@@ -2,6 +2,10 @@ const std = @import("std");
 
 const max_diff_bytes = 16 * 1024 * 1024;
 
+/// User-selected source for the raw unified diff text.
+///
+/// Terminal mode can read all variants directly. Browser mode can later reuse
+/// the same shape while swapping the backend behind it.
 pub const SourceMode = union(enum) {
     unstaged,
     cached,
@@ -39,8 +43,11 @@ pub const LoadError = error{
 };
 
 pub const LoadResult = union(enum) {
+    /// Allocated raw diff text. Caller owns and must call `deinit`.
     ok: []u8,
+    /// Allocated error message from the backend. Caller owns and must call `deinit`.
     failed: []u8,
+    /// Non-owned fallback error message, used when allocation itself fails.
     failed_static: []const u8,
 
     pub fn deinit(self: LoadResult, allocator: std.mem.Allocator) void {
@@ -52,6 +59,11 @@ pub const LoadResult = union(enum) {
     }
 };
 
+/// Minimal backend boundary for obtaining raw unified diff text.
+///
+/// It is intentionally one-method for now: Phase 1 only needs read-only diff
+/// acquisition, while future browser/backend work can add another implementation
+/// without wiring process execution through the app state.
 pub const GitBackend = struct {
     ptr: *anyopaque,
     load_diff_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, SourceMode) LoadError!LoadResult,
@@ -139,12 +151,16 @@ pub fn freeSource(allocator: std.mem.Allocator, source: SourceMode) void {
     }
 }
 
+/// Convenience entry point for terminal mode. The explicit GitBackend interface
+/// remains available for tests and future non-local backends.
 pub fn load(allocator: std.mem.Allocator, io: std.Io, source: SourceMode) LoadError!LoadResult {
     var local_backend: LocalGitCommandBackend = .{};
     return local_backend.backend().loadDiff(allocator, io, source);
 }
 
 fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) LoadError!LoadResult {
+    // Use structured argv and disable color/ext-diff so the parser sees stable
+    // Git unified diff output, not user-configured pager formatting.
     const result = std.process.run(allocator, io, .{
         .argv = argv,
         .stdout_limit = .limited(max_diff_bytes),
@@ -164,6 +180,8 @@ fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u
     }
 
     allocator.free(result.stdout);
+    // Prefer Git's stderr when available; it usually contains the actionable
+    // reason, for example "not a git repository".
     if (result.stderr.len > 0) return .{ .failed = result.stderr };
     allocator.free(result.stderr);
 

@@ -58,8 +58,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_diff_source_tests = b.addRunArtifact(diff_source_tests);
 
+    const diff_parser_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/diff_parser.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_diff_parser_tests = b.addRunArtifact(diff_parser_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_diff_source_tests.step);
+    test_step.dependOn(&run_diff_parser_tests.step);
 }

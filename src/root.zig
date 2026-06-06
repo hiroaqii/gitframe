@@ -1,5 +1,6 @@
 const std = @import("std");
 const chasen = @import("chasen");
+const diff_parser = @import("diff_parser.zig");
 const diff_source = @import("diff_source.zig");
 
 pub const SourceMode = diff_source.SourceMode;
@@ -11,7 +12,10 @@ pub const App = struct {
     config: CliConfig = .{},
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
     load_state: LoadState = .idle,
+    /// Owns the currently loaded raw diff, parsed document arrays, and error
+    /// messages. Recreated on every successful load/reload.
     load_arena: ?std.heap.ArenaAllocator = null,
+    /// Monotonic id used to ignore stale async task results after reload.
     load_generation: u64 = 0,
 
     pub const Msg = union(enum) {
@@ -104,8 +108,9 @@ pub const App = struct {
             .loading => col.borrowText("Loading diff...", .{ .fg = .{ .index = 11 } }),
             .empty => col.borrowText("No changes found.", .{ .fg = .gray }),
             .loaded => |loaded| {
-                try col.print("Loaded {d} bytes across {d} lines.", .{ loaded.bytes, loaded.lines });
-                col.borrowText("Parser and file sidebar are next roadmap slices.", .{ .fg = .gray });
+                try col.print("Loaded {d} files / {d} hunks.", .{ loaded.document.files.len, loaded.document.totalHunks() });
+                try col.print("{d} bytes across {d} lines.", .{ loaded.bytes, loaded.lines });
+                col.borrowText("File sidebar and diff pane are next roadmap slices.", .{ .fg = .gray });
             },
             .failed => |message| {
                 col.borrowText("Could not load diff:", .{ .fg = .{ .index = 9 }, .bold = true });
@@ -138,6 +143,8 @@ pub const App = struct {
         errdefer ctx.allocator().destroy(task);
         self.load_generation +%= 1;
         task.* = .{
+            // Source payloads come from process args, so clone them before the
+            // async task crosses the update boundary.
             .source = try diff_source.cloneSource(ctx.allocator(), self.config.source),
             .generation = self.load_generation,
         };
@@ -153,6 +160,8 @@ pub const App = struct {
 
     fn finishDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: DiffLoadFinished) !void {
         defer finished.result.deinit(ctx.allocator());
+        // Multiple reloads can be in flight. Only the newest generation is
+        // allowed to update visible state.
         if (finished.generation != self.load_generation) return;
 
         self.clearLoadedDiff();
@@ -163,18 +172,27 @@ pub const App = struct {
 
         switch (finished.result) {
             .ok => |bytes| {
+                // The task allocator owns `bytes`; copy into the app arena so
+                // parsed line/path slices can safely point into the raw text.
                 const copied = try arena_allocator.dupe(u8, bytes);
                 if (copied.len == 0) {
                     self.load_state = .empty;
                     arena.deinit();
                     return;
                 }
+                const document = diff_parser.parse(arena_allocator, copied) catch |err| {
+                    const message = try std.fmt.allocPrint(arena_allocator, "Diff parse failed: {s}", .{@errorName(err)});
+                    self.load_arena = arena;
+                    self.load_state = .{ .failed = message };
+                    return;
+                };
 
                 self.load_arena = arena;
                 self.load_state = .{ .loaded = .{
                     .bytes = copied.len,
                     .lines = countLines(copied),
                     .text = copied,
+                    .document = document,
                 } };
             },
             .failed => |message| {
@@ -207,6 +225,7 @@ const LoadState = union(enum) {
 
 const LoadedDiff = struct {
     text: []const u8,
+    document: diff_parser.DiffDocument,
     bytes: usize,
     lines: usize,
 };
@@ -227,6 +246,8 @@ const DiffLoadTask = struct {
             allocator.destroy(task);
         }
 
+        // The returned LoadResult transfers any allocated payload to App.update,
+        // where it is copied into app-owned storage and then deinitialized.
         const result: diff_source.LoadResult = diff_source.load(allocator, io, task.source) catch |err| .{
             .failed = std.fmt.allocPrint(allocator, "Diff load failed: {s}", .{@errorName(err)}) catch
                 return .{ .diff_loaded = .{
