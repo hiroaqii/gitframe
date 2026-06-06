@@ -1,42 +1,40 @@
 const std = @import("std");
 const chasen = @import("chasen");
+const diff_source = @import("diff_source.zig");
 
-pub const SourceMode = union(enum) {
-    unstaged,
-    cached,
-    stdin,
-    patch_file: []const u8,
-    range: []const u8,
-};
-
-pub const CliConfig = struct {
-    source: SourceMode = .unstaged,
-
-    pub fn sourceLabel(self: CliConfig) []const u8 {
-        return switch (self.source) {
-            .unstaged => "unstaged changes",
-            .cached => "staged changes",
-            .stdin => "stdin diff",
-            .patch_file => |path| path,
-            .range => |range| range,
-        };
-    }
-};
+pub const SourceMode = diff_source.SourceMode;
+pub const CliConfig = diff_source.CliConfig;
+pub const ParseArgsError = diff_source.ParseArgsError;
+pub const parseArgs = diff_source.parseArgs;
 
 pub const App = struct {
     config: CliConfig = .{},
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
+    load_state: LoadState = .idle,
+    load_arena: ?std.heap.ArenaAllocator = null,
+    load_generation: u64 = 0,
 
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
+        diff_loaded: DiffLoadFinished,
         reload,
         quit,
     };
 
+    pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        try self.startDiffLoad(ctx);
+    }
+
+    pub fn deinit(self: *App, deinit_ctx: chasen.AppDeinitContext) void {
+        _ = deinit_ctx;
+        self.clearLoadedDiff();
+    }
+
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .terminal_resized => |size| self.terminal_size = size,
-            .reload => {},
+            .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
+            .reload => try self.startDiffLoad(ctx),
             .quit => ctx.quit(),
         }
     }
@@ -96,8 +94,24 @@ pub const App = struct {
         col.borrowText(title, .{ .bold = true, .fg = .{ .index = 14 } });
         col.borrowText(subtitle, .{ .fg = .gray });
         try col.print("Source: {s}", .{self.config.sourceLabel()});
-        col.borrowText("Diff acquisition and parser are next roadmap slices.", .{});
+        try self.viewLoadState(&col);
         col.borrowText("Keys: r reload, q quit", .{ .fg = .gray });
+    }
+
+    fn viewLoadState(self: *const App, col: *chasen.Column) !void {
+        switch (self.load_state) {
+            .idle => col.borrowText("Waiting to load diff.", .{ .fg = .gray }),
+            .loading => col.borrowText("Loading diff...", .{ .fg = .{ .index = 11 } }),
+            .empty => col.borrowText("No changes found.", .{ .fg = .gray }),
+            .loaded => |loaded| {
+                try col.print("Loaded {d} bytes across {d} lines.", .{ loaded.bytes, loaded.lines });
+                col.borrowText("Parser and file sidebar are next roadmap slices.", .{ .fg = .gray });
+            },
+            .failed => |message| {
+                col.borrowText("Could not load diff:", .{ .fg = .{ .index = 9 }, .bold = true });
+                col.borrowText(message, .{ .fg = .{ .index = 9 } });
+            },
+        }
     }
 
     fn viewFooter(self: *const App, surface: *chasen.Surface) void {
@@ -118,95 +132,128 @@ pub const App = struct {
             _ = surface.copyTextAt(width - size_width, 0, size_text, .{ .fg = .gray }) catch {};
         }
     }
-};
 
-pub const ParseArgsError = error{
-    UnknownOption,
-    MissingOptionValue,
-    TooManyInputs,
-    ConflictingSourceMode,
-};
+    fn startDiffLoad(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const task = try ctx.allocator().create(DiffLoadTask);
+        errdefer ctx.allocator().destroy(task);
+        self.load_generation +%= 1;
+        task.* = .{
+            .source = try diff_source.cloneSource(ctx.allocator(), self.config.source),
+            .generation = self.load_generation,
+        };
+        errdefer diff_source.freeSource(ctx.allocator(), task.source);
 
-pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
-    var config: CliConfig = .{};
-    var input_count: usize = 0;
+        self.clearLoadedDiff();
+        self.load_state = .loading;
+        ctx.spawnWith(task, DiffLoadTask.run) catch |err| {
+            self.load_state = .{ .failed = "Could not start diff load task" };
+            return err;
+        };
+    }
 
-    var index: usize = 1;
-    while (index < args.len) : (index += 1) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--cached")) {
-            try setSourceMode(&config, .cached);
-        } else if (std.mem.eql(u8, arg, "--stdin")) {
-            try setSourceMode(&config, .stdin);
-        } else if (std.mem.eql(u8, arg, "--range")) {
-            index += 1;
-            if (index >= args.len) return error.MissingOptionValue;
-            try setSourceMode(&config, .{ .range = args[index] });
-        } else if (std.mem.startsWith(u8, arg, "--range=")) {
-            const value = arg["--range=".len..];
-            if (value.len == 0) return error.MissingOptionValue;
-            try setSourceMode(&config, .{ .range = value });
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            return error.UnknownOption;
-        } else {
-            input_count += 1;
-            if (input_count > 1) return error.TooManyInputs;
-            try setSourceMode(&config, .{ .patch_file = arg });
+    fn finishDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: DiffLoadFinished) !void {
+        defer finished.result.deinit(ctx.allocator());
+        if (finished.generation != self.load_generation) return;
+
+        self.clearLoadedDiff();
+
+        var arena: std.heap.ArenaAllocator = .init(ctx.allocator());
+        errdefer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        switch (finished.result) {
+            .ok => |bytes| {
+                const copied = try arena_allocator.dupe(u8, bytes);
+                if (copied.len == 0) {
+                    self.load_state = .empty;
+                    arena.deinit();
+                    return;
+                }
+
+                self.load_arena = arena;
+                self.load_state = .{ .loaded = .{
+                    .bytes = copied.len,
+                    .lines = countLines(copied),
+                    .text = copied,
+                } };
+            },
+            .failed => |message| {
+                const copied = try arena_allocator.dupe(u8, std.mem.trim(u8, message, " \t\r\n"));
+                self.load_arena = arena;
+                self.load_state = .{ .failed = if (copied.len > 0) copied else "Unknown diff load error" };
+            },
+            .failed_static => |message| {
+                const copied = try arena_allocator.dupe(u8, message);
+                self.load_arena = arena;
+                self.load_state = .{ .failed = copied };
+            },
         }
     }
 
-    return config;
+    fn clearLoadedDiff(self: *App) void {
+        if (self.load_arena) |*arena| arena.deinit();
+        self.load_arena = null;
+        self.load_state = .idle;
+    }
+};
+
+const LoadState = union(enum) {
+    idle,
+    loading,
+    empty,
+    loaded: LoadedDiff,
+    failed: []const u8,
+};
+
+const LoadedDiff = struct {
+    text: []const u8,
+    bytes: usize,
+    lines: usize,
+};
+
+const DiffLoadFinished = struct {
+    generation: u64,
+    result: diff_source.LoadResult,
+};
+
+const DiffLoadTask = struct {
+    source: SourceMode,
+    generation: u64,
+
+    fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) App.Msg {
+        const task: *DiffLoadTask = @ptrCast(@alignCast(ctx_ptr));
+        defer {
+            diff_source.freeSource(allocator, task.source);
+            allocator.destroy(task);
+        }
+
+        const result: diff_source.LoadResult = diff_source.load(allocator, io, task.source) catch |err| .{
+            .failed = std.fmt.allocPrint(allocator, "Diff load failed: {s}", .{@errorName(err)}) catch
+                return .{ .diff_loaded = .{
+                    .generation = task.generation,
+                    .result = .{ .failed_static = "Diff load failed: OutOfMemory" },
+                } },
+        };
+        return .{ .diff_loaded = .{
+            .generation = task.generation,
+            .result = result,
+        } };
+    }
+};
+
+fn countLines(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+
+    var count: usize = 1;
+    for (bytes) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    return count;
 }
 
-fn setSourceMode(config: *CliConfig, source: SourceMode) ParseArgsError!void {
-    if (config.source != .unstaged) return error.ConflictingSourceMode;
-    config.source = source;
-}
-
-test "parseArgs defaults to unstaged diff" {
-    const args = [_][]const u8{"gitframe"};
-    const config = try parseArgs(args[0..]);
-
-    try std.testing.expect(config.source == .unstaged);
-}
-
-test "parseArgs accepts cached mode" {
-    const args = [_][]const u8{ "gitframe", "--cached" };
-    const config = try parseArgs(args[0..]);
-
-    try std.testing.expect(config.source == .cached);
-}
-
-test "parseArgs accepts stdin mode" {
-    const args = [_][]const u8{ "gitframe", "--stdin" };
-    const config = try parseArgs(args[0..]);
-
-    try std.testing.expect(config.source == .stdin);
-}
-
-test "parseArgs accepts range option" {
-    const args = [_][]const u8{ "gitframe", "--range", "main...HEAD" };
-    const config = try parseArgs(args[0..]);
-
-    try std.testing.expect(config.source == .range);
-    try std.testing.expectEqualStrings("main...HEAD", config.source.range);
-}
-
-test "parseArgs accepts patch file path" {
-    const args = [_][]const u8{ "gitframe", "change.diff" };
-    const config = try parseArgs(args[0..]);
-
-    try std.testing.expect(config.source == .patch_file);
-    try std.testing.expectEqualStrings("change.diff", config.source.patch_file);
-}
-
-test "parseArgs rejects conflicting source modes" {
-    const stdin_and_file = [_][]const u8{ "gitframe", "--stdin", "change.diff" };
-    try std.testing.expectError(error.ConflictingSourceMode, parseArgs(stdin_and_file[0..]));
-
-    const cached_and_range = [_][]const u8{ "gitframe", "--cached", "--range", "main...HEAD" };
-    try std.testing.expectError(error.ConflictingSourceMode, parseArgs(cached_and_range[0..]));
-
-    const range_and_stdin = [_][]const u8{ "gitframe", "--range=main...HEAD", "--stdin" };
-    try std.testing.expectError(error.ConflictingSourceMode, parseArgs(range_and_stdin[0..]));
+test "countLines handles empty and trailing newline inputs" {
+    try std.testing.expectEqual(@as(usize, 0), countLines(""));
+    try std.testing.expectEqual(@as(usize, 1), countLines("one"));
+    try std.testing.expectEqual(@as(usize, 2), countLines("one\n"));
+    try std.testing.expectEqual(@as(usize, 2), countLines("one\ntwo"));
 }
