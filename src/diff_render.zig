@@ -299,24 +299,9 @@ fn copyClippedTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const
     const size = surface.size();
     if (col >= size.width) return;
     const max_width = size.width - col;
-    const clipped = clipTextToWidth(text, max_width);
+    const clipped = chasen.text.clipToWidth(text, max_width);
     if (clipped.len == 0) return;
     _ = try surface.copyTextAt(col, row, clipped, style);
-}
-
-fn clipTextToWidth(text: []const u8, max_width: u16) []const u8 {
-    if (max_width == 0) return "";
-
-    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
-    var used_width: u16 = 0;
-    var end: usize = 0;
-    while (iterator.nextCodepointSlice()) |bytes| {
-        const width = chasen.text.displayWidth(bytes);
-        if (used_width + width > max_width) break;
-        used_width += width;
-        end = @intFromPtr(bytes.ptr) - @intFromPtr(text.ptr) + bytes.len;
-    }
-    return text[0..end];
 }
 
 fn lineNumberText(surface: *chasen.Surface, line: ?u32) ![]const u8 {
@@ -512,11 +497,4 @@ test "side-by-side hunk header is clipped before the new column" {
     try ts.expectCellText(gutter_col, 3, "│");
     try ts.expectCellText(gutter_col + 1, 3, " ");
     try ts.expectCellText(gutter_col + 8, 3, " ");
-}
-
-test "clipTextToWidth does not split wide graphemes" {
-    try std.testing.expectEqualStrings("Aあ", clipTextToWidth("AあB", 3));
-    try std.testing.expectEqualStrings("A", clipTextToWidth("AあB", 2));
-    try std.testing.expectEqualStrings("e\u{301}", clipTextToWidth("e\u{301}x", 1));
-    try std.testing.expectEqualStrings("", clipTextToWidth("あ", 1));
 }
