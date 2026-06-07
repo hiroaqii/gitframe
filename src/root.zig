@@ -386,7 +386,7 @@ pub const App = struct {
 
         self.clearLoadedDiff();
         self.load_state = .loading;
-        ctx.spawnWith(task, DiffLoadTask.run) catch |err| {
+        ctx.task().spawnWith(task, DiffLoadTask.run) catch |err| {
             self.load_state = .{ .failed = "Could not start diff load task" };
             return err;
         };
