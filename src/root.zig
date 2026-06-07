@@ -2,6 +2,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const diff_parser = @import("diff_parser.zig");
 const diff_render = @import("diff_render.zig");
+const diff_search = @import("diff_search.zig");
 const diff_source = @import("diff_source.zig");
 
 pub const SourceMode = diff_source.SourceMode;
@@ -19,6 +20,10 @@ pub const App = struct {
     diff_scroll: usize = 0,
     selected_hunk: usize = 0,
     display_mode: diff_render.DisplayMode = .side_by_side,
+    search_mode: bool = false,
+    search_input: SearchQuery = .{},
+    search_query: SearchQuery = .{},
+    search_match: ?usize = null,
     /// Owns the currently loaded raw diff, parsed document arrays, and error
     /// messages. Recreated on every successful load/reload.
     load_arena: ?std.heap.ArenaAllocator = null,
@@ -40,6 +45,13 @@ pub const App = struct {
         select_last_file,
         toggle_focus,
         toggle_display_mode,
+        enter_search,
+        cancel_search,
+        submit_search,
+        search_insert: u21,
+        search_backspace,
+        select_next_search_match,
+        select_previous_search_match,
         reload,
         quit,
     };
@@ -56,8 +68,10 @@ pub const App = struct {
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .terminal_resized => |size| {
+                const search_base = self.search_match orelse self.diff_scroll;
                 self.terminal_size = size;
                 self.clampDiffNavigationKeepingHunkVisible();
+                self.resyncSearchMatchFrom(search_base);
             },
             .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
@@ -72,9 +86,18 @@ pub const App = struct {
             .select_last_file => self.selectLastFile(),
             .toggle_focus => self.focus = self.focus.toggled(),
             .toggle_display_mode => {
+                const search_base = self.search_match orelse self.diff_scroll;
                 self.display_mode = self.display_mode.toggled();
                 self.clampDiffNavigationKeepingHunkVisible();
+                self.resyncSearchMatchFrom(search_base);
             },
+            .enter_search => self.enterSearchMode(),
+            .cancel_search => self.cancelSearchMode(),
+            .submit_search => self.submitSearch(),
+            .search_insert => |codepoint| self.search_input.insert(codepoint) catch {},
+            .search_backspace => self.search_input.backspace(),
+            .select_next_search_match => self.selectSearchMatch(.forward),
+            .select_previous_search_match => self.selectSearchMatch(.backward),
             .reload => try self.startDiffLoad(ctx),
             .quit => ctx.quit(),
         }
@@ -116,6 +139,14 @@ pub const App = struct {
     }
 
     fn handleKey(self: *const App, key: chasen.Key) ?Msg {
+        if (self.search_mode) {
+            if (key.matches(chasen.Key.escape, .{})) return .cancel_search;
+            if (key.matches(chasen.Key.enter, .{})) return .submit_search;
+            if (key.matches(chasen.Key.backspace, .{})) return .search_backspace;
+            if (isSearchCodepoint(key.codepoint)) return .{ .search_insert = key.codepoint };
+            return null;
+        }
+
         if (key.matches(chasen.Key.tab, .{})) return .toggle_focus;
         if (key.matches(chasen.Key.page_up, .{})) return .page_diff_up;
         if (key.matches(chasen.Key.page_down, .{})) return .page_diff_down;
@@ -125,8 +156,10 @@ pub const App = struct {
         return switch (key.codepoint) {
             'k', chasen.Key.up => if (self.focus == .diff) .scroll_diff_up else .select_previous_file,
             'j', chasen.Key.down => if (self.focus == .diff) .scroll_diff_down else .select_next_file,
-            'n' => .select_next_hunk,
-            'p' => .select_previous_hunk,
+            '/' => .enter_search,
+            'n' => if (self.search_query.len > 0) .select_next_search_match else .select_next_hunk,
+            'N' => if (self.search_query.len > 0) .select_previous_search_match else null,
+            'p' => if (self.search_query.len > 0) .select_previous_search_match else .select_previous_hunk,
             'g' => .select_first_file,
             'G' => .select_last_file,
             'u' => .toggle_display_mode,
@@ -252,7 +285,8 @@ pub const App = struct {
 
         const selected = @min(self.selected_file, loaded.document.files.len - 1);
         const file = loaded.document.files[selected];
-        const mode = diff_render.effectiveMode(surface.size().width, self.display_mode);
+        var diff_content = diffContentSurface(surface);
+        const mode = diff_render.effectiveMode(diff_content.size().width, self.display_mode);
         const focus_label = if (self.focus == .diff) "diff" else "sidebar";
         _ = try surface.printAt(0, 2, .{ .fg = .gray }, "{d}/{d}  {d} hunks  {s}  focus:{s}  scroll:{d}", .{
             selected + 1,
@@ -262,11 +296,25 @@ pub const App = struct {
             focus_label,
             self.diff_scroll,
         });
-        try diff_render.renderFile(surface, file, .{
+        if (self.search_query.len > 0 or self.search_mode) {
+            surface.clear(.{ .col = 0, .row = 2, .width = size.width, .height = 1 });
+        }
+        if (!self.search_mode and self.search_query.len > 0 and size.width > 0) {
+            const match_text = if (self.search_match) |offset|
+                std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ self.search_query.slice(), offset + 1 }) catch "search"
+            else
+                std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{self.search_query.slice()}) catch "search";
+            _ = surface.copyTextAt(0, 2, match_text, .{ .fg = .{ .index = 11 } }) catch {};
+        } else if (self.search_mode and size.width > 0) {
+            const prompt_text = std.fmt.allocPrint(surface.frameAllocator(), "search: {s}", .{self.search_input.slice()}) catch "search";
+            _ = surface.copyTextAt(0, 2, prompt_text, .{ .fg = .{ .index = 11 } }) catch {};
+        }
+        try diff_render.renderFile(&diff_content, file, .{
             .requested_mode = self.display_mode,
             .scroll = self.diff_scroll,
             .highlighted_hunk = if (file.hunks.len > 0) self.selected_hunk else null,
         });
+        self.drawSearchMatchMarker(surface);
     }
 
     fn viewLoadState(self: *const App, col: *chasen.Column) !void {
@@ -290,11 +338,17 @@ pub const App = struct {
         if (width == 0) return;
 
         var col: u16 = 0;
+        if (self.search_mode) {
+            _ = surface.borrowTextAt(0, 0, "/", .{ .fg = .{ .index = 11 }, .bold = true });
+            _ = surface.copyTextAt(1, 0, self.search_input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
+            return;
+        }
+
         _ = surface.borrowTextAt(col, 0, "gitframe", .{ .bold = true });
         col +|= 9;
         _ = surface.borrowTextAt(col, 0, "viewer shell", .{ .fg = .gray });
         col +|= 13;
-        _ = surface.borrowTextAt(col, 0, "Tab focus  j/k move  n/p hunk  u mode  r reload  q quit", .{ .fg = .gray });
+        _ = surface.borrowTextAt(col, 0, "Tab focus  j/k move  / search  n/p hunk/search  u mode  r reload  q quit", .{ .fg = .gray });
 
         const size_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
             self.terminal_size.width,
@@ -304,6 +358,18 @@ pub const App = struct {
         if (width > size_width + 1) {
             _ = surface.copyTextAt(width - size_width, 0, size_text, .{ .fg = .gray }) catch {};
         }
+    }
+
+    fn drawSearchMatchMarker(self: *const App, surface: *chasen.Surface) void {
+        const match_offset = self.search_match orelse return;
+        if (match_offset < self.diff_scroll) return;
+
+        const visible_offset = match_offset - self.diff_scroll;
+        const body_rows = diff_render.visibleBodyRows(surface.size().height);
+        if (visible_offset >= body_rows) return;
+
+        const row: u16 = @intCast(diff_body_start_row + visible_offset);
+        _ = surface.borrowTextAt(0, row, ">", .{ .bold = true, .reverse = true, .fg = .{ .index = 11 } });
     }
 
     fn startDiffLoad(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -364,6 +430,7 @@ pub const App = struct {
                     .document = document,
                 } };
                 self.clampDiffNavigation();
+                self.resyncSearchMatch();
             },
             .failed => |message| {
                 const copied = try arena_allocator.dupe(u8, std.mem.trim(u8, message, " \t\r\n"));
@@ -384,6 +451,7 @@ pub const App = struct {
         self.load_state = .idle;
         self.diff_scroll = 0;
         self.selected_hunk = 0;
+        self.search_match = null;
     }
 
     fn selectFileDelta(self: *App, delta: i2) void {
@@ -399,7 +467,10 @@ pub const App = struct {
         } else if (self.selected_file + 1 < file_count) {
             self.selected_file += 1;
         }
-        if (self.selected_file != previous_file) self.resetDiffPosition();
+        if (self.selected_file != previous_file) {
+            self.resetDiffPosition();
+            self.resyncSearchMatch();
+        }
         self.clampSelection(file_count);
         self.clampDiffNavigation();
     }
@@ -411,6 +482,7 @@ pub const App = struct {
         if (self.selected_file == target) return;
         self.selected_file = target;
         self.resetDiffPosition();
+        self.resyncSearchMatch();
         self.clampSelection(file_count);
         self.clampDiffNavigation();
     }
@@ -496,6 +568,66 @@ pub const App = struct {
     fn resetDiffPosition(self: *App) void {
         self.diff_scroll = 0;
         self.selected_hunk = 0;
+        self.search_match = null;
+    }
+
+    fn enterSearchMode(self: *App) void {
+        self.search_input = self.search_query;
+        self.search_mode = true;
+    }
+
+    fn cancelSearchMode(self: *App) void {
+        self.search_input = self.search_query;
+        self.search_mode = false;
+    }
+
+    fn submitSearch(self: *App) void {
+        self.search_mode = false;
+        self.search_query = self.search_input;
+        self.search_match = null;
+        if (self.search_query.len == 0) {
+            self.search_match = null;
+            return;
+        }
+        self.selectSearchMatch(.forward);
+    }
+
+    fn selectSearchMatch(self: *App, direction: diff_search.Direction) void {
+        const file = self.selectedFile() orelse return;
+        if (self.search_query.len == 0) return;
+
+        const line_count = diff_render.renderedBodyLineCount(file, self.effectiveDisplayMode());
+        if (line_count == 0) return;
+        const base = self.search_match orelse switch (direction) {
+            .forward => if (line_count > 0) line_count - 1 else 0,
+            .backward => 0,
+        };
+        const next = diff_search.findMatch(file, self.effectiveDisplayMode(), self.search_query.slice(), base, direction) orelse {
+            self.search_match = null;
+            return;
+        };
+        self.search_match = next;
+        self.diff_scroll = next;
+        self.clampDiffNavigation();
+    }
+
+    fn resyncSearchMatch(self: *App) void {
+        self.resyncSearchMatchFrom(0);
+    }
+
+    fn resyncSearchMatchFrom(self: *App, preferred_offset: usize) void {
+        if (self.search_query.len == 0) return;
+        self.search_match = null;
+        const file = self.selectedFile() orelse return;
+        const line_count = diff_render.renderedBodyLineCount(file, self.effectiveDisplayMode());
+        if (line_count == 0) return;
+
+        const clamped = @min(preferred_offset, line_count - 1);
+        const base = if (clamped == 0) line_count - 1 else clamped - 1;
+        const next = diff_search.findMatch(file, self.effectiveDisplayMode(), self.search_query.slice(), base, .forward) orelse return;
+        self.search_match = next;
+        self.diff_scroll = next;
+        self.clampDiffNavigation();
     }
 
     fn selectedFile(self: *const App) ?diff_parser.FileDiff {
@@ -526,7 +658,8 @@ pub const App = struct {
     fn diffPaneWidth(self: *const App) u16 {
         const width = self.terminal_size.width;
         const sidebar_width = sidebarWidth(width);
-        return if (width > sidebar_width + 1) width - sidebar_width - 1 else 0;
+        if (width <= sidebar_width + 1) return 0;
+        return contentWidth(width - sidebar_width - 1);
     }
 
     fn clampSelection(self: *App, file_count: usize) void {
@@ -550,6 +683,56 @@ pub const App = struct {
 
 const footer_rows: u16 = 1;
 const sidebar_header_rows: u16 = 3;
+const diff_body_start_row: u16 = 3;
+
+fn diffContentSurface(surface: *chasen.Surface) chasen.Surface {
+    const size = surface.size();
+    if (size.width <= search_marker_gutter_width) {
+        return surface.child(.{ .col = 0, .row = 0, .width = size.width, .height = size.height });
+    }
+    return surface.child(.{
+        .col = search_marker_gutter_width,
+        .row = 0,
+        .width = size.width - search_marker_gutter_width,
+        .height = size.height,
+    });
+}
+
+fn contentWidth(width: u16) u16 {
+    return if (width > search_marker_gutter_width) width - search_marker_gutter_width else width;
+}
+
+const search_marker_gutter_width: u16 = 1;
+
+const SearchQuery = struct {
+    buffer: [128]u8 = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const SearchQuery) []const u8 {
+        return self.buffer[0..self.len];
+    }
+
+    fn insert(self: *SearchQuery, codepoint: u21) !void {
+        var bytes: [4]u8 = undefined;
+        const written = try std.unicode.utf8Encode(codepoint, &bytes);
+        if (self.len + written > self.buffer.len) return;
+        @memcpy(self.buffer[self.len .. self.len + written], bytes[0..written]);
+        self.len += written;
+    }
+
+    fn backspace(self: *SearchQuery) void {
+        if (self.len == 0) return;
+        var view = std.unicode.Utf8View.initUnchecked(self.slice());
+        var iterator = view.iterator();
+        var previous_end: usize = 0;
+        while (iterator.nextCodepointSlice()) |bytes| {
+            const end = @intFromPtr(bytes.ptr) - @intFromPtr(self.buffer[0..].ptr) + bytes.len;
+            if (end >= self.len) break;
+            previous_end = end;
+        }
+        self.len = previous_end;
+    }
+};
 
 const Focus = enum {
     sidebar,
@@ -571,6 +754,10 @@ fn sidebarWidth(total_width: u16) u16 {
     if (total_width < 50) return @min(total_width, 24);
     if (total_width < 90) return 28;
     return 34;
+}
+
+fn isSearchCodepoint(codepoint: u21) bool {
+    return codepoint >= 0x20 and codepoint != 0x7f and !(codepoint >= 0x80 and codepoint <= 0x9f);
 }
 
 const LoadState = union(enum) {
@@ -686,6 +873,202 @@ test "mode toggle keeps selected hunk visible" {
     try std.testing.expect(visible_rows == 0 or target < app.diff_scroll + visible_rows);
 }
 
+test "mode change resyncs search match to rendered body offsets" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 12 },
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .bytes = 0,
+            .lines = 0,
+            .document = .{ .files = &.{testFileWithHunks()} },
+        } },
+        .display_mode = .unified,
+    };
+    setSearchQuery(&app, "late new");
+
+    app.submitSearch();
+    try std.testing.expectEqual(@as(?usize, 12), app.search_match);
+
+    app.display_mode = .side_by_side;
+    app.clampDiffNavigationKeepingHunkVisible();
+    app.resyncSearchMatch();
+
+    try std.testing.expectEqual(@as(?usize, 10), app.search_match);
+    try std.testing.expect(app.search_match.? >= app.diff_scroll);
+    try std.testing.expect(app.search_match.? < app.diff_scroll + app.diffVisibleRows());
+}
+
+test "mode change keeps search near later matches" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 8 },
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .bytes = 0,
+            .lines = 0,
+            .document = .{ .files = &.{testFileWithHunks()} },
+        } },
+        .display_mode = .unified,
+    };
+    setSearchQuery(&app, "new");
+
+    app.submitSearch();
+    try std.testing.expectEqual(@as(?usize, 7), app.search_match);
+    app.selectSearchMatch(.forward);
+    try std.testing.expectEqual(@as(?usize, 12), app.search_match);
+
+    const old_match = app.search_match.?;
+    app.display_mode = .side_by_side;
+    app.clampDiffNavigationKeepingHunkVisible();
+    app.resyncSearchMatchFrom(old_match);
+
+    try std.testing.expectEqual(@as(?usize, 10), app.search_match);
+}
+
+test "file change resyncs retained search query to selected file" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .bytes = 0,
+            .lines = 0,
+            .document = .{ .files = &.{ testFileWithHunks(), testFileWithTargetMetadata() } },
+        } },
+        .display_mode = .unified,
+    };
+    setSearchQuery(&app, "target");
+
+    app.selectFileAbsolute(1);
+
+    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
+    try std.testing.expectEqual(@as(?usize, 0), app.search_match);
+    try std.testing.expectEqual(@as(usize, 0), app.diff_scroll);
+}
+
+test "search match marker is drawn on visible match row" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 8);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 80, .height = 9 },
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .bytes = 0,
+            .lines = 0,
+            .document = .{ .files = &.{testFileWithHunks()} },
+        } },
+        .search_match = 4,
+        .diff_scroll = 3,
+    };
+
+    app.drawSearchMatchMarker(&ts.surface);
+
+    try ts.expectCellText(0, diff_body_start_row + 1, ">");
+}
+
+test "search marker gutter does not overwrite diff content" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(90, 10);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 90, .height = 11 },
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .bytes = 0,
+            .lines = 0,
+            .document = .{ .files = &.{testFileWithHunks()} },
+        } },
+        .search_match = 0,
+    };
+
+    try app.viewDiffPane(&ts.surface, app.load_state.loaded);
+
+    try ts.expectCellText(0, diff_body_start_row, ">");
+    try ts.expectCellText(1, diff_body_start_row, "i");
+}
+
+test "status mode label uses diff content width after marker gutter" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(72, 8);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 72, .height = 9 },
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .bytes = 0,
+            .lines = 0,
+            .document = .{ .files = &.{testFileWithHunks()} },
+        } },
+        .display_mode = .side_by_side,
+    };
+
+    try app.viewDiffPane(&ts.surface, app.load_state.loaded);
+
+    try ts.expectCellText(14, 2, "u");
+    try ts.expectCellText(15, 2, "n");
+    try ts.expectCellText(16, 2, "i");
+}
+
+test "search input header does not show no match before submit" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(90, 10);
+    defer ts.deinit();
+
+    var app: App = .{
+        .terminal_size = .{ .width = 90, .height = 11 },
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .bytes = 0,
+            .lines = 0,
+            .document = .{ .files = &.{testFileWithHunks()} },
+        } },
+        .search_mode = true,
+    };
+    setSearchInput(&app, "missing");
+
+    try app.viewDiffPane(&ts.surface, app.load_state.loaded);
+
+    try ts.expectCellText(0, 2, "s");
+    try ts.expectCellText(8, 2, "m");
+    try ts.expectCellText(15, 2, " ");
+}
+
+test "canceling edited search restores committed query and match" {
+    var app: App = .{
+        .terminal_size = .{ .width = 90, .height = 11 },
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .bytes = 0,
+            .lines = 0,
+            .document = .{ .files = &.{testFileWithHunks()} },
+        } },
+        .search_match = 7,
+    };
+    setSearchQuery(&app, "new");
+
+    app.enterSearchMode();
+    app.search_input.backspace();
+    try app.search_input.insert('x');
+    app.cancelSearchMode();
+
+    try std.testing.expectEqualStrings("new", app.search_query.slice());
+    try std.testing.expectEqualStrings("new", app.search_input.slice());
+    try std.testing.expectEqual(@as(?usize, 7), app.search_match);
+}
+
+fn setSearchQuery(app: *App, query: []const u8) void {
+    @memcpy(app.search_query.buffer[0..query.len], query);
+    app.search_query.len = query.len;
+    setSearchInput(app, query);
+}
+
+fn setSearchInput(app: *App, query: []const u8) void {
+    @memcpy(app.search_input.buffer[0..query.len], query);
+    app.search_input.len = query.len;
+}
+
 fn testFileWithHunks() diff_parser.FileDiff {
     return .{
         .header = "diff --git a/a b/a",
@@ -720,5 +1103,15 @@ fn testFileWithHunks() diff_parser.FileDiff {
                 },
             },
         },
+    };
+}
+
+fn testFileWithTargetMetadata() diff_parser.FileDiff {
+    return .{
+        .header = "diff --git a/b b/b",
+        .old_path = "a/b",
+        .new_path = "b/b",
+        .metadata = &.{"target metadata"},
+        .hunks = &.{},
     };
 }
