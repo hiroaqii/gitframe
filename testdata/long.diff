@@ -1,0 +1,50 @@
+diff --git a/src/long.zig b/src/long.zig
+index 5555555..6666666 100644
+--- a/src/long.zig
++++ b/src/long.zig
+@@ -1,20 +1,22 @@
+ const std = @import("std");
+ 
+ pub fn render() void {
+-    step("old 01");
++    step("new 01");
+     step("same 02");
+     step("same 03");
+-    step("old 04");
++    step("new 04");
++    step("new 04b");
+     step("same 05");
+     step("same 06");
+     step("same 07");
+     step("same 08");
+     step("same 09");
+     step("same 10");
+-    step("old 11");
++    step("new 11");
+     step("same 12");
+     step("same 13");
+     step("same 14");
+     step("same 15");
+     step("same 16");
++    step("new 16b");
+     step("same 17");
+     step("same 18");
+     step("same 19");
+@@ -30,12 +32,14 @@ pub fn update() void {
+     tick("same 30");
+     tick("same 31");
+     tick("same 32");
+-    tick("old 33");
+-    tick("old 34");
++    tick("new 33");
++    tick("new 34");
++    tick("new 34b");
+     tick("same 35");
+     tick("same 36");
+     tick("same 37");
+     tick("same 38");
+-    tick("old 39");
++    tick("new 39");
+     tick("same 40");
++    tick("new 41");
+ }

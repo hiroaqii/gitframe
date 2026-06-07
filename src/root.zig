@@ -15,6 +15,9 @@ pub const App = struct {
     load_state: LoadState = .idle,
     selected_file: usize = 0,
     sidebar_scroll: usize = 0,
+    focus: Focus = .sidebar,
+    diff_scroll: usize = 0,
+    selected_hunk: usize = 0,
     display_mode: diff_render.DisplayMode = .side_by_side,
     /// Owns the currently loaded raw diff, parsed document arrays, and error
     /// messages. Recreated on every successful load/reload.
@@ -27,6 +30,15 @@ pub const App = struct {
         diff_loaded: DiffLoadFinished,
         select_previous_file,
         select_next_file,
+        scroll_diff_up,
+        scroll_diff_down,
+        page_diff_up,
+        page_diff_down,
+        select_previous_hunk,
+        select_next_hunk,
+        select_first_file,
+        select_last_file,
+        toggle_focus,
         toggle_display_mode,
         reload,
         quit,
@@ -43,11 +55,26 @@ pub const App = struct {
 
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
-            .terminal_resized => |size| self.terminal_size = size,
+            .terminal_resized => |size| {
+                self.terminal_size = size;
+                self.clampDiffNavigationKeepingHunkVisible();
+            },
             .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
-            .toggle_display_mode => self.display_mode = self.display_mode.toggled(),
+            .scroll_diff_up => self.scrollDiff(-1),
+            .scroll_diff_down => self.scrollDiff(1),
+            .page_diff_up => self.pageDiff(-1),
+            .page_diff_down => self.pageDiff(1),
+            .select_previous_hunk => self.selectHunkDelta(-1),
+            .select_next_hunk => self.selectHunkDelta(1),
+            .select_first_file => self.selectFileAbsolute(0),
+            .select_last_file => self.selectLastFile(),
+            .toggle_focus => self.focus = self.focus.toggled(),
+            .toggle_display_mode => {
+                self.display_mode = self.display_mode.toggled();
+                self.clampDiffNavigationKeepingHunkVisible();
+            },
             .reload => try self.startDiffLoad(ctx),
             .quit => ctx.quit(),
         }
@@ -78,20 +105,33 @@ pub const App = struct {
     }
 
     pub fn handleEvent(self: *const App, event: chasen.Event) ?Msg {
-        _ = self;
         return switch (event) {
-            .key_press => |key| switch (key.codepoint) {
-                'k', chasen.Key.up => .select_previous_file,
-                'j', chasen.Key.down => .select_next_file,
-                'u' => .toggle_display_mode,
-                'q' => .quit,
-                'r' => .reload,
-                else => null,
-            },
+            .key_press => |key| self.handleKey(key),
             .winsize => |winsize| .{ .terminal_resized = .{
                 .width = winsize.cols,
                 .height = winsize.rows,
             } },
+            else => null,
+        };
+    }
+
+    fn handleKey(self: *const App, key: chasen.Key) ?Msg {
+        if (key.matches(chasen.Key.tab, .{})) return .toggle_focus;
+        if (key.matches(chasen.Key.page_up, .{})) return .page_diff_up;
+        if (key.matches(chasen.Key.page_down, .{})) return .page_diff_down;
+        if (key.matches(chasen.Key.home, .{})) return .select_first_file;
+        if (key.matches(chasen.Key.end, .{})) return .select_last_file;
+
+        return switch (key.codepoint) {
+            'k', chasen.Key.up => if (self.focus == .diff) .scroll_diff_up else .select_previous_file,
+            'j', chasen.Key.down => if (self.focus == .diff) .scroll_diff_down else .select_next_file,
+            'n' => .select_next_hunk,
+            'p' => .select_previous_hunk,
+            'g' => .select_first_file,
+            'G' => .select_last_file,
+            'u' => .toggle_display_mode,
+            'q' => .quit,
+            'r' => .reload,
             else => null,
         };
     }
@@ -154,7 +194,11 @@ pub const App = struct {
         const size = surface.size();
         if (size.width == 0 or size.height == 0) return;
 
-        _ = surface.borrowTextAt(0, 0, "Files", .{ .bold = true, .fg = .{ .index = 14 } });
+        const title_style: chasen.TextStyle = if (self.focus == .sidebar)
+            .{ .bold = true, .reverse = true, .fg = .{ .index = 14 } }
+        else
+            .{ .bold = true, .fg = .{ .index = 14 } };
+        _ = surface.borrowTextAt(0, 0, "Files", title_style);
         _ = try surface.printAt(0, 1, .{ .fg = .gray }, "{d} files / {d} hunks", .{
             loaded.document.files.len,
             loaded.document.totalHunks(),
@@ -199,13 +243,20 @@ pub const App = struct {
         const selected = @min(self.selected_file, loaded.document.files.len - 1);
         const file = loaded.document.files[selected];
         const mode = diff_render.effectiveMode(surface.size().width, self.display_mode);
-        _ = try surface.printAt(0, 2, .{ .fg = .gray }, "{d}/{d}  {d} hunks  {s}", .{
+        const focus_label = if (self.focus == .diff) "diff" else "sidebar";
+        _ = try surface.printAt(0, 2, .{ .fg = .gray }, "{d}/{d}  {d} hunks  {s}  focus:{s}  scroll:{d}", .{
             selected + 1,
             loaded.document.files.len,
             file.hunks.len,
             mode.label(),
+            focus_label,
+            self.diff_scroll,
         });
-        try diff_render.renderFile(surface, file, .{ .requested_mode = self.display_mode });
+        try diff_render.renderFile(surface, file, .{
+            .requested_mode = self.display_mode,
+            .scroll = self.diff_scroll,
+            .highlighted_hunk = if (file.hunks.len > 0) self.selected_hunk else null,
+        });
     }
 
     fn viewLoadState(self: *const App, col: *chasen.Column) !void {
@@ -233,7 +284,7 @@ pub const App = struct {
         col +|= 9;
         _ = surface.borrowTextAt(col, 0, "viewer shell", .{ .fg = .gray });
         col +|= 13;
-        _ = surface.borrowTextAt(col, 0, "j/k select  u mode  r reload  q quit", .{ .fg = .gray });
+        _ = surface.borrowTextAt(col, 0, "Tab focus  j/k move  n/p hunk  u mode  r reload  q quit", .{ .fg = .gray });
 
         const size_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
             self.terminal_size.width,
@@ -302,6 +353,7 @@ pub const App = struct {
                     .text = copied,
                     .document = document,
                 } };
+                self.clampDiffNavigation();
             },
             .failed => |message| {
                 const copied = try arena_allocator.dupe(u8, std.mem.trim(u8, message, " \t\r\n"));
@@ -320,6 +372,8 @@ pub const App = struct {
         if (self.load_arena) |*arena| arena.deinit();
         self.load_arena = null;
         self.load_state = .idle;
+        self.diff_scroll = 0;
+        self.selected_hunk = 0;
     }
 
     fn selectFileDelta(self: *App, delta: i2) void {
@@ -329,12 +383,140 @@ pub const App = struct {
         };
         if (file_count == 0) return;
 
+        const previous_file = self.selected_file;
         if (delta < 0) {
             if (self.selected_file > 0) self.selected_file -= 1;
         } else if (self.selected_file + 1 < file_count) {
             self.selected_file += 1;
         }
+        if (self.selected_file != previous_file) self.resetDiffPosition();
         self.clampSelection(file_count);
+        self.clampDiffNavigation();
+    }
+
+    fn selectFileAbsolute(self: *App, index: usize) void {
+        const file_count = self.loadedFileCount() orelse return;
+        if (file_count == 0) return;
+        const target = @min(index, file_count - 1);
+        if (self.selected_file == target) return;
+        self.selected_file = target;
+        self.resetDiffPosition();
+        self.clampSelection(file_count);
+        self.clampDiffNavigation();
+    }
+
+    fn selectLastFile(self: *App) void {
+        const file_count = self.loadedFileCount() orelse return;
+        if (file_count == 0) return;
+        self.selectFileAbsolute(file_count - 1);
+    }
+
+    fn scrollDiff(self: *App, delta: i2) void {
+        if (delta < 0) {
+            self.diff_scroll -|= 1;
+        } else {
+            self.diff_scroll += 1;
+        }
+        self.clampDiffNavigation();
+    }
+
+    fn pageDiff(self: *App, delta: i2) void {
+        const rows = self.diffVisibleRows();
+        const step: usize = @max(rows, 1);
+        if (delta < 0) {
+            self.diff_scroll -|= step;
+        } else {
+            self.diff_scroll += step;
+        }
+        self.clampDiffNavigation();
+    }
+
+    fn selectHunkDelta(self: *App, delta: i2) void {
+        const file = self.selectedFile() orelse return;
+        if (file.hunks.len == 0) return;
+
+        if (delta < 0) {
+            if (self.selected_hunk > 0) self.selected_hunk -= 1;
+        } else if (self.selected_hunk + 1 < file.hunks.len) {
+            self.selected_hunk += 1;
+        }
+
+        self.scrollSelectedHunkIntoView(file);
+        self.clampDiffNavigation();
+    }
+
+    fn scrollSelectedHunkIntoView(self: *App, file: diff_parser.FileDiff) void {
+        const mode = self.effectiveDisplayMode();
+        const target = diff_render.hunkBodyLineOffset(file, mode, self.selected_hunk);
+        const visible_rows = self.diffVisibleRows();
+        if (target < self.diff_scroll) {
+            self.diff_scroll = target;
+        } else if (visible_rows > 0 and target >= self.diff_scroll + visible_rows) {
+            self.diff_scroll = target + 1 - visible_rows;
+        }
+    }
+
+    fn clampDiffNavigation(self: *App) void {
+        const file = self.selectedFile() orelse {
+            self.resetDiffPosition();
+            return;
+        };
+
+        if (file.hunks.len == 0) {
+            self.selected_hunk = 0;
+        } else if (self.selected_hunk >= file.hunks.len) {
+            self.selected_hunk = file.hunks.len - 1;
+        }
+
+        const mode = self.effectiveDisplayMode();
+        const line_count = diff_render.renderedBodyLineCount(file, mode);
+        const visible_rows = self.diffVisibleRows();
+        const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
+        if (self.diff_scroll > max_scroll) self.diff_scroll = max_scroll;
+    }
+
+    fn clampDiffNavigationKeepingHunkVisible(self: *App) void {
+        self.clampDiffNavigation();
+        if (self.selectedFile()) |file| {
+            if (file.hunks.len > 0) self.scrollSelectedHunkIntoView(file);
+        }
+        self.clampDiffNavigation();
+    }
+
+    fn resetDiffPosition(self: *App) void {
+        self.diff_scroll = 0;
+        self.selected_hunk = 0;
+    }
+
+    fn selectedFile(self: *const App) ?diff_parser.FileDiff {
+        return switch (self.load_state) {
+            .loaded => |loaded| if (loaded.document.files.len == 0)
+                null
+            else
+                loaded.document.files[@min(self.selected_file, loaded.document.files.len - 1)],
+            else => null,
+        };
+    }
+
+    fn loadedFileCount(self: *const App) ?usize {
+        return switch (self.load_state) {
+            .loaded => |loaded| loaded.document.files.len,
+            else => null,
+        };
+    }
+
+    fn effectiveDisplayMode(self: *const App) diff_render.DisplayMode {
+        return diff_render.effectiveMode(self.diffPaneWidth(), self.display_mode);
+    }
+
+    fn diffVisibleRows(self: *const App) usize {
+        return diff_render.visibleBodyRows(terminalBodyHeight(self.terminal_size.height));
+    }
+
+    fn diffPaneWidth(self: *const App) u16 {
+        const width = self.terminal_size.width;
+        const sidebar_width = sidebarWidth(width);
+        return if (width > sidebar_width + 1) width - sidebar_width - 1 else 0;
     }
 
     fn clampSelection(self: *App, file_count: usize) void {
@@ -358,6 +540,18 @@ pub const App = struct {
 
 const footer_rows: u16 = 1;
 const sidebar_header_rows: u16 = 3;
+
+const Focus = enum {
+    sidebar,
+    diff,
+
+    fn toggled(self: Focus) Focus {
+        return switch (self) {
+            .sidebar => .diff,
+            .diff => .sidebar,
+        };
+    }
+};
 
 fn terminalBodyHeight(terminal_height: u16) u16 {
     return if (terminal_height > footer_rows) terminal_height - footer_rows else 0;
@@ -431,4 +625,90 @@ test "countLines handles empty and trailing newline inputs" {
     try std.testing.expectEqual(@as(usize, 1), countLines("one"));
     try std.testing.expectEqual(@as(usize, 2), countLines("one\n"));
     try std.testing.expectEqual(@as(usize, 2), countLines("one\ntwo"));
+}
+
+test "file selection boundary does not reset diff position" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .bytes = 0,
+            .lines = 0,
+            .document = .{ .files = &.{testFileWithHunks()} },
+        } },
+        .diff_scroll = 4,
+        .selected_hunk = 1,
+    };
+
+    app.selectFileDelta(-1);
+    try std.testing.expectEqual(@as(usize, 0), app.selected_file);
+    try std.testing.expectEqual(@as(usize, 4), app.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 1), app.selected_hunk);
+
+    app.selectFileAbsolute(0);
+    try std.testing.expectEqual(@as(usize, 4), app.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 1), app.selected_hunk);
+}
+
+test "mode toggle keeps selected hunk visible" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .bytes = 0,
+            .lines = 0,
+            .document = .{ .files = &.{testFileWithHunks()} },
+        } },
+        .display_mode = .unified,
+        .selected_hunk = 1,
+    };
+
+    app.scrollSelectedHunkIntoView(testFileWithHunks());
+    try std.testing.expect(app.diff_scroll > 0);
+
+    app.display_mode = .side_by_side;
+    app.clampDiffNavigationKeepingHunkVisible();
+
+    const file = testFileWithHunks();
+    const target = diff_render.hunkBodyLineOffset(file, app.effectiveDisplayMode(), app.selected_hunk);
+    const visible_rows = app.diffVisibleRows();
+    try std.testing.expect(target >= app.diff_scroll);
+    try std.testing.expect(visible_rows == 0 or target < app.diff_scroll + visible_rows);
+}
+
+fn testFileWithHunks() diff_parser.FileDiff {
+    return .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 5,
+                .new_start = 1,
+                .new_count = 5,
+                .section = "first",
+                .lines = &.{
+                    .{ .kind = .context, .text = "one", .old_line = 1, .new_line = 1 },
+                    .{ .kind = .context, .text = "two", .old_line = 2, .new_line = 2 },
+                    .{ .kind = .removed, .text = "old", .old_line = 3 },
+                    .{ .kind = .added, .text = "new", .new_line = 3 },
+                    .{ .kind = .context, .text = "four", .old_line = 4, .new_line = 4 },
+                },
+            },
+            .{
+                .old_start = 20,
+                .old_count = 3,
+                .new_start = 20,
+                .new_count = 3,
+                .section = "second",
+                .lines = &.{
+                    .{ .kind = .context, .text = "late one", .old_line = 20, .new_line = 20 },
+                    .{ .kind = .removed, .text = "late old", .old_line = 21 },
+                    .{ .kind = .added, .text = "late new", .new_line = 21 },
+                },
+            },
+        },
+    };
 }

@@ -23,6 +23,8 @@ pub const DisplayMode = enum {
 
 pub const RenderOptions = struct {
     requested_mode: DisplayMode = .unified,
+    scroll: usize = 0,
+    highlighted_hunk: ?usize = null,
 };
 
 pub const FileStats = struct {
@@ -55,6 +57,30 @@ pub fn displayPath(file: diff_parser.FileDiff) []const u8 {
     return file.header;
 }
 
+pub fn renderedBodyLineCount(file: diff_parser.FileDiff, mode: DisplayMode) usize {
+    if (file.is_binary) return file.metadata.len + 1;
+
+    var count = file.metadata.len;
+    for (file.hunks) |hunk| {
+        count += 1;
+        count += renderedHunkLineCount(hunk.lines, mode);
+    }
+    return count;
+}
+
+pub fn hunkBodyLineOffset(file: diff_parser.FileDiff, mode: DisplayMode, hunk_index: usize) usize {
+    var offset = file.metadata.len;
+    for (file.hunks, 0..) |hunk, index| {
+        if (index == hunk_index) return offset;
+        offset += 1 + renderedHunkLineCount(hunk.lines, mode);
+    }
+    return offset;
+}
+
+pub fn visibleBodyRows(surface_height: u16) usize {
+    return if (surface_height > body_start_row) surface_height - body_start_row else 0;
+}
+
 pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options: RenderOptions) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
@@ -62,74 +88,130 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     const mode = effectiveMode(size.width, options.requested_mode);
     try renderFileHeader(surface, file, mode);
 
-    var row: u16 = 3;
+    var cursor: BodyCursor = .{
+        .scroll = options.scroll,
+        .height = size.height,
+    };
     for (file.metadata) |line| {
-        if (row >= size.height) return;
+        const row = cursor.nextRow() orelse continue;
         _ = try surface.copyTextAt(0, row, line, style_metadata);
-        row += 1;
     }
 
     if (file.is_binary) {
-        if (row < size.height) _ = surface.borrowTextAt(0, row, "Binary file", style_warning);
+        if (cursor.nextRow()) |row| _ = surface.borrowTextAt(0, row, "Binary file", style_warning);
         return;
     }
 
-    for (file.hunks) |hunk| {
-        if (row >= size.height) return;
-        _ = try surface.printAt(0, row, style_hunk, "@@ -{d},{d} +{d},{d} @@ {s}", .{
-            hunk.old_start,
-            hunk.old_count,
-            hunk.new_start,
-            hunk.new_count,
-            hunk.section,
-        });
-        row += 1;
+    for (file.hunks, 0..) |hunk, hunk_index| {
+        if (cursor.nextRow()) |row| {
+            const style = if (options.highlighted_hunk != null and options.highlighted_hunk.? == hunk_index)
+                style_selected_hunk
+            else
+                style_hunk;
+            const header = try std.fmt.allocPrint(surface.frameAllocator(), "@@ -{d},{d} +{d},{d} @@ {s}", .{
+                hunk.old_start,
+                hunk.old_count,
+                hunk.new_start,
+                hunk.new_count,
+                hunk.section,
+            });
+            try drawHunkHeader(surface, row, header, style, mode);
+        }
 
         switch (mode) {
-            .unified => try renderUnifiedHunkLines(surface, hunk.lines, &row),
-            .side_by_side => try renderSideBySideHunkLines(surface, hunk.lines, &row),
+            .unified => try renderUnifiedHunkLines(surface, hunk.lines, &cursor),
+            .side_by_side => try renderSideBySideHunkLines(surface, hunk.lines, &cursor),
         }
     }
 }
 
 fn renderFileHeader(surface: *chasen.Surface, file: diff_parser.FileDiff, mode: DisplayMode) !void {
     const stats = fileStats(file);
-    _ = try surface.copyTextAt(0, 0, displayPath(file), style_file_header);
-    _ = try surface.printAt(0, 1, style_metadata, "{s}  +{d} -{d}", .{
+    try copyClippedTextAt(surface, 0, 0, displayPath(file), style_file_header);
+    const summary = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  +{d} -{d}", .{
         mode.label(),
         stats.added,
         stats.removed,
     });
+    try copyClippedTextAt(surface, 0, 1, summary, style_metadata);
 }
 
-fn renderUnifiedHunkLines(surface: *chasen.Surface, lines: []const diff_parser.DiffLine, row: *u16) !void {
-    const height = surface.size().height;
+fn drawHunkHeader(surface: *chasen.Surface, row: u16, header: []const u8, style: chasen.TextStyle, mode: DisplayMode) !void {
+    if (mode == .side_by_side and surface.size().width >= side_by_side_min_width) {
+        const gutter_col = surface.size().width / 2;
+        var old_column = surface.child(.{
+            .col = 0,
+            .row = row,
+            .width = gutter_col,
+            .height = 1,
+        });
+        try copyClippedTextAt(&old_column, 0, 0, header, style);
+        _ = surface.borrowTextAt(gutter_col, row, "│", style_metadata);
+        return;
+    }
+
+    try copyClippedTextAt(surface, 0, row, header, style);
+}
+
+const body_start_row: u16 = 3;
+
+const BodyCursor = struct {
+    scroll: usize,
+    virtual_row: usize = 0,
+    row: u16 = body_start_row,
+    height: u16,
+
+    fn nextRow(self: *BodyCursor) ?u16 {
+        defer self.virtual_row += 1;
+        if (self.virtual_row < self.scroll) return null;
+        if (self.row >= self.height) return null;
+        const row = self.row;
+        self.row += 1;
+        return row;
+    }
+};
+
+fn renderUnifiedHunkLines(surface: *chasen.Surface, lines: []const diff_parser.DiffLine, cursor: *BodyCursor) !void {
     for (lines) |line| {
-        if (row.* >= height) return;
-        try drawUnifiedLine(surface, row.*, line);
-        row.* += 1;
+        const row = cursor.nextRow() orelse continue;
+        try drawUnifiedLine(surface, row, line);
     }
 }
 
-fn renderSideBySideHunkLines(surface: *chasen.Surface, lines: []const diff_parser.DiffLine, row: *u16) !void {
+fn renderSideBySideHunkLines(surface: *chasen.Surface, lines: []const diff_parser.DiffLine, cursor: *BodyCursor) !void {
     const size = surface.size();
-    if (size.width < side_by_side_min_width) return renderUnifiedHunkLines(surface, lines, row);
+    if (size.width < side_by_side_min_width) return renderUnifiedHunkLines(surface, lines, cursor);
 
     const gutter_col = size.width / 2;
     var index: usize = 0;
     while (index < lines.len) {
-        if (row.* >= size.height) return;
-
+        const row = cursor.nextRow();
         const old_line = lines[index];
         if (old_line.kind == .removed and index + 1 < lines.len and lines[index + 1].kind == .added) {
-            try drawSideBySidePair(surface, row.*, old_line, lines[index + 1], gutter_col);
+            if (row) |visible_row| try drawSideBySidePair(surface, visible_row, old_line, lines[index + 1], gutter_col);
             index += 2;
         } else {
-            try drawSideBySideSingle(surface, row.*, old_line, gutter_col);
+            if (row) |visible_row| try drawSideBySideSingle(surface, visible_row, old_line, gutter_col);
             index += 1;
         }
-        row.* += 1;
     }
+}
+
+fn renderedHunkLineCount(lines: []const diff_parser.DiffLine, mode: DisplayMode) usize {
+    if (mode == .unified) return lines.len;
+
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < lines.len) {
+        const old_line = lines[index];
+        if (old_line.kind == .removed and index + 1 < lines.len and lines[index + 1].kind == .added) {
+            index += 2;
+        } else {
+            index += 1;
+        }
+        count += 1;
+    }
+    return count;
 }
 
 fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine) !void {
@@ -139,7 +221,7 @@ fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLin
     _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), style_line_number);
     _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), style_line_number);
     _ = surface.borrowTextAt(10, row, prefix, style);
-    _ = try surface.copyTextAt(12, row, line.text, style);
+    try copyClippedTextAt(surface, 12, row, line.text, style);
 }
 
 fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: diff_parser.DiffLine, added: diff_parser.DiffLine, gutter_col: u16) !void {
@@ -199,14 +281,38 @@ fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffL
     _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), style_line_number);
     const prefix = if (line.kind == .removed) "-" else " ";
     _ = surface.borrowTextAt(5, row, prefix, styleForLine(line.kind));
-    _ = try surface.copyTextAt(7, row, line.text, styleForLine(line.kind));
+    try copyClippedTextAt(surface, 7, row, line.text, styleForLine(line.kind));
 }
 
 fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine) !void {
     _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), style_line_number);
     const prefix = if (line.kind == .added) "+" else " ";
     _ = surface.borrowTextAt(5, row, prefix, styleForLine(line.kind));
-    _ = try surface.copyTextAt(7, row, line.text, styleForLine(line.kind));
+    try copyClippedTextAt(surface, 7, row, line.text, styleForLine(line.kind));
+}
+
+fn copyClippedTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, style: chasen.TextStyle) !void {
+    const size = surface.size();
+    if (col >= size.width) return;
+    const max_width = size.width - col;
+    const clipped = clipTextToWidth(text, max_width);
+    if (clipped.len == 0) return;
+    _ = try surface.copyTextAt(col, row, clipped, style);
+}
+
+fn clipTextToWidth(text: []const u8, max_width: u16) []const u8 {
+    if (max_width == 0) return "";
+
+    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
+    var used_width: u16 = 0;
+    var end: usize = 0;
+    while (iterator.nextCodepointSlice()) |bytes| {
+        const width = chasen.text.displayWidth(bytes);
+        if (used_width + width > max_width) break;
+        used_width += width;
+        end = @intFromPtr(bytes.ptr) - @intFromPtr(text.ptr) + bytes.len;
+    }
+    return text[0..end];
 }
 
 fn lineNumberText(surface: *chasen.Surface, line: ?u32) ![]const u8 {
@@ -244,6 +350,7 @@ const side_by_side_min_width: u16 = 72;
 
 const style_file_header: chasen.TextStyle = .{ .bold = true, .fg = .{ .index = 11 } };
 const style_hunk: chasen.TextStyle = .{ .bold = true, .fg = .{ .index = 14 } };
+const style_selected_hunk: chasen.TextStyle = .{ .bold = true, .reverse = true, .fg = .{ .index = 14 } };
 const style_added: chasen.TextStyle = .{ .fg = .{ .index = 2 } };
 const style_removed: chasen.TextStyle = .{ .fg = .{ .index = 9 } };
 const style_context: chasen.TextStyle = .{};
@@ -292,6 +399,42 @@ test "displayPath prefers new path and strips git prefixes" {
     try std.testing.expectEqualStrings("src/main.zig", displayPath(file));
 }
 
+test "body line offsets account for metadata and side-by-side pairs" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 2,
+                .new_start = 1,
+                .new_count = 2,
+                .section = "first",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old", .old_line = 1 },
+                    .{ .kind = .added, .text = "new", .new_line = 1 },
+                    .{ .kind = .context, .text = "same", .old_line = 2, .new_line = 2 },
+                },
+            },
+            .{
+                .old_start = 8,
+                .old_count = 1,
+                .new_start = 8,
+                .new_count = 1,
+                .section = "second",
+                .lines = &.{
+                    .{ .kind = .added, .text = "later", .new_line = 8 },
+                },
+            },
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 6), hunkBodyLineOffset(file, .side_by_side, 1));
+    try std.testing.expectEqual(@as(usize, 8), renderedBodyLineCount(file, .side_by_side));
+    try std.testing.expectEqual(@as(usize, 7), hunkBodyLineOffset(file, .unified, 1));
+    try std.testing.expectEqual(@as(usize, 9), renderedBodyLineCount(file, .unified));
+}
+
 test "side-by-side clips old column before new column" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 5);
@@ -333,4 +476,43 @@ test "side-by-side clips old column before new column" {
     try ts.expectCellText(gutter_col + 9, 4, "e");
     try ts.expectCellText(gutter_col + 10, 4, "w");
     try ts.expectCellText(gutter_col + 12, 4, " ");
+}
+
+test "side-by-side hunk header is clipped before the new column" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 5);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 102,
+                .old_count = 36,
+                .new_start = 134,
+                .new_count = 67,
+                .section = "fn renderFileHeader(surface: *chasen.Surface, file: diff_parser.FileDiff, mode: DisplayMode) !void",
+                .lines = &.{},
+            },
+        },
+    };
+
+    try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side });
+
+    const gutter_col: u16 = 40;
+    try ts.expectCellText(0, 3, "@");
+    try ts.expectCellText(1, 3, "@");
+    try ts.expectCellText(gutter_col, 3, "│");
+    try ts.expectCellText(gutter_col + 1, 3, " ");
+    try ts.expectCellText(gutter_col + 8, 3, " ");
+}
+
+test "clipTextToWidth does not split wide graphemes" {
+    try std.testing.expectEqualStrings("Aあ", clipTextToWidth("AあB", 3));
+    try std.testing.expectEqualStrings("A", clipTextToWidth("AあB", 2));
+    try std.testing.expectEqualStrings("e\u{301}", clipTextToWidth("e\u{301}x", 1));
+    try std.testing.expectEqualStrings("", clipTextToWidth("あ", 1));
 }
