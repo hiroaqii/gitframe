@@ -1,0 +1,32 @@
+diff --git a/src/app.zig b/src/app.zig
+index 1111111..2222222 100644
+--- a/src/app.zig
++++ b/src/app.zig
+@@ -1,6 +1,7 @@
+ const std = @import("std");
+ const chasen = @import("chasen");
+ 
+-pub const title = "Old";
++pub const title = "GitFrame";
++pub const version = "0.1.0";
+ 
+ pub fn main() !void {
+     _ = std;
+@@ -10,4 +11,4 @@ pub fn main() !void {
+     // The viewer starts with unified diff rendering.
+-    std.debug.print("old\n", .{});
++    std.debug.print("new\n", .{});
+ }
+diff --git a/README.md b/README.md
+index 3333333..4444444 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,7 @@
+ # GitFrame
+ 
+-Terminal diff viewer.
++Terminal diff viewer built with Chasen.
++
++Phase 3 adds the first visible file sidebar.
+ 
+ Use `r` to reload.

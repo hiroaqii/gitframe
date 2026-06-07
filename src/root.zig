@@ -12,6 +12,8 @@ pub const App = struct {
     config: CliConfig = .{},
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
     load_state: LoadState = .idle,
+    selected_file: usize = 0,
+    sidebar_scroll: usize = 0,
     /// Owns the currently loaded raw diff, parsed document arrays, and error
     /// messages. Recreated on every successful load/reload.
     load_arena: ?std.heap.ArenaAllocator = null,
@@ -21,6 +23,8 @@ pub const App = struct {
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
         diff_loaded: DiffLoadFinished,
+        select_previous_file,
+        select_next_file,
         reload,
         quit,
     };
@@ -38,6 +42,8 @@ pub const App = struct {
         switch (msg) {
             .terminal_resized => |size| self.terminal_size = size,
             .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
+            .select_previous_file => self.selectFileDelta(-1),
+            .select_next_file => self.selectFileDelta(1),
             .reload => try self.startDiffLoad(ctx),
             .quit => ctx.quit(),
         }
@@ -49,7 +55,7 @@ pub const App = struct {
 
         surface.hideCursor();
 
-        const footer_row = size.height - 1;
+        const footer_row = size.height - footer_rows;
         var body = surface.child(.{
             .col = 0,
             .row = 0,
@@ -62,7 +68,7 @@ pub const App = struct {
             .col = 0,
             .row = footer_row,
             .width = size.width,
-            .height = 1,
+            .height = footer_rows,
         });
         self.viewFooter(&footer);
     }
@@ -71,6 +77,8 @@ pub const App = struct {
         _ = self;
         return switch (event) {
             .key_press => |key| switch (key.codepoint) {
+                'k', chasen.Key.up => .select_previous_file,
+                'j', chasen.Key.down => .select_next_file,
                 'q' => .quit,
                 'r' => .reload,
                 else => null,
@@ -84,6 +92,11 @@ pub const App = struct {
     }
 
     fn viewBody(self: *const App, surface: *chasen.Surface) !void {
+        switch (self.load_state) {
+            .loaded => |loaded| return self.viewLoadedDiff(surface, loaded),
+            else => {},
+        }
+
         const size = surface.size();
         const title = "GitFrame";
         const subtitle = "Read-only diff viewer shell";
@@ -102,6 +115,118 @@ pub const App = struct {
         col.borrowText("Keys: r reload, q quit", .{ .fg = .gray });
     }
 
+    fn viewLoadedDiff(self: *const App, surface: *chasen.Surface, loaded: LoadedDiff) !void {
+        const size = surface.size();
+        if (size.width == 0 or size.height == 0) return;
+
+        const sidebar_width = sidebarWidth(size.width);
+        var sidebar = surface.child(.{
+            .col = 0,
+            .row = 0,
+            .width = sidebar_width,
+            .height = size.height,
+        });
+        try self.viewSidebar(&sidebar, loaded);
+
+        if (size.width > sidebar_width) {
+            var row: u16 = 0;
+            while (row < size.height) : (row += 1) {
+                _ = surface.borrowTextAt(sidebar_width, row, "│", .{ .fg = .gray });
+            }
+        }
+
+        if (size.width <= sidebar_width + 1) return;
+        var diff_pane = surface.child(.{
+            .col = sidebar_width + 1,
+            .row = 0,
+            .width = size.width - sidebar_width - 1,
+            .height = size.height,
+        });
+        try self.viewDiffPane(&diff_pane, loaded);
+    }
+
+    fn viewSidebar(self: *const App, surface: *chasen.Surface, loaded: LoadedDiff) !void {
+        const size = surface.size();
+        if (size.width == 0 or size.height == 0) return;
+
+        _ = surface.borrowTextAt(0, 0, "Files", .{ .bold = true, .fg = .{ .index = 14 } });
+        _ = try surface.printAt(0, 1, .{ .fg = .gray }, "{d} files / {d} hunks", .{
+            loaded.document.files.len,
+            loaded.document.totalHunks(),
+        });
+
+        if (size.height <= sidebar_header_rows) return;
+
+        const visible_rows: usize = size.height - sidebar_header_rows;
+        const start = @min(self.sidebar_scroll, loaded.document.files.len);
+        const end = @min(start + visible_rows, loaded.document.files.len);
+        var row: u16 = sidebar_header_rows;
+        var index: usize = start;
+        while (index < end) : ({
+            index += 1;
+            row += 1;
+        }) {
+            const file = loaded.document.files[index];
+            const selected = index == self.selected_file;
+            const style: chasen.TextStyle = if (selected)
+                .{ .reverse = true, .bold = true }
+            else
+                .{};
+            const marker = if (selected) ">" else " ";
+            _ = surface.borrowTextAt(0, row, marker, style);
+            _ = try surface.copyTextAt(2, row, displayPath(file), style);
+        }
+    }
+
+    fn viewDiffPane(self: *const App, surface: *chasen.Surface, loaded: LoadedDiff) !void {
+        const size = surface.size();
+        if (size.width == 0 or size.height == 0) return;
+
+        if (loaded.document.files.len == 0) {
+            _ = surface.borrowTextAt(0, 0, "No parsed files.", .{ .fg = .gray });
+            return;
+        }
+
+        const selected = @min(self.selected_file, loaded.document.files.len - 1);
+        const file = loaded.document.files[selected];
+        _ = try surface.copyTextAt(0, 0, displayPath(file), .{ .bold = true, .fg = .{ .index = 14 } });
+        _ = try surface.printAt(0, 1, .{ .fg = .gray }, "{d}/{d}  {d} hunks", .{
+            selected + 1,
+            loaded.document.files.len,
+            file.hunks.len,
+        });
+
+        var row: u16 = 3;
+        for (file.metadata) |line| {
+            if (row >= size.height) return;
+            _ = try surface.copyTextAt(0, row, line, .{ .fg = .gray });
+            row += 1;
+        }
+
+        if (file.is_binary) {
+            if (row < size.height) _ = surface.borrowTextAt(0, row, "Binary file", .{ .fg = .{ .index = 11 } });
+            return;
+        }
+
+        for (file.hunks) |hunk| {
+            if (row >= size.height) return;
+            _ = try surface.printAt(0, row, .{ .fg = .{ .index = 14 }, .bold = true }, "@@ -{d},{d} +{d},{d} @@ {s}", .{
+                hunk.old_start,
+                hunk.old_count,
+                hunk.new_start,
+                hunk.new_count,
+                hunk.section,
+            });
+            row += 1;
+
+            for (hunk.lines) |line| {
+                if (row >= size.height) return;
+                try drawDiffLine(surface, row, line);
+                row += 1;
+            }
+        }
+    }
+
     fn viewLoadState(self: *const App, col: *chasen.Column) !void {
         switch (self.load_state) {
             .idle => col.borrowText("Waiting to load diff.", .{ .fg = .gray }),
@@ -110,7 +235,6 @@ pub const App = struct {
             .loaded => |loaded| {
                 try col.print("Loaded {d} files / {d} hunks.", .{ loaded.document.files.len, loaded.document.totalHunks() });
                 try col.print("{d} bytes across {d} lines.", .{ loaded.bytes, loaded.lines });
-                col.borrowText("File sidebar and diff pane are next roadmap slices.", .{ .fg = .gray });
             },
             .failed => |message| {
                 col.borrowText("Could not load diff:", .{ .fg = .{ .index = 9 }, .bold = true });
@@ -127,6 +251,8 @@ pub const App = struct {
         _ = surface.borrowTextAt(col, 0, "gitframe", .{ .bold = true });
         col +|= 9;
         _ = surface.borrowTextAt(col, 0, "viewer shell", .{ .fg = .gray });
+        col +|= 13;
+        _ = surface.borrowTextAt(col, 0, "j/k select  r reload  q quit", .{ .fg = .gray });
 
         const size_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
             self.terminal_size.width,
@@ -188,6 +314,7 @@ pub const App = struct {
                 };
 
                 self.load_arena = arena;
+                self.clampSelection(document.files.len);
                 self.load_state = .{ .loaded = .{
                     .bytes = copied.len,
                     .lines = countLines(copied),
@@ -213,7 +340,92 @@ pub const App = struct {
         self.load_arena = null;
         self.load_state = .idle;
     }
+
+    fn selectFileDelta(self: *App, delta: i2) void {
+        const file_count = switch (self.load_state) {
+            .loaded => |loaded| loaded.document.files.len,
+            else => return,
+        };
+        if (file_count == 0) return;
+
+        if (delta < 0) {
+            if (self.selected_file > 0) self.selected_file -= 1;
+        } else if (self.selected_file + 1 < file_count) {
+            self.selected_file += 1;
+        }
+        self.clampSelection(file_count);
+    }
+
+    fn clampSelection(self: *App, file_count: usize) void {
+        if (file_count == 0) {
+            self.selected_file = 0;
+            self.sidebar_scroll = 0;
+            return;
+        }
+        if (self.selected_file >= file_count) self.selected_file = file_count - 1;
+        if (self.sidebar_scroll > self.selected_file) self.sidebar_scroll = self.selected_file;
+        const body_height = terminalBodyHeight(self.terminal_size.height);
+        const visible_rows: usize = if (body_height > sidebar_header_rows)
+            body_height - sidebar_header_rows
+        else
+            1;
+        if (self.selected_file >= self.sidebar_scroll + visible_rows) {
+            self.sidebar_scroll = self.selected_file + 1 - visible_rows;
+        }
+    }
 };
+
+const footer_rows: u16 = 1;
+const sidebar_header_rows: u16 = 3;
+
+fn terminalBodyHeight(terminal_height: u16) u16 {
+    return if (terminal_height > footer_rows) terminal_height - footer_rows else 0;
+}
+
+fn sidebarWidth(total_width: u16) u16 {
+    if (total_width < 50) return @min(total_width, 24);
+    if (total_width < 90) return 28;
+    return 34;
+}
+
+fn displayPath(file: diff_parser.FileDiff) []const u8 {
+    if (file.new_path) |path| return stripGitPathPrefix(path);
+    if (file.old_path) |path| return stripGitPathPrefix(path);
+    return file.header;
+}
+
+fn stripGitPathPrefix(path: []const u8) []const u8 {
+    if (std.mem.eql(u8, path, "/dev/null")) return path;
+    if (std.mem.startsWith(u8, path, "a/") or std.mem.startsWith(u8, path, "b/")) return path[2..];
+    return path;
+}
+
+fn drawDiffLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine) !void {
+    const style: chasen.TextStyle = switch (line.kind) {
+        .added => .{ .fg = .{ .index = 2 } },
+        .removed => .{ .fg = .{ .index = 9 } },
+        .context => .{},
+        .metadata => .{ .fg = .gray },
+    };
+    const prefix = switch (line.kind) {
+        .added => "+",
+        .removed => "-",
+        .context => " ",
+        .metadata => "\\",
+    };
+
+    _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), .{ .fg = .gray });
+    _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), .{ .fg = .gray });
+    _ = surface.borrowTextAt(10, row, prefix, style);
+    _ = try surface.copyTextAt(12, row, line.text, style);
+}
+
+fn lineNumberText(surface: *chasen.Surface, line: ?u32) ![]const u8 {
+    return if (line) |n|
+        std.fmt.allocPrint(surface.frameAllocator(), "{d: >4}", .{n})
+    else
+        surface.copyText("    ");
+}
 
 const LoadState = union(enum) {
     idle,
