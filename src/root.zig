@@ -224,7 +224,17 @@ pub const App = struct {
                 .{};
             const marker = if (selected) ">" else " ";
             _ = surface.borrowTextAt(0, row, marker, style);
-            _ = try surface.copyTextAt(2, row, diff_render.displayPath(file), style);
+
+            const stats_width: u16 = if (surface.size().width > 12) 11 else 0;
+            if (surface.size().width > 2 + stats_width) {
+                var path_area = surface.child(.{
+                    .col = 2,
+                    .row = row,
+                    .width = surface.size().width - 2 - stats_width,
+                    .height = 1,
+                });
+                _ = try path_area.copyTextAt(0, 0, diff_render.displayPath(file), style);
+            }
             if (surface.size().width > 12) {
                 _ = try surface.printAt(surface.size().width - 10, row, style, "+{d} -{d}", .{ stats.added, stats.removed });
             }

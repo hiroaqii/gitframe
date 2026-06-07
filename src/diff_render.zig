@@ -94,7 +94,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     };
     for (file.metadata) |line| {
         const row = cursor.nextRow() orelse continue;
-        _ = try surface.copyTextAt(0, row, line, style_metadata);
+        try copyClippedTextAt(surface, 0, row, line, style_metadata);
     }
 
     if (file.is_binary) {
@@ -228,7 +228,7 @@ fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: diff_parser.D
     var columns = sideBySideRowColumns(surface, row, gutter_col);
     try drawSideBySideOld(&columns.old, 0, removed);
     try drawSideBySideNew(&columns.new, 0, added);
-    _ = surface.borrowTextAt(gutter_col, row, "│", style_metadata);
+    drawSideBySideGutter(surface, row, gutter_col);
 }
 
 fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, gutter_col: u16) !void {
@@ -236,21 +236,25 @@ fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.Di
     switch (line.kind) {
         .removed => {
             try drawSideBySideOld(&columns.old, 0, line);
-            _ = surface.borrowTextAt(gutter_col, row, "│", style_metadata);
+            drawSideBySideGutter(surface, row, gutter_col);
         },
         .added => {
             try drawSideBySideNew(&columns.new, 0, line);
-            _ = surface.borrowTextAt(gutter_col, row, "│", style_metadata);
+            drawSideBySideGutter(surface, row, gutter_col);
         },
         .context => {
             try drawSideBySideOld(&columns.old, 0, line);
             try drawSideBySideNew(&columns.new, 0, line);
-            _ = surface.borrowTextAt(gutter_col, row, "│", style_metadata);
+            drawSideBySideGutter(surface, row, gutter_col);
         },
         .metadata => {
-            _ = try surface.copyTextAt(0, row, line.text, style_metadata);
+            try copyClippedTextAt(surface, 0, row, line.text, style_metadata);
         },
     }
+}
+
+fn drawSideBySideGutter(surface: *chasen.Surface, row: u16, gutter_col: u16) void {
+    _ = surface.borrowTextAt(gutter_col, row, "│", style_metadata);
 }
 
 const SideBySideColumns = struct {
