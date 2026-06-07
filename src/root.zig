@@ -1,6 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const diff_parser = @import("diff_parser.zig");
+const diff_render = @import("diff_render.zig");
 const diff_source = @import("diff_source.zig");
 
 pub const SourceMode = diff_source.SourceMode;
@@ -14,6 +15,7 @@ pub const App = struct {
     load_state: LoadState = .idle,
     selected_file: usize = 0,
     sidebar_scroll: usize = 0,
+    display_mode: diff_render.DisplayMode = .side_by_side,
     /// Owns the currently loaded raw diff, parsed document arrays, and error
     /// messages. Recreated on every successful load/reload.
     load_arena: ?std.heap.ArenaAllocator = null,
@@ -25,6 +27,7 @@ pub const App = struct {
         diff_loaded: DiffLoadFinished,
         select_previous_file,
         select_next_file,
+        toggle_display_mode,
         reload,
         quit,
     };
@@ -44,6 +47,7 @@ pub const App = struct {
             .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
+            .toggle_display_mode => self.display_mode = self.display_mode.toggled(),
             .reload => try self.startDiffLoad(ctx),
             .quit => ctx.quit(),
         }
@@ -79,6 +83,7 @@ pub const App = struct {
             .key_press => |key| switch (key.codepoint) {
                 'k', chasen.Key.up => .select_previous_file,
                 'j', chasen.Key.down => .select_next_file,
+                'u' => .toggle_display_mode,
                 'q' => .quit,
                 'r' => .reload,
                 else => null,
@@ -168,13 +173,17 @@ pub const App = struct {
         }) {
             const file = loaded.document.files[index];
             const selected = index == self.selected_file;
+            const stats = diff_render.fileStats(file);
             const style: chasen.TextStyle = if (selected)
                 .{ .reverse = true, .bold = true }
             else
                 .{};
             const marker = if (selected) ">" else " ";
             _ = surface.borrowTextAt(0, row, marker, style);
-            _ = try surface.copyTextAt(2, row, displayPath(file), style);
+            _ = try surface.copyTextAt(2, row, diff_render.displayPath(file), style);
+            if (surface.size().width > 12) {
+                _ = try surface.printAt(surface.size().width - 10, row, style, "+{d} -{d}", .{ stats.added, stats.removed });
+            }
         }
     }
 
@@ -189,42 +198,14 @@ pub const App = struct {
 
         const selected = @min(self.selected_file, loaded.document.files.len - 1);
         const file = loaded.document.files[selected];
-        _ = try surface.copyTextAt(0, 0, displayPath(file), .{ .bold = true, .fg = .{ .index = 14 } });
-        _ = try surface.printAt(0, 1, .{ .fg = .gray }, "{d}/{d}  {d} hunks", .{
+        const mode = diff_render.effectiveMode(surface.size().width, self.display_mode);
+        _ = try surface.printAt(0, 2, .{ .fg = .gray }, "{d}/{d}  {d} hunks  {s}", .{
             selected + 1,
             loaded.document.files.len,
             file.hunks.len,
+            mode.label(),
         });
-
-        var row: u16 = 3;
-        for (file.metadata) |line| {
-            if (row >= size.height) return;
-            _ = try surface.copyTextAt(0, row, line, .{ .fg = .gray });
-            row += 1;
-        }
-
-        if (file.is_binary) {
-            if (row < size.height) _ = surface.borrowTextAt(0, row, "Binary file", .{ .fg = .{ .index = 11 } });
-            return;
-        }
-
-        for (file.hunks) |hunk| {
-            if (row >= size.height) return;
-            _ = try surface.printAt(0, row, .{ .fg = .{ .index = 14 }, .bold = true }, "@@ -{d},{d} +{d},{d} @@ {s}", .{
-                hunk.old_start,
-                hunk.old_count,
-                hunk.new_start,
-                hunk.new_count,
-                hunk.section,
-            });
-            row += 1;
-
-            for (hunk.lines) |line| {
-                if (row >= size.height) return;
-                try drawDiffLine(surface, row, line);
-                row += 1;
-            }
-        }
+        try diff_render.renderFile(surface, file, .{ .requested_mode = self.display_mode });
     }
 
     fn viewLoadState(self: *const App, col: *chasen.Column) !void {
@@ -252,7 +233,7 @@ pub const App = struct {
         col +|= 9;
         _ = surface.borrowTextAt(col, 0, "viewer shell", .{ .fg = .gray });
         col +|= 13;
-        _ = surface.borrowTextAt(col, 0, "j/k select  r reload  q quit", .{ .fg = .gray });
+        _ = surface.borrowTextAt(col, 0, "j/k select  u mode  r reload  q quit", .{ .fg = .gray });
 
         const size_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
             self.terminal_size.width,
@@ -386,45 +367,6 @@ fn sidebarWidth(total_width: u16) u16 {
     if (total_width < 50) return @min(total_width, 24);
     if (total_width < 90) return 28;
     return 34;
-}
-
-fn displayPath(file: diff_parser.FileDiff) []const u8 {
-    if (file.new_path) |path| return stripGitPathPrefix(path);
-    if (file.old_path) |path| return stripGitPathPrefix(path);
-    return file.header;
-}
-
-fn stripGitPathPrefix(path: []const u8) []const u8 {
-    if (std.mem.eql(u8, path, "/dev/null")) return path;
-    if (std.mem.startsWith(u8, path, "a/") or std.mem.startsWith(u8, path, "b/")) return path[2..];
-    return path;
-}
-
-fn drawDiffLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine) !void {
-    const style: chasen.TextStyle = switch (line.kind) {
-        .added => .{ .fg = .{ .index = 2 } },
-        .removed => .{ .fg = .{ .index = 9 } },
-        .context => .{},
-        .metadata => .{ .fg = .gray },
-    };
-    const prefix = switch (line.kind) {
-        .added => "+",
-        .removed => "-",
-        .context => " ",
-        .metadata => "\\",
-    };
-
-    _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), .{ .fg = .gray });
-    _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), .{ .fg = .gray });
-    _ = surface.borrowTextAt(10, row, prefix, style);
-    _ = try surface.copyTextAt(12, row, line.text, style);
-}
-
-fn lineNumberText(surface: *chasen.Surface, line: ?u32) ![]const u8 {
-    return if (line) |n|
-        std.fmt.allocPrint(surface.frameAllocator(), "{d: >4}", .{n})
-    else
-        surface.copyText("    ");
 }
 
 const LoadState = union(enum) {
