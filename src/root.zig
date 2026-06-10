@@ -4,6 +4,7 @@ const diff_parser = @import("diff_parser.zig");
 const diff_render = @import("diff_render.zig");
 const diff_search = @import("diff_search.zig");
 const diff_source = @import("diff_source.zig");
+const file_tree = @import("file_tree.zig");
 
 pub const SourceMode = diff_source.SourceMode;
 pub const CliConfig = diff_source.CliConfig;
@@ -240,36 +241,43 @@ pub const App = struct {
         if (size.height <= sidebar_header_rows) return;
 
         const visible_rows: usize = size.height - sidebar_header_rows;
-        const start = @min(self.sidebar_scroll, loaded.document.files.len);
-        const end = @min(start + visible_rows, loaded.document.files.len);
+        const start = @min(self.sidebar_scroll, loaded.tree.nodes.len);
+        const end = @min(start + visible_rows, loaded.tree.nodes.len);
         var row: u16 = sidebar_header_rows;
         var index: usize = start;
         while (index < end) : ({
             index += 1;
             row += 1;
         }) {
-            const file = loaded.document.files[index];
-            const selected = index == self.selected_file;
-            const stats = diff_render.fileStats(file);
+            const node = loaded.tree.nodes[index];
+            const selected = node.file_index != null and node.file_index.? == self.selected_file;
             const style: chasen.TextStyle = if (selected)
                 .{ .reverse = true, .bold = true }
+            else if (node.kind == .directory)
+                .{ .bold = true, .fg = .gray }
             else
                 .{};
             const marker = if (selected) ">" else " ";
             _ = surface.borrowTextAt(0, row, marker, style);
 
             const stats_width: u16 = if (surface.size().width > 12) 11 else 0;
-            if (surface.size().width > 2 + stats_width) {
+            const indent: u16 = node.depth *| 2;
+            const name_col: u16 = 2 +| indent;
+            if (surface.size().width > name_col + stats_width) {
                 var path_area = surface.child(.{
-                    .col = 2,
+                    .col = name_col,
                     .row = row,
-                    .width = surface.size().width - 2 - stats_width,
+                    .width = surface.size().width - name_col - stats_width,
                     .height = 1,
                 });
-                _ = try path_area.copyTextAt(0, 0, diff_render.displayPath(file), style);
+                const label = if (node.kind == .directory)
+                    std.fmt.allocPrint(surface.frameAllocator(), "{s}/", .{node.name}) catch node.name
+                else
+                    node.name;
+                _ = try path_area.copyTextAt(0, 0, label, style);
             }
             if (surface.size().width > 12) {
-                _ = try surface.printAt(surface.size().width - 10, row, style, "+{d} -{d}", .{ stats.added, stats.removed });
+                _ = try surface.printAt(surface.size().width - 10, row, style, "+{d} -{d}", .{ node.stats.added, node.stats.removed });
             }
         }
     }
@@ -440,15 +448,17 @@ pub const App = struct {
                     self.load_state = .{ .failed = message };
                     return;
                 };
+                const tree = try file_tree.build(arena_allocator, document);
 
                 self.load_arena = arena;
-                self.clampSelection(document.files.len);
                 self.load_state = .{ .loaded = .{
                     .bytes = copied.len,
                     .lines = countLines(copied),
                     .text = copied,
                     .document = document,
+                    .tree = tree,
                 } };
+                self.clampSelection(document.files.len);
                 self.clampDiffNavigation();
                 self.resyncSearchMatch();
             },
@@ -689,15 +699,23 @@ pub const App = struct {
             return;
         }
         if (self.selected_file >= file_count) self.selected_file = file_count - 1;
-        if (self.sidebar_scroll > self.selected_file) self.sidebar_scroll = self.selected_file;
+        const selected_row = self.selectedSidebarRow() orelse self.selected_file;
+        if (self.sidebar_scroll > selected_row) self.sidebar_scroll = selected_row;
         const body_height = terminalBodyHeight(self.terminal_size.height);
         const visible_rows: usize = if (body_height > sidebar_header_rows)
             body_height - sidebar_header_rows
         else
             1;
-        if (self.selected_file >= self.sidebar_scroll + visible_rows) {
-            self.sidebar_scroll = self.selected_file + 1 - visible_rows;
+        if (selected_row >= self.sidebar_scroll + visible_rows) {
+            self.sidebar_scroll = selected_row + 1 - visible_rows;
         }
+    }
+
+    fn selectedSidebarRow(self: *const App) ?usize {
+        return switch (self.load_state) {
+            .loaded => |loaded| loaded.tree.selectedNodeIndex(self.selected_file),
+            else => null,
+        };
     }
 };
 
@@ -811,6 +829,7 @@ const LoadState = union(enum) {
 const LoadedDiff = struct {
     text: []const u8,
     document: diff_parser.DiffDocument,
+    tree: file_tree.FileTree,
     bytes: usize,
     lines: usize,
 };
@@ -867,12 +886,7 @@ test "countLines handles empty and trailing newline inputs" {
 test "file selection boundary does not reset diff position" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load_state = .{ .loaded = .{
-            .text = "",
-            .bytes = 0,
-            .lines = 0,
-            .document = .{ .files = &.{testFileWithHunks()} },
-        } },
+        .load_state = .{ .loaded = testLoadedDiffOne() },
         .diff_scroll = 4,
         .selected_hunk = 1,
     };
@@ -890,12 +904,7 @@ test "file selection boundary does not reset diff position" {
 test "mode toggle keeps selected hunk visible" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load_state = .{ .loaded = .{
-            .text = "",
-            .bytes = 0,
-            .lines = 0,
-            .document = .{ .files = &.{testFileWithHunks()} },
-        } },
+        .load_state = .{ .loaded = testLoadedDiffOne() },
         .display_mode = .unified,
         .selected_hunk = 1,
     };
@@ -916,12 +925,7 @@ test "mode toggle keeps selected hunk visible" {
 test "mode change resyncs search match to rendered body offsets" {
     var app: App = .{
         .terminal_size = .{ .width = 140, .height = 12 },
-        .load_state = .{ .loaded = .{
-            .text = "",
-            .bytes = 0,
-            .lines = 0,
-            .document = .{ .files = &.{testFileWithHunks()} },
-        } },
+        .load_state = .{ .loaded = testLoadedDiffOne() },
         .display_mode = .unified,
     };
     setSearchQuery(&app, "late new");
@@ -941,12 +945,7 @@ test "mode change resyncs search match to rendered body offsets" {
 test "mode change keeps search near later matches" {
     var app: App = .{
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load_state = .{ .loaded = .{
-            .text = "",
-            .bytes = 0,
-            .lines = 0,
-            .document = .{ .files = &.{testFileWithHunks()} },
-        } },
+        .load_state = .{ .loaded = testLoadedDiffOne() },
         .display_mode = .unified,
     };
     setSearchQuery(&app, "new");
@@ -967,12 +966,7 @@ test "mode change keeps search near later matches" {
 test "file change resyncs retained search query to selected file" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load_state = .{ .loaded = .{
-            .text = "",
-            .bytes = 0,
-            .lines = 0,
-            .document = .{ .files = &.{ testFileWithHunks(), testFileWithTargetMetadata() } },
-        } },
+        .load_state = .{ .loaded = testLoadedDiffTwo() },
         .display_mode = .unified,
     };
     setSearchQuery(&app, "target");
@@ -991,12 +985,7 @@ test "search match marker is drawn on visible match row" {
 
     const app: App = .{
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load_state = .{ .loaded = .{
-            .text = "",
-            .bytes = 0,
-            .lines = 0,
-            .document = .{ .files = &.{testFileWithHunks()} },
-        } },
+        .load_state = .{ .loaded = testLoadedDiffOne() },
         .search_match = 4,
         .diff_scroll = 3,
     };
@@ -1013,12 +1002,7 @@ test "search marker gutter does not overwrite diff content" {
 
     const app: App = .{
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load_state = .{ .loaded = .{
-            .text = "",
-            .bytes = 0,
-            .lines = 0,
-            .document = .{ .files = &.{testFileWithHunks()} },
-        } },
+        .load_state = .{ .loaded = testLoadedDiffOne() },
         .search_match = 0,
     };
 
@@ -1035,12 +1019,7 @@ test "status mode label uses diff content width after marker gutter" {
 
     const app: App = .{
         .terminal_size = .{ .width = 72, .height = 9 },
-        .load_state = .{ .loaded = .{
-            .text = "",
-            .bytes = 0,
-            .lines = 0,
-            .document = .{ .files = &.{testFileWithHunks()} },
-        } },
+        .load_state = .{ .loaded = testLoadedDiffOne() },
         .display_mode = .side_by_side,
     };
 
@@ -1058,12 +1037,7 @@ test "search input header does not show no match before submit" {
 
     var app: App = .{
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load_state = .{ .loaded = .{
-            .text = "",
-            .bytes = 0,
-            .lines = 0,
-            .document = .{ .files = &.{testFileWithHunks()} },
-        } },
+        .load_state = .{ .loaded = testLoadedDiffOne() },
         .search_mode = true,
     };
     setSearchInput(&app, "missing");
@@ -1078,12 +1052,7 @@ test "search input header does not show no match before submit" {
 test "canceling edited search restores committed query and match" {
     var app: App = .{
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load_state = .{ .loaded = .{
-            .text = "",
-            .bytes = 0,
-            .lines = 0,
-            .document = .{ .files = &.{testFileWithHunks()} },
-        } },
+        .load_state = .{ .loaded = testLoadedDiffOne() },
         .search_match = 7,
     };
     setSearchQuery(&app, "new");
@@ -1109,49 +1078,97 @@ fn setSearchInput(app: *App, query: []const u8) void {
     app.search_input.len = query.len;
 }
 
-fn testFileWithHunks() diff_parser.FileDiff {
+fn testLoadedDiffOne() LoadedDiff {
     return .{
-        .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
-        .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
-        .hunks = &.{
-            .{
-                .old_start = 1,
-                .old_count = 5,
-                .new_start = 1,
-                .new_count = 5,
-                .section = "first",
-                .lines = &.{
-                    .{ .kind = .context, .text = "one", .old_line = 1, .new_line = 1 },
-                    .{ .kind = .context, .text = "two", .old_line = 2, .new_line = 2 },
-                    .{ .kind = .removed, .text = "old", .old_line = 3 },
-                    .{ .kind = .added, .text = "new", .new_line = 3 },
-                    .{ .kind = .context, .text = "four", .old_line = 4, .new_line = 4 },
-                },
-            },
-            .{
-                .old_start = 20,
-                .old_count = 3,
-                .new_start = 20,
-                .new_count = 3,
-                .section = "second",
-                .lines = &.{
-                    .{ .kind = .context, .text = "late one", .old_line = 20, .new_line = 20 },
-                    .{ .kind = .removed, .text = "late old", .old_line = 21 },
-                    .{ .kind = .added, .text = "late new", .new_line = 21 },
-                },
-            },
-        },
+        .text = "",
+        .document = .{ .files = &test_files_one },
+        .tree = .{ .nodes = &test_tree_one_nodes },
+        .bytes = 0,
+        .lines = 0,
     };
 }
 
-fn testFileWithTargetMetadata() diff_parser.FileDiff {
+fn testLoadedDiffTwo() LoadedDiff {
     return .{
-        .header = "diff --git a/b b/b",
-        .old_path = "a/b",
-        .new_path = "b/b",
-        .metadata = &.{"target metadata"},
-        .hunks = &.{},
+        .text = "",
+        .document = .{ .files = &test_files_two },
+        .tree = .{ .nodes = &test_tree_two_nodes },
+        .bytes = 0,
+        .lines = 0,
     };
+}
+
+const test_tree_one_nodes = [_]file_tree.Node{
+    .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .file_index = 0 },
+};
+
+const test_tree_two_nodes = [_]file_tree.Node{
+    .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .file_index = 0 },
+    .{ .kind = .file, .name = "b", .path = "b", .depth = 0, .file_index = 1 },
+};
+
+const test_files_one = [_]diff_parser.FileDiff{
+    test_file_with_hunks,
+};
+
+const test_files_two = [_]diff_parser.FileDiff{
+    test_file_with_hunks,
+    test_file_with_target_metadata,
+};
+
+const test_file_with_hunks = diff_parser.FileDiff{
+    .header = "diff --git a/a b/a",
+    .old_path = "a/a",
+    .new_path = "b/a",
+    .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
+    .hunks = &test_hunks,
+};
+
+const test_hunks = [_]diff_parser.Hunk{
+    .{
+        .old_start = 1,
+        .old_count = 5,
+        .new_start = 1,
+        .new_count = 5,
+        .section = "first",
+        .lines = &test_hunk_first_lines,
+    },
+    .{
+        .old_start = 20,
+        .old_count = 3,
+        .new_start = 20,
+        .new_count = 3,
+        .section = "second",
+        .lines = &test_hunk_second_lines,
+    },
+};
+
+const test_hunk_first_lines = [_]diff_parser.DiffLine{
+    .{ .kind = .context, .text = "one", .old_line = 1, .new_line = 1 },
+    .{ .kind = .context, .text = "two", .old_line = 2, .new_line = 2 },
+    .{ .kind = .removed, .text = "old", .old_line = 3 },
+    .{ .kind = .added, .text = "new", .new_line = 3 },
+    .{ .kind = .context, .text = "four", .old_line = 4, .new_line = 4 },
+};
+
+const test_hunk_second_lines = [_]diff_parser.DiffLine{
+    .{ .kind = .context, .text = "late one", .old_line = 20, .new_line = 20 },
+    .{ .kind = .removed, .text = "late old", .old_line = 21 },
+    .{ .kind = .added, .text = "late new", .new_line = 21 },
+};
+
+const test_file_with_target_metadata = diff_parser.FileDiff{
+    .header = "diff --git a/b b/b",
+    .old_path = "a/b",
+    .new_path = "b/b",
+    .metadata = &.{"target metadata"},
+    .hunks = &.{},
+};
+
+fn testFileWithHunks() diff_parser.FileDiff {
+    return test_file_with_hunks;
+}
+
+fn testFileWithTargetMetadata() diff_parser.FileDiff {
+    return test_file_with_target_metadata;
 }
