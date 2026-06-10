@@ -16,6 +16,7 @@ pub const App = struct {
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
     load_state: LoadState = .idle,
     selected_file: usize = 0,
+    selected_node: usize = 0,
     sidebar_scroll: usize = 0,
     focus: Focus = .sidebar,
     diff_scroll: usize = 0,
@@ -36,6 +37,9 @@ pub const App = struct {
         diff_loaded: DiffLoadFinished,
         select_previous_file,
         select_next_file,
+        toggle_directory,
+        expand_directory,
+        collapse_or_parent_directory,
         scroll_diff_up,
         scroll_diff_down,
         page_diff_up,
@@ -77,6 +81,9 @@ pub const App = struct {
             .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
+            .toggle_directory => try self.toggleSelectedDirectory(),
+            .expand_directory => self.expandSelectedDirectory(),
+            .collapse_or_parent_directory => self.collapseOrSelectParentDirectory(),
             .scroll_diff_up => self.scrollDiff(-1),
             .scroll_diff_down => self.scrollDiff(1),
             .page_diff_up => self.pageDiff(-1),
@@ -153,6 +160,9 @@ pub const App = struct {
         if (key.matches(chasen.Key.page_down, .{})) return .page_diff_down;
         if (key.matches(chasen.Key.home, .{})) return .select_first_file;
         if (key.matches(chasen.Key.end, .{})) return .select_last_file;
+        if (self.focus == .sidebar and key.matches(chasen.Key.enter, .{})) return .toggle_directory;
+        if (self.focus == .sidebar and key.matches(chasen.Key.right, .{})) return .expand_directory;
+        if (self.focus == .sidebar and key.matches(chasen.Key.left, .{})) return .collapse_or_parent_directory;
 
         return switch (key.codepoint) {
             'k', chasen.Key.up => if (self.focus == .diff) .scroll_diff_up else .select_previous_file,
@@ -241,16 +251,18 @@ pub const App = struct {
         if (size.height <= sidebar_header_rows) return;
 
         const visible_rows: usize = size.height - sidebar_header_rows;
-        const start = @min(self.sidebar_scroll, loaded.tree.nodes.len);
-        const end = @min(start + visible_rows, loaded.tree.nodes.len);
+        const visible_count = loaded.tree.visibleNodeCount(&loaded.collapsed_dirs);
+        const start = @min(self.sidebar_scroll, visible_count);
+        const end = @min(start + visible_rows, visible_count);
         var row: u16 = sidebar_header_rows;
-        var index: usize = start;
-        while (index < end) : ({
-            index += 1;
+        var visible_index: usize = start;
+        while (visible_index < end) : ({
+            visible_index += 1;
             row += 1;
         }) {
+            const index = loaded.tree.visibleNodeAt(&loaded.collapsed_dirs, visible_index) orelse continue;
             const node = loaded.tree.nodes[index];
-            const selected = node.file_index != null and node.file_index.? == self.selected_file;
+            const selected = index == self.selected_node;
             const style: chasen.TextStyle = if (selected)
                 .{ .reverse = true, .bold = true }
             else if (node.kind == .directory)
@@ -262,7 +274,12 @@ pub const App = struct {
 
             const stats_width: u16 = if (surface.size().width > 12) 11 else 0;
             const indent: u16 = node.depth *| 2;
-            const name_col: u16 = 2 +| indent;
+            const fold_width: u16 = if (node.kind == .directory) 2 else 0;
+            const name_col: u16 = 2 +| indent +| fold_width;
+            if (node.kind == .directory and surface.size().width > 2 + indent) {
+                const fold_marker = if (file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) "▸" else "▾";
+                _ = surface.borrowTextAt(2 + indent, row, fold_marker, style);
+            }
             if (surface.size().width > name_col + stats_width) {
                 var path_area = surface.child(.{
                     .col = name_col,
@@ -270,11 +287,7 @@ pub const App = struct {
                     .width = surface.size().width - name_col - stats_width,
                     .height = 1,
                 });
-                const label = if (node.kind == .directory)
-                    std.fmt.allocPrint(surface.frameAllocator(), "{s}/", .{node.name}) catch node.name
-                else
-                    node.name;
-                _ = try path_area.copyTextAt(0, 0, label, style);
+                _ = try path_area.copyTextAt(0, 0, node.name, style);
             }
             if (surface.size().width > 12) {
                 _ = try surface.printAt(surface.size().width - 10, row, style, "+{d} -{d}", .{ node.stats.added, node.stats.removed });
@@ -457,7 +470,11 @@ pub const App = struct {
                     .text = copied,
                     .document = document,
                     .tree = tree,
+                    .collapsed_dirs = .empty,
                 } };
+                if (tree.selectedNodeIndex(self.selected_file)) |node_index| {
+                    self.selected_node = node_index;
+                }
                 self.clampSelection(document.files.len);
                 self.clampDiffNavigation();
                 self.resyncSearchMatch();
@@ -485,23 +502,20 @@ pub const App = struct {
     }
 
     fn selectFileDelta(self: *App, delta: i2) void {
-        const file_count = switch (self.load_state) {
-            .loaded => |loaded| loaded.document.files.len,
+        const loaded = switch (self.load_state) {
+            .loaded => |*loaded| loaded,
             else => return,
         };
-        if (file_count == 0) return;
+        if (loaded.document.files.len == 0 or loaded.tree.nodes.len == 0) return;
 
-        const previous_file = self.selected_file;
         if (delta < 0) {
-            if (self.selected_file > 0) self.selected_file -= 1;
-        } else if (self.selected_file + 1 < file_count) {
-            self.selected_file += 1;
+            if (loaded.tree.previousVisibleNodeIndex(&loaded.collapsed_dirs, self.selected_node)) |previous| {
+                self.selectSidebarNode(loaded, previous);
+            }
+        } else if (loaded.tree.nextVisibleNodeIndex(&loaded.collapsed_dirs, self.selected_node)) |next| {
+            self.selectSidebarNode(loaded, next);
         }
-        if (self.selected_file != previous_file) {
-            self.resetDiffPosition();
-            self.resyncSearchMatch();
-        }
-        self.clampSelection(file_count);
+        self.clampSelection(loaded.document.files.len);
         self.clampDiffNavigation();
     }
 
@@ -509,8 +523,17 @@ pub const App = struct {
         const file_count = self.loadedFileCount() orelse return;
         if (file_count == 0) return;
         const target = @min(index, file_count - 1);
-        if (self.selected_file == target) return;
+        if (self.selected_file == target) {
+            if (self.loadedDiff()) |loaded| {
+                if (loaded.tree.selectedNodeIndex(self.selected_file)) |node_index| self.selected_node = node_index;
+            }
+            self.clampSelection(file_count);
+            return;
+        }
         self.selected_file = target;
+        if (self.loadedDiff()) |loaded| {
+            if (loaded.tree.selectedNodeIndex(self.selected_file)) |node_index| self.selected_node = node_index;
+        }
         self.resetDiffPosition();
         self.resyncSearchMatch();
         self.clampSelection(file_count);
@@ -521,6 +544,53 @@ pub const App = struct {
         const file_count = self.loadedFileCount() orelse return;
         if (file_count == 0) return;
         self.selectFileAbsolute(file_count - 1);
+    }
+
+    fn selectSidebarNode(self: *App, loaded: *LoadedDiff, node_index: usize) void {
+        if (node_index >= loaded.tree.nodes.len) return;
+        const previous_file = self.selected_file;
+        self.selected_node = node_index;
+        if (loaded.tree.nodes[node_index].file_index) |file_index| {
+            self.selected_file = file_index;
+            if (self.selected_file != previous_file) {
+                self.resetDiffPosition();
+                self.resyncSearchMatch();
+            }
+        }
+    }
+
+    fn toggleSelectedDirectory(self: *App) !void {
+        const loaded = self.loadedDiff() orelse return;
+        if (self.selected_node >= loaded.tree.nodes.len) return;
+        const node = loaded.tree.nodes[self.selected_node];
+        if (node.kind != .directory) return;
+        const allocator = self.loadArenaAllocator() orelse return;
+        try file_tree.toggle(allocator, &loaded.collapsed_dirs, node.path);
+        self.clampSelection(loaded.document.files.len);
+    }
+
+    fn expandSelectedDirectory(self: *App) void {
+        const loaded = self.loadedDiff() orelse return;
+        if (self.selected_node >= loaded.tree.nodes.len) return;
+        const node = loaded.tree.nodes[self.selected_node];
+        if (node.kind != .directory) return;
+        file_tree.expand(&loaded.collapsed_dirs, node.path);
+        self.clampSelection(loaded.document.files.len);
+    }
+
+    fn collapseOrSelectParentDirectory(self: *App) void {
+        const loaded = self.loadedDiff() orelse return;
+        if (self.selected_node >= loaded.tree.nodes.len) return;
+        const node = loaded.tree.nodes[self.selected_node];
+        if (node.kind == .directory and !file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) {
+            file_tree.collapse(self.loadArenaAllocator() orelse return, &loaded.collapsed_dirs, node.path) catch return;
+            self.clampSelection(loaded.document.files.len);
+            return;
+        }
+        if (parentDirectoryNodeIndex(loaded.tree, self.selected_node)) |parent| {
+            self.selected_node = parent;
+            self.clampSelection(loaded.document.files.len);
+        }
     }
 
     fn scrollDiff(self: *App, delta: i2) void {
@@ -695,11 +765,22 @@ pub const App = struct {
     fn clampSelection(self: *App, file_count: usize) void {
         if (file_count == 0) {
             self.selected_file = 0;
+            self.selected_node = 0;
             self.sidebar_scroll = 0;
             return;
         }
         if (self.selected_file >= file_count) self.selected_file = file_count - 1;
-        const selected_row = self.selectedSidebarRow() orelse self.selected_file;
+        if (self.loadedDiff()) |loaded| {
+            if (self.selected_node >= loaded.tree.nodes.len) {
+                self.selected_node = loaded.tree.selectedNodeIndex(self.selected_file) orelse 0;
+            }
+            if (loaded.tree.visibleAncestorOrSelf(&loaded.collapsed_dirs, self.selected_node)) |visible_node| {
+                self.selected_node = visible_node;
+            } else if (loaded.tree.selectedNodeIndex(self.selected_file)) |file_node| {
+                self.selected_node = file_node;
+            }
+        }
+        const selected_row = self.selectedSidebarRow() orelse self.selected_node;
         if (self.sidebar_scroll > selected_row) self.sidebar_scroll = selected_row;
         const body_height = terminalBodyHeight(self.terminal_size.height);
         const visible_rows: usize = if (body_height > sidebar_header_rows)
@@ -713,9 +794,21 @@ pub const App = struct {
 
     fn selectedSidebarRow(self: *const App) ?usize {
         return switch (self.load_state) {
-            .loaded => |loaded| loaded.tree.selectedNodeIndex(self.selected_file),
+            .loaded => |loaded| loaded.tree.visibleRowOfNode(&loaded.collapsed_dirs, self.selected_node),
             else => null,
         };
+    }
+
+    fn loadedDiff(self: *App) ?*LoadedDiff {
+        return switch (self.load_state) {
+            .loaded => |*loaded| loaded,
+            else => null,
+        };
+    }
+
+    fn loadArenaAllocator(self: *App) ?std.mem.Allocator {
+        if (self.load_arena) |*arena| return arena.allocator();
+        return null;
     }
 };
 
@@ -726,6 +819,7 @@ const diff_body_start_row: u16 = 3;
 const footer_sidebar_items = [_]chasen.key_hint.Item{
     chasen.key_hint.item("Tab", "focus"),
     chasen.key_hint.item("↑/↓/j/k", "move"),
+    chasen.key_hint.item("Enter/←/→", "fold"),
     chasen.key_hint.item("/", "search"),
     chasen.key_hint.item("n/p", "hunk/search"),
     chasen.key_hint.item("u", "mode"),
@@ -830,6 +924,7 @@ const LoadedDiff = struct {
     text: []const u8,
     document: diff_parser.DiffDocument,
     tree: file_tree.FileTree,
+    collapsed_dirs: file_tree.CollapsedSet = .empty,
     bytes: usize,
     lines: usize,
 };
@@ -874,6 +969,25 @@ fn countLines(bytes: []const u8) usize {
         if (byte == '\n') count += 1;
     }
     return count;
+}
+
+fn parentDirectoryNodeIndex(tree: file_tree.FileTree, node_index: usize) ?usize {
+    if (node_index >= tree.nodes.len) return null;
+    const node = tree.nodes[node_index];
+    var index = node_index;
+    while (index > 0) {
+        index -= 1;
+        const candidate = tree.nodes[index];
+        if (candidate.kind != .directory) continue;
+        if (candidate.depth >= node.depth) continue;
+        if (node.path.len > candidate.path.len and
+            std.mem.startsWith(u8, node.path, candidate.path) and
+            node.path[candidate.path.len] == '/')
+        {
+            return index;
+        }
+    }
+    return null;
 }
 
 test "countLines handles empty and trailing newline inputs" {
@@ -976,6 +1090,45 @@ test "file change resyncs retained search query to selected file" {
     try std.testing.expectEqual(@as(usize, 1), app.selected_file);
     try std.testing.expectEqual(@as(?usize, 0), app.search_match);
     try std.testing.expectEqual(@as(usize, 0), app.diff_scroll);
+}
+
+test "sidebar navigation can select directories without changing selected file" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load_state = .{ .loaded = testLoadedDiffNested() },
+        .selected_file = 0,
+        .selected_node = 1,
+    };
+
+    app.selectFileDelta(-1);
+    try std.testing.expectEqual(@as(usize, 0), app.selected_node);
+    try std.testing.expectEqual(@as(usize, 0), app.selected_file);
+
+    app.selectFileDelta(1);
+    try std.testing.expectEqual(@as(usize, 1), app.selected_node);
+    try std.testing.expectEqual(@as(usize, 0), app.selected_file);
+
+    app.selectFileDelta(1);
+    try std.testing.expectEqual(@as(usize, 2), app.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
+}
+
+test "toggling selected directory collapses visible descendants" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load_arena = .init(std.testing.allocator),
+        .load_state = .{ .loaded = testLoadedDiffNested() },
+        .selected_file = 0,
+        .selected_node = 0,
+    };
+    defer app.clearLoadedDiff();
+
+    try app.toggleSelectedDirectory();
+
+    const loaded = app.load_state.loaded;
+    try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
+    try std.testing.expectEqual(@as(usize, 1), loaded.tree.visibleNodeCount(&loaded.collapsed_dirs));
+    try std.testing.expectEqual(@as(usize, 0), app.selected_node);
 }
 
 test "search match marker is drawn on visible match row" {
@@ -1083,6 +1236,7 @@ fn testLoadedDiffOne() LoadedDiff {
         .text = "",
         .document = .{ .files = &test_files_one },
         .tree = .{ .nodes = &test_tree_one_nodes },
+        .collapsed_dirs = .{},
         .bytes = 0,
         .lines = 0,
     };
@@ -1093,6 +1247,18 @@ fn testLoadedDiffTwo() LoadedDiff {
         .text = "",
         .document = .{ .files = &test_files_two },
         .tree = .{ .nodes = &test_tree_two_nodes },
+        .collapsed_dirs = .{},
+        .bytes = 0,
+        .lines = 0,
+    };
+}
+
+fn testLoadedDiffNested() LoadedDiff {
+    return .{
+        .text = "",
+        .document = .{ .files = &test_files_two },
+        .tree = .{ .nodes = &test_tree_nested_nodes },
+        .collapsed_dirs = .{},
         .bytes = 0,
         .lines = 0,
     };
@@ -1105,6 +1271,12 @@ const test_tree_one_nodes = [_]file_tree.Node{
 const test_tree_two_nodes = [_]file_tree.Node{
     .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .file_index = 0 },
     .{ .kind = .file, .name = "b", .path = "b", .depth = 0, .file_index = 1 },
+};
+
+const test_tree_nested_nodes = [_]file_tree.Node{
+    .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
+    .{ .kind = .file, .name = "a", .path = "src/a", .depth = 1, .file_index = 0 },
+    .{ .kind = .file, .name = "b", .path = "src/b", .depth = 1, .file_index = 1 },
 };
 
 const test_files_one = [_]diff_parser.FileDiff{

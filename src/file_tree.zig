@@ -2,6 +2,8 @@ const std = @import("std");
 
 const diff_parser = @import("diff_parser.zig");
 
+pub const CollapsedSet = std.StringHashMapUnmanaged(void);
+
 pub const Stats = struct {
     added: usize = 0,
     removed: usize = 0,
@@ -34,6 +36,75 @@ pub const FileTree = struct {
             if (node.file_index == file_index) return index;
         }
         return null;
+    }
+
+    pub fn visibleNodeCount(self: FileTree, collapsed: *const CollapsedSet) usize {
+        var count: usize = 0;
+        for (self.nodes, 0..) |_, index| {
+            if (self.isVisible(index, collapsed)) count += 1;
+        }
+        return count;
+    }
+
+    pub fn visibleNodeAt(self: FileTree, collapsed: *const CollapsedSet, visible_index: usize) ?usize {
+        var visible_count: usize = 0;
+        for (self.nodes, 0..) |_, index| {
+            if (!self.isVisible(index, collapsed)) continue;
+            if (visible_count == visible_index) return index;
+            visible_count += 1;
+        }
+        return null;
+    }
+
+    pub fn visibleRowOfNode(self: FileTree, collapsed: *const CollapsedSet, node_index: usize) ?usize {
+        if (node_index >= self.nodes.len or !self.isVisible(node_index, collapsed)) return null;
+
+        var visible_count: usize = 0;
+        for (self.nodes, 0..) |_, index| {
+            if (!self.isVisible(index, collapsed)) continue;
+            if (index == node_index) return visible_count;
+            visible_count += 1;
+        }
+        return null;
+    }
+
+    pub fn nextVisibleNodeIndex(self: FileTree, collapsed: *const CollapsedSet, node_index: usize) ?usize {
+        var index = node_index + 1;
+        while (index < self.nodes.len) : (index += 1) {
+            if (self.isVisible(index, collapsed)) return index;
+        }
+        return null;
+    }
+
+    pub fn previousVisibleNodeIndex(self: FileTree, collapsed: *const CollapsedSet, node_index: usize) ?usize {
+        var index = node_index;
+        while (index > 0) {
+            index -= 1;
+            if (self.isVisible(index, collapsed)) return index;
+        }
+        return null;
+    }
+
+    pub fn visibleAncestorOrSelf(self: FileTree, collapsed: *const CollapsedSet, node_index: usize) ?usize {
+        if (node_index >= self.nodes.len) return null;
+        if (self.isVisible(node_index, collapsed)) return node_index;
+
+        const node = self.nodes[node_index];
+        var index = node_index;
+        while (index > 0) {
+            index -= 1;
+            const candidate = self.nodes[index];
+            if (candidate.kind != .directory) continue;
+            if (candidate.depth >= node.depth) continue;
+            if (!isPathAncestor(candidate.path, node.path)) continue;
+            if (self.isVisible(index, collapsed)) return index;
+        }
+        return null;
+    }
+
+    pub fn isVisible(self: FileTree, node_index: usize, collapsed: *const CollapsedSet) bool {
+        if (node_index >= self.nodes.len) return false;
+        return !hasCollapsedAncestor(self.nodes[node_index].path, collapsed);
     }
 };
 
@@ -128,6 +199,41 @@ fn stripGitPathPrefix(path: []const u8) []const u8 {
     return path;
 }
 
+pub fn isCollapsed(collapsed: *const CollapsedSet, path: []const u8) bool {
+    return collapsed.contains(path);
+}
+
+pub fn collapse(allocator: std.mem.Allocator, collapsed: *CollapsedSet, path: []const u8) !void {
+    try collapsed.put(allocator, path, {});
+}
+
+pub fn expand(collapsed: *CollapsedSet, path: []const u8) void {
+    _ = collapsed.remove(path);
+}
+
+pub fn toggle(allocator: std.mem.Allocator, collapsed: *CollapsedSet, path: []const u8) !void {
+    if (isCollapsed(collapsed, path)) {
+        expand(collapsed, path);
+    } else {
+        try collapse(allocator, collapsed, path);
+    }
+}
+
+fn hasCollapsedAncestor(path: []const u8, collapsed: *const CollapsedSet) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, path, start, '/')) |slash| {
+        if (slash > 0 and collapsed.contains(path[0..slash])) return true;
+        start = slash + 1;
+    }
+    return false;
+}
+
+fn isPathAncestor(ancestor: []const u8, path: []const u8) bool {
+    return path.len > ancestor.len and
+        std.mem.startsWith(u8, path, ancestor) and
+        path[ancestor.len] == '/';
+}
+
 test "build creates directory and file nodes with aggregate stats" {
     const text =
         \\diff --git a/src/main.zig b/src/main.zig
@@ -175,4 +281,27 @@ test "selectedNodeIndex maps file index to tree row" {
 
     try std.testing.expectEqual(@as(?usize, 1), tree.selectedNodeIndex(0));
     try std.testing.expectEqual(@as(?usize, null), tree.selectedNodeIndex(1));
+}
+
+test "collapsed directory hides descendants but remains visible" {
+    const nodes = [_]Node{
+        .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
+        .{ .kind = .file, .name = "main.zig", .path = "src/main.zig", .depth = 1, .file_index = 0 },
+        .{ .kind = .directory, .name = "test", .path = "test", .depth = 0 },
+        .{ .kind = .file, .name = "main.zig", .path = "test/main.zig", .depth = 1, .file_index = 1 },
+    };
+    const tree = FileTree{ .nodes = &nodes };
+    var collapsed: CollapsedSet = .empty;
+    defer collapsed.deinit(std.testing.allocator);
+
+    try collapse(std.testing.allocator, &collapsed, "src");
+
+    try std.testing.expect(tree.isVisible(0, &collapsed));
+    try std.testing.expect(!tree.isVisible(1, &collapsed));
+    try std.testing.expect(tree.isVisible(2, &collapsed));
+    try std.testing.expect(tree.isVisible(3, &collapsed));
+    try std.testing.expectEqual(@as(usize, 3), tree.visibleNodeCount(&collapsed));
+    try std.testing.expectEqual(@as(?usize, 0), tree.visibleNodeAt(&collapsed, 0));
+    try std.testing.expectEqual(@as(?usize, 2), tree.visibleNodeAt(&collapsed, 1));
+    try std.testing.expectEqual(@as(?usize, 0), tree.visibleAncestorOrSelf(&collapsed, 1));
 }
