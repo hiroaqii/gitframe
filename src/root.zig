@@ -337,27 +337,47 @@ pub const App = struct {
         const width = surface.size().width;
         if (width == 0) return;
 
-        var col: u16 = 0;
         if (self.search_mode) {
             _ = surface.borrowTextAt(0, 0, "/", .{ .fg = .{ .index = 11 }, .bold = true });
             _ = surface.copyTextAt(1, 0, self.search_input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
             return;
         }
 
+        var col: u16 = 0;
         _ = surface.borrowTextAt(col, 0, "gitframe", .{ .bold = true });
         col +|= 9;
         _ = surface.borrowTextAt(col, 0, "viewer shell", .{ .fg = .gray });
         col +|= 13;
-        _ = surface.borrowTextAt(col, 0, "Tab focus  j/k move  / search  n/p hunk/search  u mode  r reload  q quit", .{ .fg = .gray });
 
         const size_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
             self.terminal_size.width,
             self.terminal_size.height,
         }) catch return;
         const size_width: u16 = @intCast(@min(chasen.text.displayWidth(size_text), std.math.maxInt(u16)));
+        const reserved_size_width: u16 = if (width > size_width + 1) size_width + 1 else 0;
+        if (width > col + reserved_size_width) {
+            var hint_area = surface.child(.{
+                .col = col,
+                .row = 0,
+                .width = width - col - reserved_size_width,
+                .height = 1,
+            });
+            _ = chasen.key_hint.draw(&hint_area, 0, 0, self.footerItems(), .{
+                .style = .{ .fg = .gray },
+                .key_style = .{ .bold = true, .fg = .gray },
+            });
+        }
+
         if (width > size_width + 1) {
             _ = surface.copyTextAt(width - size_width, 0, size_text, .{ .fg = .gray }) catch {};
         }
+    }
+
+    fn footerItems(self: *const App) []const chasen.key_hint.Item {
+        return switch (self.focus) {
+            .sidebar => &footer_sidebar_items,
+            .diff => &footer_diff_items,
+        };
     }
 
     fn drawSearchMatchMarker(self: *const App, surface: *chasen.Surface) void {
@@ -684,6 +704,26 @@ pub const App = struct {
 const footer_rows: u16 = 1;
 const sidebar_header_rows: u16 = 3;
 const diff_body_start_row: u16 = 3;
+
+const footer_sidebar_items = [_]chasen.key_hint.Item{
+    chasen.key_hint.item("Tab", "focus"),
+    chasen.key_hint.item("↑/↓/j/k", "move"),
+    chasen.key_hint.item("/", "search"),
+    chasen.key_hint.item("n/p", "hunk/search"),
+    chasen.key_hint.item("u", "mode"),
+    chasen.key_hint.item("r", "reload"),
+    chasen.key_hint.item("q", "quit"),
+};
+
+const footer_diff_items = [_]chasen.key_hint.Item{
+    chasen.key_hint.item("Tab", "focus"),
+    chasen.key_hint.item("↑/↓/j/k", "scroll"),
+    chasen.key_hint.item("/", "search"),
+    chasen.key_hint.item("n/p", "hunk/search"),
+    chasen.key_hint.item("u", "mode"),
+    chasen.key_hint.item("r", "reload"),
+    chasen.key_hint.item("q", "quit"),
+};
 
 fn diffContentSurface(surface: *chasen.Surface) chasen.Surface {
     const size = surface.size();
