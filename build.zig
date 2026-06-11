@@ -8,12 +8,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const chasen_ui_dep = b.dependency("chasen_ui", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const mod = b.addModule("gitframe", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{
             .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+            .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
         },
     });
 
@@ -26,6 +31,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "gitframe", .module = mod },
                 .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+                .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
             },
         }),
     });

@@ -1,5 +1,6 @@
 const std = @import("std");
 const chasen = @import("chasen");
+const ui = @import("chasen_ui");
 const diff_parser = @import("diff_parser.zig");
 const diff_render = @import("diff_render.zig");
 const diff_search = @import("diff_search.zig");
@@ -383,7 +384,7 @@ pub const App = struct {
                 .width = width - col - reserved_size_width,
                 .height = 1,
             });
-            _ = chasen.key_hint.draw(&hint_area, 0, 0, self.footerItems(), .{
+            _ = ui.key_hint.draw(&hint_area, 0, 0, self.footerItems(), .{
                 .style = .{ .fg = .gray },
                 .key_style = .{ .bold = true, .fg = .gray },
             });
@@ -394,7 +395,7 @@ pub const App = struct {
         }
     }
 
-    fn footerItems(self: *const App) []const chasen.key_hint.Item {
+    fn footerItems(self: *const App) []const ui.key_hint.Item {
         return switch (self.focus) {
             .sidebar => &footer_sidebar_items,
             .diff => &footer_diff_items,
@@ -816,25 +817,25 @@ const footer_rows: u16 = 1;
 const sidebar_header_rows: u16 = 3;
 const diff_body_start_row: u16 = 3;
 
-const footer_sidebar_items = [_]chasen.key_hint.Item{
-    chasen.key_hint.item("Tab", "focus"),
-    chasen.key_hint.item("↑/↓/j/k", "move"),
-    chasen.key_hint.item("Enter/←/→", "fold"),
-    chasen.key_hint.item("/", "search"),
-    chasen.key_hint.item("n/p", "hunk/search"),
-    chasen.key_hint.item("u", "mode"),
-    chasen.key_hint.item("r", "reload"),
-    chasen.key_hint.item("q", "quit"),
+const footer_sidebar_items = [_]ui.key_hint.Item{
+    ui.key_hint.item("Tab", "focus"),
+    ui.key_hint.item("↑/↓/j/k", "move"),
+    ui.key_hint.item("Enter/←/→", "fold"),
+    ui.key_hint.item("/", "search"),
+    ui.key_hint.item("n/p", "hunk/search"),
+    ui.key_hint.item("u", "mode"),
+    ui.key_hint.item("r", "reload"),
+    ui.key_hint.item("q", "quit"),
 };
 
-const footer_diff_items = [_]chasen.key_hint.Item{
-    chasen.key_hint.item("Tab", "focus"),
-    chasen.key_hint.item("↑/↓/j/k", "scroll"),
-    chasen.key_hint.item("/", "search"),
-    chasen.key_hint.item("n/p", "hunk/search"),
-    chasen.key_hint.item("u", "mode"),
-    chasen.key_hint.item("r", "reload"),
-    chasen.key_hint.item("q", "quit"),
+const footer_diff_items = [_]ui.key_hint.Item{
+    ui.key_hint.item("Tab", "focus"),
+    ui.key_hint.item("↑/↓/j/k", "scroll"),
+    ui.key_hint.item("/", "search"),
+    ui.key_hint.item("n/p", "hunk/search"),
+    ui.key_hint.item("u", "mode"),
+    ui.key_hint.item("r", "reload"),
+    ui.key_hint.item("q", "quit"),
 };
 
 fn diffContentSurface(surface: *chasen.Surface) chasen.Surface {
