@@ -44,18 +44,9 @@ fn bodyLineMatches(file: diff_parser.FileDiff, mode: diff_render.DisplayMode, ta
                 }
             },
             .side_by_side => {
-                var index: usize = 0;
-                while (index < hunk.lines.len) {
-                    const line = hunk.lines[index];
-                    if (line.kind == .removed and index + 1 < hunk.lines.len and hunk.lines[index + 1].kind == .added) {
-                        if (offset == target) {
-                            return containsIgnoreCase(line.text, query) or containsIgnoreCase(hunk.lines[index + 1].text, query);
-                        }
-                        index += 2;
-                    } else {
-                        if (offset == target) return containsIgnoreCase(line.text, query);
-                        index += 1;
-                    }
+                var rows = diff_render.SideBySideIterator.init(hunk.lines);
+                while (rows.next()) |row| {
+                    if (offset == target) return sideBySideRowMatches(row, query);
                     offset += 1;
                 }
             },
@@ -63,6 +54,14 @@ fn bodyLineMatches(file: diff_parser.FileDiff, mode: diff_render.DisplayMode, ta
     }
 
     return false;
+}
+
+fn sideBySideRowMatches(row: diff_render.SideBySideRow, query: []const u8) bool {
+    return switch (row) {
+        .single => |line| containsIgnoreCase(line.text, query),
+        .paired => |pair| (if (pair.removed) |line| containsIgnoreCase(line.text, query) else false) or
+            (if (pair.added) |line| containsIgnoreCase(line.text, query) else false),
+    };
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -89,6 +88,31 @@ test "search match checks both sides of side-by-side pairs" {
 
     try std.testing.expectEqual(@as(?usize, 6), findMatch(file, .side_by_side, "new", 0, .forward));
     try std.testing.expectEqual(@as(?usize, 6), findMatch(file, .side_by_side, "old", 0, .forward));
+}
+
+test "search match follows side-by-side block pairing" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 2,
+                .new_start = 1,
+                .new_count = 2,
+                .section = "block",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old one", .old_line = 1 },
+                    .{ .kind = .removed, .text = "old two", .old_line = 2 },
+                    .{ .kind = .added, .text = "new one", .new_line = 1 },
+                    .{ .kind = .added, .text = "new two", .new_line = 2 },
+                },
+            },
+        },
+    };
+
+    try std.testing.expectEqual(@as(?usize, 1), findMatch(file, .side_by_side, "new one", 0, .forward));
+    try std.testing.expectEqual(@as(?usize, 2), findMatch(file, .side_by_side, "new two", 0, .forward));
 }
 
 fn testFileWithHunks() diff_parser.FileDiff {

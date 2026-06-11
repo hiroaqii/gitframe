@@ -90,6 +90,12 @@ const Parser = struct {
     }
 
     fn parseLine(self: *Parser, line: []const u8) ParseError!void {
+        // Plain unified diffs do not have `diff --git` file headers, so hunk
+        // line counts are the only reliable boundary before the next `---`.
+        if (self.current_hunk != null and self.current_hunk.?.isComplete() and !std.mem.startsWith(u8, line, "\\")) {
+            try self.finishHunk();
+        }
+
         if (std.mem.startsWith(u8, line, "diff --git ")) {
             try self.startFile(line);
         } else if (std.mem.startsWith(u8, line, "@@ ")) {
@@ -100,6 +106,11 @@ const Parser = struct {
             // should be interpreted structurally.
             try self.parseHunkLine(line);
         } else if (std.mem.startsWith(u8, line, "--- ")) {
+            // After a completed hunk, a new old-path header starts the next
+            // plain unified diff file.
+            if (self.current_file != null and self.current_file.?.hunks.items.len > 0) {
+                try self.finishFile();
+            }
             try self.ensureFile(line);
             self.current_file.?.old_path = parsePath(line[4..]);
             try self.current_file.?.metadata.append(self.allocator, line);
@@ -175,6 +186,8 @@ const Parser = struct {
             try self.appendHunkLine(.context, line, self.old_line, self.new_line);
             self.old_line += 1;
             self.new_line += 1;
+            self.current_hunk.?.old_seen += 1;
+            self.current_hunk.?.new_seen += 1;
             return;
         }
 
@@ -183,14 +196,18 @@ const Parser = struct {
                 try self.appendHunkLine(.context, line[1..], self.old_line, self.new_line);
                 self.old_line += 1;
                 self.new_line += 1;
+                self.current_hunk.?.old_seen += 1;
+                self.current_hunk.?.new_seen += 1;
             },
             '+' => {
                 try self.appendHunkLine(.added, line[1..], null, self.new_line);
                 self.new_line += 1;
+                self.current_hunk.?.new_seen += 1;
             },
             '-' => {
                 try self.appendHunkLine(.removed, line[1..], self.old_line, null);
                 self.old_line += 1;
+                self.current_hunk.?.old_seen += 1;
             },
             '\\' => try self.appendHunkLine(.metadata, line, null, null),
             else => try self.appendHunkLine(.metadata, line, null, null),
@@ -221,8 +238,14 @@ const HunkBuilder = struct {
     old_count: u32,
     new_start: u32,
     new_count: u32,
+    old_seen: u32 = 0,
+    new_seen: u32 = 0,
     section: []const u8,
     lines: std.ArrayList(DiffLine) = .empty,
+
+    fn isComplete(self: HunkBuilder) bool {
+        return self.old_seen >= self.old_count and self.new_seen >= self.new_count;
+    }
 };
 
 const ParsedHunkHeader = struct {
@@ -379,6 +402,33 @@ test "parse hunk lines that look like file path headers" {
     try std.testing.expectEqualStrings("++ separator", lines[1].text);
     try std.testing.expectEqualStrings("a/markers.txt", doc.files[0].old_path.?);
     try std.testing.expectEqualStrings("b/markers.txt", doc.files[0].new_path.?);
+}
+
+test "parse plain unified diff with multiple files" {
+    const text =
+        \\--- old/one.txt
+        \\+++ new/one.txt
+        \\@@ -1 +1 @@
+        \\-one old
+        \\+one new
+        \\--- old/two.txt
+        \\+++ new/two.txt
+        \\@@ -1 +1 @@
+        \\-two old
+        \\+two new
+        \\
+    ;
+
+    const doc = try parse(std.testing.allocator, text);
+    defer freeDocument(std.testing.allocator, doc);
+
+    try std.testing.expectEqual(@as(usize, 2), doc.files.len);
+    try std.testing.expectEqualStrings("old/one.txt", doc.files[0].old_path.?);
+    try std.testing.expectEqualStrings("new/one.txt", doc.files[0].new_path.?);
+    try std.testing.expectEqualStrings("old/two.txt", doc.files[1].old_path.?);
+    try std.testing.expectEqualStrings("new/two.txt", doc.files[1].new_path.?);
+    try std.testing.expectEqualStrings("one old", doc.files[0].hunks[0].lines[0].text);
+    try std.testing.expectEqualStrings("two old", doc.files[1].hunks[0].lines[0].text);
 }
 
 test "parse ignores trailing newline after final hunk line" {

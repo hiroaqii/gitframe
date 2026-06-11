@@ -53,6 +53,7 @@ pub const App = struct {
         toggle_display_mode,
         enter_search,
         cancel_search,
+        clear_search,
         submit_search,
         search_insert: u21,
         search_backspace,
@@ -102,12 +103,16 @@ pub const App = struct {
             },
             .enter_search => self.enterSearchMode(),
             .cancel_search => self.cancelSearchMode(),
+            .clear_search => self.clearSearch(),
             .submit_search => self.submitSearch(),
             .search_insert => |codepoint| self.search_input.insert(codepoint) catch {},
             .search_backspace => self.search_input.backspace(),
             .select_next_search_match => self.selectSearchMatch(.forward),
             .select_previous_search_match => self.selectSearchMatch(.backward),
-            .reload => try self.startDiffLoad(ctx),
+            .reload => switch (self.config.source) {
+                .stdin => ctx.redraw().skip(),
+                else => try self.startDiffLoad(ctx),
+            },
             .quit => ctx.quit(),
         }
     }
@@ -161,6 +166,7 @@ pub const App = struct {
         if (key.matches(chasen.Key.page_down, .{})) return .page_diff_down;
         if (key.matches(chasen.Key.home, .{})) return .select_first_file;
         if (key.matches(chasen.Key.end, .{})) return .select_last_file;
+        if (key.matches(chasen.Key.escape, .{}) and self.search_query.len > 0) return .clear_search;
         if (self.focus == .sidebar and key.matches(chasen.Key.enter, .{})) return .toggle_directory;
         if (self.focus == .sidebar and key.matches(chasen.Key.right, .{})) return .expand_directory;
         if (self.focus == .sidebar and key.matches(chasen.Key.left, .{})) return .collapse_or_parent_directory;
@@ -273,7 +279,7 @@ pub const App = struct {
             const marker = if (selected) ">" else " ";
             _ = surface.borrowTextAt(0, row, marker, style);
 
-            const stats_width: u16 = if (surface.size().width > 12) 11 else 0;
+            const stats_width: u16 = if (surface.size().width > 12) 12 else 0;
             const indent: u16 = node.depth *| 2;
             const fold_width: u16 = if (node.kind == .directory) 2 else 0;
             const name_col: u16 = 2 +| indent +| fold_width;
@@ -291,7 +297,7 @@ pub const App = struct {
                 _ = try path_area.copyTextAt(0, 0, node.name, style);
             }
             if (surface.size().width > 12) {
-                _ = try surface.printAt(surface.size().width - 10, row, style, "+{d} -{d}", .{ node.stats.added, node.stats.removed });
+                _ = try surface.printAt(surface.size().width - stats_width, row, style, "+{d} -{d}", .{ node.stats.added, node.stats.removed });
             }
         }
     }
@@ -682,12 +688,18 @@ pub const App = struct {
         self.search_mode = false;
     }
 
+    fn clearSearch(self: *App) void {
+        self.search_mode = false;
+        self.search_input = .{};
+        self.search_query = .{};
+        self.search_match = null;
+    }
+
     fn submitSearch(self: *App) void {
         self.search_mode = false;
         self.search_query = self.search_input;
         self.search_match = null;
         if (self.search_query.len == 0) {
-            self.search_match = null;
             return;
         }
         self.selectSearchMatch(.forward);

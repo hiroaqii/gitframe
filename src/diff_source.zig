@@ -31,6 +31,7 @@ pub const CliConfig = struct {
 pub const ParseArgsError = error{
     UnknownOption,
     MissingOptionValue,
+    InvalidRange,
     TooManyInputs,
     ConflictingSourceMode,
 };
@@ -111,10 +112,12 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
         } else if (std.mem.eql(u8, arg, "--range")) {
             index += 1;
             if (index >= args.len) return error.MissingOptionValue;
+            if (isOptionLikeValue(args[index])) return error.InvalidRange;
             try setSourceMode(&config, .{ .range = args[index] });
         } else if (std.mem.startsWith(u8, arg, "--range=")) {
             const value = arg["--range=".len..];
             if (value.len == 0) return error.MissingOptionValue;
+            if (isOptionLikeValue(value)) return error.InvalidRange;
             try setSourceMode(&config, .{ .range = value });
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownOption;
@@ -126,6 +129,10 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
     }
 
     return config;
+}
+
+fn isOptionLikeValue(value: []const u8) bool {
+    return value.len > 0 and value[0] == '-';
 }
 
 fn setSourceMode(config: *CliConfig, source: SourceMode) ParseArgsError!void {
@@ -233,6 +240,14 @@ test "parseArgs accepts range option" {
 
     try std.testing.expect(config.source == .range);
     try std.testing.expectEqualStrings("main...HEAD", config.source.range);
+}
+
+test "parseArgs rejects option-like range values" {
+    const equals_form = [_][]const u8{ "gitframe", "--range=--output=/tmp/gitframe.diff" };
+    try std.testing.expectError(error.InvalidRange, parseArgs(equals_form[0..]));
+
+    const separate_value = [_][]const u8{ "gitframe", "--range", "--output=/tmp/gitframe.diff" };
+    try std.testing.expectError(error.InvalidRange, parseArgs(separate_value[0..]));
 }
 
 test "parseArgs accepts patch file path" {

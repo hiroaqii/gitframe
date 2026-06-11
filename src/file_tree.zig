@@ -1,18 +1,11 @@
 const std = @import("std");
 
+const diff_file = @import("diff_file.zig");
 const diff_parser = @import("diff_parser.zig");
 
 pub const CollapsedSet = std.StringHashMapUnmanaged(void);
 
-pub const Stats = struct {
-    added: usize = 0,
-    removed: usize = 0,
-
-    pub fn add(self: *Stats, other: Stats) void {
-        self.added += other.added;
-        self.removed += other.removed;
-    }
-};
+pub const Stats = diff_file.Stats;
 
 pub const Node = struct {
     kind: Kind,
@@ -131,23 +124,11 @@ pub fn build(allocator: std.mem.Allocator, document: diff_parser.DiffDocument) !
 }
 
 pub fn displayPath(file: diff_parser.FileDiff) []const u8 {
-    if (file.new_path) |path| return stripGitPathPrefix(path);
-    if (file.old_path) |path| return stripGitPathPrefix(path);
-    return file.header;
+    return diff_file.displayPath(file);
 }
 
 pub fn fileStats(file: diff_parser.FileDiff) Stats {
-    var stats: Stats = .{};
-    for (file.hunks) |hunk| {
-        for (hunk.lines) |line| {
-            switch (line.kind) {
-                .added => stats.added += 1,
-                .removed => stats.removed += 1,
-                else => {},
-            }
-        }
-    }
-    return stats;
+    return diff_file.stats(file);
 }
 
 fn ensureDirectoryNodes(allocator: std.mem.Allocator, nodes: *std.ArrayList(Node), path: []const u8, stats: Stats) !void {
@@ -192,11 +173,6 @@ fn pathDepth(path: []const u8) u16 {
         if (byte == '/') depth += 1;
     }
     return depth;
-}
-
-fn stripGitPathPrefix(path: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, path, "a/") or std.mem.startsWith(u8, path, "b/")) return path[2..];
-    return path;
 }
 
 pub fn isCollapsed(collapsed: *const CollapsedSet, path: []const u8) bool {
