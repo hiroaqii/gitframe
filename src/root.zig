@@ -27,6 +27,10 @@ pub const App = struct {
     search_input: SearchQuery = .{},
     search_query: SearchQuery = .{},
     search_match: ?usize = null,
+    file_search_mode: bool = false,
+    file_search_input: SearchQuery = .{},
+    file_search_no_match: bool = false,
+    file_search_return_focus: Focus = .sidebar,
     /// Owns the currently loaded raw diff, parsed document arrays, and error
     /// messages. Recreated on every successful load/reload.
     load_arena: ?std.heap.ArenaAllocator = null,
@@ -59,6 +63,11 @@ pub const App = struct {
         search_backspace,
         select_next_search_match,
         select_previous_search_match,
+        enter_file_search,
+        cancel_file_search,
+        submit_file_search,
+        file_search_insert: u21,
+        file_search_backspace,
         reload,
         quit,
     };
@@ -109,6 +118,17 @@ pub const App = struct {
             .search_backspace => self.search_input.backspace(),
             .select_next_search_match => self.selectSearchMatch(.forward),
             .select_previous_search_match => self.selectSearchMatch(.backward),
+            .enter_file_search => self.enterFileSearchMode(),
+            .cancel_file_search => self.cancelFileSearchMode(),
+            .submit_file_search => self.submitFileSearch(),
+            .file_search_insert => |codepoint| {
+                self.file_search_no_match = false;
+                self.file_search_input.insert(codepoint) catch {};
+            },
+            .file_search_backspace => {
+                self.file_search_no_match = false;
+                self.file_search_input.backspace();
+            },
             .reload => switch (self.config.source) {
                 .stdin => ctx.redraw().skip(),
                 else => try self.startDiffLoad(ctx),
@@ -161,6 +181,14 @@ pub const App = struct {
             return null;
         }
 
+        if (self.file_search_mode) {
+            if (key.matches(chasen.Key.escape, .{})) return .cancel_file_search;
+            if (key.matches(chasen.Key.enter, .{})) return .submit_file_search;
+            if (key.matches(chasen.Key.backspace, .{})) return .file_search_backspace;
+            if (isSearchCodepoint(key.codepoint)) return .{ .file_search_insert = key.codepoint };
+            return null;
+        }
+
         if (key.matches(chasen.Key.tab, .{})) return .toggle_focus;
         if (key.matches(chasen.Key.page_up, .{})) return .page_diff_up;
         if (key.matches(chasen.Key.page_down, .{})) return .page_diff_down;
@@ -180,6 +208,7 @@ pub const App = struct {
             'p' => if (self.search_query.len > 0) .select_previous_search_match else .select_previous_hunk,
             'g' => .select_first_file,
             'G' => .select_last_file,
+            'f' => .enter_file_search,
             'u' => .toggle_display_mode,
             'q' => .quit,
             'r' => .reload,
@@ -368,6 +397,16 @@ pub const App = struct {
         if (self.search_mode) {
             _ = surface.borrowTextAt(0, 0, "/", .{ .fg = .{ .index = 11 }, .bold = true });
             _ = surface.copyTextAt(1, 0, self.search_input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
+            return;
+        }
+
+        if (self.file_search_mode) {
+            _ = surface.borrowTextAt(0, 0, "file: ", .{ .fg = .{ .index = 11 }, .bold = true });
+            _ = surface.copyTextAt(6, 0, self.file_search_input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
+            if (self.file_search_no_match) {
+                const col: u16 = @intCast(@min(6 + chasen.text.displayWidth(self.file_search_input.slice()) + 1, std.math.maxInt(u16)));
+                if (surface.size().width > col) _ = surface.borrowTextAt(col, 0, "(no match)", .{ .fg = .{ .index = 9 } });
+            }
             return;
         }
 
@@ -695,6 +734,46 @@ pub const App = struct {
         self.search_match = null;
     }
 
+    fn enterFileSearchMode(self: *App) void {
+        self.file_search_return_focus = self.focus;
+        self.focus = .sidebar;
+        self.file_search_mode = true;
+        self.file_search_input = .{};
+        self.file_search_no_match = false;
+    }
+
+    fn cancelFileSearchMode(self: *App) void {
+        self.file_search_mode = false;
+        self.file_search_input = .{};
+        self.file_search_no_match = false;
+        self.focus = self.file_search_return_focus;
+    }
+
+    fn submitFileSearch(self: *App) void {
+        const query = std.mem.trim(u8, self.file_search_input.slice(), " \t\r\n");
+        if (query.len == 0) {
+            self.cancelFileSearchMode();
+            return;
+        }
+
+        const loaded = self.loadedDiff() orelse {
+            self.file_search_no_match = true;
+            return;
+        };
+        const node_index = findFileNodeMatching(loaded.tree, query) orelse {
+            self.file_search_no_match = true;
+            return;
+        };
+
+        // Go-to-file should land on the file row, not on a still-collapsed
+        // parent directory that hides the matched path.
+        file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
+        self.selectSidebarNode(loaded, node_index);
+        self.clampSelection(loaded.document.files.len);
+        self.clampDiffNavigation();
+        self.cancelFileSearchMode();
+    }
+
     fn submitSearch(self: *App) void {
         self.search_mode = false;
         self.search_query = self.search_input;
@@ -834,6 +913,7 @@ const footer_sidebar_items = [_]ui.key_hint.Item{
     ui.key_hint.item("↑/↓/j/k", "move"),
     ui.key_hint.item("Enter/←/→", "fold"),
     ui.key_hint.item("/", "search"),
+    ui.key_hint.item("f", "file"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),
     ui.key_hint.item("r", "reload"),
@@ -844,6 +924,7 @@ const footer_diff_items = [_]ui.key_hint.Item{
     ui.key_hint.item("Tab", "focus"),
     ui.key_hint.item("↑/↓/j/k", "scroll"),
     ui.key_hint.item("/", "search"),
+    ui.key_hint.item("f", "file"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),
     ui.key_hint.item("r", "reload"),
@@ -1003,6 +1084,14 @@ fn parentDirectoryNodeIndex(tree: file_tree.FileTree, node_index: usize) ?usize 
     return null;
 }
 
+fn findFileNodeMatching(tree: file_tree.FileTree, query: []const u8) ?usize {
+    for (tree.nodes, 0..) |node, index| {
+        if (node.kind != .file) continue;
+        if (ui.list_filter.matchesLabel(node.path, query)) return index;
+    }
+    return null;
+}
+
 test "countLines handles empty and trailing newline inputs" {
     try std.testing.expectEqual(@as(usize, 0), countLines(""));
     try std.testing.expectEqual(@as(usize, 1), countLines("one"));
@@ -1144,6 +1233,63 @@ test "toggling selected directory collapses visible descendants" {
     try std.testing.expectEqual(@as(usize, 0), app.selected_node);
 }
 
+test "file search selects matching file and expands ancestors" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load_arena = .init(std.testing.allocator),
+        .load_state = .{ .loaded = testLoadedDiffNested() },
+        .selected_file = 0,
+        .selected_node = 0,
+        .file_search_mode = true,
+    };
+    defer app.clearLoadedDiff();
+
+    var loaded = app.loadedDiff().?;
+    try file_tree.collapse(app.loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+    setFileSearchInput(&app, "src/b");
+
+    app.submitFileSearch();
+
+    loaded = app.loadedDiff().?;
+    try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
+    try std.testing.expectEqual(@as(usize, 2), app.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
+    try std.testing.expect(!app.file_search_mode);
+}
+
+test "file search keeps prompt open on no match" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load_state = .{ .loaded = testLoadedDiffNested() },
+        .file_search_mode = true,
+    };
+    setFileSearchInput(&app, "missing");
+
+    app.submitFileSearch();
+
+    try std.testing.expect(app.file_search_mode);
+    try std.testing.expect(app.file_search_no_match);
+    try std.testing.expectEqual(@as(usize, 0), app.selected_file);
+}
+
+test "file search trims empty input and restores focus on cancel" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load_state = .{ .loaded = testLoadedDiffNested() },
+        .focus = .diff,
+    };
+
+    app.enterFileSearchMode();
+    try std.testing.expectEqual(Focus.sidebar, app.focus);
+    setFileSearchInput(&app, "   ");
+
+    app.submitFileSearch();
+
+    try std.testing.expect(!app.file_search_mode);
+    try std.testing.expectEqual(Focus.diff, app.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.selected_file);
+}
+
 test "search match marker is drawn on visible match row" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 8);
@@ -1242,6 +1388,11 @@ fn setSearchQuery(app: *App, query: []const u8) void {
 fn setSearchInput(app: *App, query: []const u8) void {
     @memcpy(app.search_input.buffer[0..query.len], query);
     app.search_input.len = query.len;
+}
+
+fn setFileSearchInput(app: *App, query: []const u8) void {
+    @memcpy(app.file_search_input.buffer[0..query.len], query);
+    app.file_search_input.len = query.len;
 }
 
 fn testLoadedDiffOne() LoadedDiff {

@@ -187,6 +187,14 @@ pub fn expand(collapsed: *CollapsedSet, path: []const u8) void {
     _ = collapsed.remove(path);
 }
 
+pub fn expandAncestors(collapsed: *CollapsedSet, path: []const u8) void {
+    var start: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, path, start, '/')) |slash| {
+        if (slash > 0) _ = collapsed.remove(path[0..slash]);
+        start = slash + 1;
+    }
+}
+
 pub fn toggle(allocator: std.mem.Allocator, collapsed: *CollapsedSet, path: []const u8) !void {
     if (isCollapsed(collapsed, path)) {
         expand(collapsed, path);
@@ -280,4 +288,17 @@ test "collapsed directory hides descendants but remains visible" {
     try std.testing.expectEqual(@as(?usize, 0), tree.visibleNodeAt(&collapsed, 0));
     try std.testing.expectEqual(@as(?usize, 2), tree.visibleNodeAt(&collapsed, 1));
     try std.testing.expectEqual(@as(?usize, 0), tree.visibleAncestorOrSelf(&collapsed, 1));
+}
+
+test "expandAncestors reveals nested file path" {
+    var collapsed: CollapsedSet = .empty;
+    defer collapsed.deinit(std.testing.allocator);
+
+    try collapse(std.testing.allocator, &collapsed, "src");
+    try collapse(std.testing.allocator, &collapsed, "src/lib");
+
+    expandAncestors(&collapsed, "src/lib/root.zig");
+
+    try std.testing.expect(!isCollapsed(&collapsed, "src"));
+    try std.testing.expect(!isCollapsed(&collapsed, "src/lib"));
 }
