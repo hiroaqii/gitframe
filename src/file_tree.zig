@@ -6,6 +6,7 @@ const diff_parser = @import("diff_parser.zig");
 pub const CollapsedSet = std.StringHashMapUnmanaged(void);
 
 pub const Stats = diff_file.Stats;
+pub const Status = diff_file.Status;
 
 pub const Node = struct {
     kind: Kind,
@@ -13,6 +14,7 @@ pub const Node = struct {
     path: []const u8,
     depth: u16,
     stats: Stats = .{},
+    status: ?Status = null,
     file_index: ?usize = null,
 
     pub const Kind = enum {
@@ -116,6 +118,7 @@ pub fn build(allocator: std.mem.Allocator, document: diff_parser.DiffDocument) !
             .path = path,
             .depth = pathDepth(path),
             .stats = stats,
+            .status = diff_file.status(file),
             .file_index = file_index,
         });
     }
@@ -249,6 +252,7 @@ test "build creates directory and file nodes with aggregate stats" {
     try std.testing.expectEqual(@as(usize, 2), tree.nodes[0].stats.removed);
     try std.testing.expectEqual(Node.Kind.file, tree.nodes[1].kind);
     try std.testing.expectEqualStrings("main.zig", tree.nodes[1].name);
+    try std.testing.expectEqual(Status.modified, tree.nodes[1].status.?);
     try std.testing.expectEqual(@as(?usize, 0), tree.nodes[1].file_index);
     try std.testing.expectEqual(Node.Kind.directory, tree.nodes[2].kind);
     try std.testing.expectEqualStrings("lib", tree.nodes[2].name);

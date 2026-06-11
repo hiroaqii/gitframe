@@ -311,11 +311,16 @@ pub const App = struct {
 
             const stats_width: u16 = if (surface.size().width > 12) 12 else 0;
             const indent: u16 = node.depth *| 2;
-            const fold_width: u16 = if (node.kind == .directory) 2 else 0;
-            const name_col: u16 = 2 +| indent +| fold_width;
+            const name_col: u16 = if (node.status != null) 3 +| indent else 2 +| indent +| 2;
             if (node.kind == .directory and surface.size().width > 2 + indent) {
                 const fold_marker = if (file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) "▸" else "▾";
                 _ = surface.borrowTextAt(2 + indent, row, fold_marker, style);
+            }
+            if (node.status) |status| {
+                const badge_col = 1 +| indent;
+                if (surface.size().width > badge_col) {
+                    _ = surface.borrowTextAt(badge_col, row, status.badge(), statusStyle(status, selected));
+                }
             }
             if (surface.size().width > name_col + stats_width) {
                 var path_area = surface.child(.{
@@ -975,6 +980,17 @@ const Focus = enum {
     }
 };
 
+fn statusStyle(status: file_tree.Status, selected: bool) chasen.TextStyle {
+    const fg: chasen.Color = switch (status) {
+        .modified => .{ .index = 11 },
+        .added => .{ .index = 2 },
+        .deleted => .{ .index = 9 },
+        .renamed => .{ .index = 14 },
+        .binary => .{ .index = 13 },
+    };
+    return .{ .fg = fg, .bold = true, .reverse = selected };
+}
+
 fn terminalBodyHeight(terminal_height: u16) u16 {
     return if (terminal_height > footer_rows) terminal_height - footer_rows else 0;
 }
@@ -1273,6 +1289,22 @@ test "file search trims empty input and restores focus on cancel" {
     try std.testing.expectEqual(@as(usize, 0), app.selected_file);
 }
 
+test "sidebar renders file status badges" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(34, 8);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 80, .height = 9 },
+        .load_state = .{ .loaded = testLoadedDiffTwoWithStatuses() },
+    };
+
+    try app.viewSidebar(&ts.surface, app.load_state.loaded);
+
+    try ts.expectCellText(3, sidebar_header_rows, "A");
+    try ts.expectCellText(3, sidebar_header_rows + 1, "D");
+}
+
 test "search match marker is drawn on visible match row" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 8);
@@ -1411,6 +1443,17 @@ fn testLoadedDiffNested() LoadedDiff {
     };
 }
 
+fn testLoadedDiffTwoWithStatuses() LoadedDiff {
+    return .{
+        .text = "",
+        .document = .{ .files = &test_files_two_statuses },
+        .tree = .{ .nodes = &test_tree_two_status_nodes },
+        .collapsed_dirs = .{},
+        .bytes = 0,
+        .lines = 0,
+    };
+}
+
 const test_tree_one_nodes = [_]file_tree.Node{
     .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .file_index = 0 },
 };
@@ -1426,6 +1469,11 @@ const test_tree_nested_nodes = [_]file_tree.Node{
     .{ .kind = .file, .name = "b", .path = "src/b", .depth = 1, .file_index = 1 },
 };
 
+const test_tree_two_status_nodes = [_]file_tree.Node{
+    .{ .kind = .file, .name = "added.zig", .path = "src/added.zig", .depth = 1, .file_index = 0, .status = .added },
+    .{ .kind = .file, .name = "deleted.zig", .path = "src/deleted.zig", .depth = 1, .file_index = 1, .status = .deleted },
+};
+
 const test_files_one = [_]diff_parser.FileDiff{
     test_file_with_hunks,
 };
@@ -1433,6 +1481,23 @@ const test_files_one = [_]diff_parser.FileDiff{
 const test_files_two = [_]diff_parser.FileDiff{
     test_file_with_hunks,
     test_file_with_target_metadata,
+};
+
+const test_files_two_statuses = [_]diff_parser.FileDiff{
+    .{
+        .header = "diff --git a/src/added.zig b/src/added.zig",
+        .old_path = null,
+        .new_path = "b/src/added.zig",
+        .metadata = &.{"new file mode 100644"},
+        .hunks = &.{},
+    },
+    .{
+        .header = "diff --git a/src/deleted.zig b/src/deleted.zig",
+        .old_path = "a/src/deleted.zig",
+        .new_path = null,
+        .metadata = &.{"deleted file mode 100644"},
+        .hunks = &.{},
+    },
 };
 
 const test_file_with_hunks = diff_parser.FileDiff{
