@@ -18,7 +18,6 @@ pub const App = struct {
     load_state: LoadState = .idle,
     selected_file: usize = 0,
     selected_node: usize = 0,
-    sidebar_scroll: usize = 0,
     focus: Focus = .sidebar,
     diff_scroll: usize = 0,
     selected_hunk: usize = 0,
@@ -288,11 +287,13 @@ pub const App = struct {
 
         const visible_rows: usize = size.height - sidebar_header_rows;
         const visible_count = loaded.tree.visibleNodeCount(&loaded.collapsed_dirs);
-        const start = @min(self.sidebar_scroll, visible_count);
-        const end = @min(start + visible_rows, visible_count);
+        const selected_row = loaded.tree.visibleRowOfNode(&loaded.collapsed_dirs, self.selected_node) orelse 0;
+        // Sidebar has no independent scroll state; derive the visible window
+        // from the selected row each frame.
+        const range = ui.ListViewport.visibleRange(visible_count, selected_row, visible_rows);
         var row: u16 = sidebar_header_rows;
-        var visible_index: usize = start;
-        while (visible_index < end) : ({
+        var visible_index: usize = range.start;
+        while (visible_index < range.end) : ({
             visible_index += 1;
             row += 1;
         }) {
@@ -858,7 +859,6 @@ pub const App = struct {
         if (file_count == 0) {
             self.selected_file = 0;
             self.selected_node = 0;
-            self.sidebar_scroll = 0;
             return;
         }
         if (self.selected_file >= file_count) self.selected_file = file_count - 1;
@@ -872,23 +872,6 @@ pub const App = struct {
                 self.selected_node = file_node;
             }
         }
-        const selected_row = self.selectedSidebarRow() orelse self.selected_node;
-        if (self.sidebar_scroll > selected_row) self.sidebar_scroll = selected_row;
-        const body_height = terminalBodyHeight(self.terminal_size.height);
-        const visible_rows: usize = if (body_height > sidebar_header_rows)
-            body_height - sidebar_header_rows
-        else
-            1;
-        if (selected_row >= self.sidebar_scroll + visible_rows) {
-            self.sidebar_scroll = selected_row + 1 - visible_rows;
-        }
-    }
-
-    fn selectedSidebarRow(self: *const App) ?usize {
-        return switch (self.load_state) {
-            .loaded => |loaded| loaded.tree.visibleRowOfNode(&loaded.collapsed_dirs, self.selected_node),
-            else => null,
-        };
     }
 
     fn loadedDiff(self: *App) ?*LoadedDiff {
