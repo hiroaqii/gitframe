@@ -92,8 +92,8 @@ pub const App = struct {
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
             .toggle_directory => try self.toggleSelectedDirectory(),
-            .expand_directory => self.expandSelectedDirectory(),
-            .collapse_or_parent_directory => self.collapseOrSelectParentDirectory(),
+            .expand_directory => try self.expandSelectedDirectory(),
+            .collapse_or_parent_directory => try self.collapseOrSelectParentDirectory(),
             .scroll_diff_up => self.scrollDiff(-1),
             .scroll_diff_down => self.scrollDiff(1),
             .page_diff_up => self.pageDiff(-1),
@@ -286,8 +286,8 @@ pub const App = struct {
         if (size.height <= sidebar_header_rows) return;
 
         const visible_rows: usize = size.height - sidebar_header_rows;
-        const visible_count = loaded.tree.visibleNodeCount(&loaded.collapsed_dirs);
-        const selected_row = loaded.tree.visibleRowOfNode(&loaded.collapsed_dirs, self.selected_node) orelse 0;
+        const visible_count = loaded.visibleNodeCount();
+        const selected_row = loaded.visibleRowOfNode(self.selected_node) orelse 0;
         // Sidebar has no independent scroll state; derive the visible window
         // from the selected row each frame.
         const range = ui.ListViewport.visibleRange(visible_count, selected_row, visible_rows);
@@ -297,7 +297,7 @@ pub const App = struct {
             visible_index += 1;
             row += 1;
         }) {
-            const index = loaded.tree.visibleNodeAt(&loaded.collapsed_dirs, visible_index) orelse continue;
+            const index = loaded.visibleNodeAt(visible_index) orelse continue;
             const node = loaded.tree.nodes[index];
             const selected = index == self.selected_node;
             const style: chasen.TextStyle = if (selected)
@@ -514,16 +514,18 @@ pub const App = struct {
                     return;
                 };
                 const tree = try file_tree.build(arena_allocator, document);
-
-                self.load_arena = arena;
-                self.load_state = .{ .loaded = .{
+                var loaded: LoadedDiff = .{
                     .bytes = copied.len,
                     .lines = countLines(copied),
                     .text = copied,
                     .document = document,
                     .tree = tree,
                     .collapsed_dirs = .empty,
-                } };
+                };
+                try loaded.rebuildVisibleNodes(arena_allocator);
+
+                self.load_arena = arena;
+                self.load_state = .{ .loaded = loaded };
                 if (tree.selectedNodeIndex(self.selected_file)) |node_index| {
                     self.selected_node = node_index;
                 }
@@ -561,10 +563,10 @@ pub const App = struct {
         if (loaded.document.files.len == 0 or loaded.tree.nodes.len == 0) return;
 
         if (delta < 0) {
-            if (loaded.tree.previousVisibleNodeIndex(&loaded.collapsed_dirs, self.selected_node)) |previous| {
+            if (loaded.previousVisibleNodeIndex(self.selected_node)) |previous| {
                 self.selectSidebarNode(loaded, previous);
             }
-        } else if (loaded.tree.nextVisibleNodeIndex(&loaded.collapsed_dirs, self.selected_node)) |next| {
+        } else if (loaded.nextVisibleNodeIndex(self.selected_node)) |next| {
             self.selectSidebarNode(loaded, next);
         }
         self.clampSelection(loaded.document.files.len);
@@ -618,24 +620,28 @@ pub const App = struct {
         if (node.kind != .directory) return;
         const allocator = self.loadArenaAllocator() orelse return;
         try file_tree.toggle(allocator, &loaded.collapsed_dirs, node.path);
+        try loaded.rebuildVisibleNodes(allocator);
         self.clampSelection(loaded.document.files.len);
     }
 
-    fn expandSelectedDirectory(self: *App) void {
+    fn expandSelectedDirectory(self: *App) !void {
         const loaded = self.loadedDiff() orelse return;
         if (self.selected_node >= loaded.tree.nodes.len) return;
         const node = loaded.tree.nodes[self.selected_node];
         if (node.kind != .directory) return;
         file_tree.expand(&loaded.collapsed_dirs, node.path);
+        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return);
         self.clampSelection(loaded.document.files.len);
     }
 
-    fn collapseOrSelectParentDirectory(self: *App) void {
+    fn collapseOrSelectParentDirectory(self: *App) !void {
         const loaded = self.loadedDiff() orelse return;
         if (self.selected_node >= loaded.tree.nodes.len) return;
         const node = loaded.tree.nodes[self.selected_node];
         if (node.kind == .directory and !file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) {
-            file_tree.collapse(self.loadArenaAllocator() orelse return, &loaded.collapsed_dirs, node.path) catch return;
+            const allocator = self.loadArenaAllocator() orelse return;
+            try file_tree.collapse(allocator, &loaded.collapsed_dirs, node.path);
+            try loaded.rebuildVisibleNodes(allocator);
             self.clampSelection(loaded.document.files.len);
             return;
         }
@@ -774,6 +780,10 @@ pub const App = struct {
         // Go-to-file should land on the file row, not on a still-collapsed
         // parent directory that hides the matched path.
         file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
+        loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return) catch {
+            self.file_search_no_match = true;
+            return;
+        };
         self.selectSidebarNode(loaded, node_index);
         self.clampSelection(loaded.document.files.len);
         self.clampDiffNavigation();
@@ -871,7 +881,7 @@ pub const App = struct {
             if (self.selected_node >= loaded.tree.nodes.len) {
                 self.selected_node = loaded.tree.selectedNodeIndex(self.selected_file) orelse 0;
             }
-            if (loaded.tree.visibleAncestorOrSelf(&loaded.collapsed_dirs, self.selected_node)) |visible_node| {
+            if (loaded.visibleAncestorOrSelf(self.selected_node)) |visible_node| {
                 self.selected_node = visible_node;
             } else if (loaded.tree.selectedNodeIndex(self.selected_file)) |file_node| {
                 self.selected_node = file_node;
@@ -1018,8 +1028,71 @@ const LoadedDiff = struct {
     document: diff_parser.DiffDocument,
     tree: file_tree.FileTree,
     collapsed_dirs: file_tree.CollapsedSet = .empty,
+    visible_nodes: []usize = &.{},
+    visible_node_count: usize = 0,
     bytes: usize,
     lines: usize,
+
+    fn rebuildVisibleNodes(self: *LoadedDiff, allocator: std.mem.Allocator) !void {
+        if (self.visible_nodes.len < self.tree.nodes.len) {
+            self.visible_nodes = try allocator.alloc(usize, self.tree.nodes.len);
+        }
+
+        var count: usize = 0;
+        for (self.tree.nodes, 0..) |_, index| {
+            if (!self.tree.isVisible(index, &self.collapsed_dirs)) continue;
+            self.visible_nodes[count] = index;
+            count += 1;
+        }
+        self.visible_node_count = count;
+    }
+
+    fn materializedVisibleNodes(self: *const LoadedDiff) ?[]const usize {
+        // Production load always calls rebuildVisibleNodes. The fallback keeps
+        // tests that construct LoadedDiff directly on the old tree traversal.
+        if (self.visible_nodes.len == 0 and self.tree.nodes.len > 0) return null;
+        return self.visible_nodes[0..self.visible_node_count];
+    }
+
+    fn visibleNodeCount(self: *const LoadedDiff) usize {
+        if (self.materializedVisibleNodes()) |nodes| return nodes.len;
+        return self.tree.visibleNodeCount(&self.collapsed_dirs);
+    }
+
+    fn visibleNodeAt(self: *const LoadedDiff, visible_index: usize) ?usize {
+        if (self.materializedVisibleNodes()) |nodes| {
+            return if (visible_index < nodes.len) nodes[visible_index] else null;
+        }
+        return self.tree.visibleNodeAt(&self.collapsed_dirs, visible_index);
+    }
+
+    fn visibleRowOfNode(self: *const LoadedDiff, node_index: usize) ?usize {
+        if (self.materializedVisibleNodes()) |nodes| {
+            for (nodes, 0..) |index, row| {
+                if (index == node_index) return row;
+            }
+            return null;
+        }
+        return self.tree.visibleRowOfNode(&self.collapsed_dirs, node_index);
+    }
+
+    fn nextVisibleNodeIndex(self: *const LoadedDiff, node_index: usize) ?usize {
+        const row = self.visibleRowOfNode(node_index) orelse
+            return self.tree.nextVisibleNodeIndex(&self.collapsed_dirs, node_index);
+        return self.visibleNodeAt(row + 1);
+    }
+
+    fn previousVisibleNodeIndex(self: *const LoadedDiff, node_index: usize) ?usize {
+        const row = self.visibleRowOfNode(node_index) orelse
+            return self.tree.previousVisibleNodeIndex(&self.collapsed_dirs, node_index);
+        if (row == 0) return null;
+        return self.visibleNodeAt(row - 1);
+    }
+
+    fn visibleAncestorOrSelf(self: *const LoadedDiff, node_index: usize) ?usize {
+        if (self.visibleRowOfNode(node_index) != null) return node_index;
+        return self.tree.visibleAncestorOrSelf(&self.collapsed_dirs, node_index);
+    }
 };
 
 const DiffLoadFinished = struct {
@@ -1229,6 +1302,9 @@ test "toggling selected directory collapses visible descendants" {
     const loaded = app.load_state.loaded;
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 1), loaded.tree.visibleNodeCount(&loaded.collapsed_dirs));
+    try std.testing.expect(loaded.visible_nodes.len >= loaded.tree.nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(usize, 0), app.selected_node);
 }
 
