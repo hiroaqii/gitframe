@@ -2,25 +2,9 @@ const std = @import("std");
 const chasen = @import("chasen");
 const diff_file = @import("diff_file.zig");
 const diff_parser = @import("diff_parser.zig");
+const diff_view_model = @import("diff_view_model.zig");
 
-pub const DisplayMode = enum {
-    unified,
-    side_by_side,
-
-    pub fn label(self: DisplayMode) []const u8 {
-        return switch (self) {
-            .unified => "unified",
-            .side_by_side => "side-by-side",
-        };
-    }
-
-    pub fn toggled(self: DisplayMode) DisplayMode {
-        return switch (self) {
-            .unified => .side_by_side,
-            .side_by_side => .unified,
-        };
-    }
-};
+pub const DisplayMode = diff_view_model.DisplayMode;
 
 pub const RenderOptions = struct {
     requested_mode: DisplayMode = .unified,
@@ -44,23 +28,11 @@ pub fn displayPath(file: diff_parser.FileDiff) []const u8 {
 }
 
 pub fn renderedBodyLineCount(file: diff_parser.FileDiff, mode: DisplayMode) usize {
-    if (file.is_binary) return file.metadata.len + 1;
-
-    var count = file.metadata.len;
-    for (file.hunks) |hunk| {
-        count += 1;
-        count += renderedHunkLineCount(hunk.lines, mode);
-    }
-    return count;
+    return diff_view_model.renderedBodyLineCount(file, mode);
 }
 
 pub fn hunkBodyLineOffset(file: diff_parser.FileDiff, mode: DisplayMode, hunk_index: usize) usize {
-    var offset = file.metadata.len;
-    for (file.hunks, 0..) |hunk, index| {
-        if (index == hunk_index) return offset;
-        offset += 1 + renderedHunkLineCount(hunk.lines, mode);
-    }
-    return offset;
+    return diff_view_model.hunkBodyLineOffset(file, mode, hunk_index);
 }
 
 pub fn visibleBodyRows(surface_height: u16) usize {
@@ -78,35 +50,22 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
         .scroll = options.scroll,
         .height = size.height,
     };
-    for (file.metadata) |line| {
+    var rows = diff_view_model.BodyRowIterator.init(file, mode);
+    while (rows.next()) |body_row| {
+        if (cursor.done()) return;
         const row = cursor.nextRow() orelse continue;
-        try copyClippedTextAt(surface, 0, row, line, style_metadata);
-    }
-
-    if (file.is_binary) {
-        if (cursor.nextRow()) |row| _ = surface.borrowTextAt(0, row, "Binary file", style_warning);
-        return;
-    }
-
-    for (file.hunks, 0..) |hunk, hunk_index| {
-        if (cursor.nextRow()) |row| {
-            const style = if (options.highlighted_hunk != null and options.highlighted_hunk.? == hunk_index)
-                style_selected_hunk
-            else
-                style_hunk;
-            const header = try std.fmt.allocPrint(surface.frameAllocator(), "@@ -{d},{d} +{d},{d} @@ {s}", .{
-                hunk.old_start,
-                hunk.old_count,
-                hunk.new_start,
-                hunk.new_count,
-                hunk.section,
-            });
-            try drawHunkHeader(surface, row, header, style, mode);
-        }
-
-        switch (mode) {
-            .unified => try renderUnifiedHunkLines(surface, hunk.lines, &cursor),
-            .side_by_side => try renderSideBySideHunkLines(surface, hunk.lines, &cursor),
+        switch (body_row) {
+            .metadata => |line| try copyClippedTextAt(surface, 0, row, line, style_metadata),
+            .binary_marker => _ = surface.borrowTextAt(0, row, "Binary file", style_warning),
+            .hunk_header => |hunk| try drawHunkHeaderRow(surface, row, hunk, options.highlighted_hunk, mode),
+            .unified_line => |line| try drawUnifiedLine(surface, row, line),
+            .side_by_side => |side_row| {
+                const gutter_col = size.width / 2;
+                switch (side_row) {
+                    .single => |line| try drawSideBySideSingle(surface, row, line, gutter_col),
+                    .paired => |pair| try drawSideBySidePair(surface, row, pair.removed, pair.added, gutter_col),
+                }
+            },
         }
     }
 }
@@ -139,6 +98,27 @@ fn drawHunkHeader(surface: *chasen.Surface, row: u16, header: []const u8, style:
     try copyClippedTextAt(surface, 0, row, header, style);
 }
 
+fn drawHunkHeaderRow(
+    surface: *chasen.Surface,
+    row: u16,
+    hunk: diff_view_model.HunkHeader,
+    highlighted_hunk: ?usize,
+    mode: DisplayMode,
+) !void {
+    const style = if (highlighted_hunk != null and highlighted_hunk.? == hunk.hunk_index)
+        style_selected_hunk
+    else
+        style_hunk;
+    const header = try std.fmt.allocPrint(surface.frameAllocator(), "@@ -{d},{d} +{d},{d} @@ {s}", .{
+        hunk.old_start,
+        hunk.old_count,
+        hunk.new_start,
+        hunk.new_count,
+        hunk.section,
+    });
+    try drawHunkHeader(surface, row, header, style, mode);
+}
+
 const body_start_row: u16 = 3;
 
 const BodyCursor = struct {
@@ -158,117 +138,6 @@ const BodyCursor = struct {
 
     fn done(self: BodyCursor) bool {
         return self.virtual_row >= self.scroll and self.row >= self.height;
-    }
-};
-
-fn renderUnifiedHunkLines(surface: *chasen.Surface, lines: []const diff_parser.DiffLine, cursor: *BodyCursor) !void {
-    for (lines) |line| {
-        if (cursor.done()) return;
-        const row = cursor.nextRow() orelse continue;
-        try drawUnifiedLine(surface, row, line);
-    }
-}
-
-fn renderSideBySideHunkLines(surface: *chasen.Surface, lines: []const diff_parser.DiffLine, cursor: *BodyCursor) !void {
-    const size = surface.size();
-    if (size.width < side_by_side_min_width) return renderUnifiedHunkLines(surface, lines, cursor);
-
-    const gutter_col = size.width / 2;
-    var rows = SideBySideIterator.init(lines);
-    while (rows.next()) |side_row| {
-        if (cursor.done()) return;
-        const row = cursor.nextRow();
-        if (row) |visible_row| {
-            switch (side_row) {
-                .single => |line| try drawSideBySideSingle(surface, visible_row, line, gutter_col),
-                .paired => |pair| try drawSideBySidePair(surface, visible_row, pair.removed, pair.added, gutter_col),
-            }
-        }
-    }
-}
-
-fn renderedHunkLineCount(lines: []const diff_parser.DiffLine, mode: DisplayMode) usize {
-    if (mode == .unified) return lines.len;
-
-    var count: usize = 0;
-    var rows = SideBySideIterator.init(lines);
-    while (rows.next() != null) {
-        count += 1;
-    }
-    return count;
-}
-
-pub const SideBySidePair = struct {
-    removed: ?diff_parser.DiffLine = null,
-    added: ?diff_parser.DiffLine = null,
-};
-
-pub const SideBySideRow = union(enum) {
-    single: diff_parser.DiffLine,
-    paired: SideBySidePair,
-};
-
-/// Converts a hunk's raw unified lines into the rows used by side-by-side mode.
-///
-/// Git commonly emits replacement blocks as a removed run followed by an added
-/// run (`-a -b +A +B`). Pairing those runs by index keeps the two sides aligned
-/// for rendering, counting, and search.
-pub const SideBySideIterator = struct {
-    lines: []const diff_parser.DiffLine,
-    index: usize = 0,
-    block_removed_start: usize = 0,
-    block_removed_len: usize = 0,
-    block_added_start: usize = 0,
-    block_added_len: usize = 0,
-    block_offset: usize = 0,
-    in_block: bool = false,
-
-    pub fn init(lines: []const diff_parser.DiffLine) SideBySideIterator {
-        return .{ .lines = lines };
-    }
-
-    pub fn next(self: *SideBySideIterator) ?SideBySideRow {
-        if (self.in_block) return self.nextBlockRow();
-        if (self.index >= self.lines.len) return null;
-
-        const line = self.lines[self.index];
-        if (line.kind == .removed) {
-            const removed_start = self.index;
-            var added_start = removed_start;
-            while (added_start < self.lines.len and self.lines[added_start].kind == .removed) : (added_start += 1) {}
-
-            var added_end = added_start;
-            while (added_end < self.lines.len and self.lines[added_end].kind == .added) : (added_end += 1) {}
-
-            if (added_end > added_start) {
-                self.in_block = true;
-                self.block_removed_start = removed_start;
-                self.block_removed_len = added_start - removed_start;
-                self.block_added_start = added_start;
-                self.block_added_len = added_end - added_start;
-                self.block_offset = 0;
-                return self.nextBlockRow();
-            }
-        }
-
-        self.index += 1;
-        return .{ .single = line };
-    }
-
-    fn nextBlockRow(self: *SideBySideIterator) ?SideBySideRow {
-        const max_len = @max(self.block_removed_len, self.block_added_len);
-        if (self.block_offset >= max_len) {
-            self.index = self.block_added_start + self.block_added_len;
-            self.in_block = false;
-            return self.next();
-        }
-
-        const offset = self.block_offset;
-        self.block_offset += 1;
-        return .{ .paired = .{
-            .removed = if (offset < self.block_removed_len) self.lines[self.block_removed_start + offset] else null,
-            .added = if (offset < self.block_added_len) self.lines[self.block_added_start + offset] else null,
-        } };
     }
 };
 
@@ -438,62 +307,6 @@ test "displayPath prefers new path and strips git prefixes" {
     };
 
     try std.testing.expectEqualStrings("src/main.zig", displayPath(file));
-}
-
-test "body line offsets account for metadata and side-by-side pairs" {
-    const file: diff_parser.FileDiff = .{
-        .header = "diff --git a/a b/a",
-        .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
-        .hunks = &.{
-            .{
-                .old_start = 1,
-                .old_count = 2,
-                .new_start = 1,
-                .new_count = 2,
-                .section = "first",
-                .lines = &.{
-                    .{ .kind = .removed, .text = "old", .old_line = 1 },
-                    .{ .kind = .added, .text = "new", .new_line = 1 },
-                    .{ .kind = .context, .text = "same", .old_line = 2, .new_line = 2 },
-                },
-            },
-            .{
-                .old_start = 8,
-                .old_count = 1,
-                .new_start = 8,
-                .new_count = 1,
-                .section = "second",
-                .lines = &.{
-                    .{ .kind = .added, .text = "later", .new_line = 8 },
-                },
-            },
-        },
-    };
-
-    try std.testing.expectEqual(@as(usize, 6), hunkBodyLineOffset(file, .side_by_side, 1));
-    try std.testing.expectEqual(@as(usize, 8), renderedBodyLineCount(file, .side_by_side));
-    try std.testing.expectEqual(@as(usize, 7), hunkBodyLineOffset(file, .unified, 1));
-    try std.testing.expectEqual(@as(usize, 9), renderedBodyLineCount(file, .unified));
-}
-
-test "side-by-side pairs removed and added runs by index" {
-    const lines = [_]diff_parser.DiffLine{
-        .{ .kind = .removed, .text = "old one", .old_line = 1 },
-        .{ .kind = .removed, .text = "old two", .old_line = 2 },
-        .{ .kind = .added, .text = "new one", .new_line = 1 },
-        .{ .kind = .added, .text = "new two", .new_line = 2 },
-    };
-
-    var rows = SideBySideIterator.init(lines[0..]);
-    const first = rows.next().?.paired;
-    const second = rows.next().?.paired;
-
-    try std.testing.expectEqualStrings("old one", first.removed.?.text);
-    try std.testing.expectEqualStrings("new one", first.added.?.text);
-    try std.testing.expectEqualStrings("old two", second.removed.?.text);
-    try std.testing.expectEqualStrings("new two", second.added.?.text);
-    try std.testing.expect(rows.next() == null);
-    try std.testing.expectEqual(@as(usize, 2), renderedHunkLineCount(lines[0..], .side_by_side));
 }
 
 test "side-by-side clips old column before new column" {

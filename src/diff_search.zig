@@ -1,16 +1,16 @@
 const std = @import("std");
 const diff_parser = @import("diff_parser.zig");
-const diff_render = @import("diff_render.zig");
+const diff_view_model = @import("diff_view_model.zig");
 
 pub const Direction = enum {
     forward,
     backward,
 };
 
-pub fn findMatch(file: diff_parser.FileDiff, mode: diff_render.DisplayMode, query: []const u8, base: usize, direction: Direction) ?usize {
+pub fn findMatch(file: diff_parser.FileDiff, mode: diff_view_model.DisplayMode, query: []const u8, base: usize, direction: Direction) ?usize {
     if (query.len == 0) return null;
 
-    const line_count = diff_render.renderedBodyLineCount(file, mode);
+    const line_count = diff_view_model.renderedBodyLineCount(file, mode);
     if (line_count == 0) return null;
 
     var step: usize = 1;
@@ -24,39 +24,27 @@ pub fn findMatch(file: diff_parser.FileDiff, mode: diff_render.DisplayMode, quer
     return null;
 }
 
-fn bodyLineMatches(file: diff_parser.FileDiff, mode: diff_render.DisplayMode, target: usize, query: []const u8) bool {
+fn bodyLineMatches(file: diff_parser.FileDiff, mode: diff_view_model.DisplayMode, target: usize, query: []const u8) bool {
+    var rows = diff_view_model.BodyRowIterator.init(file, mode);
     var offset: usize = 0;
-
-    for (file.metadata) |line| {
-        if (offset == target) return containsIgnoreCase(line, query);
+    while (rows.next()) |row| {
+        if (offset == target) return bodyRowMatches(row, query);
         offset += 1;
     }
-
-    for (file.hunks) |hunk| {
-        if (offset == target) return containsIgnoreCase(hunk.section, query);
-        offset += 1;
-
-        switch (mode) {
-            .unified => {
-                for (hunk.lines) |line| {
-                    if (offset == target) return containsIgnoreCase(line.text, query);
-                    offset += 1;
-                }
-            },
-            .side_by_side => {
-                var rows = diff_render.SideBySideIterator.init(hunk.lines);
-                while (rows.next()) |row| {
-                    if (offset == target) return sideBySideRowMatches(row, query);
-                    offset += 1;
-                }
-            },
-        }
-    }
-
     return false;
 }
 
-fn sideBySideRowMatches(row: diff_render.SideBySideRow, query: []const u8) bool {
+fn bodyRowMatches(row: diff_view_model.BodyRow, query: []const u8) bool {
+    return switch (row) {
+        .metadata => |line| containsIgnoreCase(line, query),
+        .binary_marker => containsIgnoreCase("Binary file", query),
+        .hunk_header => |hunk| containsIgnoreCase(hunk.section, query),
+        .unified_line => |line| containsIgnoreCase(line.text, query),
+        .side_by_side => |side_row| sideBySideRowMatches(side_row, query),
+    };
+}
+
+fn sideBySideRowMatches(row: diff_view_model.SideBySideRow, query: []const u8) bool {
     return switch (row) {
         .single => |line| containsIgnoreCase(line.text, query),
         .paired => |pair| (if (pair.removed) |line| containsIgnoreCase(line.text, query) else false) or

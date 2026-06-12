@@ -94,14 +94,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_diff_render_tests = b.addRunArtifact(diff_render_tests);
 
+    const diff_view_model_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/diff_view_model.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_diff_view_model_tests = b.addRunArtifact(diff_view_model_tests);
+
     const diff_search_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/diff_search.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "chasen", .module = chasen_dep.module("chasen") },
-            },
         }),
     });
     const run_diff_search_tests = b.addRunArtifact(diff_search_tests);
@@ -122,6 +128,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_diff_parser_tests.step);
     test_step.dependOn(&run_diff_file_tests.step);
     test_step.dependOn(&run_diff_render_tests.step);
+    test_step.dependOn(&run_diff_view_model_tests.step);
     test_step.dependOn(&run_diff_search_tests.step);
     test_step.dependOn(&run_file_tree_tests.step);
 }
