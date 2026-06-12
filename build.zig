@@ -121,6 +121,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_file_tree_tests = b.addRunArtifact(file_tree_tests);
 
+    const perf_baseline_exe = b.addExecutable(.{
+        .name = "gitframe-perf-baseline",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/perf_baseline.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_perf_baseline = b.addRunArtifact(perf_baseline_exe);
+
+    const perf_baseline_step = b.step("perf-baseline", "Run GitFrame performance baseline");
+    perf_baseline_step.dependOn(&run_perf_baseline.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
@@ -131,4 +144,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_diff_view_model_tests.step);
     test_step.dependOn(&run_diff_search_tests.step);
     test_step.dependOn(&run_file_tree_tests.step);
+    test_step.dependOn(&perf_baseline_exe.step);
 }
