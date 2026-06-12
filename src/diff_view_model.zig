@@ -28,6 +28,16 @@ pub const BodyRow = union(enum) {
     side_by_side: SideBySideRow,
 };
 
+pub const BodyCoordinate = union(enum) {
+    metadata: usize,
+    binary_marker,
+    hunk_header: usize,
+    hunk_line: struct {
+        hunk_index: usize,
+        line_index: usize,
+    },
+};
+
 pub const HunkHeader = struct {
     hunk_index: usize,
     old_start: u32,
@@ -199,6 +209,42 @@ pub fn hunkBodyLineOffset(file: diff_parser.FileDiff, mode: DisplayMode, hunk_in
     return offset;
 }
 
+pub fn renderedOffsetForCoordinate(
+    file: diff_parser.FileDiff,
+    mode: DisplayMode,
+    coordinate: BodyCoordinate,
+    index_opt: ?RenderedLineIndex,
+) ?usize {
+    const index = if (index_opt) |index|
+        if (index.mode == mode and index.hunk_offsets.len == file.hunks.len) index else null
+    else
+        null;
+
+    return switch (coordinate) {
+        .metadata => |metadata_index| if (metadata_index < file.metadata.len) metadata_index else null,
+        .binary_marker => if (file.is_binary) file.metadata.len else null,
+        .hunk_header => |hunk_index| hunkOffsetForCoordinate(file, mode, index, hunk_index),
+        .hunk_line => |line| blk: {
+            if (line.hunk_index >= file.hunks.len) break :blk null;
+            const hunk = file.hunks[line.hunk_index];
+            if (line.line_index >= hunk.lines.len) break :blk null;
+
+            const hunk_offset = hunkOffsetForCoordinate(file, mode, index, line.hunk_index) orelse break :blk null;
+            const local_line_offset = switch (mode) {
+                .unified => line.line_index,
+                .side_by_side => sideBySideRenderedOffsetForLine(hunk.lines, line.line_index) orelse break :blk null,
+            };
+            break :blk hunk_offset + 1 + local_line_offset;
+        },
+    };
+}
+
+fn hunkOffsetForCoordinate(file: diff_parser.FileDiff, mode: DisplayMode, index: ?RenderedLineIndex, hunk_index: usize) ?usize {
+    if (hunk_index >= file.hunks.len) return null;
+    if (index) |line_index| return line_index.hunkOffset(hunk_index);
+    return hunkBodyLineOffset(file, mode, hunk_index);
+}
+
 pub const RenderedLineIndex = struct {
     mode: DisplayMode,
     metadata_rows: usize = 0,
@@ -345,6 +391,42 @@ pub const SideBySideRow = union(enum) {
     paired: SideBySidePair,
 };
 
+pub const IndexedDiffLine = struct {
+    line: diff_parser.DiffLine,
+    line_index: usize,
+};
+
+pub const SideBySideIndexedPair = struct {
+    removed: ?IndexedDiffLine = null,
+    added: ?IndexedDiffLine = null,
+};
+
+pub const SideBySideIndexedRow = union(enum) {
+    single: IndexedDiffLine,
+    paired: SideBySideIndexedPair,
+};
+
+pub fn sideBySideRenderedOffsetForLine(lines: []const diff_parser.DiffLine, target_line_index: usize) ?usize {
+    var rows = SideBySideIndexedIterator.init(lines);
+    var offset: usize = 0;
+    while (rows.next()) |row| : (offset += 1) {
+        switch (row) {
+            .single => |line| {
+                if (line.line_index == target_line_index) return offset;
+            },
+            .paired => |pair| {
+                if (pair.removed) |line| {
+                    if (line.line_index == target_line_index) return offset;
+                }
+                if (pair.added) |line| {
+                    if (line.line_index == target_line_index) return offset;
+                }
+            },
+        }
+    }
+    return null;
+}
+
 /// Converts a hunk's raw unified lines into the rows used by side-by-side mode.
 ///
 /// Git commonly emits replacement blocks as a removed run followed by an added
@@ -412,6 +494,72 @@ pub const SideBySideIterator = struct {
         return .{ .paired = .{
             .removed = if (offset < self.block_removed_len) self.lines[self.block_removed_start + offset] else null,
             .added = if (offset < self.block_added_len) self.lines[self.block_added_start + offset] else null,
+        } };
+    }
+};
+
+pub const SideBySideIndexedIterator = struct {
+    lines: []const diff_parser.DiffLine,
+    index: usize = 0,
+    block_removed_start: usize = 0,
+    block_removed_len: usize = 0,
+    block_added_start: usize = 0,
+    block_added_len: usize = 0,
+    block_offset: usize = 0,
+    in_block: bool = false,
+
+    pub fn init(lines: []const diff_parser.DiffLine) SideBySideIndexedIterator {
+        return .{ .lines = lines };
+    }
+
+    pub fn next(self: *SideBySideIndexedIterator) ?SideBySideIndexedRow {
+        if (self.in_block) return self.nextBlockRow();
+        if (self.index >= self.lines.len) return null;
+
+        const line = self.lines[self.index];
+        if (line.kind == .removed) {
+            const removed_start = self.index;
+            var added_start = removed_start;
+            while (added_start < self.lines.len and self.lines[added_start].kind == .removed) : (added_start += 1) {}
+
+            var added_end = added_start;
+            while (added_end < self.lines.len and self.lines[added_end].kind == .added) : (added_end += 1) {}
+
+            if (added_end > added_start) {
+                self.in_block = true;
+                self.block_removed_start = removed_start;
+                self.block_removed_len = added_start - removed_start;
+                self.block_added_start = added_start;
+                self.block_added_len = added_end - added_start;
+                self.block_offset = 0;
+                return self.nextBlockRow();
+            }
+        }
+
+        const line_index = self.index;
+        self.index += 1;
+        return .{ .single = .{ .line = line, .line_index = line_index } };
+    }
+
+    fn nextBlockRow(self: *SideBySideIndexedIterator) ?SideBySideIndexedRow {
+        const max_len = @max(self.block_removed_len, self.block_added_len);
+        if (self.block_offset >= max_len) {
+            self.index = self.block_added_start + self.block_added_len;
+            self.in_block = false;
+            return self.next();
+        }
+
+        const offset = self.block_offset;
+        self.block_offset += 1;
+        return .{ .paired = .{
+            .removed = if (offset < self.block_removed_len) .{
+                .line = self.lines[self.block_removed_start + offset],
+                .line_index = self.block_removed_start + offset,
+            } else null,
+            .added = if (offset < self.block_added_len) .{
+                .line = self.lines[self.block_added_start + offset],
+                .line_index = self.block_added_start + offset,
+            } else null,
         } };
     }
 };
@@ -564,6 +712,62 @@ test "body row iterator can start at cached offsets" {
     var second_hunk = BodyRowIterator.initAt(file, .side_by_side, index, index.hunkOffset(1));
     try std.testing.expectEqual(@as(usize, 1), second_hunk.next().?.hunk_header.hunk_index);
     try std.testing.expectEqualStrings("same", second_hunk.next().?.side_by_side.single.text);
+}
+
+test "rendered offset maps added side of paired rows to the paired row" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 2,
+                .new_start = 1,
+                .new_count = 2,
+                .section = "first",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old one", .old_line = 1 },
+                    .{ .kind = .removed, .text = "old two", .old_line = 2 },
+                    .{ .kind = .added, .text = "new one", .new_line = 1 },
+                    .{ .kind = .added, .text = "new two", .new_line = 2 },
+                },
+            },
+        },
+    };
+
+    var index = try RenderedLineIndex.build(std.testing.allocator, file, .side_by_side);
+    defer index.deinit(std.testing.allocator);
+
+    const removed_offset = renderedOffsetForCoordinate(file, .side_by_side, .{
+        .hunk_line = .{ .hunk_index = 0, .line_index = 1 },
+    }, index);
+    const added_offset = renderedOffsetForCoordinate(file, .side_by_side, .{
+        .hunk_line = .{ .hunk_index = 0, .line_index = 3 },
+    }, index);
+
+    try std.testing.expectEqual(removed_offset, added_offset);
+    try std.testing.expectEqual(@as(?usize, index.hunkOffset(0) + 2), added_offset);
+}
+
+test "rendered offset rejects stale coordinates" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{"index 1..2"},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "first",
+            .lines = &.{.{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 }},
+        }},
+    };
+
+    try std.testing.expect(renderedOffsetForCoordinate(file, .unified, .{ .metadata = 9 }, null) == null);
+    try std.testing.expect(renderedOffsetForCoordinate(file, .unified, .{ .hunk_header = 2 }, null) == null);
+    try std.testing.expect(renderedOffsetForCoordinate(file, .unified, .{
+        .hunk_line = .{ .hunk_index = 0, .line_index = 3 },
+    }, null) == null);
 }
 
 test "side-by-side pairs removed and added runs by index" {

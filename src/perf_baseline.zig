@@ -132,12 +132,12 @@ fn runNoMatchSearchScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const file = document.files[0];
 
     var search_timer = Stopwatch.start(io);
-    const match = diff_search.findMatch(file, .side_by_side, "zz-no-match", 0, .forward);
+    const match = diff_search.findMatch(file, .side_by_side, "zz-no-match", null, .forward);
     const search_ns = search_timer.read();
 
     std.debug.print("\n[no-match search: {d} replacement rows]\n", .{no_match_pairs});
     printTiming("side-by-side no-match search", search_ns);
-    std.debug.print("  match: {?d}\n", .{match});
+    std.debug.print("  match: {s}\n", .{if (match == null) "none" else "found"});
 }
 
 fn buildHugeFileDiff(allocator: std.mem.Allocator, pairs: usize) ![]const u8 {

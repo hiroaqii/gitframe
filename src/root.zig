@@ -27,7 +27,8 @@ pub const App = struct {
     search_mode: bool = false,
     search_input: SearchQuery = .{},
     search_query: SearchQuery = .{},
-    search_match: ?usize = null,
+    search_match: ?diff_search.Match = null,
+    search_match_offset: ?usize = null,
     file_search_mode: bool = false,
     file_search_input: SearchQuery = .{},
     file_search_no_match: bool = false,
@@ -85,10 +86,11 @@ pub const App = struct {
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .terminal_resized => |size| {
-                const search_base = self.search_match orelse self.diff_scroll;
                 self.terminal_size = size;
                 self.clampDiffNavigationKeepingHunkVisible();
-                self.resyncSearchMatchFrom(search_base);
+                self.updateSearchMatchOffset();
+                self.scrollSearchMatchIntoView();
+                self.clampDiffNavigation();
             },
             .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
@@ -106,10 +108,11 @@ pub const App = struct {
             .select_last_file => self.selectLastFile(),
             .toggle_focus => self.focus = self.focus.toggled(),
             .toggle_display_mode => {
-                const search_base = self.search_match orelse self.diff_scroll;
                 self.display_mode = self.display_mode.toggled();
                 self.clampDiffNavigationKeepingHunkVisible();
-                self.resyncSearchMatchFrom(search_base);
+                self.updateSearchMatchOffset();
+                self.scrollSearchMatchIntoView();
+                self.clampDiffNavigation();
             },
             .enter_search => self.enterSearchMode(),
             .cancel_search => self.cancelSearchMode(),
@@ -383,7 +386,7 @@ pub const App = struct {
             surface.clear(.{ .col = 0, .row = 2, .width = size.width, .height = 1 });
         }
         if (!self.search_mode and self.search_query.len > 0 and size.width > 0) {
-            const match_text = if (self.search_match) |offset|
+            const match_text = if (self.search_match_offset) |offset|
                 std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ self.search_query.slice(), offset + 1 }) catch "search"
             else
                 std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{self.search_query.slice()}) catch "search";
@@ -475,7 +478,7 @@ pub const App = struct {
     }
 
     fn drawSearchMatchMarker(self: *const App, surface: *chasen.Surface) void {
-        const match_offset = self.search_match orelse return;
+        const match_offset = self.search_match_offset orelse return;
         if (match_offset < self.diff_scroll) return;
 
         const visible_offset = match_offset - self.diff_scroll;
@@ -554,7 +557,7 @@ pub const App = struct {
                 }
                 self.clampSelection(document.files.len);
                 self.clampDiffNavigation();
-                self.resyncSearchMatch();
+                self.refreshSearchForSelectedFile();
             },
             .failed => |message| {
                 const copied = try arena_allocator.dupe(u8, std.mem.trim(u8, message, " \t\r\n"));
@@ -575,7 +578,7 @@ pub const App = struct {
         self.load_state = .idle;
         self.diff_scroll = 0;
         self.selected_hunk = 0;
-        self.search_match = null;
+        self.clearSearchMatch();
     }
 
     fn selectFileDelta(self: *App, delta: i2) void {
@@ -612,7 +615,7 @@ pub const App = struct {
             if (loaded.tree.selectedNodeIndex(self.selected_file)) |node_index| self.selected_node = node_index;
         }
         self.resetDiffPosition();
-        self.resyncSearchMatch();
+        self.refreshSearchForSelectedFile();
         self.clampSelection(file_count);
         self.clampDiffNavigation();
     }
@@ -631,7 +634,7 @@ pub const App = struct {
             self.selected_file = file_index;
             if (self.selected_file != previous_file) {
                 self.resetDiffPosition();
-                self.resyncSearchMatch();
+                self.refreshSearchForSelectedFile();
             }
         }
     }
@@ -749,7 +752,7 @@ pub const App = struct {
     fn resetDiffPosition(self: *App) void {
         self.diff_scroll = 0;
         self.selected_hunk = 0;
-        self.search_match = null;
+        self.clearSearchMatch();
     }
 
     fn enterSearchMode(self: *App) void {
@@ -766,7 +769,7 @@ pub const App = struct {
         self.search_mode = false;
         self.search_input = .{};
         self.search_query = .{};
-        self.search_match = null;
+        self.clearSearchMatch();
     }
 
     fn enterFileSearchMode(self: *App) void {
@@ -816,7 +819,7 @@ pub const App = struct {
     fn submitSearch(self: *App) void {
         self.search_mode = false;
         self.search_query = self.search_input;
-        self.search_match = null;
+        self.clearSearchMatch();
         if (self.search_query.len == 0) {
             return;
         }
@@ -829,36 +832,55 @@ pub const App = struct {
 
         const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
         if (line_count == 0) return;
-        const base = self.search_match orelse switch (direction) {
-            .forward => if (line_count > 0) line_count - 1 else 0,
-            .backward => 0,
-        };
+        const base = if (self.search_match) |match| match.coordinate else null;
         const next = diff_search.findMatch(file, self.effectiveDisplayMode(), self.search_query.slice(), base, direction) orelse {
-            self.search_match = null;
+            self.clearSearchMatch();
             return;
         };
-        self.search_match = next;
-        self.diff_scroll = next;
+        self.setSearchMatch(next);
+        if (self.search_match_offset) |offset| self.diff_scroll = offset;
         self.clampDiffNavigation();
     }
 
-    fn resyncSearchMatch(self: *App) void {
-        self.resyncSearchMatchFrom(0);
-    }
-
-    fn resyncSearchMatchFrom(self: *App, preferred_offset: usize) void {
+    fn refreshSearchForSelectedFile(self: *App) void {
+        self.clearSearchMatch();
         if (self.search_query.len == 0) return;
-        self.search_match = null;
         const file = self.selectedFile() orelse return;
-        const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
-        if (line_count == 0) return;
+        const next = diff_search.findMatch(file, self.effectiveDisplayMode(), self.search_query.slice(), null, .forward) orelse return;
+        self.setSearchMatch(next);
+        if (self.search_match_offset) |offset| self.diff_scroll = offset;
+    }
 
-        const clamped = @min(preferred_offset, line_count - 1);
-        const base = if (clamped == 0) line_count - 1 else clamped - 1;
-        const next = diff_search.findMatch(file, self.effectiveDisplayMode(), self.search_query.slice(), base, .forward) orelse return;
-        self.search_match = next;
-        self.diff_scroll = next;
-        self.clampDiffNavigation();
+    fn clearSearchMatch(self: *App) void {
+        self.search_match = null;
+        self.search_match_offset = null;
+    }
+
+    fn setSearchMatch(self: *App, match: diff_search.Match) void {
+        self.search_match = match;
+        self.updateSearchMatchOffset();
+    }
+
+    fn updateSearchMatchOffset(self: *App) void {
+        self.search_match_offset = null;
+        const match = self.search_match orelse return;
+        const file = self.selectedFile() orelse return;
+        const mode = self.effectiveDisplayMode();
+        const offset = diff_view_model.renderedOffsetForCoordinate(file, mode, match.coordinate, self.selectedFileCachedLineIndex(mode)) orelse {
+            self.clearSearchMatch();
+            return;
+        };
+        self.search_match_offset = offset;
+    }
+
+    fn scrollSearchMatchIntoView(self: *App) void {
+        const offset = self.search_match_offset orelse return;
+        const visible_rows = self.diffVisibleRows();
+        if (offset < self.diff_scroll) {
+            self.diff_scroll = offset;
+        } else if (visible_rows > 0 and offset >= self.diff_scroll + visible_rows) {
+            self.diff_scroll = offset + 1 - visible_rows;
+        }
     }
 
     fn selectedFile(self: *const App) ?diff_parser.FileDiff {
@@ -878,6 +900,16 @@ pub const App = struct {
             else
                 loaded.renderedLineIndex(@min(self.selected_file, loaded.document.files.len - 1), mode),
             else => .{ .mode = mode },
+        };
+    }
+
+    fn selectedFileCachedLineIndex(self: *const App, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
+        return switch (self.load_state) {
+            .loaded => |loaded| if (loaded.document.files.len == 0)
+                null
+            else
+                loaded.cachedRenderedLineIndex(@min(self.selected_file, loaded.document.files.len - 1), mode),
+            else => null,
         };
     }
 
@@ -1288,15 +1320,17 @@ test "mode change resyncs search match to rendered body offsets" {
     setSearchQuery(&app, "late new");
 
     app.submitSearch();
-    try std.testing.expectEqual(@as(?usize, 12), app.search_match);
+    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
+    try std.testing.expectEqual(@as(?usize, 12), app.search_match_offset);
 
     app.display_mode = .side_by_side;
     app.clampDiffNavigationKeepingHunkVisible();
-    app.resyncSearchMatch();
+    app.updateSearchMatchOffset();
 
-    try std.testing.expectEqual(@as(?usize, 10), app.search_match);
-    try std.testing.expect(app.search_match.? >= app.diff_scroll);
-    try std.testing.expect(app.search_match.? < app.diff_scroll + app.diffVisibleRows());
+    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
+    try std.testing.expectEqual(@as(?usize, 10), app.search_match_offset);
+    try std.testing.expect(app.search_match_offset.? >= app.diff_scroll);
+    try std.testing.expect(app.search_match_offset.? < app.diff_scroll + app.diffVisibleRows());
 }
 
 test "mode change keeps search near later matches" {
@@ -1308,16 +1342,18 @@ test "mode change keeps search near later matches" {
     setSearchQuery(&app, "new");
 
     app.submitSearch();
-    try std.testing.expectEqual(@as(?usize, 7), app.search_match);
+    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
+    try std.testing.expectEqual(@as(?usize, 7), app.search_match_offset);
     app.selectSearchMatch(.forward);
-    try std.testing.expectEqual(@as(?usize, 12), app.search_match);
+    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
+    try std.testing.expectEqual(@as(?usize, 12), app.search_match_offset);
 
-    const old_match = app.search_match.?;
     app.display_mode = .side_by_side;
     app.clampDiffNavigationKeepingHunkVisible();
-    app.resyncSearchMatchFrom(old_match);
+    app.updateSearchMatchOffset();
 
-    try std.testing.expectEqual(@as(?usize, 10), app.search_match);
+    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
+    try std.testing.expectEqual(@as(?usize, 10), app.search_match_offset);
 }
 
 test "file change resyncs retained search query to selected file" {
@@ -1331,7 +1367,8 @@ test "file change resyncs retained search query to selected file" {
     app.selectFileAbsolute(1);
 
     try std.testing.expectEqual(@as(usize, 1), app.selected_file);
-    try std.testing.expectEqual(@as(?usize, 0), app.search_match);
+    try expectSearchCoordinate(&app, .{ .metadata = 0 });
+    try std.testing.expectEqual(@as(?usize, 0), app.search_match_offset);
     try std.testing.expectEqual(@as(usize, 0), app.diff_scroll);
 }
 
@@ -1458,7 +1495,7 @@ test "search match marker is drawn on visible match row" {
     const app: App = .{
         .terminal_size = .{ .width = 80, .height = 9 },
         .load_state = .{ .loaded = testLoadedDiffOne() },
-        .search_match = 4,
+        .search_match_offset = 4,
         .diff_scroll = 3,
     };
 
@@ -1475,7 +1512,7 @@ test "search marker gutter does not overwrite diff content" {
     const app: App = .{
         .terminal_size = .{ .width = 90, .height = 11 },
         .load_state = .{ .loaded = testLoadedDiffOne() },
-        .search_match = 0,
+        .search_match_offset = 0,
     };
 
     try app.viewDiffPane(&ts.surface, app.load_state.loaded);
@@ -1525,7 +1562,8 @@ test "canceling edited search restores committed query and match" {
     var app: App = .{
         .terminal_size = .{ .width = 90, .height = 11 },
         .load_state = .{ .loaded = testLoadedDiffOne() },
-        .search_match = 7,
+        .search_match = .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } },
+        .search_match_offset = 7,
     };
     setSearchQuery(&app, "new");
 
@@ -1536,7 +1574,13 @@ test "canceling edited search restores committed query and match" {
 
     try std.testing.expectEqualStrings("new", app.search_query.slice());
     try std.testing.expectEqualStrings("new", app.search_input.slice());
-    try std.testing.expectEqual(@as(?usize, 7), app.search_match);
+    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
+    try std.testing.expectEqual(@as(?usize, 7), app.search_match_offset);
+}
+
+fn expectSearchCoordinate(app: *const App, expected: diff_view_model.BodyCoordinate) !void {
+    try std.testing.expect(app.search_match != null);
+    try std.testing.expect(std.meta.eql(expected, app.search_match.?.coordinate));
 }
 
 fn setSearchQuery(app: *App, query: []const u8) void {
