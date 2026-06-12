@@ -8,6 +8,10 @@ pub const CollapsedSet = std.StringHashMapUnmanaged(void);
 pub const Stats = diff_file.Stats;
 pub const Status = diff_file.Status;
 
+// Build-only dedup index. Keys borrow path slices owned by the parsed diff
+// arena and are not stored in the returned FileTree model.
+const DirectoryIndex = std.StringHashMapUnmanaged(usize);
+
 pub const Node = struct {
     kind: Kind,
     name: []const u8,
@@ -107,11 +111,14 @@ pub fn build(allocator: std.mem.Allocator, document: diff_parser.DiffDocument) !
     var nodes: std.ArrayList(Node) = .empty;
     errdefer nodes.deinit(allocator);
 
+    var directory_index: DirectoryIndex = .empty;
+    defer directory_index.deinit(allocator);
+
     for (document.files, 0..) |file, file_index| {
         const path = displayPath(file);
         const stats = fileStats(file);
 
-        try ensureDirectoryNodes(allocator, &nodes, path, stats);
+        try ensureDirectoryNodes(allocator, &nodes, &directory_index, path, stats);
         try nodes.append(allocator, .{
             .kind = .file,
             .name = baseName(path),
@@ -134,33 +141,34 @@ pub fn fileStats(file: diff_parser.FileDiff) Stats {
     return diff_file.stats(file);
 }
 
-fn ensureDirectoryNodes(allocator: std.mem.Allocator, nodes: *std.ArrayList(Node), path: []const u8, stats: Stats) !void {
+fn ensureDirectoryNodes(
+    allocator: std.mem.Allocator,
+    nodes: *std.ArrayList(Node),
+    directory_index: *DirectoryIndex,
+    path: []const u8,
+    stats: Stats,
+) !void {
     var start: usize = 0;
     var depth: u16 = 0;
     while (std.mem.indexOfScalarPos(u8, path, start, '/')) |slash| {
         if (slash > start) {
             const dir_path = path[0..slash];
-            const dir_index = findDirectory(nodes.items, dir_path) orelse blk: {
+            const dir_index = directory_index.get(dir_path) orelse blk: {
                 try nodes.append(allocator, .{
                     .kind = .directory,
                     .name = path[start..slash],
                     .path = dir_path,
                     .depth = depth,
                 });
-                break :blk nodes.items.len - 1;
+                const new_index = nodes.items.len - 1;
+                try directory_index.put(allocator, dir_path, new_index);
+                break :blk new_index;
             };
             nodes.items[dir_index].stats.add(stats);
         }
         start = slash + 1;
         depth += 1;
     }
-}
-
-fn findDirectory(nodes: []const Node, path: []const u8) ?usize {
-    for (nodes, 0..) |node, index| {
-        if (node.kind == .directory and std.mem.eql(u8, node.path, path)) return index;
-    }
-    return null;
 }
 
 fn baseName(path: []const u8) []const u8 {
