@@ -64,6 +64,68 @@ pub const BodyRowIterator = struct {
         };
     }
 
+    /// `index` must be built from the same file and display mode as this
+    /// iterator; callers validate that boundary before taking this fast path.
+    pub fn initAt(file: diff_parser.FileDiff, mode: DisplayMode, index: RenderedLineIndex, body_offset: usize) BodyRowIterator {
+        if (body_offset == 0) return init(file, mode);
+        if (body_offset >= index.total_rows) {
+            return .{
+                .file = file,
+                .mode = mode,
+                .phase = .done,
+            };
+        }
+
+        if (body_offset < index.metadata_rows) {
+            return .{
+                .file = file,
+                .mode = mode,
+                .metadata_index = body_offset,
+            };
+        }
+
+        if (body_offset < index.metadata_rows + index.binary_rows) {
+            return .{
+                .file = file,
+                .mode = mode,
+                .phase = .binary,
+            };
+        }
+
+        const hunk_index = index.hunkIndexAtOffset(body_offset) orelse {
+            return .{
+                .file = file,
+                .mode = mode,
+                .phase = .done,
+            };
+        };
+        const hunk_local_offset = body_offset - index.hunkOffset(hunk_index);
+        if (hunk_local_offset == 0) {
+            return .{
+                .file = file,
+                .mode = mode,
+                .phase = .hunk_header,
+                .hunk_index = hunk_index,
+            };
+        }
+
+        var iterator: BodyRowIterator = .{
+            .file = file,
+            .mode = mode,
+            .phase = .hunk_lines,
+            .hunk_index = hunk_index,
+        };
+        const hunk = file.hunks[hunk_index];
+        switch (mode) {
+            .unified => iterator.line_index = @min(hunk_local_offset - 1, hunk.lines.len),
+            .side_by_side => {
+                iterator.side_by_side_rows = .init(hunk.lines);
+                iterator.side_by_side_rows.skipRows(hunk_local_offset - 1);
+            },
+        }
+        return iterator;
+    }
+
     pub fn next(self: *BodyRowIterator) ?BodyRow {
         while (true) {
             switch (self.phase) {
@@ -209,6 +271,25 @@ pub const RenderedLineIndex = struct {
         if (hunk_index >= self.hunk_line_counts.len) return 0;
         return self.hunk_line_counts[hunk_index];
     }
+
+    pub fn hunkIndexAtOffset(self: RenderedLineIndex, offset: usize) ?usize {
+        if (self.hunk_offsets.len == 0) return null;
+        if (offset < self.hunk_offsets[0]) return null;
+
+        var lo: usize = 0;
+        var hi: usize = self.hunk_offsets.len;
+        while (lo + 1 < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.hunk_offsets[mid] <= offset) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+
+        if (offset >= self.hunk_offsets[lo] + self.hunkLineCount(lo)) return null;
+        return lo;
+    }
 };
 
 pub const RenderedLineCache = struct {
@@ -309,6 +390,13 @@ pub const SideBySideIterator = struct {
 
         self.index += 1;
         return .{ .single = line };
+    }
+
+    pub fn skipRows(self: *SideBySideIterator, count: usize) void {
+        var skipped: usize = 0;
+        while (skipped < count) : (skipped += 1) {
+            if (self.next() == null) return;
+        }
     }
 
     fn nextBlockRow(self: *SideBySideIterator) ?SideBySideRow {
@@ -427,6 +515,55 @@ test "rendered line index counts binary file" {
     try std.testing.expectEqual(renderedBodyLineCount(file, .unified), index.lineCount());
     try std.testing.expectEqual(index.lineCount(), index.hunkOffset(0));
     try std.testing.expectEqual(@as(usize, 0), index.hunkLineCount(0));
+}
+
+test "body row iterator can start at cached offsets" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 2,
+                .new_start = 1,
+                .new_count = 2,
+                .section = "first",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old one", .old_line = 1 },
+                    .{ .kind = .removed, .text = "old two", .old_line = 2 },
+                    .{ .kind = .added, .text = "new one", .new_line = 1 },
+                    .{ .kind = .added, .text = "new two", .new_line = 2 },
+                },
+            },
+            .{
+                .old_start = 8,
+                .old_count = 1,
+                .new_start = 8,
+                .new_count = 1,
+                .section = "second",
+                .lines = &.{
+                    .{ .kind = .context, .text = "same", .old_line = 8, .new_line = 8 },
+                },
+            },
+        },
+    };
+
+    var index = try RenderedLineIndex.build(std.testing.allocator, file, .side_by_side);
+    defer index.deinit(std.testing.allocator);
+
+    var first_pair = BodyRowIterator.initAt(file, .side_by_side, index, index.hunkOffset(0) + 1);
+    const pair = first_pair.next().?.side_by_side.paired;
+    try std.testing.expectEqualStrings("old one", pair.removed.?.text);
+    try std.testing.expectEqualStrings("new one", pair.added.?.text);
+
+    var second_pair = BodyRowIterator.initAt(file, .side_by_side, index, index.hunkOffset(0) + 2);
+    const next_pair = second_pair.next().?.side_by_side.paired;
+    try std.testing.expectEqualStrings("old two", next_pair.removed.?.text);
+    try std.testing.expectEqualStrings("new two", next_pair.added.?.text);
+
+    var second_hunk = BodyRowIterator.initAt(file, .side_by_side, index, index.hunkOffset(1));
+    try std.testing.expectEqual(@as(usize, 1), second_hunk.next().?.hunk_header.hunk_index);
+    try std.testing.expectEqualStrings("same", second_hunk.next().?.side_by_side.single.text);
 }
 
 test "side-by-side pairs removed and added runs by index" {

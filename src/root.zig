@@ -396,6 +396,7 @@ pub const App = struct {
             .requested_mode = self.display_mode,
             .scroll = self.diff_scroll,
             .highlighted_hunk = if (file.hunks.len > 0) self.selected_hunk else null,
+            .line_index = loaded.cachedRenderedLineIndex(selected, mode),
         });
         self.drawSearchMatchMarker(surface);
     }
@@ -1128,6 +1129,10 @@ const LoadedDiff = struct {
             .mode = mode,
             .total_rows = diff_render.renderedBodyLineCount(file, mode),
         };
+    }
+
+    fn cachedRenderedLineIndex(self: *const LoadedDiff, file_index: usize, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
+        return self.rendered_line_cache.indexFor(file_index, mode);
     }
 
     fn visibleRowOfNode(self: *const LoadedDiff, node_index: usize) ?usize {

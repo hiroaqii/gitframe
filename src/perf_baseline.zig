@@ -66,7 +66,7 @@ fn runHugeFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const offset_ns = offset_timer.read();
 
     var traverse_timer = Stopwatch.start(io);
-    const visible_rows = traverseVisibleBodyRows(file, .side_by_side, rows -| 40, 40);
+    const visible_rows = traverseVisibleBodyRows(file, .side_by_side, line_index, rows -| 40, 40);
     const traverse_ns = traverse_timer.read();
 
     std.debug.print("\n[huge single file: {d} replacement rows]\n", .{huge_file_pairs});
@@ -75,7 +75,7 @@ fn runHugeFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     printTiming("rendered line cache build", cache_ns);
     printTiming("cached rendered row count", count_ns);
     printTiming("cached hunk offset lookup", offset_ns);
-    printTiming("visible row traversal near end", traverse_ns);
+    printTiming("indexed visible row traversal near end", traverse_ns);
     std.debug.print("  rows: {d}, last hunk offset: {d}, visible rows: {d}\n", .{ rows, offset, visible_rows });
 }
 
@@ -200,14 +200,17 @@ fn buildManyFileDiff(allocator: std.mem.Allocator, file_count: usize) ![]const u
     return out.toOwnedSlice(allocator);
 }
 
-fn traverseVisibleBodyRows(file: diff_parser.FileDiff, mode: diff_view_model.DisplayMode, scroll: usize, height: usize) usize {
-    var iter = diff_view_model.BodyRowIterator.init(file, mode);
-    var virtual_row: usize = 0;
+fn traverseVisibleBodyRows(
+    file: diff_parser.FileDiff,
+    mode: diff_view_model.DisplayMode,
+    line_index: diff_view_model.RenderedLineIndex,
+    scroll: usize,
+    height: usize,
+) usize {
+    var iter = diff_view_model.BodyRowIterator.initAt(file, mode, line_index, scroll);
     var visible_rows: usize = 0;
 
     while (iter.next()) |_| {
-        defer virtual_row += 1;
-        if (virtual_row < scroll) continue;
         if (visible_rows >= height) break;
         visible_rows += 1;
     }

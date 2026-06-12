@@ -10,6 +10,7 @@ pub const RenderOptions = struct {
     requested_mode: DisplayMode = .unified,
     scroll: usize = 0,
     highlighted_hunk: ?usize = null,
+    line_index: ?diff_view_model.RenderedLineIndex = null,
 };
 
 pub const FileStats = diff_file.Stats;
@@ -46,11 +47,19 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     const mode = effectiveMode(size.width, options.requested_mode);
     try renderFileHeader(surface, file, mode);
 
+    const line_index = if (options.line_index) |index|
+        if (lineIndexMatchesFile(file, index, mode)) index else null
+    else
+        null;
     var cursor: BodyCursor = .{
-        .scroll = options.scroll,
+        // initAt has already consumed the virtual rows before options.scroll.
+        .scroll = if (line_index != null) 0 else options.scroll,
         .height = size.height,
     };
-    var rows = diff_view_model.BodyRowIterator.init(file, mode);
+    var rows = if (line_index) |index|
+        diff_view_model.BodyRowIterator.initAt(file, mode, index, options.scroll)
+    else
+        diff_view_model.BodyRowIterator.init(file, mode);
     while (rows.next()) |body_row| {
         if (cursor.done()) return;
         const row = cursor.nextRow() orelse continue;
@@ -68,6 +77,10 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
             },
         }
     }
+}
+
+fn lineIndexMatchesFile(file: diff_parser.FileDiff, index: diff_view_model.RenderedLineIndex, mode: DisplayMode) bool {
+    return index.mode == mode and index.hunk_offsets.len == file.hunks.len;
 }
 
 fn renderFileHeader(surface: *chasen.Surface, file: diff_parser.FileDiff, mode: DisplayMode) !void {
@@ -382,4 +395,101 @@ test "side-by-side hunk header is clipped before the new column" {
     try ts.expectCellText(gutter_col, 3, "│");
     try ts.expectCellText(gutter_col + 1, 3, " ");
     try ts.expectCellText(gutter_col + 8, 3, " ");
+}
+
+test "renderFile can start from cached viewport offset" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 5);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{ "--- a/src/main.zig", "+++ b/src/main.zig" },
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 1,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "first",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old", .old_line = 1 },
+                    .{ .kind = .added, .text = "new", .new_line = 1 },
+                },
+            },
+            .{
+                .old_start = 9,
+                .old_count = 1,
+                .new_start = 9,
+                .new_count = 1,
+                .section = "second",
+                .lines = &.{
+                    .{ .kind = .context, .text = "same", .old_line = 9, .new_line = 9 },
+                },
+            },
+        },
+    };
+
+    var index = try diff_view_model.RenderedLineIndex.build(std.testing.allocator, file, .unified);
+    defer index.deinit(std.testing.allocator);
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .scroll = index.hunkOffset(1),
+        .line_index = index,
+    });
+
+    try ts.expectCellText(0, 3, "@");
+    try ts.expectCellText(1, 3, "@");
+    try ts.expectCellText(12, 4, "s");
+    try ts.expectCellText(13, 4, "a");
+    try ts.expectCellText(14, 4, "m");
+    try ts.expectCellText(15, 4, "e");
+}
+
+test "renderFile can start from cached side-by-side viewport offset" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 5);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 2,
+                .new_start = 1,
+                .new_count = 2,
+                .section = "",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old one", .old_line = 1 },
+                    .{ .kind = .removed, .text = "old two", .old_line = 2 },
+                    .{ .kind = .added, .text = "new one", .new_line = 1 },
+                    .{ .kind = .added, .text = "new two", .new_line = 2 },
+                },
+            },
+        },
+    };
+
+    var index = try diff_view_model.RenderedLineIndex.build(std.testing.allocator, file, .side_by_side);
+    defer index.deinit(std.testing.allocator);
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .side_by_side,
+        .scroll = index.hunkOffset(0) + 2,
+        .line_index = index,
+    });
+
+    try ts.expectCellText(7, 3, "o");
+    try ts.expectCellText(8, 3, "l");
+    try ts.expectCellText(9, 3, "d");
+    try ts.expectCellText(40, 3, "│");
+    try ts.expectCellText(48, 3, "n");
+    try ts.expectCellText(49, 3, "e");
+    try ts.expectCellText(50, 3, "w");
 }
