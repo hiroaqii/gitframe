@@ -6,6 +6,7 @@ const diff_render = @import("diff_render.zig");
 const diff_search = @import("diff_search.zig");
 const diff_source = @import("diff_source.zig");
 const file_tree = @import("file_tree.zig");
+const sidebar_view_model = @import("sidebar_view_model.zig");
 
 pub const SourceMode = diff_source.SourceMode;
 pub const CliConfig = diff_source.CliConfig;
@@ -297,44 +298,62 @@ pub const App = struct {
             visible_index += 1;
             row += 1;
         }) {
-            const index = loaded.visibleNodeAt(visible_index) orelse continue;
-            const node = loaded.tree.nodes[index];
-            const selected = index == self.selected_node;
-            const style: chasen.TextStyle = if (selected)
-                .{ .reverse = true, .bold = true }
-            else if (node.kind == .directory)
-                .{ .bold = true, .fg = .gray }
-            else
-                .{};
-            const marker = if (selected) ">" else " ";
-            _ = surface.borrowTextAt(0, row, marker, style);
+            const row_model = loaded.sidebarRowAt(visible_index, self.selected_node) orelse continue;
+            try drawSidebarRow(surface, row, row_model);
+        }
+    }
 
-            const stats_width: u16 = if (surface.size().width > 12) 12 else 0;
-            const indent: u16 = node.depth *| 2;
-            const name_col: u16 = if (node.status != null) 3 +| indent else 2 +| indent +| 2;
-            if (node.kind == .directory and surface.size().width > 2 + indent) {
-                const fold_marker = if (file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) "▸" else "▾";
-                _ = surface.borrowTextAt(2 + indent, row, fold_marker, style);
-            }
-            if (node.status) |status| {
-                const badge_col = 1 +| indent;
-                if (surface.size().width > badge_col) {
-                    _ = surface.borrowTextAt(badge_col, row, status.badge(), statusStyle(status, selected));
-                }
-            }
-            if (surface.size().width > name_col + stats_width) {
-                var path_area = surface.child(.{
-                    .col = name_col,
-                    .row = row,
-                    .width = surface.size().width - name_col - stats_width,
-                    .height = 1,
-                });
-                _ = try path_area.copyTextAt(0, 0, node.name, style);
-            }
-            if (surface.size().width > 12) {
-                _ = try surface.printAt(surface.size().width - stats_width, row, style, "+{d} -{d}", .{ node.stats.added, node.stats.removed });
+    fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_model.Row) !void {
+        const width = surface.size().width;
+        const row_layout = sidebar_view_model.layout(row_model, width);
+        const style = sidebarRowStyle(row_model);
+        const marker = if (row_model.selected) ">" else " ";
+
+        if (width > row_layout.marker_col) {
+            _ = surface.borrowTextAt(0, row, marker, style);
+        }
+
+        if (row_layout.fold_col) |fold_col| {
+            if (width > fold_col) {
+                const fold_marker = switch (row_model.fold) {
+                    .none => "",
+                    .expanded => "▾",
+                    .collapsed => "▸",
+                };
+                _ = surface.borrowTextAt(fold_col, row, fold_marker, style);
             }
         }
+
+        if (row_model.status) |status| {
+            if (row_layout.badge_col) |badge_col| {
+                if (width > badge_col) {
+                    _ = surface.borrowTextAt(badge_col, row, status.badge(), statusStyle(status, row_model.selected));
+                }
+            }
+        }
+
+        if (row_layout.name_width > 0) {
+            var path_area = surface.child(.{
+                .col = row_layout.name_col,
+                .row = row,
+                .width = row_layout.name_width,
+                .height = 1,
+            });
+            _ = try path_area.copyTextAt(0, 0, row_model.name, style);
+        }
+
+        if (row_layout.stats_col) |stats_col| {
+            _ = try surface.printAt(stats_col, row, style, "+{d} -{d}", .{
+                row_model.stats.added,
+                row_model.stats.removed,
+            });
+        }
+    }
+
+    fn sidebarRowStyle(row: sidebar_view_model.Row) chasen.TextStyle {
+        if (row.selected) return .{ .reverse = true, .bold = true };
+        if (row.kind == .directory) return .{ .bold = true, .fg = .gray };
+        return .{};
     }
 
     fn viewDiffPane(self: *const App, surface: *chasen.Surface, loaded: LoadedDiff) !void {
@@ -1064,6 +1083,15 @@ const LoadedDiff = struct {
             return if (visible_index < nodes.len) nodes[visible_index] else null;
         }
         return self.tree.visibleNodeAt(&self.collapsed_dirs, visible_index);
+    }
+
+    fn sidebarRowAt(self: *const LoadedDiff, visible_index: usize, selected_node: usize) ?sidebar_view_model.Row {
+        if (self.materializedVisibleNodes()) |nodes| {
+            return sidebar_view_model.visibleRowAt(self.tree, &self.collapsed_dirs, nodes, visible_index, selected_node);
+        }
+
+        const node_index = self.visibleNodeAt(visible_index) orelse return null;
+        return sidebar_view_model.rowForNode(self.tree, &self.collapsed_dirs, node_index, selected_node);
     }
 
     fn visibleRowOfNode(self: *const LoadedDiff, node_index: usize) ?usize {
