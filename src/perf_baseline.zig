@@ -51,13 +51,18 @@ fn runHugeFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const parse_ns = parse_timer.read();
     const file = document.files[0];
 
+    var cache_timer = Stopwatch.start(io);
+    const cache = try diff_view_model.RenderedLineCache.build(arena.allocator(), document);
+    const cache_ns = cache_timer.read();
+    const line_index = cache.indexFor(0, .side_by_side).?;
+
     var count_timer = Stopwatch.start(io);
-    const rows = diff_view_model.renderedBodyLineCount(file, .side_by_side);
+    const rows = line_index.lineCount();
     const count_ns = count_timer.read();
 
     const last_hunk_index = file.hunks.len - 1;
     var offset_timer = Stopwatch.start(io);
-    const offset = diff_view_model.hunkBodyLineOffset(file, .side_by_side, last_hunk_index);
+    const offset = line_index.hunkOffset(last_hunk_index);
     const offset_ns = offset_timer.read();
 
     var traverse_timer = Stopwatch.start(io);
@@ -67,8 +72,9 @@ fn runHugeFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     std.debug.print("\n[huge single file: {d} replacement rows]\n", .{huge_file_pairs});
     printTiming("fixture build", raw_ns);
     printTiming("parse", parse_ns);
-    printTiming("rendered row count", count_ns);
-    printTiming("hunk offset lookup", offset_ns);
+    printTiming("rendered line cache build", cache_ns);
+    printTiming("cached rendered row count", count_ns);
+    printTiming("cached hunk offset lookup", offset_ns);
     printTiming("visible row traversal near end", traverse_ns);
     std.debug.print("  rows: {d}, last hunk offset: {d}, visible rows: {d}\n", .{ rows, offset, visible_rows });
 }
@@ -90,6 +96,10 @@ fn runManyFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const tree = try file_tree.build(arena.allocator(), document);
     const tree_ns = tree_timer.read();
 
+    var cache_timer = Stopwatch.start(io);
+    const cache = try diff_view_model.RenderedLineCache.build(arena.allocator(), document);
+    const cache_ns = cache_timer.read();
+
     var collapsed: file_tree.CollapsedSet = .empty;
     defer collapsed.deinit(allocator);
 
@@ -101,12 +111,14 @@ fn runManyFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     printTiming("fixture build", raw_ns);
     printTiming("parse", parse_ns);
     printTiming("file tree build", tree_ns);
+    printTiming("rendered line cache build", cache_ns);
     printTiming("visible node count", visible_ns);
     std.debug.print("  files: {d}, tree nodes: {d}, visible nodes: {d}\n", .{
         document.files.len,
         tree.nodes.len,
         visible_count,
     });
+    std.debug.print("  first file cached rows: {d}\n", .{cache.indexFor(0, .side_by_side).?.lineCount()});
 }
 
 fn runNoMatchSearchScenario(allocator: std.mem.Allocator, io: std.Io) !void {

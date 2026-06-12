@@ -5,6 +5,7 @@ const diff_parser = @import("diff_parser.zig");
 const diff_render = @import("diff_render.zig");
 const diff_search = @import("diff_search.zig");
 const diff_source = @import("diff_source.zig");
+const diff_view_model = @import("diff_view_model.zig");
 const file_tree = @import("file_tree.zig");
 const sidebar_view_model = @import("sidebar_view_model.zig");
 
@@ -533,12 +534,14 @@ pub const App = struct {
                     return;
                 };
                 const tree = try file_tree.build(arena_allocator, document);
+                const rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document);
                 var loaded: LoadedDiff = .{
                     .bytes = copied.len,
                     .lines = countLines(copied),
                     .text = copied,
                     .document = document,
                     .tree = tree,
+                    .rendered_line_cache = rendered_line_cache,
                     .collapsed_dirs = .empty,
                 };
                 try loaded.rebuildVisibleNodes(arena_allocator);
@@ -700,13 +703,13 @@ pub const App = struct {
             self.selected_hunk += 1;
         }
 
-        self.scrollSelectedHunkIntoView(file);
+        self.scrollSelectedHunkIntoView();
         self.clampDiffNavigation();
     }
 
-    fn scrollSelectedHunkIntoView(self: *App, file: diff_parser.FileDiff) void {
+    fn scrollSelectedHunkIntoView(self: *App) void {
         const mode = self.effectiveDisplayMode();
-        const target = diff_render.hunkBodyLineOffset(file, mode, self.selected_hunk);
+        const target = self.selectedHunkOffset(mode, self.selected_hunk);
         const visible_rows = self.diffVisibleRows();
         if (target < self.diff_scroll) {
             self.diff_scroll = target;
@@ -728,7 +731,7 @@ pub const App = struct {
         }
 
         const mode = self.effectiveDisplayMode();
-        const line_count = diff_render.renderedBodyLineCount(file, mode);
+        const line_count = self.selectedFileLineIndex(mode).lineCount();
         const visible_rows = self.diffVisibleRows();
         const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
         if (self.diff_scroll > max_scroll) self.diff_scroll = max_scroll;
@@ -737,7 +740,7 @@ pub const App = struct {
     fn clampDiffNavigationKeepingHunkVisible(self: *App) void {
         self.clampDiffNavigation();
         if (self.selectedFile()) |file| {
-            if (file.hunks.len > 0) self.scrollSelectedHunkIntoView(file);
+            if (file.hunks.len > 0) self.scrollSelectedHunkIntoView();
         }
         self.clampDiffNavigation();
     }
@@ -823,7 +826,7 @@ pub const App = struct {
         const file = self.selectedFile() orelse return;
         if (self.search_query.len == 0) return;
 
-        const line_count = diff_render.renderedBodyLineCount(file, self.effectiveDisplayMode());
+        const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
         if (line_count == 0) return;
         const base = self.search_match orelse switch (direction) {
             .forward => if (line_count > 0) line_count - 1 else 0,
@@ -846,7 +849,7 @@ pub const App = struct {
         if (self.search_query.len == 0) return;
         self.search_match = null;
         const file = self.selectedFile() orelse return;
-        const line_count = diff_render.renderedBodyLineCount(file, self.effectiveDisplayMode());
+        const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
         if (line_count == 0) return;
 
         const clamped = @min(preferred_offset, line_count - 1);
@@ -864,6 +867,27 @@ pub const App = struct {
             else
                 loaded.document.files[@min(self.selected_file, loaded.document.files.len - 1)],
             else => null,
+        };
+    }
+
+    fn selectedFileLineIndex(self: *const App, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {
+        return switch (self.load_state) {
+            .loaded => |loaded| if (loaded.document.files.len == 0)
+                .{ .mode = mode }
+            else
+                loaded.renderedLineIndex(@min(self.selected_file, loaded.document.files.len - 1), mode),
+            else => .{ .mode = mode },
+        };
+    }
+
+    fn selectedHunkOffset(self: *const App, mode: diff_render.DisplayMode, hunk_index: usize) usize {
+        return switch (self.load_state) {
+            .loaded => |loaded| if (loaded.document.files.len == 0) 0 else blk: {
+                const file_index = @min(self.selected_file, loaded.document.files.len - 1);
+                if (loaded.rendered_line_cache.indexFor(file_index, mode)) |index| break :blk index.hunkOffset(hunk_index);
+                break :blk diff_render.hunkBodyLineOffset(loaded.document.files[file_index], mode, hunk_index);
+            },
+            else => 0,
         };
     }
 
@@ -1046,6 +1070,7 @@ const LoadedDiff = struct {
     text: []const u8,
     document: diff_parser.DiffDocument,
     tree: file_tree.FileTree,
+    rendered_line_cache: diff_view_model.RenderedLineCache = .{},
     collapsed_dirs: file_tree.CollapsedSet = .empty,
     visible_nodes: []usize = &.{},
     visible_node_count: usize = 0,
@@ -1092,6 +1117,17 @@ const LoadedDiff = struct {
 
         const node_index = self.visibleNodeAt(visible_index) orelse return null;
         return sidebar_view_model.rowForNode(self.tree, &self.collapsed_dirs, node_index, selected_node);
+    }
+
+    fn renderedLineIndex(self: *const LoadedDiff, file_index: usize, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {
+        if (self.rendered_line_cache.indexFor(file_index, mode)) |index| return index;
+        if (file_index >= self.document.files.len) return .{ .mode = mode };
+
+        const file = self.document.files[file_index];
+        return .{
+            .mode = mode,
+            .total_rows = diff_render.renderedBodyLineCount(file, mode),
+        };
     }
 
     fn visibleRowOfNode(self: *const LoadedDiff, node_index: usize) ?usize {
@@ -1225,7 +1261,7 @@ test "mode toggle keeps selected hunk visible" {
         .selected_hunk = 1,
     };
 
-    app.scrollSelectedHunkIntoView(testFileWithHunks());
+    app.scrollSelectedHunkIntoView();
     try std.testing.expect(app.diff_scroll > 0);
 
     app.display_mode = .side_by_side;

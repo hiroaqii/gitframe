@@ -137,6 +137,123 @@ pub fn hunkBodyLineOffset(file: diff_parser.FileDiff, mode: DisplayMode, hunk_in
     return offset;
 }
 
+pub const RenderedLineIndex = struct {
+    mode: DisplayMode,
+    metadata_rows: usize = 0,
+    binary_rows: usize = 0,
+    total_rows: usize = 0,
+    // Offsets are body-row coordinates. Each hunk offset points at its hunk
+    // header row; each line count includes that header plus rendered hunk rows.
+    hunk_offsets: []usize = &.{},
+    hunk_line_counts: []usize = &.{},
+
+    pub fn build(allocator: std.mem.Allocator, file: diff_parser.FileDiff, mode: DisplayMode) !RenderedLineIndex {
+        const hunk_offsets = try allocator.alloc(usize, file.hunks.len);
+        const hunk_line_counts = allocator.alloc(usize, file.hunks.len) catch |err| {
+            allocator.free(hunk_offsets);
+            return err;
+        };
+
+        var index: RenderedLineIndex = .{
+            .mode = mode,
+            .hunk_offsets = hunk_offsets,
+            .hunk_line_counts = hunk_line_counts,
+        };
+
+        // Build from the same iterator used by render/search wrappers so the
+        // cached index cannot drift from the rendered body row order.
+        var rows = BodyRowIterator.init(file, mode);
+        var offset: usize = 0;
+        while (rows.next()) |row| : (offset += 1) {
+            switch (row) {
+                .metadata => index.metadata_rows += 1,
+                .binary_marker => index.binary_rows += 1,
+                .hunk_header => |hunk| {
+                    if (hunk.hunk_index < index.hunk_offsets.len) {
+                        index.hunk_offsets[hunk.hunk_index] = offset;
+                    }
+                },
+                .unified_line, .side_by_side => {},
+            }
+        }
+        index.total_rows = offset;
+
+        for (index.hunk_offsets, 0..) |hunk_offset, hunk_index| {
+            const next_offset = if (hunk_index + 1 < index.hunk_offsets.len)
+                index.hunk_offsets[hunk_index + 1]
+            else
+                index.total_rows;
+            index.hunk_line_counts[hunk_index] = next_offset - hunk_offset;
+        }
+
+        return index;
+    }
+
+    pub fn deinit(self: *RenderedLineIndex, allocator: std.mem.Allocator) void {
+        const mode = self.mode;
+        allocator.free(self.hunk_offsets);
+        allocator.free(self.hunk_line_counts);
+        self.* = .{ .mode = mode };
+    }
+
+    pub fn lineCount(self: RenderedLineIndex) usize {
+        return self.total_rows;
+    }
+
+    pub fn hunkOffset(self: RenderedLineIndex, hunk_index: usize) usize {
+        if (hunk_index >= self.hunk_offsets.len) return self.total_rows;
+        return self.hunk_offsets[hunk_index];
+    }
+
+    pub fn hunkLineCount(self: RenderedLineIndex, hunk_index: usize) usize {
+        if (hunk_index >= self.hunk_line_counts.len) return 0;
+        return self.hunk_line_counts[hunk_index];
+    }
+};
+
+pub const RenderedLineCache = struct {
+    unified: []RenderedLineIndex = &.{},
+    side_by_side: []RenderedLineIndex = &.{},
+
+    pub fn build(allocator: std.mem.Allocator, document: diff_parser.DiffDocument) !RenderedLineCache {
+        const unified = try allocator.alloc(RenderedLineIndex, document.files.len);
+        const side_by_side = allocator.alloc(RenderedLineIndex, document.files.len) catch |err| {
+            allocator.free(unified);
+            return err;
+        };
+
+        var cache: RenderedLineCache = .{
+            .unified = unified,
+            .side_by_side = side_by_side,
+        };
+        @memset(cache.unified, .{ .mode = .unified });
+        @memset(cache.side_by_side, .{ .mode = .side_by_side });
+        errdefer cache.deinitForTests(allocator);
+
+        for (document.files, 0..) |file, index| {
+            cache.unified[index] = try RenderedLineIndex.build(allocator, file, .unified);
+            cache.side_by_side[index] = try RenderedLineIndex.build(allocator, file, .side_by_side);
+        }
+
+        return cache;
+    }
+
+    pub fn indexFor(self: RenderedLineCache, file_index: usize, mode: DisplayMode) ?RenderedLineIndex {
+        return switch (mode) {
+            .unified => if (file_index < self.unified.len) self.unified[file_index] else null,
+            .side_by_side => if (file_index < self.side_by_side.len) self.side_by_side[file_index] else null,
+        };
+    }
+
+    fn deinitForTests(self: *RenderedLineCache, allocator: std.mem.Allocator) void {
+        for (self.unified) |*index| index.deinit(allocator);
+        for (self.side_by_side) |*index| index.deinit(allocator);
+        allocator.free(self.unified);
+        allocator.free(self.side_by_side);
+        self.* = .{};
+    }
+};
+
 pub const SideBySidePair = struct {
     removed: ?diff_parser.DiffLine = null,
     added: ?diff_parser.DiffLine = null,
@@ -245,6 +362,71 @@ test "body line offsets account for metadata and side-by-side pairs" {
     try std.testing.expectEqual(@as(usize, 8), renderedBodyLineCount(file, .side_by_side));
     try std.testing.expectEqual(@as(usize, 7), hunkBodyLineOffset(file, .unified, 1));
     try std.testing.expectEqual(@as(usize, 9), renderedBodyLineCount(file, .unified));
+}
+
+test "rendered line index matches iterator wrappers" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 4,
+                .new_start = 1,
+                .new_count = 2,
+                .section = "first",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old one", .old_line = 1 },
+                    .{ .kind = .removed, .text = "old two", .old_line = 2 },
+                    .{ .kind = .removed, .text = "old three", .old_line = 3 },
+                    .{ .kind = .added, .text = "new one", .new_line = 1 },
+                    .{ .kind = .context, .text = "\\ No newline at end of file" },
+                },
+            },
+            .{
+                .old_start = 9,
+                .old_count = 1,
+                .new_start = 9,
+                .new_count = 1,
+                .section = "second",
+                .lines = &.{
+                    .{ .kind = .context, .text = "same", .old_line = 9, .new_line = 9 },
+                },
+            },
+        },
+    };
+
+    var unified = try RenderedLineIndex.build(std.testing.allocator, file, .unified);
+    defer unified.deinit(std.testing.allocator);
+    var side_by_side = try RenderedLineIndex.build(std.testing.allocator, file, .side_by_side);
+    defer side_by_side.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(renderedBodyLineCount(file, .unified), unified.lineCount());
+    try std.testing.expectEqual(renderedBodyLineCount(file, .side_by_side), side_by_side.lineCount());
+    try std.testing.expectEqual(hunkBodyLineOffset(file, .unified, 1), unified.hunkOffset(1));
+    try std.testing.expectEqual(hunkBodyLineOffset(file, .side_by_side, 1), side_by_side.hunkOffset(1));
+    try std.testing.expectEqual(@as(usize, 3), unified.metadata_rows);
+    try std.testing.expectEqual(@as(usize, 0), unified.binary_rows);
+    try std.testing.expectEqual(@as(usize, 6), unified.hunkLineCount(0));
+    try std.testing.expectEqual(@as(usize, 5), side_by_side.hunkLineCount(0));
+}
+
+test "rendered line index counts binary file" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/bin b/bin",
+        .metadata = &.{"Binary files a/bin and b/bin differ"},
+        .hunks = &.{},
+        .is_binary = true,
+    };
+
+    var index = try RenderedLineIndex.build(std.testing.allocator, file, .unified);
+    defer index.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), index.metadata_rows);
+    try std.testing.expectEqual(@as(usize, 1), index.binary_rows);
+    try std.testing.expectEqual(renderedBodyLineCount(file, .unified), index.lineCount());
+    try std.testing.expectEqual(index.lineCount(), index.hunkOffset(0));
+    try std.testing.expectEqual(@as(usize, 0), index.hunkLineCount(0));
 }
 
 test "side-by-side pairs removed and added runs by index" {
