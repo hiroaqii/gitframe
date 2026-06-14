@@ -11,6 +11,9 @@ const file_tree = @import("file_tree.zig");
 const repo_discovery = @import("repo_discovery.zig");
 const sidebar_view_model = @import("sidebar_view_model.zig");
 
+const auto_reload_timer_id = "gitframe.auto_reload";
+const auto_reload_interval_ns = 2 * std.time.ns_per_s;
+
 pub const SourceMode = diff_source.SourceMode;
 pub const CliConfig = diff_source.CliConfig;
 pub const LoadRequest = diff_source.LoadRequest;
@@ -49,6 +52,8 @@ pub const App = struct {
     changed_file_filter: ChangedFileFilter = .all,
     repo_discovery_result: ?repo_discovery.DiscoveryResult = null,
     active_repo: usize = 0,
+    load_in_flight: bool = false,
+    load_in_flight_generation: ?u64 = null,
     /// Session-level source of truth for reviewed files. The active LoadedDiff
     /// keeps a materialized bool slice so hide-reviewed hot paths stay O(1).
     reviewed_store: std.StringHashMapUnmanaged(void) = .empty,
@@ -103,11 +108,15 @@ pub const App = struct {
         toggle_hide_reviewed_files,
         cycle_changed_file_filter,
         reload,
+        auto_reload_tick,
         quit,
     };
 
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         self.allocator = ctx.allocator();
+        if (self.config.watch) {
+            try ctx.timer().every(auto_reload_timer_id, auto_reload_interval_ns, .auto_reload_tick);
+        }
         if (diff_source.sourceRequiresRepo(self.config.source)) {
             try self.startRepoDiscovery(ctx);
         } else {
@@ -204,6 +213,7 @@ pub const App = struct {
                     }
                 },
             },
+            .auto_reload_tick => try self.autoReloadTick(ctx),
             .quit => ctx.quit(),
         }
     }
@@ -561,6 +571,10 @@ pub const App = struct {
         col +|= 9;
         _ = surface.borrowTextAt(col, 0, "viewer shell", .{ .fg = .gray });
         col +|= 13;
+        if (self.config.watch and width > col + 8) {
+            _ = surface.borrowTextAt(col, 0, "watch", .{ .fg = .{ .index = 10 } });
+            col +|= 7;
+        }
 
         const size_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
             self.terminal_size.width,
@@ -666,6 +680,8 @@ pub const App = struct {
         errdefer ctx.allocator().destroy(task);
 
         self.load_generation +%= 1;
+        self.load_in_flight = false;
+        self.load_in_flight_generation = null;
         task.* = .{ .generation = self.load_generation };
         self.clearLoadedDiff();
         self.load_state = .loading;
@@ -714,10 +730,10 @@ pub const App = struct {
             return;
         };
 
-        try self.startDiffLoadWithRepoRoot(ctx, repo_root);
+        try self.startDiffLoadWithRepoRoot(ctx, repo_root, true);
     }
 
-    fn startDiffLoadWithRepoRoot(self: *App, ctx: *chasen.Ctx(Msg), repo_root: ?[]const u8) !void {
+    fn startDiffLoadWithRepoRoot(self: *App, ctx: *chasen.Ctx(Msg), repo_root: ?[]const u8, clear_visible_state: bool) !void {
         const task = try ctx.allocator().create(DiffLoadTask);
         errdefer ctx.allocator().destroy(task);
 
@@ -735,12 +751,40 @@ pub const App = struct {
             .generation = self.load_generation,
         };
 
-        self.clearLoadedDiff();
-        self.load_state = .loading;
+        if (clear_visible_state) {
+            self.clearLoadedDiff();
+            self.load_state = .loading;
+        }
+        self.load_in_flight = true;
+        self.load_in_flight_generation = self.load_generation;
         ctx.task().spawnWith(task, DiffLoadTask.run) catch |err| {
             self.load_state = .{ .failed = "Could not start diff load task" };
+            self.load_in_flight = false;
+            self.load_in_flight_generation = null;
             return err;
         };
+    }
+
+    fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (!self.config.watch) return;
+        if (self.config.source == .stdin) return;
+        if (self.repo_picker_mode or self.search_mode or self.file_search_mode) {
+            ctx.redraw().skip();
+            return;
+        }
+        if (self.load_in_flight or self.load_state == .loading) {
+            ctx.redraw().skip();
+            return;
+        }
+
+        if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
+            try self.startRepoDiscovery(ctx);
+        } else {
+            try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
+                ctx.redraw().skip();
+                return;
+            }, self.load_state == .idle);
+        }
     }
 
     fn repoRootForCurrentSource(self: *const App) error{MissingRepoRoot}!?[]const u8 {
@@ -773,6 +817,10 @@ pub const App = struct {
 
         // Multiple reloads can be in flight. Only the newest generation is
         // allowed to update visible state.
+        if (self.load_in_flight_generation == finished.generation) {
+            self.load_in_flight = false;
+            self.load_in_flight_generation = null;
+        }
         if (finished.generation != self.load_generation) return;
 
         self.clearLoadedDiff();
@@ -1097,7 +1145,7 @@ pub const App = struct {
         self.cancelRepoPickerMode(ctx.allocator());
         if (repo_index == self.active_repo) return;
 
-        try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root);
+        try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root, true);
         self.active_repo = repo_index;
         self.selected_file = 0;
         self.selected_node = 0;

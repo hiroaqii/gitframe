@@ -40,6 +40,7 @@ fn printHelp(io: std.Io) !void {
         \\  --cached          Show staged changes
         \\  --stdin           Read unified diff from stdin
         \\  --range <range>   Show a commit range, for example main...HEAD
+        \\  --watch           Poll and reload the active diff every 2 seconds
         \\  -h, --help        Show this help
         \\
         \\Default:

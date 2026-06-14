@@ -16,6 +16,7 @@ pub const SourceMode = union(enum) {
 
 pub const CliConfig = struct {
     source: SourceMode = .unstaged,
+    watch: bool = false,
 
     pub fn sourceLabel(self: CliConfig) []const u8 {
         return switch (self.source) {
@@ -55,6 +56,7 @@ pub const ParseArgsError = error{
     InvalidRange,
     TooManyInputs,
     ConflictingSourceMode,
+    UnsupportedWatchSource,
 };
 
 pub const LoadError = error{
@@ -131,6 +133,8 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
             try setSourceMode(&config, .cached);
         } else if (std.mem.eql(u8, arg, "--stdin")) {
             try setSourceMode(&config, .stdin);
+        } else if (std.mem.eql(u8, arg, "--watch")) {
+            config.watch = true;
         } else if (std.mem.eql(u8, arg, "--range")) {
             index += 1;
             if (index >= args.len) return error.MissingOptionValue;
@@ -149,6 +153,8 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
             try setSourceMode(&config, .{ .patch_file = arg });
         }
     }
+
+    if (config.watch and config.source == .stdin) return error.UnsupportedWatchSource;
 
     return config;
 }
@@ -270,6 +276,19 @@ test "parseArgs accepts stdin mode" {
     const config = try parseArgs(args[0..]);
 
     try std.testing.expect(config.source == .stdin);
+}
+
+test "parseArgs accepts watch mode" {
+    const args = [_][]const u8{ "gitframe", "--watch" };
+    const config = try parseArgs(args[0..]);
+
+    try std.testing.expect(config.source == .unstaged);
+    try std.testing.expect(config.watch);
+}
+
+test "parseArgs rejects watch with stdin" {
+    const args = [_][]const u8{ "gitframe", "--stdin", "--watch" };
+    try std.testing.expectError(error.UnsupportedWatchSource, parseArgs(args[0..]));
 }
 
 test "parseArgs accepts range option" {
