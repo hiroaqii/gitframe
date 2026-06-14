@@ -576,10 +576,7 @@ pub const App = struct {
     }
 
     fn selectFileDelta(self: *App, delta: i2) void {
-        const loaded = switch (self.load_state) {
-            .loaded => |*loaded| loaded,
-            else => return,
-        };
+        const loaded = self.activeLoadedDiff() orelse return;
         if (loaded.document.files.len == 0 or loaded.tree.nodes.len == 0) return;
 
         if (delta < 0) {
@@ -598,14 +595,14 @@ pub const App = struct {
         if (file_count == 0) return;
         const target = @min(index, file_count - 1);
         if (self.selected_file == target) {
-            if (self.loadedDiff()) |loaded| {
+            if (self.activeLoadedDiff()) |loaded| {
                 if (loaded.tree.selectedNodeIndex(self.selected_file)) |node_index| self.selected_node = node_index;
             }
             self.clampSelection(file_count);
             return;
         }
         self.selected_file = target;
-        if (self.loadedDiff()) |loaded| {
+        if (self.activeLoadedDiff()) |loaded| {
             if (loaded.tree.selectedNodeIndex(self.selected_file)) |node_index| self.selected_node = node_index;
         }
         self.resetDiffPosition();
@@ -634,7 +631,7 @@ pub const App = struct {
     }
 
     fn toggleSelectedDirectory(self: *App) !void {
-        const loaded = self.loadedDiff() orelse return;
+        const loaded = self.activeLoadedDiff() orelse return;
         if (self.selected_node >= loaded.tree.nodes.len) return;
         const node = loaded.tree.nodes[self.selected_node];
         if (node.kind != .directory) return;
@@ -645,7 +642,7 @@ pub const App = struct {
     }
 
     fn expandSelectedDirectory(self: *App) !void {
-        const loaded = self.loadedDiff() orelse return;
+        const loaded = self.activeLoadedDiff() orelse return;
         if (self.selected_node >= loaded.tree.nodes.len) return;
         const node = loaded.tree.nodes[self.selected_node];
         if (node.kind != .directory) return;
@@ -655,7 +652,7 @@ pub const App = struct {
     }
 
     fn collapseOrSelectParentDirectory(self: *App) !void {
-        const loaded = self.loadedDiff() orelse return;
+        const loaded = self.activeLoadedDiff() orelse return;
         if (self.selected_node >= loaded.tree.nodes.len) return;
         const node = loaded.tree.nodes[self.selected_node];
         if (node.kind == .directory and !file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) {
@@ -782,7 +779,7 @@ pub const App = struct {
     }
 
     fn toggleReviewedFile(self: *App) !void {
-        const loaded = self.loadedDiff() orelse return;
+        const loaded = self.activeLoadedDiff() orelse return;
         if (self.selected_node >= loaded.tree.nodes.len) return;
 
         const node = loaded.tree.nodes[self.selected_node];
@@ -798,7 +795,7 @@ pub const App = struct {
 
     fn toggleHideReviewedFiles(self: *App) !void {
         self.hide_reviewed_files = !self.hide_reviewed_files;
-        const loaded = self.loadedDiff() orelse return;
+        const loaded = self.activeLoadedDiff() orelse return;
         try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.hide_reviewed_files);
         self.reconcileSelectionAfterVisibleNodeChange(loaded);
         self.clampDiffNavigation();
@@ -811,7 +808,7 @@ pub const App = struct {
             return;
         }
 
-        const loaded = self.loadedDiff() orelse {
+        const loaded = self.activeLoadedDiff() orelse {
             self.file_search_no_match = true;
             return;
         };
@@ -901,51 +898,35 @@ pub const App = struct {
     }
 
     fn selectedFile(self: *const App) ?diff_parser.FileDiff {
-        return switch (self.load_state) {
-            .loaded => |loaded| if (loaded.document.files.len == 0)
-                null
-            else
-                loaded.document.files[@min(self.selected_file, loaded.document.files.len - 1)],
-            else => null,
-        };
+        const loaded = self.activeLoadedDiffConst() orelse return null;
+        if (loaded.document.files.len == 0) return null;
+        return loaded.document.files[@min(self.selected_file, loaded.document.files.len - 1)];
     }
 
     fn selectedFileLineIndex(self: *const App, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {
-        return switch (self.load_state) {
-            .loaded => |loaded| if (loaded.document.files.len == 0)
-                .{ .mode = mode }
-            else
-                loaded.renderedLineIndex(@min(self.selected_file, loaded.document.files.len - 1), mode),
-            else => .{ .mode = mode },
-        };
+        const loaded = self.activeLoadedDiffConst() orelse return .{ .mode = mode };
+        if (loaded.document.files.len == 0) return .{ .mode = mode };
+        return loaded.renderedLineIndex(@min(self.selected_file, loaded.document.files.len - 1), mode);
     }
 
     fn selectedFileCachedLineIndex(self: *const App, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
-        return switch (self.load_state) {
-            .loaded => |loaded| if (loaded.document.files.len == 0)
-                null
-            else
-                loaded.cachedRenderedLineIndex(@min(self.selected_file, loaded.document.files.len - 1), mode),
-            else => null,
-        };
+        const loaded = self.activeLoadedDiffConst() orelse return null;
+        if (loaded.document.files.len == 0) return null;
+        return loaded.cachedRenderedLineIndex(@min(self.selected_file, loaded.document.files.len - 1), mode);
     }
 
     fn selectedHunkOffset(self: *const App, mode: diff_render.DisplayMode, hunk_index: usize) usize {
-        return switch (self.load_state) {
-            .loaded => |loaded| if (loaded.document.files.len == 0) 0 else blk: {
-                const file_index = @min(self.selected_file, loaded.document.files.len - 1);
-                if (loaded.rendered_line_cache.indexFor(file_index, mode)) |index| break :blk index.hunkOffset(hunk_index);
-                break :blk diff_render.hunkBodyLineOffset(loaded.document.files[file_index], mode, hunk_index);
-            },
-            else => 0,
-        };
+        const loaded = self.activeLoadedDiffConst() orelse return 0;
+        if (loaded.document.files.len == 0) return 0;
+
+        const file_index = @min(self.selected_file, loaded.document.files.len - 1);
+        if (loaded.rendered_line_cache.indexFor(file_index, mode)) |index| return index.hunkOffset(hunk_index);
+        return diff_render.hunkBodyLineOffset(loaded.document.files[file_index], mode, hunk_index);
     }
 
     fn loadedFileCount(self: *const App) ?usize {
-        return switch (self.load_state) {
-            .loaded => |loaded| loaded.document.files.len,
-            else => null,
-        };
+        const loaded = self.activeLoadedDiffConst() orelse return null;
+        return loaded.document.files.len;
     }
 
     fn effectiveDisplayMode(self: *const App) diff_render.DisplayMode {
@@ -970,7 +951,7 @@ pub const App = struct {
             return;
         }
         if (self.selected_file >= file_count) self.selected_file = file_count - 1;
-        if (self.loadedDiff()) |loaded| {
+        if (self.activeLoadedDiff()) |loaded| {
             if (self.selected_node >= loaded.tree.nodes.len) {
                 self.selected_node = loaded.tree.selectedNodeIndex(self.selected_file) orelse 0;
             }
@@ -1003,6 +984,17 @@ pub const App = struct {
     }
 
     fn loadedDiff(self: *App) ?*LoadedDiff {
+        return self.activeLoadedDiff();
+    }
+
+    fn activeLoadedDiff(self: *App) ?*LoadedDiff {
+        return switch (self.load_state) {
+            .loaded => |*loaded| loaded,
+            else => null,
+        };
+    }
+
+    fn activeLoadedDiffConst(self: *const App) ?*const LoadedDiff {
         return switch (self.load_state) {
             .loaded => |*loaded| loaded,
             else => null,
