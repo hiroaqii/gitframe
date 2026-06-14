@@ -36,6 +36,7 @@ pub const App = struct {
     search_match_offset: ?usize = null,
     file_search_mode: bool = false,
     file_search_input: SearchQuery = .{},
+    file_search_filter: ui.ListFilter = .{},
     file_search_no_match: bool = false,
     file_search_return_focus: Focus = .sidebar,
     hide_reviewed_files: bool = false,
@@ -94,6 +95,7 @@ pub const App = struct {
     pub fn deinit(self: *App, deinit_ctx: chasen.AppDeinitContext) void {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.clearLoadedDiff();
+        self.file_search_filter.deinit(deinit_ctx.allocator);
         self.clearReviewedStore(deinit_ctx.allocator);
     }
 
@@ -137,8 +139,8 @@ pub const App = struct {
             .select_next_search_match => self.selectSearchMatch(.forward),
             .select_previous_search_match => self.selectSearchMatch(.backward),
             .enter_file_search => self.enterFileSearchMode(),
-            .cancel_file_search => self.cancelFileSearchMode(),
-            .submit_file_search => self.submitFileSearch(),
+            .cancel_file_search => self.cancelFileSearchMode(ctx.allocator()),
+            .submit_file_search => try self.submitFileSearch(ctx.allocator()),
             .file_search_insert => |codepoint| {
                 self.file_search_no_match = false;
                 self.file_search_input.insert(codepoint) catch {};
@@ -809,9 +811,10 @@ pub const App = struct {
         self.file_search_no_match = false;
     }
 
-    fn cancelFileSearchMode(self: *App) void {
+    fn cancelFileSearchMode(self: *App, allocator: std.mem.Allocator) void {
         self.file_search_mode = false;
         self.file_search_input = .{};
+        self.file_search_filter.deinit(allocator);
         self.file_search_no_match = false;
         self.focus = self.file_search_return_focus;
     }
@@ -841,10 +844,10 @@ pub const App = struct {
         self.clampDiffNavigation();
     }
 
-    fn submitFileSearch(self: *App) void {
+    fn submitFileSearch(self: *App, allocator: std.mem.Allocator) !void {
         const query = std.mem.trim(u8, self.file_search_input.slice(), " \t\r\n");
         if (query.len == 0) {
-            self.cancelFileSearchMode();
+            self.cancelFileSearchMode(allocator);
             return;
         }
 
@@ -852,7 +855,8 @@ pub const App = struct {
             self.file_search_no_match = true;
             return;
         };
-        const node_index = findFileNodeMatching(loaded, query, self.hide_reviewed_files) orelse {
+        const node_index = try self.findFileNodeWithFilter(allocator, loaded, query) orelse {
+            self.file_search_filter.deinit(allocator);
             self.file_search_no_match = true;
             return;
         };
@@ -860,14 +864,19 @@ pub const App = struct {
         // Go-to-file should land on the file row, not on a still-collapsed
         // parent directory that hides the matched path.
         file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
-        loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.hide_reviewed_files) catch {
+        const load_allocator = self.loadArenaAllocator() orelse {
+            self.file_search_filter.deinit(allocator);
+            return;
+        };
+        loaded.rebuildVisibleNodes(load_allocator, self.hide_reviewed_files) catch {
+            self.file_search_filter.deinit(allocator);
             self.file_search_no_match = true;
             return;
         };
         self.selectSidebarNode(loaded, node_index);
         self.clampSelection(loaded.document.files.len);
         self.clampDiffNavigation();
-        self.cancelFileSearchMode();
+        self.cancelFileSearchMode(allocator);
     }
 
     fn submitSearch(self: *App) void {
@@ -1064,6 +1073,25 @@ pub const App = struct {
         while (keys.next()) |key| allocator.free(key.*);
         self.reviewed_store.deinit(allocator);
         self.reviewed_store = .empty;
+    }
+
+    fn findFileNodeWithFilter(self: *App, allocator: std.mem.Allocator, loaded: *const LoadedDiff, query: []const u8) !?usize {
+        var labels: std.ArrayList([]const u8) = .empty;
+        defer labels.deinit(allocator);
+        var node_indexes: std.ArrayList(usize) = .empty;
+        defer node_indexes.deinit(allocator);
+
+        for (loaded.tree.nodes, 0..) |node, index| {
+            if (node.kind != .file) continue;
+            if (self.hide_reviewed_files and loaded.isReviewedFileNode(index)) continue;
+            try labels.append(allocator, node.path);
+            try node_indexes.append(allocator, index);
+        }
+
+        // ListFilter owns the filtered index arrays, while file path labels
+        // remain borrowed from the active LoadedDiff.
+        try self.file_search_filter.applyWithSourceIndexes(allocator, labels.items, node_indexes.items, query);
+        return self.file_search_filter.sourceIndex(0);
     }
 
     fn loadedDiff(self: *App) ?*LoadedDiff {
@@ -1513,15 +1541,6 @@ fn parentDirectoryNodeIndex(tree: file_tree.FileTree, node_index: usize) ?usize 
     return null;
 }
 
-fn findFileNodeMatching(loaded: *const LoadedDiff, query: []const u8, hide_reviewed: bool) ?usize {
-    for (loaded.tree.nodes, 0..) |node, index| {
-        if (node.kind != .file) continue;
-        if (hide_reviewed and loaded.isReviewedFileNode(index)) continue;
-        if (ui.list_filter.matchesLabel(node.path, query)) return index;
-    }
-    return null;
-}
-
 test "countLines handles empty and trailing newline inputs" {
     try std.testing.expectEqual(@as(usize, 0), countLines(""));
     try std.testing.expectEqual(@as(usize, 1), countLines("one"));
@@ -1686,7 +1705,7 @@ test "file search selects matching file and expands ancestors" {
     try file_tree.collapse(app.loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
     setFileSearchInput(&app, "src/b");
 
-    app.submitFileSearch();
+    try app.submitFileSearch(std.testing.allocator);
 
     loaded = app.loadedDiff().?;
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
@@ -1703,7 +1722,9 @@ test "file search keeps prompt open on no match" {
     };
     setFileSearchInput(&app, "missing");
 
-    app.submitFileSearch();
+    defer app.file_search_filter.deinit(std.testing.allocator);
+
+    try app.submitFileSearch(std.testing.allocator);
 
     try std.testing.expect(app.file_search_mode);
     try std.testing.expect(app.file_search_no_match);
@@ -1730,7 +1751,7 @@ test "file search skips hidden reviewed matches" {
     try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, true);
     setFileSearchInput(&app, "src");
 
-    app.submitFileSearch();
+    try app.submitFileSearch(std.testing.allocator);
 
     try std.testing.expect(!app.file_search_mode);
     try std.testing.expect(!app.file_search_no_match);
@@ -1749,7 +1770,7 @@ test "file search trims empty input and restores focus on cancel" {
     try std.testing.expectEqual(Focus.sidebar, app.focus);
     setFileSearchInput(&app, "   ");
 
-    app.submitFileSearch();
+    try app.submitFileSearch(std.testing.allocator);
 
     try std.testing.expect(!app.file_search_mode);
     try std.testing.expectEqual(Focus.diff, app.focus);
