@@ -45,6 +45,19 @@ pub fn status(file: diff_parser.FileDiff) Status {
     return .modified;
 }
 
+pub fn hasModeChange(file: diff_parser.FileDiff) bool {
+    for (file.metadata) |line| {
+        if (std.mem.startsWith(u8, line, "old mode ") or
+            std.mem.startsWith(u8, line, "new mode ") or
+            hasNonRegularFileMode(line, "new file mode ") or
+            hasNonRegularFileMode(line, "deleted file mode "))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 pub fn stats(file: diff_parser.FileDiff) Stats {
     var result: Stats = .{};
     for (file.hunks) |hunk| {
@@ -68,6 +81,12 @@ fn hasRenameMetadata(file: diff_parser.FileDiff) bool {
         }
     }
     return false;
+}
+
+fn hasNonRegularFileMode(line: []const u8, prefix: []const u8) bool {
+    if (!std.mem.startsWith(u8, line, prefix)) return false;
+    const mode = line[prefix.len..];
+    return !std.mem.eql(u8, mode, "100644");
 }
 
 pub fn stripGitPathPrefix(path: []const u8) []const u8 {
@@ -130,5 +149,36 @@ test "status classifies common diff file states" {
         .metadata = &.{"Binary files a/image.png and b/image.png differ"},
         .hunks = &.{},
         .is_binary = true,
+    }));
+}
+
+test "hasModeChange detects mode metadata" {
+    try std.testing.expect(hasModeChange(.{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{ "old mode 100644", "new mode 100755" },
+        .hunks = &.{},
+    }));
+    try std.testing.expect(hasModeChange(.{
+        .header = "diff --git a/a b/a",
+        .old_path = null,
+        .new_path = "b/a",
+        .metadata = &.{"new file mode 100755"},
+        .hunks = &.{},
+    }));
+    try std.testing.expect(!hasModeChange(.{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{"index 1..2 100644"},
+        .hunks = &.{},
+    }));
+    try std.testing.expect(!hasModeChange(.{
+        .header = "diff --git a/a b/a",
+        .old_path = null,
+        .new_path = "b/a",
+        .metadata = &.{"new file mode 100644"},
+        .hunks = &.{},
     }));
 }

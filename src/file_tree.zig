@@ -19,6 +19,7 @@ pub const Node = struct {
     depth: u16,
     stats: Stats = .{},
     status: ?Status = null,
+    mode_changed: bool = false,
     file_index: ?usize = null,
 
     pub const Kind = enum {
@@ -126,6 +127,7 @@ pub fn build(allocator: std.mem.Allocator, document: diff_parser.DiffDocument) !
             .depth = pathDepth(path),
             .stats = stats,
             .status = diff_file.status(file),
+            .mode_changed = diff_file.hasModeChange(file),
             .file_index = file_index,
         });
     }
@@ -261,11 +263,36 @@ test "build creates directory and file nodes with aggregate stats" {
     try std.testing.expectEqual(Node.Kind.file, tree.nodes[1].kind);
     try std.testing.expectEqualStrings("main.zig", tree.nodes[1].name);
     try std.testing.expectEqual(Status.modified, tree.nodes[1].status.?);
+    try std.testing.expect(!tree.nodes[1].mode_changed);
     try std.testing.expectEqual(@as(?usize, 0), tree.nodes[1].file_index);
     try std.testing.expectEqual(Node.Kind.directory, tree.nodes[2].kind);
     try std.testing.expectEqualStrings("lib", tree.nodes[2].name);
     try std.testing.expectEqual(Node.Kind.file, tree.nodes[3].kind);
     try std.testing.expectEqualStrings("root.zig", tree.nodes[3].name);
+}
+
+test "build marks file nodes with mode metadata" {
+    const text =
+        \\diff --git a/script.sh b/script.sh
+        \\old mode 100644
+        \\new mode 100755
+        \\--- a/script.sh
+        \\+++ b/script.sh
+        \\@@ -1 +1 @@
+        \\-echo old
+        \\+echo new
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const document = try diff_parser.parse(allocator, text);
+    const tree = try build(allocator, document);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.nodes.len);
+    try std.testing.expectEqual(Node.Kind.file, tree.nodes[0].kind);
+    try std.testing.expect(tree.nodes[0].mode_changed);
 }
 
 test "selectedNodeIndex maps file index to tree row" {

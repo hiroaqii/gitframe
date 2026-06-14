@@ -369,6 +369,12 @@ pub const App = struct {
             }
         }
 
+        if (row_layout.mode_col) |mode_col| {
+            if (width > mode_col) {
+                _ = surface.borrowTextAt(mode_col, row, "m", modeBadgeStyle(row_model.selected));
+            }
+        }
+
         if (row_layout.reviewed_col) |reviewed_col| {
             if (width > reviewed_col) {
                 _ = surface.borrowTextAt(reviewed_col, row, "✓", reviewedStyle(row_model.selected));
@@ -1244,6 +1250,10 @@ fn reviewedStyle(selected: bool) chasen.TextStyle {
     return .{ .fg = .{ .index = 2 }, .bold = true, .reverse = selected };
 }
 
+fn modeBadgeStyle(selected: bool) chasen.TextStyle {
+    return .{ .fg = .{ .index = 12 }, .bold = true, .reverse = selected };
+}
+
 fn terminalBodyHeight(terminal_height: u16) u16 {
     return if (terminal_height > footer_rows) terminal_height - footer_rows else 0;
 }
@@ -1862,6 +1872,40 @@ test "sidebar renders file status badges" {
 
     try ts.expectCellText(4, sidebar_header_rows, "A");
     try ts.expectCellText(4, sidebar_header_rows + 1, "D");
+}
+
+test "sidebar renders mode change badge next to file status" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(34, 8);
+    defer ts.deinit();
+
+    const nodes = [_]file_tree.Node{
+        .{
+            .kind = .file,
+            .name = "script.sh",
+            .path = "script.sh",
+            .depth = 0,
+            .file_index = 0,
+            .status = .modified,
+            .mode_changed = true,
+        },
+    };
+    const app: App = .{
+        .terminal_size = .{ .width = 80, .height = 9 },
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .document = .{ .files = &test_files_one },
+            .tree = .{ .nodes = &nodes },
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        } },
+    };
+
+    try app.viewSidebar(&ts.surface, app.load_state.loaded);
+
+    try ts.expectCellText(2, sidebar_header_rows, "M");
+    try ts.expectCellText(4, sidebar_header_rows, "m");
 }
 
 test "changed file filter keeps only matching status rows" {
