@@ -143,6 +143,22 @@ pub fn build(b: *std.Build) void {
     const perf_baseline_step = b.step("perf-baseline", "Run GitFrame performance baseline");
     perf_baseline_step.dependOn(&run_perf_baseline.step);
 
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const core_wasm = b.addObject(.{
+        .name = "gitframe-core-wasm-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/core_wasm_check.zig"),
+            .target = wasm_target,
+            .optimize = optimize,
+        }),
+    });
+
+    const check_core_wasm_step = b.step("check-core-wasm", "Compile the GitFrame shared core for wasm32-freestanding");
+    check_core_wasm_step.dependOn(&core_wasm.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
@@ -155,4 +171,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_file_tree_tests.step);
     test_step.dependOn(&run_sidebar_view_model_tests.step);
     test_step.dependOn(&perf_baseline_exe.step);
+    test_step.dependOn(&core_wasm.step);
 }
