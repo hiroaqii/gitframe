@@ -41,6 +41,10 @@ pub const App = struct {
     file_search_filter: ui.ListFilter = .{},
     file_search_no_match: bool = false,
     file_search_return_focus: Focus = .sidebar,
+    repo_picker_mode: bool = false,
+    repo_picker_input: SearchQuery = .{},
+    repo_picker_filter: ui.ListFilter = .{},
+    repo_picker_no_match: bool = false,
     hide_reviewed_files: bool = false,
     changed_file_filter: ChangedFileFilter = .all,
     repo_discovery_result: ?repo_discovery.DiscoveryResult = null,
@@ -88,6 +92,13 @@ pub const App = struct {
         submit_file_search,
         file_search_insert: u21,
         file_search_backspace,
+        enter_repo_picker,
+        cancel_repo_picker,
+        submit_repo_picker,
+        repo_picker_insert: u21,
+        repo_picker_backspace,
+        repo_picker_move_previous,
+        repo_picker_move_next,
         toggle_reviewed_file,
         toggle_hide_reviewed_files,
         cycle_changed_file_filter,
@@ -109,6 +120,7 @@ pub const App = struct {
         self.clearLoadedDiff();
         self.clearRepoDiscovery(deinit_ctx.allocator);
         self.file_search_filter.deinit(deinit_ctx.allocator);
+        self.repo_picker_filter.deinit(deinit_ctx.allocator);
         self.clearReviewedStore(deinit_ctx.allocator);
     }
 
@@ -164,6 +176,21 @@ pub const App = struct {
                 self.file_search_no_match = false;
                 self.file_search_input.backspace();
             },
+            .enter_repo_picker => try self.enterRepoPickerMode(ctx.allocator()),
+            .cancel_repo_picker => self.cancelRepoPickerMode(ctx.allocator()),
+            .submit_repo_picker => try self.submitRepoPicker(ctx),
+            .repo_picker_insert => |codepoint| {
+                self.repo_picker_no_match = false;
+                self.repo_picker_input.insert(codepoint) catch {};
+                try self.refreshRepoPickerFilter(ctx.allocator());
+            },
+            .repo_picker_backspace => {
+                self.repo_picker_no_match = false;
+                self.repo_picker_input.backspace();
+                try self.refreshRepoPickerFilter(ctx.allocator());
+            },
+            .repo_picker_move_previous => self.repo_picker_filter.update(.move_prev),
+            .repo_picker_move_next => self.repo_picker_filter.update(.move_next),
             .toggle_reviewed_file => try self.toggleReviewedFile(ctx.allocator()),
             .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
@@ -203,6 +230,10 @@ pub const App = struct {
             .height = footer_rows,
         });
         self.viewFooter(&footer);
+
+        if (self.repo_picker_mode) {
+            try self.viewRepoPicker(surface);
+        }
     }
 
     pub fn handleEvent(self: *const App, event: chasen.Event) ?Msg {
@@ -233,6 +264,18 @@ pub const App = struct {
             return null;
         }
 
+        if (self.repo_picker_mode) {
+            if (key.matches(chasen.Key.escape, .{})) return .cancel_repo_picker;
+            if (key.matches(chasen.Key.enter, .{})) return .submit_repo_picker;
+            if (key.matches(chasen.Key.backspace, .{})) return .repo_picker_backspace;
+            return switch (key.codepoint) {
+                'k', chasen.Key.up => .repo_picker_move_previous,
+                'j', chasen.Key.down => .repo_picker_move_next,
+                'q' => .cancel_repo_picker,
+                else => if (isSearchCodepoint(key.codepoint)) .{ .repo_picker_insert = key.codepoint } else null,
+            };
+        }
+
         if (key.matches(chasen.Key.tab, .{})) return .toggle_focus;
         if (key.matches(chasen.Key.page_up, .{})) return .page_diff_up;
         if (key.matches(chasen.Key.page_down, .{})) return .page_diff_down;
@@ -254,6 +297,7 @@ pub const App = struct {
             'g' => .select_first_file,
             'G' => .select_last_file,
             'f' => .enter_file_search,
+            'R' => .enter_repo_picker,
             'F' => .cycle_changed_file_filter,
             'v' => .toggle_reviewed_file,
             'H' => .toggle_hide_reviewed_files,
@@ -536,6 +580,62 @@ pub const App = struct {
         }
     }
 
+    fn viewRepoPicker(self: *const App, surface: *chasen.Surface) !void {
+        const modal = ui.Modal.init(.{});
+        const opts: ui.Modal.ViewOptions = .{
+            .dialog_width = 64,
+            .dialog_height = 14,
+            .title = "Repositories",
+            .border = .rounded,
+            .title_style = .{ .bold = true, .fg = .{ .index = 14 } },
+        };
+        modal.view(surface, opts);
+
+        const content_rect = ui.Modal.contentRect(surface, opts);
+        if (content_rect.width == 0 or content_rect.height == 0) return;
+        var content = surface.child(content_rect);
+        const size = content.size();
+
+        _ = content.borrowTextAt(0, 0, "filter: ", .{ .fg = .{ .index = 11 }, .bold = true });
+        _ = content.copyTextAt(8, 0, self.repo_picker_input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
+        if (self.repo_picker_no_match and size.width > 20) {
+            _ = content.borrowTextAt(20, 0, "(no match)", .{ .fg = .{ .index = 9 } });
+        }
+
+        if (size.height <= 2) return;
+        const rows = size.height - 2;
+        const focused = self.repo_picker_filter.list.focusedIndex();
+        const range = ui.ListViewport.visibleRange(self.repo_picker_filter.labels.len, focused, rows);
+        var row: u16 = 2;
+        var visible_index: usize = range.start;
+        while (visible_index < range.end) : ({
+            visible_index += 1;
+            row += 1;
+        }) {
+            const source_index = self.repo_picker_filter.sourceIndex(visible_index) orelse continue;
+            const label = self.repo_picker_filter.labels[visible_index];
+            const focused_row = visible_index == focused;
+            const active = source_index == self.active_repo;
+            const style: chasen.TextStyle = if (focused_row)
+                .{ .reverse = true, .bold = true }
+            else if (active)
+                .{ .fg = .{ .index = 10 }, .bold = true }
+            else
+                .{};
+            const marker = if (focused_row) ">" else " ";
+            const active_marker = if (active) "*" else " ";
+            _ = content.borrowTextAt(0, row, marker, style);
+            _ = content.borrowTextAt(2, row, active_marker, style);
+            var label_area = content.child(.{
+                .col = 4,
+                .row = row,
+                .width = if (size.width > 4) size.width - 4 else 0,
+                .height = 1,
+            });
+            _ = try label_area.copyTextAt(0, 0, label, style);
+        }
+    }
+
     fn footerItems(self: *const App) []const ui.key_hint.Item {
         return switch (self.focus) {
             .sidebar => &footer_sidebar_items,
@@ -607,19 +707,26 @@ pub const App = struct {
             return;
         };
 
+        try self.startDiffLoadWithRepoRoot(ctx, repo_root);
+    }
+
+    fn startDiffLoadWithRepoRoot(self: *App, ctx: *chasen.Ctx(Msg), repo_root: ?[]const u8) !void {
         const task = try ctx.allocator().create(DiffLoadTask);
         errdefer ctx.allocator().destroy(task);
+
+        const request = try diff_source.cloneLoadRequest(ctx.allocator(), .{
+            .source = self.config.source,
+            .repo_root = repo_root,
+        });
+        errdefer diff_source.freeLoadRequest(ctx.allocator(), request);
+
         self.load_generation +%= 1;
         task.* = .{
             // Source payloads come from process args, so clone the request
             // before the async task crosses the update boundary.
-            .request = try diff_source.cloneLoadRequest(ctx.allocator(), .{
-                .source = self.config.source,
-                .repo_root = repo_root,
-            }),
+            .request = request,
             .generation = self.load_generation,
         };
-        errdefer diff_source.freeLoadRequest(ctx.allocator(), task.request);
 
         self.clearLoadedDiff();
         self.load_state = .loading;
@@ -951,6 +1058,72 @@ pub const App = struct {
         self.focus = self.file_search_return_focus;
     }
 
+    fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
+        if (self.workspaceRepos() == null) return;
+
+        self.repo_picker_mode = true;
+        self.repo_picker_input = .{};
+        self.repo_picker_no_match = false;
+        try self.refreshRepoPickerFilter(allocator);
+        self.focusRepoPickerOnActive();
+    }
+
+    fn cancelRepoPickerMode(self: *App, allocator: std.mem.Allocator) void {
+        self.repo_picker_mode = false;
+        self.repo_picker_input = .{};
+        self.repo_picker_filter.deinit(allocator);
+        self.repo_picker_no_match = false;
+    }
+
+    fn submitRepoPicker(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const focused = self.repo_picker_filter.list.focusedIndex();
+        const repo_index = self.repo_picker_filter.sourceIndex(focused) orelse {
+            self.repo_picker_no_match = true;
+            return;
+        };
+        const repos = self.workspaceRepos() orelse return;
+        if (repo_index >= repos.len) {
+            self.repo_picker_no_match = true;
+            return;
+        }
+
+        self.cancelRepoPickerMode(ctx.allocator());
+        if (repo_index == self.active_repo) return;
+
+        try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root);
+        self.active_repo = repo_index;
+        self.selected_file = 0;
+        self.selected_node = 0;
+        self.clearSearch();
+    }
+
+    fn refreshRepoPickerFilter(self: *App, allocator: std.mem.Allocator) !void {
+        const repos = self.workspaceRepos() orelse return;
+
+        var labels: std.ArrayList([]const u8) = .empty;
+        defer labels.deinit(allocator);
+
+        for (repos) |repo| {
+            try labels.append(allocator, repo.display_path);
+        }
+
+        // ListFilter owns the filtered index arrays; repository labels remain
+        // borrowed from the current discovery result.
+        try self.repo_picker_filter.apply(allocator, labels.items, self.repo_picker_input.slice());
+    }
+
+    fn focusRepoPickerOnActive(self: *App) void {
+        var visible_index: usize = 0;
+        while (visible_index < self.repo_picker_filter.labels.len) : (visible_index += 1) {
+            const source_index = self.repo_picker_filter.sourceIndex(visible_index) orelse continue;
+            if (source_index != self.active_repo) continue;
+            while (self.repo_picker_filter.list.focusedIndex() < visible_index) {
+                self.repo_picker_filter.update(.move_next);
+            }
+            return;
+        }
+    }
+
     fn toggleReviewedFile(self: *App, allocator: std.mem.Allocator) !void {
         const loaded = self.activeLoadedDiff() orelse return;
         if (self.selected_node >= loaded.tree.nodes.len) return;
@@ -1209,24 +1382,35 @@ pub const App = struct {
         errdefer allocator.free(reviewed_files);
 
         for (loaded.document.files, 0..) |file, index| {
-            reviewed_files[index] = self.reviewed_store.contains(reviewedKey(file));
+            const key = try self.reviewedKeyAlloc(allocator, file);
+            defer allocator.free(key);
+            reviewed_files[index] = self.reviewed_store.contains(key);
         }
         loaded.reviewed_files = reviewed_files;
     }
 
     fn setReviewedFile(self: *App, allocator: std.mem.Allocator, file: diff_parser.FileDiff, reviewed: bool) !void {
-        const key = reviewedKey(file);
+        const key = try self.reviewedKeyAlloc(allocator, file);
         if (reviewed) {
-            if (self.reviewed_store.contains(key)) return;
-            const copied = try allocator.dupe(u8, key);
-            errdefer allocator.free(copied);
-            try self.reviewed_store.put(allocator, copied, {});
+            if (self.reviewed_store.contains(key)) {
+                allocator.free(key);
+                return;
+            }
+            errdefer allocator.free(key);
+            try self.reviewed_store.put(allocator, key, {});
             return;
         }
 
+        defer allocator.free(key);
         if (self.reviewed_store.fetchRemove(key)) |entry| {
             allocator.free(entry.key);
         }
+    }
+
+    fn reviewedKeyAlloc(self: *const App, allocator: std.mem.Allocator, file: diff_parser.FileDiff) ![]u8 {
+        const path = diff_file.displayPath(file);
+        const repo_root = self.activeRepoRoot() orelse return allocator.dupe(u8, path);
+        return std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ repo_root, path });
     }
 
     fn clearReviewedStore(self: *App, allocator: std.mem.Allocator) void {
@@ -1240,6 +1424,14 @@ pub const App = struct {
         if (self.repo_discovery_result) |*discovery| discovery.deinit(allocator);
         self.repo_discovery_result = null;
         self.active_repo = 0;
+    }
+
+    fn workspaceRepos(self: *const App) ?[]const repo_discovery.RepoEntry {
+        const discovery = self.repo_discovery_result orelse return null;
+        return switch (discovery) {
+            .workspace => |workspace| workspace.repos,
+            .single_repo, .none => null,
+        };
     }
 
     fn findFileNodeWithFilter(self: *App, allocator: std.mem.Allocator, loaded: *const LoadedDiff, query: []const u8) !?usize {
@@ -1295,6 +1487,7 @@ const footer_sidebar_items = [_]ui.key_hint.Item{
     ui.key_hint.item("Enter/←/→", "fold"),
     ui.key_hint.item("/", "search"),
     ui.key_hint.item("f", "file"),
+    ui.key_hint.item("R", "repo"),
     ui.key_hint.item("F", "filter"),
     ui.key_hint.item("v", "viewed"),
     ui.key_hint.item("H", "hide viewed"),
@@ -1310,6 +1503,7 @@ const footer_diff_items = [_]ui.key_hint.Item{
     ui.key_hint.item("Enter", "fold"),
     ui.key_hint.item("/", "search"),
     ui.key_hint.item("f", "file"),
+    ui.key_hint.item("R", "repo"),
     ui.key_hint.item("v", "viewed"),
     ui.key_hint.item("H", "hide viewed"),
     ui.key_hint.item("n/p", "hunk/search"),
@@ -1814,10 +2008,6 @@ const DiffLoadTask = struct {
         return .{ .arena = arena, .loaded = loaded };
     }
 };
-
-fn reviewedKey(file: diff_parser.FileDiff) []const u8 {
-    return diff_file.displayPath(file);
-}
 
 fn countLines(bytes: []const u8) usize {
     if (bytes.len == 0) return 0;
@@ -2337,6 +2527,76 @@ test "reviewed state survives active loaded diff replacement" {
     app.active_reviewed_files_owned = true;
 
     try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded.reviewed_files);
+}
+
+test "reviewed state is scoped by active repository root" {
+    const allocator = std.testing.allocator;
+    const repos = try allocator.alloc(repo_discovery.RepoEntry, 2);
+    repos[0] = .{
+        .label = try allocator.dupe(u8, "one"),
+        .display_path = try allocator.dupe(u8, "one"),
+        .canonical_root = try allocator.dupe(u8, "/work/one"),
+    };
+    repos[1] = .{
+        .label = try allocator.dupe(u8, "two"),
+        .display_path = try allocator.dupe(u8, "two"),
+        .canonical_root = try allocator.dupe(u8, "/work/two"),
+    };
+
+    var app: App = .{
+        .allocator = allocator,
+        .repo_discovery_result = .{ .workspace = .{
+            .current_root = try allocator.dupe(u8, "/work"),
+            .repos = repos,
+        } },
+        .active_repo = 0,
+    };
+    defer app.clearRepoDiscovery(allocator);
+    defer app.clearReviewedStore(allocator);
+
+    try app.setReviewedFile(allocator, test_files_two[0], true);
+
+    var loaded_one = testLoadedDiffTwo();
+    try app.materializeReviewedFiles(allocator, &loaded_one);
+    defer allocator.free(loaded_one.reviewed_files);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded_one.reviewed_files);
+
+    app.active_repo = 1;
+    var loaded_two = testLoadedDiffTwo();
+    try app.materializeReviewedFiles(allocator, &loaded_two);
+    defer allocator.free(loaded_two.reviewed_files);
+    try std.testing.expectEqualSlices(bool, &.{ false, false }, loaded_two.reviewed_files);
+}
+
+test "repo picker focuses active workspace repository" {
+    const allocator = std.testing.allocator;
+    const repos = try allocator.alloc(repo_discovery.RepoEntry, 2);
+    repos[0] = .{
+        .label = try allocator.dupe(u8, "one"),
+        .display_path = try allocator.dupe(u8, "one"),
+        .canonical_root = try allocator.dupe(u8, "/work/one"),
+    };
+    repos[1] = .{
+        .label = try allocator.dupe(u8, "two"),
+        .display_path = try allocator.dupe(u8, "two"),
+        .canonical_root = try allocator.dupe(u8, "/work/two"),
+    };
+
+    var app: App = .{
+        .repo_discovery_result = .{ .workspace = .{
+            .current_root = try allocator.dupe(u8, "/work"),
+            .repos = repos,
+        } },
+        .active_repo = 1,
+    };
+    defer app.clearRepoDiscovery(allocator);
+    defer app.repo_picker_filter.deinit(allocator);
+
+    try app.enterRepoPickerMode(allocator);
+
+    try std.testing.expect(app.repo_picker_mode);
+    try std.testing.expectEqual(@as(usize, 2), app.repo_picker_filter.labels.len);
+    try std.testing.expectEqual(@as(usize, 1), app.repo_picker_filter.list.focusedIndex());
 }
 
 test "sidebar renders reviewed marker" {
