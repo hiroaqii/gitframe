@@ -28,6 +28,27 @@ pub const CliConfig = struct {
     }
 };
 
+/// Concrete load request used by backends.
+///
+/// `source` answers "what diff should be read"; `repo_root` answers "where a
+/// Git command should run". Raw text sources such as stdin and patch files can
+/// leave `repo_root` null because they do not execute Git.
+pub const LoadRequest = struct {
+    source: SourceMode,
+    repo_root: ?[]const u8 = null,
+
+    pub fn requiresRepo(self: LoadRequest) bool {
+        return sourceRequiresRepo(self.source);
+    }
+};
+
+pub fn sourceRequiresRepo(source: SourceMode) bool {
+    return switch (source) {
+        .unstaged, .cached, .range => true,
+        .stdin, .patch_file => false,
+    };
+}
+
 pub const ParseArgsError = error{
     UnknownOption,
     MissingOptionValue,
@@ -41,6 +62,7 @@ pub const LoadError = error{
     StreamTooLong,
     OutOfMemory,
     SpawnFailed,
+    MissingRepoRoot,
 };
 
 pub const LoadResult = union(enum) {
@@ -67,10 +89,10 @@ pub const LoadResult = union(enum) {
 /// without wiring process execution through the app state.
 pub const GitBackend = struct {
     ptr: *anyopaque,
-    load_diff_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, SourceMode) LoadError!LoadResult,
+    load_diff_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, LoadRequest) LoadError!LoadResult,
 
-    pub fn loadDiff(self: GitBackend, allocator: std.mem.Allocator, io: std.Io, source: SourceMode) LoadError!LoadResult {
-        return self.load_diff_fn(self.ptr, allocator, io, source);
+    pub fn loadDiff(self: GitBackend, allocator: std.mem.Allocator, io: std.Io, request: LoadRequest) LoadError!LoadResult {
+        return self.load_diff_fn(self.ptr, allocator, io, request);
     }
 };
 
@@ -82,19 +104,19 @@ pub const LocalGitCommandBackend = struct {
         };
     }
 
-    pub fn loadDiff(_: *LocalGitCommandBackend, allocator: std.mem.Allocator, io: std.Io, source: SourceMode) LoadError!LoadResult {
-        return switch (source) {
-            .unstaged => loadGitDiff(allocator, io, &.{ "git", "diff", "--no-color", "--no-ext-diff" }),
-            .cached => loadGitDiff(allocator, io, &.{ "git", "diff", "--cached", "--no-color", "--no-ext-diff" }),
-            .range => |range| loadGitDiff(allocator, io, &.{ "git", "diff", "--no-color", "--no-ext-diff", range }),
+    pub fn loadDiff(_: *LocalGitCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: LoadRequest) LoadError!LoadResult {
+        return switch (request.source) {
+            .unstaged => loadGitDiff(allocator, io, request.repo_root orelse return error.MissingRepoRoot, &.{ "git", "diff", "--no-color", "--no-ext-diff" }),
+            .cached => loadGitDiff(allocator, io, request.repo_root orelse return error.MissingRepoRoot, &.{ "git", "diff", "--cached", "--no-color", "--no-ext-diff" }),
+            .range => |range| loadGitDiff(allocator, io, request.repo_root orelse return error.MissingRepoRoot, &.{ "git", "diff", "--no-color", "--no-ext-diff", range }),
             .patch_file => |path| .{ .ok = readPatchFile(allocator, io, path) catch |err| return mapReadError(err) },
             .stdin => .{ .ok = readStdin(allocator, io) catch |err| return mapReadError(err) },
         };
     }
 
-    fn loadDiffErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, source: SourceMode) LoadError!LoadResult {
+    fn loadDiffErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: LoadRequest) LoadError!LoadResult {
         const self: *LocalGitCommandBackend = @ptrCast(@alignCast(ctx));
-        return self.loadDiff(allocator, io, source);
+        return self.loadDiff(allocator, io, request);
     }
 };
 
@@ -150,6 +172,16 @@ pub fn cloneSource(allocator: std.mem.Allocator, source: SourceMode) std.mem.All
     };
 }
 
+pub fn cloneLoadRequest(allocator: std.mem.Allocator, request: LoadRequest) std.mem.Allocator.Error!LoadRequest {
+    const source = try cloneSource(allocator, request.source);
+    errdefer freeSource(allocator, source);
+
+    return .{
+        .source = source,
+        .repo_root = if (request.repo_root) |repo_root| try allocator.dupe(u8, repo_root) else null,
+    };
+}
+
 pub fn freeSource(allocator: std.mem.Allocator, source: SourceMode) void {
     switch (source) {
         .patch_file => |path| allocator.free(path),
@@ -158,18 +190,24 @@ pub fn freeSource(allocator: std.mem.Allocator, source: SourceMode) void {
     }
 }
 
-/// Convenience entry point for terminal mode. The explicit GitBackend interface
-/// remains available for tests and future non-local backends.
-pub fn load(allocator: std.mem.Allocator, io: std.Io, source: SourceMode) LoadError!LoadResult {
-    var local_backend: LocalGitCommandBackend = .{};
-    return local_backend.backend().loadDiff(allocator, io, source);
+pub fn freeLoadRequest(allocator: std.mem.Allocator, request: LoadRequest) void {
+    freeSource(allocator, request.source);
+    if (request.repo_root) |repo_root| allocator.free(repo_root);
 }
 
-fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) LoadError!LoadResult {
+/// Convenience entry point for terminal mode. The explicit GitBackend interface
+/// remains available for tests and future non-local backends.
+pub fn load(allocator: std.mem.Allocator, io: std.Io, request: LoadRequest) LoadError!LoadResult {
+    var local_backend: LocalGitCommandBackend = .{};
+    return local_backend.backend().loadDiff(allocator, io, request);
+}
+
+fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!LoadResult {
     // Use structured argv and disable color/ext-diff so the parser sees stable
     // Git unified diff output, not user-configured pager formatting.
     const result = std.process.run(allocator, io, .{
         .argv = argv,
+        .cwd = .{ .path = repo_root },
         .stdout_limit = .limited(max_diff_bytes),
         .stderr_limit = .limited(256 * 1024),
     }) catch |err| return switch (err) {
@@ -276,6 +314,36 @@ test "cloneSource duplicates payload source modes" {
 
     try std.testing.expect(source == .range);
     try std.testing.expectEqualStrings("main...HEAD", source.range);
+}
+
+test "LoadRequest identifies sources that require a repo root" {
+    try std.testing.expect((LoadRequest{ .source = .unstaged }).requiresRepo());
+    try std.testing.expect((LoadRequest{ .source = .cached }).requiresRepo());
+    try std.testing.expect((LoadRequest{ .source = .{ .range = "main...HEAD" } }).requiresRepo());
+
+    try std.testing.expect(!(LoadRequest{ .source = .stdin }).requiresRepo());
+    try std.testing.expect(!(LoadRequest{ .source = .{ .patch_file = "change.diff" } }).requiresRepo());
+}
+
+test "cloneLoadRequest duplicates source payload and repo root" {
+    const allocator = std.testing.allocator;
+    const request = try cloneLoadRequest(allocator, .{
+        .source = .{ .range = "main...HEAD" },
+        .repo_root = "/repo",
+    });
+    defer freeLoadRequest(allocator, request);
+
+    try std.testing.expect(request.source == .range);
+    try std.testing.expectEqualStrings("main...HEAD", request.source.range);
+    try std.testing.expectEqualStrings("/repo", request.repo_root.?);
+}
+
+test "LocalGitCommandBackend requires repo root for git sources" {
+    var local_backend: LocalGitCommandBackend = .{};
+    try std.testing.expectError(error.MissingRepoRoot, local_backend.loadDiff(std.testing.allocator, std.testing.io, .{
+        .source = .unstaged,
+        .repo_root = null,
+    }));
 }
 
 test "LocalGitCommandBackend exposes backend interface" {

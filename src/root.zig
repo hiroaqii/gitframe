@@ -12,6 +12,7 @@ const sidebar_view_model = @import("sidebar_view_model.zig");
 
 pub const SourceMode = diff_source.SourceMode;
 pub const CliConfig = diff_source.CliConfig;
+pub const LoadRequest = diff_source.LoadRequest;
 pub const ParseArgsError = diff_source.ParseArgsError;
 pub const parseArgs = diff_source.parseArgs;
 
@@ -543,12 +544,17 @@ pub const App = struct {
         errdefer ctx.allocator().destroy(task);
         self.load_generation +%= 1;
         task.* = .{
-            // Source payloads come from process args, so clone them before the
-            // async task crosses the update boundary.
-            .source = try diff_source.cloneSource(ctx.allocator(), self.config.source),
+            // Source payloads come from process args, so clone the request
+            // before the async task crosses the update boundary. Phase 6.8
+            // keeps the current process directory as the active repo root;
+            // the repo picker will replace this with a canonical repo path.
+            .request = try diff_source.cloneLoadRequest(ctx.allocator(), .{
+                .source = self.config.source,
+                .repo_root = if (diff_source.sourceRequiresRepo(self.config.source)) "." else null,
+            }),
             .generation = self.load_generation,
         };
-        errdefer diff_source.freeSource(ctx.allocator(), task.source);
+        errdefer diff_source.freeLoadRequest(ctx.allocator(), task.request);
 
         self.clearLoadedDiff();
         self.load_state = .loading;
@@ -1602,13 +1608,13 @@ const LoadedDiffBundle = struct {
 };
 
 const DiffLoadTask = struct {
-    source: SourceMode,
+    request: LoadRequest,
     generation: u64,
 
     fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) App.Msg {
         const task: *DiffLoadTask = @ptrCast(@alignCast(ctx_ptr));
         defer {
-            diff_source.freeSource(allocator, task.source);
+            diff_source.freeLoadRequest(allocator, task.request);
             allocator.destroy(task);
         }
 
@@ -1619,7 +1625,7 @@ const DiffLoadTask = struct {
     }
 
     fn runLoad(task: *DiffLoadTask, allocator: std.mem.Allocator, io: std.Io) DiffLoadTaskResult {
-        const raw_result = diff_source.load(allocator, io, task.source) catch |err| {
+        const raw_result = diff_source.load(allocator, io, task.request) catch |err| {
             return .{
                 .failed = std.fmt.allocPrint(allocator, "Diff load failed: {s}", .{@errorName(err)}) catch
                     return .{ .failed_static = "Diff load failed: OutOfMemory" },
