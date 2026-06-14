@@ -36,7 +36,7 @@ pub const DiscoveryResult = union(enum) {
 
 pub fn discover(allocator: std.mem.Allocator, io: std.Io) !DiscoveryResult {
     const cwd = try std.process.currentPathAlloc(io, allocator);
-    errdefer allocator.free(cwd);
+    defer allocator.free(cwd);
     return discoverRoot(allocator, io, cwd);
 }
 

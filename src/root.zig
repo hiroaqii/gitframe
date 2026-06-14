@@ -8,6 +8,7 @@ const diff_search = @import("diff_search.zig");
 const diff_source = @import("diff_source.zig");
 const diff_view_model = @import("diff_view_model.zig");
 const file_tree = @import("file_tree.zig");
+const repo_discovery = @import("repo_discovery.zig");
 const sidebar_view_model = @import("sidebar_view_model.zig");
 
 pub const SourceMode = diff_source.SourceMode;
@@ -42,6 +43,8 @@ pub const App = struct {
     file_search_return_focus: Focus = .sidebar,
     hide_reviewed_files: bool = false,
     changed_file_filter: ChangedFileFilter = .all,
+    repo_discovery_result: ?repo_discovery.DiscoveryResult = null,
+    active_repo: usize = 0,
     /// Session-level source of truth for reviewed files. The active LoadedDiff
     /// keeps a materialized bool slice so hide-reviewed hot paths stay O(1).
     reviewed_store: std.StringHashMapUnmanaged(void) = .empty,
@@ -54,6 +57,7 @@ pub const App = struct {
 
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
+        repos_discovered: RepoDiscoveryFinished,
         diff_loaded: DiffLoadFinished,
         select_previous_file,
         select_next_file,
@@ -93,12 +97,17 @@ pub const App = struct {
 
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         self.allocator = ctx.allocator();
-        try self.startDiffLoad(ctx);
+        if (diff_source.sourceRequiresRepo(self.config.source)) {
+            try self.startRepoDiscovery(ctx);
+        } else {
+            try self.startDiffLoad(ctx);
+        }
     }
 
     pub fn deinit(self: *App, deinit_ctx: chasen.AppDeinitContext) void {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.clearLoadedDiff();
+        self.clearRepoDiscovery(deinit_ctx.allocator);
         self.file_search_filter.deinit(deinit_ctx.allocator);
         self.clearReviewedStore(deinit_ctx.allocator);
     }
@@ -112,6 +121,7 @@ pub const App = struct {
                 self.scrollSearchMatchIntoView();
                 self.clampDiffNavigation();
             },
+            .repos_discovered => |finished| try self.finishRepoDiscovery(ctx, finished),
             .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
@@ -159,7 +169,13 @@ pub const App = struct {
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
             .reload => switch (self.config.source) {
                 .stdin => ctx.redraw().skip(),
-                else => try self.startDiffLoad(ctx),
+                else => {
+                    if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
+                        try self.startRepoDiscovery(ctx);
+                    } else {
+                        try self.startDiffLoad(ctx);
+                    }
+                },
             },
             .quit => ctx.quit(),
         }
@@ -539,18 +555,67 @@ pub const App = struct {
         _ = surface.borrowTextAt(0, row, ">", .{ .bold = true, .reverse = true, .fg = .{ .index = 11 } });
     }
 
+    fn startRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const task = try ctx.allocator().create(RepoDiscoveryTask);
+        errdefer ctx.allocator().destroy(task);
+
+        self.load_generation +%= 1;
+        task.* = .{ .generation = self.load_generation };
+        self.clearLoadedDiff();
+        self.load_state = .loading;
+        ctx.task().spawnWith(task, RepoDiscoveryTask.run) catch |err| {
+            self.load_state = .{ .failed = "Could not start repo discovery task" };
+            return err;
+        };
+    }
+
+    fn finishRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg), finished: RepoDiscoveryFinished) !void {
+        var result = finished.result;
+        defer result.deinit(ctx.allocator());
+
+        if (finished.generation != self.load_generation) return;
+
+        switch (result) {
+            .empty => unreachable,
+            .discovered => |discovery| {
+                result = .empty;
+                self.clearRepoDiscovery(ctx.allocator());
+                self.repo_discovery_result = discovery;
+                self.active_repo = 0;
+
+                if (self.activeRepoRoot() == null) {
+                    try self.storeFailedMessage(ctx.allocator(), "No Git repository found");
+                    return;
+                }
+
+                try self.startDiffLoad(ctx);
+            },
+            .failed => |message| {
+                try self.storeFailedMessage(ctx.allocator(), std.mem.trim(u8, message, " \t\r\n"));
+            },
+            .failed_static => |message| {
+                try self.storeFailedMessage(ctx.allocator(), message);
+            },
+        }
+    }
+
     fn startDiffLoad(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const repo_root = self.repoRootForCurrentSource() catch |err| {
+            self.load_state = .{ .failed = switch (err) {
+                error.MissingRepoRoot => "No Git repository found",
+            } };
+            return;
+        };
+
         const task = try ctx.allocator().create(DiffLoadTask);
         errdefer ctx.allocator().destroy(task);
         self.load_generation +%= 1;
         task.* = .{
             // Source payloads come from process args, so clone the request
-            // before the async task crosses the update boundary. Phase 6.8
-            // keeps the current process directory as the active repo root;
-            // the repo picker will replace this with a canonical repo path.
+            // before the async task crosses the update boundary.
             .request = try diff_source.cloneLoadRequest(ctx.allocator(), .{
                 .source = self.config.source,
-                .repo_root = if (diff_source.sourceRequiresRepo(self.config.source)) "." else null,
+                .repo_root = repo_root,
             }),
             .generation = self.load_generation,
         };
@@ -562,6 +627,28 @@ pub const App = struct {
             self.load_state = .{ .failed = "Could not start diff load task" };
             return err;
         };
+    }
+
+    fn repoRootForCurrentSource(self: *const App) error{MissingRepoRoot}!?[]const u8 {
+        if (!diff_source.sourceRequiresRepo(self.config.source)) return null;
+        return self.activeRepoRoot() orelse error.MissingRepoRoot;
+    }
+
+    fn activeRepoRoot(self: *const App) ?[]const u8 {
+        const discovery = self.repo_discovery_result orelse return null;
+        return switch (discovery) {
+            .single_repo => |entry| entry.canonical_root,
+            .workspace => |workspace| if (self.active_repo < workspace.repos.len)
+                workspace.repos[self.active_repo].canonical_root
+            else
+                null,
+            .none => null,
+        };
+    }
+
+    fn needsRepoDiscovery(self: *const App) bool {
+        const discovery = self.repo_discovery_result orelse return true;
+        return discovery == .none;
     }
 
     fn finishDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: DiffLoadFinished) !void {
@@ -1149,6 +1236,12 @@ pub const App = struct {
         self.reviewed_store = .empty;
     }
 
+    fn clearRepoDiscovery(self: *App, allocator: std.mem.Allocator) void {
+        if (self.repo_discovery_result) |*discovery| discovery.deinit(allocator);
+        self.repo_discovery_result = null;
+        self.active_repo = 0;
+    }
+
     fn findFileNodeWithFilter(self: *App, allocator: std.mem.Allocator, loaded: *const LoadedDiff, query: []const u8) !?usize {
         var labels: std.ArrayList([]const u8) = .empty;
         defer labels.deinit(allocator);
@@ -1575,6 +1668,27 @@ const DiffLoadFinished = struct {
     result: DiffLoadTaskResult,
 };
 
+const RepoDiscoveryFinished = struct {
+    generation: u64,
+    result: RepoDiscoveryTaskResult,
+};
+
+const RepoDiscoveryTaskResult = union(enum) {
+    empty,
+    discovered: repo_discovery.DiscoveryResult,
+    failed: []u8,
+    failed_static: []const u8,
+
+    fn deinit(self: *RepoDiscoveryTaskResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .empty, .failed_static => {},
+            .discovered => |*discovery| discovery.deinit(allocator),
+            .failed => |message| allocator.free(message),
+        }
+        self.* = .empty;
+    }
+};
+
 const DiffLoadTaskResult = union(enum) {
     empty,
     loaded: LoadedDiffBundle,
@@ -1604,6 +1718,30 @@ const LoadedDiffBundle = struct {
         const arena = self.arena.?;
         self.arena = null;
         return arena;
+    }
+};
+
+const RepoDiscoveryTask = struct {
+    generation: u64,
+
+    fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) App.Msg {
+        const task: *RepoDiscoveryTask = @ptrCast(@alignCast(ctx_ptr));
+        defer allocator.destroy(task);
+
+        return .{ .repos_discovered = .{
+            .generation = task.generation,
+            .result = runDiscovery(allocator, io),
+        } };
+    }
+
+    fn runDiscovery(allocator: std.mem.Allocator, io: std.Io) RepoDiscoveryTaskResult {
+        const result = repo_discovery.discover(allocator, io) catch |err| {
+            return .{
+                .failed = std.fmt.allocPrint(allocator, "Repo discovery failed: {s}", .{@errorName(err)}) catch
+                    return .{ .failed_static = "Repo discovery failed: OutOfMemory" },
+            };
+        };
+        return .{ .discovered = result };
     }
 };
 
