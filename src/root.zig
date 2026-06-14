@@ -518,7 +518,13 @@ pub const App = struct {
         switch (self.load_state) {
             .idle => col.borrowText("Waiting to load diff.", .{ .fg = .gray }),
             .loading => col.borrowText("Loading diff...", .{ .fg = .{ .index = 11 } }),
-            .empty => col.borrowText("No changes found.", .{ .fg = .gray }),
+            .empty => |reason| switch (reason) {
+                .no_changes => col.borrowText("No changes found.", .{ .fg = .gray }),
+                .no_repository => {
+                    col.borrowText("No Git repositories found.", .{ .fg = .gray });
+                    col.borrowText("Run inside a repository or a workspace containing direct child repositories.", .{ .fg = .gray });
+                },
+            },
             .loaded => |loaded| {
                 try col.print("Loaded {d} files / {d} hunks.", .{ loaded.document.files.len, loaded.document.totalHunks() });
                 try col.print("{d} bytes across {d} lines.", .{ loaded.bytes, loaded.lines });
@@ -684,7 +690,8 @@ pub const App = struct {
                 self.active_repo = 0;
 
                 if (self.activeRepoRoot() == null) {
-                    try self.storeFailedMessage(ctx.allocator(), "No Git repository found");
+                    self.clearLoadedDiff();
+                    self.load_state = .{ .empty = .no_repository };
                     return;
                 }
 
@@ -701,8 +708,8 @@ pub const App = struct {
 
     fn startDiffLoad(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         const repo_root = self.repoRootForCurrentSource() catch |err| {
-            self.load_state = .{ .failed = switch (err) {
-                error.MissingRepoRoot => "No Git repository found",
+            self.load_state = .{ .empty = switch (err) {
+                error.MissingRepoRoot => .no_repository,
             } };
             return;
         };
@@ -771,7 +778,7 @@ pub const App = struct {
         self.clearLoadedDiff();
 
         switch (result) {
-            .empty => self.load_state = .empty,
+            .empty => self.load_state = .{ .empty = .no_changes },
             .loaded => |*bundle| {
                 var loaded = bundle.loaded;
                 var arena = bundle.takeArena();
@@ -1651,9 +1658,14 @@ const ChangedFileFilter = enum {
 const LoadState = union(enum) {
     idle,
     loading,
-    empty,
+    empty: EmptyReason,
     loaded: LoadedDiff,
     failed: []const u8,
+};
+
+const EmptyReason = enum {
+    no_changes,
+    no_repository,
 };
 
 const LoadedDiff = struct {
@@ -2854,6 +2866,35 @@ test "finishDiffLoad frees stale loaded bundle" {
 
     try std.testing.expect(app.load_arena == null);
     try std.testing.expect(app.load_state == .idle);
+}
+
+test "finishDiffLoad records empty diff as no changes" {
+    var app: App = .{ .load_generation = 1 };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 1,
+        .result = .empty,
+    });
+
+    try std.testing.expect(app.load_state == .empty);
+    try std.testing.expectEqual(EmptyReason.no_changes, app.load_state.empty);
+}
+
+test "finishRepoDiscovery records no repository as empty state" {
+    var app: App = .{ .load_generation = 1 };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer app.clearRepoDiscovery(std.testing.allocator);
+
+    try app.finishRepoDiscovery(&ctx, .{
+        .generation = 1,
+        .result = .{ .discovered = .{ .none = .{
+            .current_root = try std.testing.allocator.dupe(u8, "/work"),
+        } } },
+    });
+
+    try std.testing.expect(app.load_state == .empty);
+    try std.testing.expectEqual(EmptyReason.no_repository, app.load_state.empty);
 }
 
 test "finishDiffLoad copies and frees current failed message" {
