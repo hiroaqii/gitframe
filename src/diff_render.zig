@@ -11,6 +11,7 @@ pub const RenderOptions = struct {
     scroll: usize = 0,
     highlighted_hunk: ?usize = null,
     line_index: ?diff_view_model.RenderedLineIndex = null,
+    folded_hunks: []const bool = &.{},
 };
 
 pub const FileStats = diff_file.Stats;
@@ -57,9 +58,9 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
         .height = size.height,
     };
     var rows = if (line_index) |index|
-        diff_view_model.BodyRowIterator.initAt(file, mode, index, options.scroll)
+        diff_view_model.BodyRowIterator.initAtWithFolded(file, mode, index, options.scroll, options.folded_hunks)
     else
-        diff_view_model.BodyRowIterator.init(file, mode);
+        diff_view_model.BodyRowIterator.initWithFolded(file, mode, options.folded_hunks);
     while (rows.next()) |body_row| {
         if (cursor.done()) return;
         const row = cursor.nextRow() orelse continue;
@@ -122,7 +123,9 @@ fn drawHunkHeaderRow(
         style_selected_hunk
     else
         style_hunk;
-    const header = try std.fmt.allocPrint(surface.frameAllocator(), "@@ -{d},{d} +{d},{d} @@ {s}", .{
+    const marker = if (hunk.folded) "▸" else "▾";
+    const header = try std.fmt.allocPrint(surface.frameAllocator(), "{s} @@ -{d},{d} +{d},{d} @@ {s}", .{
+        marker,
         hunk.old_start,
         hunk.old_count,
         hunk.new_start,
@@ -390,8 +393,8 @@ test "side-by-side hunk header is clipped before the new column" {
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side });
 
     const gutter_col: u16 = 40;
-    try ts.expectCellText(0, 3, "@");
-    try ts.expectCellText(1, 3, "@");
+    try ts.expectCellText(2, 3, "@");
+    try ts.expectCellText(3, 3, "@");
     try ts.expectCellText(gutter_col, 3, "│");
     try ts.expectCellText(gutter_col + 1, 3, " ");
     try ts.expectCellText(gutter_col + 8, 3, " ");
@@ -441,8 +444,8 @@ test "renderFile can start from cached viewport offset" {
         .line_index = index,
     });
 
-    try ts.expectCellText(0, 3, "@");
-    try ts.expectCellText(1, 3, "@");
+    try ts.expectCellText(2, 3, "@");
+    try ts.expectCellText(3, 3, "@");
     try ts.expectCellText(12, 4, "s");
     try ts.expectCellText(13, 4, "a");
     try ts.expectCellText(14, 4, "m");

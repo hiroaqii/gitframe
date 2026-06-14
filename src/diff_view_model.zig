@@ -45,6 +45,7 @@ pub const HunkHeader = struct {
     new_start: u32,
     new_count: u32,
     section: []const u8,
+    folded: bool = false,
 };
 
 pub const BodyRowIterator = struct {
@@ -55,6 +56,7 @@ pub const BodyRowIterator = struct {
     hunk_index: usize = 0,
     line_index: usize = 0,
     side_by_side_rows: SideBySideIterator = .init(&.{}),
+    folded_hunks: []const bool = &.{},
 
     const Phase = enum {
         metadata,
@@ -68,20 +70,36 @@ pub const BodyRowIterator = struct {
     /// Render, count, offset, and search should consume this iterator rather
     /// than each reimplementing metadata / hunk / side-by-side traversal.
     pub fn init(file: diff_parser.FileDiff, mode: DisplayMode) BodyRowIterator {
+        return initWithFolded(file, mode, &.{});
+    }
+
+    pub fn initWithFolded(file: diff_parser.FileDiff, mode: DisplayMode, folded_hunks: []const bool) BodyRowIterator {
         return .{
             .file = file,
             .mode = mode,
+            .folded_hunks = folded_hunks,
         };
     }
 
     /// `index` must be built from the same file and display mode as this
     /// iterator; callers validate that boundary before taking this fast path.
     pub fn initAt(file: diff_parser.FileDiff, mode: DisplayMode, index: RenderedLineIndex, body_offset: usize) BodyRowIterator {
-        if (body_offset == 0) return init(file, mode);
+        return initAtWithFolded(file, mode, index, body_offset, &.{});
+    }
+
+    pub fn initAtWithFolded(
+        file: diff_parser.FileDiff,
+        mode: DisplayMode,
+        index: RenderedLineIndex,
+        body_offset: usize,
+        folded_hunks: []const bool,
+    ) BodyRowIterator {
+        if (body_offset == 0) return initWithFolded(file, mode, folded_hunks);
         if (body_offset >= index.total_rows) {
             return .{
                 .file = file,
                 .mode = mode,
+                .folded_hunks = folded_hunks,
                 .phase = .done,
             };
         }
@@ -90,6 +108,7 @@ pub const BodyRowIterator = struct {
             return .{
                 .file = file,
                 .mode = mode,
+                .folded_hunks = folded_hunks,
                 .metadata_index = body_offset,
             };
         }
@@ -98,6 +117,7 @@ pub const BodyRowIterator = struct {
             return .{
                 .file = file,
                 .mode = mode,
+                .folded_hunks = folded_hunks,
                 .phase = .binary,
             };
         }
@@ -106,6 +126,7 @@ pub const BodyRowIterator = struct {
             return .{
                 .file = file,
                 .mode = mode,
+                .folded_hunks = folded_hunks,
                 .phase = .done,
             };
         };
@@ -114,6 +135,7 @@ pub const BodyRowIterator = struct {
             return .{
                 .file = file,
                 .mode = mode,
+                .folded_hunks = folded_hunks,
                 .phase = .hunk_header,
                 .hunk_index = hunk_index,
             };
@@ -122,6 +144,7 @@ pub const BodyRowIterator = struct {
         var iterator: BodyRowIterator = .{
             .file = file,
             .mode = mode,
+            .folded_hunks = folded_hunks,
             .phase = .hunk_lines,
             .hunk_index = hunk_index,
         };
@@ -167,9 +190,15 @@ pub const BodyRowIterator = struct {
                         .new_start = hunk.new_start,
                         .new_count = hunk.new_count,
                         .section = hunk.section,
+                        .folded = self.isFolded(self.hunk_index),
                     } };
                 },
                 .hunk_lines => {
+                    if (self.isFolded(self.hunk_index)) {
+                        self.hunk_index += 1;
+                        self.phase = .hunk_header;
+                        continue;
+                    }
                     const hunk = self.file.hunks[self.hunk_index];
                     switch (self.mode) {
                         .unified => {
@@ -190,18 +219,30 @@ pub const BodyRowIterator = struct {
             }
         }
     }
+
+    fn isFolded(self: BodyRowIterator, hunk_index: usize) bool {
+        return hunk_index < self.folded_hunks.len and self.folded_hunks[hunk_index];
+    }
 };
 
 pub fn renderedBodyLineCount(file: diff_parser.FileDiff, mode: DisplayMode) usize {
+    return renderedBodyLineCountFolded(file, mode, &.{});
+}
+
+pub fn renderedBodyLineCountFolded(file: diff_parser.FileDiff, mode: DisplayMode, folded_hunks: []const bool) usize {
     var count: usize = 0;
-    var rows = BodyRowIterator.init(file, mode);
+    var rows = BodyRowIterator.initWithFolded(file, mode, folded_hunks);
     while (rows.next() != null) count += 1;
     return count;
 }
 
 pub fn hunkBodyLineOffset(file: diff_parser.FileDiff, mode: DisplayMode, hunk_index: usize) usize {
+    return hunkBodyLineOffsetFolded(file, mode, hunk_index, &.{});
+}
+
+pub fn hunkBodyLineOffsetFolded(file: diff_parser.FileDiff, mode: DisplayMode, hunk_index: usize, folded_hunks: []const bool) usize {
     var offset: usize = 0;
-    var rows = BodyRowIterator.init(file, mode);
+    var rows = BodyRowIterator.initWithFolded(file, mode, folded_hunks);
     while (rows.next()) |row| {
         if (row == .hunk_header and row.hunk_header.hunk_index == hunk_index) return offset;
         offset += 1;
@@ -230,6 +271,9 @@ pub fn renderedOffsetForCoordinate(
             if (line.line_index >= hunk.lines.len) break :blk null;
 
             const hunk_offset = hunkOffsetForCoordinate(file, mode, index, line.hunk_index) orelse break :blk null;
+            if (index) |line_index| {
+                if (line_index.hunkLineCount(line.hunk_index) <= 1) break :blk null;
+            }
             const local_line_offset = switch (mode) {
                 .unified => line.line_index,
                 .side_by_side => sideBySideRenderedOffsetForLine(hunk.lines, line.line_index) orelse break :blk null,
@@ -256,6 +300,15 @@ pub const RenderedLineIndex = struct {
     hunk_line_counts: []usize = &.{},
 
     pub fn build(allocator: std.mem.Allocator, file: diff_parser.FileDiff, mode: DisplayMode) !RenderedLineIndex {
+        return buildFolded(allocator, file, mode, &.{});
+    }
+
+    pub fn buildFolded(
+        allocator: std.mem.Allocator,
+        file: diff_parser.FileDiff,
+        mode: DisplayMode,
+        folded_hunks: []const bool,
+    ) !RenderedLineIndex {
         const hunk_offsets = try allocator.alloc(usize, file.hunks.len);
         const hunk_line_counts = allocator.alloc(usize, file.hunks.len) catch |err| {
             allocator.free(hunk_offsets);
@@ -267,34 +320,40 @@ pub const RenderedLineIndex = struct {
             .hunk_offsets = hunk_offsets,
             .hunk_line_counts = hunk_line_counts,
         };
+        index.recompute(file, folded_hunks);
+        return index;
+    }
+
+    pub fn recompute(self: *RenderedLineIndex, file: diff_parser.FileDiff, folded_hunks: []const bool) void {
+        self.metadata_rows = 0;
+        self.binary_rows = 0;
+        self.total_rows = 0;
 
         // Build from the same iterator used by render/search wrappers so the
         // cached index cannot drift from the rendered body row order.
-        var rows = BodyRowIterator.init(file, mode);
+        var rows = BodyRowIterator.initWithFolded(file, self.mode, folded_hunks);
         var offset: usize = 0;
         while (rows.next()) |row| : (offset += 1) {
             switch (row) {
-                .metadata => index.metadata_rows += 1,
-                .binary_marker => index.binary_rows += 1,
+                .metadata => self.metadata_rows += 1,
+                .binary_marker => self.binary_rows += 1,
                 .hunk_header => |hunk| {
-                    if (hunk.hunk_index < index.hunk_offsets.len) {
-                        index.hunk_offsets[hunk.hunk_index] = offset;
+                    if (hunk.hunk_index < self.hunk_offsets.len) {
+                        self.hunk_offsets[hunk.hunk_index] = offset;
                     }
                 },
                 .unified_line, .side_by_side => {},
             }
         }
-        index.total_rows = offset;
+        self.total_rows = offset;
 
-        for (index.hunk_offsets, 0..) |hunk_offset, hunk_index| {
-            const next_offset = if (hunk_index + 1 < index.hunk_offsets.len)
-                index.hunk_offsets[hunk_index + 1]
+        for (self.hunk_offsets, 0..) |hunk_offset, hunk_index| {
+            const next_offset = if (hunk_index + 1 < self.hunk_offsets.len)
+                self.hunk_offsets[hunk_index + 1]
             else
-                index.total_rows;
-            index.hunk_line_counts[hunk_index] = next_offset - hunk_offset;
+                self.total_rows;
+            self.hunk_line_counts[hunk_index] = next_offset - hunk_offset;
         }
-
-        return index;
     }
 
     pub fn deinit(self: *RenderedLineIndex, allocator: std.mem.Allocator) void {
@@ -370,6 +429,18 @@ pub const RenderedLineCache = struct {
             .unified => if (file_index < self.unified.len) self.unified[file_index] else null,
             .side_by_side => if (file_index < self.side_by_side.len) self.side_by_side[file_index] else null,
         };
+    }
+
+    pub fn recomputeFile(
+        self: *RenderedLineCache,
+        document: diff_parser.DiffDocument,
+        file_index: usize,
+        folded_hunks: []const bool,
+    ) void {
+        if (file_index >= document.files.len) return;
+        const file = document.files[file_index];
+        if (file_index < self.unified.len) self.unified[file_index].recompute(file, folded_hunks);
+        if (file_index < self.side_by_side.len) self.side_by_side[file_index].recompute(file, folded_hunks);
     }
 
     fn deinitForTests(self: *RenderedLineCache, allocator: std.mem.Allocator) void {
@@ -645,6 +716,59 @@ test "rendered line index matches iterator wrappers" {
     try std.testing.expectEqual(@as(usize, 0), unified.binary_rows);
     try std.testing.expectEqual(@as(usize, 6), unified.hunkLineCount(0));
     try std.testing.expectEqual(@as(usize, 5), side_by_side.hunkLineCount(0));
+}
+
+test "rendered line index can fold hunk bodies in place" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{"index 1..2"},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 2,
+                .new_start = 1,
+                .new_count = 2,
+                .section = "first",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old", .old_line = 1 },
+                    .{ .kind = .added, .text = "new", .new_line = 1 },
+                },
+            },
+            .{
+                .old_start = 9,
+                .old_count = 1,
+                .new_start = 9,
+                .new_count = 1,
+                .section = "second",
+                .lines = &.{
+                    .{ .kind = .context, .text = "same", .old_line = 9, .new_line = 9 },
+                },
+            },
+        },
+    };
+    const folded = [_]bool{ true, false };
+
+    var index = try RenderedLineIndex.buildFolded(std.testing.allocator, file, .unified, &folded);
+    defer index.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), index.hunkLineCount(0));
+    try std.testing.expectEqual(@as(usize, 2), index.hunkOffset(1));
+    try std.testing.expectEqual(@as(?usize, null), renderedOffsetForCoordinate(file, .unified, .{
+        .hunk_line = .{ .hunk_index = 0, .line_index = 0 },
+    }, index));
+
+    var rows = BodyRowIterator.initAtWithFolded(file, .unified, index, index.hunkOffset(0), &folded);
+    const header = rows.next().?.hunk_header;
+    try std.testing.expect(header.folded);
+    try std.testing.expectEqual(@as(usize, 1), rows.next().?.hunk_header.hunk_index);
+
+    var unfolded = folded;
+    unfolded[0] = false;
+    index.recompute(file, &unfolded);
+    try std.testing.expectEqual(@as(usize, 3), index.hunkLineCount(0));
+    try std.testing.expectEqual(@as(?usize, index.hunkOffset(0) + 1), renderedOffsetForCoordinate(file, .unified, .{
+        .hunk_line = .{ .hunk_index = 0, .line_index = 0 },
+    }, index));
 }
 
 test "rendered line index counts binary file" {

@@ -65,6 +65,7 @@ pub const App = struct {
         page_diff_down,
         select_previous_hunk,
         select_next_hunk,
+        toggle_hunk_fold,
         select_first_file,
         select_last_file,
         toggle_focus,
@@ -122,6 +123,7 @@ pub const App = struct {
             .page_diff_down => self.pageDiff(1),
             .select_previous_hunk => self.selectHunkDelta(-1),
             .select_next_hunk => self.selectHunkDelta(1),
+            .toggle_hunk_fold => self.toggleSelectedHunkFold(),
             .select_first_file => self.selectFileAbsolute(0),
             .select_last_file => self.selectLastFile(),
             .toggle_focus => self.focus = self.focus.toggled(),
@@ -221,6 +223,7 @@ pub const App = struct {
         if (key.matches(chasen.Key.end, .{})) return .select_last_file;
         if (key.matches(chasen.Key.escape, .{}) and self.search_query.len > 0) return .clear_search;
         if (self.focus == .sidebar and key.matches(chasen.Key.enter, .{})) return .toggle_directory;
+        if (self.focus == .diff and key.matches(chasen.Key.enter, .{})) return .toggle_hunk_fold;
         if (self.focus == .sidebar and key.matches(chasen.Key.right, .{})) return .expand_directory;
         if (self.focus == .sidebar and key.matches(chasen.Key.left, .{})) return .collapse_or_parent_directory;
 
@@ -445,6 +448,7 @@ pub const App = struct {
             .scroll = self.diff_scroll,
             .highlighted_hunk = if (file.hunks.len > 0) self.selected_hunk else null,
             .line_index = loaded.cachedRenderedLineIndex(selected, mode),
+            .folded_hunks = loaded.foldedHunksForFile(selected),
         });
         self.drawSearchMatchMarker(surface);
     }
@@ -758,6 +762,25 @@ pub const App = struct {
         self.clampDiffNavigation();
     }
 
+    fn toggleSelectedHunkFold(self: *App) void {
+        const loaded = self.activeLoadedDiff() orelse return;
+        const file_index = self.selectedFileIndex(loaded) orelse return;
+        if (file_index >= loaded.document.files.len) return;
+        const file = loaded.document.files[file_index];
+        if (self.selected_hunk >= file.hunks.len) return;
+
+        if (!loaded.isHunkFolded(file_index, self.selected_hunk) and
+            self.currentSearchMatchInHunkBody(self.selected_hunk))
+        {
+            return;
+        }
+
+        loaded.toggleHunkFold(file_index, self.selected_hunk);
+        self.updateSearchMatchOffset();
+        self.scrollSelectedHunkIntoView();
+        self.clampDiffNavigation();
+    }
+
     fn scrollSelectedHunkIntoView(self: *App) void {
         const mode = self.effectiveDisplayMode();
         const target = self.selectedHunkOffset(mode, self.selected_hunk);
@@ -924,6 +947,7 @@ pub const App = struct {
             self.clearSearchMatch();
             return;
         };
+        self.unfoldSearchMatchIfNeeded(next);
         self.setSearchMatch(next);
         if (self.search_match_offset) |offset| self.diff_scroll = offset;
         self.clampDiffNavigation();
@@ -934,6 +958,7 @@ pub const App = struct {
         if (self.search_query.len == 0) return;
         const file = self.selectedFile() orelse return;
         const next = diff_search.findMatch(file, self.effectiveDisplayMode(), self.search_query.slice(), null, .forward) orelse return;
+        self.unfoldSearchMatchIfNeeded(next);
         self.setSearchMatch(next);
         if (self.search_match_offset) |offset| self.diff_scroll = offset;
     }
@@ -958,6 +983,25 @@ pub const App = struct {
             return;
         };
         self.search_match_offset = offset;
+    }
+
+    fn unfoldSearchMatchIfNeeded(self: *App, match: diff_search.Match) void {
+        const hunk_index = switch (match.coordinate) {
+            .hunk_line => |line| line.hunk_index,
+            else => return,
+        };
+        const loaded = self.activeLoadedDiff() orelse return;
+        const file_index = self.selectedFileIndex(loaded) orelse return;
+        if (!loaded.isHunkFolded(file_index, hunk_index)) return;
+        loaded.setHunkFolded(file_index, hunk_index, false);
+    }
+
+    fn currentSearchMatchInHunkBody(self: *const App, hunk_index: usize) bool {
+        const match = self.search_match orelse return false;
+        return switch (match.coordinate) {
+            .hunk_line => |line| line.hunk_index == hunk_index,
+            else => false,
+        };
     }
 
     fn scrollSearchMatchIntoView(self: *App) void {
@@ -992,7 +1036,7 @@ pub const App = struct {
         const loaded = self.activeLoadedDiffConst() orelse return 0;
         const file_index = self.selectedFileIndex(loaded) orelse return 0;
         if (loaded.rendered_line_cache.indexFor(file_index, mode)) |index| return index.hunkOffset(hunk_index);
-        return diff_render.hunkBodyLineOffset(loaded.document.files[file_index], mode, hunk_index);
+        return diff_view_model.hunkBodyLineOffsetFolded(loaded.document.files[file_index], mode, hunk_index, loaded.foldedHunksForFile(file_index));
     }
 
     fn loadedFileCount(self: *const App) ?usize {
@@ -1164,6 +1208,7 @@ const footer_sidebar_items = [_]ui.key_hint.Item{
 const footer_diff_items = [_]ui.key_hint.Item{
     ui.key_hint.item("Tab", "focus"),
     ui.key_hint.item("↑/↓/j/k", "scroll"),
+    ui.key_hint.item("Enter", "fold"),
     ui.key_hint.item("/", "search"),
     ui.key_hint.item("f", "file"),
     ui.key_hint.item("v", "viewed"),
@@ -1324,6 +1369,7 @@ const LoadedDiff = struct {
     tree: file_tree.FileTree,
     rendered_line_cache: diff_view_model.RenderedLineCache = .{},
     collapsed_dirs: file_tree.CollapsedSet = .empty,
+    collapsed_hunks: []bool = &.{},
     reviewed_files: []bool = &.{},
     visible_nodes: []usize = &.{},
     visible_node_count: usize = 0,
@@ -1424,12 +1470,45 @@ const LoadedDiff = struct {
         const file = self.document.files[file_index];
         return .{
             .mode = mode,
-            .total_rows = diff_render.renderedBodyLineCount(file, mode),
+            .total_rows = diff_view_model.renderedBodyLineCountFolded(file, mode, self.foldedHunksForFile(file_index)),
         };
     }
 
     fn cachedRenderedLineIndex(self: *const LoadedDiff, file_index: usize, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
         return self.rendered_line_cache.indexFor(file_index, mode);
+    }
+
+    fn foldedHunksForFile(self: *const LoadedDiff, file_index: usize) []const bool {
+        const start = self.hunkOrdinal(file_index, 0) orelse return &.{};
+        if (file_index >= self.document.files.len) return &.{};
+        const len = self.document.files[file_index].hunks.len;
+        if (start + len > self.collapsed_hunks.len) return &.{};
+        return self.collapsed_hunks[start .. start + len];
+    }
+
+    fn hunkOrdinal(self: *const LoadedDiff, file_index: usize, hunk_index: usize) ?usize {
+        if (file_index >= self.document.files.len) return null;
+        if (hunk_index >= self.document.files[file_index].hunks.len) return null;
+        var ordinal: usize = 0;
+        for (self.document.files[0..file_index]) |file| ordinal += file.hunks.len;
+        return ordinal + hunk_index;
+    }
+
+    fn isHunkFolded(self: *const LoadedDiff, file_index: usize, hunk_index: usize) bool {
+        const ordinal = self.hunkOrdinal(file_index, hunk_index) orelse return false;
+        return ordinal < self.collapsed_hunks.len and self.collapsed_hunks[ordinal];
+    }
+
+    fn toggleHunkFold(self: *LoadedDiff, file_index: usize, hunk_index: usize) void {
+        self.setHunkFolded(file_index, hunk_index, !self.isHunkFolded(file_index, hunk_index));
+    }
+
+    fn setHunkFolded(self: *LoadedDiff, file_index: usize, hunk_index: usize, folded: bool) void {
+        const ordinal = self.hunkOrdinal(file_index, hunk_index) orelse return;
+        if (ordinal >= self.collapsed_hunks.len) return;
+        if (self.collapsed_hunks[ordinal] == folded) return;
+        self.collapsed_hunks[ordinal] = folded;
+        self.rendered_line_cache.recomputeFile(self.document, file_index, self.foldedHunksForFile(file_index));
     }
 
     fn visibleRowOfNode(self: *const LoadedDiff, node_index: usize) ?usize {
@@ -1571,6 +1650,8 @@ const DiffLoadTask = struct {
         const document = try diff_parser.parse(arena_allocator, copied);
         const tree = try file_tree.build(arena_allocator, document);
         const rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document);
+        const collapsed_hunks = try arena_allocator.alloc(bool, document.totalHunks());
+        @memset(collapsed_hunks, false);
         var loaded: LoadedDiff = .{
             .bytes = copied.len,
             .lines = countLines(copied),
@@ -1578,6 +1659,7 @@ const DiffLoadTask = struct {
             .document = document,
             .tree = tree,
             .rendered_line_cache = rendered_line_cache,
+            .collapsed_hunks = collapsed_hunks,
             .collapsed_dirs = .empty,
         };
         try loaded.rebuildVisibleNodes(arena_allocator, false, .all);
@@ -1711,6 +1793,83 @@ test "mode change keeps search near later matches" {
 
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
     try std.testing.expectEqual(@as(?usize, 10), app.search_match_offset);
+}
+
+test "toggle selected hunk fold updates active rendered line cache" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    const allocator = arena.allocator();
+    var loaded = testLoadedDiffOne();
+    loaded.collapsed_hunks = try allocator.alloc(bool, loaded.document.totalHunks());
+    @memset(loaded.collapsed_hunks, false);
+    loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
+
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load_arena = arena,
+        .load_state = .{ .loaded = loaded },
+        .selected_hunk = 0,
+    };
+    defer app.clearLoadedDiff();
+
+    try std.testing.expectEqual(@as(usize, 13), app.selectedFileLineIndex(.unified).lineCount());
+    app.toggleSelectedHunkFold();
+
+    const active = app.loadedDiff().?;
+    try std.testing.expect(active.isHunkFolded(0, 0));
+    try std.testing.expectEqual(@as(usize, 8), app.selectedFileLineIndex(.unified).lineCount());
+    try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .unified).hunkLineCount(0));
+    try std.testing.expectEqual(@as(usize, 7), app.selectedFileLineIndex(.side_by_side).lineCount());
+    try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .side_by_side).hunkLineCount(0));
+}
+
+test "search unfolds folded hunk body matches before setting offset" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    const allocator = arena.allocator();
+    var loaded = testLoadedDiffOne();
+    loaded.collapsed_hunks = try allocator.alloc(bool, loaded.document.totalHunks());
+    @memset(loaded.collapsed_hunks, false);
+    loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
+    loaded.setHunkFolded(0, 0, true);
+
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load_arena = arena,
+        .load_state = .{ .loaded = loaded },
+    };
+    defer app.clearLoadedDiff();
+    setSearchQuery(&app, "new");
+
+    app.submitSearch();
+
+    const active = app.loadedDiff().?;
+    try std.testing.expect(!active.isHunkFolded(0, 0));
+    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
+    try std.testing.expectEqual(@as(?usize, 7), app.search_match_offset);
+}
+
+test "manual fold keeps hunk open when it contains active search match" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    const allocator = arena.allocator();
+    var loaded = testLoadedDiffOne();
+    loaded.collapsed_hunks = try allocator.alloc(bool, loaded.document.totalHunks());
+    @memset(loaded.collapsed_hunks, false);
+    loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
+
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load_arena = arena,
+        .load_state = .{ .loaded = loaded },
+    };
+    defer app.clearLoadedDiff();
+    setSearchQuery(&app, "new");
+    app.submitSearch();
+
+    app.toggleSelectedHunkFold();
+
+    const active = app.loadedDiff().?;
+    try std.testing.expect(!active.isHunkFolded(0, 0));
+    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
+    try std.testing.expectEqual(@as(?usize, 7), app.search_match_offset);
 }
 
 test "file change resyncs retained search query to selected file" {
