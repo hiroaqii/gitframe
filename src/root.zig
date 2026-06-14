@@ -33,6 +33,7 @@ pub const App = struct {
     file_search_input: SearchQuery = .{},
     file_search_no_match: bool = false,
     file_search_return_focus: Focus = .sidebar,
+    hide_reviewed_files: bool = false,
     /// Owns the currently loaded raw diff, parsed document arrays, and error
     /// messages. Recreated on every successful load/reload.
     load_arena: ?std.heap.ArenaAllocator = null,
@@ -71,6 +72,7 @@ pub const App = struct {
         file_search_insert: u21,
         file_search_backspace,
         toggle_reviewed_file,
+        toggle_hide_reviewed_files,
         reload,
         quit,
     };
@@ -134,7 +136,8 @@ pub const App = struct {
                 self.file_search_no_match = false;
                 self.file_search_input.backspace();
             },
-            .toggle_reviewed_file => self.toggleReviewedFile(),
+            .toggle_reviewed_file => try self.toggleReviewedFile(),
+            .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .reload => switch (self.config.source) {
                 .stdin => ctx.redraw().skip(),
                 else => try self.startDiffLoad(ctx),
@@ -216,6 +219,7 @@ pub const App = struct {
             'G' => .select_last_file,
             'f' => .enter_file_search,
             'v' => .toggle_reviewed_file,
+            'H' => .toggle_hide_reviewed_files,
             'u' => .toggle_display_mode,
             'q' => .quit,
             'r' => .reload,
@@ -290,6 +294,9 @@ pub const App = struct {
             loaded.document.files.len,
             loaded.document.totalHunks(),
         });
+        if (self.hide_reviewed_files and size.width > 2) {
+            _ = surface.borrowTextAt(0, 2, "hiding reviewed", .{ .fg = .{ .index = 11 } });
+        }
 
         if (size.height <= sidebar_header_rows) return;
 
@@ -633,7 +640,7 @@ pub const App = struct {
         if (node.kind != .directory) return;
         const allocator = self.loadArenaAllocator() orelse return;
         try file_tree.toggle(allocator, &loaded.collapsed_dirs, node.path);
-        try loaded.rebuildVisibleNodes(allocator);
+        try loaded.rebuildVisibleNodes(allocator, self.hide_reviewed_files);
         self.clampSelection(loaded.document.files.len);
     }
 
@@ -643,7 +650,7 @@ pub const App = struct {
         const node = loaded.tree.nodes[self.selected_node];
         if (node.kind != .directory) return;
         file_tree.expand(&loaded.collapsed_dirs, node.path);
-        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return);
+        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.hide_reviewed_files);
         self.clampSelection(loaded.document.files.len);
     }
 
@@ -654,7 +661,7 @@ pub const App = struct {
         if (node.kind == .directory and !file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) {
             const allocator = self.loadArenaAllocator() orelse return;
             try file_tree.collapse(allocator, &loaded.collapsed_dirs, node.path);
-            try loaded.rebuildVisibleNodes(allocator);
+            try loaded.rebuildVisibleNodes(allocator, self.hide_reviewed_files);
             self.clampSelection(loaded.document.files.len);
             return;
         }
@@ -774,7 +781,7 @@ pub const App = struct {
         self.focus = self.file_search_return_focus;
     }
 
-    fn toggleReviewedFile(self: *App) void {
+    fn toggleReviewedFile(self: *App) !void {
         const loaded = self.loadedDiff() orelse return;
         if (self.selected_node >= loaded.tree.nodes.len) return;
 
@@ -782,6 +789,19 @@ pub const App = struct {
         const file_index = node.file_index orelse return;
         if (file_index >= loaded.reviewed_files.len) return;
         loaded.reviewed_files[file_index] = !loaded.reviewed_files[file_index];
+        if (self.hide_reviewed_files) {
+            try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, true);
+            self.reconcileSelectionAfterVisibleNodeChange(loaded);
+            self.clampDiffNavigation();
+        }
+    }
+
+    fn toggleHideReviewedFiles(self: *App) !void {
+        self.hide_reviewed_files = !self.hide_reviewed_files;
+        const loaded = self.loadedDiff() orelse return;
+        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.hide_reviewed_files);
+        self.reconcileSelectionAfterVisibleNodeChange(loaded);
+        self.clampDiffNavigation();
     }
 
     fn submitFileSearch(self: *App) void {
@@ -795,7 +815,7 @@ pub const App = struct {
             self.file_search_no_match = true;
             return;
         };
-        const node_index = findFileNodeMatching(loaded.tree, query) orelse {
+        const node_index = findFileNodeMatching(loaded, query, self.hide_reviewed_files) orelse {
             self.file_search_no_match = true;
             return;
         };
@@ -803,7 +823,7 @@ pub const App = struct {
         // Go-to-file should land on the file row, not on a still-collapsed
         // parent directory that hides the matched path.
         file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
-        loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return) catch {
+        loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.hide_reviewed_files) catch {
             self.file_search_no_match = true;
             return;
         };
@@ -962,6 +982,26 @@ pub const App = struct {
         }
     }
 
+    fn reconcileSelectionAfterVisibleNodeChange(self: *App, loaded: *LoadedDiff) void {
+        if (loaded.visibleRowOfNode(self.selected_node) != null) {
+            return;
+        }
+
+        if (loaded.firstVisibleFileNode()) |file_node| {
+            self.selectSidebarNode(loaded, file_node);
+            return;
+        }
+
+        if (loaded.visibleAncestorOrSelf(self.selected_node)) |visible_node| {
+            self.selectSidebarNode(loaded, visible_node);
+            return;
+        }
+
+        if (loaded.visibleNodeAt(0)) |node_index| {
+            self.selected_node = node_index;
+        }
+    }
+
     fn loadedDiff(self: *App) ?*LoadedDiff {
         return switch (self.load_state) {
             .loaded => |*loaded| loaded,
@@ -986,6 +1026,7 @@ const footer_sidebar_items = [_]ui.key_hint.Item{
     ui.key_hint.item("/", "search"),
     ui.key_hint.item("f", "file"),
     ui.key_hint.item("v", "viewed"),
+    ui.key_hint.item("H", "hide viewed"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),
     ui.key_hint.item("r", "reload"),
@@ -998,6 +1039,7 @@ const footer_diff_items = [_]ui.key_hint.Item{
     ui.key_hint.item("/", "search"),
     ui.key_hint.item("f", "file"),
     ui.key_hint.item("v", "viewed"),
+    ui.key_hint.item("H", "hide viewed"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),
     ui.key_hint.item("r", "reload"),
@@ -1114,18 +1156,53 @@ const LoadedDiff = struct {
     bytes: usize,
     lines: usize,
 
-    fn rebuildVisibleNodes(self: *LoadedDiff, allocator: std.mem.Allocator) !void {
+    fn rebuildVisibleNodes(self: *LoadedDiff, allocator: std.mem.Allocator, hide_reviewed: bool) !void {
         if (self.visible_nodes.len < self.tree.nodes.len) {
             self.visible_nodes = try allocator.alloc(usize, self.tree.nodes.len);
         }
 
         var count: usize = 0;
         for (self.tree.nodes, 0..) |_, index| {
-            if (!self.tree.isVisible(index, &self.collapsed_dirs)) continue;
+            if (!self.shouldIncludeVisibleNode(index, hide_reviewed)) continue;
             self.visible_nodes[count] = index;
             count += 1;
         }
         self.visible_node_count = count;
+    }
+
+    fn shouldIncludeVisibleNode(self: *const LoadedDiff, node_index: usize, hide_reviewed: bool) bool {
+        if (!self.tree.isVisible(node_index, &self.collapsed_dirs)) return false;
+        if (!hide_reviewed) return true;
+
+        const node = self.tree.nodes[node_index];
+        return switch (node.kind) {
+            .file => !self.isReviewedFileNode(node_index),
+            .directory => self.hasUnreviewedFileDescendant(node_index),
+        };
+    }
+
+    fn isFileReviewedNode(self: *const LoadedDiff, node_index: usize) bool {
+        if (node_index >= self.tree.nodes.len) return false;
+        return self.isReviewedFileNode(node_index);
+    }
+
+    fn isReviewedFileNode(self: *const LoadedDiff, node_index: usize) bool {
+        const file_index = self.tree.nodes[node_index].file_index orelse return false;
+        return file_index < self.reviewed_files.len and self.reviewed_files[file_index];
+    }
+
+    fn hasUnreviewedFileDescendant(self: *const LoadedDiff, directory_index: usize) bool {
+        if (directory_index >= self.tree.nodes.len) return false;
+
+        const directory = self.tree.nodes[directory_index];
+        if (directory.kind != .directory) return false;
+
+        for (self.tree.nodes, 0..) |node, index| {
+            if (node.kind != .file) continue;
+            if (!file_tree.isPathAncestor(directory.path, node.path)) continue;
+            if (!self.isReviewedFileNode(index)) return true;
+        }
+        return false;
     }
 
     fn materializedVisibleNodes(self: *const LoadedDiff) ?[]const usize {
@@ -1196,7 +1273,31 @@ const LoadedDiff = struct {
 
     fn visibleAncestorOrSelf(self: *const LoadedDiff, node_index: usize) ?usize {
         if (self.visibleRowOfNode(node_index) != null) return node_index;
+        if (self.materializedVisibleNodes() != null) {
+            if (node_index >= self.tree.nodes.len) return null;
+            const node = self.tree.nodes[node_index];
+            var index = node_index;
+            while (index > 0) {
+                index -= 1;
+                const candidate = self.tree.nodes[index];
+                if (candidate.kind != .directory) continue;
+                if (candidate.depth >= node.depth) continue;
+                if (!file_tree.isPathAncestor(candidate.path, node.path)) continue;
+                if (self.visibleRowOfNode(index) != null) return index;
+            }
+            return null;
+        }
         return self.tree.visibleAncestorOrSelf(&self.collapsed_dirs, node_index);
+    }
+
+    fn firstVisibleFileNode(self: *const LoadedDiff) ?usize {
+        const count = self.visibleNodeCount();
+        var visible_index: usize = 0;
+        while (visible_index < count) : (visible_index += 1) {
+            const node_index = self.visibleNodeAt(visible_index) orelse continue;
+            if (self.tree.nodes[node_index].file_index != null) return node_index;
+        }
+        return null;
     }
 };
 
@@ -1298,7 +1399,7 @@ const DiffLoadTask = struct {
             .reviewed_files = reviewed_files,
             .collapsed_dirs = .empty,
         };
-        try loaded.rebuildVisibleNodes(arena_allocator);
+        try loaded.rebuildVisibleNodes(arena_allocator, false);
 
         // Do not store `arena_allocator` in the result: its interface points
         // at this local arena value, while the arena itself is moved by value
@@ -1336,9 +1437,10 @@ fn parentDirectoryNodeIndex(tree: file_tree.FileTree, node_index: usize) ?usize 
     return null;
 }
 
-fn findFileNodeMatching(tree: file_tree.FileTree, query: []const u8) ?usize {
-    for (tree.nodes, 0..) |node, index| {
+fn findFileNodeMatching(loaded: *const LoadedDiff, query: []const u8, hide_reviewed: bool) ?usize {
+    for (loaded.tree.nodes, 0..) |node, index| {
         if (node.kind != .file) continue;
+        if (hide_reviewed and loaded.isReviewedFileNode(index)) continue;
         if (ui.list_filter.matchesLabel(node.path, query)) return index;
     }
     return null;
@@ -1532,6 +1634,34 @@ test "file search keeps prompt open on no match" {
     try std.testing.expectEqual(@as(usize, 0), app.selected_file);
 }
 
+test "file search skips hidden reviewed matches" {
+    var reviewed = [_]bool{ true, false };
+    var app: App = .{
+        .load_arena = .init(std.testing.allocator),
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .document = .{ .files = &test_files_two },
+            .tree = .{ .nodes = &test_tree_nested_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        } },
+        .file_search_mode = true,
+        .hide_reviewed_files = true,
+    };
+    defer app.clearLoadedDiff();
+    try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, true);
+    setFileSearchInput(&app, "src");
+
+    app.submitFileSearch();
+
+    try std.testing.expect(!app.file_search_mode);
+    try std.testing.expect(!app.file_search_no_match);
+    try std.testing.expectEqual(@as(usize, 2), app.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
+}
+
 test "file search trims empty input and restores focus on cancel" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
@@ -1582,14 +1712,14 @@ test "toggleReviewedFile marks only selected file nodes" {
         .selected_file = 0,
     };
 
-    app.toggleReviewedFile();
+    try app.toggleReviewedFile();
     try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
 
     app.selected_node = 1;
-    app.toggleReviewedFile();
+    try app.toggleReviewedFile();
     try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
 
-    app.toggleReviewedFile();
+    try app.toggleReviewedFile();
     try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
 }
 
@@ -1616,6 +1746,116 @@ test "sidebar renders reviewed marker" {
 
     try ts.expectCellText(1, sidebar_header_rows, "✓");
     try ts.expectCellText(4, sidebar_header_rows, "A");
+}
+
+test "hide reviewed files removes reviewed file rows from visible list" {
+    var reviewed = [_]bool{ true, false };
+    var app: App = .{
+        .load_arena = .init(std.testing.allocator),
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .document = .{ .files = &test_files_two },
+            .tree = .{ .nodes = &test_tree_nested_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        } },
+        .selected_node = 1,
+        .selected_file = 0,
+    };
+    defer app.clearLoadedDiff();
+
+    try app.toggleHideReviewedFiles();
+
+    const loaded = app.loadedDiff().?;
+    try std.testing.expect(app.hide_reviewed_files);
+    try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
+    try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
+    try std.testing.expectEqual(@as(usize, 2), app.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
+}
+
+test "hide reviewed files removes directories with no visible file descendants" {
+    var reviewed = [_]bool{ true, true };
+    var app: App = .{
+        .load_arena = .init(std.testing.allocator),
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .document = .{ .files = &test_files_two },
+            .tree = .{ .nodes = &test_tree_nested_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        } },
+        .selected_node = 1,
+        .selected_file = 0,
+    };
+    defer app.clearLoadedDiff();
+
+    try app.toggleHideReviewedFiles();
+
+    const loaded = app.loadedDiff().?;
+    try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
+}
+
+test "hide reviewed files keeps directories for non-contiguous unreviewed descendants" {
+    var reviewed = [_]bool{ true, false };
+    var app: App = .{
+        .load_arena = .init(std.testing.allocator),
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .document = .{ .files = &test_files_two },
+            .tree = .{ .nodes = &test_tree_non_contiguous_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        } },
+        .selected_node = 1,
+        .selected_file = 0,
+    };
+    defer app.clearLoadedDiff();
+
+    try app.toggleHideReviewedFiles();
+
+    const loaded = app.loadedDiff().?;
+    try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
+    try std.testing.expectEqual(@as(?usize, 4), loaded.visibleNodeAt(1));
+}
+
+test "marking a visible file as reviewed while hidden moves selection" {
+    var reviewed = [_]bool{ false, false };
+    var app: App = .{
+        .load_arena = .init(std.testing.allocator),
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .document = .{ .files = &test_files_two },
+            .tree = .{ .nodes = &test_tree_nested_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        } },
+        .selected_node = 1,
+        .selected_file = 0,
+        .hide_reviewed_files = true,
+    };
+    defer app.clearLoadedDiff();
+    try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, true);
+
+    try app.toggleReviewedFile();
+
+    const loaded = app.loadedDiff().?;
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
+    try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
+    try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
+    try std.testing.expectEqual(@as(usize, 2), app.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
 }
 
 test "search match marker is drawn on visible match row" {
@@ -1831,6 +2071,14 @@ const test_tree_two_nodes = [_]file_tree.Node{
 const test_tree_nested_nodes = [_]file_tree.Node{
     .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
     .{ .kind = .file, .name = "a", .path = "src/a", .depth = 1, .file_index = 0 },
+    .{ .kind = .file, .name = "b", .path = "src/b", .depth = 1, .file_index = 1 },
+};
+
+const test_tree_non_contiguous_nodes = [_]file_tree.Node{
+    .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
+    .{ .kind = .file, .name = "a", .path = "src/a", .depth = 1, .file_index = 0 },
+    .{ .kind = .directory, .name = "lib", .path = "lib", .depth = 0 },
+    .{ .kind = .file, .name = "c", .path = "lib/c", .depth = 1, .file_index = 0 },
     .{ .kind = .file, .name = "b", .path = "src/b", .depth = 1, .file_index = 1 },
 };
 

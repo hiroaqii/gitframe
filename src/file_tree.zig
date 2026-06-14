@@ -223,7 +223,7 @@ fn hasCollapsedAncestor(path: []const u8, collapsed: *const CollapsedSet) bool {
     return false;
 }
 
-fn isPathAncestor(ancestor: []const u8, path: []const u8) bool {
+pub fn isPathAncestor(ancestor: []const u8, path: []const u8) bool {
     return path.len > ancestor.len and
         std.mem.startsWith(u8, path, ancestor) and
         path[ancestor.len] == '/';
