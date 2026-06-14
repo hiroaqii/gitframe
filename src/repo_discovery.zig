@@ -1,15 +1,19 @@
 const std = @import("std");
 
 pub const RepoEntry = struct {
-    /// Short label used in the picker. Usually the repository directory name.
+    /// Owned short label used in the picker. Usually the repository directory name.
     label: []const u8,
-    /// Path shown to the user. Initial discovery uses a path relative to the
-    /// scanned root for child repos and "." for the current repo.
+    /// Owned path shown to the user. Initial discovery uses a path relative to
+    /// the scanned root for child repos and "." for the current repo.
     display_path: []const u8,
-    /// Canonical repository root returned by Git.
+    /// Owned canonical repository root returned by Git.
     canonical_root: []const u8,
 };
 
+/// Owned repository discovery result.
+///
+/// Callers must release the returned value with `deinit()` using the same
+/// allocator that was passed to `discover()` / `discoverRoot()`.
 pub const DiscoveryResult = union(enum) {
     single_repo: RepoEntry,
     workspace: struct {
@@ -34,14 +38,23 @@ pub const DiscoveryResult = union(enum) {
     }
 };
 
+/// Discover the current process directory.
+///
+/// The returned `DiscoveryResult` is owned by the caller. The temporary cwd
+/// allocation used by this convenience wrapper is not transferred into the
+/// result and is always released before returning.
 pub fn discover(allocator: std.mem.Allocator, io: std.Io) !DiscoveryResult {
     const cwd = try std.process.currentPathAlloc(io, allocator);
     defer allocator.free(cwd);
     return discoverRoot(allocator, io, cwd);
 }
 
+/// Discover repositories from a borrowed root path.
+///
+/// `root_path` is only borrowed for the duration of the call. Any path stored
+/// in the returned `DiscoveryResult` is separately owned by the result.
 pub fn discoverRoot(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8) !DiscoveryResult {
-    const current_root = try std.Io.Dir.realPathFileAbsoluteAlloc(io, root_path, allocator);
+    const current_root = try realPathAbsoluteAlloc(allocator, io, root_path);
     errdefer allocator.free(current_root);
 
     if (resolveRepoRoot(allocator, io, current_root)) |repo_root| {
@@ -162,6 +175,12 @@ fn repoLabel(allocator: std.mem.Allocator, canonical_root: []const u8) ![]u8 {
     return allocator.dupe(u8, canonical_root);
 }
 
+fn realPathAbsoluteAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const path_z = try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, allocator);
+    defer allocator.free(path_z);
+    return allocator.dupe(u8, path_z);
+}
+
 fn trimAndDupe(allocator: std.mem.Allocator, bytes: []u8) ![]u8 {
     defer allocator.free(bytes);
     return allocator.dupe(u8, std.mem.trim(u8, bytes, " \t\r\n"));
@@ -212,4 +231,125 @@ test "RepoEntry sort uses display path" {
 
     try std.testing.expectEqualStrings("alpha", entries[0].display_path);
     try std.testing.expectEqualStrings("zeta", entries[1].display_path);
+}
+
+test "discover owns and releases temporary cwd on success" {
+    var result = discover(std.testing.allocator, std.testing.io) catch |err| switch (err) {
+        error.SpawnFailed => return error.SkipZigTest,
+        else => return err,
+    };
+    result.deinit(std.testing.allocator);
+}
+
+test "discoverRoot returns none for a directory without repos" {
+    var root = try TestRoot.create(std.testing.allocator);
+    defer root.cleanup(std.testing.allocator);
+
+    var result = try discoverRootOrSkip(root.path);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result == .none);
+    try std.testing.expect(result.none.current_root.len > 0);
+}
+
+test "discoverRoot returns single repo for the root repo" {
+    var root = try TestRoot.create(std.testing.allocator);
+    defer root.cleanup(std.testing.allocator);
+    try gitInitOrSkip(root.path);
+
+    var result = try discoverRootOrSkip(root.path);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result == .single_repo);
+    try std.testing.expectEqualStrings(".", result.single_repo.display_path);
+    try std.testing.expect(result.single_repo.label.len > 0);
+    try std.testing.expect(result.single_repo.canonical_root.len > 0);
+}
+
+test "discoverRoot returns workspace for direct child repos" {
+    var root = try TestRoot.create(std.testing.allocator);
+    defer root.cleanup(std.testing.allocator);
+
+    const alpha_path = try std.fs.path.join(std.testing.allocator, &.{ root.path, "alpha" });
+    defer std.testing.allocator.free(alpha_path);
+    const zeta_path = try std.fs.path.join(std.testing.allocator, &.{ root.path, "zeta" });
+    defer std.testing.allocator.free(zeta_path);
+
+    try std.Io.Dir.createDirAbsolute(std.testing.io, alpha_path, .default_dir);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, zeta_path, .default_dir);
+
+    try gitInitOrSkip(zeta_path);
+    try gitInitOrSkip(alpha_path);
+
+    var result = try discoverRootOrSkip(root.path);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result == .workspace);
+    try std.testing.expect(result.workspace.current_root.len > 0);
+    try std.testing.expectEqual(@as(usize, 2), result.workspace.repos.len);
+    try std.testing.expectEqualStrings("alpha", result.workspace.repos[0].display_path);
+    try std.testing.expectEqualStrings("zeta", result.workspace.repos[1].display_path);
+}
+
+const TestRoot = struct {
+    parent_dir: std.Io.Dir,
+    sub_path: []u8,
+    path: []u8,
+
+    fn create(allocator: std.mem.Allocator) !TestRoot {
+        var parent_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, "/tmp", .{});
+        errdefer parent_dir.close(std.testing.io);
+
+        var random_bytes: [12]u8 = undefined;
+        std.testing.io.random(&random_bytes);
+        var encoded: [std.base64.url_safe.Encoder.calcSize(random_bytes.len)]u8 = undefined;
+        const random_name = std.base64.url_safe.Encoder.encode(&encoded, &random_bytes);
+        const sub_path = try std.fmt.allocPrint(allocator, "gitframe-repo-discovery-{s}", .{random_name});
+        errdefer allocator.free(sub_path);
+
+        try parent_dir.createDirPath(std.testing.io, sub_path);
+        const path = try std.fs.path.join(allocator, &.{ "/tmp", sub_path });
+        errdefer allocator.free(path);
+
+        return .{
+            .parent_dir = parent_dir,
+            .sub_path = sub_path,
+            .path = path,
+        };
+    }
+
+    fn cleanup(self: *TestRoot, allocator: std.mem.Allocator) void {
+        self.parent_dir.deleteTree(std.testing.io, self.sub_path) catch {};
+        self.parent_dir.close(std.testing.io);
+        allocator.free(self.sub_path);
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+fn discoverRootOrSkip(root_path: []const u8) !DiscoveryResult {
+    return discoverRoot(std.testing.allocator, std.testing.io, root_path) catch |err| switch (err) {
+        error.SpawnFailed => error.SkipZigTest,
+        else => err,
+    };
+}
+
+fn gitInitOrSkip(path: []const u8) !void {
+    const result = std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "git", "init", "--quiet" },
+        .cwd = .{ .path = path },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.SkipZigTest,
+    };
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    return error.SkipZigTest;
 }
