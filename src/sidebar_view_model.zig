@@ -79,7 +79,7 @@ pub fn visibleRowAt(
 }
 
 pub fn layout(row: Row, width: u16) RowLayout {
-    const stats_width: u16 = if (width > 12) 12 else 0;
+    const stats_width: u16 = if (width > 12 and hasLineStats(row.stats)) 12 else 0;
     const indent: u16 = row.depth *| 2;
     // Sidebar rows reserve fixed positions for marker, optional reviewed mark,
     // optional status/mode badges, optional fold marker, name text, and
@@ -101,7 +101,7 @@ pub fn layout(row: Row, width: u16) RowLayout {
     else
         3 +| indent;
     const name_width: u16 = if (width > name_col + stats_width) width - name_col - stats_width else 0;
-    const stats_col: ?u16 = if (width > 12) width - stats_width else null;
+    const stats_col: ?u16 = if (stats_width > 0) width - stats_width else null;
 
     return .{
         .badge_col = badge_col,
@@ -113,6 +113,10 @@ pub fn layout(row: Row, width: u16) RowLayout {
         .stats_col = stats_col,
         .stats_width = stats_width,
     };
+}
+
+fn hasLineStats(stats: file_tree.Stats) bool {
+    return stats.added != 0 or stats.removed != 0;
 }
 
 test "rowForNode exposes sidebar row semantics" {
@@ -225,4 +229,25 @@ test "layout reserves reviewed gutter for status-less file rows" {
     try std.testing.expectEqual(@as(u16, 1), reviewed_layout.reviewed_col.?);
     try std.testing.expectEqual(unreviewed_layout.name_col, reviewed_layout.name_col);
     try std.testing.expectEqual(unreviewed_layout.name_width, reviewed_layout.name_width);
+}
+
+test "layout omits zero line stats" {
+    const nodes = [_]file_tree.Node{
+        .{
+            .kind = .file,
+            .name = "binary.dat",
+            .path = "binary.dat",
+            .depth = 0,
+            .stats = .{},
+            .status = .binary,
+            .file_index = 0,
+        },
+    };
+    const tree: file_tree.FileTree = .{ .nodes = &nodes };
+    const collapsed: file_tree.CollapsedSet = .empty;
+    const row_layout = layout(rowForNode(tree, &collapsed, &.{false}, 0, 0).?, 40);
+
+    try std.testing.expectEqual(@as(?u16, null), row_layout.stats_col);
+    try std.testing.expectEqual(@as(u16, 0), row_layout.stats_width);
+    try std.testing.expectEqual(@as(u16, 36), row_layout.name_width);
 }
