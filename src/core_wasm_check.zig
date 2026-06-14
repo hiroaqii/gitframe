@@ -45,7 +45,8 @@ pub export fn gitframe_core_wasm_compile_check() usize {
 
     var collapsed: file_tree.CollapsedSet = .empty;
     const visible_nodes = [_]usize{0};
-    const row = sidebar_view_model.visibleRowAt(tree, &collapsed, &visible_nodes, 0, 0) orelse unreachable;
+    const reviewed_files = [_]bool{false};
+    const row = sidebar_view_model.visibleRowAt(tree, &collapsed, &reviewed_files, &visible_nodes, 0, 0) orelse unreachable;
 
     return document.files.len +
         tree.nodes.len +

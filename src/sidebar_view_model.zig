@@ -11,6 +11,7 @@ pub const Row = struct {
     path: []const u8,
     stats: file_tree.Stats,
     status: ?file_tree.Status,
+    reviewed: bool,
     fold: Fold,
 
     pub const Fold = enum {
@@ -22,6 +23,7 @@ pub const Row = struct {
 
 pub const RowLayout = struct {
     marker_col: u16 = 0,
+    reviewed_col: ?u16,
     badge_col: ?u16,
     fold_col: ?u16,
     name_col: u16,
@@ -33,6 +35,7 @@ pub const RowLayout = struct {
 pub fn rowForNode(
     tree: file_tree.FileTree,
     collapsed: *const file_tree.CollapsedSet,
+    reviewed_files: []const bool,
     node_index: usize,
     selected_node: usize,
 ) ?Row {
@@ -53,6 +56,9 @@ pub fn rowForNode(
         .path = node.path,
         .stats = node.stats,
         .status = node.status,
+        .reviewed = node.file_index != null and
+            node.file_index.? < reviewed_files.len and
+            reviewed_files[node.file_index.?],
         .fold = fold,
     };
 }
@@ -60,28 +66,35 @@ pub fn rowForNode(
 pub fn visibleRowAt(
     tree: file_tree.FileTree,
     collapsed: *const file_tree.CollapsedSet,
+    reviewed_files: []const bool,
     visible_nodes: []const usize,
     visible_index: usize,
     selected_node: usize,
 ) ?Row {
     if (visible_index >= visible_nodes.len) return null;
-    return rowForNode(tree, collapsed, visible_nodes[visible_index], selected_node);
+    return rowForNode(tree, collapsed, reviewed_files, visible_nodes[visible_index], selected_node);
 }
 
 pub fn layout(row: Row, width: u16) RowLayout {
     const stats_width: u16 = if (width > 12) 12 else 0;
     const indent: u16 = row.depth *| 2;
-    // Sidebar rows reserve fixed positions for marker, optional status badge,
-    // optional fold marker, name text, and right-aligned stats. The indent shifts
-    // the tree-specific badge/fold/name columns while keeping marker/stats fixed.
-    const badge_col: ?u16 = if (row.status != null) 1 +| indent else null;
+    // Sidebar rows reserve fixed positions for marker, optional reviewed mark,
+    // optional status badge, optional fold marker, name text, and right-aligned
+    // stats. The indent shifts tree-specific columns while keeping marker,
+    // reviewed mark, and stats fixed.
+    const reviewed_col: ?u16 = if (row.kind == .file and row.reviewed) 1 else null;
+    const badge_col: ?u16 = if (row.status != null) 2 +| indent else null;
     const fold_col: ?u16 = if (row.kind == .directory) 2 +| indent else null;
-    const name_col: u16 = if (row.status != null) 3 +| indent else 2 +| indent +| 2;
+    const name_col: u16 = if (row.status != null or row.kind == .directory)
+        4 +| indent
+    else
+        3 +| indent;
     const name_width: u16 = if (width > name_col + stats_width) width - name_col - stats_width else 0;
     const stats_col: ?u16 = if (width > 12) width - stats_width else null;
 
     return .{
         .badge_col = badge_col,
+        .reviewed_col = reviewed_col,
         .fold_col = fold_col,
         .name_col = name_col,
         .name_width = name_width,
@@ -115,7 +128,7 @@ test "rowForNode exposes sidebar row semantics" {
     };
 
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
-    const row = rowForNode(tree, &collapsed, 0, 0).?;
+    const row = rowForNode(tree, &collapsed, &.{}, 0, 0).?;
 
     try std.testing.expectEqual(@as(usize, 0), row.node_index);
     try std.testing.expect(row.selected);
@@ -137,12 +150,40 @@ test "layout keeps sidebar columns in one place" {
     };
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
     const collapsed: file_tree.CollapsedSet = .empty;
-    const row = rowForNode(tree, &collapsed, 0, 1).?;
+    const reviewed = [_]bool{true};
+    const row = rowForNode(tree, &collapsed, &reviewed, 0, 1).?;
     const row_layout = layout(row, 40);
 
     try std.testing.expect(!row.selected);
-    try std.testing.expectEqual(@as(u16, 3), row_layout.badge_col.?);
-    try std.testing.expectEqual(@as(u16, 5), row_layout.name_col);
-    try std.testing.expectEqual(@as(u16, 23), row_layout.name_width);
+    try std.testing.expect(row.reviewed);
+    try std.testing.expectEqual(@as(u16, 1), row_layout.reviewed_col.?);
+    try std.testing.expectEqual(@as(u16, 4), row_layout.badge_col.?);
+    try std.testing.expectEqual(@as(u16, 6), row_layout.name_col);
+    try std.testing.expectEqual(@as(u16, 22), row_layout.name_width);
     try std.testing.expectEqual(@as(u16, 28), row_layout.stats_col.?);
+}
+
+test "layout reserves reviewed gutter for status-less file rows" {
+    const nodes = [_]file_tree.Node{
+        .{
+            .kind = .file,
+            .name = "main.zig",
+            .path = "main.zig",
+            .depth = 0,
+            .stats = .{ .added = 1, .removed = 0 },
+            .file_index = 0,
+        },
+    };
+    const tree: file_tree.FileTree = .{ .nodes = &nodes };
+    const collapsed: file_tree.CollapsedSet = .empty;
+    const unreviewed = [_]bool{false};
+    const reviewed = [_]bool{true};
+
+    const unreviewed_layout = layout(rowForNode(tree, &collapsed, &unreviewed, 0, 0).?, 40);
+    const reviewed_layout = layout(rowForNode(tree, &collapsed, &reviewed, 0, 0).?, 40);
+
+    try std.testing.expectEqual(@as(?u16, null), unreviewed_layout.reviewed_col);
+    try std.testing.expectEqual(@as(u16, 1), reviewed_layout.reviewed_col.?);
+    try std.testing.expectEqual(unreviewed_layout.name_col, reviewed_layout.name_col);
+    try std.testing.expectEqual(unreviewed_layout.name_width, reviewed_layout.name_width);
 }

@@ -70,6 +70,7 @@ pub const App = struct {
         submit_file_search,
         file_search_insert: u21,
         file_search_backspace,
+        toggle_reviewed_file,
         reload,
         quit,
     };
@@ -133,6 +134,7 @@ pub const App = struct {
                 self.file_search_no_match = false;
                 self.file_search_input.backspace();
             },
+            .toggle_reviewed_file => self.toggleReviewedFile(),
             .reload => switch (self.config.source) {
                 .stdin => ctx.redraw().skip(),
                 else => try self.startDiffLoad(ctx),
@@ -213,6 +215,7 @@ pub const App = struct {
             'g' => .select_first_file,
             'G' => .select_last_file,
             'f' => .enter_file_search,
+            'v' => .toggle_reviewed_file,
             'u' => .toggle_display_mode,
             'q' => .quit,
             'r' => .reload,
@@ -333,6 +336,12 @@ pub const App = struct {
                 if (width > badge_col) {
                     _ = surface.borrowTextAt(badge_col, row, status.badge(), statusStyle(status, row_model.selected));
                 }
+            }
+        }
+
+        if (row_layout.reviewed_col) |reviewed_col| {
+            if (width > reviewed_col) {
+                _ = surface.borrowTextAt(reviewed_col, row, "✓", reviewedStyle(row_model.selected));
             }
         }
 
@@ -765,6 +774,16 @@ pub const App = struct {
         self.focus = self.file_search_return_focus;
     }
 
+    fn toggleReviewedFile(self: *App) void {
+        const loaded = self.loadedDiff() orelse return;
+        if (self.selected_node >= loaded.tree.nodes.len) return;
+
+        const node = loaded.tree.nodes[self.selected_node];
+        const file_index = node.file_index orelse return;
+        if (file_index >= loaded.reviewed_files.len) return;
+        loaded.reviewed_files[file_index] = !loaded.reviewed_files[file_index];
+    }
+
     fn submitFileSearch(self: *App) void {
         const query = std.mem.trim(u8, self.file_search_input.slice(), " \t\r\n");
         if (query.len == 0) {
@@ -966,6 +985,7 @@ const footer_sidebar_items = [_]ui.key_hint.Item{
     ui.key_hint.item("Enter/←/→", "fold"),
     ui.key_hint.item("/", "search"),
     ui.key_hint.item("f", "file"),
+    ui.key_hint.item("v", "viewed"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),
     ui.key_hint.item("r", "reload"),
@@ -977,6 +997,7 @@ const footer_diff_items = [_]ui.key_hint.Item{
     ui.key_hint.item("↑/↓/j/k", "scroll"),
     ui.key_hint.item("/", "search"),
     ui.key_hint.item("f", "file"),
+    ui.key_hint.item("v", "viewed"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),
     ui.key_hint.item("r", "reload"),
@@ -1055,6 +1076,10 @@ fn statusStyle(status: file_tree.Status, selected: bool) chasen.TextStyle {
     return .{ .fg = fg, .bold = true, .reverse = selected };
 }
 
+fn reviewedStyle(selected: bool) chasen.TextStyle {
+    return .{ .fg = .{ .index = 2 }, .bold = true, .reverse = selected };
+}
+
 fn terminalBodyHeight(terminal_height: u16) u16 {
     return if (terminal_height > footer_rows) terminal_height - footer_rows else 0;
 }
@@ -1083,6 +1108,7 @@ const LoadedDiff = struct {
     tree: file_tree.FileTree,
     rendered_line_cache: diff_view_model.RenderedLineCache = .{},
     collapsed_dirs: file_tree.CollapsedSet = .empty,
+    reviewed_files: []bool = &.{},
     visible_nodes: []usize = &.{},
     visible_node_count: usize = 0,
     bytes: usize,
@@ -1123,11 +1149,11 @@ const LoadedDiff = struct {
 
     fn sidebarRowAt(self: *const LoadedDiff, visible_index: usize, selected_node: usize) ?sidebar_view_model.Row {
         if (self.materializedVisibleNodes()) |nodes| {
-            return sidebar_view_model.visibleRowAt(self.tree, &self.collapsed_dirs, nodes, visible_index, selected_node);
+            return sidebar_view_model.visibleRowAt(self.tree, &self.collapsed_dirs, self.reviewed_files, nodes, visible_index, selected_node);
         }
 
         const node_index = self.visibleNodeAt(visible_index) orelse return null;
-        return sidebar_view_model.rowForNode(self.tree, &self.collapsed_dirs, node_index, selected_node);
+        return sidebar_view_model.rowForNode(self.tree, &self.collapsed_dirs, self.reviewed_files, node_index, selected_node);
     }
 
     fn renderedLineIndex(self: *const LoadedDiff, file_index: usize, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {
@@ -1260,6 +1286,8 @@ const DiffLoadTask = struct {
         const document = try diff_parser.parse(arena_allocator, copied);
         const tree = try file_tree.build(arena_allocator, document);
         const rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document);
+        const reviewed_files = try arena_allocator.alloc(bool, document.files.len);
+        @memset(reviewed_files, false);
         var loaded: LoadedDiff = .{
             .bytes = copied.len,
             .lines = countLines(copied),
@@ -1267,6 +1295,7 @@ const DiffLoadTask = struct {
             .document = document,
             .tree = tree,
             .rendered_line_cache = rendered_line_cache,
+            .reviewed_files = reviewed_files,
             .collapsed_dirs = .empty,
         };
         try loaded.rebuildVisibleNodes(arena_allocator);
@@ -1533,8 +1562,60 @@ test "sidebar renders file status badges" {
 
     try app.viewSidebar(&ts.surface, app.load_state.loaded);
 
-    try ts.expectCellText(3, sidebar_header_rows, "A");
-    try ts.expectCellText(3, sidebar_header_rows + 1, "D");
+    try ts.expectCellText(4, sidebar_header_rows, "A");
+    try ts.expectCellText(4, sidebar_header_rows + 1, "D");
+}
+
+test "toggleReviewedFile marks only selected file nodes" {
+    var reviewed = [_]bool{ false, false };
+    var app: App = .{
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .document = .{ .files = &test_files_two },
+            .tree = .{ .nodes = &test_tree_nested_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        } },
+        .selected_node = 0,
+        .selected_file = 0,
+    };
+
+    app.toggleReviewedFile();
+    try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
+
+    app.selected_node = 1;
+    app.toggleReviewedFile();
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
+
+    app.toggleReviewedFile();
+    try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
+}
+
+test "sidebar renders reviewed marker" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(34, 8);
+    defer ts.deinit();
+
+    var reviewed = [_]bool{ true, false };
+    const app: App = .{
+        .terminal_size = .{ .width = 80, .height = 9 },
+        .load_state = .{ .loaded = .{
+            .text = "",
+            .document = .{ .files = &test_files_two_statuses },
+            .tree = .{ .nodes = &test_tree_two_status_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        } },
+    };
+
+    try app.viewSidebar(&ts.surface, app.load_state.loaded);
+
+    try ts.expectCellText(1, sidebar_header_rows, "✓");
+    try ts.expectCellText(4, sidebar_header_rows, "A");
 }
 
 test "search match marker is drawn on visible match row" {
