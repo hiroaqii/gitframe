@@ -130,6 +130,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_sidebar_view_model_tests = b.addRunArtifact(sidebar_view_model_tests);
 
+    const repo_discovery_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/repo_discovery.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_repo_discovery_tests = b.addRunArtifact(repo_discovery_tests);
+
     const perf_baseline_exe = b.addExecutable(.{
         .name = "gitframe-perf-baseline",
         .root_module = b.createModule(.{
@@ -170,6 +179,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_diff_search_tests.step);
     test_step.dependOn(&run_file_tree_tests.step);
     test_step.dependOn(&run_sidebar_view_model_tests.step);
+    test_step.dependOn(&run_repo_discovery_tests.step);
     test_step.dependOn(&perf_baseline_exe.step);
     test_step.dependOn(&core_wasm.step);
 }
