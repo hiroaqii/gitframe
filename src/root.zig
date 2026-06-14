@@ -18,7 +18,10 @@ pub const App = struct {
     config: CliConfig = .{},
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
     load_state: LoadState = .idle,
+    /// Sticky file shown in the diff pane. Directory sidebar rows can be
+    /// selected without changing this value.
     selected_file: usize = 0,
+    /// Sidebar cursor. This may point at either a directory node or a file node.
     selected_node: usize = 0,
     focus: Focus = .sidebar,
     diff_scroll: usize = 0,
@@ -541,9 +544,7 @@ pub const App = struct {
                 const loaded = bundle.loaded;
                 self.load_arena = bundle.takeArena();
                 self.load_state = .{ .loaded = loaded };
-                if (loaded.tree.selectedNodeIndex(self.selected_file)) |node_index| {
-                    self.selected_node = node_index;
-                }
+                self.syncSidebarNodeToSelectedFile(&loaded);
                 self.clampSelection(loaded.document.files.len);
                 self.clampDiffNavigation();
                 self.refreshSearchForSelectedFile();
@@ -596,14 +597,14 @@ pub const App = struct {
         const target = @min(index, file_count - 1);
         if (self.selected_file == target) {
             if (self.activeLoadedDiff()) |loaded| {
-                if (loaded.tree.selectedNodeIndex(self.selected_file)) |node_index| self.selected_node = node_index;
+                self.syncSidebarNodeToSelectedFile(loaded);
             }
             self.clampSelection(file_count);
             return;
         }
         self.selected_file = target;
         if (self.activeLoadedDiff()) |loaded| {
-            if (loaded.tree.selectedNodeIndex(self.selected_file)) |node_index| self.selected_node = node_index;
+            self.syncSidebarNodeToSelectedFile(loaded);
         }
         self.resetDiffPosition();
         self.refreshSearchForSelectedFile();
@@ -621,6 +622,8 @@ pub const App = struct {
         if (node_index >= loaded.tree.nodes.len) return;
         const previous_file = self.selected_file;
         self.selected_node = node_index;
+        // File rows change the active diff pane file. Directory rows only move
+        // the sidebar cursor and keep the previous file visible.
         if (loaded.tree.nodes[node_index].file_index) |file_index| {
             self.selected_file = file_index;
             if (self.selected_file != previous_file) {
@@ -899,27 +902,25 @@ pub const App = struct {
 
     fn selectedFile(self: *const App) ?diff_parser.FileDiff {
         const loaded = self.activeLoadedDiffConst() orelse return null;
-        if (loaded.document.files.len == 0) return null;
-        return loaded.document.files[@min(self.selected_file, loaded.document.files.len - 1)];
+        const file_index = self.selectedFileIndex(loaded) orelse return null;
+        return loaded.document.files[file_index];
     }
 
     fn selectedFileLineIndex(self: *const App, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {
         const loaded = self.activeLoadedDiffConst() orelse return .{ .mode = mode };
-        if (loaded.document.files.len == 0) return .{ .mode = mode };
-        return loaded.renderedLineIndex(@min(self.selected_file, loaded.document.files.len - 1), mode);
+        const file_index = self.selectedFileIndex(loaded) orelse return .{ .mode = mode };
+        return loaded.renderedLineIndex(file_index, mode);
     }
 
     fn selectedFileCachedLineIndex(self: *const App, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
         const loaded = self.activeLoadedDiffConst() orelse return null;
-        if (loaded.document.files.len == 0) return null;
-        return loaded.cachedRenderedLineIndex(@min(self.selected_file, loaded.document.files.len - 1), mode);
+        const file_index = self.selectedFileIndex(loaded) orelse return null;
+        return loaded.cachedRenderedLineIndex(file_index, mode);
     }
 
     fn selectedHunkOffset(self: *const App, mode: diff_render.DisplayMode, hunk_index: usize) usize {
         const loaded = self.activeLoadedDiffConst() orelse return 0;
-        if (loaded.document.files.len == 0) return 0;
-
-        const file_index = @min(self.selected_file, loaded.document.files.len - 1);
+        const file_index = self.selectedFileIndex(loaded) orelse return 0;
         if (loaded.rendered_line_cache.indexFor(file_index, mode)) |index| return index.hunkOffset(hunk_index);
         return diff_render.hunkBodyLineOffset(loaded.document.files[file_index], mode, hunk_index);
     }
@@ -953,7 +954,7 @@ pub const App = struct {
         if (self.selected_file >= file_count) self.selected_file = file_count - 1;
         if (self.activeLoadedDiff()) |loaded| {
             if (self.selected_node >= loaded.tree.nodes.len) {
-                self.selected_node = loaded.tree.selectedNodeIndex(self.selected_file) orelse 0;
+                self.syncSidebarNodeToSelectedFile(loaded);
             }
             if (loaded.visibleAncestorOrSelf(self.selected_node)) |visible_node| {
                 self.selected_node = visible_node;
@@ -981,6 +982,19 @@ pub const App = struct {
         if (loaded.visibleNodeAt(0)) |node_index| {
             self.selected_node = node_index;
         }
+    }
+
+    fn selectedFileIndex(self: *const App, loaded: *const LoadedDiff) ?usize {
+        if (loaded.document.files.len == 0) return null;
+        return @min(self.selected_file, loaded.document.files.len - 1);
+    }
+
+    fn syncSidebarNodeToSelectedFile(self: *App, loaded: *const LoadedDiff) void {
+        const file_index = self.selectedFileIndex(loaded) orelse {
+            self.selected_node = 0;
+            return;
+        };
+        self.selected_node = loaded.tree.selectedNodeIndex(file_index) orelse 0;
     }
 
     fn loadedDiff(self: *App) ?*LoadedDiff {
