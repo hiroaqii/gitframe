@@ -2,6 +2,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const diff_parser = @import("diff_parser.zig");
+const diff_file = @import("diff_file.zig");
 const diff_render = @import("diff_render.zig");
 const diff_search = @import("diff_search.zig");
 const diff_source = @import("diff_source.zig");
@@ -16,6 +17,7 @@ pub const parseArgs = diff_source.parseArgs;
 
 pub const App = struct {
     config: CliConfig = .{},
+    allocator: ?std.mem.Allocator = null,
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
     load_state: LoadState = .idle,
     /// Sticky file shown in the diff pane. Directory sidebar rows can be
@@ -37,6 +39,10 @@ pub const App = struct {
     file_search_no_match: bool = false,
     file_search_return_focus: Focus = .sidebar,
     hide_reviewed_files: bool = false,
+    /// Session-level source of truth for reviewed files. The active LoadedDiff
+    /// keeps a materialized bool slice so hide-reviewed hot paths stay O(1).
+    reviewed_store: std.StringHashMapUnmanaged(void) = .empty,
+    active_reviewed_files_owned: bool = false,
     /// Owns the currently loaded raw diff, parsed document arrays, and error
     /// messages. Recreated on every successful load/reload.
     load_arena: ?std.heap.ArenaAllocator = null,
@@ -81,12 +87,14 @@ pub const App = struct {
     };
 
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        self.allocator = ctx.allocator();
         try self.startDiffLoad(ctx);
     }
 
     pub fn deinit(self: *App, deinit_ctx: chasen.AppDeinitContext) void {
-        _ = deinit_ctx;
+        if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.clearLoadedDiff();
+        self.clearReviewedStore(deinit_ctx.allocator);
     }
 
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
@@ -139,7 +147,7 @@ pub const App = struct {
                 self.file_search_no_match = false;
                 self.file_search_input.backspace();
             },
-            .toggle_reviewed_file => try self.toggleReviewedFile(),
+            .toggle_reviewed_file => try self.toggleReviewedFile(ctx.allocator()),
             .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .reload => switch (self.config.source) {
                 .stdin => ctx.redraw().skip(),
@@ -529,6 +537,8 @@ pub const App = struct {
     }
 
     fn finishDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: DiffLoadFinished) !void {
+        if (self.allocator == null) self.allocator = ctx.allocator();
+
         var result = finished.result;
         defer result.deinit(ctx.allocator());
 
@@ -541,11 +551,30 @@ pub const App = struct {
         switch (result) {
             .empty => self.load_state = .empty,
             .loaded => |*bundle| {
-                const loaded = bundle.loaded;
-                self.load_arena = bundle.takeArena();
+                var loaded = bundle.loaded;
+                var arena = bundle.takeArena();
+                errdefer arena.deinit();
+
+                try self.materializeReviewedFiles(ctx.allocator(), &loaded);
+                errdefer ctx.allocator().free(loaded.reviewed_files);
+
+                if (self.hide_reviewed_files) {
+                    try loaded.rebuildVisibleNodes(arena.allocator(), true);
+                }
+
+                // Keep all fallible setup above this point. After assigning
+                // load_state, clearLoadedDiff owns the materialized reviewed
+                // slice and load arena.
+                self.load_arena = arena;
                 self.load_state = .{ .loaded = loaded };
-                self.syncSidebarNodeToSelectedFile(&loaded);
-                self.clampSelection(loaded.document.files.len);
+                self.active_reviewed_files_owned = true;
+
+                const active_loaded = self.activeLoadedDiff().?;
+                self.syncSidebarNodeToSelectedFile(active_loaded);
+                self.clampSelection(active_loaded.document.files.len);
+                if (self.hide_reviewed_files) {
+                    self.reconcileSelectionAfterVisibleNodeChange(active_loaded);
+                }
                 self.clampDiffNavigation();
                 self.refreshSearchForSelectedFile();
             },
@@ -568,6 +597,12 @@ pub const App = struct {
     }
 
     fn clearLoadedDiff(self: *App) void {
+        if (self.active_reviewed_files_owned) {
+            if (self.allocator) |allocator| {
+                if (self.activeLoadedDiff()) |loaded| allocator.free(loaded.reviewed_files);
+            }
+        }
+        self.active_reviewed_files_owned = false;
         if (self.load_arena) |*arena| arena.deinit();
         self.load_arena = null;
         self.load_state = .idle;
@@ -781,14 +816,16 @@ pub const App = struct {
         self.focus = self.file_search_return_focus;
     }
 
-    fn toggleReviewedFile(self: *App) !void {
+    fn toggleReviewedFile(self: *App, allocator: std.mem.Allocator) !void {
         const loaded = self.activeLoadedDiff() orelse return;
         if (self.selected_node >= loaded.tree.nodes.len) return;
 
         const node = loaded.tree.nodes[self.selected_node];
         const file_index = node.file_index orelse return;
         if (file_index >= loaded.reviewed_files.len) return;
-        loaded.reviewed_files[file_index] = !loaded.reviewed_files[file_index];
+        const reviewed = !loaded.reviewed_files[file_index];
+        try self.setReviewedFile(allocator, loaded.document.files[file_index], reviewed);
+        loaded.reviewed_files[file_index] = reviewed;
         if (self.hide_reviewed_files) {
             try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, true);
             self.reconcileSelectionAfterVisibleNodeChange(loaded);
@@ -995,6 +1032,38 @@ pub const App = struct {
             return;
         };
         self.selected_node = loaded.tree.selectedNodeIndex(file_index) orelse 0;
+    }
+
+    fn materializeReviewedFiles(self: *App, allocator: std.mem.Allocator, loaded: *LoadedDiff) !void {
+        const reviewed_files = try allocator.alloc(bool, loaded.document.files.len);
+        errdefer allocator.free(reviewed_files);
+
+        for (loaded.document.files, 0..) |file, index| {
+            reviewed_files[index] = self.reviewed_store.contains(reviewedKey(file));
+        }
+        loaded.reviewed_files = reviewed_files;
+    }
+
+    fn setReviewedFile(self: *App, allocator: std.mem.Allocator, file: diff_parser.FileDiff, reviewed: bool) !void {
+        const key = reviewedKey(file);
+        if (reviewed) {
+            if (self.reviewed_store.contains(key)) return;
+            const copied = try allocator.dupe(u8, key);
+            errdefer allocator.free(copied);
+            try self.reviewed_store.put(allocator, copied, {});
+            return;
+        }
+
+        if (self.reviewed_store.fetchRemove(key)) |entry| {
+            allocator.free(entry.key);
+        }
+    }
+
+    fn clearReviewedStore(self: *App, allocator: std.mem.Allocator) void {
+        var keys = self.reviewed_store.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
+        self.reviewed_store.deinit(allocator);
+        self.reviewed_store = .empty;
     }
 
     fn loadedDiff(self: *App) ?*LoadedDiff {
@@ -1393,8 +1462,6 @@ const DiffLoadTask = struct {
         const document = try diff_parser.parse(arena_allocator, copied);
         const tree = try file_tree.build(arena_allocator, document);
         const rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document);
-        const reviewed_files = try arena_allocator.alloc(bool, document.files.len);
-        @memset(reviewed_files, false);
         var loaded: LoadedDiff = .{
             .bytes = copied.len,
             .lines = countLines(copied),
@@ -1402,7 +1469,6 @@ const DiffLoadTask = struct {
             .document = document,
             .tree = tree,
             .rendered_line_cache = rendered_line_cache,
-            .reviewed_files = reviewed_files,
             .collapsed_dirs = .empty,
         };
         try loaded.rebuildVisibleNodes(arena_allocator, false);
@@ -1413,6 +1479,10 @@ const DiffLoadTask = struct {
         return .{ .arena = arena, .loaded = loaded };
     }
 };
+
+fn reviewedKey(file: diff_parser.FileDiff) []const u8 {
+    return diff_file.displayPath(file);
+}
 
 fn countLines(bytes: []const u8) usize {
     if (bytes.len == 0) return 0;
@@ -1717,16 +1787,43 @@ test "toggleReviewedFile marks only selected file nodes" {
         .selected_node = 0,
         .selected_file = 0,
     };
+    defer app.clearReviewedStore(std.testing.allocator);
 
-    try app.toggleReviewedFile();
+    try app.toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
 
     app.selected_node = 1;
-    try app.toggleReviewedFile();
+    try app.toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
 
-    try app.toggleReviewedFile();
+    try app.toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
+}
+
+test "reviewed state survives active loaded diff replacement" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load_state = .{ .loaded = testLoadedDiffTwo() },
+        .selected_node = 0,
+        .selected_file = 0,
+    };
+    defer app.clearLoadedDiff();
+    defer app.clearReviewedStore(std.testing.allocator);
+
+    var loaded = app.loadedDiff().?;
+    try app.materializeReviewedFiles(std.testing.allocator, loaded);
+    app.active_reviewed_files_owned = true;
+
+    try app.toggleReviewedFile(std.testing.allocator);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded.reviewed_files);
+
+    app.clearLoadedDiff();
+    app.load_state = .{ .loaded = testLoadedDiffTwo() };
+    loaded = app.loadedDiff().?;
+    try app.materializeReviewedFiles(std.testing.allocator, loaded);
+    app.active_reviewed_files_owned = true;
+
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded.reviewed_files);
 }
 
 test "sidebar renders reviewed marker" {
@@ -1851,9 +1948,10 @@ test "marking a visible file as reviewed while hidden moves selection" {
         .hide_reviewed_files = true,
     };
     defer app.clearLoadedDiff();
+    defer app.clearReviewedStore(std.testing.allocator);
     try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, true);
 
-    try app.toggleReviewedFile();
+    try app.toggleReviewedFile(std.testing.allocator);
 
     const loaded = app.loadedDiff().?;
     try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
