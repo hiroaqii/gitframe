@@ -1,6 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
+const app_input = @import("app_input.zig");
 const diff_parser = @import("diff_parser.zig");
 const diff_file = @import("diff_file.zig");
 const diff_render = @import("diff_render.zig");
@@ -25,6 +26,7 @@ pub const ParseArgsError = diff_source.ParseArgsError;
 pub const parseArgs = diff_source.parseArgs;
 
 const ChangedFileFilter = loaded_diff.ChangedFileFilter;
+const Focus = app_input.Focus;
 const LoadedDiff = loaded_diff.LoadedDiff;
 
 pub const App = struct {
@@ -260,75 +262,16 @@ pub const App = struct {
     }
 
     pub fn handleEvent(self: *const App, event: chasen.Event) ?Msg {
-        return switch (event) {
-            .key_press => |key| self.handleKey(key),
-            .winsize => |winsize| .{ .terminal_resized = .{
-                .width = winsize.cols,
-                .height = winsize.rows,
-            } },
-            else => null,
-        };
+        return app_input.eventToMsg(Msg, self.keyContext(), event);
     }
 
-    fn handleKey(self: *const App, key: chasen.Key) ?Msg {
-        if (self.search_mode) {
-            if (key.matches(chasen.Key.escape, .{})) return .cancel_search;
-            if (key.matches(chasen.Key.enter, .{})) return .submit_search;
-            if (key.matches(chasen.Key.backspace, .{})) return .search_backspace;
-            if (isSearchCodepoint(key.codepoint)) return .{ .search_insert = key.codepoint };
-            return null;
-        }
-
-        if (self.file_search_mode) {
-            if (key.matches(chasen.Key.escape, .{})) return .cancel_file_search;
-            if (key.matches(chasen.Key.enter, .{})) return .submit_file_search;
-            if (key.matches(chasen.Key.backspace, .{})) return .file_search_backspace;
-            if (isSearchCodepoint(key.codepoint)) return .{ .file_search_insert = key.codepoint };
-            return null;
-        }
-
-        if (self.repo_picker_mode) {
-            if (key.matches(chasen.Key.escape, .{})) return .cancel_repo_picker;
-            if (key.matches(chasen.Key.enter, .{})) return .submit_repo_picker;
-            if (key.matches(chasen.Key.backspace, .{})) return .repo_picker_backspace;
-            return switch (key.codepoint) {
-                'k', chasen.Key.up => .repo_picker_move_previous,
-                'j', chasen.Key.down => .repo_picker_move_next,
-                'q' => .cancel_repo_picker,
-                else => if (isSearchCodepoint(key.codepoint)) .{ .repo_picker_insert = key.codepoint } else null,
-            };
-        }
-
-        if (key.matches(chasen.Key.tab, .{})) return .toggle_focus;
-        if (key.matches(chasen.Key.page_up, .{})) return .page_diff_up;
-        if (key.matches(chasen.Key.page_down, .{})) return .page_diff_down;
-        if (key.matches(chasen.Key.home, .{})) return .select_first_file;
-        if (key.matches(chasen.Key.end, .{})) return .select_last_file;
-        if (key.matches(chasen.Key.escape, .{}) and self.search_query.len > 0) return .clear_search;
-        if (self.focus == .sidebar and key.matches(chasen.Key.enter, .{})) return .toggle_directory;
-        if (self.focus == .diff and key.matches(chasen.Key.enter, .{})) return .toggle_hunk_fold;
-        if (self.focus == .sidebar and key.matches(chasen.Key.right, .{})) return .expand_directory;
-        if (self.focus == .sidebar and key.matches(chasen.Key.left, .{})) return .collapse_or_parent_directory;
-
-        return switch (key.codepoint) {
-            'k', chasen.Key.up => if (self.focus == .diff) .scroll_diff_up else .select_previous_file,
-            'j', chasen.Key.down => if (self.focus == .diff) .scroll_diff_down else .select_next_file,
-            '/' => .enter_search,
-            'n' => if (self.search_query.len > 0) .select_next_search_match else .select_next_hunk,
-            'N' => if (self.search_query.len > 0) .select_previous_search_match else null,
-            'p' => if (self.search_query.len > 0) .select_previous_search_match else .select_previous_hunk,
-            'g' => .select_first_file,
-            'G' => .select_last_file,
-            'f' => .enter_file_search,
-            'R' => .enter_repo_picker,
-            'F' => .cycle_changed_file_filter,
-            'v' => .toggle_reviewed_file,
-            'H' => .toggle_hide_reviewed_files,
-            'e' => .open_selected_file_in_editor,
-            'u' => .toggle_display_mode,
-            'q' => .quit,
-            'r' => .reload,
-            else => null,
+    fn keyContext(self: *const App) app_input.KeyContext {
+        return .{
+            .search_mode = self.search_mode,
+            .file_search_mode = self.file_search_mode,
+            .repo_picker_mode = self.repo_picker_mode,
+            .search_query_len = self.search_query.len,
+            .focus = self.focus,
         };
     }
 
@@ -1654,18 +1597,6 @@ const SearchQuery = struct {
     }
 };
 
-const Focus = enum {
-    sidebar,
-    diff,
-
-    fn toggled(self: Focus) Focus {
-        return switch (self) {
-            .sidebar => .diff,
-            .diff => .sidebar,
-        };
-    }
-};
-
 fn statusStyle(status: file_tree.Status, selected: bool) chasen.TextStyle {
     const fg: chasen.Color = switch (status) {
         .modified => .{ .index = 11 },
@@ -1693,10 +1624,6 @@ fn sidebarWidth(total_width: u16) u16 {
     if (total_width < 50) return @min(total_width, 24);
     if (total_width < 90) return 28;
     return 34;
-}
-
-fn isSearchCodepoint(codepoint: u21) bool {
-    return codepoint >= 0x20 and codepoint != 0x7f and !(codepoint >= 0x80 and codepoint <= 0x9f);
 }
 
 const LoadState = union(enum) {
