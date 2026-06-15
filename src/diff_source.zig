@@ -17,6 +17,7 @@ pub const SourceMode = union(enum) {
 pub const CliConfig = struct {
     source: SourceMode = .unstaged,
     watch: bool = false,
+    stats_summary: bool = false,
 
     pub fn sourceLabel(self: CliConfig) []const u8 {
         return switch (self.source) {
@@ -138,6 +139,8 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
             try setSourceMode(&config, .stdin);
         } else if (std.mem.eql(u8, arg, "--watch")) {
             config.watch = true;
+        } else if (std.mem.eql(u8, arg, "--stats-summary")) {
+            config.stats_summary = true;
         } else if (std.mem.eql(u8, arg, "--range")) {
             index += 1;
             if (index >= args.len) return error.MissingOptionValue;
@@ -292,6 +295,13 @@ test "parseArgs accepts watch mode" {
 
     try std.testing.expect(config.source == .unstaged);
     try std.testing.expect(config.watch);
+}
+
+test "parseArgs accepts stats summary mode" {
+    const args = [_][]const u8{ "gitframe", "--stats-summary" };
+    const config = try parseArgs(args[0..]);
+
+    try std.testing.expect(config.stats_summary);
 }
 
 test "parseArgs rejects watch with stdin" {
