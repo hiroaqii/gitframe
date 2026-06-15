@@ -11,6 +11,7 @@ const editor = @import("editor.zig");
 const file_tree = @import("file_tree.zig");
 const loaded_diff = @import("loaded_diff.zig");
 const repo_discovery = @import("repo_discovery.zig");
+const repo_state = @import("repo_state.zig");
 const review_state = @import("review_state.zig");
 const sidebar_view_model = @import("sidebar_view_model.zig");
 
@@ -59,8 +60,7 @@ pub const App = struct {
     repo_picker_no_match: bool = false,
     hide_reviewed_files: bool = false,
     changed_file_filter: ChangedFileFilter = .all,
-    repo_discovery_result: ?repo_discovery.DiscoveryResult = null,
-    active_repo: usize = 0,
+    repo_state: repo_state.State = .{},
     load_in_flight: bool = false,
     load_in_flight_generation: ?u64 = null,
     /// Session-level source of truth for reviewed files. The active LoadedDiff
@@ -138,7 +138,7 @@ pub const App = struct {
     pub fn deinit(self: *App, deinit_ctx: chasen.AppDeinitContext) void {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.clearLoadedDiff();
-        self.clearRepoDiscovery(deinit_ctx.allocator);
+        self.repo_state.deinit(deinit_ctx.allocator);
         self.file_search_filter.deinit(deinit_ctx.allocator);
         self.repo_picker_filter.deinit(deinit_ctx.allocator);
         self.reviewed_store.deinit(deinit_ctx.allocator);
@@ -654,7 +654,7 @@ pub const App = struct {
             const source_index = self.repo_picker_filter.sourceIndex(visible_index) orelse continue;
             const label = self.repo_picker_filter.labels[visible_index];
             const focused_row = visible_index == focused;
-            const active = source_index == self.active_repo;
+            const active = source_index == self.repo_state.active_index;
             const style: chasen.TextStyle = if (focused_row)
                 .{ .reverse = true, .bold = true }
             else if (active)
@@ -720,9 +720,7 @@ pub const App = struct {
             .empty => unreachable,
             .discovered => |discovery| {
                 result = .empty;
-                self.clearRepoDiscovery(ctx.allocator());
-                self.repo_discovery_result = discovery;
-                self.active_repo = 0;
+                self.repo_state.replace(ctx.allocator(), discovery);
 
                 if (self.activeRepoRoot() == null) {
                     self.clearLoadedDiff();
@@ -887,20 +885,11 @@ pub const App = struct {
     }
 
     fn activeRepoRoot(self: *const App) ?[]const u8 {
-        const discovery = self.repo_discovery_result orelse return null;
-        return switch (discovery) {
-            .single_repo => |entry| entry.canonical_root,
-            .workspace => |workspace| if (self.active_repo < workspace.repos.len)
-                workspace.repos[self.active_repo].canonical_root
-            else
-                null,
-            .none => null,
-        };
+        return self.repo_state.activeRoot();
     }
 
     fn needsRepoDiscovery(self: *const App) bool {
-        const discovery = self.repo_discovery_result orelse return true;
-        return discovery == .none;
+        return self.repo_state.needsDiscovery();
     }
 
     fn finishDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: DiffLoadFinished) !void {
@@ -1208,7 +1197,7 @@ pub const App = struct {
     }
 
     fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
-        if (self.workspaceRepos() == null) return;
+        if (self.repo_state.workspaceRepos() == null) return;
 
         self.repo_picker_mode = true;
         self.repo_picker_input = .{};
@@ -1230,24 +1219,24 @@ pub const App = struct {
             self.repo_picker_no_match = true;
             return;
         };
-        const repos = self.workspaceRepos() orelse return;
+        const repos = self.repo_state.workspaceRepos() orelse return;
         if (repo_index >= repos.len) {
             self.repo_picker_no_match = true;
             return;
         }
 
         self.cancelRepoPickerMode(ctx.allocator());
-        if (repo_index == self.active_repo) return;
+        if (repo_index == self.repo_state.active_index) return;
 
         try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root, true);
-        self.active_repo = repo_index;
+        self.repo_state.active_index = repo_index;
         self.selected_file = 0;
         self.selected_node = 0;
         self.clearSearch();
     }
 
     fn refreshRepoPickerFilter(self: *App, allocator: std.mem.Allocator) !void {
-        const repos = self.workspaceRepos() orelse return;
+        const repos = self.repo_state.workspaceRepos() orelse return;
 
         var labels: std.ArrayList([]const u8) = .empty;
         defer labels.deinit(allocator);
@@ -1265,7 +1254,7 @@ pub const App = struct {
         var visible_index: usize = 0;
         while (visible_index < self.repo_picker_filter.labels.len) : (visible_index += 1) {
             const source_index = self.repo_picker_filter.sourceIndex(visible_index) orelse continue;
-            if (source_index != self.active_repo) continue;
+            if (source_index != self.repo_state.active_index) continue;
             while (self.repo_picker_filter.list.focusedIndex() < visible_index) {
                 self.repo_picker_filter.update(.move_next);
             }
@@ -1534,20 +1523,6 @@ pub const App = struct {
             reviewed_files[index] = try self.reviewed_store.containsFile(allocator, self.activeRepoRoot(), file);
         }
         loaded.reviewed_files = reviewed_files;
-    }
-
-    fn clearRepoDiscovery(self: *App, allocator: std.mem.Allocator) void {
-        if (self.repo_discovery_result) |*discovery| discovery.deinit(allocator);
-        self.repo_discovery_result = null;
-        self.active_repo = 0;
-    }
-
-    fn workspaceRepos(self: *const App) ?[]const repo_discovery.RepoEntry {
-        const discovery = self.repo_discovery_result orelse return null;
-        return switch (discovery) {
-            .workspace => |workspace| workspace.repos,
-            .single_repo, .none => null,
-        };
     }
 
     fn findFileNodeWithFilter(self: *App, allocator: std.mem.Allocator, loaded: *const LoadedDiff, query: []const u8) !?usize {
@@ -2425,13 +2400,12 @@ test "reviewed state is scoped by active repository root" {
 
     var app: App = .{
         .allocator = allocator,
-        .repo_discovery_result = .{ .workspace = .{
+        .repo_state = .{ .discovery = .{ .workspace = .{
             .current_root = try allocator.dupe(u8, "/work"),
             .repos = repos,
-        } },
-        .active_repo = 0,
+        } } },
     };
-    defer app.clearRepoDiscovery(allocator);
+    defer app.repo_state.deinit(allocator);
     defer app.reviewed_store.deinit(allocator);
 
     try app.reviewed_store.set(allocator, app.activeRepoRoot(), test_files_two[0], true);
@@ -2441,7 +2415,7 @@ test "reviewed state is scoped by active repository root" {
     defer allocator.free(loaded_one.reviewed_files);
     try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded_one.reviewed_files);
 
-    app.active_repo = 1;
+    app.repo_state.active_index = 1;
     var loaded_two = testLoadedDiffTwo();
     try app.materializeReviewedFiles(allocator, &loaded_two);
     defer allocator.free(loaded_two.reviewed_files);
@@ -2463,13 +2437,15 @@ test "repo picker focuses active workspace repository" {
     };
 
     var app: App = .{
-        .repo_discovery_result = .{ .workspace = .{
-            .current_root = try allocator.dupe(u8, "/work"),
-            .repos = repos,
-        } },
-        .active_repo = 1,
+        .repo_state = .{
+            .discovery = .{ .workspace = .{
+                .current_root = try allocator.dupe(u8, "/work"),
+                .repos = repos,
+            } },
+            .active_index = 1,
+        },
     };
-    defer app.clearRepoDiscovery(allocator);
+    defer app.repo_state.deinit(allocator);
     defer app.repo_picker_filter.deinit(allocator);
 
     try app.enterRepoPickerMode(allocator);
@@ -2752,7 +2728,7 @@ test "finishDiffLoad records empty diff as no changes" {
 test "finishRepoDiscovery records no repository as empty state" {
     var app: App = .{ .load_generation = 1 };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer app.clearRepoDiscovery(std.testing.allocator);
+    defer app.repo_state.deinit(std.testing.allocator);
 
     try app.finishRepoDiscovery(&ctx, .{
         .generation = 1,
