@@ -47,6 +47,7 @@ fn runHugeFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const raw = try buildHugeFileDiff(allocator, huge_file_pairs);
     defer allocator.free(raw);
     const raw_ns = raw_timer.read();
+    const loaded_model_capacity = try loadedModelArenaCapacity(allocator, raw);
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -105,6 +106,8 @@ fn runHugeFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         body_rows,
         render_iterations,
     });
+    printMemory("raw diff bytes", raw.len);
+    printMemory("loaded model arena capacity", loaded_model_capacity);
 }
 
 fn runManyFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -112,6 +115,7 @@ fn runManyFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const raw = try buildManyFileDiff(allocator, many_file_count);
     defer allocator.free(raw);
     const raw_ns = raw_timer.read();
+    const loaded_model_capacity = try loadedModelArenaCapacity(allocator, raw);
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -147,11 +151,14 @@ fn runManyFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         visible_count,
     });
     std.debug.print("  first file cached rows: {d}\n", .{cache.indexFor(0, .side_by_side).?.lineCount()});
+    printMemory("raw diff bytes", raw.len);
+    printMemory("loaded model arena capacity", loaded_model_capacity);
 }
 
 fn runNoMatchSearchScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const raw = try buildHugeFileDiff(allocator, no_match_pairs);
     defer allocator.free(raw);
+    const loaded_model_capacity = try loadedModelArenaCapacity(allocator, raw);
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -166,6 +173,44 @@ fn runNoMatchSearchScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     std.debug.print("\n[no-match search: {d} replacement rows]\n", .{no_match_pairs});
     printTiming("side-by-side no-match search", search_ns);
     std.debug.print("  match: {s}\n", .{if (match == null) "none" else "found"});
+    printMemory("raw diff bytes", raw.len);
+    printMemory("loaded model arena capacity", loaded_model_capacity);
+}
+
+fn loadedModelArenaCapacity(allocator: std.mem.Allocator, raw: []const u8) !usize {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const copied = try arena_allocator.dupe(u8, raw);
+    const document = try diff_parser.parse(arena_allocator, copied);
+    const tree = try file_tree.build(arena_allocator, document);
+    const rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document);
+    const collapsed_hunks = try arena_allocator.alloc(bool, document.totalHunks());
+    @memset(collapsed_hunks, false);
+    const visible_nodes = try materializeVisibleNodes(arena_allocator, tree);
+
+    // Keep the construction intentionally close to DiffLoadTask.buildLoadedBundle:
+    // the values are arena-owned and only their retained capacity is measured.
+    _ = rendered_line_cache;
+    _ = visible_nodes;
+
+    return arena.queryCapacity();
+}
+
+fn materializeVisibleNodes(allocator: std.mem.Allocator, tree: file_tree.FileTree) ![]usize {
+    var visible_nodes = try allocator.alloc(usize, tree.nodes.len);
+    var collapsed: file_tree.CollapsedSet = .empty;
+    defer collapsed.deinit(allocator);
+
+    var count: usize = 0;
+    for (tree.nodes, 0..) |_, index| {
+        if (!tree.isVisible(index, &collapsed)) continue;
+        visible_nodes[count] = index;
+        count += 1;
+    }
+
+    return visible_nodes[0..count];
 }
 
 fn buildHugeFileDiff(allocator: std.mem.Allocator, pairs: usize) ![]const u8 {
@@ -275,6 +320,10 @@ fn appendFmt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt
 
 fn printTiming(label: []const u8, ns: u64) void {
     std.debug.print("  {s}: {d} us\n", .{ label, ns / std.time.ns_per_us });
+}
+
+fn printMemory(label: []const u8, bytes: usize) void {
+    std.debug.print("  {s}: {d} KiB\n", .{ label, bytes / 1024 });
 }
 
 fn nowNs(io: std.Io) u64 {
