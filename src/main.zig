@@ -16,7 +16,7 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    try chasen.run(init, gitframe.App{ .config = config });
+    try chasen.run(init, gitframe.App{ .config = config, .env_map = init.environ_map });
 }
 
 fn wantsHelp(args: []const []const u8) bool {

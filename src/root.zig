@@ -22,9 +22,12 @@ pub const parseArgs = diff_source.parseArgs;
 
 pub const App = struct {
     config: CliConfig = .{},
+    env_map: ?*std.process.Environ.Map = null,
     allocator: ?std.mem.Allocator = null,
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
     load_state: LoadState = .idle,
+    status_message_buf: [160]u8 = undefined,
+    status_message: []const u8 = "",
     /// Sticky file shown in the diff pane. Directory sidebar rows can be
     /// selected without changing this value.
     selected_file: usize = 0,
@@ -107,6 +110,8 @@ pub const App = struct {
         toggle_reviewed_file,
         toggle_hide_reviewed_files,
         cycle_changed_file_filter,
+        open_selected_file_in_editor,
+        editor_finished: chasen.ForegroundCommandResult,
         reload,
         auto_reload_tick,
         quit,
@@ -203,6 +208,8 @@ pub const App = struct {
             .toggle_reviewed_file => try self.toggleReviewedFile(ctx.allocator()),
             .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
+            .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
+            .editor_finished => |result| try self.finishEditorCommand(ctx, result),
             .reload => switch (self.config.source) {
                 .stdin => ctx.redraw().skip(),
                 else => {
@@ -311,6 +318,7 @@ pub const App = struct {
             'F' => .cycle_changed_file_filter,
             'v' => .toggle_reviewed_file,
             'H' => .toggle_hide_reviewed_files,
+            'e' => .open_selected_file_in_editor,
             'u' => .toggle_display_mode,
             'q' => .quit,
             'r' => .reload,
@@ -575,6 +583,11 @@ pub const App = struct {
             _ = surface.borrowTextAt(col, 0, "watch", .{ .fg = .{ .index = 10 } });
             col +|= 7;
         }
+        if (self.status_message.len > 0 and width > col + 2) {
+            _ = surface.borrowTextAt(col, 0, self.status_message, .{ .fg = .{ .index = 11 } });
+            const message_width = chasen.text.displayWidth(self.status_message);
+            col +|= @intCast(@min(message_width + 2, std.math.maxInt(u16)));
+        }
 
         const size_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
             self.terminal_size.width,
@@ -763,6 +776,106 @@ pub const App = struct {
             self.load_in_flight_generation = null;
             return err;
         };
+    }
+
+    fn openSelectedFileInEditor(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const repo_root = self.activeRepoRoot() orelse {
+            self.setStatus("editor unavailable for this source", .{});
+            return;
+        };
+        const file = self.selectedFile() orelse {
+            self.setStatus("no file selected", .{});
+            return;
+        };
+        const target_path = diff_file.editorPath(file) orelse {
+            self.setStatus("deleted files cannot be opened", .{});
+            return;
+        };
+
+        var argv_buf: [16][]const u8 = undefined;
+        const argv = self.editorArgv(target_path, &argv_buf);
+        if (argv.len == 0) {
+            self.setStatus("editor command is empty", .{});
+            return;
+        }
+
+        _ = ctx.terminal().runForegroundCommand(.{
+            .argv = argv,
+            .cwd = repo_root,
+            .finished = editorDone,
+        }) catch |err| switch (err) {
+            error.ForegroundCommandLimitExceeded => {
+                self.setStatus("editor command already queued", .{});
+                return;
+            },
+            error.ForegroundCommandEmptyArgv => {
+                self.setStatus("editor command is empty", .{});
+                return;
+            },
+            else => return err,
+        };
+        self.setStatus("opening editor: {s}", .{target_path});
+    }
+
+    fn finishEditorCommand(self: *App, ctx: *chasen.Ctx(Msg), result: chasen.ForegroundCommandResult) !void {
+        switch (result.outcome) {
+            .exited => |code| {
+                if (code == 0) {
+                    self.setStatus("editor closed", .{});
+                } else {
+                    self.setStatus("editor exited: {d}", .{code});
+                }
+            },
+            .signaled => |signal| self.setStatus("editor signal: {d}", .{signal}),
+            .spawn_failed => |err| self.setStatus("editor spawn failed: {s}", .{err}),
+            .wait_failed => |err| self.setStatus("editor wait failed: {s}", .{err}),
+        }
+
+        if (self.config.source == .stdin) {
+            ctx.redraw().skip();
+            return;
+        }
+        if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
+            try self.startRepoDiscovery(ctx);
+        } else {
+            try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
+                ctx.redraw().skip();
+                return;
+            }, self.load_state == .idle);
+        }
+    }
+
+    fn editorDone(result: chasen.ForegroundCommandResult) Msg {
+        return .{ .editor_finished = result };
+    }
+
+    fn editorArgv(self: *const App, target_path: []const u8, out: *[16][]const u8) []const []const u8 {
+        const command = self.editorCommand();
+        var index: usize = 0;
+        var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n");
+        while (tokens.next()) |token| {
+            if (index + 1 >= out.len) break;
+            out[index] = token;
+            index += 1;
+        }
+        if (index == 0) {
+            out[0] = "vi";
+            index = 1;
+        }
+        out[index] = target_path;
+        return out[0 .. index + 1];
+    }
+
+    fn editorCommand(self: *const App) []const u8 {
+        if (self.env_map) |env_map| {
+            if (nonEmptyEnv(env_map, "VISUAL")) |visual| return visual;
+            if (nonEmptyEnv(env_map, "EDITOR")) |editor| return editor;
+        }
+        return "vi";
+    }
+
+    fn setStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
+        self.status_message = std.fmt.bufPrint(&self.status_message_buf, fmt, args) catch "status formatting failed";
     }
 
     fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -1546,6 +1659,7 @@ const footer_sidebar_items = [_]ui.key_hint.Item{
     ui.key_hint.item("F", "filter"),
     ui.key_hint.item("v", "viewed"),
     ui.key_hint.item("H", "hide viewed"),
+    ui.key_hint.item("e", "edit"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),
     ui.key_hint.item("r", "reload"),
@@ -1561,6 +1675,7 @@ const footer_diff_items = [_]ui.key_hint.Item{
     ui.key_hint.item("R", "repo"),
     ui.key_hint.item("v", "viewed"),
     ui.key_hint.item("H", "hide viewed"),
+    ui.key_hint.item("e", "edit"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),
     ui.key_hint.item("r", "reload"),
@@ -1659,6 +1774,11 @@ fn sidebarWidth(total_width: u16) u16 {
 
 fn isSearchCodepoint(codepoint: u21) bool {
     return codepoint >= 0x20 and codepoint != 0x7f and !(codepoint >= 0x80 and codepoint <= 0x9f);
+}
+
+fn nonEmptyEnv(env_map: *std.process.Environ.Map, name: []const u8) ?[]const u8 {
+    const value = env_map.get(name) orelse return null;
+    return if (std.mem.trim(u8, value, " \t\r\n").len > 0) value else null;
 }
 
 const ChangedFileFilter = enum {
@@ -2103,6 +2223,15 @@ test "countLines handles empty and trailing newline inputs" {
     try std.testing.expectEqual(@as(usize, 1), countLines("one"));
     try std.testing.expectEqual(@as(usize, 2), countLines("one\n"));
     try std.testing.expectEqual(@as(usize, 2), countLines("one\ntwo"));
+}
+
+test "editorArgv falls back to vi and appends target path" {
+    const app: App = .{};
+    var argv_buf: [16][]const u8 = undefined;
+    const argv = app.editorArgv("src/main.zig", &argv_buf);
+    try std.testing.expectEqual(@as(usize, 2), argv.len);
+    try std.testing.expectEqualStrings("vi", argv[0]);
+    try std.testing.expectEqualStrings("src/main.zig", argv[1]);
 }
 
 test "file selection boundary does not reset diff position" {

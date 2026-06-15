@@ -35,6 +35,12 @@ pub fn displayPath(file: diff_parser.FileDiff) []const u8 {
     return file.header;
 }
 
+pub fn editorPath(file: diff_parser.FileDiff) ?[]const u8 {
+    const path = file.new_path orelse return null;
+    if (isDevNull(path)) return null;
+    return stripGitPathPrefix(path);
+}
+
 pub fn status(file: diff_parser.FileDiff) Status {
     // Keep more specific metadata-driven states before path-shape fallback:
     // pure renames can have no parsed old/new path headers.
@@ -111,6 +117,47 @@ test "stripGitPathPrefix keeps dev null" {
 test "stripGitPathPrefix removes git side prefix" {
     try std.testing.expectEqualStrings("src/main.zig", stripGitPathPrefix("a/src/main.zig"));
     try std.testing.expectEqualStrings("src/main.zig", stripGitPathPrefix("b/src/main.zig"));
+}
+
+test "editorPath opens the new side only" {
+    try std.testing.expectEqualStrings("src/main.zig", editorPath(.{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{},
+    }).?);
+    try std.testing.expect(editorPath(.{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = null,
+        .metadata = &.{},
+        .hunks = &.{},
+    }) == null);
+    try std.testing.expect(editorPath(.{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "/dev/null",
+        .metadata = &.{},
+        .hunks = &.{},
+    }) == null);
+}
+
+test "displayPath keeps non git-side prefixes" {
+    try std.testing.expectEqualStrings("src/main.zig", displayPath(.{
+        .header = "diff --git src/main.zig src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{},
+    }));
+    try std.testing.expectEqualStrings("new/one.txt", displayPath(.{
+        .header = "--- old/one.txt",
+        .old_path = "old/one.txt",
+        .new_path = "new/one.txt",
+        .metadata = &.{},
+        .hunks = &.{},
+    }));
 }
 
 test "status classifies common diff file states" {

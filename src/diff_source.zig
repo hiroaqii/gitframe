@@ -99,6 +99,9 @@ pub const GitBackend = struct {
 };
 
 pub const LocalGitCommandBackend = struct {
+    const git_diff_unstaged = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
+    const git_diff_cached = [_][]const u8{ "git", "diff", "--cached", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
+
     pub fn backend(self: *LocalGitCommandBackend) GitBackend {
         return .{
             .ptr = self,
@@ -108,9 +111,9 @@ pub const LocalGitCommandBackend = struct {
 
     pub fn loadDiff(_: *LocalGitCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: LoadRequest) LoadError!LoadResult {
         return switch (request.source) {
-            .unstaged => loadGitDiff(allocator, io, request.repo_root orelse return error.MissingRepoRoot, &.{ "git", "diff", "--no-color", "--no-ext-diff" }),
-            .cached => loadGitDiff(allocator, io, request.repo_root orelse return error.MissingRepoRoot, &.{ "git", "diff", "--cached", "--no-color", "--no-ext-diff" }),
-            .range => |range| loadGitDiff(allocator, io, request.repo_root orelse return error.MissingRepoRoot, &.{ "git", "diff", "--no-color", "--no-ext-diff", range }),
+            .unstaged => loadGitDiff(allocator, io, request.repo_root orelse return error.MissingRepoRoot, &git_diff_unstaged),
+            .cached => loadGitDiff(allocator, io, request.repo_root orelse return error.MissingRepoRoot, &git_diff_cached),
+            .range => |range| loadGitDiffRange(allocator, io, request.repo_root orelse return error.MissingRepoRoot, range),
             .patch_file => |path| .{ .ok = readPatchFile(allocator, io, path) catch |err| return mapReadError(err) },
             .stdin => .{ .ok = readStdin(allocator, io) catch |err| return mapReadError(err) },
         };
@@ -209,8 +212,8 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, request: LoadRequest) Load
 }
 
 fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!LoadResult {
-    // Use structured argv and disable color/ext-diff so the parser sees stable
-    // Git unified diff output, not user-configured pager formatting.
+    // Use structured argv and force stable path prefixes so display/editor
+    // paths do not depend on user diff.mnemonicPrefix/diff.noprefix config.
     const result = std.process.run(allocator, io, .{
         .argv = argv,
         .cwd = .{ .path = repo_root },
@@ -237,6 +240,11 @@ fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, 
     allocator.free(result.stderr);
 
     return .{ .failed = std.fmt.allocPrint(allocator, "git diff failed: {any}", .{result.term}) catch return error.OutOfMemory };
+}
+
+fn loadGitDiffRange(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, range: []const u8) LoadError!LoadResult {
+    const argv = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", range };
+    return loadGitDiff(allocator, io, repo_root, &argv);
 }
 
 fn readPatchFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
