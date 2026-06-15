@@ -1,6 +1,8 @@
 const std = @import("std");
 
+const chasen = @import("chasen");
 const diff_parser = @import("diff_parser.zig");
+const diff_render = @import("diff_render.zig");
 const diff_search = @import("diff_search.zig");
 const diff_view_model = @import("diff_view_model.zig");
 const file_tree = @import("file_tree.zig");
@@ -9,6 +11,9 @@ const huge_file_pairs = 8_000;
 const no_match_pairs = 2_000;
 const many_file_count = 3_000;
 const huge_hunk_count = 100;
+const render_width = 120;
+const render_height = 40;
+const render_iterations = 25;
 
 const Stopwatch = struct {
     io: std.Io,
@@ -65,9 +70,25 @@ fn runHugeFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const offset = line_index.hunkOffset(last_hunk_index);
     const offset_ns = offset_timer.read();
 
+    const body_rows = diff_render.visibleBodyRows(render_height);
+    const scroll = rows -| body_rows;
+
     var traverse_timer = Stopwatch.start(io);
-    const visible_rows = traverseVisibleBodyRows(file, .side_by_side, line_index, rows -| 40, 40);
+    const visible_rows = traverseVisibleBodyRows(file, .side_by_side, line_index, scroll, body_rows);
     const traverse_ns = traverse_timer.read();
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.initWithAllocator(render_width, render_height, std.heap.page_allocator);
+    defer ts.deinit();
+
+    _ = try renderVisibleBodyRows(&ts, file, line_index, scroll);
+
+    var render_timer = Stopwatch.start(io);
+    var iteration: usize = 0;
+    while (iteration < render_iterations) : (iteration += 1) {
+        _ = try renderVisibleBodyRows(&ts, file, line_index, scroll);
+    }
+    const render_ns = render_timer.read();
 
     std.debug.print("\n[huge single file: {d} replacement rows]\n", .{huge_file_pairs});
     printTiming("fixture build", raw_ns);
@@ -76,7 +97,14 @@ fn runHugeFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     printTiming("cached rendered row count", count_ns);
     printTiming("cached hunk offset lookup", offset_ns);
     printTiming("indexed visible row traversal near end", traverse_ns);
+    printTiming("headless side-by-side render near end", render_ns / render_iterations);
     std.debug.print("  rows: {d}, last hunk offset: {d}, visible rows: {d}\n", .{ rows, offset, visible_rows });
+    std.debug.print("  render surface: {d}x{d}, body rows: {d}, iterations: {d}\n", .{
+        render_width,
+        render_height,
+        body_rows,
+        render_iterations,
+    });
 }
 
 fn runManyFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -216,6 +244,23 @@ fn traverseVisibleBodyRows(
     }
 
     return visible_rows;
+}
+
+fn renderVisibleBodyRows(
+    ts: *chasen.testing.TestSurface,
+    file: diff_parser.FileDiff,
+    line_index: diff_view_model.RenderedLineIndex,
+    scroll: usize,
+) !usize {
+    _ = ts.arena.reset(.retain_capacity);
+    ts.surface.clearAll();
+    try diff_render.renderFile(&ts.surface, file, .{
+        .requested_mode = .side_by_side,
+        .scroll = scroll,
+        .line_index = line_index,
+    });
+
+    return diff_render.visibleBodyRows(render_height);
 }
 
 fn append(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {

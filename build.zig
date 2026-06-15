@@ -145,6 +145,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/perf_baseline.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+            },
         }),
     });
     const run_perf_baseline = b.addRunArtifact(perf_baseline_exe);
