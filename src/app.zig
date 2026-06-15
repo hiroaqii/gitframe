@@ -7,6 +7,7 @@ const diff_render = @import("diff_render.zig");
 const diff_search = @import("diff_search.zig");
 const diff_source = @import("diff_source.zig");
 const diff_view_model = @import("diff_view_model.zig");
+const editor = @import("editor.zig");
 const file_tree = @import("file_tree.zig");
 const loaded_diff = @import("loaded_diff.zig");
 const repo_discovery = @import("repo_discovery.zig");
@@ -796,8 +797,8 @@ pub const App = struct {
             return;
         };
 
-        var argv_buf: [16][]const u8 = undefined;
-        const argv = self.editorArgv(target_path, &argv_buf);
+        var argv_buf: [editor.max_argv][]const u8 = undefined;
+        const argv = editor.argv(self.env_map, target_path, &argv_buf);
         if (argv.len == 0) {
             self.setStatus("editor command is empty", .{});
             return;
@@ -851,31 +852,6 @@ pub const App = struct {
 
     fn editorDone(result: chasen.ForegroundCommandResult) Msg {
         return .{ .editor_finished = result };
-    }
-
-    fn editorArgv(self: *const App, target_path: []const u8, out: *[16][]const u8) []const []const u8 {
-        const command = self.editorCommand();
-        var index: usize = 0;
-        var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n");
-        while (tokens.next()) |token| {
-            if (index + 1 >= out.len) break;
-            out[index] = token;
-            index += 1;
-        }
-        if (index == 0) {
-            out[0] = "vi";
-            index = 1;
-        }
-        out[index] = target_path;
-        return out[0 .. index + 1];
-    }
-
-    fn editorCommand(self: *const App) []const u8 {
-        if (self.env_map) |env_map| {
-            if (nonEmptyEnv(env_map, "VISUAL")) |visual| return visual;
-            if (nonEmptyEnv(env_map, "EDITOR")) |editor| return editor;
-        }
-        return "vi";
     }
 
     fn setStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
@@ -1780,11 +1756,6 @@ fn isSearchCodepoint(codepoint: u21) bool {
     return codepoint >= 0x20 and codepoint != 0x7f and !(codepoint >= 0x80 and codepoint <= 0x9f);
 }
 
-fn nonEmptyEnv(env_map: *std.process.Environ.Map, name: []const u8) ?[]const u8 {
-    const value = env_map.get(name) orelse return null;
-    return if (std.mem.trim(u8, value, " \t\r\n").len > 0) value else null;
-}
-
 const LoadState = union(enum) {
     idle,
     loading,
@@ -1984,15 +1955,6 @@ test "countLines handles empty and trailing newline inputs" {
     try std.testing.expectEqual(@as(usize, 1), countLines("one"));
     try std.testing.expectEqual(@as(usize, 2), countLines("one\n"));
     try std.testing.expectEqual(@as(usize, 2), countLines("one\ntwo"));
-}
-
-test "editorArgv falls back to vi and appends target path" {
-    const app: App = .{};
-    var argv_buf: [16][]const u8 = undefined;
-    const argv = app.editorArgv("src/main.zig", &argv_buf);
-    try std.testing.expectEqual(@as(usize, 2), argv.len);
-    try std.testing.expectEqualStrings("vi", argv[0]);
-    try std.testing.expectEqualStrings("src/main.zig", argv[1]);
 }
 
 test "file selection boundary does not reset diff position" {
