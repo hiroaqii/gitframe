@@ -11,6 +11,7 @@ const editor = @import("editor.zig");
 const file_tree = @import("file_tree.zig");
 const loaded_diff = @import("loaded_diff.zig");
 const repo_discovery = @import("repo_discovery.zig");
+const review_state = @import("review_state.zig");
 const sidebar_view_model = @import("sidebar_view_model.zig");
 
 const auto_reload_timer_id = "gitframe.auto_reload";
@@ -64,7 +65,7 @@ pub const App = struct {
     load_in_flight_generation: ?u64 = null,
     /// Session-level source of truth for reviewed files. The active LoadedDiff
     /// keeps a materialized bool slice so hide-reviewed hot paths stay O(1).
-    reviewed_store: std.StringHashMapUnmanaged(void) = .empty,
+    reviewed_store: review_state.Store = .{},
     active_reviewed_files_owned: bool = false,
     /// Owns the currently loaded raw diff, parsed document arrays, and error
     /// messages. Recreated on every successful load/reload.
@@ -140,7 +141,7 @@ pub const App = struct {
         self.clearRepoDiscovery(deinit_ctx.allocator);
         self.file_search_filter.deinit(deinit_ctx.allocator);
         self.repo_picker_filter.deinit(deinit_ctx.allocator);
-        self.clearReviewedStore(deinit_ctx.allocator);
+        self.reviewed_store.deinit(deinit_ctx.allocator);
     }
 
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
@@ -1280,7 +1281,7 @@ pub const App = struct {
         const file_index = node.file_index orelse return;
         if (file_index >= loaded.reviewed_files.len) return;
         const reviewed = !loaded.reviewed_files[file_index];
-        try self.setReviewedFile(allocator, loaded.document.files[file_index], reviewed);
+        try self.reviewed_store.set(allocator, self.activeRepoRoot(), loaded.document.files[file_index], reviewed);
         loaded.reviewed_files[file_index] = reviewed;
         if (self.hide_reviewed_files) {
             try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, true, self.changed_file_filter);
@@ -1530,42 +1531,9 @@ pub const App = struct {
         errdefer allocator.free(reviewed_files);
 
         for (loaded.document.files, 0..) |file, index| {
-            const key = try self.reviewedKeyAlloc(allocator, file);
-            defer allocator.free(key);
-            reviewed_files[index] = self.reviewed_store.contains(key);
+            reviewed_files[index] = try self.reviewed_store.containsFile(allocator, self.activeRepoRoot(), file);
         }
         loaded.reviewed_files = reviewed_files;
-    }
-
-    fn setReviewedFile(self: *App, allocator: std.mem.Allocator, file: diff_parser.FileDiff, reviewed: bool) !void {
-        const key = try self.reviewedKeyAlloc(allocator, file);
-        if (reviewed) {
-            if (self.reviewed_store.contains(key)) {
-                allocator.free(key);
-                return;
-            }
-            errdefer allocator.free(key);
-            try self.reviewed_store.put(allocator, key, {});
-            return;
-        }
-
-        defer allocator.free(key);
-        if (self.reviewed_store.fetchRemove(key)) |entry| {
-            allocator.free(entry.key);
-        }
-    }
-
-    fn reviewedKeyAlloc(self: *const App, allocator: std.mem.Allocator, file: diff_parser.FileDiff) ![]u8 {
-        const path = diff_file.displayPath(file);
-        const repo_root = self.activeRepoRoot() orelse return allocator.dupe(u8, path);
-        return std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ repo_root, path });
-    }
-
-    fn clearReviewedStore(self: *App, allocator: std.mem.Allocator) void {
-        var keys = self.reviewed_store.keyIterator();
-        while (keys.next()) |key| allocator.free(key.*);
-        self.reviewed_store.deinit(allocator);
-        self.reviewed_store = .empty;
     }
 
     fn clearRepoDiscovery(self: *App, allocator: std.mem.Allocator) void {
@@ -2336,7 +2304,7 @@ test "finishDiffLoad applies active changed file filter" {
         .changed_file_filter = .added,
     };
     defer app.clearLoadedDiff();
-    defer app.clearReviewedStore(std.testing.allocator);
+    defer app.reviewed_store.deinit(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     const bundle = try DiffLoadTask.buildLoadedBundle(std.testing.allocator, test_diff_added_deleted);
@@ -2402,7 +2370,7 @@ test "toggleReviewedFile marks only selected file nodes" {
         .selected_node = 0,
         .selected_file = 0,
     };
-    defer app.clearReviewedStore(std.testing.allocator);
+    defer app.reviewed_store.deinit(std.testing.allocator);
 
     try app.toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
@@ -2423,7 +2391,7 @@ test "reviewed state survives active loaded diff replacement" {
         .selected_file = 0,
     };
     defer app.clearLoadedDiff();
-    defer app.clearReviewedStore(std.testing.allocator);
+    defer app.reviewed_store.deinit(std.testing.allocator);
 
     var loaded = app.loadedDiff().?;
     try app.materializeReviewedFiles(std.testing.allocator, loaded);
@@ -2464,9 +2432,9 @@ test "reviewed state is scoped by active repository root" {
         .active_repo = 0,
     };
     defer app.clearRepoDiscovery(allocator);
-    defer app.clearReviewedStore(allocator);
+    defer app.reviewed_store.deinit(allocator);
 
-    try app.setReviewedFile(allocator, test_files_two[0], true);
+    try app.reviewed_store.set(allocator, app.activeRepoRoot(), test_files_two[0], true);
 
     var loaded_one = testLoadedDiffTwo();
     try app.materializeReviewedFiles(allocator, &loaded_one);
@@ -2633,7 +2601,7 @@ test "marking a visible file as reviewed while hidden moves selection" {
         .hide_reviewed_files = true,
     };
     defer app.clearLoadedDiff();
-    defer app.clearReviewedStore(std.testing.allocator);
+    defer app.reviewed_store.deinit(std.testing.allocator);
     try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, true, .all);
 
     try app.toggleReviewedFile(std.testing.allocator);
