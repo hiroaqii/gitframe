@@ -64,16 +64,67 @@ const FilterPromptState = struct {
     no_match: bool = false,
 };
 
+const PendingLoad = union(enum) {
+    repo_discovery: u64,
+    diff_load: u64,
+
+    fn generation(self: PendingLoad) u64 {
+        return switch (self) {
+            .repo_discovery => |value| value,
+            .diff_load => |value| value,
+        };
+    }
+};
+
 const LoadRuntimeState = struct {
     state: LoadState = .idle,
-    in_flight: bool = false,
-    in_flight_generation: ?u64 = null,
+    pending: ?PendingLoad = null,
     active_reviewed_files_owned: bool = false,
     /// Owns the currently loaded raw diff, parsed document arrays, and error
     /// messages. Recreated on every successful load/reload.
     arena: ?std.heap.ArenaAllocator = null,
     /// Monotonic id used to ignore stale async task results after reload.
     generation: u64 = 0,
+
+    fn beginRepoDiscovery(self: *LoadRuntimeState) u64 {
+        const next = self.nextGeneration();
+        self.pending = .{ .repo_discovery = next };
+        return next;
+    }
+
+    fn beginDiffLoad(self: *LoadRuntimeState) u64 {
+        const next = self.nextGeneration();
+        self.pending = .{ .diff_load = next };
+        return next;
+    }
+
+    fn finishPending(self: *LoadRuntimeState, expected: PendingLoad) bool {
+        if (!self.pendingMatches(expected)) return false;
+        self.pending = null;
+        return true;
+    }
+
+    fn clearPendingIfCurrent(self: *LoadRuntimeState, expected: PendingLoad) bool {
+        return self.finishPending(expected);
+    }
+
+    fn isCurrent(self: *const LoadRuntimeState, generation: u64) bool {
+        return self.generation == generation;
+    }
+
+    fn hasPending(self: *const LoadRuntimeState) bool {
+        return self.pending != null;
+    }
+
+    fn nextGeneration(self: *LoadRuntimeState) u64 {
+        self.generation +%= 1;
+        return self.generation;
+    }
+
+    fn pendingMatches(self: *const LoadRuntimeState, expected: PendingLoad) bool {
+        const pending = self.pending orelse return false;
+        return std.meta.eql(pending, expected);
+    }
 };
 
 pub const App = struct {
@@ -288,13 +339,12 @@ pub const App = struct {
         const task = try ctx.allocator().create(RepoDiscoveryTask);
         errdefer ctx.allocator().destroy(task);
 
-        self.load.generation +%= 1;
-        self.load.in_flight = false;
-        self.load.in_flight_generation = null;
-        task.* = .{ .generation = self.load.generation };
+        const generation = self.load.beginRepoDiscovery();
+        task.* = .{ .generation = generation };
         self.clearLoadedDiff();
         self.load.state = .loading;
         ctx.task().spawnWith(task, RepoDiscoveryTask.run) catch |err| {
+            _ = self.load.clearPendingIfCurrent(.{ .repo_discovery = generation });
             self.load.state = .{ .failed = "Could not start repo discovery task" };
             return err;
         };
@@ -304,7 +354,8 @@ pub const App = struct {
         var result = finished.result;
         defer result.deinit(ctx.allocator());
 
-        if (finished.generation != self.load.generation) return;
+        _ = self.load.finishPending(.{ .repo_discovery = finished.generation });
+        if (!self.load.isCurrent(finished.generation)) return;
 
         switch (result) {
             .empty => unreachable,
@@ -350,24 +401,21 @@ pub const App = struct {
         });
         errdefer diff_source.freeLoadRequest(ctx.allocator(), request);
 
-        self.load.generation +%= 1;
+        const generation = self.load.beginDiffLoad();
         task.* = .{
             // Source payloads come from process args, so clone the request
             // before the async task crosses the update boundary.
             .request = request,
-            .generation = self.load.generation,
+            .generation = generation,
         };
 
         if (clear_visible_state) {
             self.clearLoadedDiff();
             self.load.state = .loading;
         }
-        self.load.in_flight = true;
-        self.load.in_flight_generation = self.load.generation;
         ctx.task().spawnWith(task, DiffLoadTask.run) catch |err| {
+            _ = self.load.clearPendingIfCurrent(.{ .diff_load = generation });
             self.load.state = .{ .failed = "Could not start diff load task" };
-            self.load.in_flight = false;
-            self.load.in_flight_generation = null;
             return err;
         };
     }
@@ -454,7 +502,7 @@ pub const App = struct {
             ctx.redraw().skip();
             return;
         }
-        if (self.load.in_flight or self.load.state == .loading) {
+        if (self.load.hasPending() or self.load.state == .loading) {
             ctx.redraw().skip();
             return;
         }
@@ -490,11 +538,8 @@ pub const App = struct {
 
         // Multiple reloads can be in flight. Only the newest generation is
         // allowed to update visible state.
-        if (self.load.in_flight_generation == finished.generation) {
-            self.load.in_flight = false;
-            self.load.in_flight_generation = null;
-        }
-        if (finished.generation != self.load.generation) return;
+        _ = self.load.finishPending(.{ .diff_load = finished.generation });
+        if (!self.load.isCurrent(finished.generation)) return;
 
         self.clearLoadedDiff();
 
@@ -2054,6 +2099,37 @@ test "canceling edited search restores committed query and match" {
     try std.testing.expectEqualStrings("new", app.search.input.slice());
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
     try std.testing.expectEqual(@as(?usize, 7), app.search.match_offset);
+}
+
+test "load runtime pending tracks task kind and generation" {
+    var load: LoadRuntimeState = .{};
+
+    const discovery_generation = load.beginRepoDiscovery();
+    try std.testing.expect(load.hasPending());
+    try std.testing.expect(load.isCurrent(discovery_generation));
+    try std.testing.expect(!load.finishPending(.{ .diff_load = discovery_generation }));
+    try std.testing.expect(load.hasPending());
+    try std.testing.expect(load.finishPending(.{ .repo_discovery = discovery_generation }));
+    try std.testing.expect(!load.hasPending());
+
+    const diff_generation = load.beginDiffLoad();
+    try std.testing.expect(load.hasPending());
+    try std.testing.expect(load.isCurrent(diff_generation));
+    try std.testing.expect(load.clearPendingIfCurrent(.{ .diff_load = diff_generation }));
+    try std.testing.expect(!load.hasPending());
+}
+
+test "load runtime keeps newer pending when stale task finishes" {
+    var load: LoadRuntimeState = .{};
+
+    const stale_generation = load.beginDiffLoad();
+    const current_generation = load.beginDiffLoad();
+
+    try std.testing.expect(!load.finishPending(.{ .diff_load = stale_generation }));
+    try std.testing.expect(load.hasPending());
+    try std.testing.expect(load.isCurrent(current_generation));
+    try std.testing.expect(load.finishPending(.{ .diff_load = current_generation }));
+    try std.testing.expect(!load.hasPending());
 }
 
 test "finishDiffLoad takes current loaded bundle ownership" {
