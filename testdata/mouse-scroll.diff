@@ -1,0 +1,284 @@
+diff --git a/src/mouse_scroll.zig b/src/mouse_scroll.zig
+index 1111111..2222222 100644
+--- a/src/mouse_scroll.zig
++++ b/src/mouse_scroll.zig
+@@ -1,4 +1,5 @@
+ pub fn wheelBlock001() void {
+-    step("wheel old 001");
++    step("wheel new 001");
++    step("wheel inserted 001b");
+     step("wheel same 002");
+     step("wheel same 003");
+@@ -6,4 +7,5 @@
+ pub fn wheelBlock006() void {
+-    step("wheel old 006");
++    step("wheel new 006");
++    step("wheel inserted 006b");
+     step("wheel same 007");
+     step("wheel same 008");
+@@ -11,4 +13,5 @@
+ pub fn wheelBlock011() void {
+-    step("wheel old 011");
++    step("wheel new 011");
++    step("wheel inserted 011b");
+     step("wheel same 012");
+     step("wheel same 013");
+@@ -16,4 +19,5 @@
+ pub fn wheelBlock016() void {
+-    step("wheel old 016");
++    step("wheel new 016");
++    step("wheel inserted 016b");
+     step("wheel same 017");
+     step("wheel same 018");
+@@ -21,4 +25,5 @@
+ pub fn wheelBlock021() void {
+-    step("wheel old 021");
++    step("wheel new 021");
++    step("wheel inserted 021b");
+     step("wheel same 022");
+     step("wheel same 023");
+@@ -26,4 +31,5 @@
+ pub fn wheelBlock026() void {
+-    step("wheel old 026");
++    step("wheel new 026");
++    step("wheel inserted 026b");
+     step("wheel same 027");
+     step("wheel same 028");
+@@ -31,4 +37,5 @@
+ pub fn wheelBlock031() void {
+-    step("wheel old 031");
++    step("wheel new 031");
++    step("wheel inserted 031b");
+     step("wheel same 032");
+     step("wheel same 033");
+@@ -36,4 +43,5 @@
+ pub fn wheelBlock036() void {
+-    step("wheel old 036");
++    step("wheel new 036");
++    step("wheel inserted 036b");
+     step("wheel same 037");
+     step("wheel same 038");
+@@ -41,4 +49,5 @@
+ pub fn wheelBlock041() void {
+-    step("wheel old 041");
++    step("wheel new 041");
++    step("wheel inserted 041b");
+     step("wheel same 042");
+     step("wheel same 043");
+@@ -46,4 +55,5 @@
+ pub fn wheelBlock046() void {
+-    step("wheel old 046");
++    step("wheel new 046");
++    step("wheel inserted 046b");
+     step("wheel same 047");
+     step("wheel same 048");
+@@ -51,4 +61,5 @@
+ pub fn wheelBlock051() void {
+-    step("wheel old 051");
++    step("wheel new 051");
++    step("wheel inserted 051b");
+     step("wheel same 052");
+     step("wheel same 053");
+@@ -56,4 +67,5 @@
+ pub fn wheelBlock056() void {
+-    step("wheel old 056");
++    step("wheel new 056");
++    step("wheel inserted 056b");
+     step("wheel same 057");
+     step("wheel same 058");
+@@ -61,4 +73,5 @@
+ pub fn wheelBlock061() void {
+-    step("wheel old 061");
++    step("wheel new 061");
++    step("wheel inserted 061b");
+     step("wheel same 062");
+     step("wheel same 063");
+@@ -66,4 +79,5 @@
+ pub fn wheelBlock066() void {
+-    step("wheel old 066");
++    step("wheel new 066");
++    step("wheel inserted 066b");
+     step("wheel same 067");
+     step("wheel same 068");
+@@ -71,4 +85,5 @@
+ pub fn wheelBlock071() void {
+-    step("wheel old 071");
++    step("wheel new 071");
++    step("wheel inserted 071b");
+     step("wheel same 072");
+     step("wheel same 073");
+@@ -76,4 +91,5 @@
+ pub fn wheelBlock076() void {
+-    step("wheel old 076");
++    step("wheel new 076");
++    step("wheel inserted 076b");
+     step("wheel same 077");
+     step("wheel same 078");
+@@ -81,4 +97,5 @@
+ pub fn wheelBlock081() void {
+-    step("wheel old 081");
++    step("wheel new 081");
++    step("wheel inserted 081b");
+     step("wheel same 082");
+     step("wheel same 083");
+@@ -86,4 +103,5 @@
+ pub fn wheelBlock086() void {
+-    step("wheel old 086");
++    step("wheel new 086");
++    step("wheel inserted 086b");
+     step("wheel same 087");
+     step("wheel same 088");
+@@ -91,4 +109,5 @@
+ pub fn wheelBlock091() void {
+-    step("wheel old 091");
++    step("wheel new 091");
++    step("wheel inserted 091b");
+     step("wheel same 092");
+     step("wheel same 093");
+@@ -96,4 +115,5 @@
+ pub fn wheelBlock096() void {
+-    step("wheel old 096");
++    step("wheel new 096");
++    step("wheel inserted 096b");
+     step("wheel same 097");
+     step("wheel same 098");
+@@ -101,4 +121,5 @@
+ pub fn wheelBlock101() void {
+-    step("wheel old 101");
++    step("wheel new 101");
++    step("wheel inserted 101b");
+     step("wheel same 102");
+     step("wheel same 103");
+@@ -106,4 +127,5 @@
+ pub fn wheelBlock106() void {
+-    step("wheel old 106");
++    step("wheel new 106");
++    step("wheel inserted 106b");
+     step("wheel same 107");
+     step("wheel same 108");
+@@ -111,4 +133,5 @@
+ pub fn wheelBlock111() void {
+-    step("wheel old 111");
++    step("wheel new 111");
++    step("wheel inserted 111b");
+     step("wheel same 112");
+     step("wheel same 113");
+@@ -116,4 +139,5 @@
+ pub fn wheelBlock116() void {
+-    step("wheel old 116");
++    step("wheel new 116");
++    step("wheel inserted 116b");
+     step("wheel same 117");
+     step("wheel same 118");
+@@ -121,4 +145,5 @@
+ pub fn wheelBlock121() void {
+-    step("wheel old 121");
++    step("wheel new 121");
++    step("wheel inserted 121b");
+     step("wheel same 122");
+     step("wheel same 123");
+@@ -126,4 +151,5 @@
+ pub fn wheelBlock126() void {
+-    step("wheel old 126");
++    step("wheel new 126");
++    step("wheel inserted 126b");
+     step("wheel same 127");
+     step("wheel same 128");
+@@ -131,4 +157,5 @@
+ pub fn wheelBlock131() void {
+-    step("wheel old 131");
++    step("wheel new 131");
++    step("wheel inserted 131b");
+     step("wheel same 132");
+     step("wheel same 133");
+@@ -136,4 +163,5 @@
+ pub fn wheelBlock136() void {
+-    step("wheel old 136");
++    step("wheel new 136");
++    step("wheel inserted 136b");
+     step("wheel same 137");
+     step("wheel same 138");
+@@ -141,4 +169,5 @@
+ pub fn wheelBlock141() void {
+-    step("wheel old 141");
++    step("wheel new 141");
++    step("wheel inserted 141b");
+     step("wheel same 142");
+     step("wheel same 143");
+@@ -146,4 +175,5 @@
+ pub fn wheelBlock146() void {
+-    step("wheel old 146");
++    step("wheel new 146");
++    step("wheel inserted 146b");
+     step("wheel same 147");
+     step("wheel same 148");
+@@ -151,4 +181,5 @@
+ pub fn wheelBlock151() void {
+-    step("wheel old 151");
++    step("wheel new 151");
++    step("wheel inserted 151b");
+     step("wheel same 152");
+     step("wheel same 153");
+@@ -156,4 +187,5 @@
+ pub fn wheelBlock156() void {
+-    step("wheel old 156");
++    step("wheel new 156");
++    step("wheel inserted 156b");
+     step("wheel same 157");
+     step("wheel same 158");
+@@ -161,4 +193,5 @@
+ pub fn wheelBlock161() void {
+-    step("wheel old 161");
++    step("wheel new 161");
++    step("wheel inserted 161b");
+     step("wheel same 162");
+     step("wheel same 163");
+@@ -166,4 +199,5 @@
+ pub fn wheelBlock166() void {
+-    step("wheel old 166");
++    step("wheel new 166");
++    step("wheel inserted 166b");
+     step("wheel same 167");
+     step("wheel same 168");
+@@ -171,4 +205,5 @@
+ pub fn wheelBlock171() void {
+-    step("wheel old 171");
++    step("wheel new 171");
++    step("wheel inserted 171b");
+     step("wheel same 172");
+     step("wheel same 173");
+@@ -176,4 +211,5 @@
+ pub fn wheelBlock176() void {
+-    step("wheel old 176");
++    step("wheel new 176");
++    step("wheel inserted 176b");
+     step("wheel same 177");
+     step("wheel same 178");
+@@ -181,4 +217,5 @@
+ pub fn wheelBlock181() void {
+-    step("wheel old 181");
++    step("wheel new 181");
++    step("wheel inserted 181b");
+     step("wheel same 182");
+     step("wheel same 183");
+@@ -186,4 +223,5 @@
+ pub fn wheelBlock186() void {
+-    step("wheel old 186");
++    step("wheel new 186");
++    step("wheel inserted 186b");
+     step("wheel same 187");
+     step("wheel same 188");
+@@ -191,4 +229,5 @@
+ pub fn wheelBlock191() void {
+-    step("wheel old 191");
++    step("wheel new 191");
++    step("wheel inserted 191b");
+     step("wheel same 192");
+     step("wheel same 193");
+@@ -196,4 +235,5 @@
+ pub fn wheelBlock196() void {
+-    step("wheel old 196");
++    step("wheel new 196");
++    step("wheel inserted 196b");
+     step("wheel same 197");
+     step("wheel same 198");

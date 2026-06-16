@@ -1,0 +1,50 @@
+diff --git a/src/old_name.zig b/src/new_name.zig
+similarity index 72%
+rename from src/old_name.zig
+rename to src/new_name.zig
+index 1111111..2222222 100644
+--- a/src/old_name.zig
++++ b/src/new_name.zig
+@@ -1,5 +1,6 @@
+ const std = @import("std");
+ 
+-pub const label = "old name";
++pub const label = "new name";
++pub const renamed = true;
+ 
+ pub fn run() void {
+     _ = std;
+diff --git a/src/deleted.zig b/src/deleted.zig
+deleted file mode 100644
+index 3333333..0000000
+--- a/src/deleted.zig
++++ /dev/null
+@@ -1,4 +0,0 @@
+-const std = @import("std");
+-
+-pub fn deleted() void {
+-    _ = std;
+-}
+diff --git a/src/added.zig b/src/added.zig
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/src/added.zig
+@@ -0,0 +1,5 @@
++const std = @import("std");
++
++pub fn added() void {
++    _ = std;
++}
+diff --git a/scripts/run.sh b/scripts/run.sh
+old mode 100644
+new mode 100755
+index 5555555..6666666
+--- a/scripts/run.sh
++++ b/scripts/run.sh
+@@ -1,3 +1,4 @@
+ #!/usr/bin/env sh
+ 
+-echo old
++set -eu
++echo new

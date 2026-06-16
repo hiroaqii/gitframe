@@ -2,49 +2,213 @@ diff --git a/src/long.zig b/src/long.zig
 index 5555555..6666666 100644
 --- a/src/long.zig
 +++ b/src/long.zig
-@@ -1,20 +1,22 @@
- const std = @import("std");
- 
- pub fn render() void {
--    step("old 01");
-+    step("new 01");
-     step("same 02");
-     step("same 03");
--    step("old 04");
-+    step("new 04");
-+    step("new 04b");
-     step("same 05");
-     step("same 06");
-     step("same 07");
-     step("same 08");
-     step("same 09");
-     step("same 10");
--    step("old 11");
-+    step("new 11");
-     step("same 12");
-     step("same 13");
-     step("same 14");
-     step("same 15");
-     step("same 16");
-+    step("new 16b");
-     step("same 17");
-     step("same 18");
-     step("same 19");
-@@ -30,12 +32,14 @@ pub fn update() void {
-     tick("same 30");
-     tick("same 31");
-     tick("same 32");
--    tick("old 33");
--    tick("old 34");
-+    tick("new 33");
-+    tick("new 34");
-+    tick("new 34b");
-     tick("same 35");
-     tick("same 36");
-     tick("same 37");
-     tick("same 38");
--    tick("old 39");
-+    tick("new 39");
-     tick("same 40");
-+    tick("new 41");
- }
+@@ -1,4 +1,5 @@
+ pub fn section001() void {
+-    step("old row 001");
++    step("new row 001");
++    step("inserted row 001b");
+     step("same row 002");
+     step("same row 003");
+@@ -6,4 +7,5 @@
+ pub fn section006() void {
+-    step("old row 006");
++    step("new row 006");
++    step("inserted row 006b");
+     step("same row 007");
+     step("same row 008");
+@@ -11,4 +13,5 @@
+ pub fn section011() void {
+-    step("old row 011");
++    step("new row 011");
++    step("inserted row 011b");
+     step("same row 012");
+     step("same row 013");
+@@ -16,4 +19,5 @@
+ pub fn section016() void {
+-    step("old row 016");
++    step("new row 016");
++    step("inserted row 016b");
+     step("same row 017");
+     step("same row 018");
+@@ -21,4 +25,5 @@
+ pub fn section021() void {
+-    step("old row 021");
++    step("new row 021");
++    step("inserted row 021b");
+     step("same row 022");
+     step("same row 023");
+@@ -26,4 +31,5 @@
+ pub fn section026() void {
+-    step("old row 026");
++    step("new row 026");
++    step("inserted row 026b");
+     step("same row 027");
+     step("same row 028");
+@@ -31,4 +37,5 @@
+ pub fn section031() void {
+-    step("old row 031");
++    step("new row 031");
++    step("inserted row 031b");
+     step("same row 032");
+     step("same row 033");
+@@ -36,4 +43,5 @@
+ pub fn section036() void {
+-    step("old row 036");
++    step("new row 036");
++    step("inserted row 036b");
+     step("same row 037");
+     step("same row 038");
+@@ -41,4 +49,5 @@
+ pub fn section041() void {
+-    step("old row 041");
++    step("new row 041");
++    step("inserted row 041b");
+     step("same row 042");
+     step("same row 043");
+@@ -46,4 +55,5 @@
+ pub fn section046() void {
+-    step("old row 046");
++    step("new row 046");
++    step("inserted row 046b");
+     step("same row 047");
+     step("same row 048");
+@@ -51,4 +61,5 @@
+ pub fn section051() void {
+-    step("old row 051");
++    step("new row 051");
++    step("inserted row 051b");
+     step("same row 052");
+     step("same row 053");
+@@ -56,4 +67,5 @@
+ pub fn section056() void {
+-    step("old row 056");
++    step("new row 056");
++    step("inserted row 056b");
+     step("same row 057");
+     step("same row 058");
+@@ -61,4 +73,5 @@
+ pub fn section061() void {
+-    step("old row 061");
++    step("new row 061");
++    step("inserted row 061b");
+     step("same row 062");
+     step("same row 063");
+@@ -66,4 +79,5 @@
+ pub fn section066() void {
+-    step("old row 066");
++    step("new row 066");
++    step("inserted row 066b");
+     step("same row 067");
+     step("same row 068");
+@@ -71,4 +85,5 @@
+ pub fn section071() void {
+-    step("old row 071");
++    step("new row 071");
++    step("inserted row 071b");
+     step("same row 072");
+     step("same row 073");
+@@ -76,4 +91,5 @@
+ pub fn section076() void {
+-    step("old row 076");
++    step("new row 076");
++    step("inserted row 076b");
+     step("same row 077");
+     step("same row 078");
+@@ -81,4 +97,5 @@
+ pub fn section081() void {
+-    step("old row 081");
++    step("new row 081");
++    step("inserted row 081b");
+     step("same row 082");
+     step("same row 083");
+@@ -86,4 +103,5 @@
+ pub fn section086() void {
+-    step("old row 086");
++    step("new row 086");
++    step("inserted row 086b");
+     step("same row 087");
+     step("same row 088");
+@@ -91,4 +109,5 @@
+ pub fn section091() void {
+-    step("old row 091");
++    step("new row 091");
++    step("inserted row 091b");
+     step("same row 092");
+     step("same row 093");
+@@ -96,4 +115,5 @@
+ pub fn section096() void {
+-    step("old row 096");
++    step("new row 096");
++    step("inserted row 096b");
+     step("same row 097");
+     step("same row 098");
+@@ -101,4 +121,5 @@
+ pub fn section101() void {
+-    step("old row 101");
++    step("new row 101");
++    step("inserted row 101b");
+     step("same row 102");
+     step("same row 103");
+@@ -106,4 +127,5 @@
+ pub fn section106() void {
+-    step("old row 106");
++    step("new row 106");
++    step("inserted row 106b");
+     step("same row 107");
+     step("same row 108");
+@@ -111,4 +133,5 @@
+ pub fn section111() void {
+-    step("old row 111");
++    step("new row 111");
++    step("inserted row 111b");
+     step("same row 112");
+     step("same row 113");
+@@ -116,4 +139,5 @@
+ pub fn section116() void {
+-    step("old row 116");
++    step("new row 116");
++    step("inserted row 116b");
+     step("same row 117");
+     step("same row 118");
+@@ -121,4 +145,5 @@
+ pub fn section121() void {
+-    step("old row 121");
++    step("new row 121");
++    step("inserted row 121b");
+     step("same row 122");
+     step("same row 123");
+@@ -126,4 +151,5 @@
+ pub fn section126() void {
+-    step("old row 126");
++    step("new row 126");
++    step("inserted row 126b");
+     step("same row 127");
+     step("same row 128");
+@@ -131,4 +157,5 @@
+ pub fn section131() void {
+-    step("old row 131");
++    step("new row 131");
++    step("inserted row 131b");
+     step("same row 132");
+     step("same row 133");
+@@ -136,4 +163,5 @@
+ pub fn section136() void {
+-    step("old row 136");
++    step("new row 136");
++    step("inserted row 136b");
+     step("same row 137");
+     step("same row 138");
+@@ -141,4 +169,5 @@
+ pub fn section141() void {
+-    step("old row 141");
++    step("new row 141");
++    step("inserted row 141b");
+     step("same row 142");
+     step("same row 143");
+@@ -146,4 +175,5 @@
+ pub fn section146() void {
+-    step("old row 146");
++    step("new row 146");
++    step("inserted row 146b");
+     step("same row 147");
+     step("same row 148");

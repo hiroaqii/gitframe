@@ -1,0 +1,24 @@
+diff --git a/src/wide.zig b/src/wide.zig
+index 1111111..2222222 100644
+--- a/src/wide.zig
++++ b/src/wide.zig
+@@ -1,11 +1,11 @@
+ const std = @import("std");
+ 
+ pub fn renderStatus() void {
+-    const message = "old status: this line is intentionally very long so manual QA can confirm that GitFrame clips the tail instead of wrapping it inside the diff pane, even when the terminal is wider than a normal laptop screen";
++    const message = "new status: this line is intentionally extremely wide for manual QA on large displays, so GitFrame should still clip the tail until horizontal scrolling is implemented; segment-001 segment-002 segment-003 segment-004 segment-005 segment-006 segment-007 segment-008 segment-009 segment-010 segment-011 segment-012 segment-013 segment-014 segment-015 segment-016 segment-017 segment-018 segment-019 segment-020 segment-021 segment-022 segment-023 segment-024 segment-025 segment-026 segment-027 segment-028 segment-029 segment-030";
+     std.debug.print("{s}\n", .{message});
+ }
+ 
+ pub fn renderPath() void {
+-    const path = "src/features/review/workflow/old/component/with/a/very/deep/path/that/should/exceed/the/available/terminal/width/example.zig";
++    const path = "src/features/review/workflow/new/component/with/a/very/deep/path/that/should/exceed/the/available/terminal/width/on/a/large/desktop/display/with/multiple/panes/and/a/future/horizontal/scroll/indicator/example.zig";
+     std.debug.print("{s}\n", .{path});
+ }
+@@ -12,4 +12,4 @@
+ pub fn renderCommand() void {
+-    const command = "gitframe --old --short";
++    const command = "gitframe --new --manual-qa --wide-line --with-a-command-that-keeps-going --source testdata/wide.diff --mode side-by-side --focus diff --expected horizontal-clipping-until-scroll-support-is-added --notes this-command-is-not-meant-to-run-it-is-only-a-wide-fixture";
+     std.debug.print("{s}\n", .{command});
+ }
