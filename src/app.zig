@@ -56,6 +56,14 @@ const DiffSearchState = struct {
     match_offset: ?usize = null,
 };
 
+const FilterPromptState = struct {
+    mode: bool = false,
+    input: SearchQuery = .{},
+    /// Owns filtered indexes while labels are borrowed from the active source.
+    filter: ui.ListFilter = .{},
+    no_match: bool = false,
+};
+
 pub const App = struct {
     config: CliConfig = .{},
     env_map: ?*std.process.Environ.Map = null,
@@ -66,15 +74,9 @@ pub const App = struct {
     status_message: []const u8 = "",
     viewer: ViewerState = .{},
     search: DiffSearchState = .{},
-    file_search_mode: bool = false,
-    file_search_input: SearchQuery = .{},
-    file_search_filter: ui.ListFilter = .{},
-    file_search_no_match: bool = false,
+    file_search: FilterPromptState = .{},
     file_search_return_focus: Focus = .sidebar,
-    repo_picker_mode: bool = false,
-    repo_picker_input: SearchQuery = .{},
-    repo_picker_filter: ui.ListFilter = .{},
-    repo_picker_no_match: bool = false,
+    repo_picker: FilterPromptState = .{},
     hide_reviewed_files: bool = false,
     changed_file_filter: ChangedFileFilter = .all,
     repo_state: repo_state.State = .{},
@@ -156,8 +158,8 @@ pub const App = struct {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.clearLoadedDiff();
         self.repo_state.deinit(deinit_ctx.allocator);
-        self.file_search_filter.deinit(deinit_ctx.allocator);
-        self.repo_picker_filter.deinit(deinit_ctx.allocator);
+        self.file_search.filter.deinit(deinit_ctx.allocator);
+        self.repo_picker.filter.deinit(deinit_ctx.allocator);
         self.reviewed_store.deinit(deinit_ctx.allocator);
     }
 
@@ -206,28 +208,28 @@ pub const App = struct {
             .cancel_file_search => self.cancelFileSearchMode(ctx.allocator()),
             .submit_file_search => try self.submitFileSearch(ctx.allocator()),
             .file_search_insert => |codepoint| {
-                self.file_search_no_match = false;
-                self.file_search_input.insert(codepoint) catch {};
+                self.file_search.no_match = false;
+                self.file_search.input.insert(codepoint) catch {};
             },
             .file_search_backspace => {
-                self.file_search_no_match = false;
-                self.file_search_input.backspace();
+                self.file_search.no_match = false;
+                self.file_search.input.backspace();
             },
             .enter_repo_picker => try self.enterRepoPickerMode(ctx.allocator()),
             .cancel_repo_picker => self.cancelRepoPickerMode(ctx.allocator()),
             .submit_repo_picker => try self.submitRepoPicker(ctx),
             .repo_picker_insert => |codepoint| {
-                self.repo_picker_no_match = false;
-                self.repo_picker_input.insert(codepoint) catch {};
+                self.repo_picker.no_match = false;
+                self.repo_picker.input.insert(codepoint) catch {};
                 try self.refreshRepoPickerFilter(ctx.allocator());
             },
             .repo_picker_backspace => {
-                self.repo_picker_no_match = false;
-                self.repo_picker_input.backspace();
+                self.repo_picker.no_match = false;
+                self.repo_picker.input.backspace();
                 try self.refreshRepoPickerFilter(ctx.allocator());
             },
-            .repo_picker_move_previous => self.repo_picker_filter.update(.move_prev),
-            .repo_picker_move_next => self.repo_picker_filter.update(.move_next),
+            .repo_picker_move_previous => self.repo_picker.filter.update(.move_prev),
+            .repo_picker_move_next => self.repo_picker.filter.update(.move_next),
             .toggle_reviewed_file => try self.toggleReviewedFile(ctx.allocator()),
             .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
@@ -259,8 +261,8 @@ pub const App = struct {
     fn keyContext(self: *const App) app_input.KeyContext {
         return .{
             .search_mode = self.search.mode,
-            .file_search_mode = self.file_search_mode,
-            .repo_picker_mode = self.repo_picker_mode,
+            .file_search_mode = self.file_search.mode,
+            .repo_picker_mode = self.repo_picker.mode,
             .search_query_len = self.search.query.len,
             .focus = self.viewer.focus,
         };
@@ -444,7 +446,7 @@ pub const App = struct {
     fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (!self.config.watch) return;
         if (self.config.source == .stdin) return;
-        if (self.repo_picker_mode or self.search.mode or self.file_search_mode) {
+        if (self.repo_picker.mode or self.search.mode or self.file_search.mode) {
             ctx.redraw().skip();
             return;
         }
@@ -767,45 +769,45 @@ pub const App = struct {
     fn enterFileSearchMode(self: *App) void {
         self.file_search_return_focus = self.viewer.focus;
         self.viewer.focus = .sidebar;
-        self.file_search_mode = true;
-        self.file_search_input = .{};
-        self.file_search_no_match = false;
+        self.file_search.mode = true;
+        self.file_search.input = .{};
+        self.file_search.no_match = false;
     }
 
     fn cancelFileSearchMode(self: *App, allocator: std.mem.Allocator) void {
-        self.file_search_mode = false;
-        self.file_search_input = .{};
-        self.file_search_filter.deinit(allocator);
-        self.file_search_no_match = false;
+        self.file_search.mode = false;
+        self.file_search.input = .{};
+        self.file_search.filter.deinit(allocator);
+        self.file_search.no_match = false;
         self.viewer.focus = self.file_search_return_focus;
     }
 
     fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
         if (self.repo_state.workspaceRepos() == null) return;
 
-        self.repo_picker_mode = true;
-        self.repo_picker_input = .{};
-        self.repo_picker_no_match = false;
+        self.repo_picker.mode = true;
+        self.repo_picker.input = .{};
+        self.repo_picker.no_match = false;
         try self.refreshRepoPickerFilter(allocator);
         self.focusRepoPickerOnActive();
     }
 
     fn cancelRepoPickerMode(self: *App, allocator: std.mem.Allocator) void {
-        self.repo_picker_mode = false;
-        self.repo_picker_input = .{};
-        self.repo_picker_filter.deinit(allocator);
-        self.repo_picker_no_match = false;
+        self.repo_picker.mode = false;
+        self.repo_picker.input = .{};
+        self.repo_picker.filter.deinit(allocator);
+        self.repo_picker.no_match = false;
     }
 
     fn submitRepoPicker(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        const focused = self.repo_picker_filter.list.focusedIndex();
-        const repo_index = self.repo_picker_filter.sourceIndex(focused) orelse {
-            self.repo_picker_no_match = true;
+        const focused = self.repo_picker.filter.list.focusedIndex();
+        const repo_index = self.repo_picker.filter.sourceIndex(focused) orelse {
+            self.repo_picker.no_match = true;
             return;
         };
         const repos = self.repo_state.workspaceRepos() orelse return;
         if (repo_index >= repos.len) {
-            self.repo_picker_no_match = true;
+            self.repo_picker.no_match = true;
             return;
         }
 
@@ -831,16 +833,16 @@ pub const App = struct {
 
         // ListFilter owns the filtered index arrays; repository labels remain
         // borrowed from the current discovery result.
-        try self.repo_picker_filter.apply(allocator, labels.items, self.repo_picker_input.slice());
+        try self.repo_picker.filter.apply(allocator, labels.items, self.repo_picker.input.slice());
     }
 
     fn focusRepoPickerOnActive(self: *App) void {
         var visible_index: usize = 0;
-        while (visible_index < self.repo_picker_filter.labels.len) : (visible_index += 1) {
-            const source_index = self.repo_picker_filter.sourceIndex(visible_index) orelse continue;
+        while (visible_index < self.repo_picker.filter.labels.len) : (visible_index += 1) {
+            const source_index = self.repo_picker.filter.sourceIndex(visible_index) orelse continue;
             if (source_index != self.repo_state.active_index) continue;
-            while (self.repo_picker_filter.list.focusedIndex() < visible_index) {
-                self.repo_picker_filter.update(.move_next);
+            while (self.repo_picker.filter.list.focusedIndex() < visible_index) {
+                self.repo_picker.filter.update(.move_next);
             }
             return;
         }
@@ -880,19 +882,19 @@ pub const App = struct {
     }
 
     fn submitFileSearch(self: *App, allocator: std.mem.Allocator) !void {
-        const query = std.mem.trim(u8, self.file_search_input.slice(), " \t\r\n");
+        const query = std.mem.trim(u8, self.file_search.input.slice(), " \t\r\n");
         if (query.len == 0) {
             self.cancelFileSearchMode(allocator);
             return;
         }
 
         const loaded = self.activeLoadedDiff() orelse {
-            self.file_search_no_match = true;
+            self.file_search.no_match = true;
             return;
         };
         const node_index = try self.findFileNodeWithFilter(allocator, loaded, query) orelse {
-            self.file_search_filter.deinit(allocator);
-            self.file_search_no_match = true;
+            self.file_search.filter.deinit(allocator);
+            self.file_search.no_match = true;
             return;
         };
 
@@ -900,12 +902,12 @@ pub const App = struct {
         // parent directory that hides the matched path.
         file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
         const load_allocator = self.loadArenaAllocator() orelse {
-            self.file_search_filter.deinit(allocator);
+            self.file_search.filter.deinit(allocator);
             return;
         };
         loaded.rebuildVisibleNodes(load_allocator, self.hide_reviewed_files, self.changed_file_filter) catch {
-            self.file_search_filter.deinit(allocator);
-            self.file_search_no_match = true;
+            self.file_search.filter.deinit(allocator);
+            self.file_search.no_match = true;
             return;
         };
         self.selectSidebarNode(loaded, node_index);
@@ -1124,8 +1126,8 @@ pub const App = struct {
 
         // ListFilter owns the filtered index arrays, while file path labels
         // remain borrowed from the active LoadedDiff.
-        try self.file_search_filter.applyWithSourceIndexes(allocator, labels.items, node_indexes.items, query);
-        return self.file_search_filter.sourceIndex(0);
+        try self.file_search.filter.applyWithSourceIndexes(allocator, labels.items, node_indexes.items, query);
+        return self.file_search.filter.sourceIndex(0);
     }
 
     fn loadedDiff(self: *App) ?*LoadedDiff {
@@ -1473,7 +1475,7 @@ test "file search selects matching file and expands ancestors" {
             .selected_file = 0,
             .selected_node = 0,
         },
-        .file_search_mode = true,
+        .file_search = .{ .mode = true },
     };
     defer app.clearLoadedDiff();
 
@@ -1487,23 +1489,23 @@ test "file search selects matching file and expands ancestors" {
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 2), app.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
-    try std.testing.expect(!app.file_search_mode);
+    try std.testing.expect(!app.file_search.mode);
 }
 
 test "file search keeps prompt open on no match" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
         .load_state = .{ .loaded = testLoadedDiffNested() },
-        .file_search_mode = true,
+        .file_search = .{ .mode = true },
     };
     setFileSearchInput(&app, "missing");
 
-    defer app.file_search_filter.deinit(std.testing.allocator);
+    defer app.file_search.filter.deinit(std.testing.allocator);
 
     try app.submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(app.file_search_mode);
-    try std.testing.expect(app.file_search_no_match);
+    try std.testing.expect(app.file_search.mode);
+    try std.testing.expect(app.file_search.no_match);
     try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
 }
 
@@ -1520,7 +1522,7 @@ test "file search skips hidden reviewed matches" {
             .bytes = 0,
             .lines = 0,
         } },
-        .file_search_mode = true,
+        .file_search = .{ .mode = true },
         .hide_reviewed_files = true,
     };
     defer app.clearLoadedDiff();
@@ -1529,8 +1531,8 @@ test "file search skips hidden reviewed matches" {
 
     try app.submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(!app.file_search_mode);
-    try std.testing.expect(!app.file_search_no_match);
+    try std.testing.expect(!app.file_search.mode);
+    try std.testing.expect(!app.file_search.no_match);
     try std.testing.expectEqual(@as(usize, 2), app.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
 }
@@ -1548,7 +1550,7 @@ test "file search trims empty input and restores focus on cancel" {
 
     try app.submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(!app.file_search_mode);
+    try std.testing.expect(!app.file_search.mode);
     try std.testing.expectEqual(Focus.diff, app.viewer.focus);
     try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
 }
@@ -1668,16 +1670,16 @@ test "cycling changed file filter rebuilds visible nodes and reconciles selectio
 test "file search skips files outside active changed filter" {
     var app: App = .{
         .load_state = .{ .loaded = testLoadedDiffTwoWithStatuses() },
-        .file_search_mode = true,
+        .file_search = .{ .mode = true },
         .changed_file_filter = .added,
     };
     setFileSearchInput(&app, "deleted");
-    defer app.file_search_filter.deinit(std.testing.allocator);
+    defer app.file_search.filter.deinit(std.testing.allocator);
 
     try app.submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(app.file_search_mode);
-    try std.testing.expect(app.file_search_no_match);
+    try std.testing.expect(app.file_search.mode);
+    try std.testing.expect(app.file_search.no_match);
     try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
 }
 
@@ -1801,13 +1803,13 @@ test "repo picker focuses active workspace repository" {
         },
     };
     defer app.repo_state.deinit(allocator);
-    defer app.repo_picker_filter.deinit(allocator);
+    defer app.repo_picker.filter.deinit(allocator);
 
     try app.enterRepoPickerMode(allocator);
 
-    try std.testing.expect(app.repo_picker_mode);
-    try std.testing.expectEqual(@as(usize, 2), app.repo_picker_filter.labels.len);
-    try std.testing.expectEqual(@as(usize, 1), app.repo_picker_filter.list.focusedIndex());
+    try std.testing.expect(app.repo_picker.mode);
+    try std.testing.expectEqual(@as(usize, 2), app.repo_picker.filter.labels.len);
+    try std.testing.expectEqual(@as(usize, 1), app.repo_picker.filter.list.focusedIndex());
 }
 
 test "sidebar renders reviewed marker" {
@@ -2138,8 +2140,8 @@ fn setSearchInput(app: *App, query: []const u8) void {
 }
 
 fn setFileSearchInput(app: *App, query: []const u8) void {
-    @memcpy(app.file_search_input.buffer[0..query.len], query);
-    app.file_search_input.len = query.len;
+    @memcpy(app.file_search.input.buffer[0..query.len], query);
+    app.file_search.input.len = query.len;
 }
 
 fn testLoadedDiffOne() LoadedDiff {

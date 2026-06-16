@@ -40,7 +40,7 @@ pub fn view(app: anytype, surface: *chasen.Surface) !void {
     });
     viewFooter(app, &footer);
 
-    if (app.repo_picker_mode) {
+    if (app.repo_picker.mode) {
         try viewRepoPicker(app, surface);
     }
 }
@@ -288,11 +288,11 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         return;
     }
 
-    if (app.file_search_mode) {
+    if (app.file_search.mode) {
         _ = surface.borrowTextAt(0, 0, "file: ", .{ .fg = .{ .index = 11 }, .bold = true });
-        _ = surface.copyTextAt(6, 0, app.file_search_input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
-        if (app.file_search_no_match) {
-            const col: u16 = @intCast(@min(6 + chasen.text.displayWidth(app.file_search_input.slice()) + 1, std.math.maxInt(u16)));
+        _ = surface.copyTextAt(6, 0, app.file_search.input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
+        if (app.file_search.no_match) {
+            const col: u16 = @intCast(@min(6 + chasen.text.displayWidth(app.file_search.input.slice()) + 1, std.math.maxInt(u16)));
             if (surface.size().width > col) _ = surface.borrowTextAt(col, 0, "(no match)", .{ .fg = .{ .index = 9 } });
         }
         return;
@@ -354,23 +354,23 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
     const size = content.size();
 
     _ = content.borrowTextAt(0, 0, "filter: ", .{ .fg = .{ .index = 11 }, .bold = true });
-    _ = content.copyTextAt(8, 0, app.repo_picker_input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
-    if (app.repo_picker_no_match and size.width > 20) {
+    _ = content.copyTextAt(8, 0, app.repo_picker.input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
+    if (app.repo_picker.no_match and size.width > 20) {
         _ = content.borrowTextAt(20, 0, "(no match)", .{ .fg = .{ .index = 9 } });
     }
 
     if (size.height <= 2) return;
     const rows = size.height - 2;
-    const focused = app.repo_picker_filter.list.focusedIndex();
-    const range = ui.ListViewport.visibleRange(app.repo_picker_filter.labels.len, focused, rows);
+    const focused = app.repo_picker.filter.list.focusedIndex();
+    const range = ui.ListViewport.visibleRange(app.repo_picker.filter.labels.len, focused, rows);
     var row: u16 = 2;
     var visible_index: usize = range.start;
     while (visible_index < range.end) : ({
         visible_index += 1;
         row += 1;
     }) {
-        const source_index = app.repo_picker_filter.sourceIndex(visible_index) orelse continue;
-        const label = app.repo_picker_filter.labels[visible_index];
+        const source_index = app.repo_picker.filter.sourceIndex(visible_index) orelse continue;
+        const label = app.repo_picker.filter.labels[visible_index];
         const focused_row = visible_index == focused;
         const active = source_index == app.repo_state.active_index;
         const style: chasen.TextStyle = if (focused_row)
