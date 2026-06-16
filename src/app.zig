@@ -2,6 +2,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const app_input = @import("app_input.zig");
+const app_load = @import("app_load.zig");
 const app_view = @import("app_view.zig");
 const diff_parser = @import("diff_parser.zig");
 const diff_file = @import("diff_file.zig");
@@ -26,8 +27,12 @@ pub const ParseArgsError = diff_source.ParseArgsError;
 pub const parseArgs = diff_source.parseArgs;
 
 const ChangedFileFilter = loaded_diff.ChangedFileFilter;
+const DiffLoadFinished = app_load.DiffLoadFinished;
+const DiffLoadTask = app_load.DiffLoadTask(App.Msg);
 const Focus = app_input.Focus;
 const LoadedDiff = loaded_diff.LoadedDiff;
+const RepoDiscoveryFinished = app_load.RepoDiscoveryFinished;
+const RepoDiscoveryTask = app_load.RepoDiscoveryTask(App.Msg);
 
 pub const App = struct {
     config: CliConfig = .{},
@@ -1196,168 +1201,6 @@ const EmptyReason = enum {
     no_repository,
 };
 
-const DiffLoadFinished = struct {
-    generation: u64,
-    result: DiffLoadTaskResult,
-};
-
-const RepoDiscoveryFinished = struct {
-    generation: u64,
-    result: RepoDiscoveryTaskResult,
-};
-
-const RepoDiscoveryTaskResult = union(enum) {
-    empty,
-    discovered: repo_discovery.DiscoveryResult,
-    failed: []u8,
-    failed_static: []const u8,
-
-    fn deinit(self: *RepoDiscoveryTaskResult, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .empty, .failed_static => {},
-            .discovered => |*discovery| discovery.deinit(allocator),
-            .failed => |message| allocator.free(message),
-        }
-        self.* = .empty;
-    }
-};
-
-const DiffLoadTaskResult = union(enum) {
-    empty,
-    loaded: LoadedDiffBundle,
-    failed: []u8,
-    failed_static: []const u8,
-
-    fn deinit(self: *DiffLoadTaskResult, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .empty, .failed_static => {},
-            .loaded => |*bundle| bundle.deinit(),
-            .failed => |message| allocator.free(message),
-        }
-        self.* = .empty;
-    }
-};
-
-const LoadedDiffBundle = struct {
-    arena: ?std.heap.ArenaAllocator,
-    loaded: LoadedDiff,
-
-    fn deinit(self: *LoadedDiffBundle) void {
-        if (self.arena) |*arena| arena.deinit();
-        self.arena = null;
-    }
-
-    fn takeArena(self: *LoadedDiffBundle) std.heap.ArenaAllocator {
-        const arena = self.arena.?;
-        self.arena = null;
-        return arena;
-    }
-};
-
-const RepoDiscoveryTask = struct {
-    generation: u64,
-
-    fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) App.Msg {
-        const task: *RepoDiscoveryTask = @ptrCast(@alignCast(ctx_ptr));
-        defer allocator.destroy(task);
-
-        return .{ .repos_discovered = .{
-            .generation = task.generation,
-            .result = runDiscovery(allocator, io),
-        } };
-    }
-
-    fn runDiscovery(allocator: std.mem.Allocator, io: std.Io) RepoDiscoveryTaskResult {
-        const result = repo_discovery.discover(allocator, io) catch |err| {
-            return .{
-                .failed = std.fmt.allocPrint(allocator, "Repo discovery failed: {s}", .{@errorName(err)}) catch
-                    return .{ .failed_static = "Repo discovery failed: OutOfMemory" },
-            };
-        };
-        return .{ .discovered = result };
-    }
-};
-
-const DiffLoadTask = struct {
-    request: LoadRequest,
-    generation: u64,
-
-    fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) App.Msg {
-        const task: *DiffLoadTask = @ptrCast(@alignCast(ctx_ptr));
-        defer {
-            diff_source.freeLoadRequest(allocator, task.request);
-            allocator.destroy(task);
-        }
-
-        return .{ .diff_loaded = .{
-            .generation = task.generation,
-            .result = runLoad(task, allocator, io),
-        } };
-    }
-
-    fn runLoad(task: *DiffLoadTask, allocator: std.mem.Allocator, io: std.Io) DiffLoadTaskResult {
-        const raw_result = diff_source.load(allocator, io, task.request) catch |err| {
-            return .{
-                .failed = std.fmt.allocPrint(allocator, "Diff load failed: {s}", .{@errorName(err)}) catch
-                    return .{ .failed_static = "Diff load failed: OutOfMemory" },
-            };
-        };
-
-        switch (raw_result) {
-            .ok => |bytes| {
-                defer allocator.free(bytes);
-                if (bytes.len == 0) return .empty;
-                const bundle = buildLoadedBundle(allocator, bytes) catch |err| {
-                    return .{ .failed = std.fmt.allocPrint(allocator, "Diff parse failed: {s}", .{@errorName(err)}) catch
-                        return .{ .failed_static = "Diff parse failed: OutOfMemory" } };
-                };
-                return .{ .loaded = bundle };
-            },
-            .failed => |message| return .{ .failed = message },
-            .failed_static => |message| return .{ .failed_static = message },
-        }
-    }
-
-    fn buildLoadedBundle(allocator: std.mem.Allocator, bytes: []const u8) !LoadedDiffBundle {
-        var arena: std.heap.ArenaAllocator = .init(allocator);
-        errdefer arena.deinit();
-        const arena_allocator = arena.allocator();
-
-        const copied = try arena_allocator.dupe(u8, bytes);
-        const document = try diff_parser.parse(arena_allocator, copied);
-        const tree = try file_tree.build(arena_allocator, document);
-        const rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document);
-        const collapsed_hunks = try arena_allocator.alloc(bool, document.totalHunks());
-        @memset(collapsed_hunks, false);
-        var loaded: LoadedDiff = .{
-            .bytes = copied.len,
-            .lines = countLines(copied),
-            .text = copied,
-            .document = document,
-            .tree = tree,
-            .rendered_line_cache = rendered_line_cache,
-            .collapsed_hunks = collapsed_hunks,
-            .collapsed_dirs = .empty,
-        };
-        try loaded.rebuildVisibleNodes(arena_allocator, false, .all);
-
-        // Do not store `arena_allocator` in the result: its interface points
-        // at this local arena value, while the arena itself is moved by value
-        // across the task-result boundary.
-        return .{ .arena = arena, .loaded = loaded };
-    }
-};
-
-fn countLines(bytes: []const u8) usize {
-    if (bytes.len == 0) return 0;
-
-    var count: usize = 1;
-    for (bytes) |byte| {
-        if (byte == '\n') count += 1;
-    }
-    return count;
-}
-
 fn parentDirectoryNodeIndex(tree: file_tree.FileTree, node_index: usize) ?usize {
     if (node_index >= tree.nodes.len) return null;
     const node = tree.nodes[node_index];
@@ -1378,10 +1221,10 @@ fn parentDirectoryNodeIndex(tree: file_tree.FileTree, node_index: usize) ?usize 
 }
 
 test "countLines handles empty and trailing newline inputs" {
-    try std.testing.expectEqual(@as(usize, 0), countLines(""));
-    try std.testing.expectEqual(@as(usize, 1), countLines("one"));
-    try std.testing.expectEqual(@as(usize, 2), countLines("one\n"));
-    try std.testing.expectEqual(@as(usize, 2), countLines("one\ntwo"));
+    try std.testing.expectEqual(@as(usize, 0), app_load.countLines(""));
+    try std.testing.expectEqual(@as(usize, 1), app_load.countLines("one"));
+    try std.testing.expectEqual(@as(usize, 2), app_load.countLines("one\n"));
+    try std.testing.expectEqual(@as(usize, 2), app_load.countLines("one\ntwo"));
 }
 
 test "file selection boundary does not reset diff position" {
@@ -1766,7 +1609,7 @@ test "finishDiffLoad applies active changed file filter" {
     defer app.reviewed_store.deinit(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    const bundle = try DiffLoadTask.buildLoadedBundle(std.testing.allocator, test_diff_added_deleted);
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, test_diff_added_deleted);
     try app.finishDiffLoad(&ctx, .{
         .generation = 1,
         .result = .{ .loaded = bundle },
@@ -2171,7 +2014,7 @@ test "finishDiffLoad takes current loaded bundle ownership" {
     defer app.clearLoadedDiff();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    const bundle = try DiffLoadTask.buildLoadedBundle(std.testing.allocator, test_diff_one);
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, test_diff_one);
     try app.finishDiffLoad(&ctx, .{
         .generation = 1,
         .result = .{ .loaded = bundle },
@@ -2186,7 +2029,7 @@ test "finishDiffLoad frees stale loaded bundle" {
     var app: App = .{ .load_generation = 2 };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    const bundle = try DiffLoadTask.buildLoadedBundle(std.testing.allocator, test_diff_one);
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, test_diff_one);
     try app.finishDiffLoad(&ctx, .{
         .generation = 1,
         .result = .{ .loaded = bundle },
