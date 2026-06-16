@@ -104,7 +104,7 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    const title_style: chasen.TextStyle = if (app.focus == .sidebar)
+    const title_style: chasen.TextStyle = if (app.viewer.focus == .sidebar)
         .{ .bold = true, .reverse = true, .fg = .{ .index = 14 } }
     else
         .{ .bold = true, .fg = .{ .index = 14 } };
@@ -127,7 +127,7 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
 
     const visible_rows: usize = size.height - sidebar_header_rows;
     const visible_count = loaded.visibleNodeCount();
-    const selected_row = loaded.visibleRowOfNode(app.selected_node) orelse 0;
+    const selected_row = loaded.visibleRowOfNode(app.viewer.selected_node) orelse 0;
     // Sidebar has no independent scroll state; derive the visible window
     // from the selected row each frame.
     const range = ui.ListViewport.visibleRange(visible_count, selected_row, visible_rows);
@@ -137,7 +137,7 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
         visible_index += 1;
         row += 1;
     }) {
-        const row_model = loaded.sidebarRowAt(visible_index, app.selected_node) orelse continue;
+        const row_model = loaded.sidebarRowAt(visible_index, app.viewer.selected_node) orelse continue;
         try drawSidebarRow(surface, row, row_model);
     }
 }
@@ -220,18 +220,18 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         return;
     }
 
-    const selected = @min(app.selected_file, loaded.document.files.len - 1);
+    const selected = @min(app.viewer.selected_file, loaded.document.files.len - 1);
     const file = loaded.document.files[selected];
     var diff_content = diffContentSurface(surface);
-    const mode = diff_render.effectiveMode(diff_content.size().width, app.display_mode);
-    const focus_label = if (app.focus == .diff) "diff" else "sidebar";
+    const mode = diff_render.effectiveMode(diff_content.size().width, app.viewer.display_mode);
+    const focus_label = if (app.viewer.focus == .diff) "diff" else "sidebar";
     _ = try surface.printAt(0, 2, .{ .fg = .gray }, "{d}/{d}  {d} hunks  {s}  focus:{s}  scroll:{d}", .{
         selected + 1,
         loaded.document.files.len,
         file.hunks.len,
         mode.label(),
         focus_label,
-        app.diff_scroll,
+        app.viewer.diff_scroll,
     });
     if (app.search_query.len > 0 or app.search_mode) {
         surface.clear(.{ .col = 0, .row = 2, .width = size.width, .height = 1 });
@@ -247,9 +247,9 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         _ = surface.copyTextAt(0, 2, prompt_text, .{ .fg = .{ .index = 11 } }) catch {};
     }
     try diff_render.renderFile(&diff_content, file, .{
-        .requested_mode = app.display_mode,
-        .scroll = app.diff_scroll,
-        .highlighted_hunk = if (file.hunks.len > 0) app.selected_hunk else null,
+        .requested_mode = app.viewer.display_mode,
+        .scroll = app.viewer.diff_scroll,
+        .highlighted_hunk = if (file.hunks.len > 0) app.viewer.selected_hunk else null,
         .line_index = loaded.cachedRenderedLineIndex(selected, mode),
         .folded_hunks = loaded.foldedHunksForFile(selected),
     });
@@ -394,7 +394,7 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
 }
 
 fn footerItems(app: anytype) []const ui.key_hint.Item {
-    return switch (app.focus) {
+    return switch (app.viewer.focus) {
         .sidebar => &footer_sidebar_items,
         .diff => &footer_diff_items,
     };
@@ -402,9 +402,9 @@ fn footerItems(app: anytype) []const ui.key_hint.Item {
 
 pub fn drawSearchMatchMarker(app: anytype, surface: *chasen.Surface) void {
     const match_offset = app.search_match_offset orelse return;
-    if (match_offset < app.diff_scroll) return;
+    if (match_offset < app.viewer.diff_scroll) return;
 
-    const visible_offset = match_offset - app.diff_scroll;
+    const visible_offset = match_offset - app.viewer.diff_scroll;
     const body_rows = diff_render.visibleBodyRows(surface.size().height);
     if (visible_offset >= body_rows) return;
 

@@ -34,14 +34,7 @@ const LoadedDiff = loaded_diff.LoadedDiff;
 const RepoDiscoveryFinished = app_load.RepoDiscoveryFinished;
 const RepoDiscoveryTask = app_load.RepoDiscoveryTask(App.Msg);
 
-pub const App = struct {
-    config: CliConfig = .{},
-    env_map: ?*std.process.Environ.Map = null,
-    allocator: ?std.mem.Allocator = null,
-    terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
-    load_state: LoadState = .idle,
-    status_message_buf: [160]u8 = undefined,
-    status_message: []const u8 = "",
+const ViewerState = struct {
     /// Sticky file shown in the diff pane. Directory sidebar rows can be
     /// selected without changing this value.
     selected_file: usize = 0,
@@ -51,6 +44,17 @@ pub const App = struct {
     diff_scroll: usize = 0,
     selected_hunk: usize = 0,
     display_mode: diff_render.DisplayMode = .side_by_side,
+};
+
+pub const App = struct {
+    config: CliConfig = .{},
+    env_map: ?*std.process.Environ.Map = null,
+    allocator: ?std.mem.Allocator = null,
+    terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
+    load_state: LoadState = .idle,
+    status_message_buf: [160]u8 = undefined,
+    status_message: []const u8 = "",
+    viewer: ViewerState = .{},
     search_mode: bool = false,
     search_input: SearchQuery = .{},
     search_query: SearchQuery = .{},
@@ -176,9 +180,9 @@ pub const App = struct {
             .toggle_hunk_fold => self.toggleSelectedHunkFold(),
             .select_first_file => self.selectFileAbsolute(0),
             .select_last_file => self.selectLastFile(),
-            .toggle_focus => self.focus = self.focus.toggled(),
+            .toggle_focus => self.viewer.focus = self.viewer.focus.toggled(),
             .toggle_display_mode => {
-                self.display_mode = self.display_mode.toggled();
+                self.viewer.display_mode = self.viewer.display_mode.toggled();
                 self.clampDiffNavigationKeepingHunkVisible();
                 self.updateSearchMatchOffset();
                 self.scrollSearchMatchIntoView();
@@ -252,7 +256,7 @@ pub const App = struct {
             .file_search_mode = self.file_search_mode,
             .repo_picker_mode = self.repo_picker_mode,
             .search_query_len = self.search_query.len,
-            .focus = self.focus,
+            .focus = self.viewer.focus,
         };
     }
 
@@ -540,8 +544,8 @@ pub const App = struct {
         if (self.load_arena) |*arena| arena.deinit();
         self.load_arena = null;
         self.load_state = .idle;
-        self.diff_scroll = 0;
-        self.selected_hunk = 0;
+        self.viewer.diff_scroll = 0;
+        self.viewer.selected_hunk = 0;
         self.clearSearchMatch();
     }
 
@@ -550,10 +554,10 @@ pub const App = struct {
         if (loaded.document.files.len == 0 or loaded.tree.nodes.len == 0) return;
 
         if (delta < 0) {
-            if (loaded.previousVisibleNodeIndex(self.selected_node)) |previous| {
+            if (loaded.previousVisibleNodeIndex(self.viewer.selected_node)) |previous| {
                 self.selectSidebarNode(loaded, previous);
             }
-        } else if (loaded.nextVisibleNodeIndex(self.selected_node)) |next| {
+        } else if (loaded.nextVisibleNodeIndex(self.viewer.selected_node)) |next| {
             self.selectSidebarNode(loaded, next);
         }
         self.clampSelection(loaded.document.files.len);
@@ -564,14 +568,14 @@ pub const App = struct {
         const file_count = self.loadedFileCount() orelse return;
         if (file_count == 0) return;
         const target = @min(index, file_count - 1);
-        if (self.selected_file == target) {
+        if (self.viewer.selected_file == target) {
             if (self.activeLoadedDiff()) |loaded| {
                 self.syncSidebarNodeToSelectedFile(loaded);
             }
             self.clampSelection(file_count);
             return;
         }
-        self.selected_file = target;
+        self.viewer.selected_file = target;
         if (self.activeLoadedDiff()) |loaded| {
             self.syncSidebarNodeToSelectedFile(loaded);
         }
@@ -589,13 +593,13 @@ pub const App = struct {
 
     fn selectSidebarNode(self: *App, loaded: *LoadedDiff, node_index: usize) void {
         if (node_index >= loaded.tree.nodes.len) return;
-        const previous_file = self.selected_file;
-        self.selected_node = node_index;
+        const previous_file = self.viewer.selected_file;
+        self.viewer.selected_node = node_index;
         // File rows change the active diff pane file. Directory rows only move
         // the sidebar cursor and keep the previous file visible.
         if (loaded.tree.nodes[node_index].file_index) |file_index| {
-            self.selected_file = file_index;
-            if (self.selected_file != previous_file) {
+            self.viewer.selected_file = file_index;
+            if (self.viewer.selected_file != previous_file) {
                 self.resetDiffPosition();
                 self.refreshSearchForSelectedFile();
             }
@@ -604,8 +608,8 @@ pub const App = struct {
 
     fn toggleSelectedDirectory(self: *App) !void {
         const loaded = self.activeLoadedDiff() orelse return;
-        if (self.selected_node >= loaded.tree.nodes.len) return;
-        const node = loaded.tree.nodes[self.selected_node];
+        if (self.viewer.selected_node >= loaded.tree.nodes.len) return;
+        const node = loaded.tree.nodes[self.viewer.selected_node];
         if (node.kind != .directory) return;
         const allocator = self.loadArenaAllocator() orelse return;
         try file_tree.toggle(allocator, &loaded.collapsed_dirs, node.path);
@@ -615,8 +619,8 @@ pub const App = struct {
 
     fn expandSelectedDirectory(self: *App) !void {
         const loaded = self.activeLoadedDiff() orelse return;
-        if (self.selected_node >= loaded.tree.nodes.len) return;
-        const node = loaded.tree.nodes[self.selected_node];
+        if (self.viewer.selected_node >= loaded.tree.nodes.len) return;
+        const node = loaded.tree.nodes[self.viewer.selected_node];
         if (node.kind != .directory) return;
         file_tree.expand(&loaded.collapsed_dirs, node.path);
         try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.hide_reviewed_files, self.changed_file_filter);
@@ -625,8 +629,8 @@ pub const App = struct {
 
     fn collapseOrSelectParentDirectory(self: *App) !void {
         const loaded = self.activeLoadedDiff() orelse return;
-        if (self.selected_node >= loaded.tree.nodes.len) return;
-        const node = loaded.tree.nodes[self.selected_node];
+        if (self.viewer.selected_node >= loaded.tree.nodes.len) return;
+        const node = loaded.tree.nodes[self.viewer.selected_node];
         if (node.kind == .directory and !file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) {
             const allocator = self.loadArenaAllocator() orelse return;
             try file_tree.collapse(allocator, &loaded.collapsed_dirs, node.path);
@@ -634,17 +638,17 @@ pub const App = struct {
             self.clampSelection(loaded.document.files.len);
             return;
         }
-        if (parentDirectoryNodeIndex(loaded.tree, self.selected_node)) |parent| {
-            self.selected_node = parent;
+        if (parentDirectoryNodeIndex(loaded.tree, self.viewer.selected_node)) |parent| {
+            self.viewer.selected_node = parent;
             self.clampSelection(loaded.document.files.len);
         }
     }
 
     fn scrollDiff(self: *App, delta: i2) void {
         if (delta < 0) {
-            self.diff_scroll -|= 1;
+            self.viewer.diff_scroll -|= 1;
         } else {
-            self.diff_scroll += 1;
+            self.viewer.diff_scroll += 1;
         }
         self.clampDiffNavigation();
     }
@@ -653,9 +657,9 @@ pub const App = struct {
         const rows = self.diffVisibleRows();
         const step: usize = @max(rows, 1);
         if (delta < 0) {
-            self.diff_scroll -|= step;
+            self.viewer.diff_scroll -|= step;
         } else {
-            self.diff_scroll += step;
+            self.viewer.diff_scroll += step;
         }
         self.clampDiffNavigation();
     }
@@ -665,9 +669,9 @@ pub const App = struct {
         if (file.hunks.len == 0) return;
 
         if (delta < 0) {
-            if (self.selected_hunk > 0) self.selected_hunk -= 1;
-        } else if (self.selected_hunk + 1 < file.hunks.len) {
-            self.selected_hunk += 1;
+            if (self.viewer.selected_hunk > 0) self.viewer.selected_hunk -= 1;
+        } else if (self.viewer.selected_hunk + 1 < file.hunks.len) {
+            self.viewer.selected_hunk += 1;
         }
 
         self.scrollSelectedHunkIntoView();
@@ -679,15 +683,15 @@ pub const App = struct {
         const file_index = self.selectedFileIndex(loaded) orelse return;
         if (file_index >= loaded.document.files.len) return;
         const file = loaded.document.files[file_index];
-        if (self.selected_hunk >= file.hunks.len) return;
+        if (self.viewer.selected_hunk >= file.hunks.len) return;
 
-        if (!loaded.isHunkFolded(file_index, self.selected_hunk) and
-            self.currentSearchMatchInHunkBody(self.selected_hunk))
+        if (!loaded.isHunkFolded(file_index, self.viewer.selected_hunk) and
+            self.currentSearchMatchInHunkBody(self.viewer.selected_hunk))
         {
             return;
         }
 
-        loaded.toggleHunkFold(file_index, self.selected_hunk);
+        loaded.toggleHunkFold(file_index, self.viewer.selected_hunk);
         self.updateSearchMatchOffset();
         self.scrollSelectedHunkIntoView();
         self.clampDiffNavigation();
@@ -695,12 +699,12 @@ pub const App = struct {
 
     fn scrollSelectedHunkIntoView(self: *App) void {
         const mode = self.effectiveDisplayMode();
-        const target = self.selectedHunkOffset(mode, self.selected_hunk);
+        const target = self.selectedHunkOffset(mode, self.viewer.selected_hunk);
         const visible_rows = self.diffVisibleRows();
-        if (target < self.diff_scroll) {
-            self.diff_scroll = target;
-        } else if (visible_rows > 0 and target >= self.diff_scroll + visible_rows) {
-            self.diff_scroll = target + 1 - visible_rows;
+        if (target < self.viewer.diff_scroll) {
+            self.viewer.diff_scroll = target;
+        } else if (visible_rows > 0 and target >= self.viewer.diff_scroll + visible_rows) {
+            self.viewer.diff_scroll = target + 1 - visible_rows;
         }
     }
 
@@ -711,16 +715,16 @@ pub const App = struct {
         };
 
         if (file.hunks.len == 0) {
-            self.selected_hunk = 0;
-        } else if (self.selected_hunk >= file.hunks.len) {
-            self.selected_hunk = file.hunks.len - 1;
+            self.viewer.selected_hunk = 0;
+        } else if (self.viewer.selected_hunk >= file.hunks.len) {
+            self.viewer.selected_hunk = file.hunks.len - 1;
         }
 
         const mode = self.effectiveDisplayMode();
         const line_count = self.selectedFileLineIndex(mode).lineCount();
         const visible_rows = self.diffVisibleRows();
         const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
-        if (self.diff_scroll > max_scroll) self.diff_scroll = max_scroll;
+        if (self.viewer.diff_scroll > max_scroll) self.viewer.diff_scroll = max_scroll;
     }
 
     fn clampDiffNavigationKeepingHunkVisible(self: *App) void {
@@ -732,8 +736,8 @@ pub const App = struct {
     }
 
     fn resetDiffPosition(self: *App) void {
-        self.diff_scroll = 0;
-        self.selected_hunk = 0;
+        self.viewer.diff_scroll = 0;
+        self.viewer.selected_hunk = 0;
         self.clearSearchMatch();
     }
 
@@ -755,8 +759,8 @@ pub const App = struct {
     }
 
     fn enterFileSearchMode(self: *App) void {
-        self.file_search_return_focus = self.focus;
-        self.focus = .sidebar;
+        self.file_search_return_focus = self.viewer.focus;
+        self.viewer.focus = .sidebar;
         self.file_search_mode = true;
         self.file_search_input = .{};
         self.file_search_no_match = false;
@@ -767,7 +771,7 @@ pub const App = struct {
         self.file_search_input = .{};
         self.file_search_filter.deinit(allocator);
         self.file_search_no_match = false;
-        self.focus = self.file_search_return_focus;
+        self.viewer.focus = self.file_search_return_focus;
     }
 
     fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
@@ -804,8 +808,8 @@ pub const App = struct {
 
         try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root, true);
         self.repo_state.active_index = repo_index;
-        self.selected_file = 0;
-        self.selected_node = 0;
+        self.viewer.selected_file = 0;
+        self.viewer.selected_node = 0;
         self.clearSearch();
     }
 
@@ -838,9 +842,9 @@ pub const App = struct {
 
     fn toggleReviewedFile(self: *App, allocator: std.mem.Allocator) !void {
         const loaded = self.activeLoadedDiff() orelse return;
-        if (self.selected_node >= loaded.tree.nodes.len) return;
+        if (self.viewer.selected_node >= loaded.tree.nodes.len) return;
 
-        const node = loaded.tree.nodes[self.selected_node];
+        const node = loaded.tree.nodes[self.viewer.selected_node];
         const file_index = node.file_index orelse return;
         if (file_index >= loaded.reviewed_files.len) return;
         const reviewed = !loaded.reviewed_files[file_index];
@@ -927,7 +931,7 @@ pub const App = struct {
         };
         self.unfoldSearchMatchIfNeeded(next);
         self.setSearchMatch(next);
-        if (self.search_match_offset) |offset| self.diff_scroll = offset;
+        if (self.search_match_offset) |offset| self.viewer.diff_scroll = offset;
         self.clampDiffNavigation();
     }
 
@@ -938,7 +942,7 @@ pub const App = struct {
         const next = diff_search.findMatch(file, self.effectiveDisplayMode(), self.search_query.slice(), null, .forward) orelse return;
         self.unfoldSearchMatchIfNeeded(next);
         self.setSearchMatch(next);
-        if (self.search_match_offset) |offset| self.diff_scroll = offset;
+        if (self.search_match_offset) |offset| self.viewer.diff_scroll = offset;
     }
 
     fn clearSearchMatch(self: *App) void {
@@ -985,10 +989,10 @@ pub const App = struct {
     fn scrollSearchMatchIntoView(self: *App) void {
         const offset = self.search_match_offset orelse return;
         const visible_rows = self.diffVisibleRows();
-        if (offset < self.diff_scroll) {
-            self.diff_scroll = offset;
-        } else if (visible_rows > 0 and offset >= self.diff_scroll + visible_rows) {
-            self.diff_scroll = offset + 1 - visible_rows;
+        if (offset < self.viewer.diff_scroll) {
+            self.viewer.diff_scroll = offset;
+        } else if (visible_rows > 0 and offset >= self.viewer.diff_scroll + visible_rows) {
+            self.viewer.diff_scroll = offset + 1 - visible_rows;
         }
     }
 
@@ -1023,7 +1027,7 @@ pub const App = struct {
     }
 
     fn effectiveDisplayMode(self: *const App) diff_render.DisplayMode {
-        return diff_render.effectiveMode(self.diffPaneWidth(), self.display_mode);
+        return diff_render.effectiveMode(self.diffPaneWidth(), self.viewer.display_mode);
     }
 
     fn diffVisibleRows(self: *const App) usize {
@@ -1039,25 +1043,25 @@ pub const App = struct {
 
     fn clampSelection(self: *App, file_count: usize) void {
         if (file_count == 0) {
-            self.selected_file = 0;
-            self.selected_node = 0;
+            self.viewer.selected_file = 0;
+            self.viewer.selected_node = 0;
             return;
         }
-        if (self.selected_file >= file_count) self.selected_file = file_count - 1;
+        if (self.viewer.selected_file >= file_count) self.viewer.selected_file = file_count - 1;
         if (self.activeLoadedDiff()) |loaded| {
-            if (self.selected_node >= loaded.tree.nodes.len) {
+            if (self.viewer.selected_node >= loaded.tree.nodes.len) {
                 self.syncSidebarNodeToSelectedFile(loaded);
             }
-            if (loaded.visibleAncestorOrSelf(self.selected_node)) |visible_node| {
-                self.selected_node = visible_node;
-            } else if (loaded.tree.selectedNodeIndex(self.selected_file)) |file_node| {
-                self.selected_node = file_node;
+            if (loaded.visibleAncestorOrSelf(self.viewer.selected_node)) |visible_node| {
+                self.viewer.selected_node = visible_node;
+            } else if (loaded.tree.selectedNodeIndex(self.viewer.selected_file)) |file_node| {
+                self.viewer.selected_node = file_node;
             }
         }
     }
 
     fn reconcileSelectionAfterVisibleNodeChange(self: *App, loaded: *LoadedDiff) void {
-        if (loaded.visibleRowOfNode(self.selected_node) != null) {
+        if (loaded.visibleRowOfNode(self.viewer.selected_node) != null) {
             return;
         }
 
@@ -1066,27 +1070,27 @@ pub const App = struct {
             return;
         }
 
-        if (loaded.visibleAncestorOrSelf(self.selected_node)) |visible_node| {
+        if (loaded.visibleAncestorOrSelf(self.viewer.selected_node)) |visible_node| {
             self.selectSidebarNode(loaded, visible_node);
             return;
         }
 
         if (loaded.visibleNodeAt(0)) |node_index| {
-            self.selected_node = node_index;
+            self.viewer.selected_node = node_index;
         }
     }
 
     fn selectedFileIndex(self: *const App, loaded: *const LoadedDiff) ?usize {
         if (loaded.document.files.len == 0) return null;
-        return @min(self.selected_file, loaded.document.files.len - 1);
+        return @min(self.viewer.selected_file, loaded.document.files.len - 1);
     }
 
     fn syncSidebarNodeToSelectedFile(self: *App, loaded: *const LoadedDiff) void {
         const file_index = self.selectedFileIndex(loaded) orelse {
-            self.selected_node = 0;
+            self.viewer.selected_node = 0;
             return;
         };
-        self.selected_node = loaded.tree.selectedNodeIndex(file_index) orelse 0;
+        self.viewer.selected_node = loaded.tree.selectedNodeIndex(file_index) orelse 0;
     }
 
     fn materializeReviewedFiles(self: *App, allocator: std.mem.Allocator, loaded: *LoadedDiff) !void {
@@ -1231,46 +1235,50 @@ test "file selection boundary does not reset diff position" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
         .load_state = .{ .loaded = testLoadedDiffOne() },
-        .diff_scroll = 4,
-        .selected_hunk = 1,
+        .viewer = .{
+            .diff_scroll = 4,
+            .selected_hunk = 1,
+        },
     };
 
     app.selectFileDelta(-1);
-    try std.testing.expectEqual(@as(usize, 0), app.selected_file);
-    try std.testing.expectEqual(@as(usize, 4), app.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 1), app.selected_hunk);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 4), app.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_hunk);
 
     app.selectFileAbsolute(0);
-    try std.testing.expectEqual(@as(usize, 4), app.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 1), app.selected_hunk);
+    try std.testing.expectEqual(@as(usize, 4), app.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_hunk);
 }
 
 test "mode toggle keeps selected hunk visible" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
         .load_state = .{ .loaded = testLoadedDiffOne() },
-        .display_mode = .unified,
-        .selected_hunk = 1,
+        .viewer = .{
+            .display_mode = .unified,
+            .selected_hunk = 1,
+        },
     };
 
     app.scrollSelectedHunkIntoView();
-    try std.testing.expect(app.diff_scroll > 0);
+    try std.testing.expect(app.viewer.diff_scroll > 0);
 
-    app.display_mode = .side_by_side;
+    app.viewer.display_mode = .side_by_side;
     app.clampDiffNavigationKeepingHunkVisible();
 
     const file = testFileWithHunks();
-    const target = diff_render.hunkBodyLineOffset(file, app.effectiveDisplayMode(), app.selected_hunk);
+    const target = diff_render.hunkBodyLineOffset(file, app.effectiveDisplayMode(), app.viewer.selected_hunk);
     const visible_rows = app.diffVisibleRows();
-    try std.testing.expect(target >= app.diff_scroll);
-    try std.testing.expect(visible_rows == 0 or target < app.diff_scroll + visible_rows);
+    try std.testing.expect(target >= app.viewer.diff_scroll);
+    try std.testing.expect(visible_rows == 0 or target < app.viewer.diff_scroll + visible_rows);
 }
 
 test "mode change resyncs search match to rendered body offsets" {
     var app: App = .{
         .terminal_size = .{ .width = 140, .height = 12 },
         .load_state = .{ .loaded = testLoadedDiffOne() },
-        .display_mode = .unified,
+        .viewer = .{ .display_mode = .unified },
     };
     setSearchQuery(&app, "late new");
 
@@ -1278,21 +1286,21 @@ test "mode change resyncs search match to rendered body offsets" {
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
     try std.testing.expectEqual(@as(?usize, 12), app.search_match_offset);
 
-    app.display_mode = .side_by_side;
+    app.viewer.display_mode = .side_by_side;
     app.clampDiffNavigationKeepingHunkVisible();
     app.updateSearchMatchOffset();
 
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
     try std.testing.expectEqual(@as(?usize, 10), app.search_match_offset);
-    try std.testing.expect(app.search_match_offset.? >= app.diff_scroll);
-    try std.testing.expect(app.search_match_offset.? < app.diff_scroll + app.diffVisibleRows());
+    try std.testing.expect(app.search_match_offset.? >= app.viewer.diff_scroll);
+    try std.testing.expect(app.search_match_offset.? < app.viewer.diff_scroll + app.diffVisibleRows());
 }
 
 test "mode change keeps search near later matches" {
     var app: App = .{
         .terminal_size = .{ .width = 140, .height = 8 },
         .load_state = .{ .loaded = testLoadedDiffOne() },
-        .display_mode = .unified,
+        .viewer = .{ .display_mode = .unified },
     };
     setSearchQuery(&app, "new");
 
@@ -1303,7 +1311,7 @@ test "mode change keeps search near later matches" {
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
     try std.testing.expectEqual(@as(?usize, 12), app.search_match_offset);
 
-    app.display_mode = .side_by_side;
+    app.viewer.display_mode = .side_by_side;
     app.clampDiffNavigationKeepingHunkVisible();
     app.updateSearchMatchOffset();
 
@@ -1323,7 +1331,7 @@ test "toggle selected hunk fold updates active rendered line cache" {
         .terminal_size = .{ .width = 100, .height = 12 },
         .load_arena = arena,
         .load_state = .{ .loaded = loaded },
-        .selected_hunk = 0,
+        .viewer = .{ .selected_hunk = 0 },
     };
     defer app.clearLoadedDiff();
 
@@ -1392,37 +1400,39 @@ test "file change resyncs retained search query to selected file" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
         .load_state = .{ .loaded = testLoadedDiffTwo() },
-        .display_mode = .unified,
+        .viewer = .{ .display_mode = .unified },
     };
     setSearchQuery(&app, "target");
 
     app.selectFileAbsolute(1);
 
-    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
     try expectSearchCoordinate(&app, .{ .metadata = 0 });
     try std.testing.expectEqual(@as(?usize, 0), app.search_match_offset);
-    try std.testing.expectEqual(@as(usize, 0), app.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_scroll);
 }
 
 test "sidebar navigation can select directories without changing selected file" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
         .load_state = .{ .loaded = testLoadedDiffNested() },
-        .selected_file = 0,
-        .selected_node = 1,
+        .viewer = .{
+            .selected_file = 0,
+            .selected_node = 1,
+        },
     };
 
     app.selectFileDelta(-1);
-    try std.testing.expectEqual(@as(usize, 0), app.selected_node);
-    try std.testing.expectEqual(@as(usize, 0), app.selected_file);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
 
     app.selectFileDelta(1);
-    try std.testing.expectEqual(@as(usize, 1), app.selected_node);
-    try std.testing.expectEqual(@as(usize, 0), app.selected_file);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
 
     app.selectFileDelta(1);
-    try std.testing.expectEqual(@as(usize, 2), app.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
+    try std.testing.expectEqual(@as(usize, 2), app.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
 }
 
 test "toggling selected directory collapses visible descendants" {
@@ -1430,8 +1440,10 @@ test "toggling selected directory collapses visible descendants" {
         .terminal_size = .{ .width = 100, .height = 12 },
         .load_arena = .init(std.testing.allocator),
         .load_state = .{ .loaded = testLoadedDiffNested() },
-        .selected_file = 0,
-        .selected_node = 0,
+        .viewer = .{
+            .selected_file = 0,
+            .selected_node = 0,
+        },
     };
     defer app.clearLoadedDiff();
 
@@ -1443,7 +1455,7 @@ test "toggling selected directory collapses visible descendants" {
     try std.testing.expect(loaded.visible_nodes.len >= loaded.tree.nodes.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
-    try std.testing.expectEqual(@as(usize, 0), app.selected_node);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
 }
 
 test "file search selects matching file and expands ancestors" {
@@ -1451,8 +1463,10 @@ test "file search selects matching file and expands ancestors" {
         .terminal_size = .{ .width = 100, .height = 12 },
         .load_arena = .init(std.testing.allocator),
         .load_state = .{ .loaded = testLoadedDiffNested() },
-        .selected_file = 0,
-        .selected_node = 0,
+        .viewer = .{
+            .selected_file = 0,
+            .selected_node = 0,
+        },
         .file_search_mode = true,
     };
     defer app.clearLoadedDiff();
@@ -1465,8 +1479,8 @@ test "file search selects matching file and expands ancestors" {
 
     loaded = app.loadedDiff().?;
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
-    try std.testing.expectEqual(@as(usize, 2), app.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
+    try std.testing.expectEqual(@as(usize, 2), app.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
     try std.testing.expect(!app.file_search_mode);
 }
 
@@ -1484,7 +1498,7 @@ test "file search keeps prompt open on no match" {
 
     try std.testing.expect(app.file_search_mode);
     try std.testing.expect(app.file_search_no_match);
-    try std.testing.expectEqual(@as(usize, 0), app.selected_file);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
 }
 
 test "file search skips hidden reviewed matches" {
@@ -1511,26 +1525,26 @@ test "file search skips hidden reviewed matches" {
 
     try std.testing.expect(!app.file_search_mode);
     try std.testing.expect(!app.file_search_no_match);
-    try std.testing.expectEqual(@as(usize, 2), app.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
+    try std.testing.expectEqual(@as(usize, 2), app.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
 }
 
 test "file search trims empty input and restores focus on cancel" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
         .load_state = .{ .loaded = testLoadedDiffNested() },
-        .focus = .diff,
+        .viewer = .{ .focus = .diff },
     };
 
     app.enterFileSearchMode();
-    try std.testing.expectEqual(Focus.sidebar, app.focus);
+    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
     setFileSearchInput(&app, "   ");
 
     try app.submitFileSearch(std.testing.allocator);
 
     try std.testing.expect(!app.file_search_mode);
-    try std.testing.expectEqual(Focus.diff, app.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.selected_file);
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
 }
 
 test "sidebar renders file status badges" {
@@ -1588,8 +1602,10 @@ test "changed file filter keeps only matching status rows" {
         .load_arena = .init(std.testing.allocator),
         .load_state = .{ .loaded = testLoadedDiffTwoWithStatuses() },
         .changed_file_filter = .added,
-        .selected_node = 1,
-        .selected_file = 1,
+        .viewer = .{
+            .selected_node = 1,
+            .selected_file = 1,
+        },
     };
     defer app.clearLoadedDiff();
 
@@ -1627,8 +1643,10 @@ test "cycling changed file filter rebuilds visible nodes and reconciles selectio
     var app: App = .{
         .load_arena = .init(std.testing.allocator),
         .load_state = .{ .loaded = testLoadedDiffTwoWithStatuses() },
-        .selected_node = 1,
-        .selected_file = 1,
+        .viewer = .{
+            .selected_node = 1,
+            .selected_file = 1,
+        },
     };
     defer app.clearLoadedDiff();
 
@@ -1637,8 +1655,8 @@ test "cycling changed file filter rebuilds visible nodes and reconciles selectio
     const loaded = app.loadedDiff().?;
     try std.testing.expectEqual(ChangedFileFilter.modified, app.changed_file_filter);
     try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
-    try std.testing.expectEqual(@as(usize, 1), app.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
 }
 
 test "file search skips files outside active changed filter" {
@@ -1654,7 +1672,7 @@ test "file search skips files outside active changed filter" {
 
     try std.testing.expect(app.file_search_mode);
     try std.testing.expect(app.file_search_no_match);
-    try std.testing.expectEqual(@as(usize, 0), app.selected_file);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
 }
 
 test "toggleReviewedFile marks only selected file nodes" {
@@ -1669,15 +1687,17 @@ test "toggleReviewedFile marks only selected file nodes" {
             .bytes = 0,
             .lines = 0,
         } },
-        .selected_node = 0,
-        .selected_file = 0,
+        .viewer = .{
+            .selected_node = 0,
+            .selected_file = 0,
+        },
     };
     defer app.reviewed_store.deinit(std.testing.allocator);
 
     try app.toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
 
-    app.selected_node = 1;
+    app.viewer.selected_node = 1;
     try app.toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
 
@@ -1689,8 +1709,10 @@ test "reviewed state survives active loaded diff replacement" {
     var app: App = .{
         .allocator = std.testing.allocator,
         .load_state = .{ .loaded = testLoadedDiffTwo() },
-        .selected_node = 0,
-        .selected_file = 0,
+        .viewer = .{
+            .selected_node = 0,
+            .selected_file = 0,
+        },
     };
     defer app.clearLoadedDiff();
     defer app.reviewed_store.deinit(std.testing.allocator);
@@ -1820,8 +1842,10 @@ test "hide reviewed files removes reviewed file rows from visible list" {
             .bytes = 0,
             .lines = 0,
         } },
-        .selected_node = 1,
-        .selected_file = 0,
+        .viewer = .{
+            .selected_node = 1,
+            .selected_file = 0,
+        },
     };
     defer app.clearLoadedDiff();
 
@@ -1832,8 +1856,8 @@ test "hide reviewed files removes reviewed file rows from visible list" {
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
-    try std.testing.expectEqual(@as(usize, 2), app.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
+    try std.testing.expectEqual(@as(usize, 2), app.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
 }
 
 test "hide reviewed files removes directories with no visible file descendants" {
@@ -1849,8 +1873,10 @@ test "hide reviewed files removes directories with no visible file descendants" 
             .bytes = 0,
             .lines = 0,
         } },
-        .selected_node = 1,
-        .selected_file = 0,
+        .viewer = .{
+            .selected_node = 1,
+            .selected_file = 0,
+        },
     };
     defer app.clearLoadedDiff();
 
@@ -1873,8 +1899,10 @@ test "hide reviewed files keeps directories for non-contiguous unreviewed descen
             .bytes = 0,
             .lines = 0,
         } },
-        .selected_node = 1,
-        .selected_file = 0,
+        .viewer = .{
+            .selected_node = 1,
+            .selected_file = 0,
+        },
     };
     defer app.clearLoadedDiff();
 
@@ -1899,8 +1927,10 @@ test "marking a visible file as reviewed while hidden moves selection" {
             .bytes = 0,
             .lines = 0,
         } },
-        .selected_node = 1,
-        .selected_file = 0,
+        .viewer = .{
+            .selected_node = 1,
+            .selected_file = 0,
+        },
         .hide_reviewed_files = true,
     };
     defer app.clearLoadedDiff();
@@ -1914,8 +1944,8 @@ test "marking a visible file as reviewed while hidden moves selection" {
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
-    try std.testing.expectEqual(@as(usize, 2), app.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.selected_file);
+    try std.testing.expectEqual(@as(usize, 2), app.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
 }
 
 test "search match marker is drawn on visible match row" {
@@ -1927,7 +1957,7 @@ test "search match marker is drawn on visible match row" {
         .terminal_size = .{ .width = 80, .height = 9 },
         .load_state = .{ .loaded = testLoadedDiffOne() },
         .search_match_offset = 4,
-        .diff_scroll = 3,
+        .viewer = .{ .diff_scroll = 3 },
     };
 
     app.drawSearchMatchMarker(&ts.surface);
@@ -1960,7 +1990,7 @@ test "status mode label uses diff content width after marker gutter" {
     const app: App = .{
         .terminal_size = .{ .width = 72, .height = 9 },
         .load_state = .{ .loaded = testLoadedDiffOne() },
-        .display_mode = .side_by_side,
+        .viewer = .{ .display_mode = .side_by_side },
     };
 
     try app.viewDiffPane(&ts.surface, app.load_state.loaded);
