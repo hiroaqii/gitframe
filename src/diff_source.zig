@@ -1,6 +1,5 @@
 const std = @import("std");
-
-const max_diff_bytes = 16 * 1024 * 1024;
+const git_backend = @import("git_backend.zig");
 
 /// User-selected source for the raw unified diff text.
 ///
@@ -60,71 +59,12 @@ pub const ParseArgsError = error{
     UnsupportedWatchSource,
 };
 
-pub const LoadError = error{
+pub const LoadError = git_backend.LoadError || error{
     ReadFailed,
-    StreamTooLong,
-    OutOfMemory,
-    SpawnFailed,
     MissingRepoRoot,
 };
 
-pub const LoadResult = union(enum) {
-    /// Allocated raw diff text. Caller owns and must call `deinit`.
-    ok: []u8,
-    /// Allocated error message from the backend. Caller owns and must call `deinit`.
-    failed: []u8,
-    /// Non-owned fallback error message, used when allocation itself fails.
-    failed_static: []const u8,
-
-    pub fn deinit(self: LoadResult, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .ok => |bytes| allocator.free(bytes),
-            .failed => |message| allocator.free(message),
-            .failed_static => {},
-        }
-    }
-};
-
-/// Minimal backend boundary for obtaining raw unified diff text.
-///
-/// It is intentionally one-method for now: Phase 1 only needs read-only diff
-/// acquisition, while future browser/backend work can add another implementation
-/// without wiring process execution through the app state.
-pub const GitBackend = struct {
-    ptr: *anyopaque,
-    load_diff_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, LoadRequest) LoadError!LoadResult,
-
-    pub fn loadDiff(self: GitBackend, allocator: std.mem.Allocator, io: std.Io, request: LoadRequest) LoadError!LoadResult {
-        return self.load_diff_fn(self.ptr, allocator, io, request);
-    }
-};
-
-pub const LocalGitCommandBackend = struct {
-    const git_diff_unstaged = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
-    const git_diff_cached = [_][]const u8{ "git", "diff", "--cached", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
-
-    pub fn backend(self: *LocalGitCommandBackend) GitBackend {
-        return .{
-            .ptr = self,
-            .load_diff_fn = loadDiffErased,
-        };
-    }
-
-    pub fn loadDiff(_: *LocalGitCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: LoadRequest) LoadError!LoadResult {
-        return switch (request.source) {
-            .unstaged => loadGitDiff(allocator, io, request.repo_root orelse return error.MissingRepoRoot, &git_diff_unstaged),
-            .cached => loadGitDiff(allocator, io, request.repo_root orelse return error.MissingRepoRoot, &git_diff_cached),
-            .range => |range| loadGitDiffRange(allocator, io, request.repo_root orelse return error.MissingRepoRoot, range),
-            .patch_file => |path| .{ .ok = readPatchFile(allocator, io, path) catch |err| return mapReadError(err) },
-            .stdin => .{ .ok = readStdin(allocator, io) catch |err| return mapReadError(err) },
-        };
-    }
-
-    fn loadDiffErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: LoadRequest) LoadError!LoadResult {
-        const self: *LocalGitCommandBackend = @ptrCast(@alignCast(ctx));
-        return self.loadDiff(allocator, io, request);
-    }
-};
+pub const LoadResult = git_backend.LoadResult;
 
 pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
     var config: CliConfig = .{};
@@ -207,57 +147,43 @@ pub fn freeLoadRequest(allocator: std.mem.Allocator, request: LoadRequest) void 
     if (request.repo_root) |repo_root| allocator.free(repo_root);
 }
 
-/// Convenience entry point for terminal mode. The explicit GitBackend interface
-/// remains available for tests and future non-local backends.
+/// Convenience entry point for terminal mode.
+///
+/// Raw sources are read locally here. Git-command sources are converted to a
+/// git_backend request so the backend boundary never needs to model stdin or
+/// patch-file input.
 pub fn load(allocator: std.mem.Allocator, io: std.Io, request: LoadRequest) LoadError!LoadResult {
-    var local_backend: LocalGitCommandBackend = .{};
-    return local_backend.backend().loadDiff(allocator, io, request);
-}
-
-fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!LoadResult {
-    // Use structured argv and force stable path prefixes so display/editor
-    // paths do not depend on user diff.mnemonicPrefix/diff.noprefix config.
-    const result = std.process.run(allocator, io, .{
-        .argv = argv,
-        .cwd = .{ .path = repo_root },
-        .stdout_limit = .limited(max_diff_bytes),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
-
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .{ .ok = result.stdout };
+    return switch (request.source) {
+        .patch_file => |path| .{ .ok = readPatchFile(allocator, io, path) catch |err| return mapReadError(err) },
+        .stdin => .{ .ok = readStdin(allocator, io) catch |err| return mapReadError(err) },
+        .unstaged, .cached, .range => {
+            var local_backend: git_backend.LocalCommandBackend = .{};
+            return local_backend.backend().loadDiff(allocator, io, try gitDiffRequest(request));
         },
-        else => {},
-    }
-
-    allocator.free(result.stdout);
-    // Prefer Git's stderr when available; it usually contains the actionable
-    // reason, for example "not a git repository".
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-
-    return .{ .failed = std.fmt.allocPrint(allocator, "git diff failed: {any}", .{result.term}) catch return error.OutOfMemory };
+    };
 }
 
-fn loadGitDiffRange(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, range: []const u8) LoadError!LoadResult {
-    const argv = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", range };
-    return loadGitDiff(allocator, io, repo_root, &argv);
+fn gitDiffRequest(request: LoadRequest) LoadError!git_backend.GitDiffRequest {
+    const repo_root = request.repo_root orelse return error.MissingRepoRoot;
+    return .{
+        .repo_root = repo_root,
+        .kind = switch (request.source) {
+            .unstaged => .unstaged,
+            .cached => .cached,
+            .range => |range| .{ .range = range },
+            .stdin, .patch_file => unreachable,
+        },
+    };
 }
 
 fn readPatchFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
-    return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_diff_bytes));
+    return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(git_backend.max_diff_bytes));
 }
 
 fn readStdin(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     var buffer: [4096]u8 = undefined;
     var reader = std.Io.File.stdin().readerStreaming(io, &buffer);
-    return try reader.interface.allocRemaining(allocator, .limited(max_diff_bytes));
+    return try reader.interface.allocRemaining(allocator, .limited(git_backend.max_diff_bytes));
 }
 
 fn mapReadError(err: anyerror) LoadError {
@@ -375,17 +301,9 @@ test "cloneLoadRequest duplicates source payload and repo root" {
     try std.testing.expectEqualStrings("/repo", request.repo_root.?);
 }
 
-test "LocalGitCommandBackend requires repo root for git sources" {
-    var local_backend: LocalGitCommandBackend = .{};
-    try std.testing.expectError(error.MissingRepoRoot, local_backend.loadDiff(std.testing.allocator, std.testing.io, .{
+test "load requires repo root before routing git sources to backend" {
+    try std.testing.expectError(error.MissingRepoRoot, load(std.testing.allocator, std.testing.io, .{
         .source = .unstaged,
         .repo_root = null,
     }));
-}
-
-test "LocalGitCommandBackend exposes backend interface" {
-    var local_backend: LocalGitCommandBackend = .{};
-    const backend = local_backend.backend();
-
-    try std.testing.expect(backend.ptr == @as(*anyopaque, @ptrCast(&local_backend)));
 }
