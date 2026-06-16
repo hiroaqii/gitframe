@@ -44,6 +44,7 @@ const ViewerState = struct {
     sidebar_hidden: bool = false,
     sidebar_width: ?u16 = null,
     diff_scroll: usize = 0,
+    diff_horizontal_scroll: usize = 0,
     selected_hunk: usize = 0,
     display_mode: diff_render.DisplayMode = .side_by_side,
 };
@@ -160,6 +161,8 @@ pub const App = struct {
         collapse_or_parent_directory,
         scroll_diff_up,
         scroll_diff_down,
+        scroll_diff_left,
+        scroll_diff_right,
         page_diff_up,
         page_diff_down,
         select_previous_hunk,
@@ -226,7 +229,9 @@ pub const App = struct {
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .terminal_resized => |size| {
+                const previous_width = self.diffPaneWidth();
                 self.terminal_size = size;
+                self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
                 self.clampDiffNavigationKeepingHunkVisible();
                 self.updateSearchMatchOffset();
                 self.scrollSearchMatchIntoView();
@@ -241,6 +246,8 @@ pub const App = struct {
             .collapse_or_parent_directory => try self.collapseOrSelectParentDirectory(),
             .scroll_diff_up => self.scrollDiff(-1),
             .scroll_diff_down => self.scrollDiff(1),
+            .scroll_diff_left => self.scrollDiffHorizontal(-1),
+            .scroll_diff_right => self.scrollDiffHorizontal(1),
             .page_diff_up => self.pageDiff(-1),
             .page_diff_down => self.pageDiff(1),
             .select_previous_hunk => self.selectHunkDelta(-1),
@@ -256,6 +263,7 @@ pub const App = struct {
             .increase_sidebar_width => self.adjustSidebarWidth(1),
             .toggle_display_mode => {
                 self.viewer.display_mode = self.viewer.display_mode.toggled();
+                self.resetDiffHorizontalScroll();
                 self.clampDiffNavigationKeepingHunkVisible();
                 self.updateSearchMatchOffset();
                 self.scrollSearchMatchIntoView();
@@ -613,6 +621,7 @@ pub const App = struct {
         self.load.arena = null;
         self.load.state = .idle;
         self.viewer.diff_scroll = 0;
+        self.viewer.diff_horizontal_scroll = 0;
         self.viewer.selected_hunk = 0;
         self.clearSearchMatch();
     }
@@ -719,6 +728,50 @@ pub const App = struct {
             self.viewer.diff_scroll += 1;
         }
         self.clampDiffNavigation();
+    }
+
+    fn scrollDiffHorizontal(self: *App, delta: i2) void {
+        const step: usize = 8;
+        if (delta < 0) {
+            self.viewer.diff_horizontal_scroll -|= step;
+        } else {
+            self.viewer.diff_horizontal_scroll += step;
+            self.clampDiffHorizontalScrollToVisibleRows();
+        }
+    }
+
+    fn clampDiffHorizontalScrollToVisibleRows(self: *App) void {
+        const max_scroll = self.visibleBodyTextMaxHorizontalScroll();
+        if (self.viewer.diff_horizontal_scroll > max_scroll) {
+            self.viewer.diff_horizontal_scroll = max_scroll;
+        }
+    }
+
+    fn visibleBodyTextMaxHorizontalScroll(self: *const App) usize {
+        const file = self.selectedFile() orelse return 0;
+        const mode = self.effectiveDisplayMode();
+        const visible_rows = self.diffVisibleRows();
+        if (visible_rows == 0) return 0;
+
+        const pane_width = self.diffPaneWidth();
+        const line_index = self.selectedFileCachedLineIndex(mode);
+        var max_scroll: usize = 0;
+        var rows = if (line_index) |index|
+            diff_view_model.BodyRowIterator.initAtWithFolded(file, mode, index, self.viewer.diff_scroll, self.selectedFoldedHunks())
+        else
+            diff_view_model.BodyRowIterator.initWithFolded(file, mode, self.selectedFoldedHunks());
+        var skipped: usize = if (line_index != null) self.viewer.diff_scroll else 0;
+        var visible: usize = 0;
+        while (rows.next()) |body_row| {
+            if (skipped < self.viewer.diff_scroll) {
+                skipped += 1;
+                continue;
+            }
+            if (visible >= visible_rows) break;
+            visible += 1;
+            max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(body_row, pane_width));
+        }
+        return max_scroll;
     }
 
     fn pageDiff(self: *App, delta: i2) void {
@@ -999,6 +1052,7 @@ pub const App = struct {
         };
         self.unfoldSearchMatchIfNeeded(next);
         self.setSearchMatch(next);
+        self.resetDiffHorizontalScroll();
         if (self.search.match_offset) |offset| self.viewer.diff_scroll = offset;
         self.clampDiffNavigation();
     }
@@ -1082,6 +1136,12 @@ pub const App = struct {
         return loaded.cachedRenderedLineIndex(file_index, mode);
     }
 
+    fn selectedFoldedHunks(self: *const App) []const bool {
+        const loaded = self.activeLoadedDiffConst() orelse return &.{};
+        const file_index = self.selectedFileIndex(loaded) orelse return &.{};
+        return loaded.foldedHunksForFile(file_index);
+    }
+
     fn selectedHunkOffset(self: *const App, mode: diff_render.DisplayMode, hunk_index: usize) usize {
         const loaded = self.activeLoadedDiffConst() orelse return 0;
         const file_index = self.selectedFileIndex(loaded) orelse return 0;
@@ -1111,8 +1171,10 @@ pub const App = struct {
     }
 
     fn toggleSidebarVisibility(self: *App) void {
+        const previous_width = self.diffPaneWidth();
         self.viewer.sidebar_hidden = !self.viewer.sidebar_hidden;
         if (self.viewer.sidebar_hidden) self.viewer.focus = .diff;
+        self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
         self.clampDiffNavigationKeepingHunkVisible();
         self.updateSearchMatchOffset();
         self.scrollSearchMatchIntoView();
@@ -1121,6 +1183,7 @@ pub const App = struct {
 
     fn adjustSidebarWidth(self: *App, direction: i2) void {
         const total_width = self.terminal_size.width;
+        const previous_width = self.diffPaneWidth();
         const current = sidebarWidth(total_width, self.viewer.sidebar_width);
         const step: u16 = 4;
         const next = if (direction < 0)
@@ -1129,10 +1192,19 @@ pub const App = struct {
             current +| step;
 
         self.viewer.sidebar_width = sidebarWidth(total_width, next);
+        self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
         self.clampDiffNavigationKeepingHunkVisible();
         self.updateSearchMatchOffset();
         self.scrollSearchMatchIntoView();
         self.clampDiffNavigation();
+    }
+
+    fn resetDiffHorizontalScroll(self: *App) void {
+        self.viewer.diff_horizontal_scroll = 0;
+    }
+
+    fn resetDiffHorizontalScrollIfPaneWidthChanged(self: *App, previous_width: u16) void {
+        if (self.diffPaneWidth() != previous_width) self.resetDiffHorizontalScroll();
     }
 
     fn clampSelection(self: *App, file_count: usize) void {
@@ -1254,6 +1326,46 @@ fn terminalBodyHeight(terminal_height: u16) u16 {
 
 fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
     return app_view.sidebarWidth(total_width, preferred_width);
+}
+
+fn maxHorizontalScrollForBodyRow(body_row: diff_view_model.BodyRow, pane_width: u16) usize {
+    return switch (body_row) {
+        .unified_line => |line| maxHorizontalScrollForText(line.text, if (pane_width > 12) pane_width - 12 else 0),
+        .side_by_side => |side_row| maxHorizontalScrollForSideBySideRow(side_row, pane_width),
+        else => 0,
+    };
+}
+
+fn maxHorizontalScrollForSideBySideRow(side_row: diff_view_model.SideBySideRow, pane_width: u16) usize {
+    const gutter_col = pane_width / 2;
+    const new_col = gutter_col + 1;
+    const old_text_width: u16 = if (gutter_col > 7) gutter_col - 7 else 0;
+    const new_width: u16 = if (pane_width > new_col) pane_width - new_col else 0;
+    const new_text_width: u16 = if (new_width > 7) new_width - 7 else 0;
+    var max_scroll: usize = 0;
+    switch (side_row) {
+        .single => |line| {
+            switch (line.kind) {
+                .added => max_scroll = @max(max_scroll, maxHorizontalScrollForText(line.text, new_text_width)),
+                .context => {
+                    max_scroll = @max(max_scroll, maxHorizontalScrollForText(line.text, old_text_width));
+                    max_scroll = @max(max_scroll, maxHorizontalScrollForText(line.text, new_text_width));
+                },
+                else => max_scroll = @max(max_scroll, maxHorizontalScrollForText(line.text, old_text_width)),
+            }
+        },
+        .paired => |pair| {
+            if (pair.removed) |line| max_scroll = @max(max_scroll, maxHorizontalScrollForText(line.text, old_text_width));
+            if (pair.added) |line| max_scroll = @max(max_scroll, maxHorizontalScrollForText(line.text, new_text_width));
+        },
+    }
+    return max_scroll;
+}
+
+fn maxHorizontalScrollForText(text: []const u8, visible_width: u16) usize {
+    const width = chasen.text.displayWidth(text);
+    if (width <= visible_width) return 0;
+    return width - visible_width;
 }
 
 const SearchQuery = struct {
@@ -1439,6 +1551,99 @@ test "sidebar width remains stored while sidebar is hidden" {
     try std.testing.expect(!app.viewer.sidebar_hidden);
     try std.testing.expectEqual(@as(?u16, 26), app.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
+}
+
+test "horizontal scroll uses diff focus arrows and clamps to visible text" {
+    var app: App = .{
+        .terminal_size = .{ .width = 80, .height = 10 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffWide() } },
+        .viewer = .{ .focus = .diff, .display_mode = .unified },
+    };
+
+    app.scrollDiffHorizontal(1);
+    try std.testing.expectEqual(@as(usize, 8), app.viewer.diff_horizontal_scroll);
+
+    for (0..20) |_| app.scrollDiffHorizontal(1);
+    try std.testing.expect(app.viewer.diff_horizontal_scroll > 0);
+    try std.testing.expect(app.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
+
+    app.scrollDiffHorizontal(-1);
+    try std.testing.expect(app.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
+}
+
+test "layout changes reset horizontal scroll only when diff pane width changes" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffWide() } },
+        .viewer = .{
+            .display_mode = .side_by_side,
+            .diff_horizontal_scroll = 16,
+        },
+    };
+
+    app.toggleSidebarVisibility();
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
+
+    app.viewer.diff_horizontal_scroll = 16;
+    app.adjustSidebarWidth(-1);
+    try std.testing.expectEqual(@as(usize, 16), app.viewer.diff_horizontal_scroll);
+
+    app.toggleSidebarVisibility();
+    app.viewer.diff_horizontal_scroll = 16;
+    app.adjustSidebarWidth(-1);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
+}
+
+test "search resync without pane width change keeps horizontal scroll" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffWide() } },
+        .viewer = .{
+            .display_mode = .side_by_side,
+            .sidebar_hidden = true,
+        },
+    };
+
+    setSearchQuery(&app, "wide");
+    app.submitSearch();
+    app.viewer.diff_horizontal_scroll = 16;
+
+    app.adjustSidebarWidth(-1);
+
+    try std.testing.expectEqual(@as(usize, 16), app.viewer.diff_horizontal_scroll);
+}
+
+test "side-by-side context horizontal clamp checks both columns" {
+    const line = diff_parser.DiffLine{
+        .kind = .context,
+        .text = "0123456789012345678901234567890123456789",
+        .old_line = 1,
+        .new_line = 1,
+    };
+
+    try std.testing.expectEqual(
+        @as(usize, 8),
+        maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, 80),
+    );
+}
+
+test "display mode and search navigation reset horizontal scroll" {
+    var app: App = .{
+        .terminal_size = .{ .width = 120, .height = 8 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffWide() } },
+        .viewer = .{
+            .display_mode = .unified,
+            .diff_horizontal_scroll = 16,
+        },
+    };
+
+    try app.update(.toggle_display_mode, undefined);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
+
+    app.viewer.diff_horizontal_scroll = 16;
+    setSearchQuery(&app, "wide");
+    app.submitSearch();
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
 }
 
 test "hidden sidebar keeps tab from changing focus" {
@@ -2474,6 +2679,17 @@ fn testLoadedDiffTwoWithStatuses() LoadedDiff {
     };
 }
 
+fn testLoadedDiffWide() LoadedDiff {
+    return .{
+        .text = "",
+        .document = .{ .files = &test_files_wide },
+        .tree = .{ .nodes = &test_tree_one_nodes },
+        .collapsed_dirs = .{},
+        .bytes = 0,
+        .lines = 0,
+    };
+}
+
 const test_tree_one_nodes = [_]file_tree.Node{
     .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .file_index = 0 },
 };
@@ -2526,6 +2742,30 @@ const test_files_two_statuses = [_]diff_parser.FileDiff{
         .metadata = &.{"deleted file mode 100644"},
         .hunks = &.{},
     },
+};
+
+const test_files_wide = [_]diff_parser.FileDiff{
+    test_file_wide,
+};
+
+const test_file_wide = diff_parser.FileDiff{
+    .header = "diff --git a/a b/a",
+    .old_path = "a/a",
+    .new_path = "b/a",
+    .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
+    .hunks = &.{.{
+        .old_start = 1,
+        .old_count = 1,
+        .new_start = 1,
+        .new_count = 1,
+        .section = "wide",
+        .lines = &.{.{
+            .kind = .context,
+            .text = "wide-0123456789-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            .old_line = 1,
+            .new_line = 1,
+        }},
+    }},
 };
 
 const test_diff_one =

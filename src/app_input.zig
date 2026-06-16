@@ -76,6 +76,8 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.focus == .diff and key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "toggle_hunk_fold");
     if (context.focus == .sidebar and key.matches(chasen.Key.right, .{})) return voidMsg(Msg, "expand_directory");
     if (context.focus == .sidebar and key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "collapse_or_parent_directory");
+    if (context.focus == .diff and key.matches(chasen.Key.right, .{})) return voidMsg(Msg, "scroll_diff_right");
+    if (context.focus == .diff and key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "scroll_diff_left");
 
     return switch (key.codepoint) {
         'k', chasen.Key.up => if (context.focus == .diff) voidMsg(Msg, "scroll_diff_up") else voidMsg(Msg, "select_previous_file"),
@@ -140,6 +142,8 @@ const TestMsg = union(enum) {
     toggle_hunk_fold,
     expand_directory,
     collapse_or_parent_directory,
+    scroll_diff_right,
+    scroll_diff_left,
     scroll_diff_up,
     select_previous_file,
     scroll_diff_down,
@@ -181,6 +185,13 @@ test "keyToMsg routes text while search is active" {
 test "keyToMsg maps enter by focused pane" {
     try std.testing.expectEqual(TestMsg.toggle_directory, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = chasen.Key.enter }).?);
     try std.testing.expectEqual(TestMsg.toggle_hunk_fold, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = chasen.Key.enter }).?);
+}
+
+test "keyToMsg maps left and right by focused pane" {
+    try std.testing.expectEqual(TestMsg.expand_directory, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = chasen.Key.right }).?);
+    try std.testing.expectEqual(TestMsg.collapse_or_parent_directory, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = chasen.Key.left }).?);
+    try std.testing.expectEqual(TestMsg.scroll_diff_right, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = chasen.Key.right }).?);
+    try std.testing.expectEqual(TestMsg.scroll_diff_left, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = chasen.Key.left }).?);
 }
 
 test "keyToMsg maps sidebar visibility and suppresses focus toggle while hidden" {

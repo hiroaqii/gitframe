@@ -233,22 +233,24 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     else
         "sidebar";
     if (app.viewer.sidebar_hidden) {
-        _ = try surface.printAt(0, 2, paneStatusStyle(true), "{d}/{d}  {d} hunks  {s}  {s}  scroll:{d}", .{
+        _ = try surface.printAt(0, 2, paneStatusStyle(true), "{d}/{d}  {d} hunks  {s}  {s}  scroll:{d}{s}", .{
             selected + 1,
             loaded.document.files.len,
             file.hunks.len,
             mode.label(),
             focus_label,
             app.viewer.diff_scroll,
+            horizontalScrollStatus(surface, app.viewer.diff_horizontal_scroll),
         });
     } else {
-        _ = try surface.printAt(0, 2, paneStatusStyle(app.viewer.focus == .diff), "{d}/{d}  {d} hunks  {s}  focus:{s}  scroll:{d}", .{
+        _ = try surface.printAt(0, 2, paneStatusStyle(app.viewer.focus == .diff), "{d}/{d}  {d} hunks  {s}  focus:{s}  scroll:{d}{s}", .{
             selected + 1,
             loaded.document.files.len,
             file.hunks.len,
             mode.label(),
             focus_label,
             app.viewer.diff_scroll,
+            horizontalScrollStatus(surface, app.viewer.diff_horizontal_scroll),
         });
     }
     if (app.search.query.len > 0 or app.search.mode) {
@@ -267,11 +269,17 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     try diff_render.renderFile(&diff_content, file, .{
         .requested_mode = app.viewer.display_mode,
         .scroll = app.viewer.diff_scroll,
+        .horizontal_scroll = app.viewer.diff_horizontal_scroll,
         .highlighted_hunk = if (file.hunks.len > 0) app.viewer.selected_hunk else null,
         .line_index = loaded.cachedRenderedLineIndex(selected, mode),
         .folded_hunks = loaded.foldedHunksForFile(selected),
     });
     drawSearchMatchMarker(app, surface);
+}
+
+fn horizontalScrollStatus(surface: *chasen.Surface, offset: usize) []const u8 {
+    if (offset == 0) return "";
+    return std.fmt.allocPrint(surface.frameAllocator(), "  x:{d}", .{offset}) catch "";
 }
 
 fn viewLoadState(app: anytype, col: *chasen.Column) !void {
