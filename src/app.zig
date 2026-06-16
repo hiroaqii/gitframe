@@ -1651,6 +1651,58 @@ test "sidebar renders mode change badge next to file status" {
     try ts.expectCellText(4, sidebar_header_rows, "m");
 }
 
+test "sidebar title indicates active focus" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(34, 8);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 80, .height = 9 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .viewer = .{ .focus = .sidebar },
+    };
+
+    try app.viewSidebar(&ts.surface, app.load.state.loaded);
+
+    try ts.expectCellText(0, 0, "F");
+    try std.testing.expect(ts.surface.readCell(0, 0).?.style.reverse);
+}
+
+test "diff status row indicates active focus" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(90, 10);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 90, .height = 11 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .viewer = .{ .focus = .diff },
+    };
+
+    try app.viewDiffPane(&ts.surface, app.load.state.loaded);
+
+    try ts.expectCellText(0, 2, "1");
+    try std.testing.expect(ts.surface.readCell(0, 2).?.style.reverse);
+}
+
+test "diff search row keeps active focus style" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(90, 10);
+    defer ts.deinit();
+
+    var app: App = .{
+        .terminal_size = .{ .width = 90, .height = 11 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .viewer = .{ .focus = .diff },
+    };
+    setSearchQuery(&app, "missing");
+
+    try app.viewDiffPane(&ts.surface, app.load.state.loaded);
+
+    try ts.expectCellText(0, 2, "s");
+    try std.testing.expect(ts.surface.readCell(0, 2).?.style.reverse);
+}
+
 test "changed file filter keeps only matching status rows" {
     var app: App = .{
         .load = .{ .arena = .init(std.testing.allocator), .state = .{ .loaded = testLoadedDiffTwoWithStatuses() } },

@@ -83,9 +83,10 @@ fn viewLoadedDiff(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.Lo
     try viewSidebar(app, &sidebar, loaded);
 
     if (size.width > sidebar_width) {
+        const style = paneDividerStyle(app.viewer.focus);
         var row: u16 = 0;
         while (row < size.height) : (row += 1) {
-            _ = surface.borrowTextAt(sidebar_width, row, "│", .{ .fg = .gray });
+            _ = surface.borrowTextAt(sidebar_width, row, "│", style);
         }
     }
 
@@ -104,11 +105,7 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    const title_style: chasen.TextStyle = if (app.viewer.focus == .sidebar)
-        .{ .bold = true, .reverse = true, .fg = .{ .index = 14 } }
-    else
-        .{ .bold = true, .fg = .{ .index = 14 } };
-    _ = surface.borrowTextAt(0, 0, "Files", title_style);
+    _ = surface.borrowTextAt(0, 0, "Files", paneTitleStyle(app.viewer.focus == .sidebar));
     _ = try surface.printAt(0, 1, .{ .fg = .gray }, "{d} files / {d} hunks", .{
         loaded.document.files.len,
         loaded.document.totalHunks(),
@@ -225,7 +222,7 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     var diff_content = diffContentSurface(surface);
     const mode = diff_render.effectiveMode(diff_content.size().width, app.viewer.display_mode);
     const focus_label = if (app.viewer.focus == .diff) "diff" else "sidebar";
-    _ = try surface.printAt(0, 2, .{ .fg = .gray }, "{d}/{d}  {d} hunks  {s}  focus:{s}  scroll:{d}", .{
+    _ = try surface.printAt(0, 2, paneStatusStyle(app.viewer.focus == .diff), "{d}/{d}  {d} hunks  {s}  focus:{s}  scroll:{d}", .{
         selected + 1,
         loaded.document.files.len,
         file.hunks.len,
@@ -241,10 +238,10 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
             std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ app.search.query.slice(), offset + 1 }) catch "search"
         else
             std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{app.search.query.slice()}) catch "search";
-        _ = surface.copyTextAt(0, 2, match_text, .{ .fg = .{ .index = 11 } }) catch {};
+        _ = surface.copyTextAt(0, 2, match_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
     } else if (app.search.mode and size.width > 0) {
         const prompt_text = std.fmt.allocPrint(surface.frameAllocator(), "search: {s}", .{app.search.input.slice()}) catch "search";
-        _ = surface.copyTextAt(0, 2, prompt_text, .{ .fg = .{ .index = 11 } }) catch {};
+        _ = surface.copyTextAt(0, 2, prompt_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
     }
     try diff_render.renderFile(&diff_content, file, .{
         .requested_mode = app.viewer.display_mode,
@@ -446,6 +443,34 @@ fn reviewedStyle(selected: bool) chasen.TextStyle {
 
 fn modeBadgeStyle(selected: bool) chasen.TextStyle {
     return .{ .fg = .{ .index = 12 }, .bold = true, .reverse = selected };
+}
+
+fn paneTitleStyle(active: bool) chasen.TextStyle {
+    return if (active)
+        .{ .bold = true, .reverse = true, .fg = .{ .index = 14 } }
+    else
+        .{ .bold = true, .fg = .gray };
+}
+
+fn paneStatusStyle(active: bool) chasen.TextStyle {
+    return if (active)
+        .{ .reverse = true, .fg = .{ .index = 14 } }
+    else
+        .{ .fg = .gray };
+}
+
+fn paneSearchStyle(active: bool) chasen.TextStyle {
+    return if (active)
+        .{ .reverse = true, .fg = .{ .index = 11 } }
+    else
+        .{ .fg = .{ .index = 11 } };
+}
+
+fn paneDividerStyle(focus: anytype) chasen.TextStyle {
+    return switch (focus) {
+        .sidebar => .{ .fg = .{ .index = 14 } },
+        .diff => .{ .fg = .{ .index = 10 } },
+    };
 }
 
 pub fn terminalBodyHeight(terminal_height: u16) u16 {
