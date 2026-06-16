@@ -46,7 +46,7 @@ pub fn view(app: anytype, surface: *chasen.Surface) !void {
 }
 
 fn viewBody(app: anytype, surface: *chasen.Surface) !void {
-    switch (app.load_state) {
+    switch (app.load.state) {
         .loaded => |loaded| return viewLoadedDiff(app, surface, loaded),
         else => {},
     }
@@ -257,7 +257,7 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
 }
 
 fn viewLoadState(app: anytype, col: *chasen.Column) !void {
-    switch (app.load_state) {
+    switch (app.load.state) {
         .idle => col.borrowText("Waiting to load diff.", .{ .fg = .gray }),
         .loading => col.borrowText("Loading diff...", .{ .fg = .{ .index = 11 } }),
         .empty => |reason| switch (reason) {
