@@ -16,6 +16,7 @@ test {
     _ = @import("app_input.zig");
     _ = @import("editor.zig");
     _ = @import("git_backend.zig");
+    _ = @import("git_status.zig");
     _ = @import("repo_state.zig");
     _ = @import("review_state.zig");
 }
