@@ -78,7 +78,7 @@ fn viewLoadedDiff(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.Lo
         return;
     }
 
-    const sidebar_width = sidebarWidth(size.width);
+    const sidebar_width = sidebarWidth(size.width, app.viewer.sidebar_width);
     var sidebar = surface.child(.{
         .col = 0,
         .row = 0,
@@ -499,10 +499,23 @@ pub fn terminalBodyHeight(terminal_height: u16) u16 {
     return if (terminal_height > footer_rows) terminal_height - footer_rows else 0;
 }
 
-pub fn sidebarWidth(total_width: u16) u16 {
+pub fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
+    return clampSidebarWidth(total_width, preferred_width orelse defaultSidebarWidth(total_width));
+}
+
+pub fn defaultSidebarWidth(total_width: u16) u16 {
     if (total_width < 50) return @min(total_width, 24);
     if (total_width < 90) return 28;
     return 34;
+}
+
+pub fn clampSidebarWidth(total_width: u16, width: u16) u16 {
+    const min_diff_pane_width: u16 = 24;
+    const hard_max_width: u16 = 48;
+    const max_available = if (total_width > min_diff_pane_width + 1) total_width - min_diff_pane_width - 1 else total_width;
+    const max_width = @min(hard_max_width, max_available);
+    const min_width = @min(@as(u16, 18), max_width);
+    return @min(@max(width, min_width), max_width);
 }
 
 const footer_sidebar_items = [_]ui.key_hint.Item{
@@ -516,6 +529,7 @@ const footer_sidebar_items = [_]ui.key_hint.Item{
     ui.key_hint.item("v", "viewed"),
     ui.key_hint.item("H", "hide viewed"),
     ui.key_hint.item("B", "hide sidebar"),
+    ui.key_hint.item("[/]", "width"),
     ui.key_hint.item("e", "edit"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),
@@ -533,6 +547,7 @@ const footer_diff_items = [_]ui.key_hint.Item{
     ui.key_hint.item("v", "viewed"),
     ui.key_hint.item("H", "hide viewed"),
     ui.key_hint.item("B", "hide sidebar"),
+    ui.key_hint.item("[/]", "width"),
     ui.key_hint.item("e", "edit"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),
@@ -546,6 +561,7 @@ const footer_hidden_sidebar_items = [_]ui.key_hint.Item{
     ui.key_hint.item("/", "search"),
     ui.key_hint.item("f", "file"),
     ui.key_hint.item("B", "show sidebar"),
+    ui.key_hint.item("[/]", "width"),
     ui.key_hint.item("e", "edit"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),

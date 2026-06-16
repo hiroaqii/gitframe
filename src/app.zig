@@ -42,6 +42,7 @@ const ViewerState = struct {
     selected_node: usize = 0,
     focus: Focus = .sidebar,
     sidebar_hidden: bool = false,
+    sidebar_width: ?u16 = null,
     diff_scroll: usize = 0,
     selected_hunk: usize = 0,
     display_mode: diff_render.DisplayMode = .side_by_side,
@@ -168,6 +169,8 @@ pub const App = struct {
         select_last_file,
         toggle_focus,
         toggle_sidebar_visibility,
+        decrease_sidebar_width,
+        increase_sidebar_width,
         toggle_display_mode,
         enter_search,
         cancel_search,
@@ -249,6 +252,8 @@ pub const App = struct {
                 if (!self.viewer.sidebar_hidden) self.viewer.focus = self.viewer.focus.toggled();
             },
             .toggle_sidebar_visibility => self.toggleSidebarVisibility(),
+            .decrease_sidebar_width => self.adjustSidebarWidth(-1),
+            .increase_sidebar_width => self.adjustSidebarWidth(1),
             .toggle_display_mode => {
                 self.viewer.display_mode = self.viewer.display_mode.toggled();
                 self.clampDiffNavigationKeepingHunkVisible();
@@ -1100,7 +1105,7 @@ pub const App = struct {
     fn diffPaneWidth(self: *const App) u16 {
         const width = self.terminal_size.width;
         if (self.viewer.sidebar_hidden) return contentWidth(width);
-        const sidebar_width = sidebarWidth(width);
+        const sidebar_width = sidebarWidth(width, self.viewer.sidebar_width);
         if (width <= sidebar_width + 1) return 0;
         return contentWidth(width - sidebar_width - 1);
     }
@@ -1108,6 +1113,22 @@ pub const App = struct {
     fn toggleSidebarVisibility(self: *App) void {
         self.viewer.sidebar_hidden = !self.viewer.sidebar_hidden;
         if (self.viewer.sidebar_hidden) self.viewer.focus = .diff;
+        self.clampDiffNavigationKeepingHunkVisible();
+        self.updateSearchMatchOffset();
+        self.scrollSearchMatchIntoView();
+        self.clampDiffNavigation();
+    }
+
+    fn adjustSidebarWidth(self: *App, direction: i2) void {
+        const total_width = self.terminal_size.width;
+        const current = sidebarWidth(total_width, self.viewer.sidebar_width);
+        const step: u16 = 4;
+        const next = if (direction < 0)
+            if (current > step) current - step else 0
+        else
+            current +| step;
+
+        self.viewer.sidebar_width = sidebarWidth(total_width, next);
         self.clampDiffNavigationKeepingHunkVisible();
         self.updateSearchMatchOffset();
         self.scrollSearchMatchIntoView();
@@ -1231,8 +1252,8 @@ fn terminalBodyHeight(terminal_height: u16) u16 {
     return app_view.terminalBodyHeight(terminal_height);
 }
 
-fn sidebarWidth(total_width: u16) u16 {
-    return app_view.sidebarWidth(total_width);
+fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
+    return app_view.sidebarWidth(total_width, preferred_width);
 }
 
 const SearchQuery = struct {
@@ -1374,6 +1395,50 @@ test "sidebar visibility toggle uses full diff width and keeps selection" {
     try std.testing.expect(!app.viewer.sidebar_hidden);
     try std.testing.expectEqual(Focus.diff, app.viewer.focus);
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
+}
+
+test "sidebar width adjustment clamps and affects effective mode" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .viewer = .{ .display_mode = .side_by_side },
+    };
+
+    try std.testing.expectEqual(@as(?u16, null), app.viewer.sidebar_width);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
+
+    app.adjustSidebarWidth(-1);
+    try std.testing.expectEqual(@as(?u16, 30), app.viewer.sidebar_width);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
+
+    app.adjustSidebarWidth(-1);
+    try std.testing.expectEqual(@as(?u16, 26), app.viewer.sidebar_width);
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
+
+    app.adjustSidebarWidth(1);
+    try std.testing.expectEqual(@as(?u16, 30), app.viewer.sidebar_width);
+}
+
+test "sidebar width remains stored while sidebar is hidden" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .viewer = .{ .display_mode = .side_by_side },
+    };
+
+    app.adjustSidebarWidth(-1);
+    app.toggleSidebarVisibility();
+    app.adjustSidebarWidth(-1);
+
+    try std.testing.expect(app.viewer.sidebar_hidden);
+    try std.testing.expectEqual(@as(?u16, 26), app.viewer.sidebar_width);
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
+
+    app.toggleSidebarVisibility();
+
+    try std.testing.expect(!app.viewer.sidebar_hidden);
+    try std.testing.expectEqual(@as(?u16, 26), app.viewer.sidebar_width);
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
 }
 
 test "hidden sidebar keeps tab from changing focus" {

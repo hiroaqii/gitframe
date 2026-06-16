@@ -92,6 +92,8 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         'v' => voidMsg(Msg, "toggle_reviewed_file"),
         'H' => voidMsg(Msg, "toggle_hide_reviewed_files"),
         'B' => voidMsg(Msg, "toggle_sidebar_visibility"),
+        '[' => voidMsg(Msg, "decrease_sidebar_width"),
+        ']' => voidMsg(Msg, "increase_sidebar_width"),
         'e' => voidMsg(Msg, "open_selected_file_in_editor"),
         'u' => voidMsg(Msg, "toggle_display_mode"),
         'q' => voidMsg(Msg, "quit"),
@@ -153,6 +155,8 @@ const TestMsg = union(enum) {
     toggle_reviewed_file,
     toggle_hide_reviewed_files,
     toggle_sidebar_visibility,
+    decrease_sidebar_width,
+    increase_sidebar_width,
     open_selected_file_in_editor,
     toggle_display_mode,
     quit,
@@ -182,6 +186,11 @@ test "keyToMsg maps enter by focused pane" {
 test "keyToMsg maps sidebar visibility and suppresses focus toggle while hidden" {
     try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, .{ .codepoint = 'B' }).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .sidebar_hidden = true }, .{ .codepoint = chasen.Key.tab }));
+}
+
+test "keyToMsg maps sidebar width adjustment keys" {
+    try std.testing.expectEqual(TestMsg.decrease_sidebar_width, keyToMsg(TestMsg, .{}, .{ .codepoint = '[' }).?);
+    try std.testing.expectEqual(TestMsg.increase_sidebar_width, keyToMsg(TestMsg, .{}, .{ .codepoint = ']' }).?);
 }
 
 test "keyToMsg uses search query to disambiguate navigation" {

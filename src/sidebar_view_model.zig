@@ -79,7 +79,6 @@ pub fn visibleRowAt(
 }
 
 pub fn layout(row: Row, width: u16) RowLayout {
-    const stats_width: u16 = if (width > 12 and hasLineStats(row.stats)) 12 else 0;
     const indent: u16 = row.depth *| 2;
     // Sidebar rows reserve fixed positions for marker, optional reviewed mark,
     // optional status/mode badges, optional fold marker, name text, and
@@ -100,6 +99,7 @@ pub fn layout(row: Row, width: u16) RowLayout {
         4 +| indent
     else
         3 +| indent;
+    const stats_width: u16 = if (shouldShowStats(row, width, name_col)) 12 else 0;
     const name_width: u16 = if (width > name_col + stats_width) width - name_col - stats_width else 0;
     const stats_col: ?u16 = if (stats_width > 0) width - stats_width else null;
 
@@ -117,6 +117,16 @@ pub fn layout(row: Row, width: u16) RowLayout {
 
 fn hasLineStats(stats: file_tree.Stats) bool {
     return stats.added != 0 or stats.removed != 0;
+}
+
+fn shouldShowStats(row: Row, width: u16, name_col: u16) bool {
+    const stats_width: u16 = 12;
+    const min_name_width_with_stats: u16 = 8;
+
+    // File names are the primary sidebar content; keep stats only when enough
+    // width remains for a recognizable name.
+    return hasLineStats(row.stats) and
+        width > name_col + stats_width + min_name_width_with_stats;
 }
 
 test "rowForNode exposes sidebar row semantics" {
@@ -250,4 +260,25 @@ test "layout omits zero line stats" {
     try std.testing.expectEqual(@as(?u16, null), row_layout.stats_col);
     try std.testing.expectEqual(@as(u16, 0), row_layout.stats_width);
     try std.testing.expectEqual(@as(u16, 36), row_layout.name_width);
+}
+
+test "layout prioritizes file name over stats in narrow sidebars" {
+    const nodes = [_]file_tree.Node{
+        .{
+            .kind = .file,
+            .name = "app.zig",
+            .path = "app.zig",
+            .depth = 0,
+            .stats = .{ .added = 68, .removed = 3 },
+            .status = .modified,
+            .file_index = 0,
+        },
+    };
+    const tree: file_tree.FileTree = .{ .nodes = &nodes };
+    const collapsed: file_tree.CollapsedSet = .empty;
+    const row_layout = layout(rowForNode(tree, &collapsed, &.{false}, 0, 0).?, 14);
+
+    try std.testing.expectEqual(@as(?u16, null), row_layout.stats_col);
+    try std.testing.expectEqual(@as(u16, 0), row_layout.stats_width);
+    try std.testing.expect(row_layout.name_width > 0);
 }
