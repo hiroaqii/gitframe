@@ -73,6 +73,11 @@ fn viewLoadedDiff(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.Lo
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
+    if (app.viewer.sidebar_hidden) {
+        try viewDiffPane(app, surface, loaded);
+        return;
+    }
+
     const sidebar_width = sidebarWidth(size.width);
     var sidebar = surface.child(.{
         .col = 0,
@@ -221,15 +226,31 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     const file = loaded.document.files[selected];
     var diff_content = diffContentSurface(surface);
     const mode = diff_render.effectiveMode(diff_content.size().width, app.viewer.display_mode);
-    const focus_label = if (app.viewer.focus == .diff) "diff" else "sidebar";
-    _ = try surface.printAt(0, 2, paneStatusStyle(app.viewer.focus == .diff), "{d}/{d}  {d} hunks  {s}  focus:{s}  scroll:{d}", .{
-        selected + 1,
-        loaded.document.files.len,
-        file.hunks.len,
-        mode.label(),
-        focus_label,
-        app.viewer.diff_scroll,
-    });
+    const focus_label = if (app.viewer.sidebar_hidden)
+        "diff/sidebar hidden"
+    else if (app.viewer.focus == .diff)
+        "diff"
+    else
+        "sidebar";
+    if (app.viewer.sidebar_hidden) {
+        _ = try surface.printAt(0, 2, paneStatusStyle(true), "{d}/{d}  {d} hunks  {s}  {s}  scroll:{d}", .{
+            selected + 1,
+            loaded.document.files.len,
+            file.hunks.len,
+            mode.label(),
+            focus_label,
+            app.viewer.diff_scroll,
+        });
+    } else {
+        _ = try surface.printAt(0, 2, paneStatusStyle(app.viewer.focus == .diff), "{d}/{d}  {d} hunks  {s}  focus:{s}  scroll:{d}", .{
+            selected + 1,
+            loaded.document.files.len,
+            file.hunks.len,
+            mode.label(),
+            focus_label,
+            app.viewer.diff_scroll,
+        });
+    }
     if (app.search.query.len > 0 or app.search.mode) {
         surface.clear(.{ .col = 0, .row = 2, .width = size.width, .height = 1 });
     }
@@ -391,6 +412,7 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
 }
 
 fn footerItems(app: anytype) []const ui.key_hint.Item {
+    if (app.viewer.sidebar_hidden) return &footer_hidden_sidebar_items;
     return switch (app.viewer.focus) {
         .sidebar => &footer_sidebar_items,
         .diff => &footer_diff_items,
@@ -493,6 +515,7 @@ const footer_sidebar_items = [_]ui.key_hint.Item{
     ui.key_hint.item("F", "filter"),
     ui.key_hint.item("v", "viewed"),
     ui.key_hint.item("H", "hide viewed"),
+    ui.key_hint.item("B", "hide sidebar"),
     ui.key_hint.item("e", "edit"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),
@@ -509,6 +532,20 @@ const footer_diff_items = [_]ui.key_hint.Item{
     ui.key_hint.item("R", "repo"),
     ui.key_hint.item("v", "viewed"),
     ui.key_hint.item("H", "hide viewed"),
+    ui.key_hint.item("B", "hide sidebar"),
+    ui.key_hint.item("e", "edit"),
+    ui.key_hint.item("n/p", "hunk/search"),
+    ui.key_hint.item("u", "mode"),
+    ui.key_hint.item("r", "reload"),
+    ui.key_hint.item("q", "quit"),
+};
+
+const footer_hidden_sidebar_items = [_]ui.key_hint.Item{
+    ui.key_hint.item("↑/↓/j/k", "scroll"),
+    ui.key_hint.item("Enter", "fold"),
+    ui.key_hint.item("/", "search"),
+    ui.key_hint.item("f", "file"),
+    ui.key_hint.item("B", "show sidebar"),
     ui.key_hint.item("e", "edit"),
     ui.key_hint.item("n/p", "hunk/search"),
     ui.key_hint.item("u", "mode"),

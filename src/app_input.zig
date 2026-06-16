@@ -23,6 +23,7 @@ pub const KeyContext = struct {
     repo_picker_mode: bool = false,
     search_query_len: usize = 0,
     focus: Focus = .sidebar,
+    sidebar_hidden: bool = false,
 };
 
 pub fn eventToMsg(comptime Msg: type, context: KeyContext, event: chasen.Event) ?Msg {
@@ -65,7 +66,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         };
     }
 
-    if (key.matches(chasen.Key.tab, .{})) return voidMsg(Msg, "toggle_focus");
+    if (key.matches(chasen.Key.tab, .{}) and !context.sidebar_hidden) return voidMsg(Msg, "toggle_focus");
     if (key.matches(chasen.Key.page_up, .{})) return voidMsg(Msg, "page_diff_up");
     if (key.matches(chasen.Key.page_down, .{})) return voidMsg(Msg, "page_diff_down");
     if (key.matches(chasen.Key.home, .{})) return voidMsg(Msg, "select_first_file");
@@ -90,6 +91,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         'F' => voidMsg(Msg, "cycle_changed_file_filter"),
         'v' => voidMsg(Msg, "toggle_reviewed_file"),
         'H' => voidMsg(Msg, "toggle_hide_reviewed_files"),
+        'B' => voidMsg(Msg, "toggle_sidebar_visibility"),
         'e' => voidMsg(Msg, "open_selected_file_in_editor"),
         'u' => voidMsg(Msg, "toggle_display_mode"),
         'q' => voidMsg(Msg, "quit"),
@@ -150,6 +152,7 @@ const TestMsg = union(enum) {
     cycle_changed_file_filter,
     toggle_reviewed_file,
     toggle_hide_reviewed_files,
+    toggle_sidebar_visibility,
     open_selected_file_in_editor,
     toggle_display_mode,
     quit,
@@ -174,6 +177,11 @@ test "keyToMsg routes text while search is active" {
 test "keyToMsg maps enter by focused pane" {
     try std.testing.expectEqual(TestMsg.toggle_directory, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = chasen.Key.enter }).?);
     try std.testing.expectEqual(TestMsg.toggle_hunk_fold, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = chasen.Key.enter }).?);
+}
+
+test "keyToMsg maps sidebar visibility and suppresses focus toggle while hidden" {
+    try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, .{ .codepoint = 'B' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .sidebar_hidden = true }, .{ .codepoint = chasen.Key.tab }));
 }
 
 test "keyToMsg uses search query to disambiguate navigation" {

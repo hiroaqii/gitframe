@@ -41,6 +41,7 @@ const ViewerState = struct {
     /// Sidebar cursor. This may point at either a directory node or a file node.
     selected_node: usize = 0,
     focus: Focus = .sidebar,
+    sidebar_hidden: bool = false,
     diff_scroll: usize = 0,
     selected_hunk: usize = 0,
     display_mode: diff_render.DisplayMode = .side_by_side,
@@ -166,6 +167,7 @@ pub const App = struct {
         select_first_file,
         select_last_file,
         toggle_focus,
+        toggle_sidebar_visibility,
         toggle_display_mode,
         enter_search,
         cancel_search,
@@ -243,7 +245,10 @@ pub const App = struct {
             .toggle_hunk_fold => self.toggleSelectedHunkFold(),
             .select_first_file => self.selectFileAbsolute(0),
             .select_last_file => self.selectLastFile(),
-            .toggle_focus => self.viewer.focus = self.viewer.focus.toggled(),
+            .toggle_focus => {
+                if (!self.viewer.sidebar_hidden) self.viewer.focus = self.viewer.focus.toggled();
+            },
+            .toggle_sidebar_visibility => self.toggleSidebarVisibility(),
             .toggle_display_mode => {
                 self.viewer.display_mode = self.viewer.display_mode.toggled();
                 self.clampDiffNavigationKeepingHunkVisible();
@@ -320,6 +325,7 @@ pub const App = struct {
             .repo_picker_mode = self.repo_picker.mode,
             .search_query_len = self.search.query.len,
             .focus = self.viewer.focus,
+            .sidebar_hidden = self.viewer.sidebar_hidden,
         };
     }
 
@@ -816,8 +822,8 @@ pub const App = struct {
     }
 
     fn enterFileSearchMode(self: *App) void {
-        self.file_search_return_focus = self.viewer.focus;
-        self.viewer.focus = .sidebar;
+        self.file_search_return_focus = if (self.viewer.sidebar_hidden) .diff else self.viewer.focus;
+        if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
         self.file_search.mode = true;
         self.file_search.input = .{};
         self.file_search.no_match = false;
@@ -828,7 +834,7 @@ pub const App = struct {
         self.file_search.input = .{};
         self.file_search.filter.deinit(allocator);
         self.file_search.no_match = false;
-        self.viewer.focus = self.file_search_return_focus;
+        self.viewer.focus = if (self.viewer.sidebar_hidden) .diff else self.file_search_return_focus;
     }
 
     fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
@@ -1093,9 +1099,19 @@ pub const App = struct {
 
     fn diffPaneWidth(self: *const App) u16 {
         const width = self.terminal_size.width;
+        if (self.viewer.sidebar_hidden) return contentWidth(width);
         const sidebar_width = sidebarWidth(width);
         if (width <= sidebar_width + 1) return 0;
         return contentWidth(width - sidebar_width - 1);
+    }
+
+    fn toggleSidebarVisibility(self: *App) void {
+        self.viewer.sidebar_hidden = !self.viewer.sidebar_hidden;
+        if (self.viewer.sidebar_hidden) self.viewer.focus = .diff;
+        self.clampDiffNavigationKeepingHunkVisible();
+        self.updateSearchMatchOffset();
+        self.scrollSearchMatchIntoView();
+        self.clampDiffNavigation();
     }
 
     fn clampSelection(self: *App, file_count: usize) void {
@@ -1329,6 +1345,48 @@ test "mode toggle keeps selected hunk visible" {
     const visible_rows = app.diffVisibleRows();
     try std.testing.expect(target >= app.viewer.diff_scroll);
     try std.testing.expect(visible_rows == 0 or target < app.viewer.diff_scroll + visible_rows);
+}
+
+test "sidebar visibility toggle uses full diff width and keeps selection" {
+    var app: App = .{
+        .terminal_size = .{ .width = 80, .height = 8 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .viewer = .{
+            .focus = .sidebar,
+            .selected_file = 0,
+            .selected_node = 1,
+            .display_mode = .side_by_side,
+        },
+    };
+
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
+
+    app.toggleSidebarVisibility();
+
+    try std.testing.expect(app.viewer.sidebar_hidden);
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
+
+    app.toggleSidebarVisibility();
+
+    try std.testing.expect(!app.viewer.sidebar_hidden);
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
+}
+
+test "hidden sidebar keeps tab from changing focus" {
+    var app: App = .{
+        .viewer = .{
+            .focus = .diff,
+            .sidebar_hidden = true,
+        },
+    };
+
+    try app.update(.toggle_focus, undefined);
+
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
 }
 
 test "mode change resyncs search match to rendered body offsets" {
@@ -1599,6 +1657,33 @@ test "file search trims empty input and restores focus on cancel" {
     try std.testing.expect(!app.file_search.mode);
     try std.testing.expectEqual(Focus.diff, app.viewer.focus);
     try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
+}
+
+test "file search keeps diff focus while sidebar is hidden" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load = .{ .arena = .init(std.testing.allocator), .state = .{ .loaded = testLoadedDiffNested() } },
+        .viewer = .{ .focus = .diff, .sidebar_hidden = true },
+    };
+    defer app.clearLoadedDiff();
+
+    app.enterFileSearchMode();
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    setFileSearchInput(&app, "   ");
+
+    try app.submitFileSearch(std.testing.allocator);
+
+    try std.testing.expect(!app.file_search.mode);
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+
+    app.enterFileSearchMode();
+    setFileSearchInput(&app, "src/b");
+
+    try app.submitFileSearch(std.testing.allocator);
+
+    try std.testing.expect(!app.file_search.mode);
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
 }
 
 test "sidebar renders file status badges" {
