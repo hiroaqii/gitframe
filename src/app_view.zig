@@ -233,17 +233,17 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         focus_label,
         app.viewer.diff_scroll,
     });
-    if (app.search_query.len > 0 or app.search_mode) {
+    if (app.search.query.len > 0 or app.search.mode) {
         surface.clear(.{ .col = 0, .row = 2, .width = size.width, .height = 1 });
     }
-    if (!app.search_mode and app.search_query.len > 0 and size.width > 0) {
-        const match_text = if (app.search_match_offset) |offset|
-            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ app.search_query.slice(), offset + 1 }) catch "search"
+    if (!app.search.mode and app.search.query.len > 0 and size.width > 0) {
+        const match_text = if (app.search.match_offset) |offset|
+            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ app.search.query.slice(), offset + 1 }) catch "search"
         else
-            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{app.search_query.slice()}) catch "search";
+            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{app.search.query.slice()}) catch "search";
         _ = surface.copyTextAt(0, 2, match_text, .{ .fg = .{ .index = 11 } }) catch {};
-    } else if (app.search_mode and size.width > 0) {
-        const prompt_text = std.fmt.allocPrint(surface.frameAllocator(), "search: {s}", .{app.search_input.slice()}) catch "search";
+    } else if (app.search.mode and size.width > 0) {
+        const prompt_text = std.fmt.allocPrint(surface.frameAllocator(), "search: {s}", .{app.search.input.slice()}) catch "search";
         _ = surface.copyTextAt(0, 2, prompt_text, .{ .fg = .{ .index = 11 } }) catch {};
     }
     try diff_render.renderFile(&diff_content, file, .{
@@ -282,9 +282,9 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
     const width = surface.size().width;
     if (width == 0) return;
 
-    if (app.search_mode) {
+    if (app.search.mode) {
         _ = surface.borrowTextAt(0, 0, "/", .{ .fg = .{ .index = 11 }, .bold = true });
-        _ = surface.copyTextAt(1, 0, app.search_input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
+        _ = surface.copyTextAt(1, 0, app.search.input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
         return;
     }
 
@@ -401,7 +401,7 @@ fn footerItems(app: anytype) []const ui.key_hint.Item {
 }
 
 pub fn drawSearchMatchMarker(app: anytype, surface: *chasen.Surface) void {
-    const match_offset = app.search_match_offset orelse return;
+    const match_offset = app.search.match_offset orelse return;
     if (match_offset < app.viewer.diff_scroll) return;
 
     const visible_offset = match_offset - app.viewer.diff_scroll;
