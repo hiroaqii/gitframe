@@ -93,14 +93,19 @@ pub fn shellFrameEnabled(size: chasen.Size) bool {
 }
 
 pub fn shellContentSize(terminal_size: chasen.Size) chasen.Size {
-    if (!shellFrameEnabled(terminal_size)) return terminal_size;
-    const rect = ui.Panel.contentRectFor(.{
+    const rect = shellContentRect(terminal_size);
+    return .{ .width = rect.width, .height = rect.height };
+}
+
+pub fn shellContentRect(terminal_size: chasen.Size) chasen.Rect {
+    const root_rect: chasen.Rect = .{
         .col = 0,
         .row = 0,
         .width = terminal_size.width,
         .height = terminal_size.height,
-    }, shell_frame_padding);
-    return .{ .width = rect.width, .height = rect.height };
+    };
+    if (!shellFrameEnabled(terminal_size)) return root_rect;
+    return ui.Panel.contentRectFor(root_rect, shell_frame_padding);
 }
 
 fn viewBody(app: anytype, surface: *chasen.Surface) !void {

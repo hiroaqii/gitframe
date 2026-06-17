@@ -34,6 +34,16 @@ const LoadedDiff = loaded_diff.LoadedDiff;
 const RepoDiscoveryFinished = app_load.RepoDiscoveryFinished;
 const RepoDiscoveryTask = app_load.RepoDiscoveryTask(App.Msg);
 
+const MousePane = enum {
+    sidebar,
+    diff,
+};
+
+const MousePoint = struct {
+    col: u16,
+    row: u16,
+};
+
 const ViewerState = struct {
     /// Sticky file shown in the diff pane. Directory sidebar rows can be
     /// selected without changing this value.
@@ -174,6 +184,14 @@ pub const App = struct {
         toggle_sidebar_visibility,
         decrease_sidebar_width,
         increase_sidebar_width,
+        focus_sidebar,
+        focus_diff,
+        mouse_sidebar_wheel_up,
+        mouse_sidebar_wheel_down,
+        mouse_diff_wheel_up,
+        mouse_diff_wheel_down,
+        mouse_diff_wheel_left,
+        mouse_diff_wheel_right,
         toggle_display_mode,
         enter_search,
         cancel_search,
@@ -261,6 +279,34 @@ pub const App = struct {
             .toggle_sidebar_visibility => self.toggleSidebarVisibility(),
             .decrease_sidebar_width => self.adjustSidebarWidth(-1),
             .increase_sidebar_width => self.adjustSidebarWidth(1),
+            .focus_sidebar => {
+                if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
+            },
+            .focus_diff => self.viewer.focus = .diff,
+            .mouse_sidebar_wheel_up => {
+                if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
+                self.selectFileDelta(-1);
+            },
+            .mouse_sidebar_wheel_down => {
+                if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
+                self.selectFileDelta(1);
+            },
+            .mouse_diff_wheel_up => {
+                self.viewer.focus = .diff;
+                self.scrollDiff(-1);
+            },
+            .mouse_diff_wheel_down => {
+                self.viewer.focus = .diff;
+                self.scrollDiff(1);
+            },
+            .mouse_diff_wheel_left => {
+                self.viewer.focus = .diff;
+                self.scrollDiffHorizontal(-1);
+            },
+            .mouse_diff_wheel_right => {
+                self.viewer.focus = .diff;
+                self.scrollDiffHorizontal(1);
+            },
             .toggle_display_mode => {
                 self.viewer.display_mode = self.viewer.display_mode.toggled();
                 self.resetDiffHorizontalScroll();
@@ -328,7 +374,79 @@ pub const App = struct {
     }
 
     pub fn handleEvent(self: *const App, event: chasen.Event) ?Msg {
-        return app_input.eventToMsg(Msg, self.keyContext(), event);
+        return switch (event) {
+            .mouse => |mouse| self.mouseToMsg(mouse),
+            else => app_input.eventToMsg(Msg, self.keyContext(), event),
+        };
+    }
+
+    fn mouseToMsg(self: *const App, mouse: anytype) ?Msg {
+        if (self.search.mode or self.file_search.mode or self.repo_picker.mode) return null;
+        if (mouse.type != .press) return null;
+
+        const pane = self.mousePane(mouse) orelse return null;
+        return switch (mouse.button) {
+            .left => switch (pane) {
+                .sidebar => .focus_sidebar,
+                .diff => .focus_diff,
+            },
+            .wheel_up => switch (pane) {
+                .sidebar => .mouse_sidebar_wheel_up,
+                .diff => .mouse_diff_wheel_up,
+            },
+            .wheel_down => switch (pane) {
+                .sidebar => .mouse_sidebar_wheel_down,
+                .diff => .mouse_diff_wheel_down,
+            },
+            .wheel_left => switch (pane) {
+                .sidebar => null,
+                .diff => .mouse_diff_wheel_left,
+            },
+            .wheel_right => switch (pane) {
+                .sidebar => null,
+                .diff => .mouse_diff_wheel_right,
+            },
+            else => null,
+        };
+    }
+
+    fn mousePane(self: *const App, mouse: anytype) ?MousePane {
+        _ = self.activeLoadedDiffConst() orelse return null;
+
+        const point = self.bodyMousePoint(mouse) orelse return null;
+        const size = self.layoutSize();
+        if (self.viewer.sidebar_hidden) return .diff;
+
+        const sidebar_width = sidebarWidth(size.width, self.viewer.sidebar_width);
+        if (point.col < sidebar_width) return .sidebar;
+        if (point.col == sidebar_width) return null;
+        return .diff;
+    }
+
+    fn bodyMousePoint(self: *const App, mouse: anytype) ?MousePoint {
+        const point = self.contentMousePoint(mouse) orelse return null;
+        if (point.row >= terminalBodyHeight(self.layoutSize().height)) return null;
+        return point;
+    }
+
+    fn contentMousePoint(self: *const App, mouse: anytype) ?MousePoint {
+        if (mouse.col < 0 or mouse.row < 0) return null;
+
+        const raw_col: usize = @intCast(mouse.col);
+        const raw_row: usize = @intCast(mouse.row);
+        const rect = app_view.shellContentRect(self.terminal_size);
+        const rect_col: usize = rect.col;
+        const rect_row: usize = rect.row;
+        const rect_width: usize = rect.width;
+        const rect_height: usize = rect.height;
+
+        if (raw_col < rect_col or raw_row < rect_row) return null;
+        if (raw_col >= rect_col + rect_width or raw_row >= rect_row + rect_height) return null;
+
+        return .{
+            .col = @intCast(raw_col - rect_col),
+            .row = @intCast(raw_row - rect_row),
+        };
     }
 
     fn keyContext(self: *const App) app_input.KeyContext {
@@ -1663,6 +1781,109 @@ test "hidden sidebar keeps tab from changing focus" {
     try std.testing.expectEqual(Focus.diff, app.viewer.focus);
 }
 
+test "mouse click focuses sidebar and diff panes" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 20 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .viewer = .{ .focus = .diff },
+    };
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    const sidebar_event = testMouseEvent(content.col + 1, content.row + 2, .left);
+    const sidebar_msg = app.handleEvent(sidebar_event) orelse return error.ExpectedSidebarMouseMessage;
+    try app.update(sidebar_msg, undefined);
+    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
+
+    const diff_col = content.col + sidebarWidth(app.layoutSize().width, app.viewer.sidebar_width) + 1;
+    const diff_event = testMouseEvent(diff_col, content.row + 2, .left);
+    const diff_msg = app.handleEvent(diff_event) orelse return error.ExpectedDiffMouseMessage;
+    try app.update(diff_msg, undefined);
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+}
+
+test "mouse wheel scrolls the pane under the pointer" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffTwo() } },
+        .viewer = .{ .focus = .diff },
+    };
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    const sidebar_msg = app.handleEvent(testMouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedSidebarWheelMessage;
+    try app.update(sidebar_msg, undefined);
+    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
+
+    app.selectFileAbsolute(0);
+    const diff_col = content.col + sidebarWidth(app.layoutSize().width, app.viewer.sidebar_width) + 1;
+    const diff_msg = app.handleEvent(testMouseEvent(diff_col, content.row + 2, .wheel_down)) orelse return error.ExpectedDiffWheelMessage;
+    try app.update(diff_msg, undefined);
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expect(app.viewer.diff_scroll > 0);
+}
+
+test "mouse uses full body as diff pane while sidebar is hidden" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .viewer = .{
+            .focus = .sidebar,
+            .sidebar_hidden = true,
+        },
+    };
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    const msg = app.handleEvent(testMouseEvent(content.col + 1, content.row + 2, .left)) orelse return error.ExpectedHiddenSidebarMouseMessage;
+    try app.update(msg, undefined);
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+}
+
+test "mouse horizontal wheel scrolls diff pane horizontally" {
+    var app: App = .{
+        .terminal_size = .{ .width = 80, .height = 12 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffWide() } },
+        .viewer = .{
+            .focus = .sidebar,
+            .display_mode = .unified,
+        },
+    };
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    const diff_col = content.col + sidebarWidth(app.layoutSize().width, app.viewer.sidebar_width) + 1;
+    const msg = app.handleEvent(testMouseEvent(diff_col, content.row + 2, .wheel_right)) orelse return error.ExpectedHorizontalWheelMessage;
+    try app.update(msg, undefined);
+
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expect(app.viewer.diff_horizontal_scroll > 0);
+}
+
+test "mouse events are ignored outside body and prompt modes" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+    };
+
+    try std.testing.expect(app.handleEvent(testMouseEvent(-1, 1, .left)) == null);
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    const footer_row: i16 = @intCast(content.row + terminalBodyHeight(app.layoutSize().height));
+    try std.testing.expect(app.handleEvent(testMouseEvent(content.col + 1, footer_row, .left)) == null);
+
+    app.search.mode = true;
+    try std.testing.expect(app.handleEvent(testMouseEvent(content.col + 1, content.row + 1, .left)) == null);
+}
+
+test "mouse release and motion events are ignored" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+    };
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    try std.testing.expect(app.handleEvent(testMouseEventTyped(content.col + 1, content.row + 1, .left, .release)) == null);
+    try std.testing.expect(app.handleEvent(testMouseEventTyped(content.col + 1, content.row + 1, .left, .motion)) == null);
+}
+
 test "mode change resyncs search match to rendered body offsets" {
     var app: App = .{
         .terminal_size = .{ .width = 140, .height = 14 },
@@ -2721,6 +2942,20 @@ fn setSearchInput(app: *App, query: []const u8) void {
 fn setFileSearchInput(app: *App, query: []const u8) void {
     @memcpy(app.file_search.input.buffer[0..query.len], query);
     app.file_search.input.len = query.len;
+}
+
+fn testMouseEvent(col: anytype, row: anytype, button: anytype) chasen.Event {
+    return testMouseEventTyped(col, row, button, .press);
+}
+
+fn testMouseEventTyped(col: anytype, row: anytype, button: anytype, mouse_type: anytype) chasen.Event {
+    return .{ .mouse = .{
+        .col = @intCast(col),
+        .row = @intCast(row),
+        .button = button,
+        .mods = .{},
+        .type = mouse_type,
+    } };
 }
 
 fn testLoadedDiffOne() LoadedDiff {

@@ -27,13 +27,23 @@ pub fn main(init: std.process.Init) !void {
             },
             .terminal = .{
                 .env_map = init.environ_map,
+                .mouse = true,
             },
         }, gitframe.App{ .config = config, .env_map = init.environ_map });
         try printStatsSummary(init.io, summary);
         return;
     }
 
-    try chasen.run(init, gitframe.App{ .config = config, .env_map = init.environ_map });
+    try chasen.runWith(.{
+        .runtime = .{
+            .allocator = init.gpa,
+            .io = init.io,
+        },
+        .terminal = .{
+            .env_map = init.environ_map,
+            .mouse = true,
+        },
+    }, gitframe.App{ .config = config, .env_map = init.environ_map });
 }
 
 fn wantsHelp(args: []const []const u8) bool {
