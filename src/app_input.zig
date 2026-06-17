@@ -69,10 +69,8 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
 
     if (context.help_mode) {
         if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "close_help");
-        return switch (key.codepoint) {
-            '?', 'q' => voidMsg(Msg, "close_help"),
-            else => null,
-        };
+        if (isHelpKey(key) or key.codepoint == 'q') return voidMsg(Msg, "close_help");
+        return null;
     }
 
     if (key.matches(chasen.Key.tab, .{}) and !context.sidebar_hidden) return voidMsg(Msg, "toggle_focus");
@@ -87,6 +85,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.focus == .sidebar and key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "collapse_or_parent_directory");
     if (context.focus == .diff and key.matches(chasen.Key.right, .{})) return voidMsg(Msg, "scroll_diff_right");
     if (context.focus == .diff and key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "scroll_diff_left");
+    if (isHelpKey(key)) return voidMsg(Msg, "open_help");
 
     return switch (key.codepoint) {
         'k', chasen.Key.up => if (context.focus == .diff) voidMsg(Msg, "scroll_diff_up") else voidMsg(Msg, "select_previous_file"),
@@ -97,7 +96,6 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         'p' => if (context.search_query_len > 0) voidMsg(Msg, "select_previous_search_match") else voidMsg(Msg, "select_previous_hunk"),
         'g' => voidMsg(Msg, "select_first_file"),
         'G' => voidMsg(Msg, "select_last_file"),
-        '?' => voidMsg(Msg, "open_help"),
         'f' => voidMsg(Msg, "enter_file_search"),
         'R' => voidMsg(Msg, "enter_repo_picker"),
         'F' => voidMsg(Msg, "cycle_changed_file_filter"),
@@ -112,6 +110,10 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         'r' => voidMsg(Msg, "reload"),
         else => null,
     };
+}
+
+fn isHelpKey(key: chasen.Key) bool {
+    return key.matches('?', .{}) or key.matches('/', .{ .shift = true });
 }
 
 pub fn isTextInputCodepoint(codepoint: u21) bool {
@@ -223,7 +225,21 @@ test "keyToMsg uses search query to disambiguate navigation" {
 
 test "keyToMsg opens and closes help outside prompt modes" {
     try std.testing.expectEqual(TestMsg.open_help, keyToMsg(TestMsg, .{}, .{ .codepoint = '?' }).?);
+    try std.testing.expectEqual(TestMsg.open_help, keyToMsg(TestMsg, .{}, .{
+        .codepoint = '/',
+        .shifted_codepoint = '?',
+        .mods = .{ .shift = true },
+    }).?);
+    try std.testing.expectEqual(TestMsg.open_help, keyToMsg(TestMsg, .{}, .{
+        .codepoint = '/',
+        .mods = .{ .shift = true },
+    }).?);
     try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = '?' }).?);
+    try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true }, .{
+        .codepoint = '/',
+        .shifted_codepoint = '?',
+        .mods = .{ .shift = true },
+    }).?);
     try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'q' }).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'j' }));
 }
