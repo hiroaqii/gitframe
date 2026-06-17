@@ -159,6 +159,7 @@ pub const App = struct {
     file_search_return_focus: Focus = .sidebar,
     repo_picker: FilterPromptState = .{},
     overlay: OverlayState = .none,
+    help_scroll: usize = 0,
     hide_reviewed_files: bool = false,
     changed_file_filter: ChangedFileFilter = .all,
     repo_state: repo_state.State = .{},
@@ -221,6 +222,10 @@ pub const App = struct {
         repo_picker_move_next,
         open_help,
         close_help,
+        help_scroll_up,
+        help_scroll_down,
+        help_page_up,
+        help_page_down,
         toggle_reviewed_file,
         toggle_hide_reviewed_files,
         cycle_changed_file_filter,
@@ -262,6 +267,7 @@ pub const App = struct {
                 self.updateSearchMatchOffset();
                 self.scrollSearchMatchIntoView();
                 self.clampDiffNavigation();
+                self.clampHelpScroll();
             },
             .repos_discovered => |finished| try self.finishRepoDiscovery(ctx, finished),
             .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
@@ -360,8 +366,15 @@ pub const App = struct {
             },
             .repo_picker_move_previous => self.repo_picker.filter.update(.move_prev),
             .repo_picker_move_next => self.repo_picker.filter.update(.move_next),
-            .open_help => self.overlay = .help,
+            .open_help => {
+                self.overlay = .help;
+                self.help_scroll = 0;
+            },
             .close_help => self.overlay = .none,
+            .help_scroll_up => self.scrollHelp(-1),
+            .help_scroll_down => self.scrollHelp(1),
+            .help_page_up => self.pageHelp(-1),
+            .help_page_down => self.pageHelp(1),
             .toggle_reviewed_file => try self.toggleReviewedFile(ctx.allocator()),
             .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
@@ -394,8 +407,16 @@ pub const App = struct {
     }
 
     fn mouseToMsg(self: *const App, mouse: anytype) ?Msg {
-        if (self.search.mode or self.file_search.mode or self.repo_picker.mode or self.overlay == .help) return null;
+        if (self.search.mode or self.file_search.mode or self.repo_picker.mode) return null;
         if (mouse.type != .press) return null;
+
+        if (self.overlay == .help) {
+            return switch (mouse.button) {
+                .wheel_up => .help_scroll_up,
+                .wheel_down => .help_scroll_down,
+                else => null,
+            };
+        }
 
         const pane = self.mousePane(mouse) orelse return null;
         return switch (mouse.button) {
@@ -472,6 +493,29 @@ pub const App = struct {
             .focus = self.viewer.focus,
             .sidebar_hidden = self.viewer.sidebar_hidden,
         };
+    }
+
+    fn scrollHelp(self: *App, delta: isize) void {
+        if (delta < 0) {
+            const amount: usize = @intCast(-(delta + 1));
+            self.help_scroll -|= amount + 1;
+        } else {
+            self.help_scroll +|= @intCast(delta);
+        }
+        self.clampHelpScroll();
+    }
+
+    fn pageHelp(self: *App, pages: isize) void {
+        const rows = @max(@as(usize, app_view.helpVisibleRows(self.layoutSize())), 1);
+        const delta: isize = if (pages < 0)
+            -@as(isize, @intCast(rows))
+        else
+            @as(isize, @intCast(rows));
+        self.scrollHelp(delta);
+    }
+
+    fn clampHelpScroll(self: *App) void {
+        self.help_scroll = @min(self.help_scroll, app_view.helpMaxScroll(self.layoutSize()));
     }
 
     fn viewSidebar(self: *const App, surface: *chasen.Surface, loaded: LoadedDiff) !void {
@@ -1877,13 +1921,27 @@ test "help overlay opens and closes before normal shortcuts" {
     try app.update(open_msg, undefined);
     try std.testing.expectEqual(OverlayState.help, app.overlay);
 
-    const ignored_msg = app.handleEvent(.{ .key_press = .{ .codepoint = 'j' } });
-    try std.testing.expect(ignored_msg == null);
+    const scroll_msg = app.handleEvent(.{ .key_press = .{ .codepoint = 'j' } }) orelse return error.ExpectedHelpScroll;
+    try std.testing.expectEqual(App.Msg.help_scroll_down, scroll_msg);
 
     const close_msg = app.handleEvent(.{ .key_press = .{ .codepoint = 'q' } }) orelse return error.ExpectedCloseHelp;
     try std.testing.expectEqual(App.Msg.close_help, close_msg);
     try app.update(close_msg, undefined);
     try std.testing.expectEqual(OverlayState.none, app.overlay);
+}
+
+test "help overlay reopen resets help scroll" {
+    var app: App = .{
+        .terminal_size = .{ .width = 120, .height = 12 },
+        .overlay = .help,
+        .help_scroll = 5,
+    };
+
+    try app.update(.close_help, undefined);
+    try app.update(.open_help, undefined);
+
+    try std.testing.expectEqual(OverlayState.help, app.overlay);
+    try std.testing.expectEqual(@as(usize, 0), app.help_scroll);
 }
 
 test "prompt input stays above help overlay" {
@@ -1955,7 +2013,7 @@ test "mouse uses full body as diff pane while sidebar is hidden" {
     try std.testing.expectEqual(Focus.diff, app.viewer.focus);
 }
 
-test "help overlay ignores mouse events" {
+test "help overlay wheel scrolls help and ignores clicks" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
         .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
@@ -1963,7 +2021,12 @@ test "help overlay ignores mouse events" {
     };
 
     const content = app_view.shellContentRect(app.terminal_size);
-    try std.testing.expect(app.handleEvent(testMouseEvent(content.col + 1, content.row + 2, .wheel_down)) == null);
+    const msg = app.handleEvent(testMouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedHelpWheelMessage;
+    try std.testing.expectEqual(App.Msg.help_scroll_down, msg);
+    try app.update(msg, undefined);
+    try std.testing.expect(app.help_scroll > 0);
+
+    try std.testing.expect(app.handleEvent(testMouseEvent(content.col + 1, content.row + 2, .left)) == null);
 }
 
 test "mouse horizontal wheel scrolls diff pane horizontally" {

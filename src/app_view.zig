@@ -20,6 +20,12 @@ const shell_frame_min_width: u16 = 30;
 const shell_frame_min_height: u16 = 6;
 const shell_frame_border = ui.Panel.Border.rounded;
 const shell_frame_padding: ui.layout.Insets = .{};
+const help_dialog_max_width: u16 = 108;
+const help_dialog_max_height: u16 = 24;
+const help_two_column_min_width: u16 = 96;
+const help_column_gap: u16 = 2;
+const help_header_rows: u16 = 2;
+const help_scroll_indicator_rows: u16 = 1;
 
 const StateTone = enum {
     muted,
@@ -77,7 +83,7 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
         try viewRepoPicker(app, surface);
     }
     if (app.overlay == .help) {
-        try viewHelpPopup(surface);
+        try viewHelpPopup(app, surface);
     }
 }
 
@@ -578,17 +584,9 @@ fn footerItems(app: anytype) []const ui.key_hint.Item {
     return &footer_items;
 }
 
-fn viewHelpPopup(surface: *chasen.Surface) !void {
+fn viewHelpPopup(app: anytype, surface: *chasen.Surface) !void {
     const modal = ui.Modal.init(.{});
-    const opts: ui.Modal.ViewOptions = .{
-        .dialog_width = @min(surface.size().width, 78),
-        .dialog_height = @min(surface.size().height, 24),
-        .title = "Shortcuts",
-        .border = .rounded,
-        .title_style = .{ .bold = true, .fg = .{ .index = 14 } },
-        .border_style = .{ .fg = .gray },
-        .backdrop_style = .{ .dim = true },
-    };
+    const opts = helpModalOptions(surface.size());
     modal.view(surface, opts);
 
     const content_rect = ui.Modal.contentRect(surface, opts);
@@ -599,42 +597,174 @@ fn viewHelpPopup(surface: *chasen.Surface) !void {
     _ = content.borrowTextAt(0, 0, "GitFrame shortcuts", .{ .bold = true });
     if (size.height <= 2) return;
 
-    const gap: u16 = 2;
-    const left_width: u16 = if (size.width > gap) (size.width - gap) / 2 else size.width;
-    const right_col: u16 = if (size.width > left_width + gap) left_width + gap else size.width;
+    const body = helpBodyLayout(size);
+    const total_rows = helpRenderedRows(size);
+    const max_scroll = helpMaxScrollForContentSize(size);
+    const scroll = @min(app.help_scroll, max_scroll);
+
+    if (body.overflow) {
+        drawHelpScrollIndicator(&content, scroll, body.visible_rows, total_rows) catch {};
+    }
+
+    if (body.visible_rows == 0) return;
+
+    if (!helpUsesTwoColumns(size)) {
+        var list = content.child(.{
+            .col = 0,
+            .row = help_header_rows,
+            .width = size.width,
+            .height = body.visible_rows,
+        });
+        try drawHelpSections(&list, helpAllSections(), scroll);
+        return;
+    }
+
+    const left_width: u16 = if (size.width > help_column_gap) (size.width - help_column_gap) / 2 else size.width;
+    const right_col: u16 = if (size.width > left_width + help_column_gap) left_width + help_column_gap else size.width;
     const right_width: u16 = if (size.width > right_col) size.width - right_col else 0;
-    const column_height = size.height - 2;
 
     var left = content.child(.{
         .col = 0,
-        .row = 2,
+        .row = help_header_rows,
         .width = left_width,
-        .height = column_height,
+        .height = body.visible_rows,
     });
     var right = content.child(.{
         .col = right_col,
-        .row = 2,
+        .row = help_header_rows,
         .width = right_width,
-        .height = column_height,
+        .height = body.visible_rows,
     });
 
-    try drawHelpColumn(&left, &help_left_sections);
-    try drawHelpColumn(&right, &help_right_sections);
+    try drawHelpSections(&left, &help_left_sections, scroll);
+    try drawHelpSections(&right, &help_right_sections, scroll);
 }
 
-fn drawHelpColumn(surface: *chasen.Surface, sections: []const HelpSection) !void {
-    var row: u16 = 0;
-    for (sections) |section| {
-        if (row >= surface.size().height) return;
-        _ = surface.borrowTextAt(0, row, section.title, .{ .bold = true, .fg = .{ .index = 11 } });
-        row += 1;
-        for (section.items) |item| {
-            if (row >= surface.size().height) return;
-            try drawHelpItem(surface, row, item);
-            row += 1;
-        }
-        if (row < surface.size().height) row += 1;
+const HelpBodyLayout = struct {
+    visible_rows: u16,
+    overflow: bool,
+};
+
+fn helpModalOptions(size: chasen.Size) ui.Modal.ViewOptions {
+    return .{
+        .dialog_width = @min(size.width, help_dialog_max_width),
+        .dialog_height = @min(size.height, help_dialog_max_height),
+        .title = "Shortcuts",
+        .border = .rounded,
+        .title_style = .{ .bold = true, .fg = .{ .index = 14 } },
+        .border_style = .{ .fg = .gray },
+        .backdrop_style = .{ .dim = true },
+    };
+}
+
+pub fn helpContentSize(size: chasen.Size) chasen.Size {
+    const opts = helpModalOptions(size);
+    const dialog_rect = ui.Modal.dialogRectFor(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, opts);
+    const content_rect = ui.Modal.contentRectFor(dialog_rect, opts.padding);
+    return .{ .width = content_rect.width, .height = content_rect.height };
+}
+
+fn helpBodyLayout(size: chasen.Size) HelpBodyLayout {
+    if (size.height <= help_header_rows) return .{ .visible_rows = 0, .overflow = helpRenderedRows(size) > 0 };
+
+    const total_rows = helpRenderedRows(size);
+    const initial_rows = size.height - help_header_rows;
+    if (total_rows <= @as(usize, initial_rows)) return .{ .visible_rows = initial_rows, .overflow = false };
+
+    return .{
+        .visible_rows = if (initial_rows > help_scroll_indicator_rows) initial_rows - help_scroll_indicator_rows else 0,
+        .overflow = true,
+    };
+}
+
+pub fn helpVisibleRows(size: chasen.Size) u16 {
+    return helpBodyLayout(helpContentSize(size)).visible_rows;
+}
+
+pub fn helpMaxScroll(size: chasen.Size) usize {
+    return helpMaxScrollForContentSize(helpContentSize(size));
+}
+
+fn helpMaxScrollForContentSize(content_size: chasen.Size) usize {
+    const body = helpBodyLayout(content_size);
+    const total_rows = helpRenderedRows(content_size);
+    const visible_rows: usize = body.visible_rows;
+    if (total_rows <= visible_rows) return 0;
+    return total_rows - visible_rows;
+}
+
+pub fn helpRenderedRows(size: chasen.Size) usize {
+    if (!helpUsesTwoColumns(size)) return rowsForSections(helpAllSections());
+    return @max(rowsForSections(&help_left_sections), rowsForSections(&help_right_sections));
+}
+
+fn helpUsesTwoColumns(size: chasen.Size) bool {
+    return size.width >= help_two_column_min_width;
+}
+
+fn helpAllSections() []const HelpSection {
+    return &help_all_sections;
+}
+
+fn rowsForSections(sections: []const HelpSection) usize {
+    var rows: usize = 0;
+    for (sections, 0..) |section, index| {
+        rows += 1 + section.items.len;
+        if (index + 1 < sections.len) rows += 1;
     }
+    return rows;
+}
+
+fn drawHelpSections(surface: *chasen.Surface, sections: []const HelpSection, scroll: usize) !void {
+    const height: usize = surface.size().height;
+    var source_row: usize = 0;
+    var drawn_rows: usize = 0;
+
+    for (sections, 0..) |section, section_index| {
+        if (drawn_rows >= height) return;
+        try drawHelpLine(surface, scroll, source_row, &drawn_rows, .section_title, section.title, "");
+        source_row += 1;
+
+        for (section.items) |item| {
+            if (drawn_rows >= height) return;
+            try drawHelpLine(surface, scroll, source_row, &drawn_rows, .item, item.key, item.description);
+            source_row += 1;
+        }
+
+        if (section_index + 1 < sections.len) {
+            if (drawn_rows >= height) return;
+            try drawHelpLine(surface, scroll, source_row, &drawn_rows, .blank, "", "");
+            source_row += 1;
+        }
+    }
+}
+
+const HelpLineKind = enum {
+    section_title,
+    item,
+    blank,
+};
+
+fn drawHelpLine(
+    surface: *chasen.Surface,
+    scroll: usize,
+    source_row: usize,
+    drawn_rows: *usize,
+    kind: HelpLineKind,
+    first: []const u8,
+    second: []const u8,
+) !void {
+    if (source_row < scroll) return;
+    const row_offset = source_row - scroll;
+    if (row_offset >= surface.size().height) return;
+
+    const row: u16 = @intCast(row_offset);
+    switch (kind) {
+        .section_title => try copyClippedTextAt(surface, 0, row, first, .{ .bold = true, .fg = .{ .index = 11 } }),
+        .item => try drawHelpItem(surface, row, .{ .key = first, .description = second }),
+        .blank => {},
+    }
+    drawn_rows.* = row_offset + 1;
 }
 
 fn drawHelpItem(surface: *chasen.Surface, row: u16, item: HelpItem) !void {
@@ -647,9 +777,28 @@ fn drawHelpItem(surface: *chasen.Surface, row: u16, item: HelpItem) !void {
 
 fn copyClippedTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, style: chasen.TextStyle) !void {
     if (col >= surface.size().width) return;
-    const clipped = chasen.text.clipToWidth(text, surface.size().width - col);
-    if (clipped.len == 0) return;
-    _ = try surface.copyTextAt(col, row, clipped, style);
+    const clipped = chasen.text.clipToWidthWithMarker(text, surface.size().width - col, "…");
+    if (clipped.prefix.len > 0) {
+        _ = try surface.copyTextAt(col, row, clipped.prefix, style);
+    }
+    if (clipped.marker.len > 0) {
+        const marker_col = col + chasen.text.displayWidth(clipped.prefix);
+        if (marker_col < surface.size().width) {
+            _ = try surface.copyTextAt(marker_col, row, clipped.marker, style);
+        }
+    }
+}
+
+fn drawHelpScrollIndicator(surface: *chasen.Surface, scroll: usize, visible_rows: u16, total_rows: usize) !void {
+    if (surface.size().width == 0 or surface.size().height == 0 or visible_rows == 0 or total_rows == 0) return;
+
+    const start = @min(scroll + 1, total_rows);
+    const end = @min(total_rows, scroll + @as(usize, visible_rows));
+    const text = try std.fmt.allocPrint(surface.frameAllocator(), "{d}-{d}/{d}", .{ start, end, total_rows });
+    const clipped = chasen.text.clipToWidth(text, surface.size().width);
+    const text_width = chasen.text.displayWidth(clipped);
+    const col: u16 = if (surface.size().width > text_width) surface.size().width - text_width else 0;
+    _ = try surface.copyTextAt(col, surface.size().height - 1, clipped, .{ .fg = .gray });
 }
 
 pub fn drawSearchMatchMarker(app: anytype, surface: *chasen.Surface) void {
@@ -775,6 +924,38 @@ test "shell content size falls back to terminal size on small surfaces" {
     try std.testing.expectEqual(small, shellContentSize(small));
 }
 
+test "help popup uses one column on narrow content" {
+    const size = chasen.Size{ .width = 70, .height = 20 };
+    const content = helpContentSize(size);
+
+    try std.testing.expect(content.width < help_two_column_min_width);
+    try std.testing.expectEqual(rowsForSections(helpAllSections()), helpRenderedRows(content));
+}
+
+test "help popup uses two columns on wide content" {
+    const size = chasen.Size{ .width = 140, .height = 20 };
+    const content = helpContentSize(size);
+
+    try std.testing.expect(content.width >= help_two_column_min_width);
+    try std.testing.expectEqual(@max(rowsForSections(&help_left_sections), rowsForSections(&help_right_sections)), helpRenderedRows(content));
+}
+
+test "help popup reserves indicator row only when content overflows" {
+    const roomy = chasen.Size{ .width = 140, .height = 40 };
+    const cramped = chasen.Size{ .width = 140, .height = 10 };
+
+    try std.testing.expectEqual(@as(usize, 0), helpMaxScroll(roomy));
+    try std.testing.expect(helpMaxScroll(cramped) > 0);
+    try std.testing.expect(helpVisibleRows(cramped) < helpContentSize(cramped).height - help_header_rows);
+}
+
+test "help popup max scroll helper separates outer and content sizes" {
+    const outer = chasen.Size{ .width = 140, .height = 10 };
+    const content = helpContentSize(outer);
+
+    try std.testing.expectEqual(helpMaxScrollForContentSize(content), helpMaxScroll(outer));
+}
+
 const footer_items = [_]ui.key_hint.Item{
     ui.key_hint.item("Tab", "focus"),
     ui.key_hint.item("?", "help"),
@@ -840,6 +1021,13 @@ const help_left_sections = [_]HelpSection{
 };
 
 const help_right_sections = [_]HelpSection{
+    .{ .title = "Diff", .items = &help_diff_items },
+    .{ .title = "Mouse", .items = &help_mouse_items },
+};
+
+const help_all_sections = [_]HelpSection{
+    .{ .title = "Global", .items = &help_global_items },
+    .{ .title = "Sidebar", .items = &help_sidebar_items },
     .{ .title = "Diff", .items = &help_diff_items },
     .{ .title = "Mouse", .items = &help_mouse_items },
 };

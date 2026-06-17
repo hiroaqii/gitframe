@@ -70,6 +70,12 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.help_mode) {
         if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "close_help");
         if (isHelpKey(key) or key.codepoint == 'q') return voidMsg(Msg, "close_help");
+        if (key.matches(chasen.Key.page_up, .{})) return voidMsg(Msg, "help_page_up");
+        if (key.matches(chasen.Key.page_down, .{})) return voidMsg(Msg, "help_page_down");
+        if (key.matches(chasen.Key.up, .{})) return voidMsg(Msg, "help_scroll_up");
+        if (key.matches(chasen.Key.down, .{})) return voidMsg(Msg, "help_scroll_down");
+        if (key.codepoint == 'k') return voidMsg(Msg, "help_scroll_up");
+        if (key.codepoint == 'j') return voidMsg(Msg, "help_scroll_down");
         return null;
     }
 
@@ -169,6 +175,10 @@ const TestMsg = union(enum) {
     enter_repo_picker,
     open_help,
     close_help,
+    help_scroll_up,
+    help_scroll_down,
+    help_page_up,
+    help_page_down,
     cycle_changed_file_filter,
     toggle_reviewed_file,
     toggle_hide_reviewed_files,
@@ -241,7 +251,13 @@ test "keyToMsg opens and closes help outside prompt modes" {
         .mods = .{ .shift = true },
     }).?);
     try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'j' }));
+    try std.testing.expectEqual(TestMsg.help_scroll_up, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'k' }).?);
+    try std.testing.expectEqual(TestMsg.help_scroll_down, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(TestMsg.help_scroll_up, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(TestMsg.help_scroll_down, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = chasen.Key.down }).?);
+    try std.testing.expectEqual(TestMsg.help_page_up, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = chasen.Key.page_up }).?);
+    try std.testing.expectEqual(TestMsg.help_page_down, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = chasen.Key.page_down }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'x' }));
 }
 
 test "keyToMsg keeps prompt modes above help overlay" {
