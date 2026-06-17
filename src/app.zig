@@ -308,9 +308,12 @@ pub const App = struct {
                 self.scrollDiffHorizontal(1);
             },
             .toggle_display_mode => {
+                const old_mode = self.effectiveDisplayMode();
+                const old_scroll = self.viewer.diff_scroll;
                 self.viewer.display_mode = self.viewer.display_mode.toggled();
+                const new_mode = self.effectiveDisplayMode();
+                self.viewer.diff_scroll = self.remapDiffScrollForModeChange(old_mode, new_mode, old_scroll);
                 self.resetDiffHorizontalScroll();
-                self.clampDiffNavigationKeepingHunkVisible();
                 self.updateSearchMatchOffset();
                 self.scrollSearchMatchIntoView();
                 self.clampDiffNavigation();
@@ -972,6 +975,36 @@ pub const App = struct {
             if (file.hunks.len > 0) self.scrollSelectedHunkIntoView();
         }
         self.clampDiffNavigation();
+    }
+
+    fn remapDiffScrollForModeChange(
+        self: *const App,
+        old_mode: diff_render.DisplayMode,
+        new_mode: diff_render.DisplayMode,
+        old_scroll: usize,
+    ) usize {
+        if (old_mode == new_mode) return old_scroll;
+
+        const old_index = self.selectedFileLineIndex(old_mode);
+        const new_index = self.selectedFileLineIndex(new_mode);
+        if (old_index.lineCount() == 0 or new_index.lineCount() == 0) return 0;
+
+        const hunk_index = old_index.hunkIndexAtOffset(old_scroll) orelse {
+            return @min(old_scroll, new_index.lineCount() - 1);
+        };
+
+        const old_hunk_offset = old_index.hunkOffset(hunk_index);
+        const old_hunk_rows = old_index.hunkLineCount(hunk_index);
+        const new_hunk_offset = new_index.hunkOffset(hunk_index);
+        const new_hunk_rows = new_index.hunkLineCount(hunk_index);
+        if (old_hunk_rows == 0 or new_hunk_rows == 0) return @min(new_hunk_offset, new_index.lineCount() - 1);
+
+        const old_local = @min(old_scroll - old_hunk_offset, old_hunk_rows - 1);
+        const new_local = if (old_hunk_rows <= 1)
+            0
+        else
+            old_local * (new_hunk_rows - 1) / (old_hunk_rows - 1);
+        return @min(new_hunk_offset + new_local, new_index.lineCount() - 1);
     }
 
     fn resetDiffPosition(self: *App) void {
@@ -1766,6 +1799,51 @@ test "display mode and search navigation reset horizontal scroll" {
     setSearchQuery(&app, "wide");
     app.submitSearch();
     try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
+}
+
+test "display mode toggle keeps nearby vertical scroll position" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 8 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .viewer = .{
+            .display_mode = .unified,
+            .diff_scroll = 8,
+            .sidebar_hidden = true,
+        },
+    };
+
+    try app.update(.toggle_display_mode, undefined);
+
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
+    try std.testing.expect(app.viewer.diff_scroll > 0);
+    try std.testing.expect(app.viewer.diff_scroll <= app.selectedFileLineIndex(app.effectiveDisplayMode()).lineCount());
+}
+
+test "display mode scroll remap preserves hunk-local ratio" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var loaded = testLoadedDiffOne();
+    loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
+
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 8 },
+        .load = .{ .state = .{ .loaded = loaded } },
+        .viewer = .{
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+        },
+    };
+
+    const old_index = app.selectedFileLineIndex(.unified);
+    const old_scroll = old_index.hunkOffset(0) + 3;
+    const new_scroll = app.remapDiffScrollForModeChange(.unified, .side_by_side, old_scroll);
+
+    const hunk_index = old_index.hunkIndexAtOffset(old_scroll) orelse return error.ExpectedHunkOffset;
+    const new_index = app.selectedFileLineIndex(.side_by_side);
+    const old_local = old_scroll - old_index.hunkOffset(hunk_index);
+    const expected_local = old_local * (new_index.hunkLineCount(hunk_index) - 1) / (old_index.hunkLineCount(hunk_index) - 1);
+    try std.testing.expectEqual(new_index.hunkOffset(hunk_index) + expected_local, new_scroll);
 }
 
 test "hidden sidebar keeps tab from changing focus" {
