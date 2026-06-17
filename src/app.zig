@@ -2512,6 +2512,78 @@ test "canceling edited search restores committed query and match" {
     try std.testing.expectEqual(@as(?usize, 7), app.search.match_offset);
 }
 
+test "load empty state shows actionable no changes message" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(82, 18);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 82, .height = 18 },
+        .load = .{ .state = .{ .empty = .no_changes } },
+    };
+
+    try app.view(&ts.surface);
+
+    try expectSnapshotContains(&ts, "No changes");
+    try expectSnapshotContains(&ts, "Press r to reload or q to quit.");
+}
+
+test "load empty state distinguishes missing repository" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(90, 18);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 90, .height = 18 },
+        .load = .{ .state = .{ .empty = .no_repository } },
+    };
+
+    try app.view(&ts.surface);
+
+    try expectSnapshotContains(&ts, "No Git repository");
+    try expectSnapshotContains(&ts, "Press q to quit.");
+}
+
+test "load failed state shows first error line and retry hint" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(90, 18);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 90, .height = 18 },
+        .load = .{ .state = .{ .failed = "git diff failed\nsecond line" } },
+    };
+
+    try app.view(&ts.surface);
+
+    try expectSnapshotContains(&ts, "Could not load diff");
+    try expectSnapshotContains(&ts, "git diff failed");
+    try expectSnapshotContains(&ts, "Press r to retry or q to quit.");
+    try expectSnapshotNotContains(&ts, "second line");
+}
+
+test "loaded diff with empty visible filter shows local empty state" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 18);
+    defer ts.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var loaded = testLoadedDiffTwoWithStatuses();
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .binary);
+
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 18 },
+        .load = .{ .arena = arena, .state = .{ .loaded = loaded } },
+        .changed_file_filter = .binary,
+    };
+    defer app.clearLoadedDiff();
+
+    try app.view(&ts.surface);
+
+    try expectSnapshotContains(&ts, "No files match current filters");
+    try expectSnapshotContains(&ts, "Press F to change filter or r to reload.");
+}
+
 test "load runtime pending tracks task kind and generation" {
     var load: LoadRuntimeState = .{};
 
@@ -2621,6 +2693,18 @@ test "finishDiffLoad copies and frees current failed message" {
 fn expectSearchCoordinate(app: *const App, expected: diff_view_model.BodyCoordinate) !void {
     try std.testing.expect(app.search.match != null);
     try std.testing.expect(std.meta.eql(expected, app.search.match.?.coordinate));
+}
+
+fn expectSnapshotContains(ts: *const chasen.testing.TestSurface, needle: []const u8) !void {
+    const actual = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(actual);
+    try std.testing.expect(std.mem.indexOf(u8, actual, needle) != null);
+}
+
+fn expectSnapshotNotContains(ts: *const chasen.testing.TestSurface, needle: []const u8) !void {
+    const actual = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(actual);
+    try std.testing.expect(std.mem.indexOf(u8, actual, needle) == null);
 }
 
 fn setSearchQuery(app: *App, query: []const u8) void {

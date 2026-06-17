@@ -21,6 +21,20 @@ const shell_frame_min_height: u16 = 6;
 const shell_frame_border = ui.Panel.Border.rounded;
 const shell_frame_padding: ui.layout.Insets = .{};
 
+const StateTone = enum {
+    muted,
+    loading,
+    warning,
+    failure,
+};
+
+const StateMessage = struct {
+    title: []const u8,
+    body: []const u8 = "",
+    hint: []const u8 = "",
+    tone: StateTone = .muted,
+};
+
 pub fn view(app: anytype, surface: *chasen.Surface) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
@@ -109,8 +123,7 @@ fn viewBody(app: anytype, surface: *chasen.Surface) !void {
     col.borrowText(title, .{ .bold = true, .fg = .{ .index = 14 } });
     col.borrowText(subtitle, .{ .fg = .gray });
     try col.print("Source: {s}", .{app.config.sourceLabel()});
-    try viewLoadState(app, &col);
-    col.borrowText("Keys: r reload, q quit", .{ .fg = .gray });
+    viewLoadState(app, &col);
 }
 
 fn viewLoadedDiff(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
@@ -118,6 +131,10 @@ fn viewLoadedDiff(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.Lo
     if (size.width == 0 or size.height == 0) return;
 
     if (app.viewer.sidebar_hidden) {
+        if (loaded.visibleNodeCount() == 0) {
+            drawStateMessage(surface, filterEmptyMessage(app));
+            return;
+        }
         try viewDiffPane(app, surface, loaded);
         return;
     }
@@ -145,6 +162,10 @@ fn viewLoadedDiff(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.Lo
         .width = size.width - sidebar_width - 1,
         .height = size.height,
     });
+    if (loaded.visibleNodeCount() == 0) {
+        drawStateMessage(&diff_pane, filterEmptyMessage(app));
+        return;
+    }
     try viewDiffPane(app, &diff_pane, loaded);
 }
 
@@ -330,26 +351,115 @@ fn horizontalScrollStatus(surface: *chasen.Surface, offset: usize) []const u8 {
     return std.fmt.allocPrint(surface.frameAllocator(), "  x:{d}", .{offset}) catch "";
 }
 
-fn viewLoadState(app: anytype, col: *chasen.Column) !void {
+fn viewLoadState(app: anytype, col: *chasen.Column) void {
     switch (app.load.state) {
-        .idle => col.borrowText("Waiting to load diff.", .{ .fg = .gray }),
-        .loading => col.borrowText("Loading diff...", .{ .fg = .{ .index = 11 } }),
-        .empty => |reason| switch (reason) {
-            .no_changes => col.borrowText("No changes found.", .{ .fg = .gray }),
-            .no_repository => {
-                col.borrowText("No Git repositories found.", .{ .fg = .gray });
-                col.borrowText("Run inside a repository or a workspace containing direct child repositories.", .{ .fg = .gray });
-            },
-        },
-        .loaded => |loaded| {
-            try col.print("Loaded {d} files / {d} hunks.", .{ loaded.document.files.len, loaded.document.totalHunks() });
-            try col.print("{d} bytes across {d} lines.", .{ loaded.bytes, loaded.lines });
-        },
-        .failed => |message| {
-            col.borrowText("Could not load diff:", .{ .fg = .{ .index = 9 }, .bold = true });
-            col.borrowText(message, .{ .fg = .{ .index = 9 } });
-        },
+        .idle => drawStateMessageColumn(col, .{
+            .title = "Waiting to load diff",
+            .body = "GitFrame is waiting for a load request.",
+            .hint = "Press q to quit.",
+        }),
+        .loading => drawStateMessageColumn(col, .{
+            .title = "Loading diff",
+            .body = "Reading and parsing the current source.",
+            .hint = "Press q to quit.",
+            .tone = .loading,
+        }),
+        .empty => |reason| drawStateMessageColumn(col, emptyLoadMessage(app, reason)),
+        .failed => |message| drawStateMessageColumn(col, .{
+            .title = "Could not load diff",
+            .body = firstLine(message),
+            .hint = "Press r to retry or q to quit.",
+            .tone = .failure,
+        }),
+        .loaded => {},
     }
+}
+
+fn emptyLoadMessage(app: anytype, reason: anytype) StateMessage {
+    return switch (reason) {
+        .no_changes => .{
+            .title = "No changes",
+            .body = "Working tree has no diff for the current source.",
+            .hint = noChangesHint(app),
+        },
+        .no_repository => .{
+            .title = "No Git repository",
+            .body = "Run GitFrame inside a repository or a workspace containing direct child repositories.",
+            .hint = "Press q to quit.",
+            .tone = .warning,
+        },
+    };
+}
+
+fn noChangesHint(app: anytype) []const u8 {
+    if (app.repo_state.workspaceRepos() != null) {
+        return "Press R to switch repository, r to reload, or q to quit.";
+    }
+    return "Press r to reload or q to quit.";
+}
+
+fn filterEmptyMessage(app: anytype) StateMessage {
+    const hint = if (app.hide_reviewed_files and app.changed_file_filter != .all)
+        "Press F to change filter, H to show reviewed files, or r to reload."
+    else if (app.hide_reviewed_files)
+        "Press H to show reviewed files or r to reload."
+    else if (app.changed_file_filter != .all)
+        "Press F to change filter or r to reload."
+    else
+        "Press r to reload.";
+
+    return .{
+        .title = "No files match current filters",
+        .body = "The diff is loaded, but the current sidebar filters hide every file.",
+        .hint = hint,
+    };
+}
+
+fn drawStateMessage(surface: *chasen.Surface, message: StateMessage) void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    const width = @min(size.width, 64);
+    const height: u16 = @min(size.height, 6);
+    var panel = surface.child(.{
+        .col = if (size.width > width) (size.width - width) / 2 else 0,
+        .row = if (size.height > height) (size.height - height) / 2 else 0,
+        .width = width,
+        .height = height,
+    });
+    var col = panel.column(.{ .gap = 1 });
+    drawStateMessageColumn(&col, message);
+}
+
+fn drawStateMessageColumn(col: *chasen.Column, message: StateMessage) void {
+    col.borrowText(message.title, stateTitleStyle(message.tone));
+    if (message.body.len > 0) col.borrowText(message.body, stateBodyStyle(message.tone));
+    if (message.hint.len > 0) col.borrowText(message.hint, stateHintStyle());
+}
+
+fn stateTitleStyle(tone: StateTone) chasen.TextStyle {
+    return switch (tone) {
+        .muted => .{ .bold = true, .fg = .gray },
+        .loading => .{ .bold = true, .fg = .{ .index = 11 } },
+        .warning => .{ .bold = true, .fg = .{ .index = 11 } },
+        .failure => .{ .bold = true, .fg = .{ .index = 9 } },
+    };
+}
+
+fn stateBodyStyle(tone: StateTone) chasen.TextStyle {
+    return switch (tone) {
+        .failure => .{ .fg = .{ .index = 9 } },
+        else => .{ .fg = .gray },
+    };
+}
+
+fn stateHintStyle() chasen.TextStyle {
+    return .{ .fg = .gray, .dim = true };
+}
+
+fn firstLine(text: []const u8) []const u8 {
+    if (std.mem.indexOfAny(u8, text, "\r\n")) |end| return text[0..end];
+    return text;
 }
 
 fn viewFooter(app: anytype, surface: *chasen.Surface) void {
