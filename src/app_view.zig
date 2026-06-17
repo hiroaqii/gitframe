@@ -196,11 +196,12 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
     });
     if (size.width > 2) {
         if (app.hide_reviewed_files and app.changed_file_filter != .all) {
-            _ = try surface.printAt(0, 2, .{ .fg = .{ .index = 11 } }, "hiding reviewed / {s}", .{app.changed_file_filter.label()});
+            const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{app.changed_file_filter.label()});
+            try copyClippedTextAt(surface, 0, 2, text, .{ .fg = .{ .index = 11 } });
         } else if (app.hide_reviewed_files) {
-            _ = surface.borrowTextAt(0, 2, "hiding reviewed", .{ .fg = .{ .index = 11 } });
+            try copyClippedTextAt(surface, 0, 2, "hiding reviewed", .{ .fg = .{ .index = 11 } });
         } else if (app.changed_file_filter != .all) {
-            _ = surface.borrowTextAt(0, 2, app.changed_file_filter.label(), .{ .fg = .{ .index = 11 } });
+            try copyClippedTextAt(surface, 0, 2, app.changed_file_filter.label(), .{ .fg = .{ .index = 11 } });
         }
     }
 
@@ -271,7 +272,7 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
             .width = row_layout.name_width,
             .height = 1,
         });
-        _ = try path_area.copyTextAt(0, 0, row_model.name, style);
+        try copyClippedTextAt(&path_area, 0, 0, row_model.name, style);
     }
 
     if (row_layout.stats_col) |stats_col| {
@@ -306,27 +307,17 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     var diff_content = diffContentSurface(surface);
     const mode = diff_render.effectiveMode(diff_content.size().width, app.viewer.display_mode);
     const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
-    if (app.viewer.sidebar_hidden) {
-        _ = try surface.printAt(0, 2, paneStatusStyle(true), "{s} {d}/{d}  {d} hunks  {s}  scroll:{d}{s}", .{
-            paneTitleText("Diff", true),
-            selected + 1,
-            loaded.document.files.len,
-            file.hunks.len,
-            mode.label(),
-            app.viewer.diff_scroll,
-            horizontalScrollStatus(surface, app.viewer.diff_horizontal_scroll),
-        });
-    } else {
-        _ = try surface.printAt(0, 2, paneStatusStyle(active), "{s} {d}/{d}  {d} hunks  {s}  scroll:{d}{s}", .{
-            paneTitleText("Diff", active),
-            selected + 1,
-            loaded.document.files.len,
-            file.hunks.len,
-            mode.label(),
-            app.viewer.diff_scroll,
-            horizontalScrollStatus(surface, app.viewer.diff_horizontal_scroll),
-        });
-    }
+    const status_style = paneStatusStyle(active);
+    const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "{s} {d}/{d}  {d} hunks  {s}  scroll:{d}{s}", .{
+        paneTitleText("Diff", active),
+        selected + 1,
+        loaded.document.files.len,
+        file.hunks.len,
+        mode.label(),
+        app.viewer.diff_scroll,
+        horizontalScrollStatus(surface, app.viewer.diff_horizontal_scroll),
+    });
+    try copyClippedTextAt(surface, 0, 2, status_text, status_style);
     if (app.search.query.len > 0 or app.search.mode) {
         surface.clear(.{ .col = 0, .row = 2, .width = size.width, .height = 1 });
     }
@@ -335,10 +326,10 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
             std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ app.search.query.slice(), offset + 1 }) catch "search"
         else
             std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{app.search.query.slice()}) catch "search";
-        _ = surface.copyTextAt(0, 2, match_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
+        copyClippedTextAt(surface, 0, 2, match_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
     } else if (app.search.mode and size.width > 0) {
         const prompt_text = std.fmt.allocPrint(surface.frameAllocator(), "search: {s}", .{app.search.input.slice()}) catch "search";
-        _ = surface.copyTextAt(0, 2, prompt_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
+        copyClippedTextAt(surface, 0, 2, prompt_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
     }
     try diff_render.renderFile(&diff_content, file, .{
         .requested_mode = app.viewer.display_mode,
@@ -494,7 +485,7 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         col +|= 7;
     }
     if (app.status_message.len > 0 and width > col + 2) {
-        _ = surface.borrowTextAt(col, 0, app.status_message, .{ .fg = .{ .index = 11 } });
+        copyClippedTextAt(surface, col, 0, app.status_message, .{ .fg = .{ .index = 11 } }) catch {};
         const message_width = chasen.text.displayWidth(app.status_message);
         col +|= @intCast(@min(message_width + 2, std.math.maxInt(u16)));
     }
@@ -575,7 +566,7 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
             .width = if (size.width > 4) size.width - 4 else 0,
             .height = 1,
         });
-        _ = try label_area.copyTextAt(0, 0, label, style);
+        try copyClippedTextAt(&label_area, 0, 0, label, style);
     }
 }
 

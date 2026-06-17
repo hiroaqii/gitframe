@@ -244,14 +244,32 @@ fn copyClippedTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const
     const size = surface.size();
     if (col >= size.width) return;
     const max_width = size.width - col;
-    const clipped = chasen.text.clipToWidth(text, max_width);
-    if (clipped.len == 0) return;
-    _ = try surface.copyTextAt(col, row, clipped, style);
+    const clipped = chasen.text.clipToWidthWithMarker(text, max_width, "…");
+    if (clipped.prefix.len > 0) {
+        _ = try surface.copyTextAt(col, row, clipped.prefix, style);
+    }
+    if (clipped.marker.len > 0) {
+        const marker_col = col + chasen.text.displayWidth(clipped.prefix);
+        if (marker_col < size.width) {
+            _ = try surface.copyTextAt(marker_col, row, clipped.marker, style);
+        }
+    }
 }
 
 fn copyScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, horizontal_scroll: usize, style: chasen.TextStyle) !void {
     const scrolled = chasen.text.dropToWidth(text, horizontal_scroll);
-    try copyClippedTextAt(surface, col, row, scrolled, style);
+    try copyPlainClippedTextAt(surface, col, row, scrolled, style);
+}
+
+// Scrollable diff body text should not draw an artificial ellipsis; users can
+// move horizontally to inspect the clipped suffix.
+fn copyPlainClippedTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, style: chasen.TextStyle) !void {
+    const size = surface.size();
+    if (col >= size.width) return;
+    const max_width = size.width - col;
+    const clipped = chasen.text.clipToWidth(text, max_width);
+    if (clipped.len == 0) return;
+    _ = try surface.copyTextAt(col, row, clipped, style);
 }
 
 fn lineNumberText(surface: *chasen.Surface, line: ?u32) ![]const u8 {
@@ -413,6 +431,24 @@ test "side-by-side hunk header is clipped before the new column" {
     try ts.expectCellText(gutter_col + 8, 3, " ");
 }
 
+test "marked clipping shows ellipsis in fixed metadata rows" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(16, 5);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/very-long-file-name.zig b/very-long-file-name.zig",
+        .old_path = "a/very-long-file-name.zig",
+        .new_path = "b/very-long-file-name.zig",
+        .metadata = &.{},
+        .hunks = &.{},
+    };
+
+    try renderFile(&ts.surface, file, .{});
+
+    try ts.expectCellText(15, 0, "…");
+}
+
 test "unified horizontal scroll keeps line numbers and prefix fixed" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(32, 5);
@@ -431,7 +467,7 @@ test "unified horizontal scroll keeps line numbers and prefix fixed" {
                 .new_count = 1,
                 .section = "",
                 .lines = &.{
-                    .{ .kind = .context, .text = "0123456789abcdef", .old_line = 1, .new_line = 1 },
+                    .{ .kind = .context, .text = "0123456789abcdefghijklmnopqrstuvwxyz", .old_line = 1, .new_line = 1 },
                 },
             },
         },
@@ -445,6 +481,7 @@ test "unified horizontal scroll keeps line numbers and prefix fixed" {
     try ts.expectCellText(10, 4, " ");
     try ts.expectCellText(12, 4, "4");
     try ts.expectCellText(13, 4, "5");
+    try ts.expectCellText(31, 4, "n");
 }
 
 test "inactive pane dims file header only" {
