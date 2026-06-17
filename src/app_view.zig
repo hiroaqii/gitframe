@@ -76,6 +76,9 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
     if (app.repo_picker.mode) {
         try viewRepoPicker(app, surface);
     }
+    if (app.overlay == .help) {
+        try viewHelpPopup(surface);
+    }
 }
 
 fn shellFrameOptions() ui.Panel.ViewOptions {
@@ -297,31 +300,23 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     var diff_content = diffContentSurface(surface);
     const mode = diff_render.effectiveMode(diff_content.size().width, app.viewer.display_mode);
     const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
-    const focus_label = if (app.viewer.sidebar_hidden)
-        "diff/sidebar hidden"
-    else if (active)
-        "diff"
-    else
-        "sidebar";
     if (app.viewer.sidebar_hidden) {
-        _ = try surface.printAt(0, 2, paneStatusStyle(true), "{s} {d}/{d}  {d} hunks  {s}  {s}  scroll:{d}{s}", .{
+        _ = try surface.printAt(0, 2, paneStatusStyle(true), "{s} {d}/{d}  {d} hunks  {s}  scroll:{d}{s}", .{
             paneTitleText("Diff", true),
             selected + 1,
             loaded.document.files.len,
             file.hunks.len,
             mode.label(),
-            focus_label,
             app.viewer.diff_scroll,
             horizontalScrollStatus(surface, app.viewer.diff_horizontal_scroll),
         });
     } else {
-        _ = try surface.printAt(0, 2, paneStatusStyle(active), "{s} {d}/{d}  {d} hunks  {s}  focus:{s}  scroll:{d}{s}", .{
+        _ = try surface.printAt(0, 2, paneStatusStyle(active), "{s} {d}/{d}  {d} hunks  {s}  scroll:{d}{s}", .{
             paneTitleText("Diff", active),
             selected + 1,
             loaded.document.files.len,
             file.hunks.len,
             mode.label(),
-            focus_label,
             app.viewer.diff_scroll,
             horizontalScrollStatus(surface, app.viewer.diff_horizontal_scroll),
         });
@@ -488,10 +483,6 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
     }
 
     var col: u16 = 0;
-    _ = surface.borrowTextAt(col, 0, "gitframe", .{ .bold = true });
-    col +|= 9;
-    _ = surface.borrowTextAt(col, 0, "viewer shell", .{ .fg = .gray });
-    col +|= 13;
     if (app.config.watch and width > col + 8) {
         _ = surface.borrowTextAt(col, 0, "watch", .{ .fg = .{ .index = 10 } });
         col +|= 7;
@@ -500,11 +491,6 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         _ = surface.borrowTextAt(col, 0, app.status_message, .{ .fg = .{ .index = 11 } });
         const message_width = chasen.text.displayWidth(app.status_message);
         col +|= @intCast(@min(message_width + 2, std.math.maxInt(u16)));
-    }
-    const focus_text = focusStatusText(app);
-    if (width > col + chasen.text.displayWidth(focus_text) + 2) {
-        _ = surface.borrowTextAt(col, 0, focus_text, .{ .fg = .gray, .dim = true });
-        col +|= @intCast(@min(chasen.text.displayWidth(focus_text) + 2, std.math.maxInt(u16)));
     }
 
     const size_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
@@ -589,10 +575,81 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
 
 fn footerItems(app: anytype) []const ui.key_hint.Item {
     if (app.viewer.sidebar_hidden) return &footer_hidden_sidebar_items;
-    return switch (app.viewer.focus) {
-        .sidebar => &footer_sidebar_items,
-        .diff => &footer_diff_items,
+    return &footer_items;
+}
+
+fn viewHelpPopup(surface: *chasen.Surface) !void {
+    const modal = ui.Modal.init(.{});
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, 78),
+        .dialog_height = @min(surface.size().height, 24),
+        .title = "Shortcuts",
+        .border = .rounded,
+        .title_style = .{ .bold = true, .fg = .{ .index = 14 } },
+        .border_style = .{ .fg = .gray },
+        .backdrop_style = .{ .dim = true },
     };
+    modal.view(surface, opts);
+
+    const content_rect = ui.Modal.contentRect(surface, opts);
+    if (content_rect.width == 0 or content_rect.height == 0) return;
+    var content = surface.child(content_rect);
+    const size = content.size();
+
+    _ = content.borrowTextAt(0, 0, "GitFrame shortcuts", .{ .bold = true });
+    if (size.height <= 2) return;
+
+    const gap: u16 = 2;
+    const left_width: u16 = if (size.width > gap) (size.width - gap) / 2 else size.width;
+    const right_col: u16 = if (size.width > left_width + gap) left_width + gap else size.width;
+    const right_width: u16 = if (size.width > right_col) size.width - right_col else 0;
+    const column_height = size.height - 2;
+
+    var left = content.child(.{
+        .col = 0,
+        .row = 2,
+        .width = left_width,
+        .height = column_height,
+    });
+    var right = content.child(.{
+        .col = right_col,
+        .row = 2,
+        .width = right_width,
+        .height = column_height,
+    });
+
+    try drawHelpColumn(&left, &help_left_sections);
+    try drawHelpColumn(&right, &help_right_sections);
+}
+
+fn drawHelpColumn(surface: *chasen.Surface, sections: []const HelpSection) !void {
+    var row: u16 = 0;
+    for (sections) |section| {
+        if (row >= surface.size().height) return;
+        _ = surface.borrowTextAt(0, row, section.title, .{ .bold = true, .fg = .{ .index = 11 } });
+        row += 1;
+        for (section.items) |item| {
+            if (row >= surface.size().height) return;
+            try drawHelpItem(surface, row, item);
+            row += 1;
+        }
+        if (row < surface.size().height) row += 1;
+    }
+}
+
+fn drawHelpItem(surface: *chasen.Surface, row: u16, item: HelpItem) !void {
+    if (surface.size().width == 0) return;
+    const key_width: u16 = @min(10, surface.size().width);
+    try copyClippedTextAt(surface, 0, row, item.key, .{ .bold = true });
+    if (surface.size().width <= key_width) return;
+    try copyClippedTextAt(surface, key_width, row, item.description, .{});
+}
+
+fn copyClippedTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, style: chasen.TextStyle) !void {
+    if (col >= surface.size().width) return;
+    const clipped = chasen.text.clipToWidth(text, surface.size().width - col);
+    if (clipped.len == 0) return;
+    _ = try surface.copyTextAt(col, row, clipped, style);
 }
 
 pub fn drawSearchMatchMarker(app: anytype, surface: *chasen.Surface) void {
@@ -675,14 +732,6 @@ fn paneTitleText(label: []const u8, active: bool) []const u8 {
     return label;
 }
 
-fn focusStatusText(app: anytype) []const u8 {
-    if (app.viewer.sidebar_hidden) return "focus: diff";
-    return switch (app.viewer.focus) {
-        .sidebar => "focus: files",
-        .diff => "focus: diff",
-    };
-}
-
 pub fn terminalBodyHeight(terminal_height: u16) u16 {
     return if (terminal_height > footer_rows) terminal_height - footer_rows else 0;
 }
@@ -726,53 +775,71 @@ test "shell content size falls back to terminal size on small surfaces" {
     try std.testing.expectEqual(small, shellContentSize(small));
 }
 
-const footer_sidebar_items = [_]ui.key_hint.Item{
+const footer_items = [_]ui.key_hint.Item{
     ui.key_hint.item("Tab", "focus"),
-    ui.key_hint.item("↑/↓/j/k", "move"),
-    ui.key_hint.item("Enter/←/→", "fold"),
-    ui.key_hint.item("/", "search"),
-    ui.key_hint.item("f", "file"),
-    ui.key_hint.item("R", "repo"),
-    ui.key_hint.item("F", "filter"),
-    ui.key_hint.item("v", "viewed"),
-    ui.key_hint.item("H", "hide viewed"),
-    ui.key_hint.item("B", "hide sidebar"),
-    ui.key_hint.item("[/]", "width"),
-    ui.key_hint.item("e", "edit"),
-    ui.key_hint.item("n/p", "hunk/search"),
-    ui.key_hint.item("u", "mode"),
-    ui.key_hint.item("r", "reload"),
-    ui.key_hint.item("q", "quit"),
-};
-
-const footer_diff_items = [_]ui.key_hint.Item{
-    ui.key_hint.item("Tab", "focus"),
-    ui.key_hint.item("↑/↓/j/k", "scroll"),
-    ui.key_hint.item("Enter", "fold"),
-    ui.key_hint.item("/", "search"),
-    ui.key_hint.item("f", "file"),
-    ui.key_hint.item("R", "repo"),
-    ui.key_hint.item("v", "viewed"),
-    ui.key_hint.item("H", "hide viewed"),
-    ui.key_hint.item("B", "hide sidebar"),
-    ui.key_hint.item("[/]", "width"),
-    ui.key_hint.item("e", "edit"),
-    ui.key_hint.item("n/p", "hunk/search"),
-    ui.key_hint.item("u", "mode"),
-    ui.key_hint.item("r", "reload"),
+    ui.key_hint.item("?", "help"),
     ui.key_hint.item("q", "quit"),
 };
 
 const footer_hidden_sidebar_items = [_]ui.key_hint.Item{
-    ui.key_hint.item("↑/↓/j/k", "scroll"),
-    ui.key_hint.item("Enter", "fold"),
-    ui.key_hint.item("/", "search"),
-    ui.key_hint.item("f", "file"),
-    ui.key_hint.item("B", "show sidebar"),
-    ui.key_hint.item("[/]", "width"),
-    ui.key_hint.item("e", "edit"),
-    ui.key_hint.item("n/p", "hunk/search"),
-    ui.key_hint.item("u", "mode"),
-    ui.key_hint.item("r", "reload"),
+    ui.key_hint.item("B", "sidebar"),
+    ui.key_hint.item("?", "help"),
     ui.key_hint.item("q", "quit"),
+};
+
+const HelpItem = struct {
+    key: []const u8,
+    description: []const u8,
+};
+
+const HelpSection = struct {
+    title: []const u8,
+    items: []const HelpItem,
+};
+
+const help_global_items = [_]HelpItem{
+    .{ .key = "Tab", .description = "focus sidebar / diff" },
+    .{ .key = "?", .description = "open / close help" },
+    .{ .key = "q", .description = "quit" },
+    .{ .key = "B", .description = "show / hide sidebar" },
+    .{ .key = "r", .description = "reload active repository" },
+    .{ .key = "R", .description = "switch repository" },
+    .{ .key = "Home/End", .description = "first / last file" },
+};
+
+const help_sidebar_items = [_]HelpItem{
+    .{ .key = "↑/↓ j/k", .description = "move selection" },
+    .{ .key = "Enter", .description = "toggle directory" },
+    .{ .key = "←/→", .description = "collapse / expand directory" },
+    .{ .key = "f", .description = "search files" },
+    .{ .key = "F", .description = "cycle file filter" },
+    .{ .key = "v", .description = "mark reviewed" },
+    .{ .key = "H", .description = "hide reviewed" },
+    .{ .key = "[ / ]", .description = "resize sidebar" },
+};
+
+const help_diff_items = [_]HelpItem{
+    .{ .key = "↑/↓ j/k", .description = "scroll" },
+    .{ .key = "←/→", .description = "horizontal scroll" },
+    .{ .key = "Enter", .description = "fold / unfold hunk" },
+    .{ .key = "/", .description = "search diff" },
+    .{ .key = "u", .description = "unified / side-by-side" },
+    .{ .key = "n / p", .description = "next / previous hunk or match" },
+    .{ .key = "N", .description = "previous search match" },
+    .{ .key = "e", .description = "open selected file in editor" },
+};
+
+const help_mouse_items = [_]HelpItem{
+    .{ .key = "wheel", .description = "scroll pane under pointer" },
+    .{ .key = "click", .description = "focus pane" },
+};
+
+const help_left_sections = [_]HelpSection{
+    .{ .title = "Global", .items = &help_global_items },
+    .{ .title = "Sidebar", .items = &help_sidebar_items },
+};
+
+const help_right_sections = [_]HelpSection{
+    .{ .title = "Diff", .items = &help_diff_items },
+    .{ .title = "Mouse", .items = &help_mouse_items },
 };

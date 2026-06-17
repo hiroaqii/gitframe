@@ -77,6 +77,11 @@ const FilterPromptState = struct {
     no_match: bool = false,
 };
 
+const OverlayState = enum {
+    none,
+    help,
+};
+
 const PendingLoad = union(enum) {
     repo_discovery: u64,
     diff_load: u64,
@@ -153,6 +158,7 @@ pub const App = struct {
     file_search: FilterPromptState = .{},
     file_search_return_focus: Focus = .sidebar,
     repo_picker: FilterPromptState = .{},
+    overlay: OverlayState = .none,
     hide_reviewed_files: bool = false,
     changed_file_filter: ChangedFileFilter = .all,
     repo_state: repo_state.State = .{},
@@ -213,6 +219,8 @@ pub const App = struct {
         repo_picker_backspace,
         repo_picker_move_previous,
         repo_picker_move_next,
+        open_help,
+        close_help,
         toggle_reviewed_file,
         toggle_hide_reviewed_files,
         cycle_changed_file_filter,
@@ -352,6 +360,8 @@ pub const App = struct {
             },
             .repo_picker_move_previous => self.repo_picker.filter.update(.move_prev),
             .repo_picker_move_next => self.repo_picker.filter.update(.move_next),
+            .open_help => self.overlay = .help,
+            .close_help => self.overlay = .none,
             .toggle_reviewed_file => try self.toggleReviewedFile(ctx.allocator()),
             .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
@@ -384,7 +394,7 @@ pub const App = struct {
     }
 
     fn mouseToMsg(self: *const App, mouse: anytype) ?Msg {
-        if (self.search.mode or self.file_search.mode or self.repo_picker.mode) return null;
+        if (self.search.mode or self.file_search.mode or self.repo_picker.mode or self.overlay == .help) return null;
         if (mouse.type != .press) return null;
 
         const pane = self.mousePane(mouse) orelse return null;
@@ -457,6 +467,7 @@ pub const App = struct {
             .search_mode = self.search.mode,
             .file_search_mode = self.file_search.mode,
             .repo_picker_mode = self.repo_picker.mode,
+            .help_mode = self.overlay == .help,
             .search_query_len = self.search.query.len,
             .focus = self.viewer.focus,
             .sidebar_hidden = self.viewer.sidebar_hidden,
@@ -1859,6 +1870,34 @@ test "hidden sidebar keeps tab from changing focus" {
     try std.testing.expectEqual(Focus.diff, app.viewer.focus);
 }
 
+test "help overlay opens and closes before normal shortcuts" {
+    var app: App = .{};
+
+    const open_msg = app.handleEvent(.{ .key_press = .{ .codepoint = '?' } }) orelse return error.ExpectedOpenHelp;
+    try app.update(open_msg, undefined);
+    try std.testing.expectEqual(OverlayState.help, app.overlay);
+
+    const ignored_msg = app.handleEvent(.{ .key_press = .{ .codepoint = 'j' } });
+    try std.testing.expect(ignored_msg == null);
+
+    const close_msg = app.handleEvent(.{ .key_press = .{ .codepoint = 'q' } }) orelse return error.ExpectedCloseHelp;
+    try std.testing.expectEqual(App.Msg.close_help, close_msg);
+    try app.update(close_msg, undefined);
+    try std.testing.expectEqual(OverlayState.none, app.overlay);
+}
+
+test "prompt input stays above help overlay" {
+    var app: App = .{
+        .search = .{ .mode = true },
+    };
+
+    const msg = app.handleEvent(.{ .key_press = .{ .codepoint = '?' } }) orelse return error.ExpectedPromptInput;
+    try app.update(msg, undefined);
+
+    try std.testing.expectEqual(OverlayState.none, app.overlay);
+    try std.testing.expectEqualStrings("?", app.search.input.slice());
+}
+
 test "mouse click focuses sidebar and diff panes" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 20 },
@@ -1914,6 +1953,17 @@ test "mouse uses full body as diff pane while sidebar is hidden" {
     const msg = app.handleEvent(testMouseEvent(content.col + 1, content.row + 2, .left)) orelse return error.ExpectedHiddenSidebarMouseMessage;
     try app.update(msg, undefined);
     try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+}
+
+test "help overlay ignores mouse events" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .overlay = .help,
+    };
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    try std.testing.expect(app.handleEvent(testMouseEvent(content.col + 1, content.row + 2, .wheel_down)) == null);
 }
 
 test "mouse horizontal wheel scrolls diff pane horizontally" {

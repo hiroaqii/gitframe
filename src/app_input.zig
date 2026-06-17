@@ -21,6 +21,7 @@ pub const KeyContext = struct {
     search_mode: bool = false,
     file_search_mode: bool = false,
     repo_picker_mode: bool = false,
+    help_mode: bool = false,
     search_query_len: usize = 0,
     focus: Focus = .sidebar,
     sidebar_hidden: bool = false,
@@ -66,6 +67,14 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         };
     }
 
+    if (context.help_mode) {
+        if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "close_help");
+        return switch (key.codepoint) {
+            '?', 'q' => voidMsg(Msg, "close_help"),
+            else => null,
+        };
+    }
+
     if (key.matches(chasen.Key.tab, .{}) and !context.sidebar_hidden) return voidMsg(Msg, "toggle_focus");
     if (key.matches(chasen.Key.page_up, .{})) return voidMsg(Msg, "page_diff_up");
     if (key.matches(chasen.Key.page_down, .{})) return voidMsg(Msg, "page_diff_down");
@@ -88,6 +97,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         'p' => if (context.search_query_len > 0) voidMsg(Msg, "select_previous_search_match") else voidMsg(Msg, "select_previous_hunk"),
         'g' => voidMsg(Msg, "select_first_file"),
         'G' => voidMsg(Msg, "select_last_file"),
+        '?' => voidMsg(Msg, "open_help"),
         'f' => voidMsg(Msg, "enter_file_search"),
         'R' => voidMsg(Msg, "enter_repo_picker"),
         'F' => voidMsg(Msg, "cycle_changed_file_filter"),
@@ -155,6 +165,8 @@ const TestMsg = union(enum) {
     select_previous_hunk,
     enter_file_search,
     enter_repo_picker,
+    open_help,
+    close_help,
     cycle_changed_file_filter,
     toggle_reviewed_file,
     toggle_hide_reviewed_files,
@@ -207,4 +219,16 @@ test "keyToMsg maps sidebar width adjustment keys" {
 test "keyToMsg uses search query to disambiguate navigation" {
     try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{}, .{ .codepoint = 'n' }).?);
     try std.testing.expectEqual(TestMsg.select_next_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, .{ .codepoint = 'n' }).?);
+}
+
+test "keyToMsg opens and closes help outside prompt modes" {
+    try std.testing.expectEqual(TestMsg.open_help, keyToMsg(TestMsg, .{}, .{ .codepoint = '?' }).?);
+    try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = '?' }).?);
+    try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'j' }));
+}
+
+test "keyToMsg keeps prompt modes above help overlay" {
+    const msg = keyToMsg(TestMsg, .{ .search_mode = true, .help_mode = true }, .{ .codepoint = '?' }).?;
+    try std.testing.expectEqual(TestMsg{ .search_insert = '?' }, msg);
 }
