@@ -16,12 +16,31 @@ pub const sidebar_header_rows: u16 = 3;
 pub const diff_body_start_row: u16 = 3;
 
 const search_marker_gutter_width: u16 = 1;
+const shell_frame_min_width: u16 = 30;
+const shell_frame_min_height: u16 = 6;
+const shell_frame_border = ui.Panel.Border.rounded;
+const shell_frame_padding: ui.layout.Insets = .{};
 
 pub fn view(app: anytype, surface: *chasen.Surface) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
     surface.hideCursor();
+
+    if (shellFrameEnabled(size)) {
+        const frame = ui.Panel.frame(surface, shellFrameOptions());
+        frame.view();
+        var content = frame.contentSurface();
+        try viewContent(app, &content);
+        return;
+    }
+
+    try viewContent(app, surface);
+}
+
+fn viewContent(app: anytype, surface: *chasen.Surface) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
 
     const footer_row = size.height - footer_rows;
     var body = surface.child(.{
@@ -43,6 +62,31 @@ pub fn view(app: anytype, surface: *chasen.Surface) !void {
     if (app.repo_picker.mode) {
         try viewRepoPicker(app, surface);
     }
+}
+
+fn shellFrameOptions() ui.Panel.ViewOptions {
+    return .{
+        .title = "GitFrame",
+        .padding = shell_frame_padding,
+        .border = shell_frame_border,
+        .border_style = .{ .dim = true },
+        .title_style = .{ .bold = true, .fg = .gray },
+    };
+}
+
+pub fn shellFrameEnabled(size: chasen.Size) bool {
+    return size.width >= shell_frame_min_width and size.height >= shell_frame_min_height;
+}
+
+pub fn shellContentSize(terminal_size: chasen.Size) chasen.Size {
+    if (!shellFrameEnabled(terminal_size)) return terminal_size;
+    const rect = ui.Panel.contentRectFor(.{
+        .col = 0,
+        .row = 0,
+        .width = terminal_size.width,
+        .height = terminal_size.height,
+    }, shell_frame_padding);
+    return .{ .width = rect.width, .height = rect.height };
 }
 
 fn viewBody(app: anytype, surface: *chasen.Surface) !void {
@@ -88,10 +132,9 @@ fn viewLoadedDiff(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.Lo
     try viewSidebar(app, &sidebar, loaded);
 
     if (size.width > sidebar_width) {
-        const style = paneDividerStyle(app.viewer.focus);
         var row: u16 = 0;
         while (row < size.height) : (row += 1) {
-            _ = surface.borrowTextAt(sidebar_width, row, "│", style);
+            _ = surface.borrowTextAt(sidebar_width, row, "│", shellSeparatorStyle());
         }
     }
 
@@ -110,7 +153,8 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    _ = surface.borrowTextAt(0, 0, "Files", paneTitleStyle(app.viewer.focus == .sidebar));
+    const active = app.viewer.focus == .sidebar;
+    _ = surface.borrowTextAt(0, 0, paneTitleText("Files", active), paneTitleStyle(active));
     _ = try surface.printAt(0, 1, .{ .fg = .gray }, "{d} files / {d} hunks", .{
         loaded.document.files.len,
         loaded.document.totalHunks(),
@@ -140,14 +184,14 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
         row += 1;
     }) {
         const row_model = loaded.sidebarRowAt(visible_index, app.viewer.selected_node) orelse continue;
-        try drawSidebarRow(surface, row, row_model);
+        try drawSidebarRow(surface, row, row_model, app.viewer.focus == .sidebar);
     }
 }
 
-fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_model.Row) !void {
+fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_model.Row, pane_active: bool) !void {
     const width = surface.size().width;
     const row_layout = sidebar_view_model.layout(row_model, width);
-    const style = sidebarRowStyle(row_model);
+    const style = sidebarRowStyle(row_model, pane_active);
     const marker = if (row_model.selected) ">" else " ";
 
     if (width > row_layout.marker_col) {
@@ -203,10 +247,10 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
     }
 }
 
-fn sidebarRowStyle(row: sidebar_view_model.Row) chasen.TextStyle {
+fn sidebarRowStyle(row: sidebar_view_model.Row, pane_active: bool) chasen.TextStyle {
     if (row.selected) return .{ .reverse = true, .bold = true };
-    if (row.kind == .directory) return .{ .bold = true, .fg = .gray };
-    return .{};
+    if (row.kind == .directory) return .{ .bold = true, .fg = .gray, .dim = !pane_active };
+    return .{ .dim = !pane_active };
 }
 
 /// Draw the selected file's diff pane.
@@ -226,14 +270,16 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     const file = loaded.document.files[selected];
     var diff_content = diffContentSurface(surface);
     const mode = diff_render.effectiveMode(diff_content.size().width, app.viewer.display_mode);
+    const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
     const focus_label = if (app.viewer.sidebar_hidden)
         "diff/sidebar hidden"
-    else if (app.viewer.focus == .diff)
+    else if (active)
         "diff"
     else
         "sidebar";
     if (app.viewer.sidebar_hidden) {
-        _ = try surface.printAt(0, 2, paneStatusStyle(true), "{d}/{d}  {d} hunks  {s}  {s}  scroll:{d}{s}", .{
+        _ = try surface.printAt(0, 2, paneStatusStyle(true), "{s} {d}/{d}  {d} hunks  {s}  {s}  scroll:{d}{s}", .{
+            paneTitleText("Diff", true),
             selected + 1,
             loaded.document.files.len,
             file.hunks.len,
@@ -243,7 +289,8 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
             horizontalScrollStatus(surface, app.viewer.diff_horizontal_scroll),
         });
     } else {
-        _ = try surface.printAt(0, 2, paneStatusStyle(app.viewer.focus == .diff), "{d}/{d}  {d} hunks  {s}  focus:{s}  scroll:{d}{s}", .{
+        _ = try surface.printAt(0, 2, paneStatusStyle(active), "{s} {d}/{d}  {d} hunks  {s}  focus:{s}  scroll:{d}{s}", .{
+            paneTitleText("Diff", active),
             selected + 1,
             loaded.document.files.len,
             file.hunks.len,
@@ -270,6 +317,7 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         .requested_mode = app.viewer.display_mode,
         .scroll = app.viewer.diff_scroll,
         .horizontal_scroll = app.viewer.diff_horizontal_scroll,
+        .pane_active = active,
         .highlighted_hunk = if (file.hunks.len > 0) app.viewer.selected_hunk else null,
         .line_index = loaded.cachedRenderedLineIndex(selected, mode),
         .folded_hunks = loaded.foldedHunksForFile(selected),
@@ -337,6 +385,11 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         _ = surface.borrowTextAt(col, 0, app.status_message, .{ .fg = .{ .index = 11 } });
         const message_width = chasen.text.displayWidth(app.status_message);
         col +|= @intCast(@min(message_width + 2, std.math.maxInt(u16)));
+    }
+    const focus_text = focusStatusText(app);
+    if (width > col + chasen.text.displayWidth(focus_text) + 2) {
+        _ = surface.borrowTextAt(col, 0, focus_text, .{ .fg = .gray, .dim = true });
+        col +|= @intCast(@min(chasen.text.displayWidth(focus_text) + 2, std.math.maxInt(u16)));
     }
 
     const size_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
@@ -496,10 +549,22 @@ fn paneSearchStyle(active: bool) chasen.TextStyle {
         .{ .fg = .{ .index = 11 } };
 }
 
-fn paneDividerStyle(focus: anytype) chasen.TextStyle {
-    return switch (focus) {
-        .sidebar => .{ .fg = .{ .index = 14 } },
-        .diff => .{ .fg = .{ .index = 10 } },
+fn shellSeparatorStyle() chasen.TextStyle {
+    return .{ .dim = true };
+}
+
+fn paneTitleText(label: []const u8, active: bool) []const u8 {
+    if (!active) return label;
+    if (std.mem.eql(u8, label, "Files")) return "▸ Files";
+    if (std.mem.eql(u8, label, "Diff")) return "▸ Diff";
+    return label;
+}
+
+fn focusStatusText(app: anytype) []const u8 {
+    if (app.viewer.sidebar_hidden) return "focus: diff";
+    return switch (app.viewer.focus) {
+        .sidebar => "focus: files",
+        .diff => "focus: diff",
     };
 }
 
@@ -524,6 +589,26 @@ pub fn clampSidebarWidth(total_width: u16, width: u16) u16 {
     const max_width = @min(hard_max_width, max_available);
     const min_width = @min(@as(u16, 18), max_width);
     return @min(@max(width, min_width), max_width);
+}
+
+test "shell content size matches panel content surface" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 20);
+    defer ts.deinit();
+
+    const frame = ui.Panel.frame(&ts.surface, shellFrameOptions());
+    const expected = shellContentSize(ts.surface.size());
+    const content = frame.contentSurface();
+
+    try std.testing.expectEqual(expected, content.size());
+    try std.testing.expectEqual(chasen.Size{ .width = 98, .height = 18 }, expected);
+}
+
+test "shell content size falls back to terminal size on small surfaces" {
+    const small = chasen.Size{ .width = 29, .height = 20 };
+
+    try std.testing.expect(!shellFrameEnabled(small));
+    try std.testing.expectEqual(small, shellContentSize(small));
 }
 
 const footer_sidebar_items = [_]ui.key_hint.Item{

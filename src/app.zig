@@ -1158,12 +1158,16 @@ pub const App = struct {
         return diff_render.effectiveMode(self.diffPaneWidth(), self.viewer.display_mode);
     }
 
+    fn layoutSize(self: *const App) chasen.Size {
+        return app_view.shellContentSize(self.terminal_size);
+    }
+
     fn diffVisibleRows(self: *const App) usize {
-        return diff_render.visibleBodyRows(terminalBodyHeight(self.terminal_size.height));
+        return diff_render.visibleBodyRows(terminalBodyHeight(self.layoutSize().height));
     }
 
     fn diffPaneWidth(self: *const App) u16 {
-        const width = self.terminal_size.width;
+        const width = self.layoutSize().width;
         if (self.viewer.sidebar_hidden) return contentWidth(width);
         const sidebar_width = sidebarWidth(width, self.viewer.sidebar_width);
         if (width <= sidebar_width + 1) return 0;
@@ -1182,7 +1186,7 @@ pub const App = struct {
     }
 
     fn adjustSidebarWidth(self: *App, direction: i2) void {
-        const total_width = self.terminal_size.width;
+        const total_width = self.layoutSize().width;
         const previous_width = self.diffPaneWidth();
         const current = sidebarWidth(total_width, self.viewer.sidebar_width);
         const step: u16 = 4;
@@ -1511,7 +1515,7 @@ test "sidebar visibility toggle uses full diff width and keeps selection" {
 
 test "sidebar width adjustment clamps and affects effective mode" {
     var app: App = .{
-        .terminal_size = .{ .width = 100, .height = 8 },
+        .terminal_size = .{ .width = 102, .height = 8 },
         .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
         .viewer = .{ .display_mode = .side_by_side },
     };
@@ -1533,7 +1537,7 @@ test "sidebar width adjustment clamps and affects effective mode" {
 
 test "sidebar width remains stored while sidebar is hidden" {
     var app: App = .{
-        .terminal_size = .{ .width = 100, .height = 8 },
+        .terminal_size = .{ .width = 102, .height = 8 },
         .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
         .viewer = .{ .display_mode = .side_by_side },
     };
@@ -1555,7 +1559,7 @@ test "sidebar width remains stored while sidebar is hidden" {
 
 test "horizontal scroll uses diff focus arrows and clamps to visible text" {
     var app: App = .{
-        .terminal_size = .{ .width = 80, .height = 10 },
+        .terminal_size = .{ .width = 80, .height = 12 },
         .load = .{ .state = .{ .loaded = testLoadedDiffWide() } },
         .viewer = .{ .focus = .diff, .display_mode = .unified },
     };
@@ -1661,7 +1665,7 @@ test "hidden sidebar keeps tab from changing focus" {
 
 test "mode change resyncs search match to rendered body offsets" {
     var app: App = .{
-        .terminal_size = .{ .width = 140, .height = 12 },
+        .terminal_size = .{ .width = 140, .height = 14 },
         .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
         .viewer = .{ .display_mode = .unified },
     };
@@ -2019,7 +2023,7 @@ test "sidebar title indicates active focus" {
 
     try app.viewSidebar(&ts.surface, app.load.state.loaded);
 
-    try ts.expectCellText(0, 0, "F");
+    try ts.expectCellText(0, 0, "▸");
     try std.testing.expect(ts.surface.readCell(0, 0).?.style.reverse);
 }
 
@@ -2036,7 +2040,7 @@ test "diff status row indicates active focus" {
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded);
 
-    try ts.expectCellText(0, 2, "1");
+    try ts.expectCellText(0, 2, "▸");
     try std.testing.expect(ts.surface.readCell(0, 2).?.style.reverse);
 }
 
@@ -2462,9 +2466,9 @@ test "status mode label uses diff content width after marker gutter" {
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded);
 
-    try ts.expectCellText(14, 2, "u");
-    try ts.expectCellText(15, 2, "n");
-    try ts.expectCellText(16, 2, "i");
+    try ts.expectCellText(19, 2, "u");
+    try ts.expectCellText(20, 2, "n");
+    try ts.expectCellText(21, 2, "i");
 }
 
 test "search input header does not show no match before submit" {

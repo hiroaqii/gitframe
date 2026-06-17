@@ -10,6 +10,7 @@ pub const RenderOptions = struct {
     requested_mode: DisplayMode = .unified,
     scroll: usize = 0,
     horizontal_scroll: usize = 0,
+    pane_active: bool = true,
     highlighted_hunk: ?usize = null,
     line_index: ?diff_view_model.RenderedLineIndex = null,
     folded_hunks: []const bool = &.{},
@@ -47,7 +48,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     if (size.width == 0 or size.height == 0) return;
 
     const mode = effectiveMode(size.width, options.requested_mode);
-    try renderFileHeader(surface, file, mode);
+    try renderFileHeader(surface, file, mode, options.pane_active);
 
     const line_index = if (options.line_index) |index|
         if (lineIndexMatchesFile(file, index, mode)) index else null
@@ -85,9 +86,9 @@ fn lineIndexMatchesFile(file: diff_parser.FileDiff, index: diff_view_model.Rende
     return index.mode == mode and index.hunk_offsets.len == file.hunks.len;
 }
 
-fn renderFileHeader(surface: *chasen.Surface, file: diff_parser.FileDiff, mode: DisplayMode) !void {
+fn renderFileHeader(surface: *chasen.Surface, file: diff_parser.FileDiff, mode: DisplayMode, pane_active: bool) !void {
     const stats = fileStats(file);
-    try copyClippedTextAt(surface, 0, 0, displayPath(file), style_file_header);
+    try copyClippedTextAt(surface, 0, 0, displayPath(file), fileHeaderStyle(pane_active));
     const summary = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  +{d} -{d}", .{
         mode.label(),
         stats.added,
@@ -269,6 +270,12 @@ fn styleForLine(kind: diff_parser.DiffLine.Kind) chasen.TextStyle {
     };
 }
 
+fn fileHeaderStyle(pane_active: bool) chasen.TextStyle {
+    var style = style_file_header;
+    style.dim = !pane_active;
+    return style;
+}
+
 fn prefixForLine(kind: diff_parser.DiffLine.Kind) []const u8 {
     return switch (kind) {
         .added => "+",
@@ -438,6 +445,27 @@ test "unified horizontal scroll keeps line numbers and prefix fixed" {
     try ts.expectCellText(10, 4, " ");
     try ts.expectCellText(12, 4, "4");
     try ts.expectCellText(13, 4, "5");
+}
+
+test "inactive pane dims file header only" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(40, 5);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{},
+    };
+
+    try renderFile(&ts.surface, file, .{ .pane_active = false });
+
+    try ts.expectCellText(0, 0, "s");
+    try std.testing.expect(ts.surface.readCell(0, 0).?.style.dim);
+    try ts.expectCellText(0, 1, "u");
+    try std.testing.expect(!ts.surface.readCell(0, 1).?.style.dim);
 }
 
 test "side-by-side horizontal scroll keeps gutter fixed" {
