@@ -13,12 +13,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const draw_mod = b.createModule(.{
+        .root_source_file = b.path("src/draw.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+        },
+    });
+
     const mod = b.addModule("gitframe", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{
             .{ .name = "chasen", .module = chasen_dep.module("chasen") },
             .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
+            .{ .name = "draw", .module = draw_mod },
         },
     });
 
@@ -55,6 +65,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const draw_tests = b.addTest(.{
+        .root_module = draw_mod,
+    });
+    const run_draw_tests = b.addRunArtifact(draw_tests);
+
     const diff_source_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/diff_source_test.zig"),
@@ -89,6 +104,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+                .{ .name = "draw", .module = draw_mod },
             },
         }),
     });
@@ -147,6 +163,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+                .{ .name = "draw", .module = draw_mod },
             },
         }),
     });
@@ -174,6 +191,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_draw_tests.step);
     test_step.dependOn(&run_diff_source_tests.step);
     test_step.dependOn(&run_diff_parser_tests.step);
     test_step.dependOn(&run_diff_file_tests.step);

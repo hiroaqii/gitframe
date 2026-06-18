@@ -1,5 +1,6 @@
 const std = @import("std");
 const chasen = @import("chasen");
+const draw = @import("draw");
 const diff_file = @import("file.zig");
 const diff_parser = @import("parser.zig");
 const diff_view_model = @import("view_model.zig");
@@ -67,7 +68,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
         if (cursor.done()) return;
         const row = cursor.nextRow() orelse continue;
         switch (body_row) {
-            .metadata => |line| try copyClippedTextAt(surface, 0, row, line, style_metadata),
+            .metadata => |line| try draw.copyClippedTextAt(surface, 0, row, line, style_metadata),
             .binary_marker => _ = surface.borrowTextAt(0, row, "Binary file", style_warning),
             .hunk_header => |hunk| try drawHunkHeaderRow(surface, row, hunk, options.highlighted_hunk, mode),
             .unified_line => |line| try drawUnifiedLine(surface, row, line, options.horizontal_scroll),
@@ -88,13 +89,13 @@ fn lineIndexMatchesFile(file: diff_parser.FileDiff, index: diff_view_model.Rende
 
 fn renderFileHeader(surface: *chasen.Surface, file: diff_parser.FileDiff, mode: DisplayMode, pane_active: bool) !void {
     const stats = fileStats(file);
-    try copyClippedTextAt(surface, 0, 0, displayPath(file), fileHeaderStyle(pane_active));
+    try draw.copyClippedTextAt(surface, 0, 0, displayPath(file), fileHeaderStyle(pane_active));
     const summary = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  +{d} -{d}", .{
         mode.label(),
         stats.added,
         stats.removed,
     });
-    try copyClippedTextAt(surface, 0, 1, summary, style_metadata);
+    try draw.copyClippedTextAt(surface, 0, 1, summary, style_metadata);
 }
 
 fn drawHunkHeader(surface: *chasen.Surface, row: u16, header: []const u8, style: chasen.TextStyle, mode: DisplayMode) !void {
@@ -106,12 +107,12 @@ fn drawHunkHeader(surface: *chasen.Surface, row: u16, header: []const u8, style:
             .width = gutter_col,
             .height = 1,
         });
-        try copyClippedTextAt(&old_column, 0, 0, header, style);
+        try draw.copyClippedTextAt(&old_column, 0, 0, header, style);
         _ = surface.borrowTextAt(gutter_col, row, "│", style_metadata);
         return;
     }
 
-    try copyClippedTextAt(surface, 0, row, header, style);
+    try draw.copyClippedTextAt(surface, 0, row, header, style);
 }
 
 fn drawHunkHeaderRow(
@@ -193,7 +194,7 @@ fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.Di
             drawSideBySideGutter(surface, row, gutter_col);
         },
         .metadata => {
-            try copyClippedTextAt(surface, 0, row, line.text, style_metadata);
+            try draw.copyClippedTextAt(surface, 0, row, line.text, style_metadata);
         },
     }
 }
@@ -238,22 +239,6 @@ fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffL
     const prefix = if (line.kind == .added) "+" else " ";
     _ = surface.borrowTextAt(5, row, prefix, styleForLine(line.kind));
     try copyScrolledTextAt(surface, 7, row, line.text, horizontal_scroll, styleForLine(line.kind));
-}
-
-fn copyClippedTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, style: chasen.TextStyle) !void {
-    const size = surface.size();
-    if (col >= size.width) return;
-    const max_width = size.width - col;
-    const clipped = chasen.text.clipToWidthWithMarker(text, max_width, "…");
-    if (clipped.prefix.len > 0) {
-        _ = try surface.copyTextAt(col, row, clipped.prefix, style);
-    }
-    if (clipped.marker.len > 0) {
-        const marker_col = col + chasen.text.displayWidth(clipped.prefix);
-        if (marker_col < size.width) {
-            _ = try surface.copyTextAt(marker_col, row, clipped.marker, style);
-        }
-    }
 }
 
 fn copyScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, horizontal_scroll: usize, style: chasen.TextStyle) !void {

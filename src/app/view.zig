@@ -1,6 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
+const draw = @import("draw");
 const diff_render = @import("../diff/render.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const file_tree = @import("../file_tree.zig");
@@ -197,11 +198,11 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
     if (size.width > 2) {
         if (app.hide_reviewed_files and app.changed_file_filter != .all) {
             const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{app.changed_file_filter.label()});
-            try copyClippedTextAt(surface, 0, 2, text, .{ .fg = .{ .index = 11 } });
+            try draw.copyClippedTextAt(surface, 0, 2, text, .{ .fg = .{ .index = 11 } });
         } else if (app.hide_reviewed_files) {
-            try copyClippedTextAt(surface, 0, 2, "hiding reviewed", .{ .fg = .{ .index = 11 } });
+            try draw.copyClippedTextAt(surface, 0, 2, "hiding reviewed", .{ .fg = .{ .index = 11 } });
         } else if (app.changed_file_filter != .all) {
-            try copyClippedTextAt(surface, 0, 2, app.changed_file_filter.label(), .{ .fg = .{ .index = 11 } });
+            try draw.copyClippedTextAt(surface, 0, 2, app.changed_file_filter.label(), .{ .fg = .{ .index = 11 } });
         }
     }
 
@@ -272,7 +273,7 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
             .width = row_layout.name_width,
             .height = 1,
         });
-        try copyClippedTextAt(&path_area, 0, 0, row_model.name, style);
+        try draw.copyClippedTextAt(&path_area, 0, 0, row_model.name, style);
     }
 
     if (row_layout.stats_col) |stats_col| {
@@ -317,7 +318,7 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         app.viewer.diff_scroll,
         horizontalScrollStatus(surface, app.viewer.diff_horizontal_scroll),
     });
-    try copyClippedTextAt(surface, 0, 2, status_text, status_style);
+    try draw.copyClippedTextAt(surface, 0, 2, status_text, status_style);
     if (app.search.query.len > 0 or app.search.mode) {
         surface.clear(.{ .col = 0, .row = 2, .width = size.width, .height = 1 });
     }
@@ -326,10 +327,10 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
             std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ app.search.query.slice(), offset + 1 }) catch "search"
         else
             std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{app.search.query.slice()}) catch "search";
-        copyClippedTextAt(surface, 0, 2, match_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
+        draw.copyClippedTextAt(surface, 0, 2, match_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
     } else if (app.search.mode and size.width > 0) {
         const prompt_text = std.fmt.allocPrint(surface.frameAllocator(), "search: {s}", .{app.search.input.slice()}) catch "search";
-        copyClippedTextAt(surface, 0, 2, prompt_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
+        draw.copyClippedTextAt(surface, 0, 2, prompt_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
     }
     try diff_render.renderFile(&diff_content, file, .{
         .requested_mode = app.viewer.display_mode,
@@ -485,7 +486,7 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         col +|= 7;
     }
     if (app.status_message.len > 0 and width > col + 2) {
-        copyClippedTextAt(surface, col, 0, app.status_message, .{ .fg = .{ .index = 11 } }) catch {};
+        draw.copyClippedTextAt(surface, col, 0, app.status_message, .{ .fg = .{ .index = 11 } }) catch {};
         const message_width = chasen.text.displayWidth(app.status_message);
         col +|= @intCast(@min(message_width + 2, std.math.maxInt(u16)));
     }
@@ -566,7 +567,7 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
             .width = if (size.width > 4) size.width - 4 else 0,
             .height = 1,
         });
-        try copyClippedTextAt(&label_area, 0, 0, label, style);
+        try draw.copyClippedTextAt(&label_area, 0, 0, label, style);
     }
 }
 
@@ -749,7 +750,7 @@ fn drawHelpLine(
 
     const row: u16 = @intCast(row_offset);
     switch (kind) {
-        .section_title => try copyClippedTextAt(surface, 0, row, first, .{ .bold = true, .fg = .{ .index = 11 } }),
+        .section_title => try draw.copyClippedTextAt(surface, 0, row, first, .{ .bold = true, .fg = .{ .index = 11 } }),
         .item => try drawHelpItem(surface, row, .{ .key = first, .description = second }),
         .blank => {},
     }
@@ -759,23 +760,9 @@ fn drawHelpLine(
 fn drawHelpItem(surface: *chasen.Surface, row: u16, item: HelpItem) !void {
     if (surface.size().width == 0) return;
     const key_width: u16 = @min(10, surface.size().width);
-    try copyClippedTextAt(surface, 0, row, item.key, .{ .bold = true });
+    try draw.copyClippedTextAt(surface, 0, row, item.key, .{ .bold = true });
     if (surface.size().width <= key_width) return;
-    try copyClippedTextAt(surface, key_width, row, item.description, .{});
-}
-
-fn copyClippedTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, style: chasen.TextStyle) !void {
-    if (col >= surface.size().width) return;
-    const clipped = chasen.text.clipToWidthWithMarker(text, surface.size().width - col, "…");
-    if (clipped.prefix.len > 0) {
-        _ = try surface.copyTextAt(col, row, clipped.prefix, style);
-    }
-    if (clipped.marker.len > 0) {
-        const marker_col = col + chasen.text.displayWidth(clipped.prefix);
-        if (marker_col < surface.size().width) {
-            _ = try surface.copyTextAt(marker_col, row, clipped.marker, style);
-        }
-    }
+    try draw.copyClippedTextAt(surface, key_width, row, item.description, .{});
 }
 
 fn drawHelpScrollIndicator(surface: *chasen.Surface, scroll: usize, visible_rows: u16, total_rows: usize) !void {
