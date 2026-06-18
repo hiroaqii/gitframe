@@ -1,5 +1,5 @@
 const app = @import("app.zig");
-const diff_source = @import("diff_source.zig");
+const diff_source = @import("diff/source.zig");
 
 pub const App = app.App;
 

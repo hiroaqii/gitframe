@@ -1,9 +1,9 @@
 const std = @import("std");
 
-const diff_file = @import("diff_file.zig");
-const diff_parser = @import("diff_parser.zig");
-const diff_search = @import("diff_search.zig");
-const diff_view_model = @import("diff_view_model.zig");
+const diff_file = @import("diff/file.zig");
+const diff_parser = @import("diff/parser.zig");
+const diff_search = @import("diff/search.zig");
+const diff_view_model = @import("diff/view_model.zig");
 const file_tree = @import("file_tree.zig");
 const sidebar_view_model = @import("sidebar_view_model.zig");
 

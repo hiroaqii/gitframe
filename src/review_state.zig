@@ -1,6 +1,6 @@
 const std = @import("std");
-const diff_file = @import("diff_file.zig");
-const diff_parser = @import("diff_parser.zig");
+const diff_file = @import("diff/file.zig");
+const diff_parser = @import("diff/parser.zig");
 
 /// Session-scoped source of truth for files marked as reviewed.
 ///

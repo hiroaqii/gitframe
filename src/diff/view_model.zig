@@ -1,5 +1,5 @@
 const std = @import("std");
-const diff_parser = @import("diff_parser.zig");
+const diff_parser = @import("parser.zig");
 
 pub const DisplayMode = enum {
     unified,

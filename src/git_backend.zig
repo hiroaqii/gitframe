@@ -27,7 +27,7 @@ pub const LoadResult = union(enum) {
 
 /// Git-command diff kinds only.
 ///
-/// Raw input such as stdin or patch files belongs to diff_source.zig, not to
+/// Raw input such as stdin or patch files belongs to diff/source.zig, not to
 /// this backend boundary. Keeping this union git-only prevents future status /
 /// stage / commit operations from inheriting raw-input concerns.
 pub const GitDiffKind = union(enum) {

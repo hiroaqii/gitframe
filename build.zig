@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
 
     const diff_source_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/diff_source.zig"),
+            .root_source_file = b.path("src/diff_source_test.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -66,7 +66,7 @@ pub fn build(b: *std.Build) void {
 
     const diff_parser_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/diff_parser.zig"),
+            .root_source_file = b.path("src/diff/parser.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -75,7 +75,7 @@ pub fn build(b: *std.Build) void {
 
     const diff_file_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/diff_file.zig"),
+            .root_source_file = b.path("src/diff/file.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -84,7 +84,7 @@ pub fn build(b: *std.Build) void {
 
     const diff_render_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/diff_render.zig"),
+            .root_source_file = b.path("src/diff/render.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -96,7 +96,7 @@ pub fn build(b: *std.Build) void {
 
     const diff_view_model_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/diff_view_model.zig"),
+            .root_source_file = b.path("src/diff/view_model.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -105,7 +105,7 @@ pub fn build(b: *std.Build) void {
 
     const diff_search_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/diff_search.zig"),
+            .root_source_file = b.path("src/diff/search.zig"),
             .target = target,
             .optimize = optimize,
         }),

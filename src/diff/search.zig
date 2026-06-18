@@ -1,6 +1,6 @@
 const std = @import("std");
-const diff_parser = @import("diff_parser.zig");
-const diff_view_model = @import("diff_view_model.zig");
+const diff_parser = @import("parser.zig");
+const diff_view_model = @import("view_model.zig");
 
 pub const Direction = enum {
     forward,
