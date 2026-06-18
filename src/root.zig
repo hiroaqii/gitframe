@@ -14,6 +14,7 @@ test {
     // thin facade. Add extracted modules here when they start owning tests.
     _ = @import("app.zig");
     _ = @import("app/input.zig");
+    _ = @import("app/prompt.zig");
     _ = @import("app/view.zig");
     _ = @import("editor.zig");
     _ = @import("git/backend.zig");

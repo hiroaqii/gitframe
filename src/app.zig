@@ -4,6 +4,7 @@ const ui = @import("chasen_ui");
 const app_input = @import("app/input.zig");
 const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
+const app_prompt = @import("app/prompt.zig");
 const app_view = @import("app/view.zig");
 const diff_parser = @import("diff/parser.zig");
 const diff_file = @import("diff/file.zig");
@@ -66,20 +67,12 @@ const ViewerState = struct {
 
 const DiffSearchState = struct {
     mode: bool = false,
-    input: SearchQuery = .{},
-    query: SearchQuery = .{},
+    input: app_prompt.TextInput = .{},
+    query: app_prompt.TextInput = .{},
     match: ?diff_search.Match = null,
     /// Rendered body-line offset cache for match. Recomputed when display
     /// mode, fold state, or selected file changes.
     match_offset: ?usize = null,
-};
-
-const FilterPromptState = struct {
-    mode: bool = false,
-    input: SearchQuery = .{},
-    /// Owns filtered indexes while labels are borrowed from the active source.
-    filter: ui.ListFilter = .{},
-    no_match: bool = false,
 };
 
 const OverlayState = enum {
@@ -97,9 +90,9 @@ pub const App = struct {
     status_message: []const u8 = "",
     viewer: ViewerState = .{},
     search: DiffSearchState = .{},
-    file_search: FilterPromptState = .{},
+    file_search: app_prompt.FilterPromptState = .{},
     file_search_return_focus: Focus = .sidebar,
-    repo_picker: FilterPromptState = .{},
+    repo_picker: app_prompt.FilterPromptState = .{},
     overlay: OverlayState = .none,
     help_scroll: usize = 0,
     hide_reviewed_files: bool = false,
@@ -194,8 +187,8 @@ pub const App = struct {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.clearLoadedDiff();
         self.repo_state.deinit(deinit_ctx.allocator);
-        self.file_search.filter.deinit(deinit_ctx.allocator);
-        self.repo_picker.filter.deinit(deinit_ctx.allocator);
+        self.file_search.deinit(deinit_ctx.allocator);
+        self.repo_picker.deinit(deinit_ctx.allocator);
         self.reviewed_store.deinit(deinit_ctx.allocator);
     }
 
@@ -286,23 +279,23 @@ pub const App = struct {
             .cancel_file_search => self.cancelFileSearchMode(ctx.allocator()),
             .submit_file_search => try self.submitFileSearch(ctx.allocator()),
             .file_search_insert => |codepoint| {
-                self.file_search.no_match = false;
+                self.file_search.resetNoMatch();
                 self.file_search.input.insert(codepoint) catch {};
             },
             .file_search_backspace => {
-                self.file_search.no_match = false;
+                self.file_search.resetNoMatch();
                 self.file_search.input.backspace();
             },
             .enter_repo_picker => try self.enterRepoPickerMode(ctx.allocator()),
             .cancel_repo_picker => self.cancelRepoPickerMode(ctx.allocator()),
             .submit_repo_picker => try self.submitRepoPicker(ctx),
             .repo_picker_insert => |codepoint| {
-                self.repo_picker.no_match = false;
+                self.repo_picker.resetNoMatch();
                 self.repo_picker.input.insert(codepoint) catch {};
                 try self.refreshRepoPickerFilter(ctx.allocator());
             },
             .repo_picker_backspace => {
-                self.repo_picker.no_match = false;
+                self.repo_picker.resetNoMatch();
                 self.repo_picker.input.backspace();
                 try self.refreshRepoPickerFilter(ctx.allocator());
             },
@@ -1021,14 +1014,11 @@ pub const App = struct {
         if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
         self.file_search.mode = true;
         self.file_search.input = .{};
-        self.file_search.no_match = false;
+        self.file_search.resetNoMatch();
     }
 
     fn cancelFileSearchMode(self: *App, allocator: std.mem.Allocator) void {
-        self.file_search.mode = false;
-        self.file_search.input = .{};
-        self.file_search.filter.deinit(allocator);
-        self.file_search.no_match = false;
+        self.file_search.deinit(allocator);
         self.viewer.focus = if (self.viewer.sidebar_hidden) .diff else self.file_search_return_focus;
     }
 
@@ -1037,16 +1027,13 @@ pub const App = struct {
 
         self.repo_picker.mode = true;
         self.repo_picker.input = .{};
-        self.repo_picker.no_match = false;
+        self.repo_picker.resetNoMatch();
         try self.refreshRepoPickerFilter(allocator);
         self.focusRepoPickerOnActive();
     }
 
     fn cancelRepoPickerMode(self: *App, allocator: std.mem.Allocator) void {
-        self.repo_picker.mode = false;
-        self.repo_picker.input = .{};
-        self.repo_picker.filter.deinit(allocator);
-        self.repo_picker.no_match = false;
+        self.repo_picker.deinit(allocator);
     }
 
     fn submitRepoPicker(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -1143,7 +1130,7 @@ pub const App = struct {
             return;
         };
         const node_index = try self.findFileNodeWithFilter(allocator, loaded, query) orelse {
-            self.file_search.filter.deinit(allocator);
+            self.file_search.clearFilter(allocator);
             self.file_search.no_match = true;
             return;
         };
@@ -1152,11 +1139,11 @@ pub const App = struct {
         // parent directory that hides the matched path.
         file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
         const load_allocator = self.loadArenaAllocator() orelse {
-            self.file_search.filter.deinit(allocator);
+            self.file_search.clearFilter(allocator);
             return;
         };
         loaded.rebuildVisibleNodes(load_allocator, self.hide_reviewed_files, self.changed_file_filter) catch {
-            self.file_search.filter.deinit(allocator);
+            self.file_search.clearFilter(allocator);
             self.file_search.no_match = true;
             return;
         };
@@ -1512,36 +1499,6 @@ fn maxHorizontalScrollForText(text: []const u8, visible_width: u16) usize {
     return width - visible_width;
 }
 
-const SearchQuery = struct {
-    buffer: [128]u8 = undefined,
-    len: usize = 0,
-
-    pub fn slice(self: *const SearchQuery) []const u8 {
-        return self.buffer[0..self.len];
-    }
-
-    fn insert(self: *SearchQuery, codepoint: u21) !void {
-        var bytes: [4]u8 = undefined;
-        const written = try std.unicode.utf8Encode(codepoint, &bytes);
-        if (self.len + written > self.buffer.len) return;
-        @memcpy(self.buffer[self.len .. self.len + written], bytes[0..written]);
-        self.len += written;
-    }
-
-    fn backspace(self: *SearchQuery) void {
-        if (self.len == 0) return;
-        var view = std.unicode.Utf8View.initUnchecked(self.slice());
-        var iterator = view.iterator();
-        var previous_end: usize = 0;
-        while (iterator.nextCodepointSlice()) |bytes| {
-            const end = @intFromPtr(bytes.ptr) - @intFromPtr(self.buffer[0..].ptr) + bytes.len;
-            if (end >= self.len) break;
-            previous_end = end;
-        }
-        self.len = previous_end;
-    }
-};
-
 fn parentDirectoryNodeIndex(tree: file_tree.FileTree, node_index: usize) ?usize {
     if (node_index >= tree.nodes.len) return null;
     const node = tree.nodes[node_index];
@@ -1735,7 +1692,7 @@ test "search resync without pane width change keeps horizontal scroll" {
         },
     };
 
-    setSearchQuery(&app, "wide");
+    setDiffSearchQuery(&app, "wide");
     app.submitSearch();
     app.viewer.diff_horizontal_scroll = 16;
 
@@ -1772,7 +1729,7 @@ test "display mode and search navigation reset horizontal scroll" {
     try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
 
     app.viewer.diff_horizontal_scroll = 16;
-    setSearchQuery(&app, "wide");
+    setDiffSearchQuery(&app, "wide");
     app.submitSearch();
     try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
 }
@@ -2002,7 +1959,7 @@ test "mode change resyncs search match to rendered body offsets" {
         .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{ .display_mode = .unified },
     };
-    setSearchQuery(&app, "late new");
+    setDiffSearchQuery(&app, "late new");
 
     app.submitSearch();
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
@@ -2024,7 +1981,7 @@ test "mode change keeps search near later matches" {
         .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{ .display_mode = .unified },
     };
-    setSearchQuery(&app, "new");
+    setDiffSearchQuery(&app, "new");
 
     app.submitSearch();
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
@@ -2081,7 +2038,7 @@ test "search unfolds folded hunk body matches before setting offset" {
         .load = testLoadStateWithArena(arena, loaded),
     };
     defer app.clearLoadedDiff();
-    setSearchQuery(&app, "new");
+    setDiffSearchQuery(&app, "new");
 
     app.submitSearch();
 
@@ -2104,7 +2061,7 @@ test "manual fold keeps hunk open when it contains active search match" {
         .load = testLoadStateWithArena(arena, loaded),
     };
     defer app.clearLoadedDiff();
-    setSearchQuery(&app, "new");
+    setDiffSearchQuery(&app, "new");
     app.submitSearch();
 
     app.toggleSelectedHunkFold();
@@ -2121,7 +2078,7 @@ test "file change resyncs retained search query to selected file" {
         .load = testLoadState(testLoadedDiffTwo()),
         .viewer = .{ .display_mode = .unified },
     };
-    setSearchQuery(&app, "target");
+    setDiffSearchQuery(&app, "target");
 
     app.selectFileAbsolute(1);
 
@@ -2209,7 +2166,7 @@ test "file search keeps prompt open on no match" {
     };
     setFileSearchInput(&app, "missing");
 
-    defer app.file_search.filter.deinit(std.testing.allocator);
+    defer app.file_search.deinit(std.testing.allocator);
 
     try app.submitFileSearch(std.testing.allocator);
 
@@ -2384,7 +2341,7 @@ test "diff search row keeps active focus style" {
         .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{ .focus = .diff },
     };
-    setSearchQuery(&app, "missing");
+    setDiffSearchQuery(&app, "missing");
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
@@ -2459,7 +2416,7 @@ test "file search skips files outside active changed filter" {
         .changed_file_filter = .added,
     };
     setFileSearchInput(&app, "deleted");
-    defer app.file_search.filter.deinit(std.testing.allocator);
+    defer app.file_search.deinit(std.testing.allocator);
 
     try app.submitFileSearch(std.testing.allocator);
 
@@ -2588,7 +2545,7 @@ test "repo picker focuses active workspace repository" {
         },
     };
     defer app.repo_state.deinit(allocator);
-    defer app.repo_picker.filter.deinit(allocator);
+    defer app.repo_picker.deinit(allocator);
 
     try app.enterRepoPickerMode(allocator);
 
@@ -2799,7 +2756,7 @@ test "search input header does not show no match before submit" {
         .load = testLoadState(testLoadedDiffOne()),
         .search = .{ .mode = true },
     };
-    setSearchInput(&app, "missing");
+    setDiffSearchInput(&app, "missing");
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
@@ -2817,7 +2774,7 @@ test "canceling edited search restores committed query and match" {
             .match_offset = 7,
         },
     };
-    setSearchQuery(&app, "new");
+    setDiffSearchQuery(&app, "new");
 
     app.enterSearchMode();
     app.search.input.backspace();
@@ -3026,13 +2983,13 @@ fn expectSnapshotNotContains(ts: *const chasen.testing.TestSurface, needle: []co
     try std.testing.expect(std.mem.indexOf(u8, actual, needle) == null);
 }
 
-fn setSearchQuery(app: *App, query: []const u8) void {
+fn setDiffSearchQuery(app: *App, query: []const u8) void {
     @memcpy(app.search.query.buffer[0..query.len], query);
     app.search.query.len = query.len;
-    setSearchInput(app, query);
+    setDiffSearchInput(app, query);
 }
 
-fn setSearchInput(app: *App, query: []const u8) void {
+fn setDiffSearchInput(app: *App, query: []const u8) void {
     @memcpy(app.search.input.buffer[0..query.len], query);
     app.search.input.len = query.len;
 }
