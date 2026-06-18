@@ -1,6 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
+const app_actions = @import("app/actions.zig");
 const app_input = @import("app/input.zig");
 const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
@@ -85,6 +86,7 @@ pub const App = struct {
     env_map: ?*std.process.Environ.Map = null,
     allocator: ?std.mem.Allocator = null,
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
+    actions: app_actions.ActionState = .{},
     load: LoadRuntimeState = .{},
     status_message_buf: [160]u8 = undefined,
     status_message: []const u8 = "",
