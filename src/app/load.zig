@@ -1,10 +1,10 @@
 const std = @import("std");
-const diff_parser = @import("diff_parser.zig");
-const diff_source = @import("diff_source.zig");
-const diff_view_model = @import("diff_view_model.zig");
-const file_tree = @import("file_tree.zig");
-const loaded_diff = @import("loaded_diff.zig");
-const repo_discovery = @import("repo_discovery.zig");
+const diff_parser = @import("../diff_parser.zig");
+const diff_source = @import("../diff_source.zig");
+const diff_view_model = @import("../diff_view_model.zig");
+const file_tree = @import("../file_tree.zig");
+const loaded_diff = @import("../loaded_diff.zig");
+const repo_discovery = @import("../repo_discovery.zig");
 
 const LoadRequest = diff_source.LoadRequest;
 const LoadedDiff = loaded_diff.LoadedDiff;

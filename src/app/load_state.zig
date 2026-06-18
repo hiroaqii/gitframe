@@ -17,7 +17,7 @@ pub const PendingLoad = union(enum) {
 
 /// Runtime-owned load state for the active diff source.
 ///
-/// Async tasks produce raw results in app_load.zig. Once App accepts a result,
+/// Async tasks produce raw results in app/load.zig. Once App accepts a result,
 /// this type owns the active arena-backed payload and is responsible for
 /// replacing or clearing it without leaking old sessions.
 pub const LoadRuntimeState = struct {
