@@ -650,9 +650,7 @@ fn helpModalOptions(size: chasen.Size) ui.Modal.ViewOptions {
 
 pub fn helpContentSize(size: chasen.Size) chasen.Size {
     const opts = helpModalOptions(size);
-    const dialog_rect = ui.Modal.dialogRectFor(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, opts);
-    const content_rect = ui.Modal.contentRectFor(dialog_rect, opts.padding);
-    return .{ .width = content_rect.width, .height = content_rect.height };
+    return ui.Modal.contentSizeForOverlay(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, opts);
 }
 
 fn helpBodyLayout(size: chasen.Size) HelpBodyLayout {
@@ -921,6 +919,14 @@ test "help popup uses one column on narrow content" {
 
     try std.testing.expect(content.width < help_two_column_min_width);
     try std.testing.expectEqual(rowsForSections(helpAllSections()), helpRenderedRows(content));
+}
+
+test "help content size uses Modal overlay sizing" {
+    const size = chasen.Size{ .width = 140, .height = 20 };
+    const opts = helpModalOptions(size);
+    const expected = ui.Modal.contentSizeForOverlay(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, opts);
+
+    try std.testing.expectEqual(expected, helpContentSize(size));
 }
 
 test "help popup uses two columns on wide content" {
