@@ -16,6 +16,7 @@ test {
     _ = @import("app/actions.zig");
     _ = @import("app/input.zig");
     _ = @import("app/prompt.zig");
+    _ = @import("app/state.zig");
     _ = @import("app/view.zig");
     _ = @import("draw");
     _ = @import("editor.zig");

@@ -83,7 +83,7 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
     if (app.repo_picker.mode) {
         try viewRepoPicker(app, surface);
     }
-    if (app.overlay == .help) {
+    if (app.overlay.isHelp()) {
         try viewHelpPopup(app, surface);
     }
 }
@@ -196,13 +196,13 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
         loaded.document.totalHunks(),
     });
     if (size.width > 2) {
-        if (app.hide_reviewed_files and app.changed_file_filter != .all) {
-            const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{app.changed_file_filter.label()});
+        if (app.review_display.hide_reviewed_files and app.review_display.changed_file_filter != .all) {
+            const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{app.review_display.changed_file_filter.label()});
             try draw.copyClippedTextAt(surface, 0, 2, text, .{ .fg = .{ .index = 11 } });
-        } else if (app.hide_reviewed_files) {
+        } else if (app.review_display.hide_reviewed_files) {
             try draw.copyClippedTextAt(surface, 0, 2, "hiding reviewed", .{ .fg = .{ .index = 11 } });
-        } else if (app.changed_file_filter != .all) {
-            try draw.copyClippedTextAt(surface, 0, 2, app.changed_file_filter.label(), .{ .fg = .{ .index = 11 } });
+        } else if (app.review_display.changed_file_filter != .all) {
+            try draw.copyClippedTextAt(surface, 0, 2, app.review_display.changed_file_filter.label(), .{ .fg = .{ .index = 11 } });
         }
     }
 
@@ -397,11 +397,11 @@ fn noChangesHint(app: anytype) []const u8 {
 }
 
 fn filterEmptyMessage(app: anytype) StateMessage {
-    const hint = if (app.hide_reviewed_files and app.changed_file_filter != .all)
+    const hint = if (app.review_display.hide_reviewed_files and app.review_display.changed_file_filter != .all)
         "Press F to change filter, H to show reviewed files, or r to reload."
-    else if (app.hide_reviewed_files)
+    else if (app.review_display.hide_reviewed_files)
         "Press H to show reviewed files or r to reload."
-    else if (app.changed_file_filter != .all)
+    else if (app.review_display.changed_file_filter != .all)
         "Press F to change filter or r to reload."
     else
         "Press r to reload.";
@@ -485,9 +485,9 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         _ = surface.borrowTextAt(col, 0, "watch", .{ .fg = .{ .index = 10 } });
         col +|= 7;
     }
-    if (app.status_message.len > 0 and width > col + 2) {
-        draw.copyClippedTextAt(surface, col, 0, app.status_message, .{ .fg = .{ .index = 11 } }) catch {};
-        const message_width = chasen.text.displayWidth(app.status_message);
+    if (app.status.text().len > 0 and width > col + 2) {
+        draw.copyClippedTextAt(surface, col, 0, app.status.text(), .{ .fg = .{ .index = 11 } }) catch {};
+        const message_width = chasen.text.displayWidth(app.status.text());
         col +|= @intCast(@min(message_width + 2, std.math.maxInt(u16)));
     }
 
@@ -592,7 +592,7 @@ fn viewHelpPopup(app: anytype, surface: *chasen.Surface) !void {
     const body = helpBodyLayout(size);
     const total_rows = helpRenderedRows(size);
     const max_scroll = helpMaxScrollForContentSize(size);
-    const scroll = @min(app.help_scroll, max_scroll);
+    const scroll = @min(app.overlay.help_scroll, max_scroll);
 
     if (body.overflow) {
         drawHelpScrollIndicator(&content, scroll, body.visible_rows, total_rows) catch {};

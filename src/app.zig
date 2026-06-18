@@ -6,6 +6,7 @@ const app_input = @import("app/input.zig");
 const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
 const app_prompt = @import("app/prompt.zig");
+const app_state = @import("app/state.zig");
 const app_view = @import("app/view.zig");
 const diff_parser = @import("diff/parser.zig");
 const diff_file = @import("diff/file.zig");
@@ -29,7 +30,6 @@ pub const LoadRequest = diff_source.LoadRequest;
 pub const ParseArgsError = diff_source.ParseArgsError;
 pub const parseArgs = diff_source.parseArgs;
 
-const ChangedFileFilter = loaded_diff.ChangedFileFilter;
 const DiffLoadFinished = app_load.DiffLoadFinished;
 const DiffLoadTask = app_load.DiffLoadTask(App.Msg);
 const EmptyReason = app_load_state.EmptyReason;
@@ -76,10 +76,8 @@ const DiffSearchState = struct {
     match_offset: ?usize = null,
 };
 
-const OverlayState = enum {
-    none,
-    help,
-};
+const ChangedFileFilter = loaded_diff.ChangedFileFilter;
+const OverlayKind = app_state.OverlayKind;
 
 pub const App = struct {
     config: CliConfig = .{},
@@ -88,17 +86,14 @@ pub const App = struct {
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
     actions: app_actions.ActionState = .{},
     load: LoadRuntimeState = .{},
-    status_message_buf: [160]u8 = undefined,
-    status_message: []const u8 = "",
+    status: app_state.StatusMessage = .{},
     viewer: ViewerState = .{},
     search: DiffSearchState = .{},
     file_search: app_prompt.FilterPromptState = .{},
     file_search_return_focus: Focus = .sidebar,
     repo_picker: app_prompt.FilterPromptState = .{},
-    overlay: OverlayState = .none,
-    help_scroll: usize = 0,
-    hide_reviewed_files: bool = false,
-    changed_file_filter: ChangedFileFilter = .all,
+    overlay: app_state.OverlayState = .{},
+    review_display: app_state.ReviewDisplayState = .{},
     repo_state: repo_state.State = .{},
     /// Session-level source of truth for reviewed files. The active LoadedDiff
     /// keeps a materialized bool slice so hide-reviewed hot paths stay O(1).
@@ -304,10 +299,9 @@ pub const App = struct {
             .repo_picker_move_previous => self.repo_picker.filter.update(.move_prev),
             .repo_picker_move_next => self.repo_picker.filter.update(.move_next),
             .open_help => {
-                self.overlay = .help;
-                self.help_scroll = 0;
+                self.overlay.openHelp();
             },
-            .close_help => self.overlay = .none,
+            .close_help => self.overlay.close(),
             .help_scroll_up => self.scrollHelp(-1),
             .help_scroll_down => self.scrollHelp(1),
             .help_page_up => self.pageHelp(-1),
@@ -347,7 +341,7 @@ pub const App = struct {
         if (self.search.mode or self.file_search.mode or self.repo_picker.mode) return null;
         if (mouse.type != .press) return null;
 
-        if (self.overlay == .help) {
+        if (self.overlay.isHelp()) {
             return switch (mouse.button) {
                 .wheel_up => .help_scroll_up,
                 .wheel_down => .help_scroll_down,
@@ -425,7 +419,7 @@ pub const App = struct {
             .search_mode = self.search.mode,
             .file_search_mode = self.file_search.mode,
             .repo_picker_mode = self.repo_picker.mode,
-            .help_mode = self.overlay == .help,
+            .help_mode = self.overlay.isHelp(),
             .search_query_len = self.search.query.len,
             .focus = self.viewer.focus,
             .sidebar_hidden = self.viewer.sidebar_hidden,
@@ -435,9 +429,9 @@ pub const App = struct {
     fn scrollHelp(self: *App, delta: isize) void {
         if (delta < 0) {
             const amount: usize = @intCast(-(delta + 1));
-            self.help_scroll -|= amount + 1;
+            self.overlay.help_scroll -|= amount + 1;
         } else {
-            self.help_scroll +|= @intCast(delta);
+            self.overlay.help_scroll +|= @intCast(delta);
         }
         self.clampHelpScroll();
     }
@@ -452,7 +446,7 @@ pub const App = struct {
     }
 
     fn clampHelpScroll(self: *App) void {
-        self.help_scroll = @min(self.help_scroll, app_view.helpMaxScroll(self.layoutSize()));
+        self.overlay.help_scroll = @min(self.overlay.help_scroll, app_view.helpMaxScroll(self.layoutSize()));
     }
 
     fn viewSidebar(self: *const App, surface: *chasen.Surface, loaded: LoadedDiff) !void {
@@ -624,7 +618,7 @@ pub const App = struct {
     }
 
     fn setStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
-        self.status_message = std.fmt.bufPrint(&self.status_message_buf, fmt, args) catch "status formatting failed";
+        self.status.set(fmt, args);
     }
 
     fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -685,8 +679,8 @@ pub const App = struct {
                 try self.materializeReviewedFiles(ctx.allocator(), &loaded);
                 errdefer ctx.allocator().free(loaded.reviewed_files);
 
-                if (self.hide_reviewed_files or self.changed_file_filter != .all) {
-                    try loaded.rebuildVisibleNodes(arena.allocator(), self.hide_reviewed_files, self.changed_file_filter);
+                if (self.review_display.hide_reviewed_files or self.review_display.changed_file_filter != .all) {
+                    try loaded.rebuildVisibleNodes(arena.allocator(), self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
                 }
 
                 // Keep all fallible setup above this point. After assigning a
@@ -701,7 +695,7 @@ pub const App = struct {
                 const active_loaded = self.activeLoadedDiff().?;
                 self.syncSidebarNodeToSelectedFile(active_loaded);
                 self.clampSelection(active_loaded.document.files.len);
-                if (self.hide_reviewed_files) {
+                if (self.review_display.hide_reviewed_files) {
                     self.reconcileSelectionAfterVisibleNodeChange(active_loaded);
                 }
                 self.clampDiffNavigation();
@@ -792,7 +786,7 @@ pub const App = struct {
         if (node.kind != .directory) return;
         const allocator = self.loadArenaAllocator() orelse return;
         try file_tree.toggle(allocator, &loaded.collapsed_dirs, node.path);
-        try loaded.rebuildVisibleNodes(allocator, self.hide_reviewed_files, self.changed_file_filter);
+        try loaded.rebuildVisibleNodes(allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
         self.clampSelection(loaded.document.files.len);
     }
 
@@ -802,7 +796,7 @@ pub const App = struct {
         const node = loaded.tree.nodes[self.viewer.selected_node];
         if (node.kind != .directory) return;
         file_tree.expand(&loaded.collapsed_dirs, node.path);
-        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.hide_reviewed_files, self.changed_file_filter);
+        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
         self.clampSelection(loaded.document.files.len);
     }
 
@@ -813,7 +807,7 @@ pub const App = struct {
         if (node.kind == .directory and !file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) {
             const allocator = self.loadArenaAllocator() orelse return;
             try file_tree.collapse(allocator, &loaded.collapsed_dirs, node.path);
-            try loaded.rebuildVisibleNodes(allocator, self.hide_reviewed_files, self.changed_file_filter);
+            try loaded.rebuildVisibleNodes(allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
             self.clampSelection(loaded.document.files.len);
             return;
         }
@@ -1097,25 +1091,25 @@ pub const App = struct {
         const reviewed = !loaded.reviewed_files[file_index];
         try self.reviewed_store.set(allocator, self.activeRepoRoot(), loaded.document.files[file_index], reviewed);
         loaded.reviewed_files[file_index] = reviewed;
-        if (self.hide_reviewed_files) {
-            try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, true, self.changed_file_filter);
+        if (self.review_display.hide_reviewed_files) {
+            try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, true, self.review_display.changed_file_filter);
             self.reconcileSelectionAfterVisibleNodeChange(loaded);
             self.clampDiffNavigation();
         }
     }
 
     fn toggleHideReviewedFiles(self: *App) !void {
-        self.hide_reviewed_files = !self.hide_reviewed_files;
+        self.review_display.hide_reviewed_files = !self.review_display.hide_reviewed_files;
         const loaded = self.activeLoadedDiff() orelse return;
-        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.hide_reviewed_files, self.changed_file_filter);
+        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
         self.reconcileSelectionAfterVisibleNodeChange(loaded);
         self.clampDiffNavigation();
     }
 
     fn cycleChangedFileFilter(self: *App) !void {
-        self.changed_file_filter = self.changed_file_filter.next();
+        self.review_display.changed_file_filter = self.review_display.changed_file_filter.next();
         const loaded = self.activeLoadedDiff() orelse return;
-        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.hide_reviewed_files, self.changed_file_filter);
+        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
         self.reconcileSelectionAfterVisibleNodeChange(loaded);
         self.clampDiffNavigation();
     }
@@ -1144,7 +1138,7 @@ pub const App = struct {
             self.file_search.clearFilter(allocator);
             return;
         };
-        loaded.rebuildVisibleNodes(load_allocator, self.hide_reviewed_files, self.changed_file_filter) catch {
+        loaded.rebuildVisibleNodes(load_allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter) catch {
             self.file_search.clearFilter(allocator);
             self.file_search.no_match = true;
             return;
@@ -1407,7 +1401,7 @@ pub const App = struct {
 
         for (loaded.tree.nodes, 0..) |node, index| {
             if (node.kind != .file) continue;
-            if (!loaded.shouldIncludeFileNode(index, self.hide_reviewed_files, self.changed_file_filter)) continue;
+            if (!loaded.shouldIncludeFileNode(index, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter)) continue;
             try labels.append(allocator, node.path);
             try node_indexes.append(allocator, index);
         }
@@ -1799,7 +1793,7 @@ test "help overlay opens and closes before normal shortcuts" {
 
     const open_msg = app.handleEvent(.{ .key_press = .{ .codepoint = '?' } }) orelse return error.ExpectedOpenHelp;
     try app.update(open_msg, undefined);
-    try std.testing.expectEqual(OverlayState.help, app.overlay);
+    try std.testing.expectEqual(OverlayKind.help, app.overlay.kind);
 
     const scroll_msg = app.handleEvent(.{ .key_press = .{ .codepoint = 'j' } }) orelse return error.ExpectedHelpScroll;
     try std.testing.expectEqual(App.Msg.help_scroll_down, scroll_msg);
@@ -1807,21 +1801,20 @@ test "help overlay opens and closes before normal shortcuts" {
     const close_msg = app.handleEvent(.{ .key_press = .{ .codepoint = 'q' } }) orelse return error.ExpectedCloseHelp;
     try std.testing.expectEqual(App.Msg.close_help, close_msg);
     try app.update(close_msg, undefined);
-    try std.testing.expectEqual(OverlayState.none, app.overlay);
+    try std.testing.expectEqual(OverlayKind.none, app.overlay.kind);
 }
 
 test "help overlay reopen resets help scroll" {
     var app: App = .{
         .terminal_size = .{ .width = 120, .height = 12 },
-        .overlay = .help,
-        .help_scroll = 5,
+        .overlay = .{ .kind = .help, .help_scroll = 5 },
     };
 
     try app.update(.close_help, undefined);
     try app.update(.open_help, undefined);
 
-    try std.testing.expectEqual(OverlayState.help, app.overlay);
-    try std.testing.expectEqual(@as(usize, 0), app.help_scroll);
+    try std.testing.expectEqual(OverlayKind.help, app.overlay.kind);
+    try std.testing.expectEqual(@as(usize, 0), app.overlay.help_scroll);
 }
 
 test "prompt input stays above help overlay" {
@@ -1832,7 +1825,7 @@ test "prompt input stays above help overlay" {
     const msg = app.handleEvent(.{ .key_press = .{ .codepoint = '?' } }) orelse return error.ExpectedPromptInput;
     try app.update(msg, undefined);
 
-    try std.testing.expectEqual(OverlayState.none, app.overlay);
+    try std.testing.expectEqual(OverlayKind.none, app.overlay.kind);
     try std.testing.expectEqualStrings("?", app.search.input.slice());
 }
 
@@ -1897,14 +1890,14 @@ test "help overlay wheel scrolls help and ignores clicks" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
         .load = testLoadState(testLoadedDiffOne()),
-        .overlay = .help,
+        .overlay = .{ .kind = .help },
     };
 
     const content = app_view.shellContentRect(app.terminal_size);
     const msg = app.handleEvent(testMouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedHelpWheelMessage;
     try std.testing.expectEqual(App.Msg.help_scroll_down, msg);
     try app.update(msg, undefined);
-    try std.testing.expect(app.help_scroll > 0);
+    try std.testing.expect(app.overlay.help_scroll > 0);
 
     try std.testing.expect(app.handleEvent(testMouseEvent(content.col + 1, content.row + 2, .left)) == null);
 }
@@ -2190,7 +2183,7 @@ test "file search skips hidden reviewed matches" {
             .lines = 0,
         }),
         .file_search = .{ .mode = true },
-        .hide_reviewed_files = true,
+        .review_display = .{ .hide_reviewed_files = true },
     };
     defer app.clearLoadedDiff();
     try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, true, .all);
@@ -2354,7 +2347,7 @@ test "diff search row keeps active focus style" {
 test "changed file filter keeps only matching status rows" {
     var app: App = .{
         .load = testLoadStateWithArena(.init(std.testing.allocator), testLoadedDiffTwoWithStatuses()),
-        .changed_file_filter = .added,
+        .review_display = .{ .changed_file_filter = .added },
         .viewer = .{
             .selected_node = 1,
             .selected_file = 1,
@@ -2362,7 +2355,7 @@ test "changed file filter keeps only matching status rows" {
     };
     defer app.clearLoadedDiff();
 
-    try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, false, app.changed_file_filter);
+    try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, false, app.review_display.changed_file_filter);
 
     const loaded = app.loadedDiff().?;
     try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
@@ -2372,7 +2365,7 @@ test "changed file filter keeps only matching status rows" {
 test "finishDiffLoad applies active changed file filter" {
     var app: App = .{
         .load = .{ .generation = 1 },
-        .changed_file_filter = .added,
+        .review_display = .{ .changed_file_filter = .added },
     };
     defer app.clearLoadedDiff();
     defer app.reviewed_store.deinit(std.testing.allocator);
@@ -2405,7 +2398,7 @@ test "cycling changed file filter rebuilds visible nodes and reconciles selectio
     try app.cycleChangedFileFilter();
 
     const loaded = app.loadedDiff().?;
-    try std.testing.expectEqual(ChangedFileFilter.modified, app.changed_file_filter);
+    try std.testing.expectEqual(ChangedFileFilter.modified, app.review_display.changed_file_filter);
     try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
@@ -2415,7 +2408,7 @@ test "file search skips files outside active changed filter" {
     var app: App = .{
         .load = testLoadState(testLoadedDiffTwoWithStatuses()),
         .file_search = .{ .mode = true },
-        .changed_file_filter = .added,
+        .review_display = .{ .changed_file_filter = .added },
     };
     setFileSearchInput(&app, "deleted");
     defer app.file_search.deinit(std.testing.allocator);
@@ -2603,7 +2596,7 @@ test "hide reviewed files removes reviewed file rows from visible list" {
     try app.toggleHideReviewedFiles();
 
     const loaded = app.loadedDiff().?;
-    try std.testing.expect(app.hide_reviewed_files);
+    try std.testing.expect(app.review_display.hide_reviewed_files);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
@@ -2679,7 +2672,7 @@ test "marking a visible file as reviewed while hidden moves selection" {
             .selected_node = 1,
             .selected_file = 0,
         },
-        .hide_reviewed_files = true,
+        .review_display = .{ .hide_reviewed_files = true },
     };
     defer app.clearLoadedDiff();
     defer app.reviewed_store.deinit(std.testing.allocator);
@@ -2853,7 +2846,7 @@ test "loaded diff with empty visible filter shows local empty state" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 18 },
         .load = testLoadStateWithArena(arena, loaded),
-        .changed_file_filter = .binary,
+        .review_display = .{ .changed_file_filter = .binary },
     };
     defer app.clearLoadedDiff();
 
