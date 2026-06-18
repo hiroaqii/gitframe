@@ -2,6 +2,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const app_input = @import("app_input.zig");
+const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app_load.zig");
 const app_view = @import("app_view.zig");
 const diff_parser = @import("diff_parser.zig");
@@ -29,8 +30,12 @@ pub const parseArgs = diff_source.parseArgs;
 const ChangedFileFilter = loaded_diff.ChangedFileFilter;
 const DiffLoadFinished = app_load.DiffLoadFinished;
 const DiffLoadTask = app_load.DiffLoadTask(App.Msg);
+const EmptyReason = app_load_state.EmptyReason;
+const LoadedSession = app_load_state.LoadedSession;
 const Focus = app_input.Focus;
 const LoadedDiff = loaded_diff.LoadedDiff;
+const LoadRuntimeState = app_load_state.LoadRuntimeState;
+const PendingLoad = app_load_state.PendingLoad;
 const RepoDiscoveryFinished = app_load.RepoDiscoveryFinished;
 const RepoDiscoveryTask = app_load.RepoDiscoveryTask(App.Msg);
 
@@ -80,121 +85,6 @@ const FilterPromptState = struct {
 const OverlayState = enum {
     none,
     help,
-};
-
-const PendingLoad = union(enum) {
-    repo_discovery: u64,
-    diff_load: u64,
-
-    fn generation(self: PendingLoad) u64 {
-        return switch (self) {
-            .repo_discovery => |value| value,
-            .diff_load => |value| value,
-        };
-    }
-};
-
-const LoadRuntimeState = struct {
-    state: LoadState = .idle,
-    pending: ?PendingLoad = null,
-    /// Monotonic id used to ignore stale async task results after reload.
-    generation: u64 = 0,
-
-    fn beginRepoDiscovery(self: *LoadRuntimeState) u64 {
-        const next = self.nextGeneration();
-        self.pending = .{ .repo_discovery = next };
-        return next;
-    }
-
-    fn beginDiffLoad(self: *LoadRuntimeState) u64 {
-        const next = self.nextGeneration();
-        self.pending = .{ .diff_load = next };
-        return next;
-    }
-
-    fn finishPending(self: *LoadRuntimeState, expected: PendingLoad) bool {
-        if (!self.pendingMatches(expected)) return false;
-        self.pending = null;
-        return true;
-    }
-
-    fn clearPendingIfCurrent(self: *LoadRuntimeState, expected: PendingLoad) bool {
-        return self.finishPending(expected);
-    }
-
-    fn isCurrent(self: *const LoadRuntimeState, generation: u64) bool {
-        return self.generation == generation;
-    }
-
-    fn hasPending(self: *const LoadRuntimeState) bool {
-        return self.pending != null;
-    }
-
-    fn nextGeneration(self: *LoadRuntimeState) u64 {
-        self.generation +%= 1;
-        return self.generation;
-    }
-
-    fn pendingMatches(self: *const LoadRuntimeState, expected: PendingLoad) bool {
-        const pending = self.pending orelse return false;
-        return std.meta.eql(pending, expected);
-    }
-
-    fn replaceLoaded(self: *LoadRuntimeState, allocator: std.mem.Allocator, session: LoadedSession) void {
-        self.clearCurrent(allocator);
-        self.state = .{ .loaded = session };
-    }
-
-    fn replaceFailed(self: *LoadRuntimeState, allocator: std.mem.Allocator, message: []const u8) !void {
-        var arena: std.heap.ArenaAllocator = .init(allocator);
-        errdefer arena.deinit();
-
-        const copied = try arena.allocator().dupe(u8, message);
-        self.clearCurrent(allocator);
-        self.state = .{ .failed = .{
-            .arena = arena,
-            .message = if (copied.len > 0) copied else "Unknown diff load error",
-        } };
-    }
-
-    fn replaceEmpty(self: *LoadRuntimeState, allocator: std.mem.Allocator, reason: EmptyReason) void {
-        self.clearCurrent(allocator);
-        self.state = .{ .empty = reason };
-    }
-
-    fn clearCurrent(self: *LoadRuntimeState, allocator: ?std.mem.Allocator) void {
-        switch (self.state) {
-            .loaded => |*session| session.deinit(allocator),
-            .failed => |*failed| failed.deinit(),
-            .idle, .loading, .empty => {},
-        }
-        self.state = .idle;
-    }
-};
-
-const LoadedSession = struct {
-    arena: std.heap.ArenaAllocator,
-    loaded: LoadedDiff,
-    reviewed_files_owned: bool = false,
-
-    fn deinit(self: *LoadedSession, allocator: ?std.mem.Allocator) void {
-        if (self.reviewed_files_owned) {
-            const owner = allocator orelse @panic("LoadedSession reviewed file slice requires an allocator");
-            owner.free(self.loaded.reviewed_files);
-        }
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-const FailedLoad = struct {
-    arena: std.heap.ArenaAllocator,
-    message: []const u8,
-
-    fn deinit(self: *FailedLoad) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
 };
 
 pub const App = struct {
@@ -1650,19 +1540,6 @@ const SearchQuery = struct {
         }
         self.len = previous_end;
     }
-};
-
-const LoadState = union(enum) {
-    idle,
-    loading,
-    empty: EmptyReason,
-    loaded: LoadedSession,
-    failed: FailedLoad,
-};
-
-const EmptyReason = enum {
-    no_changes,
-    no_repository,
 };
 
 fn parentDirectoryNodeIndex(tree: file_tree.FileTree, node_index: usize) ?usize {
