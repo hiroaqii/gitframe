@@ -97,10 +97,6 @@ const PendingLoad = union(enum) {
 const LoadRuntimeState = struct {
     state: LoadState = .idle,
     pending: ?PendingLoad = null,
-    active_reviewed_files_owned: bool = false,
-    /// Owns the currently loaded raw diff, parsed document arrays, and error
-    /// messages. Recreated on every successful load/reload.
-    arena: ?std.heap.ArenaAllocator = null,
     /// Monotonic id used to ignore stale async task results after reload.
     generation: u64 = 0,
 
@@ -142,6 +138,62 @@ const LoadRuntimeState = struct {
     fn pendingMatches(self: *const LoadRuntimeState, expected: PendingLoad) bool {
         const pending = self.pending orelse return false;
         return std.meta.eql(pending, expected);
+    }
+
+    fn replaceLoaded(self: *LoadRuntimeState, allocator: std.mem.Allocator, session: LoadedSession) void {
+        self.clearCurrent(allocator);
+        self.state = .{ .loaded = session };
+    }
+
+    fn replaceFailed(self: *LoadRuntimeState, allocator: std.mem.Allocator, message: []const u8) !void {
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        errdefer arena.deinit();
+
+        const copied = try arena.allocator().dupe(u8, message);
+        self.clearCurrent(allocator);
+        self.state = .{ .failed = .{
+            .arena = arena,
+            .message = if (copied.len > 0) copied else "Unknown diff load error",
+        } };
+    }
+
+    fn replaceEmpty(self: *LoadRuntimeState, allocator: std.mem.Allocator, reason: EmptyReason) void {
+        self.clearCurrent(allocator);
+        self.state = .{ .empty = reason };
+    }
+
+    fn clearCurrent(self: *LoadRuntimeState, allocator: ?std.mem.Allocator) void {
+        switch (self.state) {
+            .loaded => |*session| session.deinit(allocator),
+            .failed => |*failed| failed.deinit(),
+            .idle, .loading, .empty => {},
+        }
+        self.state = .idle;
+    }
+};
+
+const LoadedSession = struct {
+    arena: std.heap.ArenaAllocator,
+    loaded: LoadedDiff,
+    reviewed_files_owned: bool = false,
+
+    fn deinit(self: *LoadedSession, allocator: ?std.mem.Allocator) void {
+        if (self.reviewed_files_owned) {
+            const owner = allocator orelse @panic("LoadedSession reviewed file slice requires an allocator");
+            owner.free(self.loaded.reviewed_files);
+        }
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+const FailedLoad = struct {
+    arena: std.heap.ArenaAllocator,
+    message: []const u8,
+
+    fn deinit(self: *FailedLoad) void {
+        self.arena.deinit();
+        self.* = undefined;
     }
 };
 
@@ -540,7 +592,7 @@ pub const App = struct {
         self.load.state = .loading;
         ctx.task().spawnWith(task, RepoDiscoveryTask.run) catch |err| {
             _ = self.load.clearPendingIfCurrent(.{ .repo_discovery = generation });
-            self.load.state = .{ .failed = "Could not start repo discovery task" };
+            try self.storeFailedMessage(ctx.allocator(), "Could not start repo discovery task");
             return err;
         };
     }
@@ -560,7 +612,7 @@ pub const App = struct {
 
                 if (self.activeRepoRoot() == null) {
                     self.clearLoadedDiff();
-                    self.load.state = .{ .empty = .no_repository };
+                    self.load.replaceEmpty(ctx.allocator(), .no_repository);
                     return;
                 }
 
@@ -577,9 +629,9 @@ pub const App = struct {
 
     fn startDiffLoad(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         const repo_root = self.repoRootForCurrentSource() catch |err| {
-            self.load.state = .{ .empty = switch (err) {
+            self.load.replaceEmpty(ctx.allocator(), switch (err) {
                 error.MissingRepoRoot => .no_repository,
-            } };
+            });
             return;
         };
 
@@ -610,7 +662,7 @@ pub const App = struct {
         }
         ctx.task().spawnWith(task, DiffLoadTask.run) catch |err| {
             _ = self.load.clearPendingIfCurrent(.{ .diff_load = generation });
-            self.load.state = .{ .failed = "Could not start diff load task" };
+            try self.storeFailedMessage(ctx.allocator(), "Could not start diff load task");
             return err;
         };
     }
@@ -739,7 +791,7 @@ pub const App = struct {
         self.clearLoadedDiff();
 
         switch (result) {
-            .empty => self.load.state = .{ .empty = .no_changes },
+            .empty => self.load.replaceEmpty(ctx.allocator(), .no_changes),
             .loaded => |*bundle| {
                 var loaded = bundle.loaded;
                 var arena = bundle.takeArena();
@@ -752,12 +804,14 @@ pub const App = struct {
                     try loaded.rebuildVisibleNodes(arena.allocator(), self.hide_reviewed_files, self.changed_file_filter);
                 }
 
-                // Keep all fallible setup above this point. After assigning
-                // load.state, clearLoadedDiff owns the materialized reviewed
-                // slice and load arena.
-                self.load.arena = arena;
-                self.load.state = .{ .loaded = loaded };
-                self.load.active_reviewed_files_owned = true;
+                // Keep all fallible setup above this point. After assigning a
+                // LoadedSession, LoadRuntimeState owns both the arena and the
+                // materialized reviewed slice.
+                self.load.replaceLoaded(ctx.allocator(), .{
+                    .arena = arena,
+                    .loaded = loaded,
+                    .reviewed_files_owned = true,
+                });
 
                 const active_loaded = self.activeLoadedDiff().?;
                 self.syncSidebarNodeToSelectedFile(active_loaded);
@@ -778,24 +832,11 @@ pub const App = struct {
     }
 
     fn storeFailedMessage(self: *App, allocator: std.mem.Allocator, message: []const u8) !void {
-        var arena: std.heap.ArenaAllocator = .init(allocator);
-        errdefer arena.deinit();
-
-        const copied = try arena.allocator().dupe(u8, message);
-        self.load.arena = arena;
-        self.load.state = .{ .failed = if (copied.len > 0) copied else "Unknown diff load error" };
+        try self.load.replaceFailed(allocator, message);
     }
 
     fn clearLoadedDiff(self: *App) void {
-        if (self.load.active_reviewed_files_owned) {
-            if (self.allocator) |allocator| {
-                if (self.activeLoadedDiff()) |loaded| allocator.free(loaded.reviewed_files);
-            }
-        }
-        self.load.active_reviewed_files_owned = false;
-        if (self.load.arena) |*arena| arena.deinit();
-        self.load.arena = null;
-        self.load.state = .idle;
+        self.load.clearCurrent(self.allocator);
         self.viewer.diff_scroll = 0;
         self.viewer.diff_horizontal_scroll = 0;
         self.viewer.selected_hunk = 0;
@@ -1504,21 +1545,24 @@ pub const App = struct {
 
     fn activeLoadedDiff(self: *App) ?*LoadedDiff {
         return switch (self.load.state) {
-            .loaded => |*loaded| loaded,
+            .loaded => |*session| &session.loaded,
             else => null,
         };
     }
 
     fn activeLoadedDiffConst(self: *const App) ?*const LoadedDiff {
         return switch (self.load.state) {
-            .loaded => |*loaded| loaded,
+            .loaded => |*session| &session.loaded,
             else => null,
         };
     }
 
     fn loadArenaAllocator(self: *App) ?std.mem.Allocator {
-        if (self.load.arena) |*arena| return arena.allocator();
-        return null;
+        return switch (self.load.state) {
+            .loaded => |*session| session.arena.allocator(),
+            .failed => |*failed| failed.arena.allocator(),
+            else => null,
+        };
     }
 };
 
@@ -1612,8 +1656,8 @@ const LoadState = union(enum) {
     idle,
     loading,
     empty: EmptyReason,
-    loaded: LoadedDiff,
-    failed: []const u8,
+    loaded: LoadedSession,
+    failed: FailedLoad,
 };
 
 const EmptyReason = enum {
@@ -1650,7 +1694,7 @@ test "countLines handles empty and trailing newline inputs" {
 test "file selection boundary does not reset diff position" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{
             .diff_scroll = 4,
             .selected_hunk = 1,
@@ -1670,7 +1714,7 @@ test "file selection boundary does not reset diff position" {
 test "mode toggle keeps selected hunk visible" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{
             .display_mode = .unified,
             .selected_hunk = 1,
@@ -1693,7 +1737,7 @@ test "mode toggle keeps selected hunk visible" {
 test "sidebar visibility toggle uses full diff width and keeps selection" {
     var app: App = .{
         .terminal_size = .{ .width = 80, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{
             .focus = .sidebar,
             .selected_file = 0,
@@ -1722,7 +1766,7 @@ test "sidebar visibility toggle uses full diff width and keeps selection" {
 test "sidebar width adjustment clamps and affects effective mode" {
     var app: App = .{
         .terminal_size = .{ .width = 102, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{ .display_mode = .side_by_side },
     };
 
@@ -1744,7 +1788,7 @@ test "sidebar width adjustment clamps and affects effective mode" {
 test "sidebar width remains stored while sidebar is hidden" {
     var app: App = .{
         .terminal_size = .{ .width = 102, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{ .display_mode = .side_by_side },
     };
 
@@ -1766,7 +1810,7 @@ test "sidebar width remains stored while sidebar is hidden" {
 test "horizontal scroll uses diff focus arrows and clamps to visible text" {
     var app: App = .{
         .terminal_size = .{ .width = 80, .height = 12 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffWide() } },
+        .load = testLoadState(testLoadedDiffWide()),
         .viewer = .{ .focus = .diff, .display_mode = .unified },
     };
 
@@ -1784,7 +1828,7 @@ test "horizontal scroll uses diff focus arrows and clamps to visible text" {
 test "layout changes reset horizontal scroll only when diff pane width changes" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffWide() } },
+        .load = testLoadState(testLoadedDiffWide()),
         .viewer = .{
             .display_mode = .side_by_side,
             .diff_horizontal_scroll = 16,
@@ -1807,7 +1851,7 @@ test "layout changes reset horizontal scroll only when diff pane width changes" 
 test "search resync without pane width change keeps horizontal scroll" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffWide() } },
+        .load = testLoadState(testLoadedDiffWide()),
         .viewer = .{
             .display_mode = .side_by_side,
             .sidebar_hidden = true,
@@ -1840,7 +1884,7 @@ test "side-by-side context horizontal clamp checks both columns" {
 test "display mode and search navigation reset horizontal scroll" {
     var app: App = .{
         .terminal_size = .{ .width = 120, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffWide() } },
+        .load = testLoadState(testLoadedDiffWide()),
         .viewer = .{
             .display_mode = .unified,
             .diff_horizontal_scroll = 16,
@@ -1859,7 +1903,7 @@ test "display mode and search navigation reset horizontal scroll" {
 test "display mode toggle keeps nearby vertical scroll position" {
     var app: App = .{
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{
             .display_mode = .unified,
             .diff_scroll = 8,
@@ -1883,7 +1927,7 @@ test "display mode scroll remap preserves hunk-local ratio" {
 
     var app: App = .{
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = .{ .state = .{ .loaded = loaded } },
+        .load = testLoadState(loaded),
         .viewer = .{
             .display_mode = .unified,
             .sidebar_hidden = true,
@@ -1959,7 +2003,7 @@ test "prompt input stays above help overlay" {
 test "mouse click focuses sidebar and diff panes" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 20 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{ .focus = .diff },
     };
 
@@ -1979,7 +2023,7 @@ test "mouse click focuses sidebar and diff panes" {
 test "mouse wheel scrolls the pane under the pointer" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffTwo() } },
+        .load = testLoadState(testLoadedDiffTwo()),
         .viewer = .{ .focus = .diff },
     };
 
@@ -2000,7 +2044,7 @@ test "mouse wheel scrolls the pane under the pointer" {
 test "mouse uses full body as diff pane while sidebar is hidden" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{
             .focus = .sidebar,
             .sidebar_hidden = true,
@@ -2016,7 +2060,7 @@ test "mouse uses full body as diff pane while sidebar is hidden" {
 test "help overlay wheel scrolls help and ignores clicks" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .overlay = .help,
     };
 
@@ -2032,7 +2076,7 @@ test "help overlay wheel scrolls help and ignores clicks" {
 test "mouse horizontal wheel scrolls diff pane horizontally" {
     var app: App = .{
         .terminal_size = .{ .width = 80, .height = 12 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffWide() } },
+        .load = testLoadState(testLoadedDiffWide()),
         .viewer = .{
             .focus = .sidebar,
             .display_mode = .unified,
@@ -2051,7 +2095,7 @@ test "mouse horizontal wheel scrolls diff pane horizontally" {
 test "mouse events are ignored outside body and prompt modes" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
     };
 
     try std.testing.expect(app.handleEvent(testMouseEvent(-1, 1, .left)) == null);
@@ -2067,7 +2111,7 @@ test "mouse events are ignored outside body and prompt modes" {
 test "mouse release and motion events are ignored" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
     };
 
     const content = app_view.shellContentRect(app.terminal_size);
@@ -2078,7 +2122,7 @@ test "mouse release and motion events are ignored" {
 test "mode change resyncs search match to rendered body offsets" {
     var app: App = .{
         .terminal_size = .{ .width = 140, .height = 14 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{ .display_mode = .unified },
     };
     setSearchQuery(&app, "late new");
@@ -2100,7 +2144,7 @@ test "mode change resyncs search match to rendered body offsets" {
 test "mode change keeps search near later matches" {
     var app: App = .{
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{ .display_mode = .unified },
     };
     setSearchQuery(&app, "new");
@@ -2130,7 +2174,7 @@ test "toggle selected hunk fold updates active rendered line cache" {
 
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = .{ .arena = arena, .state = .{ .loaded = loaded } },
+        .load = testLoadStateWithArena(arena, loaded),
         .viewer = .{ .selected_hunk = 0 },
     };
     defer app.clearLoadedDiff();
@@ -2157,7 +2201,7 @@ test "search unfolds folded hunk body matches before setting offset" {
 
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = .{ .arena = arena, .state = .{ .loaded = loaded } },
+        .load = testLoadStateWithArena(arena, loaded),
     };
     defer app.clearLoadedDiff();
     setSearchQuery(&app, "new");
@@ -2180,7 +2224,7 @@ test "manual fold keeps hunk open when it contains active search match" {
 
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = .{ .arena = arena, .state = .{ .loaded = loaded } },
+        .load = testLoadStateWithArena(arena, loaded),
     };
     defer app.clearLoadedDiff();
     setSearchQuery(&app, "new");
@@ -2197,7 +2241,7 @@ test "manual fold keeps hunk open when it contains active search match" {
 test "file change resyncs retained search query to selected file" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffTwo() } },
+        .load = testLoadState(testLoadedDiffTwo()),
         .viewer = .{ .display_mode = .unified },
     };
     setSearchQuery(&app, "target");
@@ -2213,7 +2257,7 @@ test "file change resyncs retained search query to selected file" {
 test "sidebar navigation can select directories without changing selected file" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffNested() } },
+        .load = testLoadState(testLoadedDiffNested()),
         .viewer = .{
             .selected_file = 0,
             .selected_node = 1,
@@ -2236,7 +2280,7 @@ test "sidebar navigation can select directories without changing selected file" 
 test "toggling selected directory collapses visible descendants" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = .{ .arena = .init(std.testing.allocator), .state = .{ .loaded = testLoadedDiffNested() } },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), testLoadedDiffNested()),
         .viewer = .{
             .selected_file = 0,
             .selected_node = 0,
@@ -2246,7 +2290,7 @@ test "toggling selected directory collapses visible descendants" {
 
     try app.toggleSelectedDirectory();
 
-    const loaded = app.load.state.loaded;
+    const loaded = app.load.state.loaded.loaded;
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 1), loaded.tree.visibleNodeCount(&loaded.collapsed_dirs));
     try std.testing.expect(loaded.visible_nodes.len >= loaded.tree.nodes.len);
@@ -2258,7 +2302,7 @@ test "toggling selected directory collapses visible descendants" {
 test "file search selects matching file and expands ancestors" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = .{ .arena = .init(std.testing.allocator), .state = .{ .loaded = testLoadedDiffNested() } },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), testLoadedDiffNested()),
         .viewer = .{
             .selected_file = 0,
             .selected_node = 0,
@@ -2283,7 +2327,7 @@ test "file search selects matching file and expands ancestors" {
 test "file search keeps prompt open on no match" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffNested() } },
+        .load = testLoadState(testLoadedDiffNested()),
         .file_search = .{ .mode = true },
     };
     setFileSearchInput(&app, "missing");
@@ -2300,18 +2344,15 @@ test "file search keeps prompt open on no match" {
 test "file search skips hidden reviewed matches" {
     var reviewed = [_]bool{ true, false };
     var app: App = .{
-        .load = .{
-            .arena = .init(std.testing.allocator),
-            .state = .{ .loaded = .{
-                .text = "",
-                .document = .{ .files = &test_files_two },
-                .tree = .{ .nodes = &test_tree_nested_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            } },
-        },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), .{
+            .text = "",
+            .document = .{ .files = &test_files_two },
+            .tree = .{ .nodes = &test_tree_nested_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        }),
         .file_search = .{ .mode = true },
         .hide_reviewed_files = true,
     };
@@ -2330,7 +2371,7 @@ test "file search skips hidden reviewed matches" {
 test "file search trims empty input and restores focus on cancel" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffNested() } },
+        .load = testLoadState(testLoadedDiffNested()),
         .viewer = .{ .focus = .diff },
     };
 
@@ -2348,7 +2389,7 @@ test "file search trims empty input and restores focus on cancel" {
 test "file search keeps diff focus while sidebar is hidden" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = .{ .arena = .init(std.testing.allocator), .state = .{ .loaded = testLoadedDiffNested() } },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), testLoadedDiffNested()),
         .viewer = .{ .focus = .diff, .sidebar_hidden = true },
     };
     defer app.clearLoadedDiff();
@@ -2379,10 +2420,10 @@ test "sidebar renders file status badges" {
 
     const app: App = .{
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffTwoWithStatuses() } },
+        .load = testLoadState(testLoadedDiffTwoWithStatuses()),
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded);
+    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(4, sidebar_header_rows, "A");
     try ts.expectCellText(4, sidebar_header_rows + 1, "D");
@@ -2406,17 +2447,17 @@ test "sidebar renders mode change badge next to file status" {
     };
     const app: App = .{
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = .{ .state = .{ .loaded = .{
+        .load = testLoadState(.{
             .text = "",
             .document = .{ .files = &test_files_one },
             .tree = .{ .nodes = &nodes },
             .collapsed_dirs = .{},
             .bytes = 0,
             .lines = 0,
-        } } },
+        }),
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded);
+    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(2, sidebar_header_rows, "M");
     try ts.expectCellText(4, sidebar_header_rows, "m");
@@ -2429,11 +2470,11 @@ test "sidebar title indicates active focus" {
 
     const app: App = .{
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{ .focus = .sidebar },
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded);
+    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(0, 0, "▸");
     try std.testing.expect(ts.surface.readCell(0, 0).?.style.reverse);
@@ -2446,11 +2487,11 @@ test "diff status row indicates active focus" {
 
     const app: App = .{
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{ .focus = .diff },
     };
 
-    try app.viewDiffPane(&ts.surface, app.load.state.loaded);
+    try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(0, 2, "▸");
     try std.testing.expect(ts.surface.readCell(0, 2).?.style.reverse);
@@ -2463,12 +2504,12 @@ test "diff search row keeps active focus style" {
 
     var app: App = .{
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{ .focus = .diff },
     };
     setSearchQuery(&app, "missing");
 
-    try app.viewDiffPane(&ts.surface, app.load.state.loaded);
+    try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(0, 2, "s");
     try std.testing.expect(ts.surface.readCell(0, 2).?.style.reverse);
@@ -2476,7 +2517,7 @@ test "diff search row keeps active focus style" {
 
 test "changed file filter keeps only matching status rows" {
     var app: App = .{
-        .load = .{ .arena = .init(std.testing.allocator), .state = .{ .loaded = testLoadedDiffTwoWithStatuses() } },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), testLoadedDiffTwoWithStatuses()),
         .changed_file_filter = .added,
         .viewer = .{
             .selected_node = 1,
@@ -2517,7 +2558,7 @@ test "finishDiffLoad applies active changed file filter" {
 
 test "cycling changed file filter rebuilds visible nodes and reconciles selection" {
     var app: App = .{
-        .load = .{ .arena = .init(std.testing.allocator), .state = .{ .loaded = testLoadedDiffTwoWithStatuses() } },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), testLoadedDiffTwoWithStatuses()),
         .viewer = .{
             .selected_node = 1,
             .selected_file = 1,
@@ -2536,7 +2577,7 @@ test "cycling changed file filter rebuilds visible nodes and reconciles selectio
 
 test "file search skips files outside active changed filter" {
     var app: App = .{
-        .load = .{ .state = .{ .loaded = testLoadedDiffTwoWithStatuses() } },
+        .load = testLoadState(testLoadedDiffTwoWithStatuses()),
         .file_search = .{ .mode = true },
         .changed_file_filter = .added,
     };
@@ -2553,7 +2594,7 @@ test "file search skips files outside active changed filter" {
 test "toggleReviewedFile marks only selected file nodes" {
     var reviewed = [_]bool{ false, false };
     var app: App = .{
-        .load = .{ .state = .{ .loaded = .{
+        .load = testLoadState(.{
             .text = "",
             .document = .{ .files = &test_files_two },
             .tree = .{ .nodes = &test_tree_nested_nodes },
@@ -2561,7 +2602,7 @@ test "toggleReviewedFile marks only selected file nodes" {
             .collapsed_dirs = .{},
             .bytes = 0,
             .lines = 0,
-        } } },
+        }),
         .viewer = .{
             .selected_node = 0,
             .selected_file = 0,
@@ -2583,7 +2624,7 @@ test "toggleReviewedFile marks only selected file nodes" {
 test "reviewed state survives active loaded diff replacement" {
     var app: App = .{
         .allocator = std.testing.allocator,
-        .load = .{ .state = .{ .loaded = testLoadedDiffTwo() } },
+        .load = testLoadState(testLoadedDiffTwo()),
         .viewer = .{
             .selected_node = 0,
             .selected_file = 0,
@@ -2594,16 +2635,16 @@ test "reviewed state survives active loaded diff replacement" {
 
     var loaded = app.loadedDiff().?;
     try app.materializeReviewedFiles(std.testing.allocator, loaded);
-    app.load.active_reviewed_files_owned = true;
+    app.load.state.loaded.reviewed_files_owned = true;
 
     try app.toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded.reviewed_files);
 
     app.clearLoadedDiff();
-    app.load.state = .{ .loaded = testLoadedDiffTwo() };
+    app.load.state = .{ .loaded = testLoadedSession(testLoadedDiffTwo()) };
     loaded = app.loadedDiff().?;
     try app.materializeReviewedFiles(std.testing.allocator, loaded);
-    app.load.active_reviewed_files_owned = true;
+    app.load.state.loaded.reviewed_files_owned = true;
 
     try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded.reviewed_files);
 }
@@ -2687,7 +2728,7 @@ test "sidebar renders reviewed marker" {
     var reviewed = [_]bool{ true, false };
     const app: App = .{
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = .{ .state = .{ .loaded = .{
+        .load = testLoadState(.{
             .text = "",
             .document = .{ .files = &test_files_two_statuses },
             .tree = .{ .nodes = &test_tree_two_status_nodes },
@@ -2695,10 +2736,10 @@ test "sidebar renders reviewed marker" {
             .collapsed_dirs = .{},
             .bytes = 0,
             .lines = 0,
-        } } },
+        }),
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded);
+    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(1, sidebar_header_rows, "✓");
     try ts.expectCellText(4, sidebar_header_rows, "A");
@@ -2707,18 +2748,15 @@ test "sidebar renders reviewed marker" {
 test "hide reviewed files removes reviewed file rows from visible list" {
     var reviewed = [_]bool{ true, false };
     var app: App = .{
-        .load = .{
-            .arena = .init(std.testing.allocator),
-            .state = .{ .loaded = .{
-                .text = "",
-                .document = .{ .files = &test_files_two },
-                .tree = .{ .nodes = &test_tree_nested_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            } },
-        },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), .{
+            .text = "",
+            .document = .{ .files = &test_files_two },
+            .tree = .{ .nodes = &test_tree_nested_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        }),
         .viewer = .{
             .selected_node = 1,
             .selected_file = 0,
@@ -2740,18 +2778,15 @@ test "hide reviewed files removes reviewed file rows from visible list" {
 test "hide reviewed files removes directories with no visible file descendants" {
     var reviewed = [_]bool{ true, true };
     var app: App = .{
-        .load = .{
-            .arena = .init(std.testing.allocator),
-            .state = .{ .loaded = .{
-                .text = "",
-                .document = .{ .files = &test_files_two },
-                .tree = .{ .nodes = &test_tree_nested_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            } },
-        },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), .{
+            .text = "",
+            .document = .{ .files = &test_files_two },
+            .tree = .{ .nodes = &test_tree_nested_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        }),
         .viewer = .{
             .selected_node = 1,
             .selected_file = 0,
@@ -2768,18 +2803,15 @@ test "hide reviewed files removes directories with no visible file descendants" 
 test "hide reviewed files keeps directories for non-contiguous unreviewed descendants" {
     var reviewed = [_]bool{ true, false };
     var app: App = .{
-        .load = .{
-            .arena = .init(std.testing.allocator),
-            .state = .{ .loaded = .{
-                .text = "",
-                .document = .{ .files = &test_files_two },
-                .tree = .{ .nodes = &test_tree_non_contiguous_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            } },
-        },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), .{
+            .text = "",
+            .document = .{ .files = &test_files_two },
+            .tree = .{ .nodes = &test_tree_non_contiguous_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        }),
         .viewer = .{
             .selected_node = 1,
             .selected_file = 0,
@@ -2798,18 +2830,15 @@ test "hide reviewed files keeps directories for non-contiguous unreviewed descen
 test "marking a visible file as reviewed while hidden moves selection" {
     var reviewed = [_]bool{ false, false };
     var app: App = .{
-        .load = .{
-            .arena = .init(std.testing.allocator),
-            .state = .{ .loaded = .{
-                .text = "",
-                .document = .{ .files = &test_files_two },
-                .tree = .{ .nodes = &test_tree_nested_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            } },
-        },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), .{
+            .text = "",
+            .document = .{ .files = &test_files_two },
+            .tree = .{ .nodes = &test_tree_nested_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        }),
         .viewer = .{
             .selected_node = 1,
             .selected_file = 0,
@@ -2838,7 +2867,7 @@ test "search match marker is drawn on visible match row" {
 
     const app: App = .{
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .search = .{ .match_offset = 4 },
         .viewer = .{ .diff_scroll = 3 },
     };
@@ -2855,11 +2884,11 @@ test "search marker gutter does not overwrite diff content" {
 
     const app: App = .{
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .search = .{ .match_offset = 0 },
     };
 
-    try app.viewDiffPane(&ts.surface, app.load.state.loaded);
+    try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(0, diff_body_start_row, ">");
     try ts.expectCellText(1, diff_body_start_row, "i");
@@ -2872,11 +2901,11 @@ test "status mode label uses diff content width after marker gutter" {
 
     const app: App = .{
         .terminal_size = .{ .width = 72, .height = 9 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{ .display_mode = .side_by_side },
     };
 
-    try app.viewDiffPane(&ts.surface, app.load.state.loaded);
+    try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(19, 2, "u");
     try ts.expectCellText(20, 2, "n");
@@ -2890,12 +2919,12 @@ test "search input header does not show no match before submit" {
 
     var app: App = .{
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .search = .{ .mode = true },
     };
     setSearchInput(&app, "missing");
 
-    try app.viewDiffPane(&ts.surface, app.load.state.loaded);
+    try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(0, 2, "s");
     try ts.expectCellText(8, 2, "m");
@@ -2905,7 +2934,7 @@ test "search input header does not show no match before submit" {
 test "canceling edited search restores committed query and match" {
     var app: App = .{
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load = .{ .state = .{ .loaded = testLoadedDiffOne() } },
+        .load = testLoadState(testLoadedDiffOne()),
         .search = .{
             .match = .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } },
             .match_offset = 7,
@@ -2961,10 +2990,12 @@ test "load failed state shows first error line and retry hint" {
     try ts.init(90, 18);
     defer ts.deinit();
 
-    const app: App = .{
+    var app: App = .{
+        .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 90, .height = 18 },
-        .load = .{ .state = .{ .failed = "git diff failed\nsecond line" } },
     };
+    defer app.clearLoadedDiff();
+    try app.load.replaceFailed(std.testing.allocator, "git diff failed\nsecond line");
 
     try app.view(&ts.surface);
 
@@ -2985,7 +3016,7 @@ test "loaded diff with empty visible filter shows local empty state" {
 
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 18 },
-        .load = .{ .arena = arena, .state = .{ .loaded = loaded } },
+        .load = testLoadStateWithArena(arena, loaded),
         .changed_file_filter = .binary,
     };
     defer app.clearLoadedDiff();
@@ -3038,9 +3069,9 @@ test "finishDiffLoad takes current loaded bundle ownership" {
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expect(app.load.arena != null);
     try std.testing.expect(app.load.state == .loaded);
-    try std.testing.expectEqual(@as(usize, 1), app.load.state.loaded.document.files.len);
+    try std.testing.expect(app.load.state.loaded.loaded.document.files.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), app.load.state.loaded.loaded.document.files.len);
 }
 
 test "finishDiffLoad frees stale loaded bundle" {
@@ -3053,7 +3084,6 @@ test "finishDiffLoad frees stale loaded bundle" {
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expect(app.load.arena == null);
     try std.testing.expect(app.load.state == .idle);
 }
 
@@ -3098,8 +3128,8 @@ test "finishDiffLoad copies and frees current failed message" {
         .result = .{ .failed = message },
     });
 
-    try std.testing.expect(app.load.arena != null);
-    try std.testing.expectEqualStrings("failed", app.load.state.failed);
+    try std.testing.expect(app.load.state == .failed);
+    try std.testing.expectEqualStrings("failed", app.load.state.failed.message);
 }
 
 fn expectSearchCoordinate(app: *const App, expected: diff_view_model.BodyCoordinate) !void {
@@ -3147,6 +3177,26 @@ fn testMouseEventTyped(col: anytype, row: anytype, button: anytype, mouse_type: 
         .mods = .{},
         .type = mouse_type,
     } };
+}
+
+fn testLoadedSession(loaded: LoadedDiff) LoadedSession {
+    return .{
+        .arena = .init(std.testing.allocator),
+        .loaded = loaded,
+        .reviewed_files_owned = false,
+    };
+}
+
+fn testLoadState(loaded: LoadedDiff) LoadRuntimeState {
+    return .{ .state = .{ .loaded = testLoadedSession(loaded) } };
+}
+
+fn testLoadStateWithArena(arena: std.heap.ArenaAllocator, loaded: LoadedDiff) LoadRuntimeState {
+    return .{ .state = .{ .loaded = .{
+        .arena = arena,
+        .loaded = loaded,
+        .reviewed_files_owned = false,
+    } } };
 }
 
 fn testLoadedDiffOne() LoadedDiff {

@@ -119,7 +119,7 @@ pub fn shellContentRect(terminal_size: chasen.Size) chasen.Rect {
 
 fn viewBody(app: anytype, surface: *chasen.Surface) !void {
     switch (app.load.state) {
-        .loaded => |loaded| return viewLoadedDiff(app, surface, loaded),
+        .loaded => |session| return viewLoadedDiff(app, surface, session.loaded),
         else => {},
     }
 
@@ -362,9 +362,9 @@ fn viewLoadState(app: anytype, col: *chasen.Column) void {
             .tone = .loading,
         }),
         .empty => |reason| drawStateMessageColumn(col, emptyLoadMessage(app, reason)),
-        .failed => |message| drawStateMessageColumn(col, .{
+        .failed => |failed| drawStateMessageColumn(col, .{
             .title = "Could not load diff",
-            .body = firstLine(message),
+            .body = firstLine(failed.message),
             .hint = "Press r to retry or q to quit.",
             .tone = .failure,
         }),
