@@ -123,7 +123,7 @@ pub fn build(b: *std.Build) void {
 
     const sidebar_view_model_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/sidebar_view_model.zig"),
+            .root_source_file = b.path("src/sidebar_view_model_test.zig"),
             .target = target,
             .optimize = optimize,
         }),

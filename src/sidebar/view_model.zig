@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const file_tree = @import("file_tree.zig");
+const file_tree = @import("../file_tree.zig");
 
 pub const Row = struct {
     node_index: usize,

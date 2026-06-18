@@ -4,7 +4,7 @@ const ui = @import("chasen_ui");
 const diff_render = @import("../diff/render.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const file_tree = @import("../file_tree.zig");
-const sidebar_view_model = @import("../sidebar_view_model.zig");
+const sidebar_view_model = @import("../sidebar/view_model.zig");
 
 /// Rendering-only helpers for App.
 ///
