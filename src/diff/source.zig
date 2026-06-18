@@ -1,5 +1,5 @@
 const std = @import("std");
-const git_backend = @import("../git_backend.zig");
+const git_backend = @import("../git/backend.zig");
 
 /// User-selected source for the raw unified diff text.
 ///
