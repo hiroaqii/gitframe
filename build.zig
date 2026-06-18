@@ -132,7 +132,7 @@ pub fn build(b: *std.Build) void {
 
     const repo_discovery_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/repo_discovery.zig"),
+            .root_source_file = b.path("src/repo/discovery.zig"),
             .target = target,
             .optimize = optimize,
         }),

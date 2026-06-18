@@ -4,7 +4,7 @@ const diff_source = @import("../diff/source.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
 const loaded_diff = @import("../loaded_diff.zig");
-const repo_discovery = @import("../repo_discovery.zig");
+const repo_discovery = @import("../repo/discovery.zig");
 
 const LoadRequest = diff_source.LoadRequest;
 const LoadedDiff = loaded_diff.LoadedDiff;

@@ -18,6 +18,6 @@ test {
     _ = @import("editor.zig");
     _ = @import("git/backend.zig");
     _ = @import("git/status.zig");
-    _ = @import("repo_state.zig");
-    _ = @import("review_state.zig");
+    _ = @import("repo/state.zig");
+    _ = @import("review/state.zig");
 }

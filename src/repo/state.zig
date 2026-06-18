@@ -1,5 +1,5 @@
 const std = @import("std");
-const repo_discovery = @import("repo_discovery.zig");
+const repo_discovery = @import("discovery.zig");
 
 /// Current repository discovery result plus active workspace selection.
 ///

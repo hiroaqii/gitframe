@@ -14,9 +14,9 @@ const diff_view_model = @import("diff/view_model.zig");
 const editor = @import("editor.zig");
 const file_tree = @import("file_tree.zig");
 const loaded_diff = @import("loaded_diff.zig");
-const repo_discovery = @import("repo_discovery.zig");
-const repo_state = @import("repo_state.zig");
-const review_state = @import("review_state.zig");
+const repo_discovery = @import("repo/discovery.zig");
+const repo_state = @import("repo/state.zig");
+const review_state = @import("review/state.zig");
 
 const auto_reload_timer_id = "gitframe.auto_reload";
 const auto_reload_interval_ns = 2 * std.time.ns_per_s;
