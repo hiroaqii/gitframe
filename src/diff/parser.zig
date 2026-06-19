@@ -450,6 +450,46 @@ test "parse ignores trailing newline after final hunk line" {
     try std.testing.expectEqual(DiffLine.Kind.added, lines[1].kind);
 }
 
+test "parse skips git show preamble before diff header" {
+    const text =
+        \\commit 1111111111111111111111111111111111111111
+        \\Author: Example <example@example.com>
+        \\
+        \\    subject line
+        \\
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\index 1111111..2222222 100644
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+
+    const doc = try parse(std.testing.allocator, text);
+    defer freeDocument(std.testing.allocator, doc);
+
+    try std.testing.expectEqual(@as(usize, 1), doc.files.len);
+    try std.testing.expectEqualStrings("diff --git a/src/app.zig b/src/app.zig", doc.files[0].header);
+    try std.testing.expectEqual(@as(usize, 1), doc.files[0].hunks.len);
+}
+
+test "parse non-diff text as empty document" {
+    const text =
+        \\commit 1111111111111111111111111111111111111111
+        \\Author: Example <example@example.com>
+        \\
+        \\    subject line only
+        \\
+    ;
+
+    const doc = try parse(std.testing.allocator, text);
+    defer freeDocument(std.testing.allocator, doc);
+
+    try std.testing.expectEqual(@as(usize, 0), doc.files.len);
+}
+
 fn freeDocument(allocator: std.mem.Allocator, doc: DiffDocument) void {
     for (doc.files) |file| {
         for (file.hunks) |hunk| allocator.free(hunk.lines);

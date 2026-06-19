@@ -8,6 +8,8 @@ pub const CliConfig = diff_source.CliConfig;
 pub const LoadRequest = diff_source.LoadRequest;
 pub const ParseArgsError = diff_source.ParseArgsError;
 pub const parseArgs = diff_source.parseArgs;
+pub const freeSource = diff_source.freeSource;
+pub const preparePagerSource = diff_source.preparePagerSource;
 
 test {
     // Keep module-local tests in the package test target while root.zig stays a

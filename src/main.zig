@@ -11,10 +11,19 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const config = gitframe.parseArgs(args) catch |err| {
+    var config = gitframe.parseArgs(args) catch |err| {
         try printCliError(init.io, err);
         return err;
     };
+    var owns_config_source = false;
+    defer if (owns_config_source) gitframe.freeSource(init.gpa, config.source);
+    if (config.source == .pager) {
+        config.source = gitframe.preparePagerSource(init.gpa, init.io) catch |err| {
+            try printLoadError(init.io, err);
+            return err;
+        } orelse return;
+        owns_config_source = true;
+    }
 
     if (config.stats_summary) {
         var summary: StatsSummary = .{};
@@ -66,6 +75,7 @@ fn printHelp(io: std.Io) !void {
         \\Options:
         \\  --cached          Show staged changes
         \\  --stdin           Read unified diff from stdin
+        \\  --pager           Read Git pager input from stdin and strip ANSI color
         \\  --range <range>   Show a commit range, for example main...HEAD
         \\  --watch           Poll and reload the active diff every 2 seconds
         \\  --stats-summary   Print runtime timing summary after exit
@@ -130,6 +140,14 @@ fn printStatsSummary(io: std.Io, summary: StatsSummary) !void {
         nsToUs(summary.max_view_ns),
         nsToUs(summary.max_render_ns),
     });
+    try stderr.flush();
+}
+
+fn printLoadError(io: std.Io, err: anyerror) !void {
+    var buffer: [512]u8 = undefined;
+    var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), io, &buffer);
+    const stderr = &stderr_file_writer.interface;
+    try stderr.print("gitframe: {s}\n", .{@errorName(err)});
     try stderr.flush();
 }
 

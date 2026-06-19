@@ -311,15 +311,14 @@ pub const App = struct {
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .editor_finished => |result| try self.finishEditorCommand(ctx, result),
-            .reload => switch (self.config.source) {
-                .stdin => ctx.redraw().skip(),
-                else => {
-                    if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
-                        try self.startRepoDiscovery(ctx);
-                    } else {
-                        try self.startDiffLoad(ctx);
-                    }
-                },
+            .reload => {
+                if (diff_source.sourceIsOneShotInput(self.config.source)) {
+                    ctx.redraw().skip();
+                } else if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
+                    try self.startRepoDiscovery(ctx);
+                } else {
+                    try self.startDiffLoad(ctx);
+                }
             },
             .auto_reload_tick => try self.autoReloadTick(ctx),
             .quit => ctx.quit(),
@@ -599,7 +598,7 @@ pub const App = struct {
             .wait_failed => |err| self.setStatus("editor wait failed: {s}", .{err}),
         }
 
-        if (self.config.source == .stdin) {
+        if (diff_source.sourceIsOneShotInput(self.config.source)) {
             ctx.redraw().skip();
             return;
         }
@@ -623,7 +622,7 @@ pub const App = struct {
 
     fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (!self.config.watch) return;
-        if (self.config.source == .stdin) return;
+        if (diff_source.sourceIsOneShotInput(self.config.source)) return;
         if (self.repo_picker.mode or self.search.mode or self.file_search.mode) {
             ctx.redraw().skip();
             return;
