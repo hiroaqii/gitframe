@@ -76,6 +76,7 @@ fn printHelp(io: std.Io) !void {
         \\  --cached          Show staged changes
         \\  --stdin           Read unified diff from stdin
         \\  --pager           Read Git pager input from stdin and strip ANSI color
+        \\  --difftool L R    Compare two paths using git diff --no-index
         \\  --range <range>   Show a commit range, for example main...HEAD
         \\  --watch           Poll and reload the active diff every 2 seconds
         \\  --stats-summary   Print runtime timing summary after exit
