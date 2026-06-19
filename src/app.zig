@@ -64,6 +64,15 @@ const ViewerState = struct {
     diff_horizontal_scroll: usize = 0,
     selected_hunk: usize = 0,
     display_mode: diff_render.DisplayMode = .side_by_side,
+    view_options: ViewOptions = .{},
+};
+
+const ViewOptions = struct {
+    line_numbers: bool = true,
+
+    fn toggleLineNumbers(self: *ViewOptions) void {
+        self.line_numbers = !self.line_numbers;
+    }
 };
 
 const DiffSearchState = struct {
@@ -132,6 +141,7 @@ pub const App = struct {
         mouse_diff_wheel_left,
         mouse_diff_wheel_right,
         toggle_display_mode,
+        toggle_line_numbers,
         enter_search,
         cancel_search,
         clear_search,
@@ -263,6 +273,10 @@ pub const App = struct {
                 self.updateSearchMatchOffset();
                 self.scrollSearchMatchIntoView();
                 self.clampDiffNavigation();
+            },
+            .toggle_line_numbers => {
+                self.viewer.view_options.toggleLineNumbers();
+                self.clampDiffHorizontalScrollToVisibleRows();
             },
             .enter_search => self.enterSearchMode(),
             .cancel_search => self.cancelSearchMode(),
@@ -864,7 +878,7 @@ pub const App = struct {
             }
             if (visible >= visible_rows) break;
             visible += 1;
-            max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(body_row, pane_width));
+            max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(body_row, pane_width, self.viewer.view_options.line_numbers));
         }
         return max_scroll;
     }
@@ -1454,20 +1468,21 @@ fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
     return app_view.sidebarWidth(total_width, preferred_width);
 }
 
-fn maxHorizontalScrollForBodyRow(body_row: diff_view_model.BodyRow, pane_width: u16) usize {
+fn maxHorizontalScrollForBodyRow(body_row: diff_view_model.BodyRow, pane_width: u16, line_numbers: bool) usize {
     return switch (body_row) {
-        .unified_line => |line| maxHorizontalScrollForText(line.text, if (pane_width > 12) pane_width - 12 else 0),
-        .side_by_side => |side_row| maxHorizontalScrollForSideBySideRow(side_row, pane_width),
+        .unified_line => |line| maxHorizontalScrollForText(line.text, visibleTextWidth(pane_width, diff_render.lineTextStart(line_numbers, .unified))),
+        .side_by_side => |side_row| maxHorizontalScrollForSideBySideRow(side_row, pane_width, line_numbers),
         else => 0,
     };
 }
 
-fn maxHorizontalScrollForSideBySideRow(side_row: diff_view_model.SideBySideRow, pane_width: u16) usize {
+fn maxHorizontalScrollForSideBySideRow(side_row: diff_view_model.SideBySideRow, pane_width: u16, line_numbers: bool) usize {
     const gutter_col = pane_width / 2;
     const new_col = gutter_col + 1;
-    const old_text_width: u16 = if (gutter_col > 7) gutter_col - 7 else 0;
+    const text_col = diff_render.lineTextStart(line_numbers, .side_by_side);
+    const old_text_width: u16 = visibleTextWidth(gutter_col, text_col);
     const new_width: u16 = if (pane_width > new_col) pane_width - new_col else 0;
-    const new_text_width: u16 = if (new_width > 7) new_width - 7 else 0;
+    const new_text_width: u16 = visibleTextWidth(new_width, text_col);
     var max_scroll: usize = 0;
     switch (side_row) {
         .single => |line| {
@@ -1486,6 +1501,10 @@ fn maxHorizontalScrollForSideBySideRow(side_row: diff_view_model.SideBySideRow, 
         },
     }
     return max_scroll;
+}
+
+fn visibleTextWidth(total_width: u16, text_col: u16) u16 {
+    return if (total_width > text_col) total_width - text_col else 0;
 }
 
 fn maxHorizontalScrollForText(text: []const u8, visible_width: u16) usize {
@@ -1687,7 +1706,11 @@ test "side-by-side context horizontal clamp checks both columns" {
 
     try std.testing.expectEqual(
         @as(usize, 8),
-        maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, 80),
+        maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, 80, true),
+    );
+    try std.testing.expect(
+        maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, 80, false) <
+            maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, 80, true),
     );
 }
 
@@ -1708,6 +1731,26 @@ test "display mode and search navigation reset horizontal scroll" {
     setDiffSearchQuery(&app, "wide");
     app.submitSearch();
     try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
+}
+
+test "line number toggle clamps horizontal scroll without changing vertical scroll" {
+    var app: App = .{
+        .terminal_size = .{ .width = 80, .height = 8 },
+        .load = testLoadState(testLoadedDiffWide()),
+        .viewer = .{
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+            .diff_scroll = 2,
+            .diff_horizontal_scroll = 999,
+        },
+    };
+
+    const old_scroll = app.viewer.diff_scroll;
+    try app.update(.toggle_line_numbers, undefined);
+
+    try std.testing.expect(!app.viewer.view_options.line_numbers);
+    try std.testing.expectEqual(old_scroll, app.viewer.diff_scroll);
+    try std.testing.expect(app.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
 }
 
 test "display mode toggle keeps nearby vertical scroll position" {

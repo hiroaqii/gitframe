@@ -112,6 +112,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         ']' => voidMsg(Msg, "increase_sidebar_width"),
         'e' => voidMsg(Msg, "open_selected_file_in_editor"),
         'u' => voidMsg(Msg, "toggle_display_mode"),
+        'L' => voidMsg(Msg, "toggle_line_numbers"),
         'q' => voidMsg(Msg, "quit"),
         'r' => voidMsg(Msg, "reload"),
         else => null,
@@ -187,6 +188,7 @@ const TestMsg = union(enum) {
     increase_sidebar_width,
     open_selected_file_in_editor,
     toggle_display_mode,
+    toggle_line_numbers,
     quit,
     reload,
 };
@@ -226,6 +228,10 @@ test "keyToMsg maps sidebar visibility and suppresses focus toggle while hidden"
 test "keyToMsg maps sidebar width adjustment keys" {
     try std.testing.expectEqual(TestMsg.decrease_sidebar_width, keyToMsg(TestMsg, .{}, .{ .codepoint = '[' }).?);
     try std.testing.expectEqual(TestMsg.increase_sidebar_width, keyToMsg(TestMsg, .{}, .{ .codepoint = ']' }).?);
+}
+
+test "keyToMsg maps view option toggles" {
+    try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, .{ .codepoint = 'L' }).?);
 }
 
 test "keyToMsg uses search query to disambiguate navigation" {
