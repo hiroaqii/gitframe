@@ -991,7 +991,8 @@ const help_diff_items = [_]HelpItem{
     .{ .key = "/", .description = "search diff" },
     .{ .key = "u", .description = "unified / side-by-side" },
     .{ .key = "L", .description = "toggle line numbers" },
-    .{ .key = "n / p", .description = "next / previous hunk or match" },
+    .{ .key = "J / K", .description = "next / previous hunk" },
+    .{ .key = "n / p", .description = "next / previous match or hunk" },
     .{ .key = "N", .description = "previous search match" },
     .{ .key = "e", .description = "open selected file in editor" },
 };

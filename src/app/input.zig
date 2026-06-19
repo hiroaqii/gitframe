@@ -97,6 +97,8 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         'k', chasen.Key.up => if (context.focus == .diff) voidMsg(Msg, "scroll_diff_up") else voidMsg(Msg, "select_previous_file"),
         'j', chasen.Key.down => if (context.focus == .diff) voidMsg(Msg, "scroll_diff_down") else voidMsg(Msg, "select_next_file"),
         '/' => voidMsg(Msg, "enter_search"),
+        'J' => if (context.focus == .diff) voidMsg(Msg, "select_next_hunk") else null,
+        'K' => if (context.focus == .diff) voidMsg(Msg, "select_previous_hunk") else null,
         'n' => if (context.search_query_len > 0) voidMsg(Msg, "select_next_search_match") else voidMsg(Msg, "select_next_hunk"),
         'N' => if (context.search_query_len > 0) voidMsg(Msg, "select_previous_search_match") else null,
         'p' => if (context.search_query_len > 0) voidMsg(Msg, "select_previous_search_match") else voidMsg(Msg, "select_previous_hunk"),
@@ -237,6 +239,18 @@ test "keyToMsg maps view option toggles" {
 test "keyToMsg uses search query to disambiguate navigation" {
     try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{}, .{ .codepoint = 'n' }).?);
     try std.testing.expectEqual(TestMsg.select_next_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, .{ .codepoint = 'n' }).?);
+}
+
+test "keyToMsg maps dedicated hunk jumps only in diff focus" {
+    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 'J' }).?);
+    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 'K' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'J' }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'K' }));
+}
+
+test "keyToMsg keeps dedicated hunk jumps independent from search query" {
+    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, .{ .codepoint = 'J' }).?);
+    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, .{ .codepoint = 'K' }).?);
 }
 
 test "keyToMsg opens and closes help outside prompt modes" {
