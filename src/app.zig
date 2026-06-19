@@ -134,6 +134,7 @@ pub const App = struct {
         increase_sidebar_width,
         focus_sidebar,
         focus_diff,
+        sidebar_click_node: usize,
         mouse_sidebar_wheel_up,
         mouse_sidebar_wheel_down,
         mouse_diff_wheel_up,
@@ -239,6 +240,7 @@ pub const App = struct {
                 if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
             },
             .focus_diff => self.viewer.focus = .diff,
+            .sidebar_click_node => |node_index| try self.clickSidebarNode(node_index),
             .mouse_sidebar_wheel_up => {
                 if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
                 self.selectFileDelta(-1);
@@ -365,7 +367,7 @@ pub const App = struct {
         const pane = self.mousePane(mouse) orelse return null;
         return switch (mouse.button) {
             .left => switch (pane) {
-                .sidebar => .focus_sidebar,
+                .sidebar => self.sidebarClickToMsg(mouse),
                 .diff => .focus_diff,
             },
             .wheel_up => switch (pane) {
@@ -399,6 +401,18 @@ pub const App = struct {
         if (point.col < sidebar_width) return .sidebar;
         if (point.col == sidebar_width) return null;
         return .diff;
+    }
+
+    fn sidebarClickToMsg(self: *const App, mouse: anytype) Msg {
+        const point = self.bodyMousePoint(mouse) orelse return .focus_sidebar;
+        const body_height = terminalBodyHeight(self.layoutSize().height);
+        if (point.row < sidebar_header_rows or body_height <= sidebar_header_rows) return .focus_sidebar;
+
+        const loaded = self.activeLoadedDiffConst() orelse return .focus_sidebar;
+        const visible_rows: usize = body_height - sidebar_header_rows;
+        const body_row: usize = point.row - sidebar_header_rows;
+        const node_index = loaded.sidebarNodeAtBodyRow(self.viewer.selected_node, visible_rows, body_row) orelse return .focus_sidebar;
+        return .{ .sidebar_click_node = node_index };
     }
 
     fn bodyMousePoint(self: *const App, mouse: anytype) ?MousePoint {
@@ -801,6 +815,21 @@ pub const App = struct {
         try file_tree.toggle(allocator, &loaded.collapsed_dirs, node.path);
         try loaded.rebuildVisibleNodes(allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
         self.clampSelection(loaded.document.files.len);
+    }
+
+    fn clickSidebarNode(self: *App, node_index: usize) !void {
+        if (self.viewer.sidebar_hidden) return;
+        const loaded = self.activeLoadedDiff() orelse return;
+        if (node_index >= loaded.tree.nodes.len) return;
+
+        self.viewer.focus = .sidebar;
+        self.selectSidebarNode(loaded, node_index);
+
+        const node = loaded.tree.nodes[node_index];
+        if (node.kind == .directory) try self.toggleSelectedDirectory();
+
+        self.clampSelection(loaded.document.files.len);
+        self.clampDiffNavigation();
     }
 
     fn expandSelectedDirectory(self: *App) !void {
@@ -1870,6 +1899,90 @@ test "mouse click focuses sidebar and diff panes" {
     const diff_msg = app.handleEvent(diff_event) orelse return error.ExpectedDiffMouseMessage;
     try app.update(diff_msg, undefined);
     try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+}
+
+test "mouse click selects sidebar file rows" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 20 },
+        .load = testLoadState(testLoadedDiffTwo()),
+        .viewer = .{ .focus = .diff },
+    };
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    const row = content.row + sidebar_header_rows + 1;
+    const msg = app.handleEvent(testMouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedSidebarClickMessage;
+    try app.update(msg, undefined);
+
+    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
+}
+
+test "mouse click toggles sidebar directory rows" {
+    const arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 20 },
+        .load = testLoadStateWithArena(arena, testLoadedDiffNested()),
+        .viewer = .{ .focus = .diff, .selected_node = 1, .selected_file = 0 },
+    };
+    defer app.clearLoadedDiff();
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    const row = content.row + sidebar_header_rows;
+    const msg = app.handleEvent(testMouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedSidebarDirectoryClickMessage;
+    try app.update(msg, undefined);
+
+    const loaded = app.loadedDiff().?;
+    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
+    try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
+}
+
+test "mouse click on sidebar header or blank body focuses only" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 20 },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{ .focus = .diff },
+    };
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    const header_msg = app.handleEvent(testMouseEvent(content.col + 1, content.row + 1, .left)) orelse return error.ExpectedSidebarHeaderClickMessage;
+    try app.update(header_msg, undefined);
+    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
+
+    app.viewer.focus = .diff;
+    const blank_row = content.row + sidebar_header_rows + 2;
+    const blank_msg = app.handleEvent(testMouseEvent(content.col + 1, blank_row, .left)) orelse return error.ExpectedSidebarBlankClickMessage;
+    try app.update(blank_msg, undefined);
+    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
+}
+
+test "mouse click uses filtered sidebar projection" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    var loaded = testLoadedDiffTwoWithStatuses();
+    loaded.reviewed_files = try arena.allocator().alloc(bool, loaded.document.files.len);
+    @memset(loaded.reviewed_files, false);
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .deleted);
+
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 20 },
+        .load = testLoadStateWithArena(arena, loaded),
+        .viewer = .{ .focus = .diff, .selected_node = 0, .selected_file = 0 },
+        .review_display = .{ .changed_file_filter = .deleted },
+    };
+    defer app.clearLoadedDiff();
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    const row = content.row + sidebar_header_rows;
+    const msg = app.handleEvent(testMouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedFilteredSidebarClickMessage;
+    try app.update(msg, undefined);
+
+    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
 }
 
 test "mouse wheel scrolls the pane under the pointer" {

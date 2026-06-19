@@ -1,4 +1,5 @@
 const std = @import("std");
+const ui = @import("chasen_ui");
 const diff_parser = @import("diff/parser.zig");
 const diff_render = @import("diff/render.zig");
 const diff_view_model = @import("diff/view_model.zig");
@@ -159,6 +160,19 @@ pub const LoadedDiff = struct {
 
         const node_index = self.visibleNodeAt(visible_index) orelse return null;
         return sidebar_view_model.rowForNode(self.tree, &self.collapsed_dirs, self.reviewed_files, node_index, selected_node);
+    }
+
+    pub fn sidebarVisibleRange(self: *const LoadedDiff, selected_node: usize, visible_rows: usize) ui.ListViewport.Range {
+        const selected_row = self.visibleRowOfNode(selected_node) orelse 0;
+        return ui.ListViewport.visibleRange(self.visibleNodeCount(), selected_row, visible_rows);
+    }
+
+    pub fn sidebarNodeAtBodyRow(self: *const LoadedDiff, selected_node: usize, visible_rows: usize, body_row: usize) ?usize {
+        if (body_row >= visible_rows) return null;
+        const range = self.sidebarVisibleRange(selected_node, visible_rows);
+        const visible_index = range.start + body_row;
+        if (visible_index >= range.end) return null;
+        return self.visibleNodeAt(visible_index);
     }
 
     pub fn renderedLineIndex(self: *const LoadedDiff, file_index: usize, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {

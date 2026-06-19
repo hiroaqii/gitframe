@@ -209,11 +209,9 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
     if (size.height <= sidebar_header_rows) return;
 
     const visible_rows: usize = size.height - sidebar_header_rows;
-    const visible_count = loaded.visibleNodeCount();
-    const selected_row = loaded.visibleRowOfNode(app.viewer.selected_node) orelse 0;
     // Sidebar has no independent scroll state; derive the visible window
     // from the selected row each frame.
-    const range = ui.ListViewport.visibleRange(visible_count, selected_row, visible_rows);
+    const range = loaded.sidebarVisibleRange(app.viewer.selected_node, visible_rows);
     var row: u16 = sidebar_header_rows;
     var visible_index: usize = range.start;
     while (visible_index < range.end) : ({
