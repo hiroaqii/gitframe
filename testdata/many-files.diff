@@ -1,110 +1,1500 @@
-diff --git a/src/file_01.zig b/src/file_01.zig
+diff --git a/src/app/file_001.zig b/src/app/file_001.zig
 index 0000001..0000002 100644
---- a/src/file_01.zig
-+++ b/src/file_01.zig
-@@ -1,3 +1,3 @@
--pub const value = "old 01";
-+pub const value = "new 01";
- pub const name = "file_01";
-diff --git a/src/file_02.zig b/src/file_02.zig
-index 0000001..0000002 100644
---- a/src/file_02.zig
-+++ b/src/file_02.zig
-@@ -1,3 +1,3 @@
--pub const value = "old 02";
-+pub const value = "new 02";
- pub const name = "file_02";
-diff --git a/src/file_03.zig b/src/file_03.zig
-index 0000001..0000002 100644
---- a/src/file_03.zig
-+++ b/src/file_03.zig
-@@ -1,3 +1,3 @@
--pub const value = "old 03";
-+pub const value = "new 03";
- pub const name = "file_03";
-diff --git a/src/file_04.zig b/src/file_04.zig
-index 0000001..0000002 100644
---- a/src/file_04.zig
-+++ b/src/file_04.zig
-@@ -1,3 +1,3 @@
--pub const value = "old 04";
-+pub const value = "new 04";
- pub const name = "file_04";
-diff --git a/src/file_05.zig b/src/file_05.zig
-index 0000001..0000002 100644
---- a/src/file_05.zig
-+++ b/src/file_05.zig
-@@ -1,3 +1,3 @@
--pub const value = "old 05";
-+pub const value = "new 05";
- pub const name = "file_05";
-diff --git a/src/file_06.zig b/src/file_06.zig
-index 0000001..0000002 100644
---- a/src/file_06.zig
-+++ b/src/file_06.zig
-@@ -1,3 +1,3 @@
--pub const value = "old 06";
-+pub const value = "new 06";
- pub const name = "file_06";
-diff --git a/src/file_07.zig b/src/file_07.zig
-index 0000001..0000002 100644
---- a/src/file_07.zig
-+++ b/src/file_07.zig
-@@ -1,3 +1,3 @@
--pub const value = "old 07";
-+pub const value = "new 07";
- pub const name = "file_07";
-diff --git a/src/file_08.zig b/src/file_08.zig
-index 0000001..0000002 100644
---- a/src/file_08.zig
-+++ b/src/file_08.zig
-@@ -1,3 +1,3 @@
--pub const value = "old 08";
-+pub const value = "new 08";
- pub const name = "file_08";
-diff --git a/src/file_09.zig b/src/file_09.zig
-index 0000001..0000002 100644
---- a/src/file_09.zig
-+++ b/src/file_09.zig
-@@ -1,3 +1,3 @@
--pub const value = "old 09";
-+pub const value = "new 09";
- pub const name = "file_09";
-diff --git a/src/file_10.zig b/src/file_10.zig
-index 0000001..0000002 100644
---- a/src/file_10.zig
-+++ b/src/file_10.zig
-@@ -1,3 +1,3 @@
--pub const value = "old 10";
-+pub const value = "new 10";
- pub const name = "file_10";
-diff --git a/docs/guide_01.md b/docs/guide_01.md
-index 0000001..0000002 100644
---- a/docs/guide_01.md
-+++ b/docs/guide_01.md
-@@ -1,3 +1,3 @@
- # Guide 01
--old text
-+new text
-diff --git a/docs/guide_02.md b/docs/guide_02.md
-index 0000001..0000002 100644
---- a/docs/guide_02.md
-+++ b/docs/guide_02.md
-@@ -1,3 +1,3 @@
- # Guide 02
--old text
-+new text
-diff --git a/tests/case_01.zig b/tests/case_01.zig
-index 0000001..0000002 100644
---- a/tests/case_01.zig
-+++ b/tests/case_01.zig
-@@ -1,3 +1,3 @@
--test "old case 01" {}
-+test "new case 01" {}
-diff --git a/tests/case_02.zig b/tests/case_02.zig
-index 0000001..0000002 100644
---- a/tests/case_02.zig
-+++ b/tests/case_02.zig
-@@ -1,3 +1,3 @@
--test "old case 02" {}
-+test "new case 02" {}
+--- a/src/app/file_001.zig
++++ b/src/app/file_001.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_001 = struct {
+-    pub const value = "old 001";
++    pub const value = "new 001";
++    pub const extra = "added 001";
+ };
+diff --git a/src/app/file_002.zig b/src/app/file_002.zig
+index 0000002..0000003 100644
+--- a/src/app/file_002.zig
++++ b/src/app/file_002.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_002 = struct {
+-    pub const value = "old 002";
++    pub const value = "new 002";
++    pub const extra = "added 002";
+ };
+diff --git a/src/app/file_003.zig b/src/app/file_003.zig
+index 0000003..0000004 100644
+--- a/src/app/file_003.zig
++++ b/src/app/file_003.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_003 = struct {
+-    pub const value = "old 003";
++    pub const value = "new 003";
++    pub const extra = "added 003";
+ };
+diff --git a/src/app/file_004.zig b/src/app/file_004.zig
+index 0000004..0000005 100644
+--- a/src/app/file_004.zig
++++ b/src/app/file_004.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_004 = struct {
+-    pub const value = "old 004";
++    pub const value = "new 004";
++    pub const extra = "added 004";
+ };
+diff --git a/src/app/file_005.zig b/src/app/file_005.zig
+index 0000005..0000006 100644
+--- a/src/app/file_005.zig
++++ b/src/app/file_005.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_005 = struct {
+-    pub const value = "old 005";
++    pub const value = "new 005";
++    pub const extra = "added 005";
+ };
+diff --git a/src/app/file_006.zig b/src/app/file_006.zig
+index 0000006..0000007 100644
+--- a/src/app/file_006.zig
++++ b/src/app/file_006.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_006 = struct {
+-    pub const value = "old 006";
++    pub const value = "new 006";
++    pub const extra = "added 006";
+ };
+diff --git a/src/app/file_007.zig b/src/app/file_007.zig
+index 0000007..0000008 100644
+--- a/src/app/file_007.zig
++++ b/src/app/file_007.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_007 = struct {
+-    pub const value = "old 007";
++    pub const value = "new 007";
++    pub const extra = "added 007";
+ };
+diff --git a/src/app/file_008.zig b/src/app/file_008.zig
+index 0000008..0000009 100644
+--- a/src/app/file_008.zig
++++ b/src/app/file_008.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_008 = struct {
+-    pub const value = "old 008";
++    pub const value = "new 008";
++    pub const extra = "added 008";
+ };
+diff --git a/src/app/file_009.zig b/src/app/file_009.zig
+index 0000009..000000a 100644
+--- a/src/app/file_009.zig
++++ b/src/app/file_009.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_009 = struct {
+-    pub const value = "old 009";
++    pub const value = "new 009";
++    pub const extra = "added 009";
+ };
+diff --git a/src/app/file_010.zig b/src/app/file_010.zig
+index 000000a..000000b 100644
+--- a/src/app/file_010.zig
++++ b/src/app/file_010.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_010 = struct {
+-    pub const value = "old 010";
++    pub const value = "new 010";
++    pub const extra = "added 010";
+ };
+diff --git a/src/app/file_011.zig b/src/app/file_011.zig
+index 000000b..000000c 100644
+--- a/src/app/file_011.zig
++++ b/src/app/file_011.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_011 = struct {
+-    pub const value = "old 011";
++    pub const value = "new 011";
++    pub const extra = "added 011";
+ };
+diff --git a/src/app/file_012.zig b/src/app/file_012.zig
+index 000000c..000000d 100644
+--- a/src/app/file_012.zig
++++ b/src/app/file_012.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_012 = struct {
+-    pub const value = "old 012";
++    pub const value = "new 012";
++    pub const extra = "added 012";
+ };
+diff --git a/src/app/file_013.zig b/src/app/file_013.zig
+index 000000d..000000e 100644
+--- a/src/app/file_013.zig
++++ b/src/app/file_013.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_013 = struct {
+-    pub const value = "old 013";
++    pub const value = "new 013";
++    pub const extra = "added 013";
+ };
+diff --git a/src/app/file_014.zig b/src/app/file_014.zig
+index 000000e..000000f 100644
+--- a/src/app/file_014.zig
++++ b/src/app/file_014.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_014 = struct {
+-    pub const value = "old 014";
++    pub const value = "new 014";
++    pub const extra = "added 014";
+ };
+diff --git a/src/app/file_015.zig b/src/app/file_015.zig
+index 000000f..0000010 100644
+--- a/src/app/file_015.zig
++++ b/src/app/file_015.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_015 = struct {
+-    pub const value = "old 015";
++    pub const value = "new 015";
++    pub const extra = "added 015";
+ };
+diff --git a/src/app/file_016.zig b/src/app/file_016.zig
+index 0000010..0000011 100644
+--- a/src/app/file_016.zig
++++ b/src/app/file_016.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_016 = struct {
+-    pub const value = "old 016";
++    pub const value = "new 016";
++    pub const extra = "added 016";
+ };
+diff --git a/src/app/file_017.zig b/src/app/file_017.zig
+index 0000011..0000012 100644
+--- a/src/app/file_017.zig
++++ b/src/app/file_017.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_017 = struct {
+-    pub const value = "old 017";
++    pub const value = "new 017";
++    pub const extra = "added 017";
+ };
+diff --git a/src/app/file_018.zig b/src/app/file_018.zig
+index 0000012..0000013 100644
+--- a/src/app/file_018.zig
++++ b/src/app/file_018.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_018 = struct {
+-    pub const value = "old 018";
++    pub const value = "new 018";
++    pub const extra = "added 018";
+ };
+diff --git a/src/diff/render/file_001.zig b/src/diff/render/file_001.zig
+index 0000013..0000014 100644
+--- a/src/diff/render/file_001.zig
++++ b/src/diff/render/file_001.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_019 = struct {
+-    pub const value = "old 019";
++    pub const value = "new 019";
++    pub const extra = "added 019";
+ };
+diff --git a/src/diff/render/file_002.zig b/src/diff/render/file_002.zig
+index 0000014..0000015 100644
+--- a/src/diff/render/file_002.zig
++++ b/src/diff/render/file_002.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_020 = struct {
+-    pub const value = "old 020";
++    pub const value = "new 020";
++    pub const extra = "added 020";
+ };
+diff --git a/src/diff/render/file_003.zig b/src/diff/render/file_003.zig
+index 0000015..0000016 100644
+--- a/src/diff/render/file_003.zig
++++ b/src/diff/render/file_003.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_021 = struct {
+-    pub const value = "old 021";
++    pub const value = "new 021";
++    pub const extra = "added 021";
+ };
+diff --git a/src/diff/render/file_004.zig b/src/diff/render/file_004.zig
+index 0000016..0000017 100644
+--- a/src/diff/render/file_004.zig
++++ b/src/diff/render/file_004.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_022 = struct {
+-    pub const value = "old 022";
++    pub const value = "new 022";
++    pub const extra = "added 022";
+ };
+diff --git a/src/diff/render/file_005.zig b/src/diff/render/file_005.zig
+index 0000017..0000018 100644
+--- a/src/diff/render/file_005.zig
++++ b/src/diff/render/file_005.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_023 = struct {
+-    pub const value = "old 023";
++    pub const value = "new 023";
++    pub const extra = "added 023";
+ };
+diff --git a/src/diff/render/file_006.zig b/src/diff/render/file_006.zig
+index 0000018..0000019 100644
+--- a/src/diff/render/file_006.zig
++++ b/src/diff/render/file_006.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_024 = struct {
+-    pub const value = "old 024";
++    pub const value = "new 024";
++    pub const extra = "added 024";
+ };
+diff --git a/src/diff/render/file_007.zig b/src/diff/render/file_007.zig
+index 0000019..000001a 100644
+--- a/src/diff/render/file_007.zig
++++ b/src/diff/render/file_007.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_025 = struct {
+-    pub const value = "old 025";
++    pub const value = "new 025";
++    pub const extra = "added 025";
+ };
+diff --git a/src/diff/render/file_008.zig b/src/diff/render/file_008.zig
+index 000001a..000001b 100644
+--- a/src/diff/render/file_008.zig
++++ b/src/diff/render/file_008.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_026 = struct {
+-    pub const value = "old 026";
++    pub const value = "new 026";
++    pub const extra = "added 026";
+ };
+diff --git a/src/diff/render/file_009.zig b/src/diff/render/file_009.zig
+index 000001b..000001c 100644
+--- a/src/diff/render/file_009.zig
++++ b/src/diff/render/file_009.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_027 = struct {
+-    pub const value = "old 027";
++    pub const value = "new 027";
++    pub const extra = "added 027";
+ };
+diff --git a/src/diff/render/file_010.zig b/src/diff/render/file_010.zig
+index 000001c..000001d 100644
+--- a/src/diff/render/file_010.zig
++++ b/src/diff/render/file_010.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_028 = struct {
+-    pub const value = "old 028";
++    pub const value = "new 028";
++    pub const extra = "added 028";
+ };
+diff --git a/src/diff/render/file_011.zig b/src/diff/render/file_011.zig
+index 000001d..000001e 100644
+--- a/src/diff/render/file_011.zig
++++ b/src/diff/render/file_011.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_029 = struct {
+-    pub const value = "old 029";
++    pub const value = "new 029";
++    pub const extra = "added 029";
+ };
+diff --git a/src/diff/render/file_012.zig b/src/diff/render/file_012.zig
+index 000001e..000001f 100644
+--- a/src/diff/render/file_012.zig
++++ b/src/diff/render/file_012.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_030 = struct {
+-    pub const value = "old 030";
++    pub const value = "new 030";
++    pub const extra = "added 030";
+ };
+diff --git a/src/diff/render/file_013.zig b/src/diff/render/file_013.zig
+index 000001f..0000020 100644
+--- a/src/diff/render/file_013.zig
++++ b/src/diff/render/file_013.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_031 = struct {
+-    pub const value = "old 031";
++    pub const value = "new 031";
++    pub const extra = "added 031";
+ };
+diff --git a/src/diff/render/file_014.zig b/src/diff/render/file_014.zig
+index 0000020..0000021 100644
+--- a/src/diff/render/file_014.zig
++++ b/src/diff/render/file_014.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_032 = struct {
+-    pub const value = "old 032";
++    pub const value = "new 032";
++    pub const extra = "added 032";
+ };
+diff --git a/src/diff/render/file_015.zig b/src/diff/render/file_015.zig
+index 0000021..0000022 100644
+--- a/src/diff/render/file_015.zig
++++ b/src/diff/render/file_015.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_033 = struct {
+-    pub const value = "old 033";
++    pub const value = "new 033";
++    pub const extra = "added 033";
+ };
+diff --git a/src/diff/render/file_016.zig b/src/diff/render/file_016.zig
+index 0000022..0000023 100644
+--- a/src/diff/render/file_016.zig
++++ b/src/diff/render/file_016.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_034 = struct {
+-    pub const value = "old 034";
++    pub const value = "new 034";
++    pub const extra = "added 034";
+ };
+diff --git a/src/diff/render/file_017.zig b/src/diff/render/file_017.zig
+index 0000023..0000024 100644
+--- a/src/diff/render/file_017.zig
++++ b/src/diff/render/file_017.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_035 = struct {
+-    pub const value = "old 035";
++    pub const value = "new 035";
++    pub const extra = "added 035";
+ };
+diff --git a/src/diff/render/file_018.zig b/src/diff/render/file_018.zig
+index 0000024..0000025 100644
+--- a/src/diff/render/file_018.zig
++++ b/src/diff/render/file_018.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_036 = struct {
+-    pub const value = "old 036";
++    pub const value = "new 036";
++    pub const extra = "added 036";
+ };
+diff --git a/src/diff/parser/file_001.zig b/src/diff/parser/file_001.zig
+index 0000025..0000026 100644
+--- a/src/diff/parser/file_001.zig
++++ b/src/diff/parser/file_001.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_037 = struct {
+-    pub const value = "old 037";
++    pub const value = "new 037";
++    pub const extra = "added 037";
+ };
+diff --git a/src/diff/parser/file_002.zig b/src/diff/parser/file_002.zig
+index 0000026..0000027 100644
+--- a/src/diff/parser/file_002.zig
++++ b/src/diff/parser/file_002.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_038 = struct {
+-    pub const value = "old 038";
++    pub const value = "new 038";
++    pub const extra = "added 038";
+ };
+diff --git a/src/diff/parser/file_003.zig b/src/diff/parser/file_003.zig
+index 0000027..0000028 100644
+--- a/src/diff/parser/file_003.zig
++++ b/src/diff/parser/file_003.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_039 = struct {
+-    pub const value = "old 039";
++    pub const value = "new 039";
++    pub const extra = "added 039";
+ };
+diff --git a/src/diff/parser/file_004.zig b/src/diff/parser/file_004.zig
+index 0000028..0000029 100644
+--- a/src/diff/parser/file_004.zig
++++ b/src/diff/parser/file_004.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_040 = struct {
+-    pub const value = "old 040";
++    pub const value = "new 040";
++    pub const extra = "added 040";
+ };
+diff --git a/src/diff/parser/file_005.zig b/src/diff/parser/file_005.zig
+index 0000029..000002a 100644
+--- a/src/diff/parser/file_005.zig
++++ b/src/diff/parser/file_005.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_041 = struct {
+-    pub const value = "old 041";
++    pub const value = "new 041";
++    pub const extra = "added 041";
+ };
+diff --git a/src/diff/parser/file_006.zig b/src/diff/parser/file_006.zig
+index 000002a..000002b 100644
+--- a/src/diff/parser/file_006.zig
++++ b/src/diff/parser/file_006.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_042 = struct {
+-    pub const value = "old 042";
++    pub const value = "new 042";
++    pub const extra = "added 042";
+ };
+diff --git a/src/diff/parser/file_007.zig b/src/diff/parser/file_007.zig
+index 000002b..000002c 100644
+--- a/src/diff/parser/file_007.zig
++++ b/src/diff/parser/file_007.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_043 = struct {
+-    pub const value = "old 043";
++    pub const value = "new 043";
++    pub const extra = "added 043";
+ };
+diff --git a/src/diff/parser/file_008.zig b/src/diff/parser/file_008.zig
+index 000002c..000002d 100644
+--- a/src/diff/parser/file_008.zig
++++ b/src/diff/parser/file_008.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_044 = struct {
+-    pub const value = "old 044";
++    pub const value = "new 044";
++    pub const extra = "added 044";
+ };
+diff --git a/src/diff/parser/file_009.zig b/src/diff/parser/file_009.zig
+index 000002d..000002e 100644
+--- a/src/diff/parser/file_009.zig
++++ b/src/diff/parser/file_009.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_045 = struct {
+-    pub const value = "old 045";
++    pub const value = "new 045";
++    pub const extra = "added 045";
+ };
+diff --git a/src/diff/parser/file_010.zig b/src/diff/parser/file_010.zig
+index 000002e..000002f 100644
+--- a/src/diff/parser/file_010.zig
++++ b/src/diff/parser/file_010.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_046 = struct {
+-    pub const value = "old 046";
++    pub const value = "new 046";
++    pub const extra = "added 046";
+ };
+diff --git a/src/diff/parser/file_011.zig b/src/diff/parser/file_011.zig
+index 000002f..0000030 100644
+--- a/src/diff/parser/file_011.zig
++++ b/src/diff/parser/file_011.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_047 = struct {
+-    pub const value = "old 047";
++    pub const value = "new 047";
++    pub const extra = "added 047";
+ };
+diff --git a/src/diff/parser/file_012.zig b/src/diff/parser/file_012.zig
+index 0000030..0000031 100644
+--- a/src/diff/parser/file_012.zig
++++ b/src/diff/parser/file_012.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_048 = struct {
+-    pub const value = "old 048";
++    pub const value = "new 048";
++    pub const extra = "added 048";
+ };
+diff --git a/src/diff/parser/file_013.zig b/src/diff/parser/file_013.zig
+index 0000031..0000032 100644
+--- a/src/diff/parser/file_013.zig
++++ b/src/diff/parser/file_013.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_049 = struct {
+-    pub const value = "old 049";
++    pub const value = "new 049";
++    pub const extra = "added 049";
+ };
+diff --git a/src/diff/parser/file_014.zig b/src/diff/parser/file_014.zig
+index 0000032..0000033 100644
+--- a/src/diff/parser/file_014.zig
++++ b/src/diff/parser/file_014.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_050 = struct {
+-    pub const value = "old 050";
++    pub const value = "new 050";
++    pub const extra = "added 050";
+ };
+diff --git a/src/git/backend/file_001.zig b/src/git/backend/file_001.zig
+index 0000033..0000034 100644
+--- a/src/git/backend/file_001.zig
++++ b/src/git/backend/file_001.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_051 = struct {
+-    pub const value = "old 051";
++    pub const value = "new 051";
++    pub const extra = "added 051";
+ };
+diff --git a/src/git/backend/file_002.zig b/src/git/backend/file_002.zig
+index 0000034..0000035 100644
+--- a/src/git/backend/file_002.zig
++++ b/src/git/backend/file_002.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_052 = struct {
+-    pub const value = "old 052";
++    pub const value = "new 052";
++    pub const extra = "added 052";
+ };
+diff --git a/src/git/backend/file_003.zig b/src/git/backend/file_003.zig
+index 0000035..0000036 100644
+--- a/src/git/backend/file_003.zig
++++ b/src/git/backend/file_003.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_053 = struct {
+-    pub const value = "old 053";
++    pub const value = "new 053";
++    pub const extra = "added 053";
+ };
+diff --git a/src/git/backend/file_004.zig b/src/git/backend/file_004.zig
+index 0000036..0000037 100644
+--- a/src/git/backend/file_004.zig
++++ b/src/git/backend/file_004.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_054 = struct {
+-    pub const value = "old 054";
++    pub const value = "new 054";
++    pub const extra = "added 054";
+ };
+diff --git a/src/git/backend/file_005.zig b/src/git/backend/file_005.zig
+index 0000037..0000038 100644
+--- a/src/git/backend/file_005.zig
++++ b/src/git/backend/file_005.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_055 = struct {
+-    pub const value = "old 055";
++    pub const value = "new 055";
++    pub const extra = "added 055";
+ };
+diff --git a/src/git/backend/file_006.zig b/src/git/backend/file_006.zig
+index 0000038..0000039 100644
+--- a/src/git/backend/file_006.zig
++++ b/src/git/backend/file_006.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_056 = struct {
+-    pub const value = "old 056";
++    pub const value = "new 056";
++    pub const extra = "added 056";
+ };
+diff --git a/src/git/backend/file_007.zig b/src/git/backend/file_007.zig
+index 0000039..000003a 100644
+--- a/src/git/backend/file_007.zig
++++ b/src/git/backend/file_007.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_057 = struct {
+-    pub const value = "old 057";
++    pub const value = "new 057";
++    pub const extra = "added 057";
+ };
+diff --git a/src/git/backend/file_008.zig b/src/git/backend/file_008.zig
+index 000003a..000003b 100644
+--- a/src/git/backend/file_008.zig
++++ b/src/git/backend/file_008.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_058 = struct {
+-    pub const value = "old 058";
++    pub const value = "new 058";
++    pub const extra = "added 058";
+ };
+diff --git a/src/git/backend/file_009.zig b/src/git/backend/file_009.zig
+index 000003b..000003c 100644
+--- a/src/git/backend/file_009.zig
++++ b/src/git/backend/file_009.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_059 = struct {
+-    pub const value = "old 059";
++    pub const value = "new 059";
++    pub const extra = "added 059";
+ };
+diff --git a/src/git/backend/file_010.zig b/src/git/backend/file_010.zig
+index 000003c..000003d 100644
+--- a/src/git/backend/file_010.zig
++++ b/src/git/backend/file_010.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_060 = struct {
+-    pub const value = "old 060";
++    pub const value = "new 060";
++    pub const extra = "added 060";
+ };
+diff --git a/src/git/backend/file_011.zig b/src/git/backend/file_011.zig
+index 000003d..000003e 100644
+--- a/src/git/backend/file_011.zig
++++ b/src/git/backend/file_011.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_061 = struct {
+-    pub const value = "old 061";
++    pub const value = "new 061";
++    pub const extra = "added 061";
+ };
+diff --git a/src/git/backend/file_012.zig b/src/git/backend/file_012.zig
+index 000003e..000003f 100644
+--- a/src/git/backend/file_012.zig
++++ b/src/git/backend/file_012.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_062 = struct {
+-    pub const value = "old 062";
++    pub const value = "new 062";
++    pub const extra = "added 062";
+ };
+diff --git a/src/git/backend/file_013.zig b/src/git/backend/file_013.zig
+index 000003f..0000040 100644
+--- a/src/git/backend/file_013.zig
++++ b/src/git/backend/file_013.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_063 = struct {
+-    pub const value = "old 063";
++    pub const value = "new 063";
++    pub const extra = "added 063";
+ };
+diff --git a/src/git/backend/file_014.zig b/src/git/backend/file_014.zig
+index 0000040..0000041 100644
+--- a/src/git/backend/file_014.zig
++++ b/src/git/backend/file_014.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_064 = struct {
+-    pub const value = "old 064";
++    pub const value = "new 064";
++    pub const extra = "added 064";
+ };
+diff --git a/src/repo/discovery/file_001.zig b/src/repo/discovery/file_001.zig
+index 0000041..0000042 100644
+--- a/src/repo/discovery/file_001.zig
++++ b/src/repo/discovery/file_001.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_065 = struct {
+-    pub const value = "old 065";
++    pub const value = "new 065";
++    pub const extra = "added 065";
+ };
+diff --git a/src/repo/discovery/file_002.zig b/src/repo/discovery/file_002.zig
+index 0000042..0000043 100644
+--- a/src/repo/discovery/file_002.zig
++++ b/src/repo/discovery/file_002.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_066 = struct {
+-    pub const value = "old 066";
++    pub const value = "new 066";
++    pub const extra = "added 066";
+ };
+diff --git a/src/repo/discovery/file_003.zig b/src/repo/discovery/file_003.zig
+index 0000043..0000044 100644
+--- a/src/repo/discovery/file_003.zig
++++ b/src/repo/discovery/file_003.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_067 = struct {
+-    pub const value = "old 067";
++    pub const value = "new 067";
++    pub const extra = "added 067";
+ };
+diff --git a/src/repo/discovery/file_004.zig b/src/repo/discovery/file_004.zig
+index 0000044..0000045 100644
+--- a/src/repo/discovery/file_004.zig
++++ b/src/repo/discovery/file_004.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_068 = struct {
+-    pub const value = "old 068";
++    pub const value = "new 068";
++    pub const extra = "added 068";
+ };
+diff --git a/src/repo/discovery/file_005.zig b/src/repo/discovery/file_005.zig
+index 0000045..0000046 100644
+--- a/src/repo/discovery/file_005.zig
++++ b/src/repo/discovery/file_005.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_069 = struct {
+-    pub const value = "old 069";
++    pub const value = "new 069";
++    pub const extra = "added 069";
+ };
+diff --git a/src/repo/discovery/file_006.zig b/src/repo/discovery/file_006.zig
+index 0000046..0000047 100644
+--- a/src/repo/discovery/file_006.zig
++++ b/src/repo/discovery/file_006.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_070 = struct {
+-    pub const value = "old 070";
++    pub const value = "new 070";
++    pub const extra = "added 070";
+ };
+diff --git a/src/repo/discovery/file_007.zig b/src/repo/discovery/file_007.zig
+index 0000047..0000048 100644
+--- a/src/repo/discovery/file_007.zig
++++ b/src/repo/discovery/file_007.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_071 = struct {
+-    pub const value = "old 071";
++    pub const value = "new 071";
++    pub const extra = "added 071";
+ };
+diff --git a/src/repo/discovery/file_008.zig b/src/repo/discovery/file_008.zig
+index 0000048..0000049 100644
+--- a/src/repo/discovery/file_008.zig
++++ b/src/repo/discovery/file_008.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_072 = struct {
+-    pub const value = "old 072";
++    pub const value = "new 072";
++    pub const extra = "added 072";
+ };
+diff --git a/src/repo/discovery/file_009.zig b/src/repo/discovery/file_009.zig
+index 0000049..000004a 100644
+--- a/src/repo/discovery/file_009.zig
++++ b/src/repo/discovery/file_009.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_073 = struct {
+-    pub const value = "old 073";
++    pub const value = "new 073";
++    pub const extra = "added 073";
+ };
+diff --git a/src/repo/discovery/file_010.zig b/src/repo/discovery/file_010.zig
+index 000004a..000004b 100644
+--- a/src/repo/discovery/file_010.zig
++++ b/src/repo/discovery/file_010.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_074 = struct {
+-    pub const value = "old 074";
++    pub const value = "new 074";
++    pub const extra = "added 074";
+ };
+diff --git a/src/repo/discovery/file_011.zig b/src/repo/discovery/file_011.zig
+index 000004b..000004c 100644
+--- a/src/repo/discovery/file_011.zig
++++ b/src/repo/discovery/file_011.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_075 = struct {
+-    pub const value = "old 075";
++    pub const value = "new 075";
++    pub const extra = "added 075";
+ };
+diff --git a/src/repo/discovery/file_012.zig b/src/repo/discovery/file_012.zig
+index 000004c..000004d 100644
+--- a/src/repo/discovery/file_012.zig
++++ b/src/repo/discovery/file_012.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_076 = struct {
+-    pub const value = "old 076";
++    pub const value = "new 076";
++    pub const extra = "added 076";
+ };
+diff --git a/src/sidebar/view/file_001.zig b/src/sidebar/view/file_001.zig
+index 000004d..000004e 100644
+--- a/src/sidebar/view/file_001.zig
++++ b/src/sidebar/view/file_001.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_077 = struct {
+-    pub const value = "old 077";
++    pub const value = "new 077";
++    pub const extra = "added 077";
+ };
+diff --git a/src/sidebar/view/file_002.zig b/src/sidebar/view/file_002.zig
+index 000004e..000004f 100644
+--- a/src/sidebar/view/file_002.zig
++++ b/src/sidebar/view/file_002.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_078 = struct {
+-    pub const value = "old 078";
++    pub const value = "new 078";
++    pub const extra = "added 078";
+ };
+diff --git a/src/sidebar/view/file_003.zig b/src/sidebar/view/file_003.zig
+index 000004f..0000050 100644
+--- a/src/sidebar/view/file_003.zig
++++ b/src/sidebar/view/file_003.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_079 = struct {
+-    pub const value = "old 079";
++    pub const value = "new 079";
++    pub const extra = "added 079";
+ };
+diff --git a/src/sidebar/view/file_004.zig b/src/sidebar/view/file_004.zig
+index 0000050..0000051 100644
+--- a/src/sidebar/view/file_004.zig
++++ b/src/sidebar/view/file_004.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_080 = struct {
+-    pub const value = "old 080";
++    pub const value = "new 080";
++    pub const extra = "added 080";
+ };
+diff --git a/src/sidebar/view/file_005.zig b/src/sidebar/view/file_005.zig
+index 0000051..0000052 100644
+--- a/src/sidebar/view/file_005.zig
++++ b/src/sidebar/view/file_005.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_081 = struct {
+-    pub const value = "old 081";
++    pub const value = "new 081";
++    pub const extra = "added 081";
+ };
+diff --git a/src/sidebar/view/file_006.zig b/src/sidebar/view/file_006.zig
+index 0000052..0000053 100644
+--- a/src/sidebar/view/file_006.zig
++++ b/src/sidebar/view/file_006.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_082 = struct {
+-    pub const value = "old 082";
++    pub const value = "new 082";
++    pub const extra = "added 082";
+ };
+diff --git a/src/sidebar/view/file_007.zig b/src/sidebar/view/file_007.zig
+index 0000053..0000054 100644
+--- a/src/sidebar/view/file_007.zig
++++ b/src/sidebar/view/file_007.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_083 = struct {
+-    pub const value = "old 083";
++    pub const value = "new 083";
++    pub const extra = "added 083";
+ };
+diff --git a/src/sidebar/view/file_008.zig b/src/sidebar/view/file_008.zig
+index 0000054..0000055 100644
+--- a/src/sidebar/view/file_008.zig
++++ b/src/sidebar/view/file_008.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_084 = struct {
+-    pub const value = "old 084";
++    pub const value = "new 084";
++    pub const extra = "added 084";
+ };
+diff --git a/src/sidebar/view/file_009.zig b/src/sidebar/view/file_009.zig
+index 0000055..0000056 100644
+--- a/src/sidebar/view/file_009.zig
++++ b/src/sidebar/view/file_009.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_085 = struct {
+-    pub const value = "old 085";
++    pub const value = "new 085";
++    pub const extra = "added 085";
+ };
+diff --git a/src/sidebar/view/file_010.zig b/src/sidebar/view/file_010.zig
+index 0000056..0000057 100644
+--- a/src/sidebar/view/file_010.zig
++++ b/src/sidebar/view/file_010.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_086 = struct {
+-    pub const value = "old 086";
++    pub const value = "new 086";
++    pub const extra = "added 086";
+ };
+diff --git a/src/sidebar/view/file_011.zig b/src/sidebar/view/file_011.zig
+index 0000057..0000058 100644
+--- a/src/sidebar/view/file_011.zig
++++ b/src/sidebar/view/file_011.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_087 = struct {
+-    pub const value = "old 087";
++    pub const value = "new 087";
++    pub const extra = "added 087";
+ };
+diff --git a/src/sidebar/view/file_012.zig b/src/sidebar/view/file_012.zig
+index 0000058..0000059 100644
+--- a/src/sidebar/view/file_012.zig
++++ b/src/sidebar/view/file_012.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_088 = struct {
+-    pub const value = "old 088";
++    pub const value = "new 088";
++    pub const extra = "added 088";
+ };
+diff --git a/src/sidebar/view/file_013.zig b/src/sidebar/view/file_013.zig
+index 0000059..000005a 100644
+--- a/src/sidebar/view/file_013.zig
++++ b/src/sidebar/view/file_013.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_089 = struct {
+-    pub const value = "old 089";
++    pub const value = "new 089";
++    pub const extra = "added 089";
+ };
+diff --git a/src/sidebar/view/file_014.zig b/src/sidebar/view/file_014.zig
+index 000005a..000005b 100644
+--- a/src/sidebar/view/file_014.zig
++++ b/src/sidebar/view/file_014.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_090 = struct {
+-    pub const value = "old 090";
++    pub const value = "new 090";
++    pub const extra = "added 090";
+ };
+diff --git a/docs/user/guide/file_001.md b/docs/user/guide/file_001.md
+index 000005b..000005c 100644
+--- a/docs/user/guide/file_001.md
++++ b/docs/user/guide/file_001.md
+@@ -1,4 +1,5 @@
+ # Fixture 091
+-old sidebar documentation row 091
++new sidebar documentation row 091
++added sidebar documentation detail 091
+ unchanged documentation line
+diff --git a/docs/user/guide/file_002.md b/docs/user/guide/file_002.md
+index 000005c..000005d 100644
+--- a/docs/user/guide/file_002.md
++++ b/docs/user/guide/file_002.md
+@@ -1,4 +1,5 @@
+ # Fixture 092
+-old sidebar documentation row 092
++new sidebar documentation row 092
++added sidebar documentation detail 092
+ unchanged documentation line
+diff --git a/docs/user/guide/file_003.md b/docs/user/guide/file_003.md
+index 000005d..000005e 100644
+--- a/docs/user/guide/file_003.md
++++ b/docs/user/guide/file_003.md
+@@ -1,4 +1,5 @@
+ # Fixture 093
+-old sidebar documentation row 093
++new sidebar documentation row 093
++added sidebar documentation detail 093
+ unchanged documentation line
+diff --git a/docs/user/guide/file_004.md b/docs/user/guide/file_004.md
+index 000005e..000005f 100644
+--- a/docs/user/guide/file_004.md
++++ b/docs/user/guide/file_004.md
+@@ -1,4 +1,5 @@
+ # Fixture 094
+-old sidebar documentation row 094
++new sidebar documentation row 094
++added sidebar documentation detail 094
+ unchanged documentation line
+diff --git a/docs/user/guide/file_005.md b/docs/user/guide/file_005.md
+index 000005f..0000060 100644
+--- a/docs/user/guide/file_005.md
++++ b/docs/user/guide/file_005.md
+@@ -1,4 +1,5 @@
+ # Fixture 095
+-old sidebar documentation row 095
++new sidebar documentation row 095
++added sidebar documentation detail 095
+ unchanged documentation line
+diff --git a/docs/user/guide/file_006.md b/docs/user/guide/file_006.md
+index 0000060..0000061 100644
+--- a/docs/user/guide/file_006.md
++++ b/docs/user/guide/file_006.md
+@@ -1,4 +1,5 @@
+ # Fixture 096
+-old sidebar documentation row 096
++new sidebar documentation row 096
++added sidebar documentation detail 096
+ unchanged documentation line
+diff --git a/docs/user/guide/file_007.md b/docs/user/guide/file_007.md
+index 0000061..0000062 100644
+--- a/docs/user/guide/file_007.md
++++ b/docs/user/guide/file_007.md
+@@ -1,4 +1,5 @@
+ # Fixture 097
+-old sidebar documentation row 097
++new sidebar documentation row 097
++added sidebar documentation detail 097
+ unchanged documentation line
+diff --git a/docs/user/guide/file_008.md b/docs/user/guide/file_008.md
+index 0000062..0000063 100644
+--- a/docs/user/guide/file_008.md
++++ b/docs/user/guide/file_008.md
+@@ -1,4 +1,5 @@
+ # Fixture 098
+-old sidebar documentation row 098
++new sidebar documentation row 098
++added sidebar documentation detail 098
+ unchanged documentation line
+diff --git a/docs/user/guide/file_009.md b/docs/user/guide/file_009.md
+index 0000063..0000064 100644
+--- a/docs/user/guide/file_009.md
++++ b/docs/user/guide/file_009.md
+@@ -1,4 +1,5 @@
+ # Fixture 099
+-old sidebar documentation row 099
++new sidebar documentation row 099
++added sidebar documentation detail 099
+ unchanged documentation line
+diff --git a/docs/user/guide/file_010.md b/docs/user/guide/file_010.md
+index 0000064..0000065 100644
+--- a/docs/user/guide/file_010.md
++++ b/docs/user/guide/file_010.md
+@@ -1,4 +1,5 @@
+ # Fixture 100
+-old sidebar documentation row 100
++new sidebar documentation row 100
++added sidebar documentation detail 100
+ unchanged documentation line
+diff --git a/docs/user/guide/file_011.md b/docs/user/guide/file_011.md
+index 0000065..0000066 100644
+--- a/docs/user/guide/file_011.md
++++ b/docs/user/guide/file_011.md
+@@ -1,4 +1,5 @@
+ # Fixture 101
+-old sidebar documentation row 101
++new sidebar documentation row 101
++added sidebar documentation detail 101
+ unchanged documentation line
+diff --git a/docs/user/guide/file_012.md b/docs/user/guide/file_012.md
+index 0000066..0000067 100644
+--- a/docs/user/guide/file_012.md
++++ b/docs/user/guide/file_012.md
+@@ -1,4 +1,5 @@
+ # Fixture 102
+-old sidebar documentation row 102
++new sidebar documentation row 102
++added sidebar documentation detail 102
+ unchanged documentation line
+diff --git a/docs/dev/architecture/file_001.md b/docs/dev/architecture/file_001.md
+index 0000067..0000068 100644
+--- a/docs/dev/architecture/file_001.md
++++ b/docs/dev/architecture/file_001.md
+@@ -1,4 +1,5 @@
+ # Fixture 103
+-old sidebar documentation row 103
++new sidebar documentation row 103
++added sidebar documentation detail 103
+ unchanged documentation line
+diff --git a/docs/dev/architecture/file_002.md b/docs/dev/architecture/file_002.md
+index 0000068..0000069 100644
+--- a/docs/dev/architecture/file_002.md
++++ b/docs/dev/architecture/file_002.md
+@@ -1,4 +1,5 @@
+ # Fixture 104
+-old sidebar documentation row 104
++new sidebar documentation row 104
++added sidebar documentation detail 104
+ unchanged documentation line
+diff --git a/docs/dev/architecture/file_003.md b/docs/dev/architecture/file_003.md
+index 0000069..000006a 100644
+--- a/docs/dev/architecture/file_003.md
++++ b/docs/dev/architecture/file_003.md
+@@ -1,4 +1,5 @@
+ # Fixture 105
+-old sidebar documentation row 105
++new sidebar documentation row 105
++added sidebar documentation detail 105
+ unchanged documentation line
+diff --git a/docs/dev/architecture/file_004.md b/docs/dev/architecture/file_004.md
+index 000006a..000006b 100644
+--- a/docs/dev/architecture/file_004.md
++++ b/docs/dev/architecture/file_004.md
+@@ -1,4 +1,5 @@
+ # Fixture 106
+-old sidebar documentation row 106
++new sidebar documentation row 106
++added sidebar documentation detail 106
+ unchanged documentation line
+diff --git a/docs/dev/architecture/file_005.md b/docs/dev/architecture/file_005.md
+index 000006b..000006c 100644
+--- a/docs/dev/architecture/file_005.md
++++ b/docs/dev/architecture/file_005.md
+@@ -1,4 +1,5 @@
+ # Fixture 107
+-old sidebar documentation row 107
++new sidebar documentation row 107
++added sidebar documentation detail 107
+ unchanged documentation line
+diff --git a/docs/dev/architecture/file_006.md b/docs/dev/architecture/file_006.md
+index 000006c..000006d 100644
+--- a/docs/dev/architecture/file_006.md
++++ b/docs/dev/architecture/file_006.md
+@@ -1,4 +1,5 @@
+ # Fixture 108
+-old sidebar documentation row 108
++new sidebar documentation row 108
++added sidebar documentation detail 108
+ unchanged documentation line
+diff --git a/docs/dev/architecture/file_007.md b/docs/dev/architecture/file_007.md
+index 000006d..000006e 100644
+--- a/docs/dev/architecture/file_007.md
++++ b/docs/dev/architecture/file_007.md
+@@ -1,4 +1,5 @@
+ # Fixture 109
+-old sidebar documentation row 109
++new sidebar documentation row 109
++added sidebar documentation detail 109
+ unchanged documentation line
+diff --git a/docs/dev/architecture/file_008.md b/docs/dev/architecture/file_008.md
+index 000006e..000006f 100644
+--- a/docs/dev/architecture/file_008.md
++++ b/docs/dev/architecture/file_008.md
+@@ -1,4 +1,5 @@
+ # Fixture 110
+-old sidebar documentation row 110
++new sidebar documentation row 110
++added sidebar documentation detail 110
+ unchanged documentation line
+diff --git a/docs/dev/architecture/file_009.md b/docs/dev/architecture/file_009.md
+index 000006f..0000070 100644
+--- a/docs/dev/architecture/file_009.md
++++ b/docs/dev/architecture/file_009.md
+@@ -1,4 +1,5 @@
+ # Fixture 111
+-old sidebar documentation row 111
++new sidebar documentation row 111
++added sidebar documentation detail 111
+ unchanged documentation line
+diff --git a/docs/dev/architecture/file_010.md b/docs/dev/architecture/file_010.md
+index 0000070..0000071 100644
+--- a/docs/dev/architecture/file_010.md
++++ b/docs/dev/architecture/file_010.md
+@@ -1,4 +1,5 @@
+ # Fixture 112
+-old sidebar documentation row 112
++new sidebar documentation row 112
++added sidebar documentation detail 112
+ unchanged documentation line
+diff --git a/docs/dev/architecture/file_011.md b/docs/dev/architecture/file_011.md
+index 0000071..0000072 100644
+--- a/docs/dev/architecture/file_011.md
++++ b/docs/dev/architecture/file_011.md
+@@ -1,4 +1,5 @@
+ # Fixture 113
+-old sidebar documentation row 113
++new sidebar documentation row 113
++added sidebar documentation detail 113
+ unchanged documentation line
+diff --git a/docs/dev/architecture/file_012.md b/docs/dev/architecture/file_012.md
+index 0000072..0000073 100644
+--- a/docs/dev/architecture/file_012.md
++++ b/docs/dev/architecture/file_012.md
+@@ -1,4 +1,5 @@
+ # Fixture 114
+-old sidebar documentation row 114
++new sidebar documentation row 114
++added sidebar documentation detail 114
+ unchanged documentation line
+diff --git a/tests/integration/sidebar/file_001.zig b/tests/integration/sidebar/file_001.zig
+index 0000073..0000074 100644
+--- a/tests/integration/sidebar/file_001.zig
++++ b/tests/integration/sidebar/file_001.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_115 = struct {
+-    pub const value = "old 115";
++    pub const value = "new 115";
++    pub const extra = "added 115";
+ };
+diff --git a/tests/integration/sidebar/file_002.zig b/tests/integration/sidebar/file_002.zig
+index 0000074..0000075 100644
+--- a/tests/integration/sidebar/file_002.zig
++++ b/tests/integration/sidebar/file_002.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_116 = struct {
+-    pub const value = "old 116";
++    pub const value = "new 116";
++    pub const extra = "added 116";
+ };
+diff --git a/tests/integration/sidebar/file_003.zig b/tests/integration/sidebar/file_003.zig
+index 0000075..0000076 100644
+--- a/tests/integration/sidebar/file_003.zig
++++ b/tests/integration/sidebar/file_003.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_117 = struct {
+-    pub const value = "old 117";
++    pub const value = "new 117";
++    pub const extra = "added 117";
+ };
+diff --git a/tests/integration/sidebar/file_004.zig b/tests/integration/sidebar/file_004.zig
+index 0000076..0000077 100644
+--- a/tests/integration/sidebar/file_004.zig
++++ b/tests/integration/sidebar/file_004.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_118 = struct {
+-    pub const value = "old 118";
++    pub const value = "new 118";
++    pub const extra = "added 118";
+ };
+diff --git a/tests/integration/sidebar/file_005.zig b/tests/integration/sidebar/file_005.zig
+index 0000077..0000078 100644
+--- a/tests/integration/sidebar/file_005.zig
++++ b/tests/integration/sidebar/file_005.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_119 = struct {
+-    pub const value = "old 119";
++    pub const value = "new 119";
++    pub const extra = "added 119";
+ };
+diff --git a/tests/integration/sidebar/file_006.zig b/tests/integration/sidebar/file_006.zig
+index 0000078..0000079 100644
+--- a/tests/integration/sidebar/file_006.zig
++++ b/tests/integration/sidebar/file_006.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_120 = struct {
+-    pub const value = "old 120";
++    pub const value = "new 120";
++    pub const extra = "added 120";
+ };
+diff --git a/tests/integration/sidebar/file_007.zig b/tests/integration/sidebar/file_007.zig
+index 0000079..000007a 100644
+--- a/tests/integration/sidebar/file_007.zig
++++ b/tests/integration/sidebar/file_007.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_121 = struct {
+-    pub const value = "old 121";
++    pub const value = "new 121";
++    pub const extra = "added 121";
+ };
+diff --git a/tests/integration/sidebar/file_008.zig b/tests/integration/sidebar/file_008.zig
+index 000007a..000007b 100644
+--- a/tests/integration/sidebar/file_008.zig
++++ b/tests/integration/sidebar/file_008.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_122 = struct {
+-    pub const value = "old 122";
++    pub const value = "new 122";
++    pub const extra = "added 122";
+ };
+diff --git a/tests/integration/sidebar/file_009.zig b/tests/integration/sidebar/file_009.zig
+index 000007b..000007c 100644
+--- a/tests/integration/sidebar/file_009.zig
++++ b/tests/integration/sidebar/file_009.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_123 = struct {
+-    pub const value = "old 123";
++    pub const value = "new 123";
++    pub const extra = "added 123";
+ };
+diff --git a/tests/integration/sidebar/file_010.zig b/tests/integration/sidebar/file_010.zig
+index 000007c..000007d 100644
+--- a/tests/integration/sidebar/file_010.zig
++++ b/tests/integration/sidebar/file_010.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_124 = struct {
+-    pub const value = "old 124";
++    pub const value = "new 124";
++    pub const extra = "added 124";
+ };
+diff --git a/tests/integration/sidebar/file_011.zig b/tests/integration/sidebar/file_011.zig
+index 000007d..000007e 100644
+--- a/tests/integration/sidebar/file_011.zig
++++ b/tests/integration/sidebar/file_011.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_125 = struct {
+-    pub const value = "old 125";
++    pub const value = "new 125";
++    pub const extra = "added 125";
+ };
+diff --git a/tests/integration/sidebar/file_012.zig b/tests/integration/sidebar/file_012.zig
+index 000007e..000007f 100644
+--- a/tests/integration/sidebar/file_012.zig
++++ b/tests/integration/sidebar/file_012.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_126 = struct {
+-    pub const value = "old 126";
++    pub const value = "new 126";
++    pub const extra = "added 126";
+ };
+diff --git a/tests/integration/sidebar/file_013.zig b/tests/integration/sidebar/file_013.zig
+index 000007f..0000080 100644
+--- a/tests/integration/sidebar/file_013.zig
++++ b/tests/integration/sidebar/file_013.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_127 = struct {
+-    pub const value = "old 127";
++    pub const value = "new 127";
++    pub const extra = "added 127";
+ };
+diff --git a/tests/integration/sidebar/file_014.zig b/tests/integration/sidebar/file_014.zig
+index 0000080..0000081 100644
+--- a/tests/integration/sidebar/file_014.zig
++++ b/tests/integration/sidebar/file_014.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_128 = struct {
+-    pub const value = "old 128";
++    pub const value = "new 128";
++    pub const extra = "added 128";
+ };
+diff --git a/tests/integration/sidebar/file_015.zig b/tests/integration/sidebar/file_015.zig
+index 0000081..0000082 100644
+--- a/tests/integration/sidebar/file_015.zig
++++ b/tests/integration/sidebar/file_015.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_129 = struct {
+-    pub const value = "old 129";
++    pub const value = "new 129";
++    pub const extra = "added 129";
+ };
+diff --git a/tests/integration/sidebar/file_016.zig b/tests/integration/sidebar/file_016.zig
+index 0000082..0000083 100644
+--- a/tests/integration/sidebar/file_016.zig
++++ b/tests/integration/sidebar/file_016.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_130 = struct {
+-    pub const value = "old 130";
++    pub const value = "new 130";
++    pub const extra = "added 130";
+ };
+diff --git a/tests/integration/sidebar/file_017.zig b/tests/integration/sidebar/file_017.zig
+index 0000083..0000084 100644
+--- a/tests/integration/sidebar/file_017.zig
++++ b/tests/integration/sidebar/file_017.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_131 = struct {
+-    pub const value = "old 131";
++    pub const value = "new 131";
++    pub const extra = "added 131";
+ };
+diff --git a/tests/integration/sidebar/file_018.zig b/tests/integration/sidebar/file_018.zig
+index 0000084..0000085 100644
+--- a/tests/integration/sidebar/file_018.zig
++++ b/tests/integration/sidebar/file_018.zig
+@@ -1,4 +1,5 @@
+ pub const fixture_132 = struct {
+-    pub const value = "old 132";
++    pub const value = "new 132";
++    pub const extra = "added 132";
+ };
+diff --git a/tests/fixtures/generated/file_001.txt b/tests/fixtures/generated/file_001.txt
+index 0000085..0000086 100644
+--- a/tests/fixtures/generated/file_001.txt
++++ b/tests/fixtures/generated/file_001.txt
+@@ -1,4 +1,5 @@
+ line fixture 133
+-old generated fixture value 133
++new generated fixture value 133
++added generated fixture value 133
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_002.txt b/tests/fixtures/generated/file_002.txt
+index 0000086..0000087 100644
+--- a/tests/fixtures/generated/file_002.txt
++++ b/tests/fixtures/generated/file_002.txt
+@@ -1,4 +1,5 @@
+ line fixture 134
+-old generated fixture value 134
++new generated fixture value 134
++added generated fixture value 134
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_003.txt b/tests/fixtures/generated/file_003.txt
+index 0000087..0000088 100644
+--- a/tests/fixtures/generated/file_003.txt
++++ b/tests/fixtures/generated/file_003.txt
+@@ -1,4 +1,5 @@
+ line fixture 135
+-old generated fixture value 135
++new generated fixture value 135
++added generated fixture value 135
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_004.txt b/tests/fixtures/generated/file_004.txt
+index 0000088..0000089 100644
+--- a/tests/fixtures/generated/file_004.txt
++++ b/tests/fixtures/generated/file_004.txt
+@@ -1,4 +1,5 @@
+ line fixture 136
+-old generated fixture value 136
++new generated fixture value 136
++added generated fixture value 136
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_005.txt b/tests/fixtures/generated/file_005.txt
+index 0000089..000008a 100644
+--- a/tests/fixtures/generated/file_005.txt
++++ b/tests/fixtures/generated/file_005.txt
+@@ -1,4 +1,5 @@
+ line fixture 137
+-old generated fixture value 137
++new generated fixture value 137
++added generated fixture value 137
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_006.txt b/tests/fixtures/generated/file_006.txt
+index 000008a..000008b 100644
+--- a/tests/fixtures/generated/file_006.txt
++++ b/tests/fixtures/generated/file_006.txt
+@@ -1,4 +1,5 @@
+ line fixture 138
+-old generated fixture value 138
++new generated fixture value 138
++added generated fixture value 138
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_007.txt b/tests/fixtures/generated/file_007.txt
+index 000008b..000008c 100644
+--- a/tests/fixtures/generated/file_007.txt
++++ b/tests/fixtures/generated/file_007.txt
+@@ -1,4 +1,5 @@
+ line fixture 139
+-old generated fixture value 139
++new generated fixture value 139
++added generated fixture value 139
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_008.txt b/tests/fixtures/generated/file_008.txt
+index 000008c..000008d 100644
+--- a/tests/fixtures/generated/file_008.txt
++++ b/tests/fixtures/generated/file_008.txt
+@@ -1,4 +1,5 @@
+ line fixture 140
+-old generated fixture value 140
++new generated fixture value 140
++added generated fixture value 140
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_009.txt b/tests/fixtures/generated/file_009.txt
+index 000008d..000008e 100644
+--- a/tests/fixtures/generated/file_009.txt
++++ b/tests/fixtures/generated/file_009.txt
+@@ -1,4 +1,5 @@
+ line fixture 141
+-old generated fixture value 141
++new generated fixture value 141
++added generated fixture value 141
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_010.txt b/tests/fixtures/generated/file_010.txt
+index 000008e..000008f 100644
+--- a/tests/fixtures/generated/file_010.txt
++++ b/tests/fixtures/generated/file_010.txt
+@@ -1,4 +1,5 @@
+ line fixture 142
+-old generated fixture value 142
++new generated fixture value 142
++added generated fixture value 142
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_011.txt b/tests/fixtures/generated/file_011.txt
+index 000008f..0000090 100644
+--- a/tests/fixtures/generated/file_011.txt
++++ b/tests/fixtures/generated/file_011.txt
+@@ -1,4 +1,5 @@
+ line fixture 143
+-old generated fixture value 143
++new generated fixture value 143
++added generated fixture value 143
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_012.txt b/tests/fixtures/generated/file_012.txt
+index 0000090..0000091 100644
+--- a/tests/fixtures/generated/file_012.txt
++++ b/tests/fixtures/generated/file_012.txt
+@@ -1,4 +1,5 @@
+ line fixture 144
+-old generated fixture value 144
++new generated fixture value 144
++added generated fixture value 144
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_013.txt b/tests/fixtures/generated/file_013.txt
+index 0000091..0000092 100644
+--- a/tests/fixtures/generated/file_013.txt
++++ b/tests/fixtures/generated/file_013.txt
+@@ -1,4 +1,5 @@
+ line fixture 145
+-old generated fixture value 145
++new generated fixture value 145
++added generated fixture value 145
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_014.txt b/tests/fixtures/generated/file_014.txt
+index 0000092..0000093 100644
+--- a/tests/fixtures/generated/file_014.txt
++++ b/tests/fixtures/generated/file_014.txt
+@@ -1,4 +1,5 @@
+ line fixture 146
+-old generated fixture value 146
++new generated fixture value 146
++added generated fixture value 146
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_015.txt b/tests/fixtures/generated/file_015.txt
+index 0000093..0000094 100644
+--- a/tests/fixtures/generated/file_015.txt
++++ b/tests/fixtures/generated/file_015.txt
+@@ -1,4 +1,5 @@
+ line fixture 147
+-old generated fixture value 147
++new generated fixture value 147
++added generated fixture value 147
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_016.txt b/tests/fixtures/generated/file_016.txt
+index 0000094..0000095 100644
+--- a/tests/fixtures/generated/file_016.txt
++++ b/tests/fixtures/generated/file_016.txt
+@@ -1,4 +1,5 @@
+ line fixture 148
+-old generated fixture value 148
++new generated fixture value 148
++added generated fixture value 148
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_017.txt b/tests/fixtures/generated/file_017.txt
+index 0000095..0000096 100644
+--- a/tests/fixtures/generated/file_017.txt
++++ b/tests/fixtures/generated/file_017.txt
+@@ -1,4 +1,5 @@
+ line fixture 149
+-old generated fixture value 149
++new generated fixture value 149
++added generated fixture value 149
+ unchanged generated line
+diff --git a/tests/fixtures/generated/file_018.txt b/tests/fixtures/generated/file_018.txt
+index 0000096..0000097 100644
+--- a/tests/fixtures/generated/file_018.txt
++++ b/tests/fixtures/generated/file_018.txt
+@@ -1,4 +1,5 @@
+ line fixture 150
+-old generated fixture value 150
++new generated fixture value 150
++added generated fixture value 150
+ unchanged generated line
