@@ -25,6 +25,12 @@ pub fn effectiveMode(width: u16, requested_mode: DisplayMode) DisplayMode {
     return requested_mode;
 }
 
+pub fn modeLabel(width: u16, requested_mode: DisplayMode) []const u8 {
+    const mode = effectiveMode(width, requested_mode);
+    if (mode != requested_mode) return "unified (auto)";
+    return mode.label();
+}
+
 pub fn fileStats(file: diff_parser.FileDiff) FileStats {
     return diff_file.stats(file);
 }
@@ -50,7 +56,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     if (size.width == 0 or size.height == 0) return;
 
     const mode = effectiveMode(size.width, options.requested_mode);
-    try renderFileHeader(surface, file, mode, options.pane_active);
+    try renderFileHeader(surface, file, options.requested_mode, options.pane_active);
 
     const line_index = if (options.line_index) |index|
         if (lineIndexMatchesFile(file, index, mode)) index else null
@@ -88,11 +94,16 @@ fn lineIndexMatchesFile(file: diff_parser.FileDiff, index: diff_view_model.Rende
     return index.mode == mode and index.hunk_offsets.len == file.hunks.len;
 }
 
-fn renderFileHeader(surface: *chasen.Surface, file: diff_parser.FileDiff, mode: DisplayMode, pane_active: bool) !void {
+fn renderFileHeader(
+    surface: *chasen.Surface,
+    file: diff_parser.FileDiff,
+    requested_mode: DisplayMode,
+    pane_active: bool,
+) !void {
     const stats = fileStats(file);
     try draw.copyClippedTextAt(surface, 0, 0, displayPath(file), fileHeaderStyle(pane_active));
     const summary = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  +{d} -{d}", .{
-        mode.label(),
+        modeLabel(surface.size().width, requested_mode),
         stats.added,
         stats.removed,
     });
@@ -336,6 +347,9 @@ test "display mode falls back to unified on narrow panes" {
     try std.testing.expectEqual(DisplayMode.unified, effectiveMode(40, .side_by_side));
     try std.testing.expectEqual(DisplayMode.side_by_side, effectiveMode(90, .side_by_side));
     try std.testing.expectEqual(DisplayMode.unified, effectiveMode(90, .unified));
+
+    try std.testing.expectEqualStrings("unified (auto)", modeLabel(40, .side_by_side));
+    try std.testing.expectEqualStrings("side-by-side", modeLabel(90, .side_by_side));
 }
 
 test "fileStats counts added and removed hunk lines" {
@@ -371,6 +385,38 @@ test "displayPath prefers new path and strips git prefixes" {
     };
 
     try std.testing.expectEqualStrings("src/main.zig", displayPath(file));
+}
+
+test "narrow side-by-side request labels file header as automatic unified fallback" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(50, 4);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 1,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old", .old_line = 1 },
+                    .{ .kind = .added, .text = "new", .new_line = 1 },
+                },
+            },
+        },
+    };
+
+    try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side });
+
+    try ts.expectCellText(0, 1, "u");
+    try ts.expectCellText(8, 1, "(");
+    try ts.expectCellText(9, 1, "a");
 }
 
 test "side-by-side clips old column before new column" {

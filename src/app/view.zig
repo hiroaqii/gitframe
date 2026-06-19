@@ -305,6 +305,7 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     const file = loaded.document.files[selected];
     var diff_content = diffContentSurface(surface);
     const mode = diff_render.effectiveMode(diff_content.size().width, app.viewer.display_mode);
+    const mode_label = diff_render.modeLabel(diff_content.size().width, app.viewer.display_mode);
     const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
     const status_style = paneStatusStyle(active);
     const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "{s} {d}/{d}  {d} hunks  {s}  scroll:{d}{s}", .{
@@ -312,7 +313,7 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         selected + 1,
         loaded.document.files.len,
         file.hunks.len,
-        mode.label(),
+        mode_label,
         app.viewer.diff_scroll,
         horizontalScrollStatus(surface, app.viewer.diff_horizontal_scroll),
     });

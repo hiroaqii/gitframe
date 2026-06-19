@@ -2875,6 +2875,8 @@ test "status mode label uses diff content width after marker gutter" {
     try ts.expectCellText(19, 2, "u");
     try ts.expectCellText(20, 2, "n");
     try ts.expectCellText(21, 2, "i");
+    try ts.expectCellText(27, 2, "(");
+    try ts.expectCellText(28, 2, "a");
 }
 
 test "search input header does not show no match before submit" {
