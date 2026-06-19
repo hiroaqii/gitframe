@@ -102,6 +102,22 @@ pub const FileTree = struct {
         return null;
     }
 
+    pub fn parentDirectoryNodeIndex(self: FileTree, node_index: usize) ?usize {
+        if (node_index >= self.nodes.len) return null;
+
+        const node = self.nodes[node_index];
+        var index = node_index;
+        while (index > 0) {
+            index -= 1;
+            const candidate = self.nodes[index];
+            if (candidate.kind != .directory) continue;
+            if (candidate.depth >= node.depth) continue;
+            if (!isPathAncestor(candidate.path, node.path)) continue;
+            return index;
+        }
+        return null;
+    }
+
     pub fn isVisible(self: FileTree, node_index: usize, collapsed: *const CollapsedSet) bool {
         if (node_index >= self.nodes.len) return false;
         return !hasCollapsedAncestor(self.nodes[node_index].path, collapsed);
@@ -327,6 +343,22 @@ test "collapsed directory hides descendants but remains visible" {
     try std.testing.expectEqual(@as(?usize, 0), tree.visibleNodeAt(&collapsed, 0));
     try std.testing.expectEqual(@as(?usize, 2), tree.visibleNodeAt(&collapsed, 1));
     try std.testing.expectEqual(@as(?usize, 0), tree.visibleAncestorOrSelf(&collapsed, 1));
+}
+
+test "parentDirectoryNodeIndex finds nearest directory ancestor" {
+    const nodes = [_]Node{
+        .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
+        .{ .kind = .directory, .name = "lib", .path = "src/lib", .depth = 1 },
+        .{ .kind = .file, .name = "root.zig", .path = "src/lib/root.zig", .depth = 2, .file_index = 0 },
+        .{ .kind = .file, .name = "README.md", .path = "README.md", .depth = 0, .file_index = 1 },
+    };
+    const tree = FileTree{ .nodes = &nodes };
+
+    try std.testing.expectEqual(@as(?usize, 1), tree.parentDirectoryNodeIndex(2));
+    try std.testing.expectEqual(@as(?usize, 0), tree.parentDirectoryNodeIndex(1));
+    try std.testing.expectEqual(@as(?usize, null), tree.parentDirectoryNodeIndex(0));
+    try std.testing.expectEqual(@as(?usize, null), tree.parentDirectoryNodeIndex(3));
+    try std.testing.expectEqual(@as(?usize, null), tree.parentDirectoryNodeIndex(99));
 }
 
 test "expandAncestors reveals nested file path" {

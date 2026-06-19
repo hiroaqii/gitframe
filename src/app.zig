@@ -811,7 +811,7 @@ pub const App = struct {
             self.clampSelection(loaded.document.files.len);
             return;
         }
-        if (parentDirectoryNodeIndex(loaded.tree, self.viewer.selected_node)) |parent| {
+        if (loaded.tree.parentDirectoryNodeIndex(self.viewer.selected_node)) |parent| {
             self.viewer.selected_node = parent;
             self.clampSelection(loaded.document.files.len);
         }
@@ -1493,25 +1493,6 @@ fn maxHorizontalScrollForText(text: []const u8, visible_width: u16) usize {
     const width = chasen.text.displayWidth(text);
     if (width <= visible_width) return 0;
     return width - visible_width;
-}
-
-fn parentDirectoryNodeIndex(tree: file_tree.FileTree, node_index: usize) ?usize {
-    if (node_index >= tree.nodes.len) return null;
-    const node = tree.nodes[node_index];
-    var index = node_index;
-    while (index > 0) {
-        index -= 1;
-        const candidate = tree.nodes[index];
-        if (candidate.kind != .directory) continue;
-        if (candidate.depth >= node.depth) continue;
-        if (node.path.len > candidate.path.len and
-            std.mem.startsWith(u8, node.path, candidate.path) and
-            node.path[candidate.path.len] == '/')
-        {
-            return index;
-        }
-    }
-    return null;
 }
 
 test "countLines handles empty and trailing newline inputs" {
