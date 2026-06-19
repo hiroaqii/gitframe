@@ -122,7 +122,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
 }
 
 fn isHelpKey(key: chasen.Key) bool {
-    return key.matches('?', .{}) or key.matches('/', .{ .shift = true });
+    return key.matches('?', .{});
 }
 
 pub fn isTextInputCodepoint(codepoint: u21) bool {
@@ -262,7 +262,12 @@ test "keyToMsg opens and closes help outside prompt modes" {
     }).?);
     try std.testing.expectEqual(TestMsg.open_help, keyToMsg(TestMsg, .{}, .{
         .codepoint = '/',
+        .text = "?",
         .mods = .{ .shift = true },
+    }).?);
+    try std.testing.expectEqual(TestMsg.enter_search, keyToMsg(TestMsg, .{}, .{
+        .codepoint = '/',
+        .text = "/",
     }).?);
     try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = '?' }).?);
     try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true }, .{
