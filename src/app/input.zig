@@ -93,29 +93,36 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.focus == .diff and key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "scroll_diff_left");
     if (isHelpKey(key)) return voidMsg(Msg, "open_help");
 
+    if (matchesShiftedAscii(key, 'j', 'J')) {
+        return if (context.focus == .diff) voidMsg(Msg, "select_next_hunk") else null;
+    }
+    if (matchesShiftedAscii(key, 'k', 'K')) {
+        return if (context.focus == .diff) voidMsg(Msg, "select_previous_hunk") else null;
+    }
+    if (matchesShiftedAscii(key, 'n', 'N')) {
+        return if (context.search_query_len > 0) voidMsg(Msg, "select_previous_search_match") else null;
+    }
+    if (matchesShiftedAscii(key, 'g', 'G')) return voidMsg(Msg, "select_last_file");
+    if (matchesShiftedAscii(key, 'r', 'R')) return voidMsg(Msg, "enter_repo_picker");
+    if (matchesShiftedAscii(key, 'f', 'F')) return voidMsg(Msg, "cycle_changed_file_filter");
+    if (matchesShiftedAscii(key, 'h', 'H')) return voidMsg(Msg, "toggle_hide_reviewed_files");
+    if (matchesShiftedAscii(key, 'b', 'B')) return voidMsg(Msg, "toggle_sidebar_visibility");
+    if (matchesShiftedAscii(key, 'l', 'L')) return voidMsg(Msg, "toggle_line_numbers");
+
     return switch (key.codepoint) {
         'k', chasen.Key.up => if (context.focus == .diff) voidMsg(Msg, "scroll_diff_up") else voidMsg(Msg, "select_previous_file"),
         'j', chasen.Key.down => if (context.focus == .diff) voidMsg(Msg, "scroll_diff_down") else voidMsg(Msg, "select_next_file"),
         '/' => voidMsg(Msg, "enter_search"),
-        'J' => if (context.focus == .diff) voidMsg(Msg, "select_next_hunk") else null,
-        'K' => if (context.focus == .diff) voidMsg(Msg, "select_previous_hunk") else null,
         'n' => if (context.search_query_len > 0) voidMsg(Msg, "select_next_search_match") else voidMsg(Msg, "select_next_hunk"),
-        'N' => if (context.search_query_len > 0) voidMsg(Msg, "select_previous_search_match") else null,
         'p' => if (context.search_query_len > 0) voidMsg(Msg, "select_previous_search_match") else voidMsg(Msg, "select_previous_hunk"),
         'g' => voidMsg(Msg, "select_first_file"),
-        'G' => voidMsg(Msg, "select_last_file"),
         'f' => voidMsg(Msg, "enter_file_search"),
-        'R' => voidMsg(Msg, "enter_repo_picker"),
-        'F' => voidMsg(Msg, "cycle_changed_file_filter"),
         'v' => voidMsg(Msg, "toggle_reviewed_file"),
-        'H' => voidMsg(Msg, "toggle_hide_reviewed_files"),
-        'B' => voidMsg(Msg, "toggle_sidebar_visibility"),
         '[' => voidMsg(Msg, "decrease_sidebar_width"),
         ']' => voidMsg(Msg, "increase_sidebar_width"),
         's' => voidMsg(Msg, "stage_selected_file"),
         'e' => voidMsg(Msg, "open_selected_file_in_editor"),
         'u' => voidMsg(Msg, "toggle_display_mode"),
-        'L' => voidMsg(Msg, "toggle_line_numbers"),
         'q' => voidMsg(Msg, "quit"),
         'r' => voidMsg(Msg, "reload"),
         else => null,
@@ -124,6 +131,12 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
 
 fn isHelpKey(key: chasen.Key) bool {
     return key.matches('?', .{});
+}
+
+/// Match an ASCII Shift-letter command across terminals that report either
+/// uppercase codepoints or lowercase codepoints with the shift modifier set.
+fn matchesShiftedAscii(key: chasen.Key, lower: u21, upper: u21) bool {
+    return key.matches(upper, .{}) or (key.codepoint == lower and key.mods.shift);
 }
 
 pub fn isTextInputCodepoint(codepoint: u21) bool {
@@ -226,6 +239,7 @@ test "keyToMsg maps left and right by focused pane" {
 
 test "keyToMsg maps sidebar visibility and suppresses focus toggle while hidden" {
     try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, .{ .codepoint = 'B' }).?);
+    try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, shiftedAscii('b', 'B')).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .sidebar_hidden = true }, .{ .codepoint = chasen.Key.tab }));
 }
 
@@ -236,6 +250,7 @@ test "keyToMsg maps sidebar width adjustment keys" {
 
 test "keyToMsg maps view option toggles" {
     try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, .{ .codepoint = 'L' }).?);
+    try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, shiftedAscii('l', 'L')).?);
 }
 
 test "keyToMsg maps stage file action" {
@@ -245,18 +260,53 @@ test "keyToMsg maps stage file action" {
 test "keyToMsg uses search query to disambiguate navigation" {
     try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{}, .{ .codepoint = 'n' }).?);
     try std.testing.expectEqual(TestMsg.select_next_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, .{ .codepoint = 'n' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'N' }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, shiftedAscii('n', 'N')));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, shiftedLowerOnly('n')));
+    try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, .{ .codepoint = 'N' }).?);
+    try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, shiftedAscii('n', 'N')).?);
+    try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, shiftedLowerOnly('n')).?);
 }
 
 test "keyToMsg maps dedicated hunk jumps only in diff focus" {
     try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 'J' }).?);
     try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 'K' }).?);
+    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, shiftedAscii('j', 'J')).?);
+    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, shiftedAscii('k', 'K')).?);
+    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, shiftedLowerOnly('j')).?);
+    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, shiftedLowerOnly('k')).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'J' }));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'K' }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedAscii('j', 'J')));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedAscii('k', 'K')));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedLowerOnly('j')));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedLowerOnly('k')));
 }
 
 test "keyToMsg keeps dedicated hunk jumps independent from search query" {
     try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, .{ .codepoint = 'J' }).?);
     try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, .{ .codepoint = 'K' }).?);
+    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, shiftedAscii('j', 'J')).?);
+    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, shiftedAscii('k', 'K')).?);
+    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, shiftedLowerOnly('j')).?);
+    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, shiftedLowerOnly('k')).?);
+}
+
+test "keyToMsg maps shifted letter commands consistently" {
+    try std.testing.expectEqual(TestMsg.select_last_file, keyToMsg(TestMsg, .{}, .{ .codepoint = 'G' }).?);
+    try std.testing.expectEqual(TestMsg.select_last_file, keyToMsg(TestMsg, .{}, shiftedAscii('g', 'G')).?);
+    try std.testing.expectEqual(TestMsg.select_last_file, keyToMsg(TestMsg, .{}, shiftedLowerOnly('g')).?);
+    try std.testing.expectEqual(TestMsg.enter_repo_picker, keyToMsg(TestMsg, .{}, .{ .codepoint = 'R' }).?);
+    try std.testing.expectEqual(TestMsg.enter_repo_picker, keyToMsg(TestMsg, .{}, shiftedAscii('r', 'R')).?);
+    try std.testing.expectEqual(TestMsg.enter_repo_picker, keyToMsg(TestMsg, .{}, shiftedLowerOnly('r')).?);
+    try std.testing.expectEqual(TestMsg.cycle_changed_file_filter, keyToMsg(TestMsg, .{}, .{ .codepoint = 'F' }).?);
+    try std.testing.expectEqual(TestMsg.cycle_changed_file_filter, keyToMsg(TestMsg, .{}, shiftedAscii('f', 'F')).?);
+    try std.testing.expectEqual(TestMsg.cycle_changed_file_filter, keyToMsg(TestMsg, .{}, shiftedLowerOnly('f')).?);
+    try std.testing.expectEqual(TestMsg.toggle_hide_reviewed_files, keyToMsg(TestMsg, .{}, .{ .codepoint = 'H' }).?);
+    try std.testing.expectEqual(TestMsg.toggle_hide_reviewed_files, keyToMsg(TestMsg, .{}, shiftedAscii('h', 'H')).?);
+    try std.testing.expectEqual(TestMsg.toggle_hide_reviewed_files, keyToMsg(TestMsg, .{}, shiftedLowerOnly('h')).?);
+    try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, shiftedLowerOnly('b')).?);
+    try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, shiftedLowerOnly('l')).?);
 }
 
 test "keyToMsg opens and closes help outside prompt modes" {
@@ -294,4 +344,19 @@ test "keyToMsg opens and closes help outside prompt modes" {
 test "keyToMsg keeps prompt modes above help overlay" {
     const msg = keyToMsg(TestMsg, .{ .search_mode = true, .help_mode = true }, .{ .codepoint = '?' }).?;
     try std.testing.expectEqual(TestMsg{ .search_insert = '?' }, msg);
+}
+
+fn shiftedAscii(lower: u21, upper: u21) chasen.Key {
+    return .{
+        .codepoint = lower,
+        .shifted_codepoint = upper,
+        .mods = .{ .shift = true },
+    };
+}
+
+fn shiftedLowerOnly(lower: u21) chasen.Key {
+    return .{
+        .codepoint = lower,
+        .mods = .{ .shift = true },
+    };
 }
