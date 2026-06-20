@@ -18,6 +18,7 @@ const diff_source = @import("diff/source.zig");
 const diff_view_model = @import("diff/view_model.zig");
 const editor = @import("editor.zig");
 const file_tree = @import("file_tree.zig");
+const git_status = @import("git/status.zig");
 const loaded_diff = @import("loaded_diff.zig");
 const repo_discovery = @import("repo/discovery.zig");
 const repo_state = @import("repo/state.zig");
@@ -42,6 +43,8 @@ const LoadRuntimeState = app_load_state.LoadRuntimeState;
 const PendingLoad = app_load_state.PendingLoad;
 const RepoDiscoveryFinished = app_load.RepoDiscoveryFinished;
 const RepoDiscoveryTask = app_load.RepoDiscoveryTask(App.Msg);
+const StatusLoadFinished = app_load.StatusLoadFinished;
+const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
 
 const MousePane = enum {
     sidebar,
@@ -113,6 +116,8 @@ pub const App = struct {
     overlay: app_state.OverlayState = .{},
     review_display: app_state.ReviewDisplayState = .{},
     repo_state: repo_state.State = .{},
+    git_status: git_status.GitStatusState = .{},
+    status_load_generation: u64 = 0,
     /// Session-level source of truth for reviewed files. The active LoadedDiff
     /// keeps a materialized bool slice so hide-reviewed hot paths stay O(1).
     reviewed_store: review_state.Store = .{},
@@ -121,6 +126,7 @@ pub const App = struct {
         terminal_resized: chasen.Size,
         repos_discovered: RepoDiscoveryFinished,
         diff_loaded: DiffLoadFinished,
+        status_loaded: StatusLoadFinished,
         select_previous_file,
         select_next_file,
         toggle_directory,
@@ -204,6 +210,7 @@ pub const App = struct {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.clearLoadedDiff();
         self.repo_state.deinit(deinit_ctx.allocator);
+        self.git_status.deinit();
         self.file_search.deinit(deinit_ctx.allocator);
         self.repo_picker.deinit(deinit_ctx.allocator);
         self.reviewed_store.deinit(deinit_ctx.allocator);
@@ -223,6 +230,7 @@ pub const App = struct {
             },
             .repos_discovered => |finished| try self.finishRepoDiscovery(ctx, finished),
             .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
+            .status_loaded => |finished| try self.finishStatusLoad(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
             .toggle_directory => try self.toggleSelectedDirectory(),
@@ -554,6 +562,12 @@ pub const App = struct {
     }
 
     fn startDiffLoadWithRepoRoot(self: *App, ctx: *chasen.Ctx(Msg), repo_root: ?[]const u8, clear_visible_state: bool) !void {
+        if (repo_root) |root| {
+            self.startStatusLoad(ctx, root);
+        } else {
+            self.invalidateStatusSnapshot();
+        }
+
         const task = try ctx.allocator().create(DiffLoadTask);
         errdefer ctx.allocator().destroy(task);
 
@@ -580,6 +594,41 @@ pub const App = struct {
             try self.storeFailedMessage(ctx.allocator(), "Could not start diff load task");
             return err;
         };
+    }
+
+    fn startStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), repo_root: []const u8) void {
+        self.invalidateStatusSnapshot();
+
+        const task = ctx.allocator().create(StatusLoadTask) catch {
+            self.setStatus("could not allocate status load task", .{});
+            return;
+        };
+
+        const owned_root = ctx.allocator().dupe(u8, repo_root) catch {
+            ctx.allocator().destroy(task);
+            self.setStatus("could not allocate status repo root", .{});
+            return;
+        };
+
+        task.* = .{
+            .repo_root = owned_root,
+            .generation = self.status_load_generation,
+        };
+
+        ctx.task().spawnWith(task, StatusLoadTask.run) catch {
+            // Status is auxiliary data. Keep the diff load going even if this
+            // task cannot start; the invalidated generation prevents any older
+            // in-flight status result from restoring a stale snapshot.
+            ctx.allocator().free(owned_root);
+            ctx.allocator().destroy(task);
+            self.setStatus("could not start status load task", .{});
+            return;
+        };
+    }
+
+    fn invalidateStatusSnapshot(self: *App) void {
+        self.status_load_generation +%= 1;
+        self.git_status.clear();
     }
 
     fn openSelectedFileInEditor(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -791,6 +840,29 @@ pub const App = struct {
             },
             .failed_static => |message| {
                 try self.storeFailedMessage(ctx.allocator(), message);
+            },
+        }
+    }
+
+    fn finishStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: StatusLoadFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (result.generation != self.status_load_generation) return;
+
+        switch (result.result) {
+            .empty => self.git_status.clear(),
+            .loaded => |*bundle| {
+                try self.git_status.replace(result.repo_root, bundle);
+                result.result = .empty;
+            },
+            .failed => |message| {
+                self.git_status.clear();
+                self.setStatus("status load failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+            },
+            .failed_static => |message| {
+                self.git_status.clear();
+                self.setStatus("status load failed: {s}", .{message});
             },
         }
     }

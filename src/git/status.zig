@@ -103,6 +103,37 @@ pub const StatusBundle = struct {
     }
 };
 
+/// Active repository status snapshot owned by the app.
+///
+/// `StatusBundle` is a task-result payload. `GitStatusState` is the long-lived
+/// app state form: it owns the arena backing status paths and the copied repo
+/// root that identifies which repository the snapshot belongs to.
+pub const GitStatusState = struct {
+    arena: ?std.heap.ArenaAllocator = null,
+    repo_root: ?[]const u8 = null,
+    document: StatusDocument = .{ .entries = &.{} },
+
+    pub fn replace(self: *GitStatusState, repo_root: []const u8, bundle: *StatusBundle) ParseError!void {
+        var arena = bundle.takeArena();
+        errdefer arena.deinit();
+
+        const copied_root = try arena.allocator().dupe(u8, repo_root);
+        self.deinit();
+        self.arena = arena;
+        self.repo_root = copied_root;
+        self.document = bundle.document;
+    }
+
+    pub fn clear(self: *GitStatusState) void {
+        self.deinit();
+    }
+
+    pub fn deinit(self: *GitStatusState) void {
+        if (self.arena) |*arena| arena.deinit();
+        self.* = .{};
+    }
+};
+
 /// Parse status text while borrowing path slices from `text`.
 ///
 /// The returned entries slice must be freed by the caller. Do not store the
@@ -307,6 +338,25 @@ test "parseOwned keeps paths alive after source buffer is freed" {
     defer bundle.deinit();
 
     try std.testing.expectEqualStrings("src/main.zig", bundle.document.entries[0].path);
+}
+
+test "GitStatusState takes bundle arena and stores repo root" {
+    const allocator = std.testing.allocator;
+    var bundle = try StatusBundle.parseOwned(allocator, "?? src/new.zig\x00");
+    defer bundle.deinit();
+
+    var state: GitStatusState = .{};
+    defer state.deinit();
+
+    try state.replace("/repo", &bundle);
+    try std.testing.expect(bundle.arena == null);
+    try std.testing.expectEqualStrings("/repo", state.repo_root.?);
+    try std.testing.expectEqual(@as(usize, 1), state.document.entries.len);
+    try std.testing.expectEqualStrings("src/new.zig", state.document.entries[0].path);
+
+    state.clear();
+    try std.testing.expect(state.repo_root == null);
+    try std.testing.expectEqual(@as(usize, 0), state.document.entries.len);
 }
 
 test "parse releases partial entries on malformed input" {

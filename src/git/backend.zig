@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const max_diff_bytes = 16 * 1024 * 1024;
+pub const max_status_bytes = 8 * 1024 * 1024;
 
 pub const LoadError = error{
     StreamTooLong,
@@ -17,6 +18,23 @@ pub const LoadResult = union(enum) {
     failed_static: []const u8,
 
     pub fn deinit(self: LoadResult, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .ok => |bytes| allocator.free(bytes),
+            .failed => |message| allocator.free(message),
+            .failed_static => {},
+        }
+    }
+};
+
+pub const StatusLoadResult = union(enum) {
+    /// Allocated raw porcelain status text. Caller owns and must call `deinit`.
+    ok: []u8,
+    /// Allocated error message from the backend. Caller owns and must call `deinit`.
+    failed: []u8,
+    /// Non-owned fallback error message, used when allocation itself fails.
+    failed_static: []const u8,
+
+    pub fn deinit(self: StatusLoadResult, allocator: std.mem.Allocator) void {
         switch (self) {
             .ok => |bytes| allocator.free(bytes),
             .failed => |message| allocator.free(message),
@@ -48,6 +66,11 @@ pub const GitDiffRequest = struct {
     kind: GitDiffKind,
 };
 
+/// Request for a read-only `git status` snapshot in a concrete repository.
+pub const GitStatusRequest = struct {
+    repo_root: []const u8,
+};
+
 /// Minimal Git command backend boundary.
 ///
 /// The interface starts with diff loading only. Status, stage, commit, and
@@ -56,9 +79,14 @@ pub const GitDiffRequest = struct {
 pub const Backend = struct {
     ptr: *anyopaque,
     load_diff_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, GitDiffRequest) LoadError!LoadResult,
+    load_status_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, GitStatusRequest) LoadError!StatusLoadResult,
 
     pub fn loadDiff(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) LoadError!LoadResult {
         return self.load_diff_fn(self.ptr, allocator, io, request);
+    }
+
+    pub fn loadStatus(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
+        return self.load_status_fn(self.ptr, allocator, io, request);
     }
 };
 
@@ -70,6 +98,7 @@ pub const LocalCommandBackend = struct {
         return .{
             .ptr = self,
             .load_diff_fn = loadDiffErased,
+            .load_status_fn = loadStatusErased,
         };
     }
 
@@ -82,9 +111,18 @@ pub const LocalCommandBackend = struct {
         };
     }
 
+    pub fn loadStatus(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
+        return loadGitStatus(allocator, io, request.repo_root);
+    }
+
     fn loadDiffErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) LoadError!LoadResult {
         const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
         return self.loadDiff(allocator, io, request);
+    }
+
+    fn loadStatusErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
+        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
+        return self.loadStatus(allocator, io, request);
     }
 };
 
@@ -126,6 +164,34 @@ fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, 
 fn loadGitDiffRange(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, range: []const u8) LoadError!LoadResult {
     const argv = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", range };
     return loadGitDiff(allocator, io, repo_root, &argv);
+}
+
+fn loadGitStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!StatusLoadResult {
+    const argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
+    const result = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .cwd = .{ .path = repo_root },
+        .stdout_limit = .limited(max_status_bytes),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.StreamTooLong,
+        else => error.SpawnFailed,
+    };
+
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .{ .ok = result.stdout };
+        },
+        else => {},
+    }
+
+    allocator.free(result.stdout);
+    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    allocator.free(result.stderr);
+
+    return .{ .failed = std.fmt.allocPrint(allocator, "git status failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
 fn loadNoIndexDiff(allocator: std.mem.Allocator, io: std.Io, paths: PathPair) LoadError!LoadResult {
@@ -176,6 +242,13 @@ fn isNoIndexSuccess(term: std.process.Child.Term, stdout_len: usize) bool {
 }
 
 test "LocalCommandBackend exposes backend interface" {
+    var local_backend: LocalCommandBackend = .{};
+    const backend = local_backend.backend();
+
+    try std.testing.expect(backend.ptr == @as(*anyopaque, @ptrCast(&local_backend)));
+}
+
+test "Backend exposes status load interface" {
     var local_backend: LocalCommandBackend = .{};
     const backend = local_backend.backend();
 

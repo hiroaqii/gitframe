@@ -3,6 +3,8 @@ const diff_parser = @import("../diff/parser.zig");
 const diff_source = @import("../diff/source.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
+const git_backend = @import("../git/backend.zig");
+const git_status = @import("../git/status.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const repo_discovery = @import("../repo/discovery.zig");
 
@@ -19,6 +21,18 @@ pub const DiffLoadFinished = struct {
 pub const RepoDiscoveryFinished = struct {
     generation: u64,
     result: RepoDiscoveryTaskResult,
+};
+
+/// Result payload sent from the asynchronous status load task.
+pub const StatusLoadFinished = struct {
+    generation: u64,
+    repo_root: []u8,
+    result: StatusLoadTaskResult,
+
+    pub fn deinit(self: *StatusLoadFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        self.result.deinit(allocator);
+    }
 };
 
 pub const RepoDiscoveryTaskResult = union(enum) {
@@ -44,6 +58,22 @@ pub const DiffLoadTaskResult = union(enum) {
     failed_static: []const u8,
 
     pub fn deinit(self: *DiffLoadTaskResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .empty, .failed_static => {},
+            .loaded => |*bundle| bundle.deinit(),
+            .failed => |message| allocator.free(message),
+        }
+        self.* = .empty;
+    }
+};
+
+pub const StatusLoadTaskResult = union(enum) {
+    empty,
+    loaded: git_status.StatusBundle,
+    failed: []u8,
+    failed_static: []const u8,
+
+    pub fn deinit(self: *StatusLoadTaskResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .empty, .failed_static => {},
             .loaded => |*bundle| bundle.deinit(),
@@ -122,6 +152,51 @@ pub fn DiffLoadTask(comptime Msg: type) type {
             });
         }
     };
+}
+
+pub fn StatusLoadTask(comptime Msg: type) type {
+    return struct {
+        repo_root: []u8,
+        generation: u64,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+
+            const result = StatusLoadFinished{
+                .generation = task.generation,
+                .repo_root = task.repo_root,
+                .result = runStatusLoad(task.repo_root, allocator, io),
+            };
+            task.repo_root = &.{};
+
+            return @unionInit(Msg, "status_loaded", result);
+        }
+    };
+}
+
+pub fn runStatusLoad(repo_root: []const u8, allocator: std.mem.Allocator, io: std.Io) StatusLoadTaskResult {
+    var local_backend: git_backend.LocalCommandBackend = .{};
+    const raw_result = local_backend.backend().loadStatus(allocator, io, .{ .repo_root = repo_root }) catch |err| {
+        return .{
+            .failed = std.fmt.allocPrint(allocator, "Status load failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Status load failed: OutOfMemory" },
+        };
+    };
+
+    switch (raw_result) {
+        .ok => |bytes| {
+            defer allocator.free(bytes);
+            if (bytes.len == 0) return .empty;
+            const bundle = git_status.StatusBundle.parseOwned(allocator, bytes) catch |err| {
+                return .{ .failed = std.fmt.allocPrint(allocator, "Status parse failed: {s}", .{@errorName(err)}) catch
+                    return .{ .failed_static = "Status parse failed: OutOfMemory" } };
+            };
+            return .{ .loaded = bundle };
+        },
+        .failed => |message| return .{ .failed = message },
+        .failed_static => |message| return .{ .failed_static = message },
+    }
 }
 
 pub fn runLoad(request: LoadRequest, allocator: std.mem.Allocator, io: std.Io) DiffLoadTaskResult {
