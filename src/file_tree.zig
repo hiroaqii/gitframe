@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const context = @import("context.zig");
 const diff_file = @import("diff/file.zig");
 const diff_parser = @import("diff/parser.zig");
 
@@ -20,12 +21,19 @@ pub const Node = struct {
     stats: Stats = .{},
     status: ?Status = null,
     mode_changed: bool = false,
-    file_index: ?usize = null,
+    target: context.SidebarTarget = .{ .directory = "" },
 
     pub const Kind = enum {
         directory,
         file,
     };
+
+    /// Transitional compatibility for diff-only tree consumers.
+    /// TODO(phase8): switch callers to target-aware handling when status rows
+    /// are introduced.
+    pub fn diffFileIndex(self: Node) ?usize {
+        return self.target.diffFileIndex();
+    }
 };
 
 pub const FileTree = struct {
@@ -33,7 +41,7 @@ pub const FileTree = struct {
 
     pub fn selectedNodeIndex(self: FileTree, file_index: usize) ?usize {
         for (self.nodes, 0..) |node, index| {
-            if (node.file_index == file_index) return index;
+            if (node.diffFileIndex() == file_index) return index;
         }
         return null;
     }
@@ -144,7 +152,7 @@ pub fn build(allocator: std.mem.Allocator, document: diff_parser.DiffDocument) !
             .stats = stats,
             .status = diff_file.status(file),
             .mode_changed = diff_file.hasModeChange(file),
-            .file_index = file_index,
+            .target = .{ .diff_file = file_index },
         });
     }
 
@@ -177,6 +185,7 @@ fn ensureDirectoryNodes(
                     .name = path[start..slash],
                     .path = dir_path,
                     .depth = depth,
+                    .target = .{ .directory = dir_path },
                 });
                 const new_index = nodes.items.len - 1;
                 try directory_index.put(allocator, dir_path, new_index);
@@ -280,7 +289,7 @@ test "build creates directory and file nodes with aggregate stats" {
     try std.testing.expectEqualStrings("main.zig", tree.nodes[1].name);
     try std.testing.expectEqual(Status.modified, tree.nodes[1].status.?);
     try std.testing.expect(!tree.nodes[1].mode_changed);
-    try std.testing.expectEqual(@as(?usize, 0), tree.nodes[1].file_index);
+    try std.testing.expectEqual(@as(?usize, 0), tree.nodes[1].diffFileIndex());
     try std.testing.expectEqual(Node.Kind.directory, tree.nodes[2].kind);
     try std.testing.expectEqualStrings("lib", tree.nodes[2].name);
     try std.testing.expectEqual(Node.Kind.file, tree.nodes[3].kind);
@@ -314,7 +323,7 @@ test "build marks file nodes with mode metadata" {
 test "selectedNodeIndex maps file index to tree row" {
     const nodes = [_]Node{
         .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
-        .{ .kind = .file, .name = "main.zig", .path = "src/main.zig", .depth = 1, .file_index = 0 },
+        .{ .kind = .file, .name = "main.zig", .path = "src/main.zig", .depth = 1, .target = .{ .diff_file = 0 } },
     };
     const tree = FileTree{ .nodes = &nodes };
 
@@ -325,9 +334,9 @@ test "selectedNodeIndex maps file index to tree row" {
 test "collapsed directory hides descendants but remains visible" {
     const nodes = [_]Node{
         .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
-        .{ .kind = .file, .name = "main.zig", .path = "src/main.zig", .depth = 1, .file_index = 0 },
+        .{ .kind = .file, .name = "main.zig", .path = "src/main.zig", .depth = 1, .target = .{ .diff_file = 0 } },
         .{ .kind = .directory, .name = "test", .path = "test", .depth = 0 },
-        .{ .kind = .file, .name = "main.zig", .path = "test/main.zig", .depth = 1, .file_index = 1 },
+        .{ .kind = .file, .name = "main.zig", .path = "test/main.zig", .depth = 1, .target = .{ .diff_file = 1 } },
     };
     const tree = FileTree{ .nodes = &nodes };
     var collapsed: CollapsedSet = .empty;
@@ -349,8 +358,8 @@ test "parentDirectoryNodeIndex finds nearest directory ancestor" {
     const nodes = [_]Node{
         .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
         .{ .kind = .directory, .name = "lib", .path = "src/lib", .depth = 1 },
-        .{ .kind = .file, .name = "root.zig", .path = "src/lib/root.zig", .depth = 2, .file_index = 0 },
-        .{ .kind = .file, .name = "README.md", .path = "README.md", .depth = 0, .file_index = 1 },
+        .{ .kind = .file, .name = "root.zig", .path = "src/lib/root.zig", .depth = 2, .target = .{ .diff_file = 0 } },
+        .{ .kind = .file, .name = "README.md", .path = "README.md", .depth = 0, .target = .{ .diff_file = 1 } },
     };
     const tree = FileTree{ .nodes = &nodes };
 

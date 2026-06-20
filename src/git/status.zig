@@ -58,6 +58,14 @@ pub const StatusEntry = struct {
     pub fn isConflict(self: StatusEntry) bool {
         return self.index == .unmerged or self.worktree == .unmerged;
     }
+
+    /// Canonical key for cross-model state.
+    ///
+    /// Porcelain paths are normally repo-relative already, but keep the same
+    /// defensive normalization rules as diff file keys.
+    pub fn canonicalPathKey(self: StatusEntry) ?[]const u8 {
+        return canonicalRepoPath(self.path);
+    }
 };
 
 /// Owns a status document and the arena backing its copied input and entries.
@@ -194,6 +202,25 @@ fn statusCode(byte: u8) StatusCode {
     };
 }
 
+// Keep in sync with diff/file.zig's canonical path normalization. These
+// modules are tested as standalone roots, so the normalization is duplicated
+// until a lower shared module can be introduced without breaking module tests.
+fn canonicalRepoPath(path: []const u8) ?[]const u8 {
+    if (isDevNull(path)) return null;
+    const stripped = stripGitSidePrefix(path);
+    if (isDevNull(stripped) or stripped.len == 0) return null;
+    return stripped;
+}
+
+fn stripGitSidePrefix(path: []const u8) []const u8 {
+    if (path.len >= 2 and (path[0] == 'a' or path[0] == 'b') and path[1] == '/') return path[2..];
+    return path;
+}
+
+fn isDevNull(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/dev/null");
+}
+
 test "parse porcelain v1 z modified entries" {
     const doc = try parse(std.testing.allocator, " M src/main.zig\x00M  build.zig\x00");
     defer std.testing.allocator.free(doc.entries);
@@ -207,6 +234,32 @@ test "parse porcelain v1 z modified entries" {
     try std.testing.expectEqual(StatusCode.modified, doc.entries[1].index);
     try std.testing.expectEqual(StatusCode.unmodified, doc.entries[1].worktree);
     try std.testing.expect(doc.entries[1].isStaged());
+}
+
+test "status entry canonical key normalizes defensive path shapes" {
+    const prefixed: StatusEntry = .{
+        .path = "a/src/main.zig",
+        .raw = .{ ' ', 'M' },
+        .index = .unmodified,
+        .worktree = .modified,
+    };
+    try std.testing.expectEqualStrings("src/main.zig", prefixed.canonicalPathKey().?);
+
+    const dev_null: StatusEntry = .{
+        .path = "/dev/null",
+        .raw = .{ ' ', 'D' },
+        .index = .unmodified,
+        .worktree = .deleted,
+    };
+    try std.testing.expect(dev_null.canonicalPathKey() == null);
+
+    const empty: StatusEntry = .{
+        .path = "",
+        .raw = .{ ' ', 'M' },
+        .index = .unmodified,
+        .worktree = .modified,
+    };
+    try std.testing.expect(empty.canonicalPathKey() == null);
 }
 
 test "parse untracked and ignored entries as worktree status" {

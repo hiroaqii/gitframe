@@ -113,7 +113,7 @@ pub const LoadedDiff = struct {
     }
 
     fn isReviewedFileNode(self: *const LoadedDiff, node_index: usize) bool {
-        const file_index = self.tree.nodes[node_index].file_index orelse return false;
+        const file_index = self.tree.nodes[node_index].diffFileIndex() orelse return false;
         return file_index < self.reviewed_files.len and self.reviewed_files[file_index];
     }
 
@@ -270,7 +270,7 @@ pub const LoadedDiff = struct {
         var visible_index: usize = 0;
         while (visible_index < count) : (visible_index += 1) {
             const node_index = self.visibleNodeAt(visible_index) orelse continue;
-            if (self.tree.nodes[node_index].file_index != null) return node_index;
+            if (self.tree.nodes[node_index].diffFileIndex() != null) return node_index;
         }
         return null;
     }

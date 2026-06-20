@@ -8,6 +8,7 @@ const app_load = @import("app/load.zig");
 const app_prompt = @import("app/prompt.zig");
 const app_state = @import("app/state.zig");
 const app_view = @import("app/view.zig");
+const context = @import("context.zig");
 const diff_parser = @import("diff/parser.zig");
 const diff_file = @import("diff/file.zig");
 const diff_render = @import("diff/render.zig");
@@ -52,10 +53,17 @@ const MousePoint = struct {
 };
 
 const ViewerState = struct {
-    /// Sticky file shown in the diff pane. Directory sidebar rows can be
-    /// selected without changing this value.
+    /// Sticky target shown in the diff pane or used by file actions.
+    ///
+    /// Directory sidebar rows can be selected without changing this value.
+    selected_target: ?context.SelectedTarget = .{ .diff_file = 0 },
+    /// Transitional cache for older tests and helpers. Runtime reads should go
+    /// through selectedFileIndex().
+    /// TODO(phase8): remove after status-only targets replace diff-file-only
+    /// assumptions across the app.
     selected_file: usize = 0,
-    /// Sidebar cursor. This may point at either a directory node or a file node.
+    /// Sidebar cursor. This may point at a directory, diff file, or later a
+    /// status-only row; it is not necessarily the action target.
     selected_node: usize = 0,
     focus: Focus = .sidebar,
     sidebar_hidden: bool = false,
@@ -768,14 +776,14 @@ pub const App = struct {
         const file_count = self.loadedFileCount() orelse return;
         if (file_count == 0) return;
         const target = @min(index, file_count - 1);
-        if (self.viewer.selected_file == target) {
+        if (self.selectedDiffFileTarget() == target) {
             if (self.activeLoadedDiff()) |loaded| {
                 self.syncSidebarNodeToSelectedFile(loaded);
             }
             self.clampSelection(file_count);
             return;
         }
-        self.viewer.selected_file = target;
+        self.setSelectedDiffFile(target);
         if (self.activeLoadedDiff()) |loaded| {
             self.syncSidebarNodeToSelectedFile(loaded);
         }
@@ -793,13 +801,13 @@ pub const App = struct {
 
     fn selectSidebarNode(self: *App, loaded: *LoadedDiff, node_index: usize) void {
         if (node_index >= loaded.tree.nodes.len) return;
-        const previous_file = self.viewer.selected_file;
+        const previous_file = self.selectedDiffFileTarget();
         self.viewer.selected_node = node_index;
         // File rows change the active diff pane file. Directory rows only move
-        // the sidebar cursor and keep the previous file visible.
-        if (loaded.tree.nodes[node_index].file_index) |file_index| {
-            self.viewer.selected_file = file_index;
-            if (self.viewer.selected_file != previous_file) {
+        // the sidebar cursor and keep the previous selected target visible.
+        if (loaded.tree.nodes[node_index].diffFileIndex()) |file_index| {
+            self.setSelectedDiffFile(file_index);
+            if (previous_file == null or file_index != previous_file.?) {
                 self.resetDiffPosition();
                 self.refreshSearchForSelectedFile();
             }
@@ -1091,7 +1099,7 @@ pub const App = struct {
 
         try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root, true);
         self.repo_state.active_index = repo_index;
-        self.viewer.selected_file = 0;
+        self.setSelectedDiffFile(0);
         self.viewer.selected_node = 0;
         self.clearSearch();
     }
@@ -1127,11 +1135,13 @@ pub const App = struct {
         const loaded = self.activeLoadedDiff() orelse return;
         if (self.viewer.selected_node >= loaded.tree.nodes.len) return;
 
-        const node = loaded.tree.nodes[self.viewer.selected_node];
-        const file_index = node.file_index orelse return;
+        const file_index = self.selectedFileIndex(loaded) orelse return;
         if (file_index >= loaded.reviewed_files.len) return;
+        const file = loaded.document.files[file_index];
+        if (self.activeRepoRoot() != null and diff_file.canonicalPathKey(file) == null) return;
+
         const reviewed = !loaded.reviewed_files[file_index];
-        try self.reviewed_store.set(allocator, self.activeRepoRoot(), loaded.document.files[file_index], reviewed);
+        try self.reviewed_store.set(allocator, self.activeRepoRoot(), file, reviewed);
         loaded.reviewed_files[file_index] = reviewed;
         if (self.review_display.hide_reviewed_files) {
             try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, true, self.review_display.changed_file_filter);
@@ -1375,19 +1385,24 @@ pub const App = struct {
 
     fn clampSelection(self: *App, file_count: usize) void {
         if (file_count == 0) {
+            self.viewer.selected_target = null;
             self.viewer.selected_file = 0;
             self.viewer.selected_node = 0;
             return;
         }
-        if (self.viewer.selected_file >= file_count) self.viewer.selected_file = file_count - 1;
+        if (self.selectedDiffFileTarget() == null or self.selectedDiffFileTarget().? >= file_count) {
+            self.setSelectedDiffFile(file_count - 1);
+        }
         if (self.activeLoadedDiff()) |loaded| {
             if (self.viewer.selected_node >= loaded.tree.nodes.len) {
                 self.syncSidebarNodeToSelectedFile(loaded);
             }
             if (loaded.visibleAncestorOrSelf(self.viewer.selected_node)) |visible_node| {
                 self.viewer.selected_node = visible_node;
-            } else if (loaded.tree.selectedNodeIndex(self.viewer.selected_file)) |file_node| {
-                self.viewer.selected_node = file_node;
+            } else if (self.selectedFileIndex(loaded)) |file_index| {
+                if (loaded.tree.selectedNodeIndex(file_index)) |file_node| {
+                    self.viewer.selected_node = file_node;
+                }
             }
         }
     }
@@ -1412,9 +1427,20 @@ pub const App = struct {
         }
     }
 
-    fn selectedFileIndex(self: *const App, loaded: *const LoadedDiff) ?usize {
+    pub fn selectedFileIndex(self: *const App, loaded: *const LoadedDiff) ?usize {
         if (loaded.document.files.len == 0) return null;
-        return @min(self.viewer.selected_file, loaded.document.files.len - 1);
+        const file_index = self.selectedDiffFileTarget() orelse return null;
+        return @min(file_index, loaded.document.files.len - 1);
+    }
+
+    fn selectedDiffFileTarget(self: *const App) ?usize {
+        const target = self.viewer.selected_target orelse return null;
+        return target.diffFileIndex();
+    }
+
+    fn setSelectedDiffFile(self: *App, file_index: usize) void {
+        self.viewer.selected_target = .{ .diff_file = file_index };
+        self.viewer.selected_file = file_index;
     }
 
     fn syncSidebarNodeToSelectedFile(self: *App, loaded: *const LoadedDiff) void {
@@ -2405,7 +2431,7 @@ test "sidebar renders mode change badge next to file status" {
             .name = "script.sh",
             .path = "script.sh",
             .depth = 0,
-            .file_index = 0,
+            .target = .{ .diff_file = 0 },
             .status = .modified,
             .mode_changed = true,
         },
@@ -2486,6 +2512,7 @@ test "changed file filter keeps only matching status rows" {
         .review_display = .{ .changed_file_filter = .added },
         .viewer = .{
             .selected_node = 1,
+            .selected_target = .{ .diff_file = 1 },
             .selected_file = 1,
         },
     };
@@ -2526,6 +2553,7 @@ test "cycling changed file filter rebuilds visible nodes and reconciles selectio
         .load = testLoadStateWithArena(.init(std.testing.allocator), testLoadedDiffTwoWithStatuses()),
         .viewer = .{
             .selected_node = 1,
+            .selected_target = .{ .diff_file = 1 },
             .selected_file = 1,
         },
     };
@@ -2556,7 +2584,7 @@ test "file search skips files outside active changed filter" {
     try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
 }
 
-test "toggleReviewedFile marks only selected file nodes" {
+test "toggleReviewedFile toggles selected diff target" {
     var reviewed = [_]bool{ false, false };
     var app: App = .{
         .load = testLoadState(.{
@@ -2576,17 +2604,74 @@ test "toggleReviewedFile marks only selected file nodes" {
     defer app.reviewed_store.deinit(std.testing.allocator);
 
     try app.toggleReviewedFile(std.testing.allocator);
-    try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
 
     app.viewer.selected_node = 1;
     try app.toggleReviewedFile(std.testing.allocator);
-    try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
+    try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
 
     try app.toggleReviewedFile(std.testing.allocator);
-    try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
 }
 
-test "reviewed state survives active loaded diff replacement" {
+test "toggleReviewedFile uses selected target while cursor is on directory" {
+    var reviewed = [_]bool{ false, false };
+    var app: App = .{
+        .load = testLoadState(.{
+            .text = "",
+            .document = .{ .files = &test_files_two },
+            .tree = .{ .nodes = &test_tree_nested_nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        }),
+        .viewer = .{
+            .selected_node = 0,
+            .selected_target = .{ .diff_file = 1 },
+            .selected_file = 1,
+        },
+    };
+    defer app.reviewed_store.deinit(std.testing.allocator);
+
+    try app.toggleReviewedFile(std.testing.allocator);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, &reviewed);
+}
+
+test "toggleReviewedFile ignores unkeyable files in repository input" {
+    const unkeyable_files = [_]diff_parser.FileDiff{.{
+        .header = "metadata only",
+        .old_path = null,
+        .new_path = null,
+        .metadata = &.{},
+        .hunks = &.{},
+    }};
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .file, .name = "metadata", .path = "metadata", .depth = 0, .target = .{ .diff_file = 0 } },
+    };
+    var reviewed = [_]bool{false};
+    var app: App = .{
+        .load = testLoadState(.{
+            .text = "",
+            .document = .{ .files = &unkeyable_files },
+            .tree = .{ .nodes = &nodes },
+            .reviewed_files = &reviewed,
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        }),
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+
+    try app.toggleReviewedFile(std.testing.allocator);
+    try std.testing.expectEqualSlices(bool, &.{false}, &reviewed);
+}
+
+test "raw reviewed state stays in active load only" {
     var app: App = .{
         .allocator = std.testing.allocator,
         .load = testLoadState(testLoadedDiffTwo()),
@@ -2611,7 +2696,7 @@ test "reviewed state survives active loaded diff replacement" {
     try app.materializeReviewedFiles(std.testing.allocator, loaded);
     app.load.state.loaded.reviewed_files_owned = true;
 
-    try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded.reviewed_files);
+    try std.testing.expectEqualSlices(bool, &.{ false, false }, loaded.reviewed_files);
 }
 
 test "reviewed state is scoped by active repository root" {
@@ -3222,31 +3307,31 @@ fn testLoadedDiffWide() LoadedDiff {
 }
 
 const test_tree_one_nodes = [_]file_tree.Node{
-    .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .file_index = 0 },
+    .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
 };
 
 const test_tree_two_nodes = [_]file_tree.Node{
-    .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .file_index = 0 },
-    .{ .kind = .file, .name = "b", .path = "b", .depth = 0, .file_index = 1 },
+    .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "b", .depth = 0, .target = .{ .diff_file = 1 } },
 };
 
 const test_tree_nested_nodes = [_]file_tree.Node{
     .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
-    .{ .kind = .file, .name = "a", .path = "src/a", .depth = 1, .file_index = 0 },
-    .{ .kind = .file, .name = "b", .path = "src/b", .depth = 1, .file_index = 1 },
+    .{ .kind = .file, .name = "a", .path = "src/a", .depth = 1, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "src/b", .depth = 1, .target = .{ .diff_file = 1 } },
 };
 
 const test_tree_non_contiguous_nodes = [_]file_tree.Node{
     .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
-    .{ .kind = .file, .name = "a", .path = "src/a", .depth = 1, .file_index = 0 },
+    .{ .kind = .file, .name = "a", .path = "src/a", .depth = 1, .target = .{ .diff_file = 0 } },
     .{ .kind = .directory, .name = "lib", .path = "lib", .depth = 0 },
-    .{ .kind = .file, .name = "c", .path = "lib/c", .depth = 1, .file_index = 0 },
-    .{ .kind = .file, .name = "b", .path = "src/b", .depth = 1, .file_index = 1 },
+    .{ .kind = .file, .name = "c", .path = "lib/c", .depth = 1, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "src/b", .depth = 1, .target = .{ .diff_file = 1 } },
 };
 
 const test_tree_two_status_nodes = [_]file_tree.Node{
-    .{ .kind = .file, .name = "added.zig", .path = "src/added.zig", .depth = 1, .file_index = 0, .status = .added },
-    .{ .kind = .file, .name = "deleted.zig", .path = "src/deleted.zig", .depth = 1, .file_index = 1, .status = .deleted },
+    .{ .kind = .file, .name = "added.zig", .path = "src/added.zig", .depth = 1, .target = .{ .diff_file = 0 }, .status = .added },
+    .{ .kind = .file, .name = "deleted.zig", .path = "src/deleted.zig", .depth = 1, .target = .{ .diff_file = 1 }, .status = .deleted },
 };
 
 const test_files_one = [_]diff_parser.FileDiff{

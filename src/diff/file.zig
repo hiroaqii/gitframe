@@ -35,6 +35,21 @@ pub fn displayPath(file: diff_parser.FileDiff) []const u8 {
     return file.header;
 }
 
+/// Canonical key for cross-model state such as reviewed files.
+///
+/// New-side paths win for normal/rename/copy diffs. Deleted files fall back to
+/// the old path. Metadata-only renames use `rename to`/`copy to` when no path
+/// headers are present.
+pub fn canonicalPathKey(file: diff_parser.FileDiff) ?[]const u8 {
+    if (file.new_path) |path| {
+        if (canonicalRepoPath(path)) |key| return key;
+    }
+    if (metadataPath(file, "rename to ")) |path| return canonicalRepoPath(path);
+    if (metadataPath(file, "copy to ")) |path| return canonicalRepoPath(path);
+    if (file.old_path) |path| return canonicalRepoPath(path);
+    return null;
+}
+
 pub fn editorPath(file: diff_parser.FileDiff) ?[]const u8 {
     const path = file.new_path orelse return null;
     if (isDevNull(path)) return null;
@@ -96,18 +111,34 @@ fn hasNonRegularFileMode(line: []const u8, prefix: []const u8) bool {
 }
 
 pub fn stripGitPathPrefix(path: []const u8) []const u8 {
-    if (path.len == 0) return path;
     if (isDevNull(path)) return path;
-    if (startsWithGitSidePrefix(path)) return path[2..];
-    return path;
+    return stripGitSidePrefix(path);
 }
 
-fn startsWithGitSidePrefix(path: []const u8) bool {
-    return (path.len >= 2 and (path[0] == 'a' or path[0] == 'b') and path[1] == '/');
+fn canonicalRepoPath(path: []const u8) ?[]const u8 {
+    if (isDevNull(path)) return null;
+    const stripped = stripGitSidePrefix(path);
+    if (isDevNull(stripped) or stripped.len == 0) return null;
+    return stripped;
+}
+
+// Keep in sync with git/status.zig's status key normalization. These modules
+// are tested as standalone roots, so the normalization is duplicated until a
+// lower shared module can be introduced without breaking module tests.
+fn stripGitSidePrefix(path: []const u8) []const u8 {
+    if (path.len >= 2 and (path[0] == 'a' or path[0] == 'b') and path[1] == '/') return path[2..];
+    return path;
 }
 
 fn isDevNull(path: []const u8) bool {
     return std.mem.eql(u8, path, "/dev/null");
+}
+
+fn metadataPath(file: diff_parser.FileDiff, prefix: []const u8) ?[]const u8 {
+    for (file.metadata) |line| {
+        if (std.mem.startsWith(u8, line, prefix)) return line[prefix.len..];
+    }
+    return null;
 }
 
 test "stripGitPathPrefix keeps dev null" {
@@ -141,6 +172,40 @@ test "editorPath opens the new side only" {
         .metadata = &.{},
         .hunks = &.{},
     }) == null);
+}
+
+test "canonicalPathKey prefers new path and normalizes deleted paths" {
+    try std.testing.expectEqualStrings("src/new.zig", canonicalPathKey(.{
+        .header = "diff --git a/src/old.zig b/src/new.zig",
+        .old_path = "a/src/old.zig",
+        .new_path = "b/src/new.zig",
+        .metadata = &.{ "rename from src/old.zig", "rename to src/new.zig" },
+        .hunks = &.{},
+    }).?);
+    try std.testing.expectEqualStrings("src/deleted.zig", canonicalPathKey(.{
+        .header = "diff --git a/src/deleted.zig b/src/deleted.zig",
+        .old_path = "a/src/deleted.zig",
+        .new_path = null,
+        .metadata = &.{},
+        .hunks = &.{},
+    }).?);
+    try std.testing.expect(canonicalPathKey(.{
+        .header = "diff --git a/missing b/missing",
+        .old_path = null,
+        .new_path = "/dev/null",
+        .metadata = &.{},
+        .hunks = &.{},
+    }) == null);
+}
+
+test "canonicalPathKey uses metadata-only rename target" {
+    try std.testing.expectEqualStrings("src/new.zig", canonicalPathKey(.{
+        .header = "diff --git a/src/old.zig b/src/new.zig",
+        .old_path = null,
+        .new_path = null,
+        .metadata = &.{ "rename from src/old.zig", "rename to src/new.zig" },
+        .hunks = &.{},
+    }).?);
 }
 
 test "displayPath keeps non git-side prefixes" {

@@ -1,4 +1,5 @@
 const app = @import("app.zig");
+pub const context = @import("context.zig");
 const diff_source = @import("diff/source.zig");
 
 pub const App = app.App;
@@ -20,6 +21,7 @@ test {
     _ = @import("app/prompt.zig");
     _ = @import("app/state.zig");
     _ = @import("app/view.zig");
+    _ = @import("context.zig");
     _ = @import("draw");
     _ = @import("editor.zig");
     _ = @import("git/backend.zig");

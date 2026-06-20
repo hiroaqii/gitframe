@@ -301,7 +301,7 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         return;
     }
 
-    const selected = @min(app.viewer.selected_file, loaded.document.files.len - 1);
+    const selected = app.selectedFileIndex(&loaded) orelse 0;
     const file = loaded.document.files[selected];
     var diff_content = diffContentSurface(surface);
     const mode = diff_render.effectiveMode(diff_content.size().width, app.viewer.display_mode);

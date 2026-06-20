@@ -59,9 +59,10 @@ pub fn rowForNode(
         .stats = node.stats,
         .status = node.status,
         .mode_changed = node.mode_changed,
-        .reviewed = node.file_index != null and
-            node.file_index.? < reviewed_files.len and
-            reviewed_files[node.file_index.?],
+        .reviewed = if (node.diffFileIndex()) |file_index|
+            file_index < reviewed_files.len and reviewed_files[file_index]
+        else
+            false,
         .fold = fold,
     };
 }
@@ -150,7 +151,7 @@ test "rowForNode exposes sidebar row semantics" {
             .stats = .{ .added = 3, .removed = 1 },
             .status = .modified,
             .mode_changed = true,
-            .file_index = 0,
+            .target = .{ .diff_file = 0 },
         },
     };
 
@@ -174,7 +175,7 @@ test "layout keeps sidebar columns in one place" {
             .depth = 1,
             .stats = .{ .added = 12, .removed = 4 },
             .status = .added,
-            .file_index = 0,
+            .target = .{ .diff_file = 0 },
         },
     };
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
@@ -203,7 +204,7 @@ test "layout reserves a mode badge column for mode-changed file rows" {
             .stats = .{},
             .status = .modified,
             .mode_changed = true,
-            .file_index = 0,
+            .target = .{ .diff_file = 0 },
         },
     };
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
@@ -224,7 +225,7 @@ test "layout reserves reviewed gutter for status-less file rows" {
             .path = "main.zig",
             .depth = 0,
             .stats = .{ .added = 1, .removed = 0 },
-            .file_index = 0,
+            .target = .{ .diff_file = 0 },
         },
     };
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
@@ -250,7 +251,7 @@ test "layout omits zero line stats" {
             .depth = 0,
             .stats = .{},
             .status = .binary,
-            .file_index = 0,
+            .target = .{ .diff_file = 0 },
         },
     };
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
@@ -271,7 +272,7 @@ test "layout prioritizes file name over stats in narrow sidebars" {
             .depth = 0,
             .stats = .{ .added = 68, .removed = 3 },
             .status = .modified,
-            .file_index = 0,
+            .target = .{ .diff_file = 0 },
         },
     };
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
