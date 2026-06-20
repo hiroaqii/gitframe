@@ -3,6 +3,7 @@ const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const draw = @import("draw");
 const diff_render = @import("../diff/render.zig");
+const git_status = @import("../git/status.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const file_tree = @import("../file_tree.zig");
 const sidebar_view_model = @import("../sidebar/view_model.zig");
@@ -296,6 +297,11 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
+    if (app.selectedStatusEntry()) |entry| {
+        try viewStatusOnlyPane(app, surface, entry);
+        return;
+    }
+
     if (loaded.document.files.len == 0) {
         _ = surface.borrowTextAt(0, 0, "No parsed files.", .{ .fg = .gray });
         return;
@@ -342,6 +348,41 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         .folded_hunks = loaded.foldedHunksForFile(selected),
     });
     drawSearchMatchMarker(app, surface);
+}
+
+fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.StatusEntry) !void {
+    const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
+    const style = paneStatusStyle(active);
+    const title = try std.fmt.allocPrint(surface.frameAllocator(), "{s} status-only file", .{paneTitleText("Status", active)});
+    try draw.copyClippedTextAt(surface, 0, 2, title, style);
+
+    var content = diffContentSurface(surface);
+    const path = entry.canonicalPathKey() orelse entry.path;
+    try draw.copyClippedTextAt(&content, 0, 0, path, .{ .bold = true, .fg = .{ .index = 11 }, .dim = !active });
+    const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "status: {s}{s}", .{ statusName(entry.index), statusSuffix(entry) });
+    try draw.copyClippedTextAt(&content, 0, 2, status_text, .{ .fg = .gray, .dim = !active });
+    try draw.copyClippedTextAt(&content, 0, 4, "No diff is available for this file yet.", .{ .fg = .gray, .dim = !active });
+    try draw.copyClippedTextAt(&content, 0, 5, "Use the upcoming stage action to add it to Git.", .{ .fg = .gray, .dim = !active });
+}
+
+fn statusName(status: git_status.StatusCode) []const u8 {
+    return switch (status) {
+        .unmodified => "unmodified",
+        .modified => "modified",
+        .added => "added",
+        .deleted => "deleted",
+        .renamed => "renamed",
+        .copied => "copied",
+        .untracked => "untracked",
+        .ignored => "ignored",
+        .unmerged => "unmerged",
+        .unknown => "unknown",
+    };
+}
+
+fn statusSuffix(entry: git_status.StatusEntry) []const u8 {
+    if (entry.isConflict()) return " (conflict)";
+    return "";
 }
 
 fn horizontalScrollStatus(surface: *chasen.Surface, offset: usize) []const u8 {

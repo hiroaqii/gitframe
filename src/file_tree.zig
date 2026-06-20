@@ -3,6 +3,7 @@ const std = @import("std");
 const context = @import("context.zig");
 const diff_file = @import("diff/file.zig");
 const diff_parser = @import("diff/parser.zig");
+const git_status = @import("git/status.zig");
 
 pub const CollapsedSet = std.StringHashMapUnmanaged(void);
 
@@ -12,6 +13,7 @@ pub const Status = diff_file.Status;
 // Build-only dedup index. Keys borrow path slices owned by the parsed diff
 // arena and are not stored in the returned FileTree model.
 const DirectoryIndex = std.StringHashMapUnmanaged(usize);
+const PathKeySet = std.StringHashMapUnmanaged(void);
 
 pub const Node = struct {
     kind: Kind,
@@ -133,15 +135,23 @@ pub const FileTree = struct {
 };
 
 pub fn build(allocator: std.mem.Allocator, document: diff_parser.DiffDocument) !FileTree {
+    return buildWithStatus(allocator, document, null);
+}
+
+pub fn buildWithStatus(allocator: std.mem.Allocator, document: diff_parser.DiffDocument, status_document: ?git_status.StatusDocument) !FileTree {
     var nodes: std.ArrayList(Node) = .empty;
     errdefer nodes.deinit(allocator);
 
     var directory_index: DirectoryIndex = .empty;
     defer directory_index.deinit(allocator);
 
+    var diff_keys: PathKeySet = .empty;
+    defer diff_keys.deinit(allocator);
+
     for (document.files, 0..) |file, file_index| {
         const path = displayPath(file);
         const stats = fileStats(file);
+        if (diff_file.canonicalPathKey(file)) |key| try diff_keys.put(allocator, key, {});
 
         try ensureDirectoryNodes(allocator, &nodes, &directory_index, path, stats);
         try nodes.append(allocator, .{
@@ -154,6 +164,28 @@ pub fn build(allocator: std.mem.Allocator, document: diff_parser.DiffDocument) !
             .mode_changed = diff_file.hasModeChange(file),
             .target = .{ .diff_file = file_index },
         });
+    }
+
+    if (status_document) |doc| {
+        for (doc.entries, 0..) |entry, status_index| {
+            if (entry.isIgnored()) continue;
+            const key = entry.canonicalPathKey() orelse continue;
+            if (diff_keys.contains(key)) continue;
+
+            // Status entries are owned by GitStatusState, while the tree can be
+            // rebuilt in the loaded-diff arena. Copy status-only paths into the
+            // tree arena so a later status reload cannot leave dangling rows.
+            const path = try allocator.dupe(u8, key);
+            try ensureDirectoryNodes(allocator, &nodes, &directory_index, path, .{});
+            try nodes.append(allocator, .{
+                .kind = .file,
+                .name = baseName(path),
+                .path = path,
+                .depth = pathDepth(path),
+                .status = statusFromEntry(entry),
+                .target = .{ .status_entry = status_index },
+            });
+        }
     }
 
     return .{ .nodes = try nodes.toOwnedSlice(allocator) };
@@ -211,6 +243,35 @@ fn pathDepth(path: []const u8) u16 {
         if (byte == '/') depth += 1;
     }
     return depth;
+}
+
+fn statusFromEntry(entry: git_status.StatusEntry) ?Status {
+    if (entry.isUntracked()) return .added;
+    if (entry.index == .renamed or entry.index == .copied or entry.worktree == .renamed or entry.worktree == .copied) return .renamed;
+    if (entry.index == .deleted or entry.worktree == .deleted) return .deleted;
+    if (entry.index == .added or entry.worktree == .added) return .added;
+    if (entry.index == .modified or entry.worktree == .modified or entry.isConflict()) return .modified;
+    return null;
+}
+
+pub fn statusOnlyEntryCount(document: git_status.StatusDocument, diff_document: diff_parser.DiffDocument) usize {
+    var count: usize = 0;
+    for (document.entries) |entry| {
+        if (entry.isIgnored()) continue;
+        const key = entry.canonicalPathKey() orelse continue;
+        if (diffDocumentHasKey(diff_document, key)) continue;
+        count += 1;
+    }
+    return count;
+}
+
+fn diffDocumentHasKey(document: diff_parser.DiffDocument, key: []const u8) bool {
+    for (document.files) |file| {
+        if (diff_file.canonicalPathKey(file)) |diff_key| {
+            if (std.mem.eql(u8, diff_key, key)) return true;
+        }
+    }
+    return false;
 }
 
 pub fn isCollapsed(collapsed: *const CollapsedSet, path: []const u8) bool {
@@ -294,6 +355,56 @@ test "build creates directory and file nodes with aggregate stats" {
     try std.testing.expectEqualStrings("lib", tree.nodes[2].name);
     try std.testing.expectEqual(Node.Kind.file, tree.nodes[3].kind);
     try std.testing.expectEqualStrings("root.zig", tree.nodes[3].name);
+}
+
+test "buildWithStatus adds untracked status-only rows" {
+    const diff_text =
+        \\diff --git a/src/main.zig b/src/main.zig
+        \\--- a/src/main.zig
+        \\+++ b/src/main.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const document = try diff_parser.parse(allocator, diff_text);
+    const status_document = try git_status.parse(allocator, "?? src/new.zig\x00");
+    const tree = try buildWithStatus(allocator, document, status_document);
+
+    try std.testing.expectEqual(@as(usize, 3), tree.nodes.len);
+    try std.testing.expectEqualStrings("main.zig", tree.nodes[1].name);
+    try std.testing.expectEqual(@as(?usize, 0), tree.nodes[1].diffFileIndex());
+    try std.testing.expectEqualStrings("new.zig", tree.nodes[2].name);
+    try std.testing.expectEqual(Status.added, tree.nodes[2].status.?);
+    try std.testing.expect(tree.nodes[2].target == .status_entry);
+    try std.testing.expectEqual(@as(usize, 0), tree.nodes[2].target.status_entry);
+}
+
+test "buildWithStatus skips rows already present in diff" {
+    const diff_text =
+        \\diff --git a/src/main.zig b/src/main.zig
+        \\--- a/src/main.zig
+        \\+++ b/src/main.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const document = try diff_parser.parse(allocator, diff_text);
+    const status_document = try git_status.parse(allocator, " M src/main.zig\x00!! ignored.tmp\x00");
+    const tree = try buildWithStatus(allocator, document, status_document);
+
+    try std.testing.expectEqual(@as(usize, 2), tree.nodes.len);
+    try std.testing.expectEqualStrings("main.zig", tree.nodes[1].name);
+    try std.testing.expectEqual(@as(?usize, 0), tree.nodes[1].diffFileIndex());
 }
 
 test "build marks file nodes with mode metadata" {

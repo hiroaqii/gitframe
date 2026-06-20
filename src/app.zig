@@ -795,6 +795,7 @@ pub const App = struct {
 
         var result = finished.result;
         defer result.deinit(ctx.allocator());
+        var can_project_status = false;
 
         // Multiple reloads can be in flight. Only the newest generation is
         // allowed to update visible state.
@@ -804,7 +805,10 @@ pub const App = struct {
         self.clearLoadedDiff();
 
         switch (result) {
-            .empty => self.load.replaceEmpty(ctx.allocator(), .no_changes),
+            .empty => {
+                self.load.replaceEmpty(ctx.allocator(), .no_changes);
+                can_project_status = true;
+            },
             .loaded => |*bundle| {
                 var loaded = bundle.loaded;
                 var arena = bundle.takeArena();
@@ -834,6 +838,7 @@ pub const App = struct {
                 }
                 self.clampDiffNavigation();
                 self.refreshSearchForSelectedFile();
+                can_project_status = true;
             },
             .failed => |message| {
                 try self.storeFailedMessage(ctx.allocator(), std.mem.trim(u8, message, " \t\r\n"));
@@ -842,6 +847,11 @@ pub const App = struct {
                 try self.storeFailedMessage(ctx.allocator(), message);
             },
         }
+
+        // Diff and status loads run independently. Re-apply the status overlay
+        // here so the final sidebar does not depend on which task finished
+        // first.
+        if (can_project_status) try self.applyStatusProjection(ctx.allocator());
     }
 
     fn finishStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: StatusLoadFinished) !void {
@@ -855,6 +865,7 @@ pub const App = struct {
             .loaded => |*bundle| {
                 try self.git_status.replace(result.repo_root, bundle);
                 result.result = .empty;
+                try self.applyStatusProjection(ctx.allocator());
             },
             .failed => |message| {
                 self.git_status.clear();
@@ -864,6 +875,67 @@ pub const App = struct {
                 self.git_status.clear();
                 self.setStatus("status load failed: {s}", .{message});
             },
+        }
+    }
+
+    fn applyStatusProjection(self: *App, allocator: std.mem.Allocator) !void {
+        const status_document = self.git_status.document;
+        if (status_document.entries.len == 0) return;
+
+        if (self.activeLoadedDiff()) |loaded| {
+            try self.rebuildLoadedTreeWithStatus(loaded);
+            return;
+        }
+
+        switch (self.load.state) {
+            .empty => |reason| if (reason == .no_changes and
+                file_tree.statusOnlyEntryCount(status_document, .{ .files = &.{} }) > 0)
+            {
+                try self.createStatusOnlyLoadedSession(allocator, status_document);
+            },
+            else => {},
+        }
+    }
+
+    fn rebuildLoadedTreeWithStatus(self: *App, loaded: *LoadedDiff) !void {
+        const allocator = self.loadArenaAllocator() orelse return;
+        loaded.tree = try file_tree.buildWithStatus(allocator, loaded.document, self.git_status.document);
+        try loaded.rebuildVisibleNodes(allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
+        self.reconcileSelectionAfterVisibleNodeChange(loaded);
+    }
+
+    fn createStatusOnlyLoadedSession(self: *App, allocator: std.mem.Allocator, status_document: git_status.StatusDocument) !void {
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        errdefer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        const document = diff_parser.DiffDocument{ .files = &.{} };
+        var loaded: LoadedDiff = .{
+            .text = "",
+            .document = document,
+            .tree = try file_tree.buildWithStatus(arena_allocator, document, status_document),
+            .rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document),
+            .collapsed_hunks = &.{},
+            .collapsed_dirs = .empty,
+            .bytes = 0,
+            .lines = 0,
+        };
+        try loaded.rebuildVisibleNodes(arena_allocator, false, self.review_display.changed_file_filter);
+
+        self.load.replaceLoaded(allocator, .{
+            .arena = arena,
+            .loaded = loaded,
+            .reviewed_files_owned = false,
+        });
+
+        const active_loaded = self.activeLoadedDiff().?;
+        var visible_index: usize = 0;
+        while (visible_index < active_loaded.visibleNodeCount()) : (visible_index += 1) {
+            const node_index = active_loaded.visibleNodeAt(visible_index) orelse continue;
+            if (active_loaded.tree.nodes[node_index].target == .directory) continue;
+            self.viewer.selected_node = node_index;
+            self.selectSidebarNode(active_loaded, node_index);
+            break;
         }
     }
 
@@ -927,12 +999,20 @@ pub const App = struct {
         self.viewer.selected_node = node_index;
         // File rows change the active diff pane file. Directory rows only move
         // the sidebar cursor and keep the previous selected target visible.
-        if (loaded.tree.nodes[node_index].diffFileIndex()) |file_index| {
-            self.setSelectedDiffFile(file_index);
-            if (previous_file == null or file_index != previous_file.?) {
+        switch (loaded.tree.nodes[node_index].target) {
+            .diff_file => |file_index| {
+                self.setSelectedDiffFile(file_index);
+                if (previous_file == null or file_index != previous_file.?) {
+                    self.resetDiffPosition();
+                    self.refreshSearchForSelectedFile();
+                }
+            },
+            .status_entry => |status_index| {
+                self.viewer.selected_target = .{ .status_only = status_index };
                 self.resetDiffPosition();
-                self.refreshSearchForSelectedFile();
-            }
+                self.clearSearchMatch();
+            },
+            .directory => {},
         }
     }
 
@@ -1447,7 +1527,7 @@ pub const App = struct {
         const target = self.viewer.selected_target orelse return null;
         return switch (target) {
             .diff_file => |file_index| self.diffFileSelection(loaded, file_index),
-            .status_only => |status_index| .{ .status_only = .{ .status_index = status_index } },
+            .status_only => |status_index| self.statusOnlySelection(status_index),
         };
     }
 
@@ -1460,6 +1540,27 @@ pub const App = struct {
             .path_key = diff_file.canonicalPathKey(file),
             .hunk_index = if (self.viewer.selected_hunk < file.hunks.len) self.viewer.selected_hunk else null,
         } };
+    }
+
+    fn statusOnlySelection(self: *const App, status_index: usize) ?context.Selection {
+        if (status_index >= self.git_status.document.entries.len) {
+            return .{ .status_only = .{ .status_index = status_index } };
+        }
+        const entry = self.git_status.document.entries[status_index];
+        return .{ .status_only = .{
+            .status_index = status_index,
+            .path_key = entry.canonicalPathKey(),
+        } };
+    }
+
+    pub fn selectedStatusEntry(self: *const App) ?git_status.StatusEntry {
+        const target = self.viewer.selected_target orelse return null;
+        const status_index = switch (target) {
+            .status_only => |index| index,
+            else => return null,
+        };
+        if (status_index >= self.git_status.document.entries.len) return null;
+        return self.git_status.document.entries[status_index];
     }
 
     fn selectedFile(self: *const App) ?diff_parser.FileDiff {
@@ -1557,6 +1658,18 @@ pub const App = struct {
 
     fn clampSelection(self: *App, file_count: usize) void {
         if (file_count == 0) {
+            if (self.activeLoadedDiff()) |loaded| {
+                if (loaded.tree.nodes.len > 0) {
+                    self.viewer.selected_node = @min(self.viewer.selected_node, loaded.tree.nodes.len - 1);
+                    const node = loaded.tree.nodes[self.viewer.selected_node];
+                    self.viewer.selected_target = switch (node.target) {
+                        .status_entry => |status_index| .{ .status_only = status_index },
+                        .diff_file => |file_index| .{ .diff_file = file_index },
+                        .directory => self.viewer.selected_target,
+                    };
+                    return;
+                }
+            }
             self.viewer.selected_target = null;
             self.viewer.selected_file = 0;
             self.viewer.selected_node = 0;
@@ -3420,6 +3533,28 @@ test "finishDiffLoad records empty diff as no changes" {
     try std.testing.expect(app.load.state == .empty);
     try std.testing.expectEqual(EmptyReason.no_changes, app.load.state.empty);
     try std.testing.expectEqual(@as(u64, 1), app.load.generation);
+}
+
+test "finishDiffLoad projects earlier status snapshot into empty diff" {
+    var app: App = .{ .load = .{ .generation = 1 } };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.git_status.replace("/tmp/repo", &status_bundle);
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 1,
+        .result = .empty,
+    });
+
+    const loaded = app.loadedDiff().?;
+    try std.testing.expectEqual(@as(usize, 0), loaded.document.files.len);
+    try std.testing.expectEqual(@as(usize, 2), loaded.tree.nodes.len);
+    try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(usize, 0), loaded.tree.nodes[1].target.status_entry);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target);
 }
 
 test "finishRepoDiscovery records no repository as empty state" {
