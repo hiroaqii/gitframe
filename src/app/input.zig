@@ -21,6 +21,7 @@ pub const KeyContext = struct {
     search_mode: bool = false,
     file_search_mode: bool = false,
     repo_picker_mode: bool = false,
+    repo_picker_path_input: bool = false,
     help_mode: bool = false,
     search_query_len: usize = 0,
     focus: Focus = .sidebar,
@@ -59,6 +60,11 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_repo_picker");
         if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "submit_repo_picker");
         if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "repo_picker_backspace");
+        if (context.repo_picker_path_input) {
+            if (isTextInputCodepoint(key.codepoint)) return payloadMsg(Msg, "repo_picker_insert", key.codepoint);
+            return null;
+        }
+        if (isColonKey(key)) return voidMsg(Msg, "repo_picker_enter_path_input");
         return switch (key.codepoint) {
             'k', chasen.Key.up => voidMsg(Msg, "repo_picker_move_previous"),
             'j', chasen.Key.down => voidMsg(Msg, "repo_picker_move_next"),
@@ -133,6 +139,10 @@ fn isHelpKey(key: chasen.Key) bool {
     return key.matches('?', .{});
 }
 
+fn isColonKey(key: chasen.Key) bool {
+    return key.matches(':', .{}) or (key.codepoint == ';' and key.mods.shift);
+}
+
 /// Match an ASCII Shift-letter command across terminals that report either
 /// uppercase codepoints or lowercase codepoints with the shift modifier set.
 fn matchesShiftedAscii(key: chasen.Key, lower: u21, upper: u21) bool {
@@ -164,6 +174,7 @@ const TestMsg = union(enum) {
     cancel_repo_picker,
     submit_repo_picker,
     repo_picker_backspace,
+    repo_picker_enter_path_input,
     repo_picker_move_previous,
     repo_picker_move_next,
     repo_picker_insert: u21,
@@ -255,6 +266,14 @@ test "keyToMsg maps view option toggles" {
 
 test "keyToMsg maps stage file action" {
     try std.testing.expectEqual(TestMsg.stage_selected_file, keyToMsg(TestMsg, .{}, .{ .codepoint = 's' }).?);
+}
+
+test "keyToMsg maps repo picker path input command across shifted colon variants" {
+    const context: KeyContext = .{ .repo_picker_mode = true };
+    try std.testing.expectEqual(TestMsg.repo_picker_enter_path_input, keyToMsg(TestMsg, context, .{ .codepoint = ':' }).?);
+    try std.testing.expectEqual(TestMsg.repo_picker_enter_path_input, keyToMsg(TestMsg, context, shiftedAscii(';', ':')).?);
+    try std.testing.expectEqual(TestMsg.repo_picker_enter_path_input, keyToMsg(TestMsg, context, shiftedLowerOnly(';')).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ';' }, keyToMsg(TestMsg, context, .{ .codepoint = ';' }).?);
 }
 
 test "keyToMsg uses search query to disambiguate navigation" {

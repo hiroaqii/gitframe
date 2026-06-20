@@ -23,6 +23,19 @@ pub const RepoDiscoveryFinished = struct {
     result: RepoDiscoveryTaskResult,
 };
 
+/// Result payload sent from repository picker path discovery.
+pub const RepoPathDiscoveryFinished = struct {
+    generation: u64,
+    submitted_path: []u8,
+    result: RepoPathDiscoveryTaskResult,
+
+    pub fn deinit(self: *RepoPathDiscoveryFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.submitted_path);
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 /// Result payload sent from the asynchronous status load task.
 pub const StatusLoadFinished = struct {
     generation: u64,
@@ -44,6 +57,23 @@ pub const RepoDiscoveryTaskResult = union(enum) {
     pub fn deinit(self: *RepoDiscoveryTaskResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .empty, .failed_static => {},
+            .discovered => |*discovery| discovery.deinit(allocator),
+            .failed => |message| allocator.free(message),
+        }
+        self.* = .empty;
+    }
+};
+
+pub const RepoPathDiscoveryTaskResult = union(enum) {
+    empty,
+    discovered: repo_discovery.DiscoveryResult,
+    input_error: repo_discovery.PathDiscoveryError,
+    failed: []u8,
+    failed_static: []const u8,
+
+    pub fn deinit(self: *RepoPathDiscoveryTaskResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .empty, .input_error, .failed_static => {},
             .discovered => |*discovery| discovery.deinit(allocator),
             .failed => |message| allocator.free(message),
         }
@@ -129,6 +159,44 @@ pub fn runDiscovery(allocator: std.mem.Allocator, io: std.Io) RepoDiscoveryTaskR
         return .{
             .failed = std.fmt.allocPrint(allocator, "Repo discovery failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Repo discovery failed: OutOfMemory" },
+        };
+    };
+    return .{ .discovered = result };
+}
+
+pub fn RepoPathDiscoveryTask(comptime Msg: type) type {
+    return struct {
+        path: []u8,
+        generation: u64,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+
+            const submitted_path = task.path;
+            task.path = &.{};
+
+            return @unionInit(Msg, "repo_path_discovered", RepoPathDiscoveryFinished{
+                .generation = task.generation,
+                .submitted_path = submitted_path,
+                .result = runPathDiscovery(submitted_path, allocator, io),
+            });
+        }
+    };
+}
+
+pub fn runPathDiscovery(path: []const u8, allocator: std.mem.Allocator, io: std.Io) RepoPathDiscoveryTaskResult {
+    const result = repo_discovery.discoverInputPath(allocator, io, path) catch |err| {
+        return switch (err) {
+            error.PathDoesNotExist,
+            error.PathIsNotDirectory,
+            error.CannotAccessPath,
+            error.NoGitRepositoriesFound,
+            => .{ .input_error = err },
+            else => .{
+                .failed = std.fmt.allocPrint(allocator, "Repo path discovery failed: {s}", .{@errorName(err)}) catch
+                    return .{ .failed_static = "Repo path discovery failed: OutOfMemory" },
+            },
         };
     };
     return .{ .discovered = result };

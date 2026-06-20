@@ -38,6 +38,16 @@ pub const DiscoveryResult = union(enum) {
     }
 };
 
+pub const PathDiscoveryError = error{
+    PathDoesNotExist,
+    PathIsNotDirectory,
+    CannotAccessPath,
+    NoGitRepositoriesFound,
+    OutOfMemory,
+    SpawnFailed,
+    StreamTooLong,
+};
+
 /// Discover the current process directory.
 ///
 /// The returned `DiscoveryResult` is owned by the caller. The temporary cwd
@@ -80,6 +90,25 @@ pub fn discoverRoot(allocator: std.mem.Allocator, io: std.Io, root_path: []const
         .current_root = current_root,
         .repos = repos,
     } };
+}
+
+/// Discover a user-submitted path from the repository picker.
+///
+/// Unlike `discoverRoot`, a directory with no repository is a user-facing
+/// error here: path submit should keep the current repo open and show an
+/// inline message instead of replacing discovery with `.none`.
+pub fn discoverInputPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) PathDiscoveryError!DiscoveryResult {
+    const current_root = realPathAbsoluteAlloc(allocator, io, path) catch |err| return mapRealPathError(err);
+    defer allocator.free(current_root);
+
+    var dir = std.Io.Dir.openDirAbsolute(io, current_root, .{ .iterate = true }) catch |err| return mapOpenDirError(err);
+    dir.close(io);
+
+    var result = discoverRoot(allocator, io, current_root) catch |err| return mapDiscoveryError(err);
+    errdefer result.deinit(allocator);
+
+    if (result == .none) return error.NoGitRepositoriesFound;
+    return result;
 }
 
 fn discoverChildRepos(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8) ![]RepoEntry {
@@ -188,6 +217,37 @@ fn trimAndDupe(allocator: std.mem.Allocator, bytes: []u8) ![]u8 {
 
 fn isDotEntry(name: []const u8) bool {
     return std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..");
+}
+
+fn mapRealPathError(err: anyerror) PathDiscoveryError {
+    return switch (err) {
+        error.FileNotFound => error.PathDoesNotExist,
+        error.NotDir => error.PathIsNotDirectory,
+        error.AccessDenied, error.PermissionDenied => error.CannotAccessPath,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.CannotAccessPath,
+    };
+}
+
+fn mapOpenDirError(err: anyerror) PathDiscoveryError {
+    return switch (err) {
+        error.FileNotFound => error.PathDoesNotExist,
+        error.NotDir => error.PathIsNotDirectory,
+        error.AccessDenied, error.PermissionDenied => error.CannotAccessPath,
+        else => error.CannotAccessPath,
+    };
+}
+
+fn mapDiscoveryError(err: anyerror) PathDiscoveryError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.StreamTooLong,
+        error.SpawnFailed => error.SpawnFailed,
+        error.FileNotFound => error.PathDoesNotExist,
+        error.NotDir => error.PathIsNotDirectory,
+        error.AccessDenied, error.PermissionDenied => error.CannotAccessPath,
+        else => error.CannotAccessPath,
+    };
 }
 
 test "repoLabel uses final path component" {

@@ -585,26 +585,53 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
     var content = surface.child(content_rect);
     const size = content.size();
 
+    if (app.repo_picker.prompt_mode == .path_input) {
+        _ = content.borrowTextAt(0, 0, "path: ", .{ .fg = .{ .index = 11 }, .bold = true });
+        _ = content.copyTextAt(6, 0, app.repo_picker.path_input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
+        if (app.repo_picker.path_pending and size.width > 16) {
+            _ = content.borrowTextAt(0, 2, "checking path...", .{ .fg = .gray });
+        } else if (app.repo_picker.path_error) |err| {
+            _ = content.borrowTextAt(0, 2, err.message(), .{ .fg = .{ .index = 9 } });
+        } else if (size.height > 2) {
+            _ = content.borrowTextAt(0, 2, "Enter: open path  Esc: back", .{ .fg = .gray });
+        }
+        return;
+    }
+
     _ = content.borrowTextAt(0, 0, "filter: ", .{ .fg = .{ .index = 11 }, .bold = true });
-    _ = content.copyTextAt(8, 0, app.repo_picker.input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
-    if (app.repo_picker.no_match and size.width > 20) {
+    _ = content.copyTextAt(8, 0, app.repo_picker.list.input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
+    if (app.repo_picker.list.no_match and size.width > 20) {
         _ = content.borrowTextAt(20, 0, "(no match)", .{ .fg = .{ .index = 9 } });
+    } else if (app.repo_picker.path_pending and size.width > 24) {
+        _ = content.borrowTextAt(20, 0, "(checking path...)", .{ .fg = .gray });
+    } else if (app.repo_picker.path_error) |err| {
+        _ = content.borrowTextAt(20, 0, err.message(), .{ .fg = .{ .index = 9 } });
+    }
+    if (size.height > 1) {
+        try draw.copyClippedTextAt(&content, 0, 1, "Enter: switch  /: filter  : enter path  Esc: close", .{ .fg = .gray });
     }
 
     if (size.height <= 2) return;
     const rows = size.height - 2;
-    const focused = app.repo_picker.filter.list.focusedIndex();
-    const range = ui.ListViewport.visibleRange(app.repo_picker.filter.labels.len, focused, rows);
+    const focused = app.repo_picker.list.filter.list.focusedIndex();
+    const range = ui.ListViewport.visibleRange(app.repo_picker.list.filter.labels.len, focused, rows);
     var row: u16 = 2;
     var visible_index: usize = range.start;
     while (visible_index < range.end) : ({
         visible_index += 1;
         row += 1;
     }) {
-        const source_index = app.repo_picker.filter.sourceIndex(visible_index) orelse continue;
-        const label = app.repo_picker.filter.labels[visible_index];
+        const source_index = app.repo_picker.list.filter.sourceIndex(visible_index) orelse continue;
+        const label = app.repo_picker.list.filter.labels[visible_index];
         const focused_row = visible_index == focused;
-        const active = source_index == app.repo_state.active_index;
+        const active = if (source_index < app.repo_picker_items.items.len)
+            switch (app.repo_picker_items.items[source_index].source) {
+                .active_repo => true,
+                .workspace_repo => |repo_index| repo_index == app.repo_state.active_index,
+                .pending_workspace_repo, .recent_repo, .recent_workspace => false,
+            }
+        else
+            false;
         const style: chasen.TextStyle = if (focused_row)
             .{ .reverse = true, .bold = true }
         else if (active)

@@ -43,6 +43,8 @@ const LoadRuntimeState = app_load_state.LoadRuntimeState;
 const PendingLoad = app_load_state.PendingLoad;
 const RepoDiscoveryFinished = app_load.RepoDiscoveryFinished;
 const RepoDiscoveryTask = app_load.RepoDiscoveryTask(App.Msg);
+const RepoPathDiscoveryFinished = app_load.RepoPathDiscoveryFinished;
+const RepoPathDiscoveryTask = app_load.RepoPathDiscoveryTask(App.Msg);
 const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
 const StageFileFinished = app_actions.StageFileFinished;
@@ -56,6 +58,26 @@ const MousePane = enum {
 const MousePoint = struct {
     col: u16,
     row: u16,
+};
+
+const RepoPickerItemSource = union(enum) {
+    active_repo,
+    workspace_repo: usize,
+    pending_workspace_repo: usize,
+    recent_repo: usize,
+    recent_workspace: usize,
+};
+
+const RepoPickerItem = struct {
+    label: []u8,
+    detail: []u8,
+    source: RepoPickerItemSource,
+
+    fn deinit(self: *RepoPickerItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.label);
+        allocator.free(self.detail);
+        self.* = undefined;
+    }
 };
 
 const ViewerState = struct {
@@ -89,6 +111,15 @@ const ViewOptions = struct {
     }
 };
 
+fn expandUserPath(allocator: std.mem.Allocator, path: []const u8, home: ?[]const u8) ![]u8 {
+    const home_path = home orelse return allocator.dupe(u8, path);
+    if (std.mem.eql(u8, path, "~")) return allocator.dupe(u8, home_path);
+    if (std.mem.startsWith(u8, path, "~/")) {
+        return std.fs.path.join(allocator, &.{ home_path, path[2..] });
+    }
+    return allocator.dupe(u8, path);
+}
+
 const DiffSearchState = struct {
     mode: bool = false,
     input: app_prompt.TextInput = .{},
@@ -114,7 +145,14 @@ pub const App = struct {
     search: DiffSearchState = .{},
     file_search: app_prompt.FilterPromptState = .{},
     file_search_return_focus: Focus = .sidebar,
-    repo_picker: app_prompt.FilterPromptState = .{},
+    repo_picker: app_prompt.RepoPickerState = .{},
+    /// Workspace discovered from path input but not yet selected.
+    ///
+    /// Keeping this outside repo_state lets the picker show candidates without
+    /// changing the active repository until the user presses Enter on a repo.
+    repo_picker_discovery: ?repo_discovery.DiscoveryResult = null,
+    repo_picker_items: std.ArrayList(RepoPickerItem) = .empty,
+    recent_repos: repo_state.RecentStore = .{},
     overlay: app_state.OverlayState = .{},
     review_display: app_state.ReviewDisplayState = .{},
     repo_state: repo_state.State = .{},
@@ -131,6 +169,7 @@ pub const App = struct {
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
         repos_discovered: RepoDiscoveryFinished,
+        repo_path_discovered: app_load.RepoPathDiscoveryFinished,
         diff_loaded: DiffLoadFinished,
         status_loaded: StatusLoadFinished,
         stage_file_finished: StageFileFinished,
@@ -181,6 +220,7 @@ pub const App = struct {
         enter_repo_picker,
         cancel_repo_picker,
         submit_repo_picker,
+        repo_picker_enter_path_input,
         repo_picker_insert: u21,
         repo_picker_backspace,
         repo_picker_move_previous,
@@ -221,6 +261,9 @@ pub const App = struct {
         self.git_status.deinit();
         self.file_search.deinit(deinit_ctx.allocator);
         self.repo_picker.deinit(deinit_ctx.allocator);
+        self.clearRepoPickerDiscovery(deinit_ctx.allocator);
+        self.deinitRepoPickerItems(deinit_ctx.allocator);
+        self.recent_repos.deinit(deinit_ctx.allocator);
         self.reviewed_store.deinit(deinit_ctx.allocator);
         self.tree_order.deinit(deinit_ctx.allocator);
         if (self.tree_order_scope) |scope| deinit_ctx.allocator.free(scope);
@@ -240,6 +283,7 @@ pub const App = struct {
                 self.clampHelpScroll();
             },
             .repos_discovered => |finished| try self.finishRepoDiscovery(ctx, finished),
+            .repo_path_discovered => |finished| try self.finishRepoPathDiscovery(ctx, finished),
             .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
             .status_loaded => |finished| try self.finishStatusLoad(ctx, finished),
             .stage_file_finished => |finished| try self.finishStageFile(ctx, finished),
@@ -331,18 +375,15 @@ pub const App = struct {
             .enter_repo_picker => try self.enterRepoPickerMode(ctx.allocator()),
             .cancel_repo_picker => self.cancelRepoPickerMode(ctx.allocator()),
             .submit_repo_picker => try self.submitRepoPicker(ctx),
+            .repo_picker_enter_path_input => self.enterRepoPickerPathInput(),
             .repo_picker_insert => |codepoint| {
-                self.repo_picker.resetNoMatch();
-                self.repo_picker.input.insert(codepoint) catch {};
-                try self.refreshRepoPickerFilter(ctx.allocator());
+                try self.insertRepoPickerCodepoint(ctx.allocator(), codepoint);
             },
             .repo_picker_backspace => {
-                self.repo_picker.resetNoMatch();
-                self.repo_picker.input.backspace();
-                try self.refreshRepoPickerFilter(ctx.allocator());
+                try self.backspaceRepoPicker(ctx.allocator());
             },
-            .repo_picker_move_previous => self.repo_picker.filter.update(.move_prev),
-            .repo_picker_move_next => self.repo_picker.filter.update(.move_next),
+            .repo_picker_move_previous => self.repo_picker.list.filter.update(.move_prev),
+            .repo_picker_move_next => self.repo_picker.list.filter.update(.move_next),
             .open_help => {
                 self.overlay.openHelp();
             },
@@ -481,6 +522,7 @@ pub const App = struct {
             .search_query_len = self.search.query.len,
             .focus = self.viewer.focus,
             .sidebar_hidden = self.viewer.sidebar_hidden,
+            .repo_picker_path_input = self.repo_picker.prompt_mode == .path_input,
         };
     }
 
@@ -544,6 +586,7 @@ pub const App = struct {
         switch (result) {
             .empty => unreachable,
             .discovered => |discovery| {
+                try self.rememberDiscovery(ctx.allocator(), discovery);
                 result = .empty;
                 self.repo_state.replace(ctx.allocator(), discovery);
 
@@ -561,6 +604,17 @@ pub const App = struct {
             .failed_static => |message| {
                 try self.storeFailedMessage(ctx.allocator(), message);
             },
+        }
+    }
+
+    fn rememberDiscovery(self: *App, allocator: std.mem.Allocator, discovery: repo_discovery.DiscoveryResult) !void {
+        switch (discovery) {
+            .single_repo => |entry| try self.recent_repos.rememberRepo(allocator, entry.canonical_root),
+            .workspace => |workspace| {
+                try self.recent_repos.rememberWorkspace(allocator, workspace.current_root);
+                if (workspace.repos.len > 0) try self.recent_repos.rememberRepo(allocator, workspace.repos[0].canonical_root);
+            },
+            .none => {},
         }
     }
 
@@ -1402,71 +1456,379 @@ pub const App = struct {
     }
 
     fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
-        if (self.repo_state.workspaceRepos() == null) return;
         if (self.actions.pending != null) {
             self.setStatus("finish current git action before switching repos", .{});
             return;
         }
 
         self.repo_picker.mode = true;
-        self.repo_picker.input = .{};
-        self.repo_picker.resetNoMatch();
+        self.repo_picker.prompt_mode = .list;
+        self.repo_picker.list.mode = true;
+        self.repo_picker.list.input = .{};
+        self.repo_picker.list.resetNoMatch();
+        self.repo_picker.clearPathStatus();
+        self.clearRepoPickerDiscovery(allocator);
         try self.refreshRepoPickerFilter(allocator);
         self.focusRepoPickerOnActive();
     }
 
     fn cancelRepoPickerMode(self: *App, allocator: std.mem.Allocator) void {
+        if (self.repo_picker.mode and self.repo_picker.prompt_mode == .path_input) {
+            self.repo_picker.prompt_mode = .list;
+            self.repo_picker.invalidatePathDiscovery();
+            return;
+        }
         self.repo_picker.deinit(allocator);
+        self.clearRepoPickerDiscovery(allocator);
+        self.clearRepoPickerItems(allocator);
     }
 
     fn submitRepoPicker(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        const focused = self.repo_picker.filter.list.focusedIndex();
-        const repo_index = self.repo_picker.filter.sourceIndex(focused) orelse {
-            self.repo_picker.no_match = true;
-            return;
-        };
-        const repos = self.repo_state.workspaceRepos() orelse return;
-        if (repo_index >= repos.len) {
-            self.repo_picker.no_match = true;
+        if (self.repo_picker.prompt_mode == .path_input) {
+            try self.submitRepoPickerPath(ctx);
             return;
         }
 
-        self.cancelRepoPickerMode(ctx.allocator());
-        self.clearPendingSelectionRestore(ctx.allocator());
-        if (repo_index == self.repo_state.active_index) return;
+        const focused = self.repo_picker.list.filter.list.focusedIndex();
+        const item_index = self.repo_picker.list.filter.sourceIndex(focused) orelse {
+            self.repo_picker.list.no_match = true;
+            return;
+        };
+        if (item_index >= self.repo_picker_items.items.len) {
+            self.repo_picker.list.no_match = true;
+            return;
+        }
 
-        try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root, true);
+        switch (self.repo_picker_items.items[item_index].source) {
+            .active_repo => {
+                self.repo_picker.deinit(ctx.allocator());
+                self.clearRepoPickerItems(ctx.allocator());
+            },
+            .workspace_repo => |repo_index| {
+                const repos = self.repo_state.workspaceRepos() orelse return;
+                if (repo_index >= repos.len) {
+                    self.repo_picker.list.no_match = true;
+                    return;
+                }
+
+                self.repo_picker.deinit(ctx.allocator());
+                self.clearRepoPickerItems(ctx.allocator());
+                self.clearPendingSelectionRestore(ctx.allocator());
+                try self.recent_repos.rememberRepo(ctx.allocator(), repos[repo_index].canonical_root);
+                if (repo_index == self.repo_state.active_index) return;
+
+                try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root, true);
+                self.repo_state.active_index = repo_index;
+                self.setSelectedDiffFile(0);
+                self.viewer.selected_node = 0;
+                self.clearSearch();
+            },
+            .pending_workspace_repo => |repo_index| {
+                try self.acceptPendingRepoPickerWorkspace(ctx, repo_index);
+            },
+            .recent_repo => |recent_index| {
+                if (recent_index >= self.recent_repos.entries.items.len) return;
+                try self.startRepoPathDiscovery(ctx, self.recent_repos.entries.items[recent_index].path);
+            },
+            .recent_workspace => |recent_index| {
+                if (recent_index >= self.recent_repos.entries.items.len) return;
+                try self.startRepoPathDiscovery(ctx, self.recent_repos.entries.items[recent_index].path);
+            },
+        }
+    }
+
+    fn refreshRepoPickerFilter(self: *App, allocator: std.mem.Allocator) !void {
+        self.clearRepoPickerItems(allocator);
+
+        var labels: std.ArrayList([]const u8) = .empty;
+        defer labels.deinit(allocator);
+
+        if (self.repo_picker_discovery) |discovery| {
+            switch (discovery) {
+                .workspace => |workspace| {
+                    for (workspace.repos, 0..) |repo, index| {
+                        try self.appendRepoPickerItem(allocator, repo.display_path, repo.canonical_root, .{ .pending_workspace_repo = index });
+                    }
+                },
+                .single_repo, .none => {},
+            }
+        } else if (self.repo_state.discovery) |discovery| {
+            switch (discovery) {
+                .single_repo => |entry| {
+                    try self.appendRepoPickerItem(allocator, entry.label, entry.canonical_root, .active_repo);
+                },
+                .workspace => |workspace| {
+                    for (workspace.repos, 0..) |repo, index| {
+                        try self.appendRepoPickerItem(allocator, repo.display_path, repo.canonical_root, .{ .workspace_repo = index });
+                    }
+                },
+                .none => {},
+            }
+        }
+
+        for (self.recent_repos.entries.items, 0..) |entry, index| {
+            if (self.repoPickerAlreadyHasPath(entry.path)) continue;
+            const label = std.fs.path.basename(entry.path);
+            const source: RepoPickerItemSource = switch (entry.kind) {
+                .repo => .{ .recent_repo = index },
+                .workspace => .{ .recent_workspace = index },
+            };
+            try self.appendRepoPickerItem(allocator, label, entry.path, source);
+        }
+
+        for (self.repo_picker_items.items) |item| {
+            try labels.append(allocator, item.label);
+        }
+
+        // ListFilter owns the filtered index arrays; repository labels remain
+        // borrowed from repo_picker_items, which App owns until the picker is
+        // refreshed or closed.
+        try self.repo_picker.list.filter.apply(allocator, labels.items, self.repo_picker.list.input.slice());
+    }
+
+    fn focusRepoPickerOnActive(self: *App) void {
+        var visible_index: usize = 0;
+        while (visible_index < self.repo_picker.list.filter.labels.len) : (visible_index += 1) {
+            const source_index = self.repo_picker.list.filter.sourceIndex(visible_index) orelse continue;
+            if (source_index >= self.repo_picker_items.items.len) continue;
+            const source = self.repo_picker_items.items[source_index].source;
+            const active = switch (source) {
+                .active_repo => true,
+                .workspace_repo => |repo_index| repo_index == self.repo_state.active_index,
+                .pending_workspace_repo, .recent_repo, .recent_workspace => false,
+            };
+            if (!active) continue;
+            while (self.repo_picker.list.filter.list.focusedIndex() < visible_index) {
+                self.repo_picker.list.filter.update(.move_next);
+            }
+            return;
+        }
+    }
+
+    fn enterRepoPickerPathInput(self: *App) void {
+        if (!self.repo_picker.mode) return;
+        self.repo_picker.prompt_mode = .path_input;
+        self.repo_picker.clearPathStatus();
+    }
+
+    fn insertRepoPickerCodepoint(self: *App, allocator: std.mem.Allocator, codepoint: u21) !void {
+        switch (self.repo_picker.prompt_mode) {
+            .list => {
+                self.repo_picker.list.resetNoMatch();
+                self.repo_picker.list.input.insert(codepoint) catch {};
+                try self.refreshRepoPickerFilter(allocator);
+            },
+            .path_input => {
+                self.repo_picker.clearPathStatus();
+                self.repo_picker.path_input.insert(codepoint) catch {
+                    self.repo_picker.path_error = .path_too_long;
+                };
+            },
+        }
+    }
+
+    fn backspaceRepoPicker(self: *App, allocator: std.mem.Allocator) !void {
+        switch (self.repo_picker.prompt_mode) {
+            .list => {
+                self.repo_picker.list.resetNoMatch();
+                self.repo_picker.list.input.backspace();
+                try self.refreshRepoPickerFilter(allocator);
+            },
+            .path_input => {
+                self.repo_picker.clearPathStatus();
+                self.repo_picker.path_input.backspace();
+            },
+        }
+    }
+
+    fn submitRepoPickerPath(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const path = std.mem.trim(u8, self.repo_picker.path_input.slice(), " \t\r\n");
+        if (path.len == 0) {
+            self.repo_picker.path_error = .no_git_repositories_found;
+            return;
+        }
+        try self.startRepoPathDiscovery(ctx, path);
+    }
+
+    fn startRepoPathDiscovery(self: *App, ctx: *chasen.Ctx(Msg), path: []const u8) !void {
+        if (self.actions.pending != null) {
+            self.setStatus("finish current git action before switching repos", .{});
+            return;
+        }
+
+        const task = try ctx.allocator().create(RepoPathDiscoveryTask);
+        errdefer ctx.allocator().destroy(task);
+
+        const owned_path = try expandUserPath(ctx.allocator(), path, self.homeDir());
+        errdefer ctx.allocator().free(owned_path);
+
+        task.* = .{
+            .path = owned_path,
+            .generation = self.repo_picker.beginPathDiscovery(),
+        };
+
+        ctx.task().spawnWith(task, RepoPathDiscoveryTask.run) catch |err| {
+            _ = self.repo_picker.finishPathDiscovery(task.generation);
+            self.setStatus("could not start repo path discovery task", .{});
+            return err;
+        };
+    }
+
+    fn homeDir(self: *const App) ?[]const u8 {
+        const map = self.env_map orelse return null;
+        const home = map.get("HOME") orelse return null;
+        if (home.len == 0) return null;
+        return home;
+    }
+
+    fn finishRepoPathDiscovery(self: *App, ctx: *chasen.Ctx(Msg), finished: RepoPathDiscoveryFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (!self.repo_picker.finishPathDiscovery(result.generation)) return;
+        if (!self.repo_picker.isCurrentPathDiscovery(result.generation)) return;
+
+        switch (result.result) {
+            .empty => unreachable,
+            .discovered => |discovery| {
+                result.result = .empty;
+                try self.acceptRepoPathDiscovery(ctx, discovery);
+            },
+            .input_error => |err| {
+                self.repo_picker.path_error = repoPickerPathError(err);
+            },
+            .failed => |message| {
+                self.setStatus("repo path discovery failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+            },
+            .failed_static => |message| {
+                self.setStatus("repo path discovery failed: {s}", .{message});
+            },
+        }
+    }
+
+    fn acceptRepoPathDiscovery(self: *App, ctx: *chasen.Ctx(Msg), discovery: repo_discovery.DiscoveryResult) !void {
+        var owned_discovery = discovery;
+        errdefer owned_discovery.deinit(ctx.allocator());
+
+        switch (owned_discovery) {
+            .single_repo => |entry| {
+                try self.recent_repos.rememberRepo(ctx.allocator(), entry.canonical_root);
+                self.repo_picker.deinit(ctx.allocator());
+                self.clearRepoPickerDiscovery(ctx.allocator());
+                self.clearRepoPickerItems(ctx.allocator());
+                self.clearPendingSelectionRestore(ctx.allocator());
+                self.repo_state.replace(ctx.allocator(), owned_discovery);
+                owned_discovery = .{ .none = .{ .current_root = "" } };
+                self.repo_state.active_index = 0;
+                try self.startDiffLoad(ctx);
+                self.setSelectedDiffFile(0);
+                self.viewer.selected_node = 0;
+                self.clearSearch();
+            },
+            .workspace => |workspace| {
+                try self.recent_repos.rememberWorkspace(ctx.allocator(), workspace.current_root);
+                self.clearRepoPickerDiscovery(ctx.allocator());
+                self.repo_picker_discovery = owned_discovery;
+                owned_discovery = .{ .none = .{ .current_root = "" } };
+                self.repo_picker.prompt_mode = .list;
+                self.repo_picker.list.mode = true;
+                self.repo_picker.list.input = .{};
+                self.repo_picker.list.resetNoMatch();
+                self.repo_picker.clearPathStatus();
+                try self.refreshRepoPickerFilter(ctx.allocator());
+            },
+            .none => unreachable,
+        }
+    }
+
+    fn acceptPendingRepoPickerWorkspace(self: *App, ctx: *chasen.Ctx(Msg), repo_index: usize) !void {
+        var discovery = self.repo_picker_discovery orelse return;
+        self.repo_picker_discovery = null;
+        errdefer discovery.deinit(ctx.allocator());
+
+        const workspace = switch (discovery) {
+            .workspace => |workspace| workspace,
+            .single_repo, .none => return,
+        };
+        if (repo_index >= workspace.repos.len) {
+            discovery.deinit(ctx.allocator());
+            self.repo_picker.list.no_match = true;
+            return;
+        }
+
+        try self.recent_repos.rememberRepo(ctx.allocator(), workspace.repos[repo_index].canonical_root);
+        self.repo_picker.deinit(ctx.allocator());
+        self.clearRepoPickerItems(ctx.allocator());
+        self.clearPendingSelectionRestore(ctx.allocator());
+        self.repo_state.replace(ctx.allocator(), discovery);
+        discovery = .{ .none = .{ .current_root = "" } };
         self.repo_state.active_index = repo_index;
+        try self.startDiffLoad(ctx);
         self.setSelectedDiffFile(0);
         self.viewer.selected_node = 0;
         self.clearSearch();
     }
 
-    fn refreshRepoPickerFilter(self: *App, allocator: std.mem.Allocator) !void {
-        const repos = self.repo_state.workspaceRepos() orelse return;
-
-        var labels: std.ArrayList([]const u8) = .empty;
-        defer labels.deinit(allocator);
-
-        for (repos) |repo| {
-            try labels.append(allocator, repo.display_path);
-        }
-
-        // ListFilter owns the filtered index arrays; repository labels remain
-        // borrowed from the current discovery result.
-        try self.repo_picker.filter.apply(allocator, labels.items, self.repo_picker.input.slice());
+    fn repoPickerPathError(err: repo_discovery.PathDiscoveryError) app_prompt.RepoPickerPathError {
+        return switch (err) {
+            error.PathDoesNotExist => .path_does_not_exist,
+            error.PathIsNotDirectory => .path_is_not_directory,
+            error.CannotAccessPath => .cannot_access_path,
+            error.NoGitRepositoriesFound => .no_git_repositories_found,
+            else => .cannot_access_path,
+        };
     }
 
-    fn focusRepoPickerOnActive(self: *App) void {
-        var visible_index: usize = 0;
-        while (visible_index < self.repo_picker.filter.labels.len) : (visible_index += 1) {
-            const source_index = self.repo_picker.filter.sourceIndex(visible_index) orelse continue;
-            if (source_index != self.repo_state.active_index) continue;
-            while (self.repo_picker.filter.list.focusedIndex() < visible_index) {
-                self.repo_picker.filter.update(.move_next);
+    fn appendRepoPickerItem(self: *App, allocator: std.mem.Allocator, label: []const u8, detail: []const u8, source: RepoPickerItemSource) !void {
+        const owned_label = try allocator.dupe(u8, label);
+        errdefer allocator.free(owned_label);
+        const owned_detail = try allocator.dupe(u8, detail);
+        errdefer allocator.free(owned_detail);
+        try self.repo_picker_items.append(allocator, .{
+            .label = owned_label,
+            .detail = owned_detail,
+            .source = source,
+        });
+    }
+
+    fn clearRepoPickerItems(self: *App, allocator: std.mem.Allocator) void {
+        for (self.repo_picker_items.items) |*item| item.deinit(allocator);
+        self.repo_picker_items.clearRetainingCapacity();
+    }
+
+    fn deinitRepoPickerItems(self: *App, allocator: std.mem.Allocator) void {
+        self.clearRepoPickerItems(allocator);
+        self.repo_picker_items.deinit(allocator);
+    }
+
+    fn clearRepoPickerDiscovery(self: *App, allocator: std.mem.Allocator) void {
+        if (self.repo_picker_discovery) |*discovery| discovery.deinit(allocator);
+        self.repo_picker_discovery = null;
+    }
+
+    fn repoPickerAlreadyHasPath(self: *const App, path: []const u8) bool {
+        if (self.repo_picker_discovery) |discovery| {
+            switch (discovery) {
+                .workspace => |workspace| {
+                    if (std.mem.eql(u8, workspace.current_root, path)) return true;
+                    for (workspace.repos) |repo| {
+                        if (std.mem.eql(u8, repo.canonical_root, path)) return true;
+                    }
+                },
+                .single_repo => |entry| if (std.mem.eql(u8, entry.canonical_root, path)) return true,
+                .none => {},
             }
-            return;
         }
+        if (self.repo_state.discovery) |discovery| {
+            switch (discovery) {
+                .workspace => |workspace| if (std.mem.eql(u8, workspace.current_root, path)) return true,
+                .single_repo, .none => {},
+            }
+        }
+        for (self.repo_picker_items.items) |item| {
+            if (std.mem.eql(u8, item.detail, path)) return true;
+        }
+        return false;
     }
 
     fn toggleReviewedFile(self: *App, allocator: std.mem.Allocator) !void {
@@ -3566,12 +3928,143 @@ test "repo picker focuses active workspace repository" {
     };
     defer app.repo_state.deinit(allocator);
     defer app.repo_picker.deinit(allocator);
+    defer app.deinitRepoPickerItems(allocator);
 
     try app.enterRepoPickerMode(allocator);
 
     try std.testing.expect(app.repo_picker.mode);
-    try std.testing.expectEqual(@as(usize, 2), app.repo_picker.filter.labels.len);
-    try std.testing.expectEqual(@as(usize, 1), app.repo_picker.filter.list.focusedIndex());
+    try std.testing.expectEqual(@as(usize, 2), app.repo_picker.list.filter.labels.len);
+    try std.testing.expectEqual(@as(usize, 1), app.repo_picker.list.filter.list.focusedIndex());
+}
+
+test "repo picker opens for a single repository" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .repo_state = .{
+            .discovery = .{ .single_repo = .{
+                .label = try allocator.dupe(u8, "repo"),
+                .display_path = try allocator.dupe(u8, "."),
+                .canonical_root = try allocator.dupe(u8, "/work/repo"),
+            } },
+        },
+    };
+    defer app.repo_state.deinit(allocator);
+    defer app.repo_picker.deinit(allocator);
+    defer app.deinitRepoPickerItems(allocator);
+
+    try app.enterRepoPickerMode(allocator);
+
+    try std.testing.expect(app.repo_picker.mode);
+    try std.testing.expectEqual(@as(usize, 1), app.repo_picker.list.filter.labels.len);
+    try std.testing.expectEqualStrings("repo", app.repo_picker.list.filter.labels[0]);
+}
+
+test "repo picker path input uses separate prompt mode" {
+    var app: App = .{ .repo_picker = .{ .mode = true } };
+
+    app.enterRepoPickerPathInput();
+
+    try std.testing.expectEqual(app_prompt.RepoPickerMode.path_input, app.repo_picker.prompt_mode);
+}
+
+test "workspace path discovery keeps picker open for explicit repo selection" {
+    const allocator = std.testing.allocator;
+    const repos = try allocator.alloc(repo_discovery.RepoEntry, 2);
+    repos[0] = .{
+        .label = try allocator.dupe(u8, "chasen"),
+        .display_path = try allocator.dupe(u8, "chasen"),
+        .canonical_root = try allocator.dupe(u8, "/work/chasen"),
+    };
+    repos[1] = .{
+        .label = try allocator.dupe(u8, "gitframe"),
+        .display_path = try allocator.dupe(u8, "gitframe"),
+        .canonical_root = try allocator.dupe(u8, "/work/gitframe"),
+    };
+
+    var app: App = .{
+        .repo_picker = .{ .mode = true, .prompt_mode = .path_input },
+        .repo_state = .{
+            .discovery = .{ .single_repo = .{
+                .label = try allocator.dupe(u8, "current"),
+                .display_path = try allocator.dupe(u8, "."),
+                .canonical_root = try allocator.dupe(u8, "/current/repo"),
+            } },
+        },
+    };
+    defer app.repo_state.deinit(allocator);
+    defer app.repo_picker.deinit(allocator);
+    defer app.clearRepoPickerDiscovery(allocator);
+    defer app.deinitRepoPickerItems(allocator);
+    defer app.recent_repos.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.acceptRepoPathDiscovery(&ctx, .{ .workspace = .{
+        .current_root = try allocator.dupe(u8, "/work"),
+        .repos = repos,
+    } });
+
+    try std.testing.expect(app.repo_picker.mode);
+    try std.testing.expectEqual(app_prompt.RepoPickerMode.list, app.repo_picker.prompt_mode);
+    try std.testing.expectEqualStrings("/current/repo", app.repo_state.activeRoot().?);
+    try std.testing.expectEqual(@as(usize, 2), app.repo_picker.list.filter.labels.len);
+    try std.testing.expectEqualStrings("chasen", app.repo_picker.list.filter.labels[0]);
+    try std.testing.expectEqualStrings("gitframe", app.repo_picker.list.filter.labels[1]);
+}
+
+test "closed repo picker rejects stale path discovery result after reopen" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .repo_picker = .{ .mode = true },
+        .repo_state = .{
+            .discovery = .{ .single_repo = .{
+                .label = try allocator.dupe(u8, "current"),
+                .display_path = try allocator.dupe(u8, "."),
+                .canonical_root = try allocator.dupe(u8, "/current/repo"),
+            } },
+        },
+    };
+    defer app.repo_state.deinit(allocator);
+    defer app.repo_picker.deinit(allocator);
+    defer app.clearRepoPickerDiscovery(allocator);
+    defer app.deinitRepoPickerItems(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    const old_generation = app.repo_picker.beginPathDiscovery();
+    app.cancelRepoPickerMode(allocator);
+    try app.enterRepoPickerMode(allocator);
+    const new_generation = app.repo_picker.beginPathDiscovery();
+
+    var stale = RepoPathDiscoveryFinished{
+        .generation = old_generation,
+        .submitted_path = try allocator.dupe(u8, "/old/repo"),
+        .result = .{ .discovered = .{ .single_repo = .{
+            .label = try allocator.dupe(u8, "old"),
+            .display_path = try allocator.dupe(u8, "."),
+            .canonical_root = try allocator.dupe(u8, "/old/repo"),
+        } } },
+    };
+    try app.finishRepoPathDiscovery(&ctx, stale);
+    stale = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
+
+    try std.testing.expect(new_generation != old_generation);
+    try std.testing.expectEqualStrings("/current/repo", app.repo_state.activeRoot().?);
+}
+
+test "expandUserPath expands current user's home shorthand" {
+    const allocator = std.testing.allocator;
+    const home = "/home/tester";
+
+    const bare_home = try expandUserPath(allocator, "~", home);
+    defer allocator.free(bare_home);
+    try std.testing.expectEqualStrings(home, bare_home);
+
+    const child = try expandUserPath(allocator, "~/dev/repo", home);
+    defer allocator.free(child);
+    try std.testing.expectEqualStrings("/home/tester/dev/repo", child);
+
+    const named_user = try expandUserPath(allocator, "~someone/repo", home);
+    defer allocator.free(named_user);
+    try std.testing.expectEqualStrings("~someone/repo", named_user);
 }
 
 test "repo switch clears action selection restore" {
@@ -3600,6 +4093,8 @@ test "repo switch clears action selection restore" {
     };
     defer app.repo_state.deinit(allocator);
     defer app.repo_picker.deinit(allocator);
+    defer app.deinitRepoPickerItems(allocator);
+    defer app.recent_repos.deinit(allocator);
     defer app.clearPendingSelectionRestore(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
