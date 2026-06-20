@@ -24,6 +24,7 @@ pub const CliConfig = struct {
     source: SourceMode = .unstaged,
     watch: bool = false,
     stats_summary: bool = false,
+    export_context: bool = false,
 
     pub fn sourceLabel(self: CliConfig) []const u8 {
         return switch (self.source) {
@@ -120,6 +121,8 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
             config.watch = true;
         } else if (std.mem.eql(u8, arg, "--stats-summary")) {
             config.stats_summary = true;
+        } else if (std.mem.eql(u8, arg, "--export-context")) {
+            config.export_context = true;
         } else if (std.mem.eql(u8, arg, "--range")) {
             index += 1;
             if (index >= args.len) return error.MissingOptionValue;
@@ -366,6 +369,14 @@ test "parseArgs accepts stats summary mode" {
     const config = try parseArgs(args[0..]);
 
     try std.testing.expect(config.stats_summary);
+}
+
+test "parseArgs accepts context export mode" {
+    const args = [_][]const u8{ "gitframe", "--export-context", "--cached" };
+    const config = try parseArgs(args[0..]);
+
+    try std.testing.expect(config.export_context);
+    try std.testing.expect(config.source == .cached);
 }
 
 test "parseArgs rejects watch with stdin" {

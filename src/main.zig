@@ -25,6 +25,14 @@ pub fn main(init: std.process.Init) !void {
         owns_config_source = true;
     }
 
+    if (config.export_context) {
+        exportContext(init.io, init.gpa, config) catch |err| {
+            try printLoadError(init.io, err);
+            return err;
+        };
+        return;
+    }
+
     if (config.stats_summary) {
         var summary: StatsSummary = .{};
         try chasen.runWith(.{
@@ -80,12 +88,21 @@ fn printHelp(io: std.Io) !void {
         \\  --range <range>   Show a commit range, for example main...HEAD
         \\  --watch           Poll and reload the active diff every 2 seconds
         \\  --stats-summary   Print runtime timing summary after exit
+        \\  --export-context  Print initial selection context JSON and exit
         \\  -h, --help        Show this help
         \\
         \\Default:
         \\  gitframe          Show unstaged changes in the current repository
         \\
     );
+    try stdout.flush();
+}
+
+fn exportContext(io: std.Io, allocator: std.mem.Allocator, config: gitframe.CliConfig) !void {
+    var buffer: [4096]u8 = undefined;
+    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
+    const stdout = &stdout_file_writer.interface;
+    try gitframe.exportInitialSelectionContextJson(allocator, io, config, stdout);
     try stdout.flush();
 }
 

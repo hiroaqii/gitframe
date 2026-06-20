@@ -3,6 +3,7 @@ pub const context = @import("context.zig");
 const diff_source = @import("diff/source.zig");
 
 pub const App = app.App;
+pub const exportInitialSelectionContextJson = app.App.exportInitialSelectionContextJson;
 
 pub const SourceMode = diff_source.SourceMode;
 pub const CliConfig = diff_source.CliConfig;
@@ -22,6 +23,7 @@ test {
     _ = @import("app/state.zig");
     _ = @import("app/view.zig");
     _ = @import("context.zig");
+    _ = @import("context_export.zig");
     _ = @import("draw");
     _ = @import("editor.zig");
     _ = @import("git/backend.zig");

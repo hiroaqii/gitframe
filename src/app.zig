@@ -9,6 +9,7 @@ const app_prompt = @import("app/prompt.zig");
 const app_state = @import("app/state.zig");
 const app_view = @import("app/view.zig");
 const context = @import("context.zig");
+const context_export = @import("context_export.zig");
 const diff_parser = @import("diff/parser.zig");
 const diff_file = @import("diff/file.zig");
 const diff_render = @import("diff/render.zig");
@@ -654,6 +655,55 @@ pub const App = struct {
 
     fn setStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
         self.status.set(fmt, args);
+    }
+
+    pub fn exportInitialSelectionContextJson(allocator: std.mem.Allocator, io: std.Io, config: CliConfig, writer: *std.Io.Writer) !void {
+        var discovery: ?repo_discovery.DiscoveryResult = null;
+        defer if (discovery) |*result| result.deinit(allocator);
+
+        const repo_root = if (diff_source.sourceRequiresRepo(config.source)) blk: {
+            discovery = try repo_discovery.discover(allocator, io);
+            const discovered_root = try activeRootFromDiscovery(discovery.?);
+            break :blk discovered_root orelse return error.MissingRepoRoot;
+        } else null;
+
+        var load_result = app_load.runLoad(.{ .source = config.source, .repo_root = repo_root }, allocator, io);
+        defer load_result.deinit(allocator);
+
+        const selection = switch (load_result) {
+            .empty => initialSelectionContext(config.source, repo_root, null),
+            .loaded => |*bundle| initialSelectionContext(config.source, repo_root, &bundle.loaded),
+            .failed, .failed_static => return error.ExportContextLoadFailed,
+        };
+
+        try context_export.writeSelectionContext(writer, selection);
+    }
+
+    fn activeRootFromDiscovery(discovery: repo_discovery.DiscoveryResult) !?[]const u8 {
+        return switch (discovery) {
+            .single_repo => |entry| entry.canonical_root,
+            .workspace => error.AmbiguousWorkspaceExport,
+            .none => null,
+        };
+    }
+
+    fn initialSelectionContext(source: SourceMode, repo_root: ?[]const u8, loaded: ?*const LoadedDiff) context.SelectionContext {
+        return .{
+            .repo_root = repo_root,
+            .source = sourceContext(source),
+            .selected = if (loaded) |active_loaded| initialSelection(active_loaded) else null,
+        };
+    }
+
+    fn initialSelection(loaded: *const LoadedDiff) ?context.Selection {
+        if (loaded.document.files.len == 0) return null;
+        const file = loaded.document.files[0];
+        return .{ .diff_file = .{
+            .file_index = 0,
+            .display_path = diff_file.displayPath(file),
+            .path_key = diff_file.canonicalPathKey(file),
+            .hunk_index = if (file.hunks.len > 0) 0 else null,
+        } };
     }
 
     fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -2607,6 +2657,32 @@ test "selectionContext returns null selected without a target" {
     try std.testing.expectEqual(context.SourceKind.unstaged, selection.source.kind);
     try std.testing.expectEqualStrings("unstaged changes", selection.source.label);
     try std.testing.expect(selection.selected == null);
+}
+
+test "initialSelectionContext selects first diff file and hunk" {
+    const loaded = testLoadedDiffTwo();
+    const selection = App.initialSelectionContext(.{ .patch_file = "changes.diff" }, null, &loaded);
+
+    try std.testing.expect(selection.repo_root == null);
+    try std.testing.expectEqual(context.SourceKind.patch_file, selection.source.kind);
+    try std.testing.expectEqualStrings("changes.diff", selection.source.detail.?);
+
+    const file = selection.selected.?.diff_file;
+    try std.testing.expectEqual(@as(usize, 0), file.file_index);
+    try std.testing.expectEqualStrings("a", file.path_key.?);
+    try std.testing.expectEqual(@as(?usize, 0), file.hunk_index);
+}
+
+test "activeRootFromDiscovery rejects ambiguous workspace export" {
+    var repos = [_]repo_discovery.RepoEntry{
+        .{ .label = "one", .display_path = "one", .canonical_root = "/work/one" },
+        .{ .label = "two", .display_path = "two", .canonical_root = "/work/two" },
+    };
+
+    try std.testing.expectError(error.AmbiguousWorkspaceExport, App.activeRootFromDiscovery(.{ .workspace = .{
+        .current_root = "/work",
+        .repos = &repos,
+    } }));
 }
 
 test "diff search row keeps active focus style" {
