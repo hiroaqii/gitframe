@@ -120,6 +120,10 @@ pub const App = struct {
     repo_state: repo_state.State = .{},
     git_status: git_status.GitStatusState = .{},
     status_load_generation: u64 = 0,
+    status_load_pending: ?u64 = null,
+    tree_order: file_tree.StableOrder = .{},
+    tree_order_scope: ?[]u8 = null,
+    pending_selection_restore: ?app_state.PendingSelectionRestore = null,
     /// Session-level source of truth for reviewed files. The active LoadedDiff
     /// keeps a materialized bool slice so hide-reviewed hot paths stay O(1).
     reviewed_store: review_state.Store = .{},
@@ -218,6 +222,9 @@ pub const App = struct {
         self.file_search.deinit(deinit_ctx.allocator);
         self.repo_picker.deinit(deinit_ctx.allocator);
         self.reviewed_store.deinit(deinit_ctx.allocator);
+        self.tree_order.deinit(deinit_ctx.allocator);
+        if (self.tree_order_scope) |scope| deinit_ctx.allocator.free(scope);
+        if (self.pending_selection_restore) |*restore| restore.deinit(deinit_ctx.allocator);
     }
 
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
@@ -351,6 +358,7 @@ pub const App = struct {
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .editor_finished => |result| try self.finishEditorCommand(ctx, result),
             .reload => {
+                self.clearPendingSelectionRestore(ctx.allocator());
                 if (diff_source.sourceIsOneShotInput(self.config.source)) {
                     ctx.redraw().skip();
                 } else if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
@@ -606,12 +614,14 @@ pub const App = struct {
         self.invalidateStatusSnapshot();
 
         const task = ctx.allocator().create(StatusLoadTask) catch {
+            self.clearPendingSelectionRestore(ctx.allocator());
             self.setStatus("could not allocate status load task", .{});
             return;
         };
 
         const owned_root = ctx.allocator().dupe(u8, repo_root) catch {
             ctx.allocator().destroy(task);
+            self.clearPendingSelectionRestore(ctx.allocator());
             self.setStatus("could not allocate status repo root", .{});
             return;
         };
@@ -620,6 +630,7 @@ pub const App = struct {
             .repo_root = owned_root,
             .generation = self.status_load_generation,
         };
+        self.status_load_pending = self.status_load_generation;
 
         ctx.task().spawnWith(task, StatusLoadTask.run) catch {
             // Status is auxiliary data. Keep the diff load going even if this
@@ -627,6 +638,8 @@ pub const App = struct {
             // in-flight status result from restoring a stale snapshot.
             ctx.allocator().free(owned_root);
             ctx.allocator().destroy(task);
+            self.clearPendingSelectionRestore(ctx.allocator());
+            self.status_load_pending = null;
             self.setStatus("could not start status load task", .{});
             return;
         };
@@ -634,12 +647,17 @@ pub const App = struct {
 
     fn invalidateStatusSnapshot(self: *App) void {
         self.status_load_generation +%= 1;
+        self.status_load_pending = null;
         self.git_status.clear();
     }
 
     fn stageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (self.actions.pending != null) {
             self.setStatus("another git action is running", .{});
+            return;
+        }
+        if (!diff_source.sourceAllowsStageAction(self.config.source)) {
+            self.setStatus("stage unavailable for this source", .{});
             return;
         }
 
@@ -651,6 +669,8 @@ pub const App = struct {
             self.setStatus("no stageable file selected", .{});
             return;
         };
+        try self.setPendingSelectionRestore(ctx.allocator(), path);
+        errdefer self.clearPendingSelectionRestore(ctx.allocator());
 
         // Keep rollback active until the task is successfully handed to Chasen.
         const pending = self.actions.begin(.stage_file);
@@ -690,9 +710,11 @@ pub const App = struct {
                 try self.reloadAfterGitAction(ctx);
             },
             .failed => |message| {
+                self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("stage failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
             },
             .failed_static => |message| {
+                self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("stage failed: {s}", .{message});
             },
         }
@@ -923,9 +945,11 @@ pub const App = struct {
                 can_project_status = true;
             },
             .failed => |message| {
+                self.clearPendingSelectionRestore(ctx.allocator());
                 try self.storeFailedMessage(ctx.allocator(), std.mem.trim(u8, message, " \t\r\n"));
             },
             .failed_static => |message| {
+                self.clearPendingSelectionRestore(ctx.allocator());
                 try self.storeFailedMessage(ctx.allocator(), message);
             },
         }
@@ -941,9 +965,13 @@ pub const App = struct {
         defer result.deinit(ctx.allocator());
 
         if (result.generation != self.status_load_generation) return;
+        if (self.status_load_pending == result.generation) self.status_load_pending = null;
 
         switch (result.result) {
-            .empty => self.git_status.clear(),
+            .empty => {
+                self.git_status.clear();
+                try self.applyStatusProjection(ctx.allocator());
+            },
             .loaded => |*bundle| {
                 try self.git_status.replace(result.repo_root, bundle);
                 result.result = .empty;
@@ -951,21 +979,33 @@ pub const App = struct {
             },
             .failed => |message| {
                 self.git_status.clear();
+                self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
             },
             .failed_static => |message| {
                 self.git_status.clear();
+                self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{message});
             },
         }
     }
 
     fn applyStatusProjection(self: *App, allocator: std.mem.Allocator) !void {
+        if (!diff_source.sourceAllowsStageProjection(self.config.source)) return;
+
         const status_document = self.git_status.document;
-        if (status_document.entries.len == 0) return;
+        if (status_document.entries.len == 0) {
+            if (self.pending_selection_restore != null and
+                (self.load.hasPending() or self.status_load_pending != null)) return;
+            if (self.activeLoadedDiff()) |loaded| {
+                if (self.restorePendingSelectionByPath(allocator, loaded)) return;
+            }
+            self.clearPendingSelectionRestore(allocator);
+            return;
+        }
 
         if (self.activeLoadedDiff()) |loaded| {
-            try self.rebuildLoadedTreeWithStatus(loaded);
+            try self.rebuildLoadedTreeWithStatus(allocator, loaded);
             return;
         }
 
@@ -979,11 +1019,18 @@ pub const App = struct {
         }
     }
 
-    fn rebuildLoadedTreeWithStatus(self: *App, loaded: *LoadedDiff) !void {
+    fn rebuildLoadedTreeWithStatus(self: *App, app_allocator: std.mem.Allocator, loaded: *LoadedDiff) !void {
         const allocator = self.loadArenaAllocator() orelse return;
-        loaded.tree = try file_tree.buildWithStatus(allocator, loaded.document, self.git_status.document);
+        try self.ensureTreeOrderScope(app_allocator);
+        loaded.tree = try file_tree.buildWithStatusStable(allocator, loaded.document, self.git_status.document, self.stableOrderOptions(app_allocator));
         try loaded.rebuildVisibleNodes(allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
-        self.reconcileSelectionAfterVisibleNodeChange(loaded);
+        // Status can finish before the diff reload triggered by a Git action.
+        // In that case this projection is over the old diff, so keep the
+        // pending path restore for the incoming loaded diff.
+        if (self.pending_selection_restore != null and self.load.hasPending()) return;
+        if (!self.restorePendingSelectionOrFallback(app_allocator, loaded)) {
+            self.reconcileSelectionAfterVisibleNodeChange(loaded);
+        }
     }
 
     fn createStatusOnlyLoadedSession(self: *App, allocator: std.mem.Allocator, status_document: git_status.StatusDocument) !void {
@@ -992,10 +1039,11 @@ pub const App = struct {
         const arena_allocator = arena.allocator();
 
         const document = diff_parser.DiffDocument{ .files = &.{} };
+        try self.ensureTreeOrderScope(allocator);
         var loaded: LoadedDiff = .{
             .text = "",
             .document = document,
-            .tree = try file_tree.buildWithStatus(arena_allocator, document, status_document),
+            .tree = try file_tree.buildWithStatusStable(arena_allocator, document, status_document, self.stableOrderOptions(allocator)),
             .rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document),
             .collapsed_hunks = &.{},
             .collapsed_dirs = .empty,
@@ -1019,6 +1067,7 @@ pub const App = struct {
             self.selectSidebarNode(active_loaded, node_index);
             break;
         }
+        _ = self.restorePendingSelectionOrFallback(allocator, active_loaded);
     }
 
     fn storeFailedMessage(self: *App, allocator: std.mem.Allocator, message: []const u8) !void {
@@ -1383,6 +1432,7 @@ pub const App = struct {
         }
 
         self.cancelRepoPickerMode(ctx.allocator());
+        self.clearPendingSelectionRestore(ctx.allocator());
         if (repo_index == self.repo_state.active_index) return;
 
         try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root, true);
@@ -1625,6 +1675,83 @@ pub const App = struct {
         };
     }
 
+    fn setPendingSelectionRestore(self: *App, allocator: std.mem.Allocator, path_key: []const u8) !void {
+        self.clearPendingSelectionRestore(allocator);
+        const visible_row = if (self.activeLoadedDiffConst()) |loaded|
+            loaded.visibleRowOfNode(self.viewer.selected_node) orelse 0
+        else
+            0;
+        self.pending_selection_restore = .{
+            .path_key = try allocator.dupe(u8, path_key),
+            .visible_row = visible_row,
+        };
+    }
+
+    fn clearPendingSelectionRestore(self: *App, allocator: std.mem.Allocator) void {
+        if (self.pending_selection_restore) |*restore| restore.deinit(allocator);
+        self.pending_selection_restore = null;
+    }
+
+    fn restorePendingSelectionOrFallback(self: *App, allocator: std.mem.Allocator, loaded: *LoadedDiff) bool {
+        const restore = self.pending_selection_restore orelse return false;
+        defer self.clearPendingSelectionRestore(allocator);
+
+        if (findFileNodeByPathKey(loaded, restore.path_key)) |node_index| {
+            self.selectSidebarNode(loaded, node_index);
+            return true;
+        }
+
+        if (loaded.visibleNodeCount() == 0) {
+            self.viewer.selected_target = null;
+            self.viewer.selected_node = 0;
+            return true;
+        }
+
+        const row = @min(restore.visible_row, loaded.visibleNodeCount() - 1);
+        if (nearestVisibleFileNode(loaded, row)) |node_index| {
+            self.selectSidebarNode(loaded, node_index);
+            return true;
+        }
+
+        return false;
+    }
+
+    fn restorePendingSelectionByPath(self: *App, allocator: std.mem.Allocator, loaded: *LoadedDiff) bool {
+        const restore = self.pending_selection_restore orelse return false;
+        if (findFileNodeByPathKey(loaded, restore.path_key)) |node_index| {
+            defer self.clearPendingSelectionRestore(allocator);
+            self.selectSidebarNode(loaded, node_index);
+            return true;
+        }
+        return false;
+    }
+
+    fn findFileNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
+        for (loaded.tree.nodes, 0..) |node, index| {
+            if (node.kind != .file) continue;
+            const node_key = if (node.path_key.len > 0) node.path_key else node.path;
+            if (std.mem.eql(u8, node_key, path_key)) return index;
+        }
+        return null;
+    }
+
+    fn nearestVisibleFileNode(loaded: *const LoadedDiff, visible_row: usize) ?usize {
+        var row = visible_row;
+        while (row < loaded.visibleNodeCount()) : (row += 1) {
+            const node_index = loaded.visibleNodeAt(row) orelse continue;
+            if (loaded.tree.nodes[node_index].kind == .file) return node_index;
+        }
+
+        row = @min(visible_row, loaded.visibleNodeCount() - 1);
+        while (true) {
+            const node_index = loaded.visibleNodeAt(row) orelse return null;
+            if (loaded.tree.nodes[node_index].kind == .file) return node_index;
+            if (row == 0) break;
+            row -= 1;
+        }
+        return null;
+    }
+
     fn diffFileSelection(self: *const App, loaded: *const LoadedDiff, file_index: usize) ?context.Selection {
         if (file_index >= loaded.document.files.len) return null;
         const file = loaded.document.files[file_index];
@@ -1655,6 +1782,40 @@ pub const App = struct {
         };
         if (status_index >= self.git_status.document.entries.len) return null;
         return self.git_status.document.entries[status_index];
+    }
+
+    fn ensureTreeOrderScope(self: *App, allocator: std.mem.Allocator) !void {
+        const scope = try self.treeOrderScopeText(allocator);
+        defer allocator.free(scope);
+
+        if (self.tree_order_scope) |current| {
+            if (std.mem.eql(u8, current, scope)) return;
+            allocator.free(current);
+            self.tree_order_scope = null;
+            self.tree_order.reset(allocator);
+        }
+
+        self.tree_order_scope = try allocator.dupe(u8, scope);
+    }
+
+    fn treeOrderScopeText(self: *const App, allocator: std.mem.Allocator) ![]u8 {
+        const repo_root = self.activeRepoRoot() orelse "";
+        return switch (self.config.source) {
+            .unstaged => std.fmt.allocPrint(allocator, "{s}\x1funstaged", .{repo_root}),
+            .cached => std.fmt.allocPrint(allocator, "{s}\x1fcached", .{repo_root}),
+            .range => |range| std.fmt.allocPrint(allocator, "{s}\x1frange\x1f{s}", .{ repo_root, range }),
+            .patch_file => |path| std.fmt.allocPrint(allocator, "{s}\x1fpatch\x1f{s}", .{ repo_root, path }),
+            .stdin => std.fmt.allocPrint(allocator, "{s}\x1fstdin", .{repo_root}),
+            .pager => std.fmt.allocPrint(allocator, "{s}\x1fpager", .{repo_root}),
+            .no_index => |paths| std.fmt.allocPrint(allocator, "{s}\x1fno-index\x1f{s}\x1f{s}", .{ repo_root, paths.left, paths.right }),
+        };
+    }
+
+    fn stableOrderOptions(self: *App, allocator: std.mem.Allocator) ?file_tree.StableOrderOptions {
+        return .{
+            .allocator = allocator,
+            .order = &self.tree_order,
+        };
     }
 
     fn selectedFile(self: *const App) ?diff_parser.FileDiff {
@@ -2667,6 +2828,8 @@ test "sidebar navigation keeps status-only target through clamp" {
     };
     defer app.clearLoadedDiff();
     defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/status-only.zig\x00");
     try app.git_status.replace("/repo", &status_bundle);
@@ -2689,6 +2852,111 @@ test "sidebar navigation keeps status-only target through clamp" {
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target.?);
     try std.testing.expect(app.selectedFileIndex(loaded) == null);
     try std.testing.expect(app.selectedStatusEntry() != null);
+}
+
+test "pending selection restore waits for status projection after stage" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), testLoadedDiffOne()),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .selected_file = 0,
+            .selected_node = 0,
+        },
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.clearPendingSelectionRestore(std.testing.allocator);
+
+    try app.setPendingSelectionRestore(std.testing.allocator, "b");
+    app.status_load_pending = 1;
+
+    // Diff reload can finish before the status reload. In that intermediate
+    // tree the staged file is absent, so do not consume the pending restore yet.
+    try app.applyStatusProjection(std.testing.allocator);
+    try std.testing.expect(app.pending_selection_restore != null);
+
+    app.status_load_pending = null;
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+    try app.applyStatusProjection(std.testing.allocator);
+
+    try std.testing.expect(app.pending_selection_restore == null);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target.?);
+}
+
+test "pending selection restore survives status projection while diff reload is pending" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), testLoadedDiffTwo()),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 1 },
+            .selected_file = 1,
+            .selected_node = 1,
+        },
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.clearPendingSelectionRestore(std.testing.allocator);
+
+    try app.setPendingSelectionRestore(std.testing.allocator, "b");
+    app.load.pending = .{ .diff_load = app.load.generation + 1 };
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+    try app.applyStatusProjection(std.testing.allocator);
+
+    try std.testing.expect(app.pending_selection_restore != null);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
+}
+
+test "pending selection restore clears when status finishes empty after reload" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), testLoadedDiffOne()),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .selected_file = 0,
+            .selected_node = 0,
+        },
+        .status_load_generation = 7,
+    };
+    defer app.clearLoadedDiff();
+    defer app.clearPendingSelectionRestore(std.testing.allocator);
+
+    try app.setPendingSelectionRestore(std.testing.allocator, "missing.zig");
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 7,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .empty,
+    });
+
+    try std.testing.expect(app.pending_selection_restore == null);
+}
+
+test "manual reload clears action selection restore" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .config = .{ .source = .stdin },
+    };
+    defer app.clearPendingSelectionRestore(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.setPendingSelectionRestore(std.testing.allocator, "src/main.zig");
+
+    try app.update(.reload, &ctx);
+
+    try std.testing.expect(app.pending_selection_restore == null);
 }
 
 test "toggling selected directory collapses visible descendants" {
@@ -3306,6 +3574,43 @@ test "repo picker focuses active workspace repository" {
     try std.testing.expectEqual(@as(usize, 1), app.repo_picker.filter.list.focusedIndex());
 }
 
+test "repo switch clears action selection restore" {
+    const allocator = std.testing.allocator;
+    const repos = try allocator.alloc(repo_discovery.RepoEntry, 2);
+    repos[0] = .{
+        .label = try allocator.dupe(u8, "one"),
+        .display_path = try allocator.dupe(u8, "one"),
+        .canonical_root = try allocator.dupe(u8, "/work/one"),
+    };
+    repos[1] = .{
+        .label = try allocator.dupe(u8, "two"),
+        .display_path = try allocator.dupe(u8, "two"),
+        .canonical_root = try allocator.dupe(u8, "/work/two"),
+    };
+
+    var app: App = .{
+        .allocator = allocator,
+        .repo_state = .{
+            .discovery = .{ .workspace = .{
+                .current_root = try allocator.dupe(u8, "/work"),
+                .repos = repos,
+            } },
+            .active_index = 0,
+        },
+    };
+    defer app.repo_state.deinit(allocator);
+    defer app.repo_picker.deinit(allocator);
+    defer app.clearPendingSelectionRestore(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.setPendingSelectionRestore(allocator, "src/main.zig");
+    try app.enterRepoPickerMode(allocator);
+
+    try app.submitRepoPicker(&ctx);
+
+    try std.testing.expect(app.pending_selection_restore == null);
+}
+
 test "sidebar renders reviewed marker" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(34, 8);
@@ -3693,6 +3998,8 @@ test "finishDiffLoad projects earlier status snapshot into empty diff" {
     var app: App = .{ .load = .{ .generation = 1 } };
     defer app.clearLoadedDiff();
     defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
@@ -3740,6 +4047,22 @@ test "finishDiffLoad copies and frees current failed message" {
 
     try std.testing.expect(app.load.state == .failed);
     try std.testing.expectEqualStrings("failed", app.load.state.failed.message);
+}
+
+test "finishDiffLoad failure clears pending selection restore" {
+    var app: App = .{ .allocator = std.testing.allocator, .load = .{ .generation = 1 } };
+    defer app.clearLoadedDiff();
+    defer app.clearPendingSelectionRestore(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.setPendingSelectionRestore(std.testing.allocator, "src/main.zig");
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 1,
+        .result = .{ .failed_static = "failed" },
+    });
+
+    try std.testing.expect(app.pending_selection_restore == null);
 }
 
 fn expectSearchCoordinate(app: *const App, expected: diff_view_model.BodyCoordinate) !void {

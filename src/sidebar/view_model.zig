@@ -11,6 +11,7 @@ pub const Row = struct {
     path: []const u8,
     stats: file_tree.Stats,
     status: ?file_tree.Status,
+    stage_presence: file_tree.StagePresence,
     mode_changed: bool,
     reviewed: bool,
     fold: Fold,
@@ -58,6 +59,7 @@ pub fn rowForNode(
         .path = node.path,
         .stats = node.stats,
         .status = node.status,
+        .stage_presence = node.stage_presence,
         .mode_changed = node.mode_changed,
         .reviewed = if (node.diffFileIndex()) |file_index|
             file_index < reviewed_files.len and reviewed_files[file_index]

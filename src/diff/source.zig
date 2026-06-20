@@ -81,6 +81,20 @@ pub fn sourceSupportsWatch(source: SourceMode) bool {
     };
 }
 
+pub fn sourceAllowsStageAction(source: SourceMode) bool {
+    return switch (source) {
+        .unstaged => true,
+        .cached, .stdin, .pager, .patch_file, .range, .no_index => false,
+    };
+}
+
+pub fn sourceAllowsStageProjection(source: SourceMode) bool {
+    return switch (source) {
+        .unstaged, .cached => true,
+        .stdin, .pager, .patch_file, .range, .no_index => false,
+    };
+}
+
 pub const ParseArgsError = error{
     UnknownOption,
     MissingOptionValue,
@@ -505,6 +519,16 @@ test "sourceSupportsWatch rejects one-shot and difftool sources" {
     try std.testing.expect(!sourceSupportsWatch(.stdin));
     try std.testing.expect(!sourceSupportsWatch(.{ .pager = "diff" }));
     try std.testing.expect(!sourceSupportsWatch(.{ .no_index = .{ .left = "left", .right = "right" } }));
+}
+
+test "stage action is narrower than stage projection" {
+    try std.testing.expect(sourceAllowsStageAction(.unstaged));
+    try std.testing.expect(!sourceAllowsStageAction(.cached));
+    try std.testing.expect(!sourceAllowsStageAction(.{ .range = "main...HEAD" }));
+
+    try std.testing.expect(sourceAllowsStageProjection(.unstaged));
+    try std.testing.expect(sourceAllowsStageProjection(.cached));
+    try std.testing.expect(!sourceAllowsStageProjection(.{ .range = "main...HEAD" }));
 }
 
 test "cloneLoadRequest duplicates source payload and repo root" {

@@ -248,7 +248,7 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
     if (row_model.status) |status| {
         if (row_layout.badge_col) |badge_col| {
             if (width > badge_col) {
-                _ = surface.borrowTextAt(badge_col, row, status.badge(), statusStyle(status, row_model.selected));
+                _ = surface.borrowTextAt(badge_col, row, status.badge(), statusStyle(row_model, status));
             }
         }
     }
@@ -286,7 +286,12 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
 fn sidebarRowStyle(row: sidebar_view_model.Row, pane_active: bool) chasen.TextStyle {
     if (row.selected) return .{ .reverse = true, .bold = true };
     if (row.kind == .directory) return .{ .bold = true, .fg = .gray, .dim = !pane_active };
-    return .{ .dim = !pane_active };
+    return switch (row.stage_presence) {
+        .staged_only => .{ .fg = .{ .index = 10 }, .dim = !pane_active },
+        .mixed => .{ .fg = .{ .index = 11 }, .dim = !pane_active },
+        .conflict => .{ .fg = .{ .index = 9 }, .bold = true, .dim = !pane_active },
+        else => .{ .dim = !pane_active },
+    };
 }
 
 /// Draw the selected file's diff pane.
@@ -361,8 +366,16 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
     try draw.copyClippedTextAt(&content, 0, 0, path, .{ .bold = true, .fg = .{ .index = 11 }, .dim = !active });
     const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "status: {s}{s}", .{ statusName(entry.index), statusSuffix(entry) });
     try draw.copyClippedTextAt(&content, 0, 2, status_text, .{ .fg = .gray, .dim = !active });
-    try draw.copyClippedTextAt(&content, 0, 4, "No diff is available for this file yet.", .{ .fg = .gray, .dim = !active });
-    try draw.copyClippedTextAt(&content, 0, 5, "Use the upcoming stage action to add it to Git.", .{ .fg = .gray, .dim = !active });
+    switch (file_tree.stagePresenceFromEntry(entry)) {
+        .staged_only => {
+            try draw.copyClippedTextAt(&content, 0, 4, "This file is staged.", .{ .fg = .gray, .dim = !active });
+            try draw.copyClippedTextAt(&content, 0, 5, "Staged diff preview will be added in a later slice.", .{ .fg = .gray, .dim = !active });
+        },
+        else => {
+            try draw.copyClippedTextAt(&content, 0, 4, "No diff is available for this file yet.", .{ .fg = .gray, .dim = !active });
+            try draw.copyClippedTextAt(&content, 0, 5, "Use the upcoming stage action to add it to Git.", .{ .fg = .gray, .dim = !active });
+        },
+    }
 }
 
 fn statusName(status: git_status.StatusCode) []const u8 {
@@ -847,15 +860,20 @@ pub fn contentWidth(width: u16) u16 {
     return if (width > search_marker_gutter_width) width - search_marker_gutter_width else width;
 }
 
-fn statusStyle(status: file_tree.Status, selected: bool) chasen.TextStyle {
-    const fg: chasen.Color = switch (status) {
-        .modified => .{ .index = 11 },
-        .added => .{ .index = 2 },
-        .deleted => .{ .index = 9 },
-        .renamed => .{ .index = 14 },
-        .binary => .{ .index = 13 },
+fn statusStyle(row: sidebar_view_model.Row, status: file_tree.Status) chasen.TextStyle {
+    const fg: chasen.Color = switch (row.stage_presence) {
+        .staged_only => .{ .index = 10 },
+        .mixed => .{ .index = 11 },
+        .conflict => .{ .index = 9 },
+        else => switch (status) {
+            .modified => .{ .index = 11 },
+            .added => .{ .index = 2 },
+            .deleted => .{ .index = 9 },
+            .renamed => .{ .index = 14 },
+            .binary => .{ .index = 13 },
+        },
     };
-    return .{ .fg = fg, .bold = true, .reverse = selected };
+    return .{ .fg = fg, .bold = true, .reverse = row.selected };
 }
 
 fn reviewedStyle(selected: bool) chasen.TextStyle {

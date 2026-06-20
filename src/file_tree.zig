@@ -14,14 +14,85 @@ pub const Status = diff_file.Status;
 // arena and are not stored in the returned FileTree model.
 const DirectoryIndex = std.StringHashMapUnmanaged(usize);
 const PathKeySet = std.StringHashMapUnmanaged(void);
+const StatusIndex = std.StringHashMapUnmanaged(usize);
+
+pub const StagePresence = enum {
+    unstaged_only,
+    staged_only,
+    mixed,
+    untracked,
+    conflict,
+    clean_or_unknown,
+};
+
+const RowSource = struct {
+    name: []const u8,
+    path: []const u8,
+    path_key: []const u8,
+    stats: Stats = .{},
+    status: ?Status = null,
+    stage_presence: StagePresence = .clean_or_unknown,
+    mode_changed: bool = false,
+    target: context.SidebarTarget,
+};
+
+/// Session-local file order used to keep the sidebar stable across reloads.
+///
+/// Keys are copied into the App allocator because the source rows usually
+/// borrow from a per-load arena. The order is deliberately independent from
+/// FileTree so reloads can rebuild a fresh tree while preserving row identity.
+pub const StableOrder = struct {
+    keys: std.ArrayListUnmanaged([]u8) = .empty,
+
+    pub fn deinit(self: *StableOrder, allocator: std.mem.Allocator) void {
+        for (self.keys.items) |key| allocator.free(key);
+        self.keys.deinit(allocator);
+        self.* = .{};
+    }
+
+    pub fn reset(self: *StableOrder, allocator: std.mem.Allocator) void {
+        self.deinit(allocator);
+    }
+
+    fn indexOf(self: *const StableOrder, key: []const u8) ?usize {
+        for (self.keys.items, 0..) |known, index| {
+            if (std.mem.eql(u8, known, key)) return index;
+        }
+        return null;
+    }
+
+    fn applyAndRemember(self: *StableOrder, allocator: std.mem.Allocator, rows: []RowSource) !void {
+        std.mem.sort(RowSource, rows, self, stableRowLessThan);
+
+        for (self.keys.items) |key| allocator.free(key);
+        self.keys.clearRetainingCapacity();
+        errdefer {
+            for (self.keys.items) |key| allocator.free(key);
+            self.keys.clearRetainingCapacity();
+        }
+
+        for (rows) |row| {
+            const key = try allocator.dupe(u8, row.path_key);
+            errdefer allocator.free(key);
+            try self.keys.append(allocator, key);
+        }
+    }
+};
+
+pub const StableOrderOptions = struct {
+    allocator: std.mem.Allocator,
+    order: *StableOrder,
+};
 
 pub const Node = struct {
     kind: Kind,
     name: []const u8,
     path: []const u8,
+    path_key: []const u8 = "",
     depth: u16,
     stats: Stats = .{},
     status: ?Status = null,
+    stage_presence: StagePresence = .clean_or_unknown,
     mode_changed: bool = false,
     target: context.SidebarTarget = .{ .directory = "" },
 
@@ -139,56 +210,106 @@ pub fn build(allocator: std.mem.Allocator, document: diff_parser.DiffDocument) !
 }
 
 pub fn buildWithStatus(allocator: std.mem.Allocator, document: diff_parser.DiffDocument, status_document: ?git_status.StatusDocument) !FileTree {
-    var nodes: std.ArrayList(Node) = .empty;
-    errdefer nodes.deinit(allocator);
+    return buildWithStatusStable(allocator, document, status_document, null);
+}
 
-    var directory_index: DirectoryIndex = .empty;
-    defer directory_index.deinit(allocator);
+pub fn buildWithStatusStable(
+    allocator: std.mem.Allocator,
+    document: diff_parser.DiffDocument,
+    status_document: ?git_status.StatusDocument,
+    stable_order: ?StableOrderOptions,
+) !FileTree {
+    var rows: std.ArrayList(RowSource) = .empty;
+    defer rows.deinit(allocator);
 
     var diff_keys: PathKeySet = .empty;
     defer diff_keys.deinit(allocator);
 
+    var status_index: StatusIndex = .empty;
+    defer status_index.deinit(allocator);
+
+    if (status_document) |doc| {
+        for (doc.entries, 0..) |entry, index| {
+            if (entry.isIgnored()) continue;
+            const key = entry.canonicalPathKey() orelse continue;
+            try status_index.put(allocator, key, index);
+        }
+    }
+
     for (document.files, 0..) |file, file_index| {
         const path = displayPath(file);
-        const stats = fileStats(file);
+        const path_key = diff_file.canonicalPathKey(file) orelse path;
+        const status_entry = if (status_document) |doc|
+            if (status_index.get(path_key)) |index| doc.entries[index] else null
+        else
+            null;
+
         if (diff_file.canonicalPathKey(file)) |key| try diff_keys.put(allocator, key, {});
 
-        try ensureDirectoryNodes(allocator, &nodes, &directory_index, path, stats);
-        try nodes.append(allocator, .{
-            .kind = .file,
+        try rows.append(allocator, .{
             .name = baseName(path),
             .path = path,
-            .depth = pathDepth(path),
-            .stats = stats,
+            .path_key = path_key,
+            .stats = fileStats(file),
             .status = diff_file.status(file),
+            .stage_presence = if (status_entry) |entry| stagePresenceFromEntry(entry) else .clean_or_unknown,
             .mode_changed = diff_file.hasModeChange(file),
             .target = .{ .diff_file = file_index },
         });
     }
 
     if (status_document) |doc| {
-        for (doc.entries, 0..) |entry, status_index| {
+        for (doc.entries, 0..) |entry, status_entry_index| {
             if (entry.isIgnored()) continue;
             const key = entry.canonicalPathKey() orelse continue;
             if (diff_keys.contains(key)) continue;
 
-            // Status entries are owned by GitStatusState, while the tree can be
-            // rebuilt in the loaded-diff arena. Copy status-only paths into the
-            // tree arena so a later status reload cannot leave dangling rows.
             const path = try allocator.dupe(u8, key);
-            try ensureDirectoryNodes(allocator, &nodes, &directory_index, path, .{});
-            try nodes.append(allocator, .{
-                .kind = .file,
+            try rows.append(allocator, .{
                 .name = baseName(path),
                 .path = path,
-                .depth = pathDepth(path),
+                .path_key = path,
                 .status = statusFromEntry(entry),
-                .target = .{ .status_entry = status_index },
+                .stage_presence = stagePresenceFromEntry(entry),
+                .target = .{ .status_entry = status_entry_index },
             });
         }
     }
 
+    if (stable_order) |stable| try stable.order.applyAndRemember(stable.allocator, rows.items);
+
+    var nodes: std.ArrayList(Node) = .empty;
+    errdefer nodes.deinit(allocator);
+
+    var directory_index: DirectoryIndex = .empty;
+    defer directory_index.deinit(allocator);
+
+    for (rows.items) |row| {
+        try ensureDirectoryNodes(allocator, &nodes, &directory_index, row.path, row.stats);
+        try nodes.append(allocator, .{
+            .kind = .file,
+            .name = row.name,
+            .path = row.path,
+            .path_key = row.path_key,
+            .depth = pathDepth(row.path),
+            .stats = row.stats,
+            .status = row.status,
+            .stage_presence = row.stage_presence,
+            .mode_changed = row.mode_changed,
+            .target = row.target,
+        });
+    }
+
     return .{ .nodes = try nodes.toOwnedSlice(allocator) };
+}
+
+fn stableRowLessThan(order: *StableOrder, lhs: RowSource, rhs: RowSource) bool {
+    const lhs_index = order.indexOf(lhs.path_key);
+    const rhs_index = order.indexOf(rhs.path_key);
+    if (lhs_index != null and rhs_index != null) return lhs_index.? < rhs_index.?;
+    if (lhs_index != null) return true;
+    if (rhs_index != null) return false;
+    return std.mem.lessThan(u8, lhs.path_key, rhs.path_key);
 }
 
 pub fn displayPath(file: diff_parser.FileDiff) []const u8 {
@@ -252,6 +373,18 @@ fn statusFromEntry(entry: git_status.StatusEntry) ?Status {
     if (entry.index == .added or entry.worktree == .added) return .added;
     if (entry.index == .modified or entry.worktree == .modified or entry.isConflict()) return .modified;
     return null;
+}
+
+pub fn stagePresenceFromEntry(entry: git_status.StatusEntry) StagePresence {
+    if (entry.isConflict()) return .conflict;
+    if (entry.isUntracked()) return .untracked;
+
+    const staged = entry.isStaged();
+    const unstaged = entry.isUnstaged();
+    if (staged and unstaged) return .mixed;
+    if (staged) return .staged_only;
+    if (unstaged) return .unstaged_only;
+    return .clean_or_unknown;
 }
 
 pub fn statusOnlyEntryCount(document: git_status.StatusDocument, diff_document: diff_parser.DiffDocument) usize {
@@ -405,6 +538,93 @@ test "buildWithStatus skips rows already present in diff" {
     try std.testing.expectEqual(@as(usize, 2), tree.nodes.len);
     try std.testing.expectEqualStrings("main.zig", tree.nodes[1].name);
     try std.testing.expectEqual(@as(?usize, 0), tree.nodes[1].diffFileIndex());
+}
+
+test "buildWithStatusStable preserves existing file order across reloads" {
+    const first_text =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/c.zig b/c.zig
+        \\--- a/c.zig
+        \\+++ b/c.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    const second_text =
+        \\diff --git a/c.zig b/c.zig
+        \\--- a/c.zig
+        \\+++ b/c.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/b.zig b/b.zig
+        \\--- a/b.zig
+        \\+++ b/b.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var order: StableOrder = .{};
+    defer order.deinit(std.testing.allocator);
+
+    const first_doc = try diff_parser.parse(arena_allocator, first_text);
+    const first_tree = try buildWithStatusStable(arena_allocator, first_doc, null, .{
+        .allocator = std.testing.allocator,
+        .order = &order,
+    });
+    try std.testing.expectEqualStrings("a.zig", first_tree.nodes[0].path);
+    try std.testing.expectEqualStrings("c.zig", first_tree.nodes[1].path);
+
+    const second_doc = try diff_parser.parse(arena_allocator, second_text);
+    const second_tree = try buildWithStatusStable(arena_allocator, second_doc, null, .{
+        .allocator = std.testing.allocator,
+        .order = &order,
+    });
+
+    try std.testing.expectEqualStrings("a.zig", second_tree.nodes[0].path);
+    try std.testing.expectEqualStrings("c.zig", second_tree.nodes[1].path);
+    try std.testing.expectEqualStrings("b.zig", second_tree.nodes[2].path);
+}
+
+test "buildWithStatus records staged-only and mixed presence separately from status" {
+    const diff_text =
+        \\diff --git a/src/main.zig b/src/main.zig
+        \\--- a/src/main.zig
+        \\+++ b/src/main.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const document = try diff_parser.parse(allocator, diff_text);
+    const status_document = try git_status.parse(allocator, "MM src/main.zig\x00M  src/staged.zig\x00");
+    const tree = try buildWithStatus(allocator, document, status_document);
+
+    try std.testing.expectEqual(StagePresence.mixed, tree.nodes[1].stage_presence);
+    try std.testing.expectEqual(Status.modified, tree.nodes[1].status.?);
+    try std.testing.expectEqual(StagePresence.staged_only, tree.nodes[2].stage_presence);
+    try std.testing.expectEqual(Status.modified, tree.nodes[2].status.?);
 }
 
 test "build marks file nodes with mode metadata" {
