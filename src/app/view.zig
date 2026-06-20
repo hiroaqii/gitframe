@@ -23,7 +23,7 @@ const shell_frame_min_height: u16 = 6;
 const shell_frame_border = ui.Panel.Border.rounded;
 const shell_frame_padding: ui.layout.Insets = .{};
 const help_dialog_max_width: u16 = 108;
-const help_dialog_max_height: u16 = 24;
+const help_dialog_max_height: u16 = 28;
 const help_two_column_min_width: u16 = 96;
 const help_column_gap: u16 = 2;
 const help_header_rows: u16 = 2;
@@ -1010,6 +1010,7 @@ const help_global_items = [_]HelpItem{
     .{ .key = "B", .description = "show / hide sidebar" },
     .{ .key = "r", .description = "reload active repository" },
     .{ .key = "R", .description = "switch repository" },
+    .{ .key = "s", .description = "stage selected file" },
     .{ .key = "Home/End", .description = "first / last file" },
 };
 

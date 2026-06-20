@@ -1,4 +1,5 @@
 const std = @import("std");
+const git_backend = @import("../git/backend.zig");
 
 /// Git operation categories that can become App-facing actions.
 ///
@@ -56,6 +57,86 @@ pub const ActionState = struct {
         self.pending = null;
     }
 };
+
+pub const StageFileFinished = struct {
+    pending: PendingAction,
+    path: []u8,
+    result: StageFileTaskResult,
+
+    pub fn deinit(self: *StageFileFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.result.deinit(allocator);
+        self.* = .{
+            .pending = .{ .generation = 0, .kind = .stage_file },
+            .path = &.{},
+            .result = .ok,
+        };
+    }
+};
+
+pub const StageFileTaskResult = union(enum) {
+    ok,
+    failed: []u8,
+    failed_static: []const u8,
+
+    pub fn deinit(self: StageFileTaskResult, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .ok, .failed_static => {},
+            .failed => |message| allocator.free(message),
+        }
+    }
+};
+
+/// Async task for `git add -- <path>`.
+///
+/// The task owns copied repo/path strings because action requests cross the
+/// update boundary. The result moves `path` back to App for user-facing status
+/// messages.
+pub fn StageFileTask(comptime Msg: type) type {
+    return struct {
+        pending: PendingAction,
+        repo_root: []u8,
+        path: []u8,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                allocator.free(task.repo_root);
+                if (task.path.len > 0) allocator.free(task.path);
+                allocator.destroy(task);
+            }
+
+            const result = runStageFile(task.repo_root, task.path, allocator, io);
+            const path = task.path;
+            task.path = &.{};
+
+            return @unionInit(Msg, "stage_file_finished", StageFileFinished{
+                .pending = task.pending,
+                .path = path,
+                .result = result,
+            });
+        }
+    };
+}
+
+pub fn runStageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) StageFileTaskResult {
+    var local_backend: git_backend.LocalCommandBackend = .{};
+    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+        .repo_root = repo_root,
+        .kind = .{ .stage_file = path },
+    }) catch |err| {
+        return .{
+            .failed = std.fmt.allocPrint(allocator, "Stage failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Stage failed: OutOfMemory" },
+        };
+    };
+
+    return switch (raw_result) {
+        .ok => .ok,
+        .failed => |message| .{ .failed = message },
+        .failed_static => |message| .{ .failed_static = message },
+    };
+}
 
 test "ActionState tracks current pending action" {
     var state: ActionState = .{};

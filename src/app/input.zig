@@ -112,6 +112,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         'B' => voidMsg(Msg, "toggle_sidebar_visibility"),
         '[' => voidMsg(Msg, "decrease_sidebar_width"),
         ']' => voidMsg(Msg, "increase_sidebar_width"),
+        's' => voidMsg(Msg, "stage_selected_file"),
         'e' => voidMsg(Msg, "open_selected_file_in_editor"),
         'u' => voidMsg(Msg, "toggle_display_mode"),
         'L' => voidMsg(Msg, "toggle_line_numbers"),
@@ -188,6 +189,7 @@ const TestMsg = union(enum) {
     toggle_sidebar_visibility,
     decrease_sidebar_width,
     increase_sidebar_width,
+    stage_selected_file,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
@@ -234,6 +236,10 @@ test "keyToMsg maps sidebar width adjustment keys" {
 
 test "keyToMsg maps view option toggles" {
     try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, .{ .codepoint = 'L' }).?);
+}
+
+test "keyToMsg maps stage file action" {
+    try std.testing.expectEqual(TestMsg.stage_selected_file, keyToMsg(TestMsg, .{}, .{ .codepoint = 's' }).?);
 }
 
 test "keyToMsg uses search query to disambiguate navigation" {

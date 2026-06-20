@@ -43,6 +43,21 @@ pub const StatusLoadResult = union(enum) {
     }
 };
 
+pub const OperationResult = union(enum) {
+    ok,
+    /// Allocated error message from Git. Caller owns and must call `deinit`.
+    failed: []u8,
+    /// Non-owned fallback error message, used when allocation itself fails.
+    failed_static: []const u8,
+
+    pub fn deinit(self: OperationResult, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .ok, .failed_static => {},
+            .failed => |message| allocator.free(message),
+        }
+    }
+};
+
 /// Git-command diff kinds only.
 ///
 /// Raw input such as stdin or patch files belongs to diff/source.zig, not to
@@ -71,6 +86,19 @@ pub const GitStatusRequest = struct {
     repo_root: []const u8,
 };
 
+pub const OperationKind = union(enum) {
+    stage_file: []const u8,
+};
+
+/// Request for a write operation executed in a concrete repository.
+///
+/// The app snapshots `repo_root` and paths before spawning the task so a later
+/// repo switch cannot change where the operation runs.
+pub const OperationRequest = struct {
+    repo_root: []const u8,
+    kind: OperationKind,
+};
+
 /// Minimal Git command backend boundary.
 ///
 /// The interface starts with diff loading only. Status, stage, commit, and
@@ -80,6 +108,7 @@ pub const Backend = struct {
     ptr: *anyopaque,
     load_diff_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, GitDiffRequest) LoadError!LoadResult,
     load_status_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, GitStatusRequest) LoadError!StatusLoadResult,
+    run_operation_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, OperationRequest) LoadError!OperationResult,
 
     pub fn loadDiff(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) LoadError!LoadResult {
         return self.load_diff_fn(self.ptr, allocator, io, request);
@@ -87,6 +116,10 @@ pub const Backend = struct {
 
     pub fn loadStatus(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
         return self.load_status_fn(self.ptr, allocator, io, request);
+    }
+
+    pub fn runOperation(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
+        return self.run_operation_fn(self.ptr, allocator, io, request);
     }
 };
 
@@ -99,6 +132,7 @@ pub const LocalCommandBackend = struct {
             .ptr = self,
             .load_diff_fn = loadDiffErased,
             .load_status_fn = loadStatusErased,
+            .run_operation_fn = runOperationErased,
         };
     }
 
@@ -115,6 +149,12 @@ pub const LocalCommandBackend = struct {
         return loadGitStatus(allocator, io, request.repo_root);
     }
 
+    pub fn runOperation(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
+        return switch (request.kind) {
+            .stage_file => |path| runGitAdd(allocator, io, request.repo_root, path),
+        };
+    }
+
     fn loadDiffErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) LoadError!LoadResult {
         const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
         return self.loadDiff(allocator, io, request);
@@ -123,6 +163,11 @@ pub const LocalCommandBackend = struct {
     fn loadStatusErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
         const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
         return self.loadStatus(allocator, io, request);
+    }
+
+    fn runOperationErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
+        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
+        return self.runOperation(allocator, io, request);
     }
 };
 
@@ -194,6 +239,34 @@ fn loadGitStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8
     return .{ .failed = std.fmt.allocPrint(allocator, "git status failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
+fn runGitAdd(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) LoadError!OperationResult {
+    const argv = [_][]const u8{ "git", "add", "--", path };
+    const result = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .cwd = .{ .path = repo_root },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.StreamTooLong,
+        else => error.SpawnFailed,
+    };
+
+    allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .ok;
+        },
+        else => {},
+    }
+
+    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    allocator.free(result.stderr);
+
+    return .{ .failed = std.fmt.allocPrint(allocator, "git add failed: {any}", .{result.term}) catch return error.OutOfMemory };
+}
+
 fn loadNoIndexDiff(allocator: std.mem.Allocator, io: std.Io, paths: PathPair) LoadError!LoadResult {
     const argv = [_][]const u8{
         "git",
@@ -249,6 +322,13 @@ test "LocalCommandBackend exposes backend interface" {
 }
 
 test "Backend exposes status load interface" {
+    var local_backend: LocalCommandBackend = .{};
+    const backend = local_backend.backend();
+
+    try std.testing.expect(backend.ptr == @as(*anyopaque, @ptrCast(&local_backend)));
+}
+
+test "Backend exposes operation interface" {
     var local_backend: LocalCommandBackend = .{};
     const backend = local_backend.backend();
 

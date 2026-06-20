@@ -45,6 +45,8 @@ const RepoDiscoveryFinished = app_load.RepoDiscoveryFinished;
 const RepoDiscoveryTask = app_load.RepoDiscoveryTask(App.Msg);
 const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
+const StageFileFinished = app_actions.StageFileFinished;
+const StageFileTask = app_actions.StageFileTask(App.Msg);
 
 const MousePane = enum {
     sidebar,
@@ -127,6 +129,7 @@ pub const App = struct {
         repos_discovered: RepoDiscoveryFinished,
         diff_loaded: DiffLoadFinished,
         status_loaded: StatusLoadFinished,
+        stage_file_finished: StageFileFinished,
         select_previous_file,
         select_next_file,
         toggle_directory,
@@ -187,6 +190,7 @@ pub const App = struct {
         toggle_reviewed_file,
         toggle_hide_reviewed_files,
         cycle_changed_file_filter,
+        stage_selected_file,
         open_selected_file_in_editor,
         editor_finished: chasen.ForegroundCommandResult,
         reload,
@@ -231,6 +235,7 @@ pub const App = struct {
             .repos_discovered => |finished| try self.finishRepoDiscovery(ctx, finished),
             .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
             .status_loaded => |finished| try self.finishStatusLoad(ctx, finished),
+            .stage_file_finished => |finished| try self.finishStageFile(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
             .toggle_directory => try self.toggleSelectedDirectory(),
@@ -342,6 +347,7 @@ pub const App = struct {
             .toggle_reviewed_file => try self.toggleReviewedFile(ctx.allocator()),
             .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
+            .stage_selected_file => try self.stageSelectedFile(ctx),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .editor_finished => |result| try self.finishEditorCommand(ctx, result),
             .reload => {
@@ -629,6 +635,82 @@ pub const App = struct {
     fn invalidateStatusSnapshot(self: *App) void {
         self.status_load_generation +%= 1;
         self.git_status.clear();
+    }
+
+    fn stageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.actions.pending != null) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+
+        const repo_root = self.activeRepoRoot() orelse {
+            self.setStatus("stage unavailable for this source", .{});
+            return;
+        };
+        const path = self.selectedStagePathKey() orelse {
+            self.setStatus("no stageable file selected", .{});
+            return;
+        };
+
+        // Keep rollback active until the task is successfully handed to Chasen.
+        const pending = self.actions.begin(.stage_file);
+        errdefer _ = self.actions.finish(pending);
+
+        const task = try ctx.allocator().create(StageFileTask);
+        task.* = .{
+            .pending = pending,
+            .repo_root = &.{},
+            .path = &.{},
+        };
+        errdefer {
+            if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
+            if (task.path.len > 0) ctx.allocator().free(task.path);
+            ctx.allocator().destroy(task);
+        }
+
+        task.repo_root = try ctx.allocator().dupe(u8, repo_root);
+        task.path = try ctx.allocator().dupe(u8, path);
+
+        ctx.task().spawnWith(task, StageFileTask.run) catch |err| {
+            self.setStatus("could not start stage task", .{});
+            return err;
+        };
+        self.setStatus("staging: {s}", .{path});
+    }
+
+    fn finishStageFile(self: *App, ctx: *chasen.Ctx(Msg), finished: StageFileFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (!self.actions.finish(result.pending)) return;
+
+        switch (result.result) {
+            .ok => {
+                self.setStatus("staged: {s}", .{result.path});
+                try self.reloadAfterGitAction(ctx);
+            },
+            .failed => |message| {
+                self.setStatus("stage failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+            },
+            .failed_static => |message| {
+                self.setStatus("stage failed: {s}", .{message});
+            },
+        }
+    }
+
+    fn reloadAfterGitAction(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (diff_source.sourceIsOneShotInput(self.config.source)) {
+            ctx.redraw().skip();
+            return;
+        }
+        if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
+            try self.startRepoDiscovery(ctx);
+            return;
+        }
+        try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
+            ctx.redraw().skip();
+            return;
+        }, false);
     }
 
     fn openSelectedFileInEditor(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -1272,6 +1354,10 @@ pub const App = struct {
 
     fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
         if (self.repo_state.workspaceRepos() == null) return;
+        if (self.actions.pending != null) {
+            self.setStatus("finish current git action before switching repos", .{});
+            return;
+        }
 
         self.repo_picker.mode = true;
         self.repo_picker.input = .{};
@@ -1531,6 +1617,14 @@ pub const App = struct {
         };
     }
 
+    fn selectedStagePathKey(self: *const App) ?[]const u8 {
+        const selection = self.selectionContext().selected orelse return null;
+        return switch (selection) {
+            .diff_file => |file| file.path_key,
+            .status_only => |status| status.path_key,
+        };
+    }
+
     fn diffFileSelection(self: *const App, loaded: *const LoadedDiff, file_index: usize) ?context.Selection {
         if (file_index >= loaded.document.files.len) return null;
         const file = loaded.document.files[file_index];
@@ -1675,7 +1769,16 @@ pub const App = struct {
             self.viewer.selected_node = 0;
             return;
         }
-        if (self.selectedDiffFileTarget() == null or self.selectedDiffFileTarget().? >= file_count) {
+        if (self.viewer.selected_target) |target| {
+            switch (target) {
+                .diff_file => |file_index| if (file_index >= file_count) {
+                    self.setSelectedDiffFile(file_count - 1);
+                },
+                .status_only => |status_index| if (status_index >= self.git_status.document.entries.len) {
+                    self.setSelectedDiffFile(file_count - 1);
+                },
+            }
+        } else {
             self.setSelectedDiffFile(file_count - 1);
         }
         if (self.activeLoadedDiff()) |loaded| {
@@ -2553,6 +2656,41 @@ test "sidebar navigation can select directories without changing selected file" 
     try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
 }
 
+test "sidebar navigation keeps status-only target through clamp" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load = testLoadStateWithArena(.init(std.testing.allocator), testLoadedDiffOne()),
+        .viewer = .{
+            .selected_file = 0,
+            .selected_node = 0,
+        },
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/status-only.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+    try app.applyStatusProjection(std.testing.allocator);
+
+    const loaded = app.loadedDiff().?;
+    const status_node = blk: {
+        for (loaded.tree.nodes, 0..) |node, index| {
+            switch (node.target) {
+                .status_entry => break :blk index,
+                else => {},
+            }
+        }
+        return error.ExpectedStatusOnlyNode;
+    };
+
+    app.selectSidebarNode(loaded, status_node);
+    app.clampSelection(loaded.document.files.len);
+
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target.?);
+    try std.testing.expect(app.selectedFileIndex(loaded) == null);
+    try std.testing.expect(app.selectedStatusEntry() != null);
+}
+
 test "toggling selected directory collapses visible descendants" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
@@ -2815,6 +2953,22 @@ test "selectionContext accepts status-only target shape" {
     const status_selection = selection.selected.?.status_only;
     try std.testing.expectEqual(@as(usize, 2), status_selection.status_index);
     try std.testing.expect(status_selection.path_key == null);
+}
+
+test "selectedStagePathKey accepts diff and status-only selections" {
+    var app: App = .{
+        .load = testLoadState(testLoadedDiffTwoWithStatuses()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+
+    try std.testing.expectEqualStrings("src/added.zig", app.selectedStagePathKey().?);
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    defer app.git_status.deinit();
+    try app.git_status.replace("/repo", &status_bundle);
+    app.viewer.selected_target = .{ .status_only = 0 };
+
+    try std.testing.expectEqualStrings("src/new.zig", app.selectedStagePathKey().?);
 }
 
 test "selectionContext keeps no-index source paths" {
