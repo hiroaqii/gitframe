@@ -1,5 +1,32 @@
 const std = @import("std");
 
+/// Diff source class exposed to external integrations.
+///
+/// This deliberately mirrors the user-visible source modes without importing
+/// the CLI module, keeping context export usable from tests and browser-facing
+/// code that do not need terminal argument parsing.
+pub const SourceKind = enum {
+    unstaged,
+    cached,
+    stdin,
+    pager,
+    patch_file,
+    range,
+    no_index,
+};
+
+/// Borrowed description of the active source.
+///
+/// `label` is short and display-oriented. `detail` is optional source-specific
+/// context such as a range string or patch path.
+pub const SourceContext = struct {
+    kind: SourceKind,
+    label: []const u8,
+    detail: ?[]const u8 = null,
+    left_path: ?[]const u8 = null,
+    right_path: ?[]const u8 = null,
+};
+
 /// Canonical repo-relative path used to connect diff files, status entries,
 /// review state, and sidebar targets.
 ///
@@ -45,6 +72,41 @@ pub const SelectedTarget = union(enum) {
             else => null,
         };
     }
+};
+
+/// Model-coordinate selection for a diff file.
+///
+/// Hunk index is optional because empty/binary/status-only bodies can have no
+/// hunk to identify. Rendered row offsets intentionally do not appear here.
+pub const DiffFileSelection = struct {
+    file_index: usize,
+    display_path: []const u8,
+    path_key: ?PathKey = null,
+    hunk_index: ?usize = null,
+};
+
+/// Placeholder for a status-only sidebar row.
+///
+/// The type exists before status-only rows are rendered so action/export code
+/// can be written against the final target shape.
+pub const StatusOnlySelection = struct {
+    status_index: usize,
+    path_key: ?PathKey = null,
+};
+
+pub const Selection = union(enum) {
+    diff_file: DiffFileSelection,
+    status_only: StatusOnlySelection,
+};
+
+/// External-action context for the current app selection.
+///
+/// The slices are borrowed from the active app state / loaded diff. Clone this
+/// context before sending it to async work.
+pub const SelectionContext = struct {
+    repo_root: ?[]const u8,
+    source: SourceContext,
+    selected: ?Selection,
 };
 
 /// Normalize a git path to a repo-relative key.

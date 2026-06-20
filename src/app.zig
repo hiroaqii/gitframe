@@ -1290,6 +1290,56 @@ pub const App = struct {
         }
     }
 
+    pub fn selectionContext(self: *const App) context.SelectionContext {
+        const loaded = self.activeLoadedDiffConst();
+        return .{
+            .repo_root = self.activeRepoRoot(),
+            .source = sourceContext(self.config.source),
+            // Status-only rows currently live behind the loaded-diff gate.
+            // When GitStatusState can exist without a diff document, widen this
+            // branch to validate status-only targets against that model.
+            .selected = if (loaded) |active_loaded| self.selectionForLoaded(active_loaded) else null,
+        };
+    }
+
+    fn sourceContext(source: SourceMode) context.SourceContext {
+        // Labels intentionally mirror CliConfig.sourceLabel(); this helper is
+        // the boundary where CLI source modes become neutral context data.
+        return switch (source) {
+            .unstaged => .{ .kind = .unstaged, .label = "unstaged changes" },
+            .cached => .{ .kind = .cached, .label = "staged changes" },
+            .stdin => .{ .kind = .stdin, .label = "stdin diff" },
+            .pager => .{ .kind = .pager, .label = "pager diff" },
+            .patch_file => |path| .{ .kind = .patch_file, .label = "patch file", .detail = path },
+            .range => |range| .{ .kind = .range, .label = "range", .detail = range },
+            .no_index => |paths| .{
+                .kind = .no_index,
+                .label = "difftool",
+                .left_path = paths.left,
+                .right_path = paths.right,
+            },
+        };
+    }
+
+    fn selectionForLoaded(self: *const App, loaded: *const LoadedDiff) ?context.Selection {
+        const target = self.viewer.selected_target orelse return null;
+        return switch (target) {
+            .diff_file => |file_index| self.diffFileSelection(loaded, file_index),
+            .status_only => |status_index| .{ .status_only = .{ .status_index = status_index } },
+        };
+    }
+
+    fn diffFileSelection(self: *const App, loaded: *const LoadedDiff, file_index: usize) ?context.Selection {
+        if (file_index >= loaded.document.files.len) return null;
+        const file = loaded.document.files[file_index];
+        return .{ .diff_file = .{
+            .file_index = file_index,
+            .display_path = diff_file.displayPath(file),
+            .path_key = diff_file.canonicalPathKey(file),
+            .hunk_index = if (self.viewer.selected_hunk < file.hunks.len) self.viewer.selected_hunk else null,
+        } };
+    }
+
     fn selectedFile(self: *const App) ?diff_parser.FileDiff {
         const loaded = self.activeLoadedDiffConst() orelse return null;
         const file_index = self.selectedFileIndex(loaded) orelse return null;
@@ -2486,6 +2536,77 @@ test "diff status row indicates active focus" {
 
     try ts.expectCellText(0, 2, "▸");
     try std.testing.expect(ts.surface.readCell(0, 2).?.style.reverse);
+}
+
+test "selectionContext exposes selected diff file model coordinate" {
+    const app: App = .{
+        .config = .{ .source = .{ .range = "main...HEAD" } },
+        .load = testLoadState(testLoadedDiffTwo()),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .selected_file = 0,
+            .selected_hunk = 1,
+        },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "gitframe",
+            .display_path = ".",
+            .canonical_root = "/repo/gitframe",
+        } } },
+    };
+
+    const selection = app.selectionContext();
+    try std.testing.expectEqualStrings("/repo/gitframe", selection.repo_root.?);
+    try std.testing.expectEqual(context.SourceKind.range, selection.source.kind);
+    try std.testing.expectEqualStrings("main...HEAD", selection.source.detail.?);
+
+    const diff_selection = selection.selected.?.diff_file;
+    try std.testing.expectEqual(@as(usize, 0), diff_selection.file_index);
+    try std.testing.expectEqualStrings("a", diff_selection.display_path);
+    try std.testing.expectEqualStrings("a", diff_selection.path_key.?);
+    try std.testing.expectEqual(@as(?usize, 1), diff_selection.hunk_index);
+}
+
+test "selectionContext accepts status-only target shape" {
+    const app: App = .{
+        .config = .{ .source = .stdin },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 2 } },
+    };
+
+    const selection = app.selectionContext();
+    try std.testing.expect(selection.repo_root == null);
+    try std.testing.expectEqual(context.SourceKind.stdin, selection.source.kind);
+
+    const status_selection = selection.selected.?.status_only;
+    try std.testing.expectEqual(@as(usize, 2), status_selection.status_index);
+    try std.testing.expect(status_selection.path_key == null);
+}
+
+test "selectionContext keeps no-index source paths" {
+    const app: App = .{
+        .config = .{ .source = .{ .no_index = .{ .left = "before.zig", .right = "after.zig" } } },
+    };
+
+    const selection = app.selectionContext();
+    try std.testing.expectEqual(context.SourceKind.no_index, selection.source.kind);
+    try std.testing.expectEqualStrings("difftool", selection.source.label);
+    try std.testing.expect(selection.source.detail == null);
+    try std.testing.expectEqualStrings("before.zig", selection.source.left_path.?);
+    try std.testing.expectEqualStrings("after.zig", selection.source.right_path.?);
+    try std.testing.expect(selection.selected == null);
+}
+
+test "selectionContext returns null selected without a target" {
+    const app: App = .{
+        .config = .{ .source = .unstaged },
+        .viewer = .{ .selected_target = null },
+    };
+
+    const selection = app.selectionContext();
+    try std.testing.expect(selection.repo_root == null);
+    try std.testing.expectEqual(context.SourceKind.unstaged, selection.source.kind);
+    try std.testing.expectEqualStrings("unstaged changes", selection.source.label);
+    try std.testing.expect(selection.selected == null);
 }
 
 test "diff search row keeps active focus style" {
