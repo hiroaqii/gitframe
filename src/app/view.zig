@@ -1,6 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
+const app_commit_panel = @import("commit_panel.zig");
 const draw = @import("draw");
 const diff_render = @import("../diff/render.zig");
 const git_status = @import("../git/status.zig");
@@ -28,6 +29,8 @@ const help_two_column_min_width: u16 = 96;
 const help_column_gap: u16 = 2;
 const help_header_rows: u16 = 2;
 const help_scroll_indicator_rows: u16 = 1;
+const commit_dialog_width: u16 = 72;
+const commit_dialog_height: u16 = 10;
 
 const StateTone = enum {
     muted,
@@ -86,6 +89,9 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
     }
     if (app.overlay.isHelp()) {
         try viewHelpPopup(app, surface);
+    }
+    if (app.commit_panel.mode) {
+        try viewCommitPanel(app, surface);
     }
 }
 
@@ -652,6 +658,56 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
     }
 }
 
+fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
+    const modal = ui.Modal.init(.{});
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, commit_dialog_width),
+        .dialog_height = @min(surface.size().height, commit_dialog_height),
+        .title = "Commit",
+        .border = .rounded,
+        .title_style = .{ .bold = true, .fg = .{ .index = 14 } },
+        .border_style = .{ .fg = .gray },
+        .backdrop_style = .{ .dim = true },
+    };
+    modal.view(surface, opts);
+
+    const content_rect = ui.Modal.contentRect(surface, opts);
+    if (content_rect.width == 0 or content_rect.height == 0) return;
+    var content = surface.child(content_rect);
+    const size = content.size();
+
+    const staged_text = try stagedSummaryText(content.frameAllocator(), app.stagedSummaryForActiveRepo());
+    try draw.copyClippedTextAt(&content, 0, 0, staged_text, .{ .fg = .gray });
+
+    if (size.height > 2) {
+        _ = content.borrowTextAt(0, 2, "message: ", .{ .bold = true });
+        const input_col: u16 = @min(9, size.width);
+        if (size.width > input_col) {
+            try draw.copyClippedTextAt(&content, input_col, 2, app.commit_panel.message.slice(), .{ .fg = .{ .index = 11 } });
+        }
+    }
+
+    if (size.height > 4) {
+        if (app.commit_panel.commit_error) |err| {
+            try draw.copyClippedTextAt(&content, 0, 4, err.message(), .{ .fg = .{ .index = 9 } });
+        } else {
+            try draw.copyClippedTextAt(&content, 0, 4, "Enter validates the staged commit; git commit is added later.", .{ .fg = .gray });
+        }
+    }
+
+    if (size.height > 6) {
+        try draw.copyClippedTextAt(&content, 0, 6, "Enter: validate  Esc: close", .{ .fg = .gray });
+    }
+}
+
+fn stagedSummaryText(allocator: std.mem.Allocator, summary: app_commit_panel.StagedSummary) ![]const u8 {
+    return switch (summary) {
+        .ready => |ready| try std.fmt.allocPrint(allocator, "{d} staged file{s}", .{ ready.count, if (ready.count == 1) "" else "s" }),
+        .loading_or_stale => "status loading...",
+        .unavailable => "status unavailable",
+    };
+}
+
 fn footerItems(app: anytype) []const ui.key_hint.Item {
     if (app.viewer.sidebar_hidden) return &footer_hidden_sidebar_items;
     return &footer_items;
@@ -1028,12 +1084,14 @@ test "help popup max scroll helper separates outer and content sizes" {
 
 const footer_items = [_]ui.key_hint.Item{
     ui.key_hint.item("Tab", "focus"),
+    ui.key_hint.item("c", "commit"),
     ui.key_hint.item("?", "help"),
     ui.key_hint.item("q", "quit"),
 };
 
 const footer_hidden_sidebar_items = [_]ui.key_hint.Item{
     ui.key_hint.item("B", "sidebar"),
+    ui.key_hint.item("c", "commit"),
     ui.key_hint.item("?", "help"),
     ui.key_hint.item("q", "quit"),
 };
@@ -1055,6 +1113,7 @@ const help_global_items = [_]HelpItem{
     .{ .key = "B", .description = "show / hide sidebar" },
     .{ .key = "r", .description = "reload active repository" },
     .{ .key = "R", .description = "switch repository" },
+    .{ .key = "c", .description = "open commit panel" },
     .{ .key = "s", .description = "stage selected file" },
     .{ .key = "Home/End", .description = "first / last file" },
 };

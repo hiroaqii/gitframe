@@ -20,6 +20,7 @@ pub const Focus = enum {
 pub const KeyContext = struct {
     search_mode: bool = false,
     file_search_mode: bool = false,
+    commit_panel_mode: bool = false,
     repo_picker_mode: bool = false,
     repo_picker_path_input: bool = false,
     help_mode: bool = false,
@@ -56,6 +57,14 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         return null;
     }
 
+    if (context.commit_panel_mode) {
+        if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_commit_panel");
+        if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "submit_commit_panel");
+        if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "commit_panel_backspace");
+        if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "commit_panel_insert", codepoint);
+        return null;
+    }
+
     if (context.repo_picker_mode) {
         if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_repo_picker");
         if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "submit_repo_picker");
@@ -75,6 +84,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
 
     if (context.help_mode) {
         if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "close_help");
+        if (key.matches('c', .{})) return voidMsg(Msg, "enter_commit_panel");
         if (isHelpKey(key) or key.codepoint == 'q') return voidMsg(Msg, "close_help");
         if (key.matches(chasen.Key.page_up, .{})) return voidMsg(Msg, "help_page_up");
         if (key.matches(chasen.Key.page_down, .{})) return voidMsg(Msg, "help_page_down");
@@ -114,6 +124,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (matchesShiftedAscii(key, 'h', 'H')) return voidMsg(Msg, "toggle_hide_reviewed_files");
     if (matchesShiftedAscii(key, 'b', 'B')) return voidMsg(Msg, "toggle_sidebar_visibility");
     if (matchesShiftedAscii(key, 'l', 'L')) return voidMsg(Msg, "toggle_line_numbers");
+    if (key.matches('c', .{})) return voidMsg(Msg, "enter_commit_panel");
 
     return switch (key.codepoint) {
         'k', chasen.Key.up => if (context.focus == .diff) voidMsg(Msg, "scroll_diff_up") else voidMsg(Msg, "select_previous_file"),
@@ -199,6 +210,10 @@ const TestMsg = union(enum) {
     submit_file_search,
     file_search_backspace,
     file_search_insert: u21,
+    cancel_commit_panel,
+    submit_commit_panel,
+    commit_panel_backspace,
+    commit_panel_insert: u21,
     cancel_repo_picker,
     submit_repo_picker,
     repo_picker_backspace,
@@ -241,6 +256,7 @@ const TestMsg = union(enum) {
     toggle_sidebar_visibility,
     decrease_sidebar_width,
     increase_sidebar_width,
+    enter_commit_panel,
     stage_selected_file,
     open_selected_file_in_editor,
     toggle_display_mode,
@@ -296,6 +312,18 @@ test "keyToMsg maps stage file action" {
     try std.testing.expectEqual(TestMsg.stage_selected_file, keyToMsg(TestMsg, .{}, .{ .codepoint = 's' }).?);
 }
 
+test "keyToMsg maps commit panel command and routes panel input" {
+    try std.testing.expectEqual(TestMsg.enter_commit_panel, keyToMsg(TestMsg, .{}, .{ .codepoint = 'c' }).?);
+    try std.testing.expectEqual(TestMsg.cancel_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(TestMsg.submit_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(TestMsg.commit_panel_backspace, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.backspace }).?);
+    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'x' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'R' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'R' }).?);
+    try std.testing.expectEqual(TestMsg.enter_commit_panel, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'c' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
+}
+
 test "keyToMsg maps repo picker path input command across shifted colon variants" {
     const context: KeyContext = .{ .repo_picker_mode = true };
     try std.testing.expectEqual(TestMsg.repo_picker_enter_path_input, keyToMsg(TestMsg, context, .{ .codepoint = ':' }).?);
@@ -347,6 +375,7 @@ test "keyToMsg ignores special keys in text input modes" {
     for (common_cases) |key| {
         try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .search_mode = true }, key));
         try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .file_search_mode = true }, key));
+        try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .commit_panel_mode = true }, key));
         try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, key));
     }
 
@@ -395,6 +424,7 @@ test "keyToMsg ignores ctrl printable in text input modes" {
 
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .search_mode = true }, ctrl_c));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .file_search_mode = true }, ctrl_c));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .commit_panel_mode = true }, ctrl_c));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, ctrl_c));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, ctrl_c));
 }
@@ -402,6 +432,7 @@ test "keyToMsg ignores ctrl printable in text input modes" {
 test "keyToMsg keeps printable text input modes working" {
     try std.testing.expectEqual(TestMsg{ .search_insert = 'x' }, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = 'x' }).?);
     try std.testing.expectEqual(TestMsg{ .file_search_insert = 'x' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'x' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'x' }).?);
     try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'x' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = 'x' }).?);
     try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'x' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = 'x' }).?);
     try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ':' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = ':' }).?);
@@ -416,6 +447,7 @@ test "keyToMsg prefers generated text for printable text input" {
 
     try std.testing.expectEqual(TestMsg{ .search_insert = '1' }, keyToMsg(TestMsg, .{ .search_mode = true }, keypad_one).?);
     try std.testing.expectEqual(TestMsg{ .file_search_insert = '1' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, keypad_one).?);
+    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = '1' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, keypad_one).?);
     try std.testing.expectEqual(TestMsg{ .repo_picker_insert = '1' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, keypad_one).?);
     try std.testing.expectEqual(TestMsg{ .repo_picker_insert = '1' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, keypad_one).?);
 }

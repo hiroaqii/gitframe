@@ -2,6 +2,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const app_actions = @import("app/actions.zig");
+const app_commit_panel = @import("app/commit_panel.zig");
 const app_input = @import("app/input.zig");
 const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
@@ -143,6 +144,7 @@ pub const App = struct {
     status: app_state.StatusMessage = .{},
     viewer: ViewerState = .{},
     search: DiffSearchState = .{},
+    commit_panel: app_commit_panel.State = .{},
     file_search: app_prompt.FilterPromptState = .{},
     file_search_return_focus: Focus = .sidebar,
     repo_picker: app_prompt.RepoPickerState = .{},
@@ -217,6 +219,11 @@ pub const App = struct {
         submit_file_search,
         file_search_insert: u21,
         file_search_backspace,
+        enter_commit_panel,
+        cancel_commit_panel,
+        submit_commit_panel,
+        commit_panel_insert: u21,
+        commit_panel_backspace,
         enter_repo_picker,
         cancel_repo_picker,
         submit_repo_picker,
@@ -372,6 +379,11 @@ pub const App = struct {
                 self.file_search.resetNoMatch();
                 self.file_search.input.backspace();
             },
+            .enter_commit_panel => self.enterCommitPanelMode(),
+            .cancel_commit_panel => self.commit_panel.close(),
+            .submit_commit_panel => self.submitCommitPanel(),
+            .commit_panel_insert => |codepoint| self.commit_panel.insert(codepoint),
+            .commit_panel_backspace => self.commit_panel.backspace(),
             .enter_repo_picker => try self.enterRepoPickerMode(ctx.allocator()),
             .cancel_repo_picker => self.cancelRepoPickerMode(ctx.allocator()),
             .submit_repo_picker => try self.submitRepoPicker(ctx),
@@ -425,7 +437,7 @@ pub const App = struct {
     }
 
     fn mouseToMsg(self: *const App, mouse: anytype) ?Msg {
-        if (self.search.mode or self.file_search.mode or self.repo_picker.mode) return null;
+        if (self.search.mode or self.file_search.mode or self.commit_panel.mode or self.repo_picker.mode) return null;
         if (mouse.type != .press) return null;
 
         if (self.overlay.isHelp()) {
@@ -517,6 +529,7 @@ pub const App = struct {
         return .{
             .search_mode = self.search.mode,
             .file_search_mode = self.file_search.mode,
+            .commit_panel_mode = self.commit_panel.mode,
             .repo_picker_mode = self.repo_picker.mode,
             .help_mode = self.overlay.isHelp(),
             .search_query_len = self.search.query.len,
@@ -752,6 +765,50 @@ pub const App = struct {
         self.setStatus("staging: {s}", .{path});
     }
 
+    fn enterCommitPanelMode(self: *App) void {
+        if (self.actions.pending != null) {
+            self.setStatus("finish current git action before committing", .{});
+            return;
+        }
+        if (!diff_source.sourceAllowsStageProjection(self.config.source) or self.activeRepoRoot() == null) {
+            self.setStatus("commit unavailable for this source", .{});
+            return;
+        }
+
+        self.overlay.close();
+        self.commit_panel.open();
+    }
+
+    fn submitCommitPanel(self: *App) void {
+        if (self.actions.pending != null) {
+            self.commit_panel.commit_error = .action_pending;
+            self.setStatus("finish current git action before committing", .{});
+            return;
+        }
+
+        if (self.commit_panel.validateSubmit(self.stagedSummaryForActiveRepo())) |err| {
+            self.commit_panel.commit_error = err;
+            return;
+        }
+
+        self.setStatus("commit action is not implemented yet", .{});
+    }
+
+    pub fn stagedSummaryForActiveRepo(self: *const App) app_commit_panel.StagedSummary {
+        if (!diff_source.sourceAllowsStageProjection(self.config.source)) return .unavailable;
+
+        const active_root = self.activeRepoRoot() orelse return .unavailable;
+        if (self.status_load_pending != null) return .loading_or_stale;
+        const snapshot_root = self.git_status.repo_root orelse return .unavailable;
+        if (!std.mem.eql(u8, active_root, snapshot_root)) return .loading_or_stale;
+
+        var count: usize = 0;
+        for (self.git_status.document.entries) |entry| {
+            if (entry.isStaged()) count += 1;
+        }
+        return .{ .ready = .{ .count = count } };
+    }
+
     fn finishStageFile(self: *App, ctx: *chasen.Ctx(Msg), finished: StageFileFinished) !void {
         var result = finished;
         defer result.deinit(ctx.allocator());
@@ -916,7 +973,7 @@ pub const App = struct {
     fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (!self.config.watch) return;
         if (diff_source.sourceIsOneShotInput(self.config.source)) return;
-        if (self.repo_picker.mode or self.search.mode or self.file_search.mode) {
+        if (self.repo_picker.mode or self.search.mode or self.file_search.mode or self.commit_panel.mode) {
             ctx.redraw().skip();
             return;
         }
@@ -3248,6 +3305,28 @@ test "pending selection restore waits for status projection after stage" {
 
     try std.testing.expect(app.pending_selection_restore == null);
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target.?);
+}
+
+test "staged summary distinguishes pending missing and ready status snapshots" {
+    var app: App = .{
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.git_status.deinit();
+
+    try std.testing.expectEqual(app_commit_panel.StagedSummary.unavailable, app.stagedSummaryForActiveRepo());
+
+    app.status_load_pending = 1;
+    try std.testing.expectEqual(app_commit_panel.StagedSummary.loading_or_stale, app.stagedSummaryForActiveRepo());
+
+    app.status_load_pending = null;
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  staged.zig\x00 M unstaged.zig\x00?? new.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    try std.testing.expectEqual(app_commit_panel.StagedSummary{ .ready = .{ .count = 1 } }, app.stagedSummaryForActiveRepo());
 }
 
 test "pending selection restore survives status projection while diff reload is pending" {
