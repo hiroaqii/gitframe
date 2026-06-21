@@ -44,7 +44,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_search");
         if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "submit_search");
         if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "search_backspace");
-        if (isTextInputCodepoint(key.codepoint)) return payloadMsg(Msg, "search_insert", key.codepoint);
+        if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "search_insert", codepoint);
         return null;
     }
 
@@ -52,7 +52,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_file_search");
         if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "submit_file_search");
         if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "file_search_backspace");
-        if (isTextInputCodepoint(key.codepoint)) return payloadMsg(Msg, "file_search_insert", key.codepoint);
+        if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "file_search_insert", codepoint);
         return null;
     }
 
@@ -61,7 +61,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "submit_repo_picker");
         if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "repo_picker_backspace");
         if (context.repo_picker_path_input) {
-            if (isTextInputCodepoint(key.codepoint)) return payloadMsg(Msg, "repo_picker_insert", key.codepoint);
+            if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
             return null;
         }
         if (isColonKey(key)) return voidMsg(Msg, "repo_picker_enter_path_input");
@@ -69,7 +69,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
             'k', chasen.Key.up => voidMsg(Msg, "repo_picker_move_previous"),
             'j', chasen.Key.down => voidMsg(Msg, "repo_picker_move_next"),
             'q' => voidMsg(Msg, "cancel_repo_picker"),
-            else => if (isTextInputCodepoint(key.codepoint)) payloadMsg(Msg, "repo_picker_insert", key.codepoint) else null,
+            else => if (textInputCodepoint(key)) |codepoint| payloadMsg(Msg, "repo_picker_insert", codepoint) else null,
         };
     }
 
@@ -149,7 +149,35 @@ fn matchesShiftedAscii(key: chasen.Key, lower: u21, upper: u21) bool {
     return key.matches(upper, .{}) or (key.codepoint == lower and key.mods.shift);
 }
 
-pub fn isTextInputCodepoint(codepoint: u21) bool {
+fn textInputCodepoint(key: chasen.Key) ?u21 {
+    if (key.isModifier()) return null;
+    if (key.mods.ctrl or key.mods.alt or key.mods.super or key.mods.hyper or key.mods.meta) return null;
+    if (keyTextCodepoint(key)) |codepoint| return codepoint;
+    if (key.codepoint == chasen.Key.multicodepoint) return null;
+    if (isVaxisSpecialCodepoint(key.codepoint)) return null;
+    if (!isPrintableCodepoint(key.codepoint)) return null;
+    return key.codepoint;
+}
+
+fn keyTextCodepoint(key: chasen.Key) ?u21 {
+    const text = key.text orelse return null;
+    if (text.len == 0) return null;
+
+    const len = std.unicode.utf8ByteSequenceLength(text[0]) catch return null;
+    if (len != text.len) return null;
+
+    const codepoint = std.unicode.utf8Decode(text) catch return null;
+    if (!isPrintableCodepoint(codepoint)) return null;
+    return codepoint;
+}
+
+// Vaxis encodes non-text special keys in this private-use range. Treat them as
+// non-text unless the event also carries printable key.text.
+fn isVaxisSpecialCodepoint(codepoint: u21) bool {
+    return codepoint >= chasen.Key.insert and codepoint <= chasen.Key.iso_level_5_shift;
+}
+
+fn isPrintableCodepoint(codepoint: u21) bool {
     return codepoint >= 0x20 and codepoint != 0x7f and !(codepoint >= 0x80 and codepoint <= 0x9f);
 }
 
@@ -274,6 +302,122 @@ test "keyToMsg maps repo picker path input command across shifted colon variants
     try std.testing.expectEqual(TestMsg.repo_picker_enter_path_input, keyToMsg(TestMsg, context, shiftedAscii(';', ':')).?);
     try std.testing.expectEqual(TestMsg.repo_picker_enter_path_input, keyToMsg(TestMsg, context, shiftedLowerOnly(';')).?);
     try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ';' }, keyToMsg(TestMsg, context, .{ .codepoint = ';' }).?);
+}
+
+test "keyToMsg ignores special keys in text input modes" {
+    const common_cases = [_]chasen.Key{
+        .{ .codepoint = chasen.Key.up },
+        .{ .codepoint = chasen.Key.up, .mods = .{ .shift = true } },
+        .{ .codepoint = chasen.Key.down, .mods = .{ .alt = true } },
+        .{ .codepoint = chasen.Key.left, .mods = .{ .ctrl = true } },
+        .{ .codepoint = chasen.Key.right },
+        .{ .codepoint = chasen.Key.home },
+        .{ .codepoint = chasen.Key.end },
+        .{ .codepoint = chasen.Key.page_up },
+        .{ .codepoint = chasen.Key.page_down },
+        .{ .codepoint = chasen.Key.insert },
+        .{ .codepoint = chasen.Key.delete },
+        .{ .codepoint = chasen.Key.kp_up },
+        .{ .codepoint = chasen.Key.kp_down },
+        .{ .codepoint = chasen.Key.kp_home },
+        .{ .codepoint = chasen.Key.kp_end },
+        .{ .codepoint = chasen.Key.kp_page_up },
+        .{ .codepoint = chasen.Key.kp_page_down },
+        .{ .codepoint = chasen.Key.kp_insert },
+        .{ .codepoint = chasen.Key.kp_delete },
+        .{ .codepoint = chasen.Key.tab },
+        .{ .codepoint = chasen.Key.left_shift },
+        .{ .codepoint = chasen.Key.right_shift },
+        .{ .codepoint = chasen.Key.left_alt },
+        .{ .codepoint = chasen.Key.right_alt },
+        .{ .codepoint = chasen.Key.left_control },
+        .{ .codepoint = chasen.Key.right_control },
+        .{ .codepoint = chasen.Key.iso_level_3_shift },
+        .{ .codepoint = chasen.Key.iso_level_5_shift },
+        .{ .codepoint = chasen.Key.f1 },
+        .{ .codepoint = chasen.Key.f35 },
+        .{ .codepoint = chasen.Key.caps_lock },
+        .{ .codepoint = chasen.Key.menu },
+        .{ .codepoint = chasen.Key.media_play },
+        .{ .codepoint = chasen.Key.kp_1 },
+        .{ .codepoint = chasen.Key.multicodepoint },
+        .{ .codepoint = chasen.Key.multicodepoint, .text = "ab" },
+    };
+
+    for (common_cases) |key| {
+        try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .search_mode = true }, key));
+        try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .file_search_mode = true }, key));
+        try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, key));
+    }
+
+    const picker_list_text_cases = [_]chasen.Key{
+        .{ .codepoint = chasen.Key.left },
+        .{ .codepoint = chasen.Key.right },
+        .{ .codepoint = chasen.Key.home },
+        .{ .codepoint = chasen.Key.end },
+        .{ .codepoint = chasen.Key.page_up },
+        .{ .codepoint = chasen.Key.page_down },
+        .{ .codepoint = chasen.Key.insert },
+        .{ .codepoint = chasen.Key.delete },
+        .{ .codepoint = chasen.Key.kp_left },
+        .{ .codepoint = chasen.Key.kp_right },
+        .{ .codepoint = chasen.Key.kp_home },
+        .{ .codepoint = chasen.Key.kp_end },
+        .{ .codepoint = chasen.Key.kp_page_up },
+        .{ .codepoint = chasen.Key.kp_page_down },
+        .{ .codepoint = chasen.Key.kp_insert },
+        .{ .codepoint = chasen.Key.kp_delete },
+        .{ .codepoint = chasen.Key.tab },
+        .{ .codepoint = chasen.Key.left_shift },
+        .{ .codepoint = chasen.Key.right_shift },
+        .{ .codepoint = chasen.Key.left_alt },
+        .{ .codepoint = chasen.Key.right_alt },
+        .{ .codepoint = chasen.Key.left_control },
+        .{ .codepoint = chasen.Key.right_control },
+        .{ .codepoint = chasen.Key.iso_level_3_shift },
+        .{ .codepoint = chasen.Key.iso_level_5_shift },
+        .{ .codepoint = chasen.Key.f1 },
+        .{ .codepoint = chasen.Key.f35 },
+        .{ .codepoint = chasen.Key.caps_lock },
+        .{ .codepoint = chasen.Key.menu },
+        .{ .codepoint = chasen.Key.media_play },
+        .{ .codepoint = chasen.Key.kp_1 },
+        .{ .codepoint = chasen.Key.multicodepoint },
+        .{ .codepoint = chasen.Key.multicodepoint, .text = "ab" },
+    };
+    for (picker_list_text_cases) |key| {
+        try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, key));
+    }
+}
+
+test "keyToMsg ignores ctrl printable in text input modes" {
+    const ctrl_c: chasen.Key = .{ .codepoint = 'c', .mods = .{ .ctrl = true } };
+
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .search_mode = true }, ctrl_c));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .file_search_mode = true }, ctrl_c));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, ctrl_c));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, ctrl_c));
+}
+
+test "keyToMsg keeps printable text input modes working" {
+    try std.testing.expectEqual(TestMsg{ .search_insert = 'x' }, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(TestMsg{ .file_search_insert = 'x' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'x' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'x' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ':' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = ':' }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 0x1F408 }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = 0x1F408 }).?);
+}
+
+test "keyToMsg prefers generated text for printable text input" {
+    const keypad_one: chasen.Key = .{
+        .codepoint = chasen.Key.kp_1,
+        .text = "1",
+    };
+
+    try std.testing.expectEqual(TestMsg{ .search_insert = '1' }, keyToMsg(TestMsg, .{ .search_mode = true }, keypad_one).?);
+    try std.testing.expectEqual(TestMsg{ .file_search_insert = '1' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, keypad_one).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = '1' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, keypad_one).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = '1' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, keypad_one).?);
 }
 
 test "keyToMsg uses search query to disambiguate navigation" {
