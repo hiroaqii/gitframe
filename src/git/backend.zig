@@ -66,8 +66,19 @@ pub const OperationResult = union(enum) {
 pub const GitDiffKind = union(enum) {
     unstaged,
     cached,
+    file: FileDiffRequest,
     range: []const u8,
     no_index: PathPair,
+};
+
+pub const FileDiffBase = enum {
+    unstaged,
+    cached,
+};
+
+pub const FileDiffRequest = struct {
+    base: FileDiffBase,
+    path: []const u8,
 };
 
 pub const PathPair = struct {
@@ -140,6 +151,7 @@ pub const LocalCommandBackend = struct {
         return switch (request.kind) {
             .unstaged => loadGitDiff(allocator, io, repoRoot(request), &git_diff_unstaged),
             .cached => loadGitDiff(allocator, io, repoRoot(request), &git_diff_cached),
+            .file => |file| loadGitFileDiff(allocator, io, repoRoot(request), file),
             .range => |range| loadGitDiffRange(allocator, io, repoRoot(request), range),
             .no_index => |paths| loadNoIndexDiff(allocator, io, paths),
         };
@@ -209,6 +221,19 @@ fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, 
 fn loadGitDiffRange(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, range: []const u8) LoadError!LoadResult {
     const argv = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", range };
     return loadGitDiff(allocator, io, repo_root, &argv);
+}
+
+fn loadGitFileDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: FileDiffRequest) LoadError!LoadResult {
+    return switch (request.base) {
+        .unstaged => {
+            const argv = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", request.path };
+            return loadGitDiff(allocator, io, repo_root, &argv);
+        },
+        .cached => {
+            const argv = [_][]const u8{ "git", "diff", "--cached", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", request.path };
+            return loadGitDiff(allocator, io, repo_root, &argv);
+        },
+    };
 }
 
 fn loadGitStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!StatusLoadResult {

@@ -90,6 +90,40 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     }
 }
 
+pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, lines: []const []const u8, truncated: bool, options: RenderOptions) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    const mode = effectiveMode(size.width, options.requested_mode);
+    try renderGeneratedFileHeader(surface, path, lines.len, truncated, options.requested_mode, options.pane_active);
+
+    var cursor: BodyCursor = .{
+        .scroll = options.scroll,
+        .height = size.height,
+    };
+
+    if (truncated) {
+        const row = cursor.nextRow();
+        if (row) |visible_row| try draw.copyClippedTextAt(surface, 0, visible_row, "File preview truncated", style_warning);
+    }
+
+    for (lines, 0..) |line_text, index| {
+        if (cursor.done()) return;
+        const row = cursor.nextRow() orelse continue;
+        const line: diff_parser.DiffLine = .{
+            .kind = .added,
+            .text = line_text,
+            .new_line = @intCast(index + 1),
+        };
+        if (mode == .side_by_side and size.width >= side_by_side_min_width) {
+            const gutter_col = size.width / 2;
+            try drawSideBySidePair(surface, row, null, line, gutter_col, options.horizontal_scroll, options.line_numbers);
+        } else {
+            try drawUnifiedLine(surface, row, line, options.horizontal_scroll, options.line_numbers);
+        }
+    }
+}
+
 fn lineIndexMatchesFile(file: diff_parser.FileDiff, index: diff_view_model.RenderedLineIndex, mode: DisplayMode) bool {
     return index.mode == mode and index.hunk_offsets.len == file.hunks.len;
 }
@@ -106,6 +140,24 @@ fn renderFileHeader(
         modeLabel(surface.size().width, requested_mode),
         stats.added,
         stats.removed,
+    });
+    try draw.copyClippedTextAt(surface, 0, 1, summary, style_metadata);
+}
+
+fn renderGeneratedFileHeader(
+    surface: *chasen.Surface,
+    path: []const u8,
+    added_lines: usize,
+    truncated: bool,
+    requested_mode: DisplayMode,
+    pane_active: bool,
+) !void {
+    try draw.copyClippedTextAt(surface, 0, 0, path, fileHeaderStyle(pane_active));
+    const suffix = if (truncated) "  truncated" else "";
+    const summary = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  +{d} -0  generated{s}", .{
+        modeLabel(surface.size().width, requested_mode),
+        added_lines,
+        suffix,
     });
     try draw.copyClippedTextAt(surface, 0, 1, summary, style_metadata);
 }
@@ -385,6 +437,20 @@ test "displayPath prefers new path and strips git prefixes" {
     };
 
     try std.testing.expectEqualStrings("src/main.zig", displayPath(file));
+}
+
+test "renderGeneratedAddedFile draws content on new side in side-by-side mode" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(90, 6);
+    defer ts.deinit();
+
+    try renderGeneratedAddedFile(&ts.surface, "src/new.zig", &.{ "const value = 1;", "pub fn main() void {}" }, false, .{ .requested_mode = .side_by_side });
+
+    try ts.expectCellText(0, 0, "s");
+    try ts.expectCellText(0, 1, "s");
+    try ts.expectCellText(45, 3, "│");
+    try ts.expectCellText(51, 3, "+");
+    try ts.expectCellText(53, 3, "c");
 }
 
 test "narrow side-by-side request labels file header as automatic unified fallback" {

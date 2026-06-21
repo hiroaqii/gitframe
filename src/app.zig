@@ -7,6 +7,7 @@ const app_input = @import("app/input.zig");
 const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
 const app_prompt = @import("app/prompt.zig");
+const app_review_projection = @import("app/review_projection.zig");
 const app_state = @import("app/state.zig");
 const app_view = @import("app/view.zig");
 const context = @import("context.zig");
@@ -48,6 +49,8 @@ const RepoPathDiscoveryFinished = app_load.RepoPathDiscoveryFinished;
 const RepoPathDiscoveryTask = app_load.RepoPathDiscoveryTask(App.Msg);
 const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
+const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
+const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
 const StageFileFinished = app_actions.StageFileFinished;
 const StageFileTask = app_actions.StageFileTask(App.Msg);
 
@@ -157,6 +160,8 @@ pub const App = struct {
     recent_repos: repo_state.RecentStore = .{},
     overlay: app_state.OverlayState = .{},
     review_display: app_state.ReviewDisplayState = .{},
+    review_projection: app_review_projection.State = .idle,
+    review_projection_next_id: u64 = 0,
     repo_state: repo_state.State = .{},
     git_status: git_status.GitStatusState = .{},
     status_load_generation: u64 = 0,
@@ -174,6 +179,7 @@ pub const App = struct {
         repo_path_discovered: app_load.RepoPathDiscoveryFinished,
         diff_loaded: DiffLoadFinished,
         status_loaded: StatusLoadFinished,
+        review_projection_loaded: ReviewProjectionFinished,
         stage_file_finished: StageFileFinished,
         select_previous_file,
         select_next_file,
@@ -272,6 +278,7 @@ pub const App = struct {
         self.deinitRepoPickerItems(deinit_ctx.allocator);
         self.recent_repos.deinit(deinit_ctx.allocator);
         self.reviewed_store.deinit(deinit_ctx.allocator);
+        self.review_projection.deinit(deinit_ctx.allocator);
         self.tree_order.deinit(deinit_ctx.allocator);
         if (self.tree_order_scope) |scope| deinit_ctx.allocator.free(scope);
         if (self.pending_selection_restore) |*restore| restore.deinit(deinit_ctx.allocator);
@@ -293,6 +300,7 @@ pub const App = struct {
             .repo_path_discovered => |finished| try self.finishRepoPathDiscovery(ctx, finished),
             .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
             .status_loaded => |finished| try self.finishStatusLoad(ctx, finished),
+            .review_projection_loaded => |finished| try self.finishReviewProjectionLoad(ctx, finished),
             .stage_file_finished => |finished| try self.finishStageFile(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
@@ -423,6 +431,7 @@ pub const App = struct {
             .auto_reload_tick => try self.autoReloadTick(ctx),
             .quit => ctx.quit(),
         }
+        try self.ensureReviewProjection(ctx);
     }
 
     pub fn view(self: *const App, surface: *chasen.Surface) !void {
@@ -716,6 +725,83 @@ pub const App = struct {
         self.status_load_generation +%= 1;
         self.status_load_pending = null;
         self.git_status.clear();
+    }
+
+    fn ensureReviewProjection(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const target = self.reviewProjectionTarget() orelse {
+            if (self.review_projection != .idle) {
+                self.review_projection.deinit(self.allocator orelse ctx.allocator());
+            }
+            return;
+        };
+
+        if (self.review_projection.matches(
+            target.repo_root,
+            target.path_key,
+            target.kind,
+            self.load.generation,
+            self.status_load_generation,
+        )) return;
+
+        self.review_projection.deinit(ctx.allocator());
+        self.review_projection_next_id +%= 1;
+        var state_request = try app_review_projection.cloneRequest(
+            ctx.allocator(),
+            self.review_projection_next_id,
+            target.repo_root,
+            target.path_key,
+            target.kind,
+            self.load.generation,
+            self.status_load_generation,
+        );
+        errdefer state_request.deinit(ctx.allocator());
+
+        var task_request = try app_review_projection.cloneRequest(
+            ctx.allocator(),
+            self.review_projection_next_id,
+            target.repo_root,
+            target.path_key,
+            target.kind,
+            self.load.generation,
+            self.status_load_generation,
+        );
+        var task_request_moved = false;
+        errdefer if (!task_request_moved) task_request.deinit(ctx.allocator());
+
+        const task = try ctx.allocator().create(ReviewProjectionTask);
+        errdefer ctx.allocator().destroy(task);
+        task.* = .{ .request = task_request };
+        task_request_moved = true;
+
+        ctx.task().spawnWith(task, ReviewProjectionTask.run) catch |err| {
+            task.request.deinit(ctx.allocator());
+            ctx.allocator().destroy(task);
+            return err;
+        };
+
+        self.review_projection = .{ .pending = state_request };
+    }
+
+    const ProjectionTarget = struct {
+        repo_root: []const u8,
+        path_key: []const u8,
+        kind: app_review_projection.Kind,
+    };
+
+    fn reviewProjectionTarget(self: *const App) ?ProjectionTarget {
+        const entry = self.selectedStatusEntry() orelse return null;
+        const repo_root = self.activeRepoRoot() orelse return null;
+        const path_key = entry.canonicalPathKey() orelse return null;
+
+        return switch (file_tree.stagePresenceFromEntry(entry)) {
+            .staged_only => .{ .repo_root = repo_root, .path_key = path_key, .kind = .cached_diff },
+            // Mixed files normally have an unstaged diff in the parsed document.
+            // This projection is only for the status-only edge case where the
+            // current source has no diff body but status still reports the path.
+            .mixed => .{ .repo_root = repo_root, .path_key = path_key, .kind = .cached_diff },
+            .untracked => .{ .repo_root = repo_root, .path_key = path_key, .kind = .generated_added_file },
+            else => null,
+        };
     }
 
     fn stageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -1101,6 +1187,65 @@ pub const App = struct {
         }
     }
 
+    fn finishReviewProjectionLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: ReviewProjectionFinished) !void {
+        var result = finished;
+        var consumed = false;
+        defer if (!consumed) result.deinit(ctx.allocator());
+
+        const pending_id = switch (self.review_projection) {
+            .pending => |request| request.id,
+            else => return,
+        };
+        if (pending_id != result.request.id) return;
+
+        const current = self.reviewProjectionTarget() orelse return;
+        if (!result.request.matchesBorrowed(
+            current.repo_root,
+            current.path_key,
+            current.kind,
+            self.load.generation,
+            self.status_load_generation,
+        )) return;
+
+        self.review_projection.deinit(ctx.allocator());
+        switch (result.result) {
+            .ready => |ready| {
+                self.review_projection = .{ .ready = .{
+                    .request = result.request,
+                    .value = ready,
+                } };
+                consumed = true;
+            },
+            .failed => |body| {
+                self.review_projection = .{ .failed = .{
+                    .request = result.request,
+                    .body = body,
+                } };
+                consumed = true;
+            },
+            .failed_static => |message| {
+                var request = try app_review_projection.cloneRequest(
+                    ctx.allocator(),
+                    result.request.id,
+                    result.request.repo_root,
+                    result.request.path_key,
+                    result.request.kind,
+                    result.request.load_generation,
+                    result.request.status_generation,
+                );
+                errdefer request.deinit(ctx.allocator());
+
+                var body = try app_review_projection.statusBodyAlloc(ctx.allocator(), result.request.path_key, "{s}", .{message});
+                errdefer body.deinit(ctx.allocator());
+
+                self.review_projection = .{ .failed = .{
+                    .request = request,
+                    .body = body,
+                } };
+            },
+        }
+    }
+
     fn applyStatusProjection(self: *App, allocator: std.mem.Allocator) !void {
         if (!diff_source.sourceAllowsStageProjection(self.config.source)) return;
 
@@ -1187,6 +1332,7 @@ pub const App = struct {
 
     fn clearLoadedDiff(self: *App) void {
         self.load.clearCurrent(self.allocator);
+        if (self.allocator) |allocator| self.review_projection.deinit(allocator);
         self.viewer.diff_scroll = 0;
         self.viewer.diff_horizontal_scroll = 0;
         self.viewer.selected_hunk = 0;
@@ -1195,7 +1341,7 @@ pub const App = struct {
 
     fn selectFileDelta(self: *App, delta: i2) void {
         const loaded = self.activeLoadedDiff() orelse return;
-        if (loaded.document.files.len == 0 or loaded.tree.nodes.len == 0) return;
+        if (loaded.tree.nodes.len == 0 or loaded.visibleNodeCount() == 0) return;
 
         if (delta < 0) {
             if (loaded.previousVisibleNodeIndex(self.viewer.selected_node)) |previous| {
@@ -1421,7 +1567,11 @@ pub const App = struct {
 
     fn clampDiffNavigation(self: *App) void {
         const file = self.selectedFile() orelse {
-            self.resetDiffPosition();
+            const line_count = self.selectedProjectionLineCount();
+            const visible_rows = self.diffVisibleRows();
+            const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
+            if (self.viewer.diff_scroll > max_scroll) self.viewer.diff_scroll = max_scroll;
+            self.viewer.selected_hunk = 0;
             return;
         };
 
@@ -1436,6 +1586,22 @@ pub const App = struct {
         const visible_rows = self.diffVisibleRows();
         const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
         if (self.viewer.diff_scroll > max_scroll) self.viewer.diff_scroll = max_scroll;
+    }
+
+    fn selectedProjectionLineCount(self: *const App) usize {
+        if (self.selectedStatusEntry() == null) return 0;
+        return switch (self.review_projection) {
+            .ready => |ready| switch (ready.value) {
+                .cached_diff => |bundle| if (bundle.loaded.document.files.len > 0)
+                    if (bundle.loaded.cachedRenderedLineIndex(0, self.effectiveDisplayMode())) |index| index.lineCount() else 0
+                else
+                    0,
+                .generated_added_file => |bundle| bundle.file.lines.len + @as(usize, if (bundle.file.truncated) 1 else 0),
+                .status_body => 1,
+            },
+            .pending, .failed => 1,
+            .idle => 0,
+        };
     }
 
     fn clampDiffNavigationKeepingHunkVisible(self: *App) void {
@@ -3271,6 +3437,32 @@ test "sidebar navigation keeps status-only target through clamp" {
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target.?);
     try std.testing.expect(app.selectedFileIndex(loaded) == null);
     try std.testing.expect(app.selectedStatusEntry() != null);
+}
+
+test "sidebar navigation moves between status-only nodes" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 12 },
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? a.zig\x00?? b.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+    try app.createStatusOnlyLoadedSession(std.testing.allocator, app.git_status.document);
+
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target.?);
+    const first_node = app.viewer.selected_node;
+
+    app.selectFileDelta(1);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 1 }, app.viewer.selected_target.?);
+    try std.testing.expect(app.viewer.selected_node != first_node);
+
+    app.selectFileDelta(-1);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target.?);
+    try std.testing.expectEqual(first_node, app.viewer.selected_node);
 }
 
 test "pending selection restore waits for status projection after stage" {

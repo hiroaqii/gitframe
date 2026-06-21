@@ -364,24 +364,84 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
 fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.StatusEntry) !void {
     const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
     const style = paneStatusStyle(active);
-    const title = try std.fmt.allocPrint(surface.frameAllocator(), "{s} status-only file", .{paneTitleText("Status", active)});
+    const title = try std.fmt.allocPrint(surface.frameAllocator(), "{s} {s}", .{ paneTitleText("Status", active), stagePresenceLabel(entry) });
     try draw.copyClippedTextAt(surface, 0, 2, title, style);
 
     var content = diffContentSurface(surface);
     const path = entry.canonicalPathKey() orelse entry.path;
+
+    switch (app.review_projection) {
+        .ready => |ready| {
+            switch (ready.value) {
+                .cached_diff => |bundle| {
+                    if (bundle.loaded.document.files.len > 0) {
+                        try diff_render.renderFile(&content, bundle.loaded.document.files[0], .{
+                            .requested_mode = app.viewer.display_mode,
+                            .scroll = app.viewer.diff_scroll,
+                            .horizontal_scroll = app.viewer.diff_horizontal_scroll,
+                            .pane_active = active,
+                            .line_numbers = app.viewer.view_options.line_numbers,
+                            .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(content.size().width, app.viewer.display_mode)),
+                        });
+                        return;
+                    }
+                },
+                .generated_added_file => |bundle| {
+                    try diff_render.renderGeneratedAddedFile(&content, bundle.file.path, bundle.file.lines, bundle.file.truncated, .{
+                        .requested_mode = app.viewer.display_mode,
+                        .scroll = app.viewer.diff_scroll,
+                        .horizontal_scroll = app.viewer.diff_horizontal_scroll,
+                        .pane_active = active,
+                        .line_numbers = app.viewer.view_options.line_numbers,
+                    });
+                    return;
+                },
+                .status_body => |body| {
+                    try drawStatusBody(&content, body.path, body.message, active);
+                    return;
+                },
+            }
+        },
+        .failed => |failed| {
+            try drawStatusBody(&content, failed.body.path, failed.body.message, active);
+            return;
+        },
+        .pending => {
+            try drawStatusBody(&content, path, "Loading review projection...", active);
+            return;
+        },
+        .idle => {},
+    }
+
     try draw.copyClippedTextAt(&content, 0, 0, path, .{ .bold = true, .fg = .{ .index = 11 }, .dim = !active });
     const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "status: {s}{s}", .{ statusName(entry.index), statusSuffix(entry) });
     try draw.copyClippedTextAt(&content, 0, 2, status_text, .{ .fg = .gray, .dim = !active });
     switch (file_tree.stagePresenceFromEntry(entry)) {
         .staged_only => {
             try draw.copyClippedTextAt(&content, 0, 4, "This file is staged.", .{ .fg = .gray, .dim = !active });
-            try draw.copyClippedTextAt(&content, 0, 5, "Staged diff preview will be added in a later slice.", .{ .fg = .gray, .dim = !active });
+            try draw.copyClippedTextAt(&content, 0, 5, "Loading staged diff preview.", .{ .fg = .gray, .dim = !active });
         },
         else => {
             try draw.copyClippedTextAt(&content, 0, 4, "No diff is available for this file yet.", .{ .fg = .gray, .dim = !active });
-            try draw.copyClippedTextAt(&content, 0, 5, "Use the upcoming stage action to add it to Git.", .{ .fg = .gray, .dim = !active });
+            try draw.copyClippedTextAt(&content, 0, 5, "Loading generated review preview if available.", .{ .fg = .gray, .dim = !active });
         },
     }
+}
+
+fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u8, active: bool) !void {
+    try draw.copyClippedTextAt(surface, 0, 0, path, .{ .bold = true, .fg = .{ .index = 11 }, .dim = !active });
+    try draw.copyClippedTextAt(surface, 0, 2, message, .{ .fg = .gray, .dim = !active });
+}
+
+fn stagePresenceLabel(entry: git_status.StatusEntry) []const u8 {
+    return switch (file_tree.stagePresenceFromEntry(entry)) {
+        .staged_only => "staged",
+        .mixed => "mixed",
+        .untracked => "untracked",
+        .conflict => "conflict",
+        .unstaged_only => "unstaged",
+        .clean_or_unknown => "status-only file",
+    };
 }
 
 fn statusName(status: git_status.StatusCode) []const u8 {

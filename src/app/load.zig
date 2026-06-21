@@ -6,6 +6,7 @@ const file_tree = @import("../file_tree.zig");
 const git_backend = @import("../git/backend.zig");
 const git_status = @import("../git/status.zig");
 const loaded_diff = @import("../loaded_diff.zig");
+const review_projection = @import("review_projection.zig");
 const repo_discovery = @import("../repo/discovery.zig");
 
 const LoadRequest = diff_source.LoadRequest;
@@ -47,6 +48,8 @@ pub const StatusLoadFinished = struct {
         self.result.deinit(allocator);
     }
 };
+
+pub const ReviewProjectionFinished = review_projection.Finished;
 
 pub const RepoDiscoveryTaskResult = union(enum) {
     empty,
@@ -243,6 +246,25 @@ pub fn StatusLoadTask(comptime Msg: type) type {
     };
 }
 
+pub fn ReviewProjectionTask(comptime Msg: type) type {
+    return struct {
+        request: review_projection.Request,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+
+            const request = task.request;
+            task.request = undefined;
+
+            return @unionInit(Msg, "review_projection_loaded", ReviewProjectionFinished{
+                .request = request,
+                .result = runReviewProjectionLoad(request, allocator, io),
+            });
+        }
+    };
+}
+
 pub fn runStatusLoad(repo_root: []const u8, allocator: std.mem.Allocator, io: std.Io) StatusLoadTaskResult {
     var local_backend: git_backend.LocalCommandBackend = .{};
     const raw_result = local_backend.backend().loadStatus(allocator, io, .{ .repo_root = repo_root }) catch |err| {
@@ -290,6 +312,97 @@ pub fn runLoad(request: LoadRequest, allocator: std.mem.Allocator, io: std.Io) D
     }
 }
 
+pub fn runReviewProjectionLoad(request: review_projection.Request, allocator: std.mem.Allocator, io: std.Io) review_projection.TaskResult {
+    return switch (request.kind) {
+        .cached_diff => loadCachedFileDiff(request, allocator, io),
+        .generated_added_file => loadGeneratedAddedFile(request, allocator, io),
+    };
+}
+
+fn loadCachedFileDiff(request: review_projection.Request, allocator: std.mem.Allocator, io: std.Io) review_projection.TaskResult {
+    var local_backend: git_backend.LocalCommandBackend = .{};
+    const raw_result = local_backend.backend().loadDiff(allocator, io, .{
+        .repo_root = request.repo_root,
+        .kind = .{ .file = .{ .base = .cached, .path = request.path_key } },
+    }) catch |err| {
+        return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Cached diff load failed: {s}", .{@errorName(err)}) catch
+            return .{ .failed_static = "Cached diff load failed: OutOfMemory" } };
+    };
+
+    switch (raw_result) {
+        .ok => |bytes| {
+            defer allocator.free(bytes);
+            if (bytes.len == 0) {
+                return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No staged diff for this file.", .{}) catch
+                    return .{ .failed_static = "Projection allocation failed" } } };
+            }
+            const bundle = buildLoadedBundle(allocator, bytes) catch |err| {
+                return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Cached diff parse failed: {s}", .{@errorName(err)}) catch
+                    return .{ .failed_static = "Cached diff parse failed: OutOfMemory" } };
+            };
+            return .{ .ready = .{ .cached_diff = bundle } };
+        },
+        .failed => |message| {
+            defer allocator.free(message);
+            return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "{s}", .{std.mem.trim(u8, message, " \t\r\n")}) catch
+                return .{ .failed_static = "Projection allocation failed" } };
+        },
+        .failed_static => |message| return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "{s}", .{message}) catch
+            return .{ .failed_static = "Projection allocation failed" } },
+    }
+}
+
+fn loadGeneratedAddedFile(request: review_projection.Request, allocator: std.mem.Allocator, io: std.Io) review_projection.TaskResult {
+    const content = readRepoFile(allocator, io, request.repo_root, request.path_key) catch |err| {
+        return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Cannot show file content: {s}", .{@errorName(err)}) catch
+            return .{ .failed_static = "Projection allocation failed" } };
+    };
+    defer allocator.free(content);
+
+    if (std.mem.indexOfScalar(u8, content, 0) != null) {
+        return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "Binary file content is not shown.", .{}) catch
+            return .{ .failed_static = "Projection allocation failed" } } };
+    }
+
+    const bundle = review_projection.generatedFileFromContent(allocator, request.path_key, content, false) catch |err| {
+        return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Generated diff failed: {s}", .{@errorName(err)}) catch
+            return .{ .failed_static = "Generated diff failed: OutOfMemory" } };
+    };
+    return .{ .ready = .{ .generated_added_file = bundle } };
+}
+
+fn readRepoFile(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path_key: []const u8) ![]u8 {
+    try validateRepoRelativePath(path_key);
+
+    var current_dir = try std.Io.Dir.openDirAbsolute(io, repo_root, .{});
+    defer current_dir.close(io);
+
+    var components = std.mem.splitScalar(u8, path_key, '/');
+    var component = components.next() orelse return error.InvalidPath;
+    while (true) {
+        const next = components.next();
+        const stat = try current_dir.statFile(io, component, .{ .follow_symlinks = false });
+        if (next == null) {
+            if (stat.kind != .file) return error.InvalidPath;
+            return try current_dir.readFileAlloc(io, component, allocator, .limited(review_projection.max_generated_file_bytes));
+        }
+
+        if (stat.kind != .directory) return error.InvalidPath;
+        const child_dir = try current_dir.openDir(io, component, .{});
+        current_dir.close(io);
+        current_dir = child_dir;
+        component = next.?;
+    }
+}
+
+fn validateRepoRelativePath(path: []const u8) !void {
+    if (path.len == 0 or std.fs.path.isAbsolute(path)) return error.InvalidPath;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidPath;
+    }
+}
+
 pub fn buildLoadedBundle(allocator: std.mem.Allocator, bytes: []const u8) !LoadedDiffBundle {
     var arena: std.heap.ArenaAllocator = .init(allocator);
     errdefer arena.deinit();
@@ -327,4 +440,26 @@ pub fn countLines(bytes: []const u8) usize {
         if (byte == '\n') count += 1;
     }
     return count;
+}
+
+test "readRepoFile rejects symlink components" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "inside.txt", .data = "inside" });
+    try tmp.dir.symLink(io, "inside.txt", "linked.txt", .{});
+    try tmp.dir.createDir(io, "dir", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "dir/inside.txt", .data = "nested" });
+    try tmp.dir.symLink(io, "dir", "linked-dir", .{ .is_directory = true });
+
+    const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+
+    const content = try readRepoFile(std.testing.allocator, io, repo_root, "inside.txt");
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("inside", content);
+
+    try std.testing.expectError(error.InvalidPath, readRepoFile(std.testing.allocator, io, repo_root, "linked.txt"));
+    try std.testing.expectError(error.InvalidPath, readRepoFile(std.testing.allocator, io, repo_root, "linked-dir/inside.txt"));
 }
