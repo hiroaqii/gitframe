@@ -36,11 +36,12 @@ const RowSource = struct {
     target: context.SidebarTarget,
 };
 
-/// Session-local file order used to keep the sidebar stable across reloads.
+/// Session-local file key memory used while rebuilding the sidebar.
 ///
 /// Keys are copied into the App allocator because the source rows usually
-/// borrow from a per-load arena. The order is deliberately independent from
-/// FileTree so reloads can rebuild a fresh tree while preserving row identity.
+/// borrow from a per-load arena. Final display sorting still groups sibling
+/// directories before files, so this is a row rebuild aid rather than the
+/// visible ordering contract.
 pub const StableOrder = struct {
     keys: std.ArrayListUnmanaged([]u8) = .empty,
 
@@ -54,16 +55,7 @@ pub const StableOrder = struct {
         self.deinit(allocator);
     }
 
-    fn indexOf(self: *const StableOrder, key: []const u8) ?usize {
-        for (self.keys.items, 0..) |known, index| {
-            if (std.mem.eql(u8, known, key)) return index;
-        }
-        return null;
-    }
-
-    fn applyAndRemember(self: *StableOrder, allocator: std.mem.Allocator, rows: []RowSource) !void {
-        std.mem.sort(RowSource, rows, self, stableRowLessThan);
-
+    fn remember(self: *StableOrder, allocator: std.mem.Allocator, rows: []const RowSource) !void {
         for (self.keys.items) |key| allocator.free(key);
         self.keys.clearRetainingCapacity();
         errdefer {
@@ -276,7 +268,8 @@ pub fn buildWithStatusStable(
         }
     }
 
-    if (stable_order) |stable| try stable.order.applyAndRemember(stable.allocator, rows.items);
+    std.mem.sort(RowSource, rows.items, {}, rowPathLessThan);
+    if (stable_order) |stable| try stable.order.remember(stable.allocator, rows.items);
 
     var nodes: std.ArrayList(Node) = .empty;
     errdefer nodes.deinit(allocator);
@@ -300,16 +293,78 @@ pub fn buildWithStatusStable(
         });
     }
 
+    try sortNodesForDisplay(allocator, &nodes);
+
     return .{ .nodes = try nodes.toOwnedSlice(allocator) };
 }
 
-fn stableRowLessThan(order: *StableOrder, lhs: RowSource, rhs: RowSource) bool {
-    const lhs_index = order.indexOf(lhs.path_key);
-    const rhs_index = order.indexOf(rhs.path_key);
-    if (lhs_index != null and rhs_index != null) return lhs_index.? < rhs_index.?;
-    if (lhs_index != null) return true;
-    if (rhs_index != null) return false;
-    return std.mem.lessThan(u8, lhs.path_key, rhs.path_key);
+fn rowPathLessThan(_: void, lhs: RowSource, rhs: RowSource) bool {
+    if (!std.mem.eql(u8, lhs.path_key, rhs.path_key)) return std.mem.lessThan(u8, lhs.path_key, rhs.path_key);
+    if (!std.mem.eql(u8, lhs.path, rhs.path)) return std.mem.lessThan(u8, lhs.path, rhs.path);
+    return false;
+}
+
+const NodeSpan = struct {
+    start: usize,
+    end: usize,
+};
+
+fn sortNodesForDisplay(allocator: std.mem.Allocator, nodes: *std.ArrayList(Node)) !void {
+    if (nodes.items.len == 0) return;
+
+    var sorted: std.ArrayList(Node) = .empty;
+    errdefer sorted.deinit(allocator);
+
+    _ = try appendSortedNodeRange(allocator, nodes.items, 0, 0, &sorted);
+
+    nodes.deinit(allocator);
+    nodes.* = sorted;
+}
+
+fn appendSortedNodeRange(
+    allocator: std.mem.Allocator,
+    source: []const Node,
+    start: usize,
+    depth: u16,
+    out: *std.ArrayList(Node),
+) !usize {
+    var spans: std.ArrayList(NodeSpan) = .empty;
+    defer spans.deinit(allocator);
+
+    var index = start;
+    while (index < source.len) {
+        if (source[index].depth < depth) break;
+        if (source[index].depth > depth) {
+            index += 1;
+            continue;
+        }
+
+        const child_start = index;
+        index += 1;
+        while (index < source.len and source[index].depth > depth) : (index += 1) {}
+        try spans.append(allocator, .{ .start = child_start, .end = index });
+    }
+
+    // Sort only sibling roots; each directory's descendants stay attached to
+    // that directory and are sorted recursively below it.
+    std.mem.sort(NodeSpan, spans.items, source, nodeSpanLessThan);
+
+    for (spans.items) |span| {
+        try out.append(allocator, source[span.start]);
+        if (span.start + 1 < span.end) {
+            _ = try appendSortedNodeRange(allocator, source, span.start + 1, depth + 1, out);
+        }
+    }
+
+    return index;
+}
+
+fn nodeSpanLessThan(source: []const Node, lhs: NodeSpan, rhs: NodeSpan) bool {
+    const lhs_node = source[lhs.start];
+    const rhs_node = source[rhs.start];
+    if (lhs_node.kind != rhs_node.kind) return lhs_node.kind == .directory;
+    if (!std.mem.eql(u8, lhs_node.name, rhs_node.name)) return std.mem.lessThan(u8, lhs_node.name, rhs_node.name);
+    return std.mem.lessThan(u8, lhs_node.path, rhs_node.path);
 }
 
 pub fn displayPath(file: diff_parser.FileDiff) []const u8 {
@@ -487,15 +542,15 @@ test "build creates directory and file nodes with aggregate stats" {
     try std.testing.expectEqualStrings("src", tree.nodes[0].name);
     try std.testing.expectEqual(@as(usize, 3), tree.nodes[0].stats.added);
     try std.testing.expectEqual(@as(usize, 2), tree.nodes[0].stats.removed);
-    try std.testing.expectEqual(Node.Kind.file, tree.nodes[1].kind);
-    try std.testing.expectEqualStrings("main.zig", tree.nodes[1].name);
-    try std.testing.expectEqual(Status.modified, tree.nodes[1].status.?);
-    try std.testing.expect(!tree.nodes[1].mode_changed);
-    try std.testing.expectEqual(@as(?usize, 0), tree.nodes[1].diffFileIndex());
-    try std.testing.expectEqual(Node.Kind.directory, tree.nodes[2].kind);
-    try std.testing.expectEqualStrings("lib", tree.nodes[2].name);
+    try std.testing.expectEqual(Node.Kind.directory, tree.nodes[1].kind);
+    try std.testing.expectEqualStrings("lib", tree.nodes[1].name);
+    try std.testing.expectEqual(Node.Kind.file, tree.nodes[2].kind);
+    try std.testing.expectEqualStrings("root.zig", tree.nodes[2].name);
     try std.testing.expectEqual(Node.Kind.file, tree.nodes[3].kind);
-    try std.testing.expectEqualStrings("root.zig", tree.nodes[3].name);
+    try std.testing.expectEqualStrings("main.zig", tree.nodes[3].name);
+    try std.testing.expectEqual(Status.modified, tree.nodes[3].status.?);
+    try std.testing.expect(!tree.nodes[3].mode_changed);
+    try std.testing.expectEqual(@as(?usize, 0), tree.nodes[3].diffFileIndex());
 }
 
 test "directory descendant matching respects path boundaries" {
@@ -503,6 +558,52 @@ test "directory descendant matching respects path boundaries" {
     try std.testing.expect(isPathDescendantOfDirectory("src/lib/root.zig", "src"));
     try std.testing.expect(!isPathDescendantOfDirectory("src/application.zig", "src/app"));
     try std.testing.expect(!isPathDescendantOfDirectory("src/app", "src/app"));
+}
+
+test "build sorts sibling directories before files" {
+    const text =
+        \\diff --git a/b.zig b/b.zig
+        \\--- a/b.zig
+        \\+++ b/b.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/src/main.zig b/src/main.zig
+        \\--- a/src/main.zig
+        \\+++ b/src/main.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/docs/readme.md b/docs/readme.md
+        \\--- a/docs/readme.md
+        \\+++ b/docs/readme.md
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const document = try diff_parser.parse(allocator, text);
+    const tree = try build(allocator, document);
+
+    try std.testing.expectEqual(@as(usize, 6), tree.nodes.len);
+    try std.testing.expectEqual(Node.Kind.directory, tree.nodes[0].kind);
+    try std.testing.expectEqualStrings("docs", tree.nodes[0].path);
+    try std.testing.expectEqualStrings("docs/readme.md", tree.nodes[1].path);
+    try std.testing.expectEqual(Node.Kind.directory, tree.nodes[2].kind);
+    try std.testing.expectEqualStrings("src", tree.nodes[2].path);
+    try std.testing.expectEqualStrings("src/main.zig", tree.nodes[3].path);
+    try std.testing.expectEqualStrings("a.zig", tree.nodes[4].path);
+    try std.testing.expectEqualStrings("b.zig", tree.nodes[5].path);
 }
 
 test "buildWithStatus adds untracked status-only rows" {
@@ -555,7 +656,7 @@ test "buildWithStatus skips rows already present in diff" {
     try std.testing.expectEqual(@as(?usize, 0), tree.nodes[1].diffFileIndex());
 }
 
-test "buildWithStatusStable preserves existing file order across reloads" {
+test "buildWithStatusStable applies final display sort after reloads" {
     const first_text =
         \\diff --git a/a.zig b/a.zig
         \\--- a/a.zig
@@ -614,8 +715,79 @@ test "buildWithStatusStable preserves existing file order across reloads" {
     });
 
     try std.testing.expectEqualStrings("a.zig", second_tree.nodes[0].path);
-    try std.testing.expectEqualStrings("c.zig", second_tree.nodes[1].path);
-    try std.testing.expectEqualStrings("b.zig", second_tree.nodes[2].path);
+    try std.testing.expectEqualStrings("b.zig", second_tree.nodes[1].path);
+    try std.testing.expectEqualStrings("c.zig", second_tree.nodes[2].path);
+}
+
+test "buildWithStatusStable keeps nested additions attached after reloads" {
+    const first_text =
+        \\diff --git a/docs/readme.md b/docs/readme.md
+        \\--- a/docs/readme.md
+        \\+++ b/docs/readme.md
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/src/main.zig b/src/main.zig
+        \\--- a/src/main.zig
+        \\+++ b/src/main.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    const second_text =
+        \\diff --git a/src/main.zig b/src/main.zig
+        \\--- a/src/main.zig
+        \\+++ b/src/main.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/docs/z.md b/docs/z.md
+        \\--- a/docs/z.md
+        \\+++ b/docs/z.md
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/docs/readme.md b/docs/readme.md
+        \\--- a/docs/readme.md
+        \\+++ b/docs/readme.md
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/src/a.zig b/src/a.zig
+        \\--- a/src/a.zig
+        \\+++ b/src/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var order: StableOrder = .{};
+    defer order.deinit(std.testing.allocator);
+
+    const first_doc = try diff_parser.parse(arena_allocator, first_text);
+    _ = try buildWithStatusStable(arena_allocator, first_doc, null, .{
+        .allocator = std.testing.allocator,
+        .order = &order,
+    });
+
+    const second_doc = try diff_parser.parse(arena_allocator, second_text);
+    const second_tree = try buildWithStatusStable(arena_allocator, second_doc, null, .{
+        .allocator = std.testing.allocator,
+        .order = &order,
+    });
+
+    try std.testing.expectEqual(@as(usize, 6), second_tree.nodes.len);
+    try std.testing.expectEqualStrings("docs", second_tree.nodes[0].path);
+    try std.testing.expectEqualStrings("docs/readme.md", second_tree.nodes[1].path);
+    try std.testing.expectEqualStrings("docs/z.md", second_tree.nodes[2].path);
+    try std.testing.expectEqualStrings("src", second_tree.nodes[3].path);
+    try std.testing.expectEqualStrings("src/a.zig", second_tree.nodes[4].path);
+    try std.testing.expectEqualStrings("src/main.zig", second_tree.nodes[5].path);
 }
 
 test "buildWithStatus records staged-only and mixed presence separately from status" {
