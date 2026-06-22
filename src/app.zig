@@ -815,20 +815,22 @@ pub const App = struct {
             self.setStatus("another git action is running", .{});
             return;
         }
-        if (!diff_source.sourceAllowsStageAction(self.config.source)) {
-            self.setStatus("stage unavailable for this source", .{});
-            return;
-        }
-
-        const repo_root = self.activeRepoRoot() orelse {
-            self.setStatus("stage unavailable for this source", .{});
-            return;
+        const target = switch (self.selectedStageTarget()) {
+            .ready => |target| target,
+            .already_staged => |path| {
+                self.setStatus("already staged: {s}", .{path});
+                return;
+            },
+            .unavailable_source, .no_repo => {
+                self.setStatus("stage unavailable for this source", .{});
+                return;
+            },
+            .no_path => {
+                self.setStatus("no stageable file selected", .{});
+                return;
+            },
         };
-        const path = self.selectedStagePathKey() orelse {
-            self.setStatus("no stageable file selected", .{});
-            return;
-        };
-        try self.setPendingSelectionRestore(ctx.allocator(), path);
+        try self.setPendingSelectionRestore(ctx.allocator(), target.path);
         errdefer self.clearPendingSelectionRestore(ctx.allocator());
 
         // Keep rollback active until the task is successfully handed to Chasen.
@@ -847,14 +849,37 @@ pub const App = struct {
             ctx.allocator().destroy(task);
         }
 
-        task.repo_root = try ctx.allocator().dupe(u8, repo_root);
-        task.path = try ctx.allocator().dupe(u8, path);
+        task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
+        task.path = try ctx.allocator().dupe(u8, target.path);
 
         ctx.task().spawnWith(task, StageFileTask.run) catch |err| {
             self.setStatus("could not start stage task", .{});
             return err;
         };
-        self.setStatus("staging: {s}", .{path});
+        self.setStatus("staging: {s}", .{target.path});
+    }
+
+    const StageTarget = struct {
+        repo_root: []const u8,
+        path: []const u8,
+    };
+
+    const StageTargetResult = union(enum) {
+        ready: StageTarget,
+        already_staged: []const u8,
+        unavailable_source,
+        no_repo,
+        no_path,
+    };
+
+    fn selectedStageTarget(self: *const App) StageTargetResult {
+        if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
+        const repo_root = self.activeRepoRoot() orelse return .no_repo;
+        const path = self.selectedStagePathKey() orelse return .no_path;
+        if (self.freshStatusEntryForPathKey(repo_root, path)) |entry| {
+            if (!entry.isConflict() and entry.isStaged() and !entry.isUnstaged()) return .{ .already_staged = path };
+        }
+        return .{ .ready = .{ .repo_root = repo_root, .path = path } };
     }
 
     fn unstageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -2379,6 +2404,13 @@ pub const App = struct {
             if (std.mem.eql(u8, entry_key, path_key)) return entry;
         }
         return null;
+    }
+
+    fn freshStatusEntryForPathKey(self: *const App, repo_root: []const u8, path_key: []const u8) ?git_status.StatusEntry {
+        if (self.status_load_pending != null) return null;
+        const snapshot_root = self.git_status.repo_root orelse return null;
+        if (!std.mem.eql(u8, snapshot_root, repo_root)) return null;
+        return self.statusEntryForPathKey(path_key);
     }
 
     fn setPendingSelectionRestore(self: *App, allocator: std.mem.Allocator, path_key: []const u8) !void {
@@ -3991,6 +4023,64 @@ test "selectedStagePathKey accepts diff and status-only selections" {
     app.viewer.selected_target = .{ .status_only = 0 };
 
     try std.testing.expectEqualStrings("src/new.zig", app.selectedStagePathKey().?);
+}
+
+test "selectedStageTarget skips only fresh staged-only files" {
+    var app: App = .{
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffTwoWithStatuses()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer app.git_status.deinit();
+
+    var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
+    try app.git_status.replace("/repo", &staged_bundle);
+    switch (app.selectedStageTarget()) {
+        .already_staged => |path| try std.testing.expectEqualStrings("src/added.zig", path),
+        else => return error.ExpectedAlreadyStagedTarget,
+    }
+
+    var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "AM src/added.zig\x00");
+    try app.git_status.replace("/repo", &mixed_bundle);
+    switch (app.selectedStageTarget()) {
+        .ready => |target| {
+            try std.testing.expectEqualStrings("/repo", target.repo_root);
+            try std.testing.expectEqualStrings("src/added.zig", target.path);
+        },
+        else => return error.ExpectedMixedStageTarget,
+    }
+
+    var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "UU src/added.zig\x00");
+    try app.git_status.replace("/repo", &conflict_bundle);
+    switch (app.selectedStageTarget()) {
+        .ready => {},
+        else => return error.ExpectedConflictStageTarget,
+    }
+
+    app.status_load_pending = 1;
+    switch (app.selectedStageTarget()) {
+        .ready => {},
+        else => return error.ExpectedStaleStatusStageTarget,
+    }
+    app.status_load_pending = null;
+
+    var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
+    try app.git_status.replace("/other", &other_repo_bundle);
+    switch (app.selectedStageTarget()) {
+        .ready => {},
+        else => return error.ExpectedMismatchedStatusStageTarget,
+    }
+
+    app.config.source = .cached;
+    switch (app.selectedStageTarget()) {
+        .unavailable_source => {},
+        else => return error.ExpectedCachedStageUnavailable,
+    }
 }
 
 test "selectedUnstageTarget requires fresh staged status" {
