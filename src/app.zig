@@ -825,6 +825,18 @@ pub const App = struct {
                 self.setStatus("already staged: {s}", .{path});
                 return;
             },
+            .stale_status => {
+                self.setStatus("status is still loading", .{});
+                return;
+            },
+            .conflict_unsupported => |path| {
+                self.setStatus("conflict under directory: {s}", .{path});
+                return;
+            },
+            .no_stageable_content => |path| {
+                self.setStatus("no stageable files under: {s}", .{path});
+                return;
+            },
             .unavailable_source, .no_repo => {
                 self.setStatus("stage unavailable for this source", .{});
                 return;
@@ -863,14 +875,28 @@ pub const App = struct {
         self.setStatus("staging: {s}", .{target.path});
     }
 
+    const GitActionTargetKind = enum {
+        file,
+        directory,
+    };
+
+    const GitActionPath = struct {
+        path: []const u8,
+        kind: GitActionTargetKind,
+    };
+
     const StageTarget = struct {
         repo_root: []const u8,
         path: []const u8,
+        kind: GitActionTargetKind,
     };
 
     const StageTargetResult = union(enum) {
         ready: StageTarget,
         already_staged: []const u8,
+        stale_status,
+        conflict_unsupported: []const u8,
+        no_stageable_content: []const u8,
         unavailable_source,
         no_repo,
         no_path,
@@ -879,11 +905,16 @@ pub const App = struct {
     fn selectedStageTarget(self: *const App) StageTargetResult {
         if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
-        const path = self.selectedStagePathKey() orelse return .no_path;
-        if (self.freshStatusEntryForPathKey(repo_root, path)) |entry| {
-            if (!entry.isConflict() and entry.isStaged() and !entry.isUnstaged()) return .{ .already_staged = path };
-        }
-        return .{ .ready = .{ .repo_root = repo_root, .path = path } };
+        const action_target = self.selectedSidebarActionTarget() orelse return .no_path;
+        return switch (action_target.kind) {
+            .file => blk: {
+                if (self.freshStatusEntryForPathKey(repo_root, action_target.path)) |entry| {
+                    if (!entry.isConflict() and entry.isStaged() and !entry.isUnstaged()) return .{ .already_staged = action_target.path };
+                }
+                break :blk .{ .ready = .{ .repo_root = repo_root, .path = action_target.path, .kind = .file } };
+            },
+            .directory => self.selectedDirectoryStageTarget(repo_root, action_target.path),
+        };
     }
 
     fn unstageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -905,12 +936,20 @@ pub const App = struct {
                 self.setStatus("status is still loading", .{});
                 return;
             },
-            .conflict_unsupported => {
-                self.setStatus("conflict unstage is not supported yet", .{});
+            .conflict_unsupported => |target_path| {
+                if (target_path.kind == .directory) {
+                    self.setStatus("conflict under directory: {s}", .{target_path.path});
+                } else {
+                    self.setStatus("conflict unstage is not supported yet", .{});
+                }
                 return;
             },
-            .no_staged_content => {
-                self.setStatus("no staged content selected", .{});
+            .no_staged_content => |target_path| {
+                if (target_path.kind == .directory) {
+                    self.setStatus("no staged files under: {s}", .{target_path.path});
+                } else {
+                    self.setStatus("no staged content selected", .{});
+                }
                 return;
             },
         };
@@ -946,6 +985,7 @@ pub const App = struct {
     const UnstageTarget = struct {
         repo_root: []const u8,
         path: []const u8,
+        kind: GitActionTargetKind,
     };
 
     const UnstageTargetResult = union(enum) {
@@ -954,21 +994,26 @@ pub const App = struct {
         no_repo,
         no_path,
         stale_status,
-        conflict_unsupported,
-        no_staged_content,
+        conflict_unsupported: GitActionPath,
+        no_staged_content: GitActionPath,
     };
 
     fn selectedUnstageTarget(self: *const App) UnstageTargetResult {
         if (!diff_source.sourceAllowsUnstageAction(self.config.source)) return .unavailable_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
-        const path = self.selectedStagePathKey() orelse return .no_path;
+        const action_target = self.selectedSidebarActionTarget() orelse return .no_path;
         if (self.status_load_pending != null) return .stale_status;
         const snapshot_root = self.git_status.repo_root orelse return .stale_status;
         if (!std.mem.eql(u8, snapshot_root, repo_root)) return .stale_status;
-        const entry = self.statusEntryForPathKey(path) orelse return .no_staged_content;
-        if (entry.isConflict()) return .conflict_unsupported;
-        if (!entry.isStaged()) return .no_staged_content;
-        return .{ .ready = .{ .repo_root = repo_root, .path = path } };
+        return switch (action_target.kind) {
+            .file => blk: {
+                const entry = self.statusEntryForPathKey(action_target.path) orelse return .{ .no_staged_content = action_target };
+                if (entry.isConflict()) return .{ .conflict_unsupported = action_target };
+                if (!entry.isStaged()) return .{ .no_staged_content = action_target };
+                break :blk .{ .ready = .{ .repo_root = repo_root, .path = action_target.path, .kind = .file } };
+            },
+            .directory => self.selectedDirectoryUnstageTarget(repo_root, action_target.path),
+        };
     }
 
     fn enterCommitPanelMode(self: *App) void {
@@ -2402,12 +2447,77 @@ pub const App = struct {
         };
     }
 
+    fn selectedSidebarActionTarget(self: *const App) ?GitActionPath {
+        const loaded = self.activeLoadedDiffConst() orelse {
+            const path = self.selectedStagePathKey() orelse return null;
+            return .{ .path = path, .kind = .file };
+        };
+        if (self.viewer.selected_node >= loaded.tree.nodes.len) return null;
+
+        // Directory rows intentionally do not update selected_target; actions
+        // must use the sidebar cursor so they do not hit the previous file.
+        const node = loaded.tree.nodes[self.viewer.selected_node];
+        return switch (node.target) {
+            .directory => |path| .{ .path = if (path.len > 0) path else node.path, .kind = .directory },
+            .diff_file, .status_entry => .{
+                .path = if (node.path_key.len > 0) node.path_key else node.path,
+                .kind = .file,
+            },
+        };
+    }
+
     fn statusEntryForPathKey(self: *const App, path_key: []const u8) ?git_status.StatusEntry {
         for (self.git_status.document.entries) |entry| {
             const entry_key = entry.canonicalPathKey() orelse continue;
             if (std.mem.eql(u8, entry_key, path_key)) return entry;
         }
         return null;
+    }
+
+    fn selectedDirectoryStageTarget(self: *const App, repo_root: []const u8, directory: []const u8) StageTargetResult {
+        if (self.status_load_pending != null) return .stale_status;
+        const snapshot_root = self.git_status.repo_root orelse return .stale_status;
+        if (!std.mem.eql(u8, snapshot_root, repo_root)) return .stale_status;
+
+        var has_stageable = false;
+        for (self.git_status.document.entries) |entry| {
+            const key = entry.canonicalPathKey() orelse continue;
+            if (!file_tree.isPathDescendantOfDirectory(key, directory)) continue;
+
+            // Git operates on the whole directory path. Reject conflicts here
+            // so first-slice directory actions cannot resolve them implicitly.
+            if (entry.isConflict()) return .{ .conflict_unsupported = directory };
+
+            switch (file_tree.stagePresenceFromEntry(entry)) {
+                .untracked, .unstaged_only, .mixed => has_stageable = true,
+                .staged_only, .clean_or_unknown, .conflict => {},
+            }
+        }
+
+        if (!has_stageable) return .{ .no_stageable_content = directory };
+        return .{ .ready = .{ .repo_root = repo_root, .path = directory, .kind = .directory } };
+    }
+
+    fn selectedDirectoryUnstageTarget(self: *const App, repo_root: []const u8, directory: []const u8) UnstageTargetResult {
+        if (self.status_load_pending != null) return .stale_status;
+        const snapshot_root = self.git_status.repo_root orelse return .stale_status;
+        if (!std.mem.eql(u8, snapshot_root, repo_root)) return .stale_status;
+
+        var has_staged = false;
+        for (self.git_status.document.entries) |entry| {
+            const key = entry.canonicalPathKey() orelse continue;
+            if (!file_tree.isPathDescendantOfDirectory(key, directory)) continue;
+
+            if (entry.isConflict()) return .{ .conflict_unsupported = .{ .path = directory, .kind = .directory } };
+
+            switch (file_tree.stagePresenceFromEntry(entry)) {
+                .staged_only, .mixed => has_staged = true,
+                .untracked, .unstaged_only, .clean_or_unknown, .conflict => {},
+            }
+        }
+
+        if (!has_staged) return .{ .no_staged_content = .{ .path = directory, .kind = .directory } };
+        return .{ .ready = .{ .repo_root = repo_root, .path = directory, .kind = .directory } };
     }
 
     fn freshStatusEntryForPathKey(self: *const App, repo_root: []const u8, path_key: []const u8) ?git_status.StatusEntry {
@@ -2438,7 +2548,7 @@ pub const App = struct {
         const restore = self.pending_selection_restore orelse return false;
         defer self.clearPendingSelectionRestore(allocator);
 
-        if (findFileNodeByPathKey(loaded, restore.path_key)) |node_index| {
+        if (findNodeByPathKey(loaded, restore.path_key)) |node_index| {
             self.selectSidebarNode(loaded, node_index);
             return true;
         }
@@ -2460,12 +2570,20 @@ pub const App = struct {
 
     fn restorePendingSelectionByPath(self: *App, allocator: std.mem.Allocator, loaded: *LoadedDiff) bool {
         const restore = self.pending_selection_restore orelse return false;
-        if (findFileNodeByPathKey(loaded, restore.path_key)) |node_index| {
+        if (findNodeByPathKey(loaded, restore.path_key)) |node_index| {
             defer self.clearPendingSelectionRestore(allocator);
             self.selectSidebarNode(loaded, node_index);
             return true;
         }
         return false;
+    }
+
+    fn findNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
+        for (loaded.tree.nodes, 0..) |node, index| {
+            const node_key = if (node.path_key.len > 0) node.path_key else node.path;
+            if (std.mem.eql(u8, node_key, path_key)) return index;
+        }
+        return null;
     }
 
     fn findFileNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
@@ -4148,9 +4266,124 @@ test "selectedUnstageTarget requires fresh staged status" {
     var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "UU src/added.zig\x00");
     try app.git_status.replace("/repo", &conflict_bundle);
     switch (app.selectedUnstageTarget()) {
-        .conflict_unsupported => {},
+        .conflict_unsupported => |target| {
+            try std.testing.expectEqualStrings("src/added.zig", target.path);
+            try std.testing.expect(target.kind == .file);
+        },
         else => return error.ExpectedConflictUnstageTarget,
     }
+}
+
+test "directory stage target uses sidebar cursor and status subtree" {
+    var app: App = .{
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffNested()),
+        .viewer = .{
+            // The diff pane still points at a file, but the sidebar cursor is
+            // on the directory. Directory actions must use the cursor target.
+            .selected_target = .{ .diff_file = 1 },
+            .selected_node = 0,
+        },
+    };
+    defer app.git_status.deinit();
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00?? src/b\x00M  other.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    switch (app.selectedStageTarget()) {
+        .ready => |target| {
+            try std.testing.expectEqualStrings("/repo", target.repo_root);
+            try std.testing.expectEqualStrings("src", target.path);
+            try std.testing.expect(target.kind == .directory);
+        },
+        else => return error.ExpectedDirectoryStageTarget,
+    }
+
+    var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/a\x00");
+    try app.git_status.replace("/repo", &staged_bundle);
+    switch (app.selectedStageTarget()) {
+        .no_stageable_content => |path| try std.testing.expectEqualStrings("src", path),
+        else => return error.ExpectedNoDirectoryStageableContent,
+    }
+
+    var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00UU src/b\x00");
+    try app.git_status.replace("/repo", &conflict_bundle);
+    switch (app.selectedStageTarget()) {
+        .conflict_unsupported => |path| try std.testing.expectEqualStrings("src", path),
+        else => return error.ExpectedDirectoryConflictStageReject,
+    }
+}
+
+test "directory unstage target scans staged subtree" {
+    var app: App = .{
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffNested()),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 1 },
+            .selected_node = 0,
+        },
+    };
+    defer app.git_status.deinit();
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/a\x00AM src/b\x00 M other.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    switch (app.selectedUnstageTarget()) {
+        .ready => |target| {
+            try std.testing.expectEqualStrings("/repo", target.repo_root);
+            try std.testing.expectEqualStrings("src", target.path);
+            try std.testing.expect(target.kind == .directory);
+        },
+        else => return error.ExpectedDirectoryUnstageTarget,
+    }
+
+    var unstaged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00?? src/b\x00");
+    try app.git_status.replace("/repo", &unstaged_bundle);
+    switch (app.selectedUnstageTarget()) {
+        .no_staged_content => |target| {
+            try std.testing.expectEqualStrings("src", target.path);
+            try std.testing.expect(target.kind == .directory);
+        },
+        else => return error.ExpectedNoDirectoryStagedContent,
+    }
+
+    var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/a\x00UU src/b\x00");
+    try app.git_status.replace("/repo", &conflict_bundle);
+    switch (app.selectedUnstageTarget()) {
+        .conflict_unsupported => |target| {
+            try std.testing.expectEqualStrings("src", target.path);
+            try std.testing.expect(target.kind == .directory);
+        },
+        else => return error.ExpectedDirectoryConflictUnstageReject,
+    }
+}
+
+test "pending selection restore can restore directory nodes" {
+    var app: App = .{
+        .load = testLoadState(testLoadedDiffNested()),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 1 },
+            .selected_node = 1,
+        },
+    };
+    defer app.clearPendingSelectionRestore(std.testing.allocator);
+
+    try app.setPendingSelectionRestore(std.testing.allocator, "src");
+    var loaded = testLoadedDiffNested();
+
+    try std.testing.expect(app.restorePendingSelectionOrFallback(std.testing.allocator, &loaded));
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.viewer.selected_target.?);
 }
 
 test "selectionContext keeps no-index source paths" {

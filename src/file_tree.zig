@@ -450,6 +450,14 @@ pub fn isPathAncestor(ancestor: []const u8, path: []const u8) bool {
         path[ancestor.len] == '/';
 }
 
+/// Return true when `path` is below `directory`.
+///
+/// Directory nodes are stored without a trailing slash, so this keeps `src/app`
+/// from matching the sibling path `src/application.zig`.
+pub fn isPathDescendantOfDirectory(path: []const u8, directory: []const u8) bool {
+    return isPathAncestor(directory, path);
+}
+
 test "build creates directory and file nodes with aggregate stats" {
     const text =
         \\diff --git a/src/main.zig b/src/main.zig
@@ -488,6 +496,13 @@ test "build creates directory and file nodes with aggregate stats" {
     try std.testing.expectEqualStrings("lib", tree.nodes[2].name);
     try std.testing.expectEqual(Node.Kind.file, tree.nodes[3].kind);
     try std.testing.expectEqualStrings("root.zig", tree.nodes[3].name);
+}
+
+test "directory descendant matching respects path boundaries" {
+    try std.testing.expect(isPathDescendantOfDirectory("src/app/main.zig", "src/app"));
+    try std.testing.expect(isPathDescendantOfDirectory("src/lib/root.zig", "src"));
+    try std.testing.expect(!isPathDescendantOfDirectory("src/application.zig", "src/app"));
+    try std.testing.expect(!isPathDescendantOfDirectory("src/app", "src/app"));
 }
 
 test "buildWithStatus adds untracked status-only rows" {
