@@ -235,6 +235,8 @@ pub const App = struct {
         commit_panel_enter,
         commit_panel_insert: u21,
         commit_panel_backspace,
+        commit_panel_move_left,
+        commit_panel_move_right,
         enter_repo_picker,
         cancel_repo_picker,
         submit_repo_picker,
@@ -401,6 +403,8 @@ pub const App = struct {
             .commit_panel_enter => self.commit_panel.enter(),
             .commit_panel_insert => |codepoint| self.commit_panel.insert(codepoint),
             .commit_panel_backspace => self.commit_panel.backspace(),
+            .commit_panel_move_left => self.commit_panel.moveLeft(),
+            .commit_panel_move_right => self.commit_panel.moveRight(),
             .enter_repo_picker => try self.enterRepoPickerMode(ctx.allocator()),
             .cancel_repo_picker => self.cancelRepoPickerMode(ctx.allocator()),
             .submit_repo_picker => try self.submitRepoPicker(ctx),
@@ -5365,17 +5369,20 @@ fn expectSnapshotNotContains(ts: *const chasen.testing.TestSurface, needle: []co
 fn setDiffSearchQuery(app: *App, query: []const u8) void {
     @memcpy(app.search.query.buffer[0..query.len], query);
     app.search.query.len = query.len;
+    app.search.query.cursor = query.len;
     setDiffSearchInput(app, query);
 }
 
 fn setDiffSearchInput(app: *App, query: []const u8) void {
     @memcpy(app.search.input.buffer[0..query.len], query);
     app.search.input.len = query.len;
+    app.search.input.cursor = query.len;
 }
 
 fn setFileSearchInput(app: *App, query: []const u8) void {
     @memcpy(app.file_search.input.buffer[0..query.len], query);
     app.file_search.input.len = query.len;
+    app.file_search.input.cursor = query.len;
 }
 
 fn testMouseEvent(col: anytype, row: anytype, button: anytype) chasen.Event {

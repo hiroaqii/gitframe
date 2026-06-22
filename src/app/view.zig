@@ -30,7 +30,7 @@ const help_column_gap: u16 = 2;
 const help_header_rows: u16 = 2;
 const help_scroll_indicator_rows: u16 = 1;
 const commit_dialog_width: u16 = 72;
-const commit_dialog_height: u16 = 16;
+const commit_dialog_height: u16 = 22;
 
 const StateTone = enum {
     muted,
@@ -739,34 +739,39 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
     const staged_text = try stagedSummaryText(content.frameAllocator(), app.stagedSummaryForActiveRepo());
     try draw.copyClippedTextAt(&content, 0, 0, staged_text, .{ .fg = .gray });
 
-    if (size.height > 2) {
+    const help_row = if (size.height > 0) size.height - 1 else 0;
+    const error_row = if (help_row > 0) help_row - 1 else help_row;
+    const field_limit_row = if (size.height > 2) error_row else help_row;
+
+    if (size.height > 2 and 2 < field_limit_row) {
         const active = app.commit_panel.active_field == .subject;
         const label_style: chasen.TextStyle = if (active) .{ .bold = true, .fg = .{ .index = 14 } } else .{ .bold = true };
         _ = content.borrowTextAt(0, 2, if (active) ">" else " ", label_style);
         _ = content.borrowTextAt(2, 2, "Subject:", label_style);
-        const input_col: u16 = @min(11, size.width);
-        if (size.width > input_col) {
-            try draw.copyClippedTextAt(&content, input_col, 2, app.commit_panel.subject.slice(), .{ .fg = .{ .index = 11 } });
+        const input_col: u16 = @min(2, size.width);
+        if (size.height > 3 and 3 < field_limit_row and size.width > input_col) {
+            const cursor = if (active) app.commit_panel.subject.cursor else null;
+            try drawCommitInputLine(&content, input_col, 3, app.commit_panel.subject.slice(), cursor, .{ .fg = .{ .index = 11 } });
+            if (active) showInputCursor(&content, input_col, 3, app.commit_panel.subject.slice(), app.commit_panel.subject.cursor);
         }
     }
 
-    if (size.height > 4) {
+    if (size.height > 5 and 5 < field_limit_row) {
         const active = app.commit_panel.active_field == .body;
         const label_style: chasen.TextStyle = if (active) .{ .bold = true, .fg = .{ .index = 14 } } else .{ .bold = true };
-        _ = content.borrowTextAt(0, 4, if (active) ">" else " ", label_style);
-        _ = content.borrowTextAt(2, 4, "Body:", label_style);
+        _ = content.borrowTextAt(0, 5, if (active) ">" else " ", label_style);
+        _ = content.borrowTextAt(2, 5, "Body:", label_style);
     }
 
-    const help_row = if (size.height > 0) size.height - 1 else 0;
-    const error_row = if (help_row > 0) help_row - 1 else help_row;
-    if (size.height > 5 and error_row > 5) {
+    if (size.height > 6 and error_row > 6) {
         var body_area = content.child(.{
             .col = 2,
-            .row = 5,
+            .row = 6,
             .width = if (size.width > 2) size.width - 2 else 0,
-            .height = error_row - 5,
+            .height = error_row - 6,
         });
-        try viewCommitBody(&app.commit_panel.body, &body_area);
+        try viewCommitBody(&app.commit_panel.body, &body_area, app.commit_panel.active_field == .body);
+        if (app.commit_panel.active_field == .body) showBodyInputCursor(&body_area, &app.commit_panel.body);
     }
 
     if (size.height > 2) {
@@ -782,22 +787,99 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
     }
 }
 
-fn viewCommitBody(body: *const app_commit_panel.BodyText, surface: *chasen.Surface) !void {
+fn viewCommitBody(body: *const app_commit_panel.BodyText, surface: *chasen.Surface, active: bool) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
     const total_lines = body.lineCount();
     const overflow = total_lines > size.height;
     const text_rows = if (overflow and size.height > 0) size.height - 1 else size.height;
+    const start_line = bodyVisibleStartLine(body, text_rows);
+    const active_line = if (active) bodyActiveLineIndex(body, start_line, text_rows) else null;
 
     var row: u16 = 0;
     while (row < text_rows) : (row += 1) {
-        const line = body.lineAt(row) orelse "";
-        try draw.copyClippedTextAt(surface, 0, row, line, .{});
+        const body_line = start_line + row;
+        const line = body.lineAt(body_line) orelse "";
+        const cursor = if (active_line != null and row == active_line.?) body.cursorLinePrefix().len else null;
+        try drawCommitInputLine(surface, 0, row, line, cursor, .{});
     }
     if (overflow) {
-        try draw.copyClippedTextAt(surface, 0, size.height - 1, "...", .{ .fg = .gray });
+        const indicator = try std.fmt.allocPrint(surface.frameAllocator(), "... {d}/{d}", .{ start_line + text_rows, total_lines });
+        try draw.copyClippedTextAt(surface, 0, size.height - 1, indicator, .{ .fg = .gray });
     }
+}
+
+fn drawCommitInputLine(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, cursor: ?usize, style: chasen.TextStyle) !void {
+    const size = surface.size();
+    if (col >= size.width or row >= size.height) return;
+
+    const width = size.width - col;
+    const visible = if (cursor) |cursor_pos| inputVisibleSlice(text, cursor_pos, width) else text;
+    try draw.copyClippedTextAt(surface, col, row, visible, style);
+}
+
+fn inputVisibleSlice(text: []const u8, cursor: usize, width: u16) []const u8 {
+    return text[inputVisibleStart(text, cursor, width)..];
+}
+
+fn inputVisibleStart(text: []const u8, cursor: usize, width: u16) usize {
+    const clamped_cursor = @min(cursor, text.len);
+    if (width == 0 or text.len == 0) return clamped_cursor;
+
+    const max_width_before_cursor = width - 1;
+    var iter = chasen.text.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        if (grapheme.start > clamped_cursor) break;
+        if (chasen.text.displayWidth(text[grapheme.start..clamped_cursor]) <= max_width_before_cursor) {
+            return grapheme.start;
+        }
+    }
+    return clamped_cursor;
+}
+
+fn showInputCursor(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, cursor: usize) void {
+    const size = surface.size();
+    if (col >= size.width or row >= size.height) return;
+
+    const width = size.width - col;
+    const clamped_cursor = @min(cursor, text.len);
+    const visible_start = inputVisibleStart(text, clamped_cursor, width);
+    const text_width = chasen.text.displayWidth(text[visible_start..clamped_cursor]);
+    const cursor_col = @min(size.width - 1, col +| text_width);
+    surface.showCursor(cursor_col, row);
+}
+
+fn showBodyInputCursor(surface: *chasen.Surface, body: *const app_commit_panel.BodyText) void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    const total_lines = body.lineCount();
+    const overflow = total_lines > size.height;
+    const text_rows = if (overflow and size.height > 0) size.height - 1 else size.height;
+    const start_line = bodyVisibleStartLine(body, text_rows);
+    const visible_line_index = bodyActiveLineIndex(body, start_line, text_rows) orelse return;
+
+    // BodyText is append-only for now, so the active insertion point is at the
+    // end of the last visible input line.
+    const line = body.lineAt(start_line + visible_line_index) orelse "";
+    showInputCursor(surface, 0, @intCast(visible_line_index), line, body.cursorLinePrefix().len);
+}
+
+fn bodyVisibleStartLine(body: *const app_commit_panel.BodyText, text_rows: u16) u16 {
+    const total_lines = body.lineCount();
+    if (text_rows == 0 or total_lines <= text_rows) return 0;
+    const cursor_line = body.cursorLineIndex();
+    if (cursor_line < text_rows) return 0;
+    return @intCast(cursor_line - text_rows + 1);
+}
+
+fn bodyActiveLineIndex(body: *const app_commit_panel.BodyText, start_line: u16, text_rows: u16) ?u16 {
+    if (text_rows == 0) return null;
+
+    const cursor_line = body.cursorLineIndex();
+    if (cursor_line < start_line or cursor_line >= @as(usize, start_line) + text_rows) return null;
+    return @intCast(cursor_line - start_line);
 }
 
 fn stagedSummaryText(allocator: std.mem.Allocator, summary: app_commit_panel.StagedSummary) ![]const u8 {

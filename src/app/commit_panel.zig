@@ -33,14 +33,14 @@ pub const max_body_lines = 32;
 
 /// Minimal app-local multiline buffer for the commit body.
 ///
-/// This intentionally keeps only append/backspace behavior for the first
-/// commit-panel slice; cursor movement and scrolling can be added when the
-/// commit workflow needs them.
+/// This keeps storage self-owned and fixed-capacity while supporting the
+/// cursor movement needed by the commit popup.
 pub const BodyText = struct {
     pub const InsertError = error{BufferFull};
 
     buffer: [max_body_bytes]u8 = undefined,
     len: usize = 0,
+    cursor: usize = 0,
 
     pub fn slice(self: *const BodyText) []const u8 {
         return self.buffer[0..self.len];
@@ -50,8 +50,10 @@ pub const BodyText = struct {
         var bytes: [4]u8 = undefined;
         const written = std.unicode.utf8Encode(codepoint, &bytes) catch unreachable;
         if (self.len + written > self.buffer.len) return error.BufferFull;
-        @memcpy(self.buffer[self.len .. self.len + written], bytes[0..written]);
+        std.mem.copyBackwards(u8, self.buffer[self.cursor + written .. self.len + written], self.buffer[self.cursor..self.len]);
+        @memcpy(self.buffer[self.cursor .. self.cursor + written], bytes[0..written]);
         self.len += written;
+        self.cursor += written;
     }
 
     pub fn newline(self: *BodyText) InsertError!void {
@@ -60,16 +62,19 @@ pub const BodyText = struct {
     }
 
     pub fn backspace(self: *BodyText) void {
-        if (self.len == 0) return;
-        var view = std.unicode.Utf8View.initUnchecked(self.slice());
-        var iterator = view.iterator();
-        var previous_end: usize = 0;
-        while (iterator.nextCodepointSlice()) |bytes| {
-            const end = @intFromPtr(bytes.ptr) - @intFromPtr(self.buffer[0..].ptr) + bytes.len;
-            if (end >= self.len) break;
-            previous_end = end;
-        }
-        self.len = previous_end;
+        if (self.cursor == 0) return;
+        const previous = previousBoundary(self.slice(), self.cursor);
+        std.mem.copyForwards(u8, self.buffer[previous .. self.len - (self.cursor - previous)], self.buffer[self.cursor..self.len]);
+        self.len -= self.cursor - previous;
+        self.cursor = previous;
+    }
+
+    pub fn moveLeft(self: *BodyText) void {
+        self.cursor = previousBoundary(self.slice(), self.cursor);
+    }
+
+    pub fn moveRight(self: *BodyText) void {
+        self.cursor = nextBoundary(self.slice(), self.cursor);
     }
 
     pub fn lineCount(self: *const BodyText) usize {
@@ -95,8 +100,26 @@ pub const BodyText = struct {
         return null;
     }
 
+    pub fn cursorLineIndex(self: *const BodyText) usize {
+        var index: usize = 0;
+        for (self.slice()[0..self.cursor]) |byte| {
+            if (byte == '\n') index += 1;
+        }
+        return index;
+    }
+
+    pub fn cursorLinePrefix(self: *const BodyText) []const u8 {
+        const text = self.slice();
+        var start: usize = 0;
+        var offset: usize = 0;
+        while (offset < self.cursor) : (offset += 1) {
+            if (text[offset] == '\n') start = offset + 1;
+        }
+        return text[start..self.cursor];
+    }
+
     pub fn clear(self: *BodyText) void {
-        self.len = 0;
+        self.* = .{};
     }
 };
 
@@ -248,6 +271,20 @@ pub const State = struct {
         }
     }
 
+    pub fn moveLeft(self: *State) void {
+        switch (self.active_field) {
+            .subject => self.subject.moveLeft(),
+            .body => self.body.moveLeft(),
+        }
+    }
+
+    pub fn moveRight(self: *State) void {
+        switch (self.active_field) {
+            .subject => self.subject.moveRight(),
+            .body => self.body.moveRight(),
+        }
+    }
+
     pub fn validateSubmit(self: *const State, summary: StagedSummary) ?CommitError {
         if (self.commit_error) |err| {
             switch (err) {
@@ -276,3 +313,54 @@ pub const State = struct {
         return std.mem.trim(u8, self.subject.slice(), " \t\r\n");
     }
 };
+
+test "BodyText edits at the cursor" {
+    var body: BodyText = .{};
+
+    try body.insert('a');
+    try body.insert('c');
+    body.moveLeft();
+    try body.insert('b');
+
+    try std.testing.expectEqualStrings("abc", body.slice());
+    try std.testing.expectEqual(@as(usize, 2), body.cursor);
+
+    body.backspace();
+    try std.testing.expectEqualStrings("ac", body.slice());
+    try std.testing.expectEqual(@as(usize, 1), body.cursor);
+}
+
+test "BodyText reports cursor line context" {
+    var body: BodyText = .{};
+    try body.insert('a');
+    try body.newline();
+    try body.insert('b');
+
+    try std.testing.expectEqual(@as(usize, 1), body.cursorLineIndex());
+    try std.testing.expectEqualStrings("b", body.cursorLinePrefix());
+}
+
+fn previousBoundary(bytes: []const u8, cursor: usize) usize {
+    if (cursor == 0) return 0;
+
+    var previous: usize = 0;
+    var iter = std.unicode.Utf8View.initUnchecked(bytes).iterator();
+    while (iter.nextCodepointSlice()) |codepoint| {
+        const end = @intFromPtr(codepoint.ptr) - @intFromPtr(bytes.ptr) + codepoint.len;
+        if (end >= cursor) return previous;
+        previous = end;
+    }
+    return previous;
+}
+
+fn nextBoundary(bytes: []const u8, cursor: usize) usize {
+    if (cursor >= bytes.len) return bytes.len;
+
+    var iter = std.unicode.Utf8View.initUnchecked(bytes).iterator();
+    while (iter.nextCodepointSlice()) |codepoint| {
+        const start = @intFromPtr(codepoint.ptr) - @intFromPtr(bytes.ptr);
+        const end = start + codepoint.len;
+        if (start >= cursor or cursor < end) return end;
+    }
+    return bytes.len;
+}

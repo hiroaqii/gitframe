@@ -10,6 +10,7 @@ pub const TextInput = struct {
 
     buffer: [128]u8 = undefined,
     len: usize = 0,
+    cursor: usize = 0,
 
     pub fn slice(self: *const TextInput) []const u8 {
         return self.buffer[0..self.len];
@@ -19,25 +20,30 @@ pub const TextInput = struct {
         var bytes: [4]u8 = undefined;
         const written = std.unicode.utf8Encode(codepoint, &bytes) catch unreachable;
         if (self.len + written > self.buffer.len) return error.BufferFull;
-        @memcpy(self.buffer[self.len .. self.len + written], bytes[0..written]);
+        std.mem.copyBackwards(u8, self.buffer[self.cursor + written .. self.len + written], self.buffer[self.cursor..self.len]);
+        @memcpy(self.buffer[self.cursor .. self.cursor + written], bytes[0..written]);
         self.len += written;
+        self.cursor += written;
     }
 
     pub fn backspace(self: *TextInput) void {
-        if (self.len == 0) return;
-        var view = std.unicode.Utf8View.initUnchecked(self.slice());
-        var iterator = view.iterator();
-        var previous_end: usize = 0;
-        while (iterator.nextCodepointSlice()) |bytes| {
-            const end = @intFromPtr(bytes.ptr) - @intFromPtr(self.buffer[0..].ptr) + bytes.len;
-            if (end >= self.len) break;
-            previous_end = end;
-        }
-        self.len = previous_end;
+        if (self.cursor == 0) return;
+        const previous = previousBoundary(self.slice(), self.cursor);
+        std.mem.copyForwards(u8, self.buffer[previous .. self.len - (self.cursor - previous)], self.buffer[self.cursor..self.len]);
+        self.len -= self.cursor - previous;
+        self.cursor = previous;
+    }
+
+    pub fn moveLeft(self: *TextInput) void {
+        self.cursor = previousBoundary(self.slice(), self.cursor);
+    }
+
+    pub fn moveRight(self: *TextInput) void {
+        self.cursor = nextBoundary(self.slice(), self.cursor);
     }
 
     pub fn clear(self: *TextInput) void {
-        self.len = 0;
+        self.* = .{};
     }
 };
 
@@ -189,10 +195,27 @@ test "TextInput inserts UTF-8 codepoints and backspaces by codepoint" {
     try std.testing.expectEqualStrings("", input.slice());
 }
 
+test "TextInput edits at the cursor" {
+    var input: TextInput = .{};
+
+    try input.insert('a');
+    try input.insert('c');
+    input.moveLeft();
+    try input.insert('b');
+
+    try std.testing.expectEqualStrings("abc", input.slice());
+    try std.testing.expectEqual(@as(usize, 2), input.cursor);
+
+    input.backspace();
+    try std.testing.expectEqualStrings("ac", input.slice());
+    try std.testing.expectEqual(@as(usize, 1), input.cursor);
+}
+
 test "TextInput reports BufferFull without changing existing bytes" {
     var input: TextInput = .{};
     @memset(input.buffer[0..], 'x');
     input.len = input.buffer.len;
+    input.cursor = input.len;
 
     try std.testing.expectError(error.BufferFull, input.insert('y'));
     try std.testing.expectEqual(@as(usize, input.buffer.len), input.len);
@@ -230,4 +253,29 @@ test "RepoPickerState tracks path discovery generation" {
     try std.testing.expect(state.isCurrentPathDiscovery(generation));
     try std.testing.expect(state.finishPathDiscovery(generation));
     try std.testing.expect(!state.path_pending);
+}
+
+fn previousBoundary(bytes: []const u8, cursor: usize) usize {
+    if (cursor == 0) return 0;
+
+    var previous: usize = 0;
+    var iter = std.unicode.Utf8View.initUnchecked(bytes).iterator();
+    while (iter.nextCodepointSlice()) |codepoint| {
+        const end = @intFromPtr(codepoint.ptr) - @intFromPtr(bytes.ptr) + codepoint.len;
+        if (end >= cursor) return previous;
+        previous = end;
+    }
+    return previous;
+}
+
+fn nextBoundary(bytes: []const u8, cursor: usize) usize {
+    if (cursor >= bytes.len) return bytes.len;
+
+    var iter = std.unicode.Utf8View.initUnchecked(bytes).iterator();
+    while (iter.nextCodepointSlice()) |codepoint| {
+        const start = @intFromPtr(codepoint.ptr) - @intFromPtr(bytes.ptr);
+        const end = start + codepoint.len;
+        if (start >= cursor or cursor < end) return end;
+    }
+    return bytes.len;
 }
