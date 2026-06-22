@@ -267,6 +267,7 @@ pub const App = struct {
 
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         self.allocator = ctx.allocator();
+        self.commit_panel = app_commit_panel.State.init(ctx.allocator());
         if (self.config.watch) {
             try ctx.timer().every(auto_reload_timer_id, auto_reload_interval_ns, .auto_reload_tick);
         }
@@ -283,6 +284,7 @@ pub const App = struct {
         self.repo_state.deinit(deinit_ctx.allocator);
         self.git_status.deinit();
         self.file_search.deinit(deinit_ctx.allocator);
+        self.commit_panel.deinit();
         self.repo_picker.deinit(deinit_ctx.allocator);
         self.clearRepoPickerDiscovery(deinit_ctx.allocator);
         self.deinitRepoPickerItems(deinit_ctx.allocator);

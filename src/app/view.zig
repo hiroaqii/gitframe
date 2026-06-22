@@ -763,7 +763,7 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
         const label_style: chasen.TextStyle = if (active) .{ .bold = true, .fg = .{ .index = 14 } } else .{ .bold = true };
         _ = content.borrowTextAt(0, 5, if (active) ">" else " ", label_style);
         _ = content.borrowTextAt(2, 5, "Body:", label_style);
-        try drawCommitCounter(&content, 5, app.commit_panel.bodyCharCount(), app_commit_panel.max_body_chars);
+        try drawCommitCounter(&content, 5, app.commit_panel.bodyCharCount(), null);
     }
 
     if (size.height > 6 and error_row > 6) {
@@ -788,11 +788,14 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
     try viewCommitHelp(&content, help_start_row, help_rows);
 }
 
-fn drawCommitCounter(surface: *chasen.Surface, row: u16, len: usize, max: usize) !void {
+fn drawCommitCounter(surface: *chasen.Surface, row: u16, len: usize, max: ?usize) !void {
     const size = surface.size();
     if (row >= size.height or size.width == 0) return;
 
-    const counter = try std.fmt.allocPrint(surface.frameAllocator(), "{d}/{d}", .{ len, max });
+    const counter = if (max) |limit|
+        try std.fmt.allocPrint(surface.frameAllocator(), "{d}/{d}", .{ len, limit })
+    else
+        try std.fmt.allocPrint(surface.frameAllocator(), "{d}", .{len});
     const counter_width = chasen.text.displayWidth(counter);
     if (counter_width >= size.width) return;
 
