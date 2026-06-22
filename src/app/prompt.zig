@@ -8,7 +8,7 @@ const ui = @import("chasen_ui");
 pub const TextInput = struct {
     pub const InsertError = error{BufferFull};
 
-    buffer: [128]u8 = undefined,
+    buffer: [512]u8 = undefined,
     len: usize = 0,
     cursor: usize = 0,
 

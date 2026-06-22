@@ -65,6 +65,8 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "commit_panel_backspace");
         if (key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "commit_panel_move_left");
         if (key.matches(chasen.Key.right, .{})) return voidMsg(Msg, "commit_panel_move_right");
+        if (key.matches(chasen.Key.up, .{})) return voidMsg(Msg, "commit_panel_move_up");
+        if (key.matches(chasen.Key.down, .{})) return voidMsg(Msg, "commit_panel_move_down");
         if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "commit_panel_insert", codepoint);
         return null;
     }
@@ -228,6 +230,8 @@ const TestMsg = union(enum) {
     commit_panel_backspace,
     commit_panel_move_left,
     commit_panel_move_right,
+    commit_panel_move_up,
+    commit_panel_move_down,
     commit_panel_insert: u21,
     cancel_repo_picker,
     submit_repo_picker,
@@ -345,6 +349,8 @@ test "keyToMsg maps commit panel command and routes panel input" {
     try std.testing.expectEqual(TestMsg.commit_panel_backspace, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.backspace }).?);
     try std.testing.expectEqual(TestMsg.commit_panel_move_left, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.left }).?);
     try std.testing.expectEqual(TestMsg.commit_panel_move_right, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.right }).?);
+    try std.testing.expectEqual(TestMsg.commit_panel_move_up, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(TestMsg.commit_panel_move_down, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.down }).?);
     try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'x' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'x' }).?);
     try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'R' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'R' }).?);
     try std.testing.expectEqual(TestMsg.enter_commit_panel, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'c' }).?);
@@ -403,7 +409,7 @@ test "keyToMsg ignores special keys in text input modes" {
     for (common_cases) |key| {
         try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .search_mode = true }, key));
         try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .file_search_mode = true }, key));
-        if (key.codepoint != chasen.Key.tab and key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right) {
+        if (key.codepoint != chasen.Key.tab and key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right and key.codepoint != chasen.Key.up and key.codepoint != chasen.Key.down) {
             try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .commit_panel_mode = true }, key));
         }
         try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, key));

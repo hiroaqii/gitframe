@@ -739,15 +739,17 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
     const staged_text = try stagedSummaryText(content.frameAllocator(), app.stagedSummaryForActiveRepo());
     try draw.copyClippedTextAt(&content, 0, 0, staged_text, .{ .fg = .gray });
 
-    const help_row = if (size.height > 0) size.height - 1 else 0;
-    const error_row = if (help_row > 0) help_row - 1 else help_row;
-    const field_limit_row = if (size.height > 2) error_row else help_row;
+    const help_rows = commitHelpRows(size.width);
+    const help_start_row = if (size.height > help_rows) size.height - help_rows else 0;
+    const error_row = if (help_start_row > 0) help_start_row - 1 else help_start_row;
+    const field_limit_row = if (size.height > 2) error_row else help_start_row;
 
     if (size.height > 2 and 2 < field_limit_row) {
         const active = app.commit_panel.active_field == .subject;
         const label_style: chasen.TextStyle = if (active) .{ .bold = true, .fg = .{ .index = 14 } } else .{ .bold = true };
         _ = content.borrowTextAt(0, 2, if (active) ">" else " ", label_style);
         _ = content.borrowTextAt(2, 2, "Subject:", label_style);
+        try drawCommitCounter(&content, 2, app.commit_panel.subjectCharCount(), app_commit_panel.max_subject_chars);
         const input_col: u16 = @min(2, size.width);
         if (size.height > 3 and 3 < field_limit_row and size.width > input_col) {
             const cursor = if (active) app.commit_panel.subject.cursor else null;
@@ -761,6 +763,7 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
         const label_style: chasen.TextStyle = if (active) .{ .bold = true, .fg = .{ .index = 14 } } else .{ .bold = true };
         _ = content.borrowTextAt(0, 5, if (active) ">" else " ", label_style);
         _ = content.borrowTextAt(2, 5, "Body:", label_style);
+        try drawCommitCounter(&content, 5, app.commit_panel.bodyCharCount(), app_commit_panel.max_body_chars);
     }
 
     if (size.height > 6 and error_row > 6) {
@@ -782,8 +785,39 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
         }
     }
 
-    if (size.height > 0) {
-        try draw.copyClippedTextAt(&content, 0, help_row, "Tab: field  Enter: body/newline  Ctrl+Enter/Ctrl+s: validate  Esc: close", .{ .fg = .gray });
+    try viewCommitHelp(&content, help_start_row, help_rows);
+}
+
+fn drawCommitCounter(surface: *chasen.Surface, row: u16, len: usize, max: usize) !void {
+    const size = surface.size();
+    if (row >= size.height or size.width == 0) return;
+
+    const counter = try std.fmt.allocPrint(surface.frameAllocator(), "{d}/{d}", .{ len, max });
+    const counter_width = chasen.text.displayWidth(counter);
+    if (counter_width >= size.width) return;
+
+    const col = size.width - counter_width;
+    try draw.copyClippedTextAt(surface, col, row, counter, .{ .fg = .gray });
+}
+
+fn commitHelpRows(width: u16) u16 {
+    const single_line = "Tab: field  Enter: newline  Ctrl+s/Ctrl+Enter: validate  Esc: close";
+    return if (chasen.text.displayWidth(single_line) <= width) 1 else 2;
+}
+
+fn viewCommitHelp(surface: *chasen.Surface, start_row: u16, rows: u16) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0 or start_row >= size.height) return;
+
+    const style: chasen.TextStyle = .{ .fg = .gray };
+    if (rows <= 1) {
+        try draw.copyClippedTextAt(surface, 0, start_row, "Tab: field  Enter: newline  Ctrl+s/Ctrl+Enter: validate  Esc: close", style);
+        return;
+    }
+
+    try draw.copyClippedTextAt(surface, 0, start_row, "Tab: field  Enter: newline  Ctrl+s: validate", style);
+    if (start_row + 1 < size.height) {
+        try draw.copyClippedTextAt(surface, 0, start_row + 1, "Ctrl+Enter: validate  Esc: close", style);
     }
 }
 
@@ -805,7 +839,7 @@ fn viewCommitBody(body: *const app_commit_panel.BodyText, surface: *chasen.Surfa
         try drawCommitInputLine(surface, 0, row, line, cursor, .{});
     }
     if (overflow) {
-        const indicator = try std.fmt.allocPrint(surface.frameAllocator(), "... {d}/{d}", .{ start_line + text_rows, total_lines });
+        const indicator = try std.fmt.allocPrint(surface.frameAllocator(), "... {d}/{d}", .{ body.cursorLineIndex() + 1, total_lines });
         try draw.copyClippedTextAt(surface, 0, size.height - 1, indicator, .{ .fg = .gray });
     }
 }
@@ -860,8 +894,6 @@ fn showBodyInputCursor(surface: *chasen.Surface, body: *const app_commit_panel.B
     const start_line = bodyVisibleStartLine(body, text_rows);
     const visible_line_index = bodyActiveLineIndex(body, start_line, text_rows) orelse return;
 
-    // BodyText is append-only for now, so the active insertion point is at the
-    // end of the last visible input line.
     const line = body.lineAt(start_line + visible_line_index) orelse "";
     showInputCursor(surface, 0, @intCast(visible_line_index), line, body.cursorLinePrefix().len);
 }

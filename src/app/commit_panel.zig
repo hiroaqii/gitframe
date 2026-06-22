@@ -1,4 +1,5 @@
 const std = @import("std");
+const chasen = @import("chasen");
 const prompt = @import("prompt.zig");
 
 pub const CommitError = enum {
@@ -28,7 +29,9 @@ pub const Field = enum {
     body,
 };
 
-pub const max_body_bytes = 4096;
+pub const max_body_bytes = 8192;
+pub const max_subject_chars = 72;
+pub const max_body_chars = 2000;
 pub const max_body_lines = 32;
 
 /// Minimal app-local multiline buffer for the commit body.
@@ -77,6 +80,20 @@ pub const BodyText = struct {
         self.cursor = nextBoundary(self.slice(), self.cursor);
     }
 
+    pub fn moveUp(self: *BodyText) void {
+        const current_line = self.cursorLineIndex();
+        if (current_line == 0) return;
+
+        self.cursor = self.cursorForLineColumn(current_line - 1, self.cursorDisplayColumn());
+    }
+
+    pub fn moveDown(self: *BodyText) void {
+        const current_line = self.cursorLineIndex();
+        if (current_line + 1 >= self.lineCount()) return;
+
+        self.cursor = self.cursorForLineColumn(current_line + 1, self.cursorDisplayColumn());
+    }
+
     pub fn lineCount(self: *const BodyText) usize {
         if (self.len == 0) return 1;
         var count: usize = 1;
@@ -118,10 +135,40 @@ pub const BodyText = struct {
         return text[start..self.cursor];
     }
 
+    pub fn cursorDisplayColumn(self: *const BodyText) u16 {
+        return displayWidthClamped(self.cursorLinePrefix());
+    }
+
+    fn cursorForLineColumn(self: *const BodyText, line_index: usize, target_column: u16) usize {
+        const bounds = self.lineBounds(line_index) orelse return self.cursor;
+        return bounds.start + offsetForDisplayColumn(self.slice()[bounds.start..bounds.end], target_column);
+    }
+
+    fn lineBounds(self: *const BodyText, target_index: usize) ?struct { start: usize, end: usize } {
+        var start: usize = 0;
+        var index: usize = 0;
+        const text = self.slice();
+        for (text, 0..) |byte, offset| {
+            if (byte != '\n') continue;
+            if (index == target_index) return .{ .start = start, .end = offset };
+            start = offset + 1;
+            index += 1;
+        }
+        if (index == target_index) return .{ .start = start, .end = text.len };
+        return null;
+    }
+
     pub fn clear(self: *BodyText) void {
         self.* = .{};
     }
 };
+
+pub fn graphemeCount(text: []const u8) usize {
+    var count: usize = 0;
+    var iter = chasen.text.graphemeIterator(text);
+    while (iter.next()) |_| count += 1;
+    return count;
+}
 
 test "State validates commit message and staged summary" {
     var state: State = .{};
@@ -154,6 +201,38 @@ test "State reports input overflow as panel error" {
 
     try std.testing.expectEqual(CommitError.body_too_long, state.commit_error.?);
     try std.testing.expectEqual(CommitError.body_too_long, state.validateSubmit(.{ .ready = .{ .count = 1 } }).?);
+}
+
+test "State accepts multibyte subject up to character limit" {
+    var state: State = .{};
+
+    var index: usize = 0;
+    while (index < max_subject_chars) : (index += 1) state.insert('あ');
+
+    try std.testing.expect(state.commit_error == null);
+    try std.testing.expectEqual(max_subject_chars, graphemeCount(state.subject.slice()));
+    try std.testing.expect(state.validateSubmit(.{ .ready = .{ .count = 1 } }) == null);
+}
+
+test "State validates trimmed character counts" {
+    var state: State = .{};
+
+    state.insert(' ');
+    var index: usize = 0;
+    while (index < max_subject_chars) : (index += 1) state.insert('あ');
+    state.insert(' ');
+
+    try std.testing.expectEqual(max_subject_chars, state.subjectCharCount());
+    try std.testing.expect(state.validateSubmit(.{ .ready = .{ .count = 1 } }) == null);
+
+    state.active_field = .body;
+    index = 0;
+    while (index < max_body_chars) : (index += 1) state.insert('a');
+    state.enter();
+    state.insert(' ');
+
+    try std.testing.expectEqual(max_body_chars, state.bodyCharCount());
+    try std.testing.expect(state.validateSubmit(.{ .ready = .{ .count = 1 } }) == null);
 }
 
 test "State routes enter and body text" {
@@ -285,6 +364,14 @@ pub const State = struct {
         }
     }
 
+    pub fn moveUp(self: *State) void {
+        if (self.active_field == .body) self.body.moveUp();
+    }
+
+    pub fn moveDown(self: *State) void {
+        if (self.active_field == .body) self.body.moveDown();
+    }
+
     pub fn validateSubmit(self: *const State, summary: StagedSummary) ?CommitError {
         if (self.commit_error) |err| {
             switch (err) {
@@ -293,6 +380,8 @@ pub const State = struct {
             }
         }
         if (trimmedSubject(self).len == 0) return .subject_empty;
+        if (self.subjectCharCount() > max_subject_chars) return .subject_too_long;
+        if (self.bodyCharCount() > max_body_chars) return .body_too_long;
         return switch (summary) {
             .ready => |ready| if (ready.count == 0) .no_staged_changes else null,
             .loading_or_stale => .status_loading,
@@ -304,13 +393,25 @@ pub const State = struct {
     /// `subject\n\nbody` when the body has meaningful content.
     pub fn formatMessage(self: *const State, allocator: std.mem.Allocator) ![]u8 {
         const subject = trimmedSubject(self);
-        const body = std.mem.trim(u8, self.body.slice(), " \t\r\n");
+        const body = trimmedBody(self);
         if (body.len == 0) return allocator.dupe(u8, subject);
         return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ subject, body });
     }
 
+    pub fn subjectCharCount(self: *const State) usize {
+        return graphemeCount(trimmedSubject(self));
+    }
+
+    pub fn bodyCharCount(self: *const State) usize {
+        return graphemeCount(trimmedBody(self));
+    }
+
     fn trimmedSubject(self: *const State) []const u8 {
         return std.mem.trim(u8, self.subject.slice(), " \t\r\n");
+    }
+
+    fn trimmedBody(self: *const State) []const u8 {
+        return std.mem.trim(u8, self.body.slice(), " \t\r\n");
     }
 };
 
@@ -340,6 +441,27 @@ test "BodyText reports cursor line context" {
     try std.testing.expectEqualStrings("b", body.cursorLinePrefix());
 }
 
+test "BodyText moves vertically by display column" {
+    var body: BodyText = .{};
+    try body.insert('a');
+    try body.insert('b');
+    try body.newline();
+    try body.insert('c');
+    try body.insert('d');
+    try body.insert('e');
+
+    body.moveLeft();
+    try std.testing.expectEqualStrings("e", body.slice()[body.cursor .. body.cursor + 1]);
+
+    body.moveUp();
+    try std.testing.expectEqual(@as(usize, 0), body.cursorLineIndex());
+    try std.testing.expectEqualStrings("ab", body.cursorLinePrefix());
+
+    body.moveDown();
+    try std.testing.expectEqual(@as(usize, 1), body.cursorLineIndex());
+    try std.testing.expectEqualStrings("cd", body.cursorLinePrefix());
+}
+
 fn previousBoundary(bytes: []const u8, cursor: usize) usize {
     if (cursor == 0) return 0;
 
@@ -361,6 +483,23 @@ fn nextBoundary(bytes: []const u8, cursor: usize) usize {
         const start = @intFromPtr(codepoint.ptr) - @intFromPtr(bytes.ptr);
         const end = start + codepoint.len;
         if (start >= cursor or cursor < end) return end;
+    }
+    return bytes.len;
+}
+
+fn displayWidthClamped(bytes: []const u8) u16 {
+    return chasen.text.displayWidth(bytes);
+}
+
+fn offsetForDisplayColumn(bytes: []const u8, target_column: u16) usize {
+    var used: u16 = 0;
+    var iter = chasen.text.graphemeIterator(bytes);
+    while (iter.next()) |grapheme| {
+        const grapheme_bytes = grapheme.bytes(bytes);
+        const width = chasen.text.displayWidth(grapheme_bytes);
+        if (used +| width > target_column) return grapheme.start;
+        used +|= width;
+        if (used >= target_column) return grapheme.start + grapheme.len;
     }
     return bytes.len;
 }
