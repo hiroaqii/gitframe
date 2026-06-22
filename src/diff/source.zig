@@ -88,6 +88,13 @@ pub fn sourceAllowsStageAction(source: SourceMode) bool {
     };
 }
 
+pub fn sourceAllowsUnstageAction(source: SourceMode) bool {
+    return switch (source) {
+        .unstaged, .cached => true,
+        .stdin, .pager, .patch_file, .range, .no_index => false,
+    };
+}
+
 pub fn sourceAllowsStageProjection(source: SourceMode) bool {
     return switch (source) {
         .unstaged, .cached => true,
@@ -525,6 +532,10 @@ test "stage action is narrower than stage projection" {
     try std.testing.expect(sourceAllowsStageAction(.unstaged));
     try std.testing.expect(!sourceAllowsStageAction(.cached));
     try std.testing.expect(!sourceAllowsStageAction(.{ .range = "main...HEAD" }));
+
+    try std.testing.expect(sourceAllowsUnstageAction(.unstaged));
+    try std.testing.expect(sourceAllowsUnstageAction(.cached));
+    try std.testing.expect(!sourceAllowsUnstageAction(.{ .range = "main...HEAD" }));
 
     try std.testing.expect(sourceAllowsStageProjection(.unstaged));
     try std.testing.expect(sourceAllowsStageProjection(.cached));

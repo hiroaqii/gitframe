@@ -124,7 +124,9 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (matchesShiftedAscii(key, 'h', 'H')) return voidMsg(Msg, "toggle_hide_reviewed_files");
     if (matchesShiftedAscii(key, 'b', 'B')) return voidMsg(Msg, "toggle_sidebar_visibility");
     if (matchesShiftedAscii(key, 'l', 'L')) return voidMsg(Msg, "toggle_line_numbers");
+    if (matchesShiftedAscii(key, 's', 'S')) return voidMsg(Msg, "unstage_selected_file");
     if (key.matches('c', .{})) return voidMsg(Msg, "enter_commit_panel");
+    if (hasCommandModifier(key)) return null;
 
     return switch (key.codepoint) {
         'k', chasen.Key.up => if (context.focus == .diff) voidMsg(Msg, "scroll_diff_up") else voidMsg(Msg, "select_previous_file"),
@@ -157,12 +159,17 @@ fn isColonKey(key: chasen.Key) bool {
 /// Match an ASCII Shift-letter command across terminals that report either
 /// uppercase codepoints or lowercase codepoints with the shift modifier set.
 fn matchesShiftedAscii(key: chasen.Key, lower: u21, upper: u21) bool {
+    if (hasCommandModifier(key)) return false;
     return key.matches(upper, .{}) or (key.codepoint == lower and key.mods.shift);
+}
+
+fn hasCommandModifier(key: chasen.Key) bool {
+    return key.mods.ctrl or key.mods.alt or key.mods.super or key.mods.hyper or key.mods.meta;
 }
 
 fn textInputCodepoint(key: chasen.Key) ?u21 {
     if (key.isModifier()) return null;
-    if (key.mods.ctrl or key.mods.alt or key.mods.super or key.mods.hyper or key.mods.meta) return null;
+    if (hasCommandModifier(key)) return null;
     if (keyTextCodepoint(key)) |codepoint| return codepoint;
     if (key.codepoint == chasen.Key.multicodepoint) return null;
     if (isVaxisSpecialCodepoint(key.codepoint)) return null;
@@ -258,6 +265,7 @@ const TestMsg = union(enum) {
     increase_sidebar_width,
     enter_commit_panel,
     stage_selected_file,
+    unstage_selected_file,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
@@ -310,6 +318,13 @@ test "keyToMsg maps view option toggles" {
 
 test "keyToMsg maps stage file action" {
     try std.testing.expectEqual(TestMsg.stage_selected_file, keyToMsg(TestMsg, .{}, .{ .codepoint = 's' }).?);
+    try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{}, .{ .codepoint = 'S' }).?);
+    try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{}, shiftedAscii('s', 'S')).?);
+    try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{}, shiftedLowerOnly('s')).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'S', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'S', .mods = .{ .alt = true } }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 's', .mods = .{ .shift = true, .ctrl = true } }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 's', .mods = .{ .shift = true, .alt = true } }));
 }
 
 test "keyToMsg maps commit panel command and routes panel input" {

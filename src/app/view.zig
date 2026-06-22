@@ -1175,6 +1175,7 @@ const help_global_items = [_]HelpItem{
     .{ .key = "R", .description = "switch repository" },
     .{ .key = "c", .description = "open commit panel" },
     .{ .key = "s", .description = "stage selected file" },
+    .{ .key = "S", .description = "unstage selected file" },
     .{ .key = "Home/End", .description = "first / last file" },
 };
 

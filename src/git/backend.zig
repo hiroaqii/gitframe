@@ -99,6 +99,7 @@ pub const GitStatusRequest = struct {
 
 pub const OperationKind = union(enum) {
     stage_file: []const u8,
+    unstage_file: []const u8,
 };
 
 /// Request for a write operation executed in a concrete repository.
@@ -164,6 +165,7 @@ pub const LocalCommandBackend = struct {
     pub fn runOperation(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
         return switch (request.kind) {
             .stage_file => |path| runGitAdd(allocator, io, request.repo_root, path),
+            .unstage_file => |path| runGitUnstage(allocator, io, request.repo_root, path),
         };
     }
 
@@ -292,6 +294,34 @@ fn runGitAdd(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, pa
     return .{ .failed = std.fmt.allocPrint(allocator, "git add failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
+fn runGitUnstage(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) LoadError!OperationResult {
+    const argv = [_][]const u8{ "git", "restore", "--staged", "--", path };
+    const result = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .cwd = .{ .path = repo_root },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.StreamTooLong,
+        else => error.SpawnFailed,
+    };
+
+    allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .ok;
+        },
+        else => {},
+    }
+
+    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    allocator.free(result.stderr);
+
+    return .{ .failed = std.fmt.allocPrint(allocator, "git restore --staged failed: {any}", .{result.term}) catch return error.OutOfMemory };
+}
+
 fn loadNoIndexDiff(allocator: std.mem.Allocator, io: std.Io, paths: PathPair) LoadError!LoadResult {
     const argv = [_][]const u8{
         "git",
@@ -358,6 +388,13 @@ test "Backend exposes operation interface" {
     const backend = local_backend.backend();
 
     try std.testing.expect(backend.ptr == @as(*anyopaque, @ptrCast(&local_backend)));
+
+    const request: OperationRequest = .{
+        .repo_root = "/repo",
+        .kind = .{ .unstage_file = "src/app.zig" },
+    };
+    try std.testing.expectEqualStrings("/repo", request.repo_root);
+    try std.testing.expectEqualStrings("src/app.zig", request.kind.unstage_file);
 }
 
 test "GitDiffRequest cannot represent raw input sources" {

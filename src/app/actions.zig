@@ -61,7 +61,7 @@ pub const ActionState = struct {
 pub const StageFileFinished = struct {
     pending: PendingAction,
     path: []u8,
-    result: StageFileTaskResult,
+    result: FileActionTaskResult,
 
     pub fn deinit(self: *StageFileFinished, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -74,12 +74,28 @@ pub const StageFileFinished = struct {
     }
 };
 
-pub const StageFileTaskResult = union(enum) {
+pub const UnstageFileFinished = struct {
+    pending: PendingAction,
+    path: []u8,
+    result: FileActionTaskResult,
+
+    pub fn deinit(self: *UnstageFileFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.result.deinit(allocator);
+        self.* = .{
+            .pending = .{ .generation = 0, .kind = .unstage_file },
+            .path = &.{},
+            .result = .ok,
+        };
+    }
+};
+
+pub const FileActionTaskResult = union(enum) {
     ok,
     failed: []u8,
     failed_static: []const u8,
 
-    pub fn deinit(self: StageFileTaskResult, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: FileActionTaskResult, allocator: std.mem.Allocator) void {
         switch (self) {
             .ok, .failed_static => {},
             .failed => |message| allocator.free(message),
@@ -119,7 +135,39 @@ pub fn StageFileTask(comptime Msg: type) type {
     };
 }
 
-pub fn runStageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) StageFileTaskResult {
+/// Async task for `git restore --staged -- <path>`.
+///
+/// Kept separate from StageFileTask for now so operation-specific status text
+/// stays obvious; a shared helper can be introduced once a third file action
+/// proves the common shape.
+pub fn UnstageFileTask(comptime Msg: type) type {
+    return struct {
+        pending: PendingAction,
+        repo_root: []u8,
+        path: []u8,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                allocator.free(task.repo_root);
+                if (task.path.len > 0) allocator.free(task.path);
+                allocator.destroy(task);
+            }
+
+            const result = runUnstageFile(task.repo_root, task.path, allocator, io);
+            const path = task.path;
+            task.path = &.{};
+
+            return @unionInit(Msg, "unstage_file_finished", UnstageFileFinished{
+                .pending = task.pending,
+                .path = path,
+                .result = result,
+            });
+        }
+    };
+}
+
+pub fn runStageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     var local_backend: git_backend.LocalCommandBackend = .{};
     const raw_result = local_backend.backend().runOperation(allocator, io, .{
         .repo_root = repo_root,
@@ -128,6 +176,25 @@ pub fn runStageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.
         return .{
             .failed = std.fmt.allocPrint(allocator, "Stage failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Stage failed: OutOfMemory" },
+        };
+    };
+
+    return switch (raw_result) {
+        .ok => .ok,
+        .failed => |message| .{ .failed = message },
+        .failed_static => |message| .{ .failed_static = message },
+    };
+}
+
+pub fn runUnstageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+    var local_backend: git_backend.LocalCommandBackend = .{};
+    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+        .repo_root = repo_root,
+        .kind = .{ .unstage_file = path },
+    }) catch |err| {
+        return .{
+            .failed = std.fmt.allocPrint(allocator, "Unstage failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Unstage failed: OutOfMemory" },
         };
     };
 

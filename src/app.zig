@@ -53,6 +53,8 @@ const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
 const StageFileFinished = app_actions.StageFileFinished;
 const StageFileTask = app_actions.StageFileTask(App.Msg);
+const UnstageFileFinished = app_actions.UnstageFileFinished;
+const UnstageFileTask = app_actions.UnstageFileTask(App.Msg);
 
 const MousePane = enum {
     sidebar,
@@ -181,6 +183,7 @@ pub const App = struct {
         status_loaded: StatusLoadFinished,
         review_projection_loaded: ReviewProjectionFinished,
         stage_file_finished: StageFileFinished,
+        unstage_file_finished: UnstageFileFinished,
         select_previous_file,
         select_next_file,
         toggle_directory,
@@ -248,6 +251,7 @@ pub const App = struct {
         toggle_hide_reviewed_files,
         cycle_changed_file_filter,
         stage_selected_file,
+        unstage_selected_file,
         open_selected_file_in_editor,
         editor_finished: chasen.ForegroundCommandResult,
         reload,
@@ -302,6 +306,7 @@ pub const App = struct {
             .status_loaded => |finished| try self.finishStatusLoad(ctx, finished),
             .review_projection_loaded => |finished| try self.finishReviewProjectionLoad(ctx, finished),
             .stage_file_finished => |finished| try self.finishStageFile(ctx, finished),
+            .unstage_file_finished => |finished| try self.finishUnstageFile(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
             .toggle_directory => try self.toggleSelectedDirectory(),
@@ -416,6 +421,7 @@ pub const App = struct {
             .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
             .stage_selected_file => try self.stageSelectedFile(ctx),
+            .unstage_selected_file => try self.unstageSelectedFile(ctx),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .editor_finished => |result| try self.finishEditorCommand(ctx, result),
             .reload => {
@@ -851,6 +857,91 @@ pub const App = struct {
         self.setStatus("staging: {s}", .{path});
     }
 
+    fn unstageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.actions.pending != null) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+        const target = switch (self.selectedUnstageTarget()) {
+            .ready => |target| target,
+            .unavailable_source, .no_repo => {
+                self.setStatus("unstage unavailable for this source", .{});
+                return;
+            },
+            .no_path => {
+                self.setStatus("no file selected", .{});
+                return;
+            },
+            .stale_status => {
+                self.setStatus("status is still loading", .{});
+                return;
+            },
+            .conflict_unsupported => {
+                self.setStatus("conflict unstage is not supported yet", .{});
+                return;
+            },
+            .no_staged_content => {
+                self.setStatus("no staged content selected", .{});
+                return;
+            },
+        };
+
+        try self.setPendingSelectionRestore(ctx.allocator(), target.path);
+        errdefer self.clearPendingSelectionRestore(ctx.allocator());
+
+        const pending = self.actions.begin(.unstage_file);
+        errdefer _ = self.actions.finish(pending);
+
+        const task = try ctx.allocator().create(UnstageFileTask);
+        task.* = .{
+            .pending = pending,
+            .repo_root = &.{},
+            .path = &.{},
+        };
+        errdefer {
+            if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
+            if (task.path.len > 0) ctx.allocator().free(task.path);
+            ctx.allocator().destroy(task);
+        }
+
+        task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
+        task.path = try ctx.allocator().dupe(u8, target.path);
+
+        ctx.task().spawnWith(task, UnstageFileTask.run) catch |err| {
+            self.setStatus("could not start unstage task", .{});
+            return err;
+        };
+        self.setStatus("unstaging: {s}", .{target.path});
+    }
+
+    const UnstageTarget = struct {
+        repo_root: []const u8,
+        path: []const u8,
+    };
+
+    const UnstageTargetResult = union(enum) {
+        ready: UnstageTarget,
+        unavailable_source,
+        no_repo,
+        no_path,
+        stale_status,
+        conflict_unsupported,
+        no_staged_content,
+    };
+
+    fn selectedUnstageTarget(self: *const App) UnstageTargetResult {
+        if (!diff_source.sourceAllowsUnstageAction(self.config.source)) return .unavailable_source;
+        const repo_root = self.activeRepoRoot() orelse return .no_repo;
+        const path = self.selectedStagePathKey() orelse return .no_path;
+        if (self.status_load_pending != null) return .stale_status;
+        const snapshot_root = self.git_status.repo_root orelse return .stale_status;
+        if (!std.mem.eql(u8, snapshot_root, repo_root)) return .stale_status;
+        const entry = self.statusEntryForPathKey(path) orelse return .no_staged_content;
+        if (entry.isConflict()) return .conflict_unsupported;
+        if (!entry.isStaged()) return .no_staged_content;
+        return .{ .ready = .{ .repo_root = repo_root, .path = path } };
+    }
+
     fn enterCommitPanelMode(self: *App) void {
         if (self.actions.pending != null) {
             self.setStatus("finish current git action before committing", .{});
@@ -913,6 +1004,28 @@ pub const App = struct {
             .failed_static => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("stage failed: {s}", .{message});
+            },
+        }
+    }
+
+    fn finishUnstageFile(self: *App, ctx: *chasen.Ctx(Msg), finished: UnstageFileFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (!self.actions.finish(result.pending)) return;
+
+        switch (result.result) {
+            .ok => {
+                self.setStatus("unstaged: {s}", .{result.path});
+                try self.reloadAfterGitAction(ctx);
+            },
+            .failed => |message| {
+                self.clearPendingSelectionRestore(ctx.allocator());
+                self.setStatus("unstage failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+            },
+            .failed_static => |message| {
+                self.clearPendingSelectionRestore(ctx.allocator());
+                self.setStatus("unstage failed: {s}", .{message});
             },
         }
     }
@@ -2258,6 +2371,14 @@ pub const App = struct {
             .diff_file => |file| file.path_key,
             .status_only => |status| status.path_key,
         };
+    }
+
+    fn statusEntryForPathKey(self: *const App, path_key: []const u8) ?git_status.StatusEntry {
+        for (self.git_status.document.entries) |entry| {
+            const entry_key = entry.canonicalPathKey() orelse continue;
+            if (std.mem.eql(u8, entry_key, path_key)) return entry;
+        }
+        return null;
     }
 
     fn setPendingSelectionRestore(self: *App, allocator: std.mem.Allocator, path_key: []const u8) !void {
@@ -3870,6 +3991,72 @@ test "selectedStagePathKey accepts diff and status-only selections" {
     app.viewer.selected_target = .{ .status_only = 0 };
 
     try std.testing.expectEqualStrings("src/new.zig", app.selectedStagePathKey().?);
+}
+
+test "selectedUnstageTarget requires fresh staged status" {
+    var app: App = .{
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffTwoWithStatuses()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer app.git_status.deinit();
+
+    var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
+    try app.git_status.replace("/repo", &staged_bundle);
+
+    switch (app.selectedUnstageTarget()) {
+        .ready => |target| {
+            try std.testing.expectEqualStrings("/repo", target.repo_root);
+            try std.testing.expectEqualStrings("src/added.zig", target.path);
+        },
+        else => return error.ExpectedReadyUnstageTarget,
+    }
+
+    app.config.source = .cached;
+    switch (app.selectedUnstageTarget()) {
+        .ready => {},
+        else => return error.ExpectedCachedUnstageTarget,
+    }
+
+    app.config.source = .{ .range = "main...HEAD" };
+    switch (app.selectedUnstageTarget()) {
+        .unavailable_source => {},
+        else => return error.ExpectedUnavailableUnstageSource,
+    }
+    app.config.source = .unstaged;
+
+    app.status_load_pending = 1;
+    switch (app.selectedUnstageTarget()) {
+        .stale_status => {},
+        else => return error.ExpectedStaleUnstageStatus,
+    }
+    app.status_load_pending = null;
+
+    var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
+    try app.git_status.replace("/other", &other_repo_bundle);
+    switch (app.selectedUnstageTarget()) {
+        .stale_status => {},
+        else => return error.ExpectedMismatchedUnstageStatus,
+    }
+
+    var unstaged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/added.zig\x00");
+    try app.git_status.replace("/repo", &unstaged_bundle);
+    switch (app.selectedUnstageTarget()) {
+        .no_staged_content => {},
+        else => return error.ExpectedNoStagedContent,
+    }
+
+    var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "UU src/added.zig\x00");
+    try app.git_status.replace("/repo", &conflict_bundle);
+    switch (app.selectedUnstageTarget()) {
+        .conflict_unsupported => {},
+        else => return error.ExpectedConflictUnstageTarget,
+    }
 }
 
 test "selectionContext keeps no-index source paths" {
