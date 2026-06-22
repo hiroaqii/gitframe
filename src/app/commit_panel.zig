@@ -11,6 +11,7 @@ pub const CommitError = enum {
     status_loading,
     status_unavailable,
     action_pending,
+    commit_failed,
 
     pub fn message(self: CommitError) []const u8 {
         return switch (self) {
@@ -22,6 +23,7 @@ pub const CommitError = enum {
             .status_loading => "Status is still loading",
             .status_unavailable => "Status is unavailable",
             .action_pending => "Another git action is running",
+            .commit_failed => "Commit failed",
         };
     }
 };
@@ -33,6 +35,17 @@ pub const Field = enum {
 
 pub const max_subject_chars = 72;
 pub const max_message_bytes = 64 * 1024;
+
+pub const MessageParts = struct {
+    subject: []u8,
+    body: ?[]u8 = null,
+
+    pub fn deinit(self: *MessageParts, allocator: std.mem.Allocator) void {
+        allocator.free(self.subject);
+        if (self.body) |body| allocator.free(body);
+        self.* = .{ .subject = &.{} };
+    }
+};
 
 /// Multiline commit body editor.
 ///
@@ -323,6 +336,21 @@ pub const State = struct {
         return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ subject, body });
     }
 
+    /// Return the split message shape used by `git commit -m subject [-m body]`.
+    ///
+    /// The commit action should not re-parse `formatMessage()` because trimming
+    /// and ownership rules belong to this editor state.
+    pub fn formatMessageParts(self: *const State, allocator: std.mem.Allocator) !MessageParts {
+        const subject = try allocator.dupe(u8, trimmedSubject(self));
+        errdefer allocator.free(subject);
+
+        const body = trimmedBody(self);
+        return .{
+            .subject = subject,
+            .body = if (body.len == 0) null else try allocator.dupe(u8, body),
+        };
+    }
+
     pub fn subjectCharCount(self: *const State) usize {
         return graphemeCount(trimmedSubject(self));
     }
@@ -346,7 +374,7 @@ pub const State = struct {
         }
         if (self.commit_error) |err| {
             switch (err) {
-                .subject_too_long, .message_too_large, .input_allocation_failed => self.commit_error = null,
+                .subject_too_long, .message_too_large, .input_allocation_failed, .commit_failed => self.commit_error = null,
                 else => {},
             }
         }
@@ -467,6 +495,32 @@ test "State formats commit message payload" {
     const with_body = try state.formatMessage(std.testing.allocator);
     defer std.testing.allocator.free(with_body);
     try std.testing.expectEqualStrings("s\n\nb\nc", with_body);
+}
+
+test "State formats split message parts" {
+    var state: State = .init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.subject.insert(std.testing.allocator, ' ');
+    try state.subject.insert(std.testing.allocator, 's');
+    try state.subject.insert(std.testing.allocator, ' ');
+
+    var subject_only = try state.formatMessageParts(std.testing.allocator);
+    defer subject_only.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("s", subject_only.subject);
+    try std.testing.expect(subject_only.body == null);
+
+    state.active_field = .body;
+    state.insert(' ');
+    state.insert('b');
+    state.enter();
+    state.insert('c');
+    state.insert(' ');
+
+    var with_body = try state.formatMessageParts(std.testing.allocator);
+    defer with_body.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("s", with_body.subject);
+    try std.testing.expectEqualStrings("b\nc", with_body.body.?);
 }
 
 test "State close clears content and remains reusable" {

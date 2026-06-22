@@ -51,6 +51,8 @@ const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
 const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
+const CommitFinished = app_actions.CommitFinished;
+const CommitTask = app_actions.CommitTask(App.Msg);
 const StageFileFinished = app_actions.StageFileFinished;
 const StageFileTask = app_actions.StageFileTask(App.Msg);
 const UnstageFileFinished = app_actions.UnstageFileFinished;
@@ -184,6 +186,7 @@ pub const App = struct {
         review_projection_loaded: ReviewProjectionFinished,
         stage_file_finished: StageFileFinished,
         unstage_file_finished: UnstageFileFinished,
+        commit_finished: CommitFinished,
         select_previous_file,
         select_next_file,
         toggle_directory,
@@ -315,6 +318,7 @@ pub const App = struct {
             .review_projection_loaded => |finished| try self.finishReviewProjectionLoad(ctx, finished),
             .stage_file_finished => |finished| try self.finishStageFile(ctx, finished),
             .unstage_file_finished => |finished| try self.finishUnstageFile(ctx, finished),
+            .commit_finished => |finished| try self.finishCommit(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
             .toggle_directory => try self.toggleSelectedDirectory(),
@@ -402,7 +406,7 @@ pub const App = struct {
             },
             .enter_commit_panel => self.enterCommitPanelMode(),
             .cancel_commit_panel => self.commit_panel.close(),
-            .submit_commit_panel => self.submitCommitPanel(),
+            .submit_commit_panel => try self.submitCommitPanel(ctx),
             .commit_panel_tab => self.commit_panel.toggleField(),
             .commit_panel_enter => self.commit_panel.enter(),
             .commit_panel_insert => |codepoint| self.commit_panel.insert(codepoint),
@@ -1040,7 +1044,7 @@ pub const App = struct {
         self.commit_panel.open();
     }
 
-    fn submitCommitPanel(self: *App) void {
+    fn submitCommitPanel(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (self.actions.pending != null) {
             self.commit_panel.commit_error = .action_pending;
             self.setStatus("finish current git action before committing", .{});
@@ -1052,7 +1056,43 @@ pub const App = struct {
             return;
         }
 
-        self.setStatus("commit action is not implemented yet", .{});
+        const repo_root = self.activeRepoRoot() orelse {
+            self.commit_panel.commit_error = .status_unavailable;
+            self.setStatus("commit unavailable for this source", .{});
+            return;
+        };
+
+        var parts = self.commit_panel.formatMessageParts(ctx.allocator()) catch {
+            self.commit_panel.commit_error = .input_allocation_failed;
+            return;
+        };
+        errdefer parts.deinit(ctx.allocator());
+
+        const owned_root = try ctx.allocator().dupe(u8, repo_root);
+        errdefer ctx.allocator().free(owned_root);
+
+        const task = try ctx.allocator().create(CommitTask);
+        errdefer ctx.allocator().destroy(task);
+
+        const pending = self.actions.begin(.commit);
+        task.* = .{
+            .pending = pending,
+            .repo_root = owned_root,
+            .subject = parts.subject,
+            .body = parts.body,
+        };
+        parts = .{ .subject = &.{}, .body = null };
+
+        ctx.task().spawnWith(task, CommitTask.run) catch |err| {
+            self.actions.clear();
+            ctx.allocator().free(task.subject);
+            if (task.body) |body| ctx.allocator().free(body);
+            self.commit_panel.commit_error = .commit_failed;
+            self.setStatus("could not start commit task", .{});
+            return err;
+        };
+
+        self.setStatus("committing...", .{});
     }
 
     pub fn stagedSummaryForActiveRepo(self: *const App) app_commit_panel.StagedSummary {
@@ -1110,6 +1150,45 @@ pub const App = struct {
             .failed_static => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("unstage failed: {s}", .{message});
+            },
+        }
+    }
+
+    fn finishCommit(self: *App, ctx: *chasen.Ctx(Msg), finished: CommitFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (!self.actions.finish(result.pending)) return;
+
+        switch (result.result) {
+            .ok => {
+                const reviewed_clear_failed = if (self.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
+                const active_root = self.activeRepoRoot();
+                const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+                self.commit_panel.close();
+
+                if (active_matches) {
+                    if (reviewed_clear_failed) {
+                        self.setStatus("committed; could not clear reviewed marks", .{});
+                    } else {
+                        self.setStatus("committed", .{});
+                    }
+                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, false);
+                } else {
+                    if (reviewed_clear_failed) {
+                        self.setStatus("committed: {s}; could not clear reviewed marks", .{result.repo_root});
+                    } else {
+                        self.setStatus("committed: {s}", .{result.repo_root});
+                    }
+                }
+            },
+            .failed => |message| {
+                self.commit_panel.commit_error = .commit_failed;
+                self.setStatus("commit failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+            },
+            .failed_static => |message| {
+                self.commit_panel.commit_error = .commit_failed;
+                self.setStatus("commit failed: {s}", .{message});
             },
         }
     }
