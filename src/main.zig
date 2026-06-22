@@ -45,6 +45,9 @@ pub fn main(init: std.process.Init) !void {
             .terminal = .{
                 .env_map = init.environ_map,
                 .mouse = true,
+                // GitFrame has text-heavy prompts; keep IME/language toggles
+                // in the terminal/input-method layer.
+                .keyboard_protocol = .legacy,
             },
         }, gitframe.App{ .config = config, .env_map = init.environ_map });
         try printStatsSummary(init.io, summary);
@@ -59,6 +62,9 @@ pub fn main(init: std.process.Init) !void {
         .terminal = .{
             .env_map = init.environ_map,
             .mouse = true,
+            // GitFrame has text-heavy prompts; keep IME/language toggles
+            // in the terminal/input-method layer.
+            .keyboard_protocol = .legacy,
         },
     }, gitframe.App{ .config = config, .env_map = init.environ_map });
 }

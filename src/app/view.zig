@@ -30,7 +30,7 @@ const help_column_gap: u16 = 2;
 const help_header_rows: u16 = 2;
 const help_scroll_indicator_rows: u16 = 1;
 const commit_dialog_width: u16 = 72;
-const commit_dialog_height: u16 = 10;
+const commit_dialog_height: u16 = 16;
 
 const StateTone = enum {
     muted,
@@ -740,23 +740,63 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
     try draw.copyClippedTextAt(&content, 0, 0, staged_text, .{ .fg = .gray });
 
     if (size.height > 2) {
-        _ = content.borrowTextAt(0, 2, "message: ", .{ .bold = true });
-        const input_col: u16 = @min(9, size.width);
+        const active = app.commit_panel.active_field == .subject;
+        const label_style: chasen.TextStyle = if (active) .{ .bold = true, .fg = .{ .index = 14 } } else .{ .bold = true };
+        _ = content.borrowTextAt(0, 2, if (active) ">" else " ", label_style);
+        _ = content.borrowTextAt(2, 2, "Subject:", label_style);
+        const input_col: u16 = @min(11, size.width);
         if (size.width > input_col) {
-            try draw.copyClippedTextAt(&content, input_col, 2, app.commit_panel.message.slice(), .{ .fg = .{ .index = 11 } });
+            try draw.copyClippedTextAt(&content, input_col, 2, app.commit_panel.subject.slice(), .{ .fg = .{ .index = 11 } });
         }
     }
 
     if (size.height > 4) {
+        const active = app.commit_panel.active_field == .body;
+        const label_style: chasen.TextStyle = if (active) .{ .bold = true, .fg = .{ .index = 14 } } else .{ .bold = true };
+        _ = content.borrowTextAt(0, 4, if (active) ">" else " ", label_style);
+        _ = content.borrowTextAt(2, 4, "Body:", label_style);
+    }
+
+    const help_row = if (size.height > 0) size.height - 1 else 0;
+    const error_row = if (help_row > 0) help_row - 1 else help_row;
+    if (size.height > 5 and error_row > 5) {
+        var body_area = content.child(.{
+            .col = 2,
+            .row = 5,
+            .width = if (size.width > 2) size.width - 2 else 0,
+            .height = error_row - 5,
+        });
+        try viewCommitBody(&app.commit_panel.body, &body_area);
+    }
+
+    if (size.height > 2) {
         if (app.commit_panel.commit_error) |err| {
-            try draw.copyClippedTextAt(&content, 0, 4, err.message(), .{ .fg = .{ .index = 9 } });
+            try draw.copyClippedTextAt(&content, 0, error_row, err.message(), .{ .fg = .{ .index = 9 } });
         } else {
-            try draw.copyClippedTextAt(&content, 0, 4, "Enter validates the staged commit; git commit is added later.", .{ .fg = .gray });
+            try draw.copyClippedTextAt(&content, 0, error_row, "Commit execution is added later.", .{ .fg = .gray });
         }
     }
 
-    if (size.height > 6) {
-        try draw.copyClippedTextAt(&content, 0, 6, "Enter: validate  Esc: close", .{ .fg = .gray });
+    if (size.height > 0) {
+        try draw.copyClippedTextAt(&content, 0, help_row, "Tab: field  Enter: body/newline  Ctrl+Enter/Ctrl+s: validate  Esc: close", .{ .fg = .gray });
+    }
+}
+
+fn viewCommitBody(body: *const app_commit_panel.BodyText, surface: *chasen.Surface) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    const total_lines = body.lineCount();
+    const overflow = total_lines > size.height;
+    const text_rows = if (overflow and size.height > 0) size.height - 1 else size.height;
+
+    var row: u16 = 0;
+    while (row < text_rows) : (row += 1) {
+        const line = body.lineAt(row) orelse "";
+        try draw.copyClippedTextAt(surface, 0, row, line, .{});
+    }
+    if (overflow) {
+        try draw.copyClippedTextAt(surface, 0, size.height - 1, "...", .{ .fg = .gray });
     }
 }
 
