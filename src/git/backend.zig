@@ -100,6 +100,7 @@ pub const GitStatusRequest = struct {
 pub const OperationKind = union(enum) {
     stage_file: []const u8,
     unstage_file: []const u8,
+    discard_file: []const u8,
     commit: CommitRequest,
 };
 
@@ -172,6 +173,7 @@ pub const LocalCommandBackend = struct {
         return switch (request.kind) {
             .stage_file => |path| runGitAdd(allocator, io, request.repo_root, path),
             .unstage_file => |path| runGitUnstage(allocator, io, request.repo_root, path),
+            .discard_file => |path| runGitDiscard(allocator, io, request.repo_root, path),
             .commit => |commit| runGitCommit(allocator, io, request.repo_root, commit),
         };
     }
@@ -327,6 +329,34 @@ fn runGitUnstage(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8
     allocator.free(result.stderr);
 
     return .{ .failed = std.fmt.allocPrint(allocator, "git restore --staged failed: {any}", .{result.term}) catch return error.OutOfMemory };
+}
+
+fn runGitDiscard(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) LoadError!OperationResult {
+    const argv = [_][]const u8{ "git", "restore", "--", path };
+    const result = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .cwd = .{ .path = repo_root },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.StreamTooLong,
+        else => error.SpawnFailed,
+    };
+
+    allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .ok;
+        },
+        else => {},
+    }
+
+    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    allocator.free(result.stderr);
+
+    return .{ .failed = std.fmt.allocPrint(allocator, "git restore failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
 fn runGitCommit(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest) LoadError!OperationResult {

@@ -90,6 +90,25 @@ pub const UnstageFileFinished = struct {
     }
 };
 
+pub const DiscardFileFinished = struct {
+    pending: PendingAction,
+    repo_root: []u8,
+    path: []u8,
+    result: FileActionTaskResult,
+
+    pub fn deinit(self: *DiscardFileFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.path);
+        self.result.deinit(allocator);
+        self.* = .{
+            .pending = .{ .generation = 0, .kind = .discard_file },
+            .repo_root = &.{},
+            .path = &.{},
+            .result = .ok,
+        };
+    }
+};
+
 pub const CommitFinished = struct {
     pending: PendingAction,
     repo_root: []u8,
@@ -183,6 +202,40 @@ pub fn UnstageFileTask(comptime Msg: type) type {
     };
 }
 
+/// Async task for `git restore -- <path>`.
+///
+/// This intentionally discards only unstaged tracked changes. Untracked file
+/// deletion and staged discard need separate confirmation contracts.
+pub fn DiscardFileTask(comptime Msg: type) type {
+    return struct {
+        pending: PendingAction,
+        repo_root: []u8,
+        path: []u8,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                allocator.free(task.repo_root);
+                if (task.path.len > 0) allocator.free(task.path);
+                allocator.destroy(task);
+            }
+
+            const result = runDiscardFile(task.repo_root, task.path, allocator, io);
+            const repo_root = task.repo_root;
+            const path = task.path;
+            task.repo_root = &.{};
+            task.path = &.{};
+
+            return @unionInit(Msg, "discard_file_finished", DiscardFileFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .path = path,
+                .result = result,
+            });
+        }
+    };
+}
+
 /// Async task for `git commit -m subject [-m body]`.
 ///
 /// The task snapshots repo/message ownership so the user can switch repository
@@ -244,6 +297,25 @@ pub fn runUnstageFile(repo_root: []const u8, path: []const u8, allocator: std.me
         return .{
             .failed = std.fmt.allocPrint(allocator, "Unstage failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Unstage failed: OutOfMemory" },
+        };
+    };
+
+    return switch (raw_result) {
+        .ok => .ok,
+        .failed => |message| .{ .failed = message },
+        .failed_static => |message| .{ .failed_static = message },
+    };
+}
+
+pub fn runDiscardFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+    var local_backend: git_backend.LocalCommandBackend = .{};
+    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+        .repo_root = repo_root,
+        .kind = .{ .discard_file = path },
+    }) catch |err| {
+        return .{
+            .failed = std.fmt.allocPrint(allocator, "Discard failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Discard failed: OutOfMemory" },
         };
     };
 

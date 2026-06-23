@@ -53,6 +53,8 @@ const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
 const CommitFinished = app_actions.CommitFinished;
 const CommitTask = app_actions.CommitTask(App.Msg);
+const DiscardFileFinished = app_actions.DiscardFileFinished;
+const DiscardFileTask = app_actions.DiscardFileTask(App.Msg);
 const StageFileFinished = app_actions.StageFileFinished;
 const StageFileTask = app_actions.StageFileTask(App.Msg);
 const UnstageFileFinished = app_actions.UnstageFileFinished;
@@ -176,6 +178,7 @@ pub const App = struct {
     /// Session-level source of truth for reviewed files. The active LoadedDiff
     /// keeps a materialized bool slice so hide-reviewed hot paths stay O(1).
     reviewed_store: review_state.Store = .{},
+    discard_confirmation: ?app_state.DiscardFileConfirmation = null,
 
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
@@ -186,6 +189,7 @@ pub const App = struct {
         review_projection_loaded: ReviewProjectionFinished,
         stage_file_finished: StageFileFinished,
         unstage_file_finished: UnstageFileFinished,
+        discard_file_finished: DiscardFileFinished,
         commit_finished: CommitFinished,
         select_previous_file,
         select_next_file,
@@ -263,6 +267,9 @@ pub const App = struct {
         cycle_changed_file_filter,
         stage_selected_file,
         unstage_selected_file,
+        request_discard_selected_file,
+        confirm_discard_file,
+        cancel_discard_file,
         open_selected_file_in_editor,
         editor_finished: chasen.ForegroundCommandResult,
         reload,
@@ -296,6 +303,7 @@ pub const App = struct {
         self.recent_repos.deinit(deinit_ctx.allocator);
         self.reviewed_store.deinit(deinit_ctx.allocator);
         self.review_projection.deinit(deinit_ctx.allocator);
+        self.cancelDiscardConfirmation(deinit_ctx.allocator);
         self.tree_order.deinit(deinit_ctx.allocator);
         if (self.tree_order_scope) |scope| deinit_ctx.allocator.free(scope);
         if (self.pending_selection_restore) |*restore| restore.deinit(deinit_ctx.allocator);
@@ -320,6 +328,7 @@ pub const App = struct {
             .review_projection_loaded => |finished| try self.finishReviewProjectionLoad(ctx, finished),
             .stage_file_finished => |finished| try self.finishStageFile(ctx, finished),
             .unstage_file_finished => |finished| try self.finishUnstageFile(ctx, finished),
+            .discard_file_finished => |finished| try self.finishDiscardFile(ctx, finished),
             .commit_finished => |finished| try self.finishCommit(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
@@ -444,6 +453,9 @@ pub const App = struct {
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
             .stage_selected_file => try self.stageSelectedFile(ctx),
             .unstage_selected_file => try self.unstageSelectedFile(ctx),
+            .request_discard_selected_file => try self.requestDiscardSelectedFile(ctx.allocator()),
+            .confirm_discard_file => try self.confirmDiscardFile(ctx),
+            .cancel_discard_file => self.cancelDiscardConfirmation(ctx.allocator()),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .editor_finished => |result| try self.finishEditorCommand(ctx, result),
             .reload => {
@@ -569,6 +581,7 @@ pub const App = struct {
             .commit_panel_mode = self.commit_panel.mode,
             .repo_picker_mode = self.repo_picker.mode,
             .help_mode = self.overlay.isHelp(),
+            .discard_confirmation_mode = self.overlay.isDiscardFile(),
             .search_query_len = self.search.query.len,
             .focus = self.viewer.focus,
             .sidebar_hidden = self.viewer.sidebar_hidden,
@@ -1034,6 +1047,131 @@ pub const App = struct {
         };
     }
 
+    fn requestDiscardSelectedFile(self: *App, allocator: std.mem.Allocator) !void {
+        if (self.actions.pending != null) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+
+        const target = switch (self.selectedDiscardTarget()) {
+            .ready => |target| target,
+            .unavailable_source, .no_repo => {
+                self.setStatus("discard unavailable for this source", .{});
+                return;
+            },
+            .no_path => {
+                self.setStatus("no file selected", .{});
+                return;
+            },
+            .stale_status => {
+                self.setStatus("status is still loading", .{});
+                return;
+            },
+            .directory_unsupported => {
+                self.setStatus("directory discard is not supported yet", .{});
+                return;
+            },
+            .conflict_unsupported => {
+                self.setStatus("conflict discard is not supported yet", .{});
+                return;
+            },
+            .untracked_unsupported => {
+                self.setStatus("untracked discard is not supported yet", .{});
+                return;
+            },
+            .no_unstaged_content => {
+                self.setStatus("no unstaged changes selected", .{});
+                return;
+            },
+        };
+
+        self.cancelDiscardConfirmation(allocator);
+        const owned_repo_root = try allocator.dupe(u8, target.repo_root);
+        errdefer allocator.free(owned_repo_root);
+        const owned_path = try allocator.dupe(u8, target.path);
+        errdefer allocator.free(owned_path);
+
+        self.discard_confirmation = .{
+            .repo_root = owned_repo_root,
+            .path = owned_path,
+        };
+        self.overlay.openDiscardFile();
+    }
+
+    fn confirmDiscardFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const confirmation = self.discard_confirmation orelse return;
+        if (self.actions.pending != null) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+
+        try self.setPendingSelectionRestore(ctx.allocator(), confirmation.path);
+        errdefer self.clearPendingSelectionRestore(ctx.allocator());
+
+        const pending = self.actions.begin(.discard_file);
+        errdefer _ = self.actions.finish(pending);
+
+        const task = try ctx.allocator().create(DiscardFileTask);
+        task.* = .{
+            .pending = pending,
+            .repo_root = &.{},
+            .path = &.{},
+        };
+        errdefer {
+            if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
+            if (task.path.len > 0) ctx.allocator().free(task.path);
+            ctx.allocator().destroy(task);
+        }
+
+        task.repo_root = try ctx.allocator().dupe(u8, confirmation.repo_root);
+        task.path = try ctx.allocator().dupe(u8, confirmation.path);
+
+        ctx.task().spawnWith(task, DiscardFileTask.run) catch |err| {
+            self.setStatus("could not start discard task", .{});
+            return err;
+        };
+
+        self.setStatus("discarding: {s}", .{confirmation.path});
+        self.cancelDiscardConfirmation(ctx.allocator());
+    }
+
+    fn cancelDiscardConfirmation(self: *App, allocator: std.mem.Allocator) void {
+        if (self.discard_confirmation) |*confirmation| confirmation.deinit(allocator);
+        self.discard_confirmation = null;
+        if (self.overlay.isDiscardFile()) self.overlay.close();
+    }
+
+    const DiscardTarget = struct {
+        repo_root: []const u8,
+        path: []const u8,
+    };
+
+    const DiscardTargetResult = union(enum) {
+        ready: DiscardTarget,
+        unavailable_source,
+        no_repo,
+        no_path,
+        stale_status,
+        directory_unsupported,
+        conflict_unsupported,
+        untracked_unsupported,
+        no_unstaged_content,
+    };
+
+    fn selectedDiscardTarget(self: *const App) DiscardTargetResult {
+        if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
+        const repo_root = self.activeRepoRoot() orelse return .no_repo;
+        const action_target = self.selectedSidebarActionTarget() orelse return .no_path;
+        if (action_target.kind == .directory) return .directory_unsupported;
+        const entry = self.freshStatusEntryForPathKey(repo_root, action_target.path) orelse return .stale_status;
+        if (entry.isConflict()) return .conflict_unsupported;
+        return switch (file_tree.stagePresenceFromEntry(entry)) {
+            .unstaged_only, .mixed => .{ .ready = .{ .repo_root = repo_root, .path = action_target.path } },
+            .untracked => .untracked_unsupported,
+            .staged_only, .clean_or_unknown, .conflict => .no_unstaged_content,
+        };
+    }
+
     fn enterCommitPanelMode(self: *App) void {
         if (self.actions.pending != null) {
             self.setStatus("finish current git action before committing", .{});
@@ -1154,6 +1292,33 @@ pub const App = struct {
             .failed_static => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("unstage failed: {s}", .{message});
+            },
+        }
+    }
+
+    fn finishDiscardFile(self: *App, ctx: *chasen.Ctx(Msg), finished: DiscardFileFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (!self.actions.finish(result.pending)) return;
+
+        switch (result.result) {
+            .ok => {
+                self.reviewed_store.clearPathKey(ctx.allocator(), result.repo_root, result.path) catch {
+                    self.setStatus("discarded: {s}; could not clear reviewed mark", .{result.path});
+                    try self.reloadAfterGitAction(ctx);
+                    return;
+                };
+                self.setStatus("discarded: {s}", .{result.path});
+                try self.reloadAfterGitAction(ctx);
+            },
+            .failed => |message| {
+                self.clearPendingSelectionRestore(ctx.allocator());
+                self.setStatus("discard failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+            },
+            .failed_static => |message| {
+                self.clearPendingSelectionRestore(ctx.allocator());
+                self.setStatus("discard failed: {s}", .{message});
             },
         }
     }

@@ -31,6 +31,8 @@ const help_header_rows: u16 = 2;
 const help_scroll_indicator_rows: u16 = 1;
 const commit_dialog_width: u16 = 72;
 const commit_dialog_height: u16 = 22;
+const discard_dialog_width: u16 = 72;
+const discard_dialog_height: u16 = 9;
 
 const StateTone = enum {
     muted,
@@ -89,6 +91,9 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
     }
     if (app.overlay.isHelp()) {
         try viewHelpPopup(app, surface);
+    }
+    if (app.overlay.isDiscardFile()) {
+        try viewDiscardConfirmation(app, surface);
     }
     if (app.commit_panel.mode) {
         try viewCommitPanel(app, surface);
@@ -851,6 +856,37 @@ fn viewCommitBody(body: *const app_commit_panel.BodyText, surface: *chasen.Surfa
     }
 }
 
+fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
+    const confirmation = app.discard_confirmation orelse return;
+    const modal = ui.Modal.init(.{});
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, discard_dialog_width),
+        .dialog_height = @min(surface.size().height, discard_dialog_height),
+        .title = "Discard file changes?",
+        .border = .rounded,
+        .title_style = .{ .bold = true, .fg = .{ .index = 9 } },
+        .border_style = .{ .fg = .{ .index = 9 } },
+        .backdrop_style = .{ .dim = true },
+    };
+    modal.view(surface, opts);
+
+    const content_rect = ui.Modal.contentRect(surface, opts);
+    if (content_rect.width == 0 or content_rect.height == 0) return;
+    var content = surface.child(content_rect);
+    const size = content.size();
+
+    try draw.copyClippedTextAt(&content, 0, 0, "This will discard unstaged tracked changes.", .{ .fg = .{ .index = 9 } });
+    if (size.height > 2) {
+        try draw.copyClippedTextAt(&content, 0, 2, "File:", .{ .bold = true });
+        if (size.width > 6) {
+            try draw.copyClippedTextAt(&content, 6, 2, confirmation.path, .{ .fg = .{ .index = 11 } });
+        }
+    }
+    if (size.height > 4) {
+        try draw.copyClippedTextAt(&content, 0, 4, "Enter: discard    Esc/q: cancel", .{ .fg = .gray });
+    }
+}
+
 fn drawCommitInputLine(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, cursor: ?usize, style: chasen.TextStyle) !void {
     const size = surface.size();
     if (col >= size.width or row >= size.height) return;
@@ -1337,6 +1373,7 @@ const help_global_items = [_]HelpItem{
     .{ .key = "c", .description = "open commit panel" },
     .{ .key = "s", .description = "stage selected file / directory" },
     .{ .key = "S", .description = "unstage selected file / directory" },
+    .{ .key = "D", .description = "discard selected file changes" },
     .{ .key = "Home/End", .description = "first / last file" },
 };
 

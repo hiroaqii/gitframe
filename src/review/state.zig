@@ -72,6 +72,15 @@ pub const Store = struct {
             }
         }
     }
+
+    pub fn clearPathKey(self: *Store, allocator: std.mem.Allocator, repo_root: []const u8, path_key: []const u8) !void {
+        const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ repo_root, path_key });
+        defer allocator.free(key);
+
+        if (self.entries.fetchRemove(key)) |entry| {
+            allocator.free(entry.key);
+        }
+    }
 };
 
 fn keyAlloc(allocator: std.mem.Allocator, repo_root: []const u8, file: diff_parser.FileDiff) !?[]u8 {

@@ -4,6 +4,7 @@ const loaded_diff = @import("../loaded_diff.zig");
 pub const OverlayKind = enum {
     none,
     help,
+    discard_file,
 };
 
 /// App-owned modal/overlay state.
@@ -18,13 +19,36 @@ pub const OverlayState = struct {
         return self.kind == .help;
     }
 
+    pub fn isDiscardFile(self: OverlayState) bool {
+        return self.kind == .discard_file;
+    }
+
     pub fn openHelp(self: *OverlayState) void {
         self.kind = .help;
         self.help_scroll = 0;
     }
 
+    pub fn openDiscardFile(self: *OverlayState) void {
+        self.kind = .discard_file;
+    }
+
     pub fn close(self: *OverlayState) void {
         self.kind = .none;
+    }
+};
+
+/// Owned snapshot for a destructive file discard confirmation.
+///
+/// The selection can move while the confirmation is open, so the exact repo
+/// and file path must be copied when the prompt is created.
+pub const DiscardFileConfirmation = struct {
+    repo_root: []u8,
+    path: []u8,
+
+    pub fn deinit(self: *DiscardFileConfirmation, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.path);
+        self.* = undefined;
     }
 };
 

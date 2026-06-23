@@ -24,6 +24,7 @@ pub const KeyContext = struct {
     repo_picker_mode: bool = false,
     repo_picker_path_input: bool = false,
     help_mode: bool = false,
+    discard_confirmation_mode: bool = false,
     search_query_len: usize = 0,
     focus: Focus = .sidebar,
     sidebar_hidden: bool = false,
@@ -103,6 +104,12 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         return null;
     }
 
+    if (context.discard_confirmation_mode) {
+        if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return voidMsg(Msg, "cancel_discard_file");
+        if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "confirm_discard_file");
+        return null;
+    }
+
     if (key.matches(chasen.Key.tab, .{}) and !context.sidebar_hidden) return voidMsg(Msg, "toggle_focus");
     if (key.matches(chasen.Key.page_up, .{})) return voidMsg(Msg, "page_diff_up");
     if (key.matches(chasen.Key.page_down, .{})) return voidMsg(Msg, "page_diff_down");
@@ -133,6 +140,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (matchesShiftedAscii(key, 'b', 'B')) return voidMsg(Msg, "toggle_sidebar_visibility");
     if (matchesShiftedAscii(key, 'l', 'L')) return voidMsg(Msg, "toggle_line_numbers");
     if (matchesShiftedAscii(key, 's', 'S')) return voidMsg(Msg, "unstage_selected_file");
+    if (matchesShiftedAscii(key, 'd', 'D')) return voidMsg(Msg, "request_discard_selected_file");
     if (key.matches('c', .{})) return voidMsg(Msg, "enter_commit_panel");
     if (hasCommandModifier(key)) return null;
 
@@ -282,6 +290,9 @@ const TestMsg = union(enum) {
     enter_commit_panel,
     stage_selected_file,
     unstage_selected_file,
+    request_discard_selected_file,
+    confirm_discard_file,
+    cancel_discard_file,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
@@ -341,6 +352,16 @@ test "keyToMsg maps stage file action" {
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'S', .mods = .{ .alt = true } }));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 's', .mods = .{ .shift = true, .ctrl = true } }));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 's', .mods = .{ .shift = true, .alt = true } }));
+}
+
+test "keyToMsg maps discard confirmation flow" {
+    try std.testing.expectEqual(TestMsg.request_discard_selected_file, keyToMsg(TestMsg, .{}, .{ .codepoint = 'D' }).?);
+    try std.testing.expectEqual(TestMsg.request_discard_selected_file, keyToMsg(TestMsg, .{}, shiftedAscii('d', 'D')).?);
+    try std.testing.expectEqual(TestMsg.request_discard_selected_file, keyToMsg(TestMsg, .{}, shiftedLowerOnly('d')).?);
+    try std.testing.expectEqual(TestMsg.confirm_discard_file, keyToMsg(TestMsg, .{ .discard_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(TestMsg.cancel_discard_file, keyToMsg(TestMsg, .{ .discard_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(TestMsg.cancel_discard_file, keyToMsg(TestMsg, .{ .discard_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .discard_confirmation_mode = true }, .{ .codepoint = 'D' }));
 }
 
 test "keyToMsg maps commit panel command and routes panel input" {
