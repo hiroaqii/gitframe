@@ -250,6 +250,8 @@ pub const App = struct {
         repo_picker_backspace,
         repo_picker_move_previous,
         repo_picker_move_next,
+        repo_picker_move_left,
+        repo_picker_move_right,
         open_help,
         close_help,
         help_scroll_up,
@@ -427,6 +429,8 @@ pub const App = struct {
             },
             .repo_picker_move_previous => self.repo_picker.list.filter.update(.move_prev),
             .repo_picker_move_next => self.repo_picker.list.filter.update(.move_next),
+            .repo_picker_move_left => self.moveRepoPickerCursorLeft(),
+            .repo_picker_move_right => self.moveRepoPickerCursorRight(),
             .open_help => {
                 self.overlay.openHelp();
             },
@@ -2137,6 +2141,20 @@ pub const App = struct {
                 self.repo_picker.clearPathStatus();
                 self.repo_picker.path_input.backspace();
             },
+        }
+    }
+
+    fn moveRepoPickerCursorLeft(self: *App) void {
+        switch (self.repo_picker.prompt_mode) {
+            .list => self.repo_picker.list.input.moveLeft(),
+            .path_input => self.repo_picker.path_input.moveLeft(),
+        }
+    }
+
+    fn moveRepoPickerCursorRight(self: *App) void {
+        switch (self.repo_picker.prompt_mode) {
+            .list => self.repo_picker.list.input.moveRight(),
+            .path_input => self.repo_picker.path_input.moveRight(),
         }
     }
 

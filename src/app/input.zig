@@ -75,6 +75,8 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_repo_picker");
         if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "submit_repo_picker");
         if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "repo_picker_backspace");
+        if (key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "repo_picker_move_left");
+        if (key.matches(chasen.Key.right, .{})) return voidMsg(Msg, "repo_picker_move_right");
         if (context.repo_picker_path_input) {
             if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
             return null;
@@ -239,6 +241,8 @@ const TestMsg = union(enum) {
     repo_picker_enter_path_input,
     repo_picker_move_previous,
     repo_picker_move_next,
+    repo_picker_move_left,
+    repo_picker_move_right,
     repo_picker_insert: u21,
     toggle_focus,
     page_diff_up,
@@ -412,12 +416,12 @@ test "keyToMsg ignores special keys in text input modes" {
         if (key.codepoint != chasen.Key.tab and key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right and key.codepoint != chasen.Key.up and key.codepoint != chasen.Key.down) {
             try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .commit_panel_mode = true }, key));
         }
-        try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, key));
+        if (key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right) {
+            try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, key));
+        }
     }
 
     const picker_list_text_cases = [_]chasen.Key{
-        .{ .codepoint = chasen.Key.left },
-        .{ .codepoint = chasen.Key.right },
         .{ .codepoint = chasen.Key.home },
         .{ .codepoint = chasen.Key.end },
         .{ .codepoint = chasen.Key.page_up },
@@ -453,6 +457,13 @@ test "keyToMsg ignores special keys in text input modes" {
     for (picker_list_text_cases) |key| {
         try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, key));
     }
+}
+
+test "keyToMsg maps repo picker cursor movement" {
+    try std.testing.expectEqual(TestMsg.repo_picker_move_left, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.left }).?);
+    try std.testing.expectEqual(TestMsg.repo_picker_move_right, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.right }).?);
+    try std.testing.expectEqual(TestMsg.repo_picker_move_left, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = chasen.Key.left }).?);
+    try std.testing.expectEqual(TestMsg.repo_picker_move_right, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = chasen.Key.right }).?);
 }
 
 test "keyToMsg ignores ctrl printable in text input modes" {

@@ -653,7 +653,8 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
 
     if (app.repo_picker.prompt_mode == .path_input) {
         _ = content.borrowTextAt(0, 0, "path: ", .{ .fg = .{ .index = 11 }, .bold = true });
-        _ = content.copyTextAt(6, 0, app.repo_picker.path_input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
+        try drawCommitInputLine(&content, 6, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor, .{ .fg = .{ .index = 11 } });
+        showInputCursor(&content, 6, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor);
         if (app.repo_picker.path_pending and size.width > 16) {
             _ = content.borrowTextAt(0, 2, "checking path...", .{ .fg = .gray });
         } else if (app.repo_picker.path_error) |err| {
@@ -665,16 +666,19 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
     }
 
     _ = content.borrowTextAt(0, 0, "filter: ", .{ .fg = .{ .index = 11 }, .bold = true });
-    _ = content.copyTextAt(8, 0, app.repo_picker.list.input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
-    if (app.repo_picker.list.no_match and size.width > 20) {
-        _ = content.borrowTextAt(20, 0, "(no match)", .{ .fg = .{ .index = 9 } });
-    } else if (app.repo_picker.path_pending and size.width > 24) {
-        _ = content.borrowTextAt(20, 0, "(checking path...)", .{ .fg = .gray });
-    } else if (app.repo_picker.path_error) |err| {
-        _ = content.borrowTextAt(20, 0, err.message(), .{ .fg = .{ .index = 9 } });
-    }
+    try drawCommitInputLine(&content, 8, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor, .{ .fg = .{ .index = 11 } });
+    showInputCursor(&content, 8, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor);
+
     if (size.height > 1) {
-        try draw.copyClippedTextAt(&content, 0, 1, "Enter: switch  /: filter  : enter path  Esc: close", .{ .fg = .gray });
+        if (app.repo_picker.list.no_match) {
+            _ = content.borrowTextAt(0, 1, "(no match)", .{ .fg = .{ .index = 9 } });
+        } else if (app.repo_picker.path_pending) {
+            _ = content.borrowTextAt(0, 1, "(checking path...)", .{ .fg = .gray });
+        } else if (app.repo_picker.path_error) |err| {
+            try draw.copyClippedTextAt(&content, 0, 1, err.message(), .{ .fg = .{ .index = 9 } });
+        } else {
+            try draw.copyClippedTextAt(&content, 0, 1, "Enter: switch  /: filter  : enter path  Esc: close", .{ .fg = .gray });
+        }
     }
 
     if (size.height <= 2) return;

@@ -57,6 +57,7 @@ pub const PathInput = struct {
 
     buffer: [1024]u8 = undefined,
     len: usize = 0,
+    cursor: usize = 0,
 
     pub fn slice(self: *const PathInput) []const u8 {
         return self.buffer[0..self.len];
@@ -66,25 +67,30 @@ pub const PathInput = struct {
         var bytes: [4]u8 = undefined;
         const written = std.unicode.utf8Encode(codepoint, &bytes) catch unreachable;
         if (self.len + written > self.buffer.len) return error.BufferFull;
-        @memcpy(self.buffer[self.len .. self.len + written], bytes[0..written]);
+        std.mem.copyBackwards(u8, self.buffer[self.cursor + written .. self.len + written], self.buffer[self.cursor..self.len]);
+        @memcpy(self.buffer[self.cursor .. self.cursor + written], bytes[0..written]);
         self.len += written;
+        self.cursor += written;
     }
 
     pub fn backspace(self: *PathInput) void {
-        if (self.len == 0) return;
-        var view = std.unicode.Utf8View.initUnchecked(self.slice());
-        var iterator = view.iterator();
-        var previous_end: usize = 0;
-        while (iterator.nextCodepointSlice()) |bytes| {
-            const end = @intFromPtr(bytes.ptr) - @intFromPtr(self.buffer[0..].ptr) + bytes.len;
-            if (end >= self.len) break;
-            previous_end = end;
-        }
-        self.len = previous_end;
+        if (self.cursor == 0) return;
+        const previous = previousBoundary(self.slice(), self.cursor);
+        std.mem.copyForwards(u8, self.buffer[previous .. self.len - (self.cursor - previous)], self.buffer[self.cursor..self.len]);
+        self.len -= self.cursor - previous;
+        self.cursor = previous;
+    }
+
+    pub fn moveLeft(self: *PathInput) void {
+        self.cursor = previousBoundary(self.slice(), self.cursor);
+    }
+
+    pub fn moveRight(self: *PathInput) void {
+        self.cursor = nextBoundary(self.slice(), self.cursor);
     }
 
     pub fn clear(self: *PathInput) void {
-        self.len = 0;
+        self.* = .{};
     }
 };
 
@@ -229,6 +235,22 @@ test "PathInput accepts longer paths than TextInput" {
     while (index < 256) : (index += 1) try input.insert('a');
 
     try std.testing.expectEqual(@as(usize, 256), input.slice().len);
+}
+
+test "PathInput edits at the cursor" {
+    var input: PathInput = .{};
+
+    try input.insert('a');
+    try input.insert('c');
+    input.moveLeft();
+    try input.insert('b');
+
+    try std.testing.expectEqualStrings("abc", input.slice());
+    try std.testing.expectEqual(@as(usize, 2), input.cursor);
+
+    input.backspace();
+    try std.testing.expectEqualStrings("ac", input.slice());
+    try std.testing.expectEqual(@as(usize, 1), input.cursor);
 }
 
 test "FilterPromptState deinit resets reusable prompt state" {
