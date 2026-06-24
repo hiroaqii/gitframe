@@ -3171,6 +3171,11 @@ pub const App = struct {
         return self.statusEntryForPathKey(path_key);
     }
 
+    fn isFreshStagedOnlyPath(self: *const App, repo_root: []const u8, path_key: []const u8) bool {
+        const entry = self.freshStatusEntryForPathKey(repo_root, path_key) orelse return false;
+        return !entry.isConflict() and entry.isStaged() and !entry.isUnstaged();
+    }
+
     fn setPendingSelectionRestore(self: *App, allocator: std.mem.Allocator, path_key: []const u8) !void {
         self.clearPendingSelectionRestore(allocator);
         const visible_row = if (self.activeLoadedDiffConst()) |loaded|
@@ -3368,6 +3373,14 @@ pub const App = struct {
         if (self.staged_hunks.items.items.len == 0 or file.hunks.len == 0) return &.{};
         const repo_root = self.activeRepoRoot() orelse return &.{};
         const path = diff_file.canonicalPathKey(file) orelse return &.{};
+
+        var marked_count: usize = 0;
+        for (0..file.hunks.len) |hunk_index| {
+            if (self.staged_hunks.contains(repo_root, path, hunk_index)) marked_count += 1;
+        }
+
+        if (marked_count == 0) return &.{};
+        if (marked_count == file.hunks.len and self.isFreshStagedOnlyPath(repo_root, path)) return &.{};
 
         const flags = try allocator.alloc(bool, file.hunks.len);
         @memset(flags, false);
@@ -5060,6 +5073,114 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
     switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
         .offscreen_cursor => {},
         else => return error.ExpectedOffscreenHunkUnstageTarget,
+    }
+}
+
+test "stagedHunkFlagsForFile keeps partial staged display flags" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffOne()),
+    };
+    defer app.staged_hunks.deinit(std.testing.allocator);
+    defer app.git_status.deinit();
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+
+    const flags = try app.stagedHunkFlagsForFile(arena.allocator(), test_file_with_hunks);
+    try std.testing.expectEqual(@as(usize, 2), flags.len);
+    try std.testing.expect(flags[0]);
+    try std.testing.expect(!flags[1]);
+}
+
+test "stagedHunkFlagsForFile normalizes all staged hunks only when status is staged-only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffOne()),
+    };
+    defer app.staged_hunks.deinit(std.testing.allocator);
+    defer app.git_status.deinit();
+
+    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 1);
+
+    var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
+    try app.git_status.replace("/repo", &staged_bundle);
+    try std.testing.expectEqual(@as(usize, 0), (try app.stagedHunkFlagsForFile(arena.allocator(), test_file_with_hunks)).len);
+
+    var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
+    try app.git_status.replace("/repo", &mixed_bundle);
+    const mixed_flags = try app.stagedHunkFlagsForFile(arena.allocator(), test_file_with_hunks);
+    try std.testing.expectEqual(@as(usize, 2), mixed_flags.len);
+    try std.testing.expect(mixed_flags[0]);
+    try std.testing.expect(mixed_flags[1]);
+
+    app.status_load_pending = 1;
+    const stale_flags = try app.stagedHunkFlagsForFile(arena.allocator(), test_file_with_hunks);
+    try std.testing.expectEqual(@as(usize, 2), stale_flags.len);
+    try std.testing.expect(stale_flags[0]);
+    try std.testing.expect(stale_flags[1]);
+
+    app.status_load_pending = null;
+    var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
+    try app.git_status.replace("/other", &other_repo_bundle);
+    const missing_flags = try app.stagedHunkFlagsForFile(arena.allocator(), test_file_with_hunks);
+    try std.testing.expectEqual(@as(usize, 2), missing_flags.len);
+    try std.testing.expect(missing_flags[0]);
+    try std.testing.expect(missing_flags[1]);
+}
+
+test "stagedHunkFlagsForFile display normalization does not clear hunk action marks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 10 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer app.staged_hunks.deinit(std.testing.allocator);
+    defer app.git_status.deinit();
+
+    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 1);
+
+    var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
+    try app.git_status.replace("/repo", &staged_bundle);
+    try std.testing.expectEqual(@as(usize, 0), (try app.stagedHunkFlagsForFile(arena.allocator(), test_file_with_hunks)).len);
+
+    switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
+        .ready => |target| {
+            defer std.testing.allocator.free(target.patch);
+            try std.testing.expectEqualStrings("/repo", target.repo_root);
+            try std.testing.expectEqualStrings("a", target.path);
+            try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
+        },
+        else => return error.ExpectedReadyHunkUnstageTarget,
     }
 }
 
