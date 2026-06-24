@@ -202,11 +202,7 @@ fn drawHunkHeaderRow(
     mode: DisplayMode,
     staged: bool,
 ) !void {
-    var style = if (highlighted_hunk != null and highlighted_hunk.? == hunk.hunk_index)
-        style_selected_hunk
-    else
-        style_hunk;
-    if (staged) style.dim = true;
+    const style = hunkHeaderStyle(highlighted_hunk != null and highlighted_hunk.? == hunk.hunk_index, staged);
     const marker = if (hunk.folded) "▸" else "▾";
     const header = try std.fmt.allocPrint(surface.frameAllocator(), "{s} @@ -{d},{d} +{d},{d} @@ {s}", .{
         marker,
@@ -217,6 +213,17 @@ fn drawHunkHeaderRow(
         hunk.section,
     });
     try drawHunkHeader(surface, row, header, style, mode);
+}
+
+fn hunkHeaderStyle(highlighted: bool, staged: bool) chasen.TextStyle {
+    if (highlighted) return style_selected_hunk;
+
+    var style = style_hunk;
+    if (staged) {
+        style.dim = true;
+        style.bg = .{ .index = 8 };
+    }
+    return style;
 }
 
 const body_start_row: u16 = 3;
@@ -496,12 +503,22 @@ test "renderFile dims staged hunk body without removing it" {
         .staged_hunks = &.{true},
     });
 
+    const header_cell = ts.surface.readCell(1, 3).?;
+    try std.testing.expect(header_cell.style.bg.eql(.{ .index = 8 }));
     try ts.expectCellText(13, 4, "o");
     const old_cell = ts.surface.readCell(13, 4).?;
     try std.testing.expect(old_cell.style.dim);
     try ts.expectCellText(13, 5, "n");
     const new_cell = ts.surface.readCell(13, 5).?;
     try std.testing.expect(new_cell.style.dim);
+}
+
+test "hunkHeaderStyle lets highlighted state win over staged background" {
+    const style = hunkHeaderStyle(true, true);
+
+    try std.testing.expect(style.reverse);
+    try std.testing.expect(!style.dim);
+    try std.testing.expect(style.bg.eql(.default));
 }
 
 test "displayPath prefers new path and strips git prefixes" {
