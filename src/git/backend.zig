@@ -102,6 +102,7 @@ pub const OperationKind = union(enum) {
     unstage_file: []const u8,
     discard_file: []const u8,
     stage_patch: StagePatchRequest,
+    unstage_patch: StagePatchRequest,
     commit: CommitRequest,
 };
 
@@ -180,6 +181,7 @@ pub const LocalCommandBackend = struct {
             .unstage_file => |path| runGitUnstage(allocator, io, request.repo_root, path),
             .discard_file => |path| runGitDiscard(allocator, io, request.repo_root, path),
             .stage_patch => |patch| runGitApplyCached(allocator, io, request.repo_root, patch.patch),
+            .unstage_patch => |patch| runGitApplyCachedReverse(allocator, io, request.repo_root, patch.patch),
             .commit => |commit| runGitCommit(allocator, io, request.repo_root, commit),
         };
     }
@@ -392,6 +394,35 @@ fn runGitApplyCached(allocator: std.mem.Allocator, io: std.Io, repo_root: []cons
     allocator.free(result.stderr);
 
     return .{ .failed = std.fmt.allocPrint(allocator, "git apply --cached failed: {any}", .{result.term}) catch return error.OutOfMemory };
+}
+
+fn runGitApplyCachedReverse(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, patch: []const u8) LoadError!OperationResult {
+    const argv = [_][]const u8{ "git", "apply", "--cached", "--reverse", "--whitespace=nowarn", "-" };
+    const result = runWithStdin(allocator, io, .{
+        .argv = &argv,
+        .cwd = .{ .path = repo_root },
+        .stdin = patch,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.StreamTooLong,
+        else => error.SpawnFailed,
+    };
+
+    allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .ok;
+        },
+        else => {},
+    }
+
+    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    allocator.free(result.stderr);
+
+    return .{ .failed = std.fmt.allocPrint(allocator, "git apply --cached --reverse failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
 fn runGitCommit(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest) LoadError!OperationResult {

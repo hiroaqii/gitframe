@@ -14,6 +14,8 @@ pub const RenderOptions = struct {
     pane_active: bool = true,
     line_numbers: bool = true,
     highlighted_hunk: ?usize = null,
+    cursor_offset: ?usize = null,
+    staged_hunks: []const bool = &.{},
     line_index: ?diff_view_model.RenderedLineIndex = null,
     folded_hunks: []const bool = &.{},
 };
@@ -57,6 +59,12 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
 
     const mode = effectiveMode(size.width, options.requested_mode);
     try renderFileHeader(surface, file, options.requested_mode, options.pane_active);
+    var body_surface = surface.child(.{
+        .col = cursor_gutter_width,
+        .row = 0,
+        .width = size.width -| cursor_gutter_width,
+        .height = size.height,
+    });
 
     const line_index = if (options.line_index) |index|
         if (lineIndexMatchesFile(file, index, mode)) index else null
@@ -65,25 +73,32 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     var cursor: BodyCursor = .{
         // initAt has already consumed the virtual rows before options.scroll.
         .scroll = if (line_index != null) 0 else options.scroll,
+        .base_offset = if (line_index != null) options.scroll else 0,
         .height = size.height,
     };
     var rows = if (line_index) |index|
         diff_view_model.BodyRowIterator.initAtWithFolded(file, mode, index, options.scroll, options.folded_hunks)
     else
         diff_view_model.BodyRowIterator.initWithFolded(file, mode, options.folded_hunks);
+    var current_hunk_staged = false;
     while (rows.next()) |body_row| {
         if (cursor.done()) return;
+        const body_offset = cursor.bodyOffset();
         const row = cursor.nextRow() orelse continue;
+        drawCursorMarker(surface, row, body_offset, options.cursor_offset);
         switch (body_row) {
-            .metadata => |line| try draw.copyClippedTextAt(surface, 0, row, line, style_metadata),
-            .binary_marker => _ = surface.borrowTextAt(0, row, "Binary file", style_warning),
-            .hunk_header => |hunk| try drawHunkHeaderRow(surface, row, hunk, options.highlighted_hunk, mode),
-            .unified_line => |line| try drawUnifiedLine(surface, row, line, options.horizontal_scroll, options.line_numbers),
+            .metadata => |line| try draw.copyClippedTextAt(&body_surface, 0, row, line, style_metadata),
+            .binary_marker => _ = body_surface.borrowTextAt(0, row, "Binary file", style_warning),
+            .hunk_header => |hunk| {
+                current_hunk_staged = hunk.hunk_index < options.staged_hunks.len and options.staged_hunks[hunk.hunk_index];
+                try drawHunkHeaderRow(&body_surface, row, hunk, options.highlighted_hunk, mode, current_hunk_staged);
+            },
+            .unified_line => |line| try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, current_hunk_staged),
             .side_by_side => |side_row| {
-                const gutter_col = size.width / 2;
+                const gutter_col = body_surface.size().width / 2;
                 switch (side_row) {
-                    .single => |line| try drawSideBySideSingle(surface, row, line, gutter_col, options.horizontal_scroll, options.line_numbers),
-                    .paired => |pair| try drawSideBySidePair(surface, row, pair.removed, pair.added, gutter_col, options.horizontal_scroll, options.line_numbers),
+                    .single => |line| try drawSideBySideSingle(&body_surface, row, line, gutter_col, options.horizontal_scroll, options.line_numbers, current_hunk_staged),
+                    .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, gutter_col, options.horizontal_scroll, options.line_numbers, current_hunk_staged),
                 }
             },
         }
@@ -117,9 +132,9 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, line
         };
         if (mode == .side_by_side and size.width >= side_by_side_min_width) {
             const gutter_col = size.width / 2;
-            try drawSideBySidePair(surface, row, null, line, gutter_col, options.horizontal_scroll, options.line_numbers);
+            try drawSideBySidePair(surface, row, null, line, gutter_col, options.horizontal_scroll, options.line_numbers, false);
         } else {
-            try drawUnifiedLine(surface, row, line, options.horizontal_scroll, options.line_numbers);
+            try drawUnifiedLine(surface, row, line, options.horizontal_scroll, options.line_numbers, false);
         }
     }
 }
@@ -185,11 +200,13 @@ fn drawHunkHeaderRow(
     hunk: diff_view_model.HunkHeader,
     highlighted_hunk: ?usize,
     mode: DisplayMode,
+    staged: bool,
 ) !void {
-    const style = if (highlighted_hunk != null and highlighted_hunk.? == hunk.hunk_index)
+    var style = if (highlighted_hunk != null and highlighted_hunk.? == hunk.hunk_index)
         style_selected_hunk
     else
         style_hunk;
+    if (staged) style.dim = true;
     const marker = if (hunk.folded) "▸" else "▾";
     const header = try std.fmt.allocPrint(surface.frameAllocator(), "{s} @@ -{d},{d} +{d},{d} @@ {s}", .{
         marker,
@@ -203,9 +220,16 @@ fn drawHunkHeaderRow(
 }
 
 const body_start_row: u16 = 3;
+const cursor_gutter_width: u16 = 1;
+
+fn drawCursorMarker(surface: *chasen.Surface, row: u16, body_offset: usize, cursor_offset: ?usize) void {
+    if (cursor_offset == null or cursor_offset.? != body_offset) return;
+    _ = surface.borrowTextAt(0, row, ">", style_cursor);
+}
 
 const BodyCursor = struct {
     scroll: usize,
+    base_offset: usize = 0,
     virtual_row: usize = 0,
     row: u16 = body_start_row,
     height: u16,
@@ -222,42 +246,46 @@ const BodyCursor = struct {
     fn done(self: BodyCursor) bool {
         return self.virtual_row >= self.scroll and self.row >= self.height;
     }
+
+    fn bodyOffset(self: BodyCursor) usize {
+        return self.base_offset + self.virtual_row;
+    }
 };
 
-fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool) !void {
-    const style = styleForLine(line.kind);
+fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool) !void {
+    const style = styleForLine(line.kind, staged);
     const prefix = prefixForLine(line.kind);
     const layout = lineLayout(line_numbers, .unified);
 
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), style_line_number);
-        _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), style_line_number);
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(staged));
+        _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), lineNumberStyle(staged));
     }
     _ = surface.borrowTextAt(layout.prefix_col, row, prefix, style);
     try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, style);
 }
 
-fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, gutter_col: u16, horizontal_scroll: usize, line_numbers: bool) !void {
+fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, gutter_col: u16, horizontal_scroll: usize, line_numbers: bool, staged: bool) !void {
     var columns = sideBySideRowColumns(surface, row, gutter_col);
-    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers);
-    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers);
+    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged);
+    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged);
     drawSideBySideGutter(surface, row, gutter_col);
 }
 
-fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, gutter_col: u16, horizontal_scroll: usize, line_numbers: bool) !void {
+fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, gutter_col: u16, horizontal_scroll: usize, line_numbers: bool, staged: bool) !void {
     var columns = sideBySideRowColumns(surface, row, gutter_col);
     switch (line.kind) {
         .removed => {
-            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers);
+            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged);
             drawSideBySideGutter(surface, row, gutter_col);
         },
         .added => {
-            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers);
+            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged);
             drawSideBySideGutter(surface, row, gutter_col);
         },
         .context => {
-            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers);
-            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers);
+            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged);
+            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged);
             drawSideBySideGutter(surface, row, gutter_col);
         },
         .metadata => {
@@ -294,24 +322,26 @@ fn sideBySideRowColumns(surface: *chasen.Surface, row: u16, gutter_col: u16) Sid
     };
 }
 
-fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool) !void {
+fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool) !void {
     const layout = lineLayout(line_numbers, .side_by_side);
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), style_line_number);
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(staged));
     }
     const prefix = if (line.kind == .removed) "-" else " ";
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, styleForLine(line.kind));
-    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, styleForLine(line.kind));
+    const style = styleForLine(line.kind, staged);
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, style);
+    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, style);
 }
 
-fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool) !void {
+fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool) !void {
     const layout = lineLayout(line_numbers, .side_by_side);
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), style_line_number);
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), lineNumberStyle(staged));
     }
     const prefix = if (line.kind == .added) "+" else " ";
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, styleForLine(line.kind));
-    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, styleForLine(line.kind));
+    const style = styleForLine(line.kind, staged);
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, style);
+    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, style);
 }
 
 pub const LineLayoutMode = enum {
@@ -359,13 +389,21 @@ fn lineNumberText(surface: *chasen.Surface, line: ?u32) ![]const u8 {
         surface.copyText("    ");
 }
 
-fn styleForLine(kind: diff_parser.DiffLine.Kind) chasen.TextStyle {
-    return switch (kind) {
+fn styleForLine(kind: diff_parser.DiffLine.Kind, staged: bool) chasen.TextStyle {
+    var style = switch (kind) {
         .added => style_added,
         .removed => style_removed,
         .context => style_context,
         .metadata => style_metadata,
     };
+    if (staged) style.dim = true;
+    return style;
+}
+
+fn lineNumberStyle(staged: bool) chasen.TextStyle {
+    var style = style_line_number;
+    if (staged) style.dim = true;
+    return style;
 }
 
 fn fileHeaderStyle(pane_active: bool) chasen.TextStyle {
@@ -388,6 +426,7 @@ const side_by_side_min_width: u16 = 72;
 const style_file_header: chasen.TextStyle = .{ .bold = true, .fg = .{ .index = 11 } };
 const style_hunk: chasen.TextStyle = .{ .bold = true, .fg = .{ .index = 14 } };
 const style_selected_hunk: chasen.TextStyle = .{ .bold = true, .reverse = true, .fg = .{ .index = 14 } };
+const style_cursor: chasen.TextStyle = .{ .bold = true, .fg = .{ .index = 11 } };
 const style_added: chasen.TextStyle = .{ .fg = .{ .index = 2 } };
 const style_removed: chasen.TextStyle = .{ .fg = .{ .index = 9 } };
 const style_context: chasen.TextStyle = .{};
@@ -425,6 +464,44 @@ test "fileStats counts added and removed hunk lines" {
     };
 
     try std.testing.expectEqual(FileStats{ .added = 1, .removed = 1 }, fileStats(file));
+}
+
+test "renderFile dims staged hunk body without removing it" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 6);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 1,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old", .old_line = 1 },
+                    .{ .kind = .added, .text = "new", .new_line = 1 },
+                },
+            },
+        },
+    };
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .staged_hunks = &.{true},
+    });
+
+    try ts.expectCellText(13, 4, "o");
+    const old_cell = ts.surface.readCell(13, 4).?;
+    try std.testing.expect(old_cell.style.dim);
+    try ts.expectCellText(13, 5, "n");
+    const new_cell = ts.surface.readCell(13, 5).?;
+    try std.testing.expect(new_cell.style.dim);
 }
 
 test "displayPath prefers new path and strips git prefixes" {
@@ -553,8 +630,8 @@ test "side-by-side hunk header is clipped before the new column" {
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side });
 
     const gutter_col: u16 = 40;
-    try ts.expectCellText(2, 3, "@");
     try ts.expectCellText(3, 3, "@");
+    try ts.expectCellText(4, 3, "@");
     try ts.expectCellText(gutter_col, 3, "│");
     try ts.expectCellText(gutter_col + 1, 3, " ");
     try ts.expectCellText(gutter_col + 8, 3, " ");
@@ -605,12 +682,12 @@ test "unified horizontal scroll keeps line numbers and prefix fixed" {
     try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .horizontal_scroll = 4 });
 
     try ts.expectCellText(0, 4, " ");
-    try ts.expectCellText(3, 4, "1");
-    try ts.expectCellText(8, 4, "1");
-    try ts.expectCellText(10, 4, " ");
-    try ts.expectCellText(12, 4, "4");
-    try ts.expectCellText(13, 4, "5");
-    try ts.expectCellText(31, 4, "n");
+    try ts.expectCellText(4, 4, "1");
+    try ts.expectCellText(9, 4, "1");
+    try ts.expectCellText(11, 4, " ");
+    try ts.expectCellText(13, 4, "4");
+    try ts.expectCellText(14, 4, "5");
+    try ts.expectCellText(31, 4, "m");
 }
 
 test "unified line numbers can be hidden while keeping prefix" {
@@ -639,10 +716,10 @@ test "unified line numbers can be hidden while keeping prefix" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .line_numbers = false });
 
-    try ts.expectCellText(0, 4, "+");
-    try ts.expectCellText(2, 4, "n");
-    try ts.expectCellText(3, 4, "e");
-    try ts.expectCellText(4, 4, "w");
+    try ts.expectCellText(1, 4, "+");
+    try ts.expectCellText(3, 4, "n");
+    try ts.expectCellText(4, 4, "e");
+    try ts.expectCellText(5, 4, "w");
 }
 
 test "inactive pane dims file header only" {
@@ -693,7 +770,7 @@ test "side-by-side horizontal scroll keeps gutter fixed" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side, .horizontal_scroll = 4 });
 
-    try ts.expectCellText(7, 4, "0");
+    try ts.expectCellText(8, 4, "0");
     try ts.expectCellText(40, 4, "│");
     try ts.expectCellText(48, 4, "a");
 }
@@ -725,8 +802,8 @@ test "side-by-side line numbers can be hidden while keeping prefixes" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side, .line_numbers = false });
 
-    try ts.expectCellText(0, 4, "-");
-    try ts.expectCellText(2, 4, "o");
+    try ts.expectCellText(1, 4, "-");
+    try ts.expectCellText(3, 4, "o");
     try ts.expectCellText(40, 4, "│");
     try ts.expectCellText(41, 4, "+");
     try ts.expectCellText(43, 4, "n");
@@ -776,12 +853,56 @@ test "renderFile can start from cached viewport offset" {
         .line_index = index,
     });
 
-    try ts.expectCellText(2, 3, "@");
     try ts.expectCellText(3, 3, "@");
-    try ts.expectCellText(12, 4, "s");
-    try ts.expectCellText(13, 4, "a");
-    try ts.expectCellText(14, 4, "m");
-    try ts.expectCellText(15, 4, "e");
+    try ts.expectCellText(4, 3, "@");
+    try ts.expectCellText(13, 4, "s");
+    try ts.expectCellText(14, 4, "a");
+    try ts.expectCellText(15, 4, "m");
+    try ts.expectCellText(16, 4, "e");
+}
+
+test "renderFile cursor marker uses absolute body offset with cached viewport" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 5);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{ "--- a/src/main.zig", "+++ b/src/main.zig" },
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 1,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "first",
+                .lines = &.{.{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 }},
+            },
+            .{
+                .old_start = 9,
+                .old_count = 1,
+                .new_start = 9,
+                .new_count = 1,
+                .section = "second",
+                .lines = &.{.{ .kind = .context, .text = "later", .old_line = 9, .new_line = 9 }},
+            },
+        },
+    };
+
+    var index = try diff_view_model.RenderedLineIndex.build(std.testing.allocator, file, .unified);
+    defer index.deinit(std.testing.allocator);
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .scroll = index.hunkOffset(1),
+        .cursor_offset = index.hunkOffset(1) + 1,
+        .line_index = index,
+    });
+
+    try ts.expectCellText(0, 3, " ");
+    try ts.expectCellText(0, 4, ">");
 }
 
 test "renderFile can start from cached side-by-side viewport offset" {
@@ -820,9 +941,9 @@ test "renderFile can start from cached side-by-side viewport offset" {
         .line_index = index,
     });
 
-    try ts.expectCellText(7, 3, "o");
-    try ts.expectCellText(8, 3, "l");
-    try ts.expectCellText(9, 3, "d");
+    try ts.expectCellText(8, 3, "o");
+    try ts.expectCellText(9, 3, "l");
+    try ts.expectCellText(10, 3, "d");
     try ts.expectCellText(40, 3, "│");
     try ts.expectCellText(48, 3, "n");
     try ts.expectCellText(49, 3, "e");

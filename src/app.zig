@@ -62,6 +62,8 @@ const StageFileFinished = app_actions.StageFileFinished;
 const StageFileTask = app_actions.StageFileTask(App.Msg);
 const UnstageFileFinished = app_actions.UnstageFileFinished;
 const UnstageFileTask = app_actions.UnstageFileTask(App.Msg);
+const UnstageHunkFinished = app_actions.UnstageHunkFinished;
+const UnstageHunkTask = app_actions.UnstageHunkTask(App.Msg);
 
 const MousePane = enum {
     sidebar,
@@ -111,7 +113,7 @@ const ViewerState = struct {
     sidebar_width: ?u16 = null,
     diff_scroll: usize = 0,
     diff_horizontal_scroll: usize = 0,
-    selected_hunk: usize = 0,
+    diff_cursor: diff_view_model.BodyCoordinate = .{ .metadata = 0 },
     display_mode: diff_render.DisplayMode = .side_by_side,
     view_options: ViewOptions = .{},
 };
@@ -169,6 +171,7 @@ pub const App = struct {
     recent_repos: repo_state.RecentStore = .{},
     overlay: app_state.OverlayState = .{},
     review_display: app_state.ReviewDisplayState = .{},
+    staged_hunks: app_state.StagedHunkMarks = .{},
     review_projection: app_review_projection.State = .idle,
     review_projection_next_id: u64 = 0,
     repo_state: repo_state.State = .{},
@@ -193,6 +196,7 @@ pub const App = struct {
         stage_file_finished: StageFileFinished,
         stage_hunk_finished: StageHunkFinished,
         unstage_file_finished: UnstageFileFinished,
+        unstage_hunk_finished: UnstageHunkFinished,
         discard_file_finished: DiscardFileFinished,
         commit_finished: CommitFinished,
         select_previous_file,
@@ -272,6 +276,7 @@ pub const App = struct {
         stage_selected_file,
         stage_selected_hunk,
         unstage_selected_file,
+        unstage_selected_hunk,
         request_discard_selected_file,
         confirm_discard_file,
         cancel_discard_file,
@@ -307,6 +312,7 @@ pub const App = struct {
         self.deinitRepoPickerItems(deinit_ctx.allocator);
         self.recent_repos.deinit(deinit_ctx.allocator);
         self.reviewed_store.deinit(deinit_ctx.allocator);
+        self.staged_hunks.deinit(deinit_ctx.allocator);
         self.review_projection.deinit(deinit_ctx.allocator);
         self.cancelDiscardConfirmation(deinit_ctx.allocator);
         self.tree_order.deinit(deinit_ctx.allocator);
@@ -334,6 +340,7 @@ pub const App = struct {
             .stage_file_finished => |finished| try self.finishStageFile(ctx, finished),
             .stage_hunk_finished => |finished| try self.finishStageHunk(ctx, finished),
             .unstage_file_finished => |finished| try self.finishUnstageFile(ctx, finished),
+            .unstage_hunk_finished => |finished| try self.finishUnstageHunk(ctx, finished),
             .discard_file_finished => |finished| try self.finishDiscardFile(ctx, finished),
             .commit_finished => |finished| try self.finishCommit(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
@@ -341,12 +348,12 @@ pub const App = struct {
             .toggle_directory => try self.toggleSelectedDirectory(),
             .expand_directory => try self.expandSelectedDirectory(),
             .collapse_or_parent_directory => try self.collapseOrSelectParentDirectory(),
-            .scroll_diff_up => self.scrollDiff(-1),
-            .scroll_diff_down => self.scrollDiff(1),
+            .scroll_diff_up => self.moveDiffCursorRows(-1),
+            .scroll_diff_down => self.moveDiffCursorRows(1),
             .scroll_diff_left => self.scrollDiffHorizontal(-1),
             .scroll_diff_right => self.scrollDiffHorizontal(1),
-            .page_diff_up => self.pageDiff(-1),
-            .page_diff_down => self.pageDiff(1),
+            .page_diff_up => self.moveDiffCursorPage(-1),
+            .page_diff_down => self.moveDiffCursorPage(1),
             .select_previous_hunk => self.selectHunkDelta(-1),
             .select_next_hunk => self.selectHunkDelta(1),
             .toggle_hunk_fold => self.toggleSelectedHunkFold(),
@@ -396,6 +403,7 @@ pub const App = struct {
                 self.resetDiffHorizontalScroll();
                 self.updateSearchMatchOffset();
                 self.scrollSearchMatchIntoView();
+                self.applyDiffCursorScrolloff();
                 self.clampDiffNavigation();
             },
             .toggle_line_numbers => {
@@ -460,6 +468,7 @@ pub const App = struct {
             .stage_selected_file => try self.stageSelectedFile(ctx),
             .stage_selected_hunk => try self.stageSelectedHunk(ctx),
             .unstage_selected_file => try self.unstageSelectedFile(ctx),
+            .unstage_selected_hunk => try self.unstageSelectedHunk(ctx),
             .request_discard_selected_file => try self.requestDiscardSelectedFile(ctx.allocator()),
             .confirm_discard_file => try self.confirmDiscardFile(ctx),
             .cancel_discard_file => self.cancelDiscardConfirmation(ctx.allocator()),
@@ -936,6 +945,10 @@ pub const App = struct {
                 self.setStatus("no hunk selected", .{});
                 return;
             },
+            .offscreen_cursor => {
+                self.setStatus("cursor is offscreen; move cursor first", .{});
+                return;
+            },
             .stale_status => {
                 self.setStatus("status is still loading", .{});
                 return;
@@ -952,6 +965,10 @@ pub const App = struct {
                 self.setStatus("hunk stage supports modified files only", .{});
                 return;
             },
+            .already_staged_hunk => {
+                self.setStatus("hunk already staged", .{});
+                return;
+            },
             .patch_failed => {
                 self.setStatus("could not build hunk patch", .{});
                 return;
@@ -960,9 +977,6 @@ pub const App = struct {
 
         var owned_patch = target.patch;
         errdefer if (owned_patch.len > 0) ctx.allocator().free(owned_patch);
-
-        try self.setPendingSelectionRestore(ctx.allocator(), target.path);
-        errdefer self.clearPendingSelectionRestore(ctx.allocator());
 
         const pending = self.actions.begin(.stage_hunk);
         errdefer _ = self.actions.finish(pending);
@@ -992,6 +1006,84 @@ pub const App = struct {
             return err;
         };
         self.setStatus("staging hunk: {s}", .{target.path});
+    }
+
+    fn unstageSelectedHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.actions.pending != null) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+        const target = switch (self.selectedHunkUnstageTarget(ctx.allocator())) {
+            .ready => |target| target,
+            .unavailable_source, .no_repo => {
+                self.setStatus("hunk unstage unavailable for this source", .{});
+                return;
+            },
+            .no_file => {
+                self.setStatus("no file selected", .{});
+                return;
+            },
+            .no_path => {
+                self.setStatus("hunk unstage unavailable for status-only file", .{});
+                return;
+            },
+            .no_hunk => {
+                self.setStatus("no hunk selected", .{});
+                return;
+            },
+            .offscreen_cursor => {
+                self.setStatus("cursor is offscreen; move cursor first", .{});
+                return;
+            },
+            .not_staged_hunk => {
+                self.setStatus("hunk is not staged", .{});
+                return;
+            },
+            .binary_unsupported => {
+                self.setStatus("binary hunk unstage is not supported", .{});
+                return;
+            },
+            .unsupported_file_state => {
+                self.setStatus("hunk unstage supports modified files only", .{});
+                return;
+            },
+            .patch_failed => {
+                self.setStatus("could not build hunk patch", .{});
+                return;
+            },
+        };
+
+        var owned_patch = target.patch;
+        errdefer if (owned_patch.len > 0) ctx.allocator().free(owned_patch);
+
+        const pending = self.actions.begin(.unstage_hunk);
+        errdefer _ = self.actions.finish(pending);
+
+        const task = try ctx.allocator().create(UnstageHunkTask);
+        task.* = .{
+            .pending = pending,
+            .repo_root = &.{},
+            .path = &.{},
+            .patch = &.{},
+            .hunk_index = target.hunk_index,
+        };
+        errdefer {
+            if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
+            if (task.path.len > 0) ctx.allocator().free(task.path);
+            if (task.patch.len > 0) ctx.allocator().free(task.patch);
+            ctx.allocator().destroy(task);
+        }
+
+        task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
+        task.path = try ctx.allocator().dupe(u8, target.path);
+        task.patch = owned_patch;
+        owned_patch = &.{};
+
+        ctx.task().spawnWith(task, UnstageHunkTask.run) catch |err| {
+            self.setStatus("could not start hunk unstage task", .{});
+            return err;
+        };
+        self.setStatus("unstaging hunk: {s}", .{target.path});
     }
 
     const GitActionTargetKind = enum {
@@ -1035,8 +1127,26 @@ pub const App = struct {
         no_file,
         no_path,
         no_hunk,
+        offscreen_cursor,
         stale_status,
         conflict_unsupported,
+        binary_unsupported,
+        unsupported_file_state,
+        already_staged_hunk,
+        patch_failed,
+    };
+
+    const HunkUnstageTarget = HunkStageTarget;
+
+    const HunkUnstageTargetResult = union(enum) {
+        ready: HunkUnstageTarget,
+        unavailable_source,
+        no_repo,
+        no_file,
+        no_path,
+        no_hunk,
+        offscreen_cursor,
+        not_staged_hunk,
         binary_unsupported,
         unsupported_file_state,
         patch_failed,
@@ -1047,13 +1157,16 @@ pub const App = struct {
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
         const file = self.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
-        if (file.hunks.len == 0 or self.viewer.selected_hunk >= file.hunks.len) return .no_hunk;
+        if (!self.diffCursorIsVisible()) return .offscreen_cursor;
+        const hunk_index = self.selectedHunkIndex() orelse return .no_hunk;
+        if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
         const entry = self.freshStatusEntryForPathKey(repo_root, path) orelse return .stale_status;
         if (entry.isConflict()) return .conflict_unsupported;
         if (file.is_binary) return .binary_unsupported;
         if (diff_file.status(file) != .modified or diff_file.hasModeChange(file)) return .unsupported_file_state;
+        if (self.staged_hunks.contains(repo_root, path, hunk_index)) return .already_staged_hunk;
 
-        const patch = diff_patch.formatSingleHunkPatch(allocator, file, self.viewer.selected_hunk) catch |err| switch (err) {
+        const patch = diff_patch.formatSingleHunkPatch(allocator, file, hunk_index) catch |err| switch (err) {
             error.BinaryFile => return .binary_unsupported,
             error.UnsupportedFileState => return .unsupported_file_state,
             error.NoPath => return .no_path,
@@ -1063,7 +1176,38 @@ pub const App = struct {
         return .{ .ready = .{
             .repo_root = repo_root,
             .path = path,
-            .hunk_index = self.viewer.selected_hunk,
+            .hunk_index = hunk_index,
+            .patch = patch,
+        } };
+    }
+
+    fn selectedHunkUnstageTarget(self: *const App, allocator: std.mem.Allocator) HunkUnstageTargetResult {
+        if (!diff_source.sourceAllowsUnstageAction(self.config.source)) return .unavailable_source;
+        const repo_root = self.activeRepoRoot() orelse return .no_repo;
+        const file = self.selectedFile() orelse return .no_file;
+        const path = diff_file.canonicalPathKey(file) orelse return .no_path;
+        if (!self.diffCursorIsVisible()) return .offscreen_cursor;
+        const hunk_index = self.selectedHunkIndex() orelse return .no_hunk;
+        if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
+        if (file.is_binary) return .binary_unsupported;
+        if (diff_file.status(file) != .modified or diff_file.hasModeChange(file)) return .unsupported_file_state;
+        if (!self.staged_hunks.contains(repo_root, path, hunk_index)) return .not_staged_hunk;
+
+        // This reverses a session-staged hunk from the same loaded FileDiff.
+        // finishStageHunk intentionally avoids a full diff reload, and
+        // clearLoadedDiff clears staged_hunks before a new document can reuse
+        // the same ordinal for a different hunk.
+        const patch = diff_patch.formatSingleHunkPatch(allocator, file, hunk_index) catch |err| switch (err) {
+            error.BinaryFile => return .binary_unsupported,
+            error.UnsupportedFileState => return .unsupported_file_state,
+            error.NoPath => return .no_path,
+            error.InvalidHunk => return .no_hunk,
+            error.OutOfMemory => return .patch_failed,
+        };
+        return .{ .ready = .{
+            .repo_root = repo_root,
+            .path = path,
+            .hunk_index = hunk_index,
             .patch = patch,
         } };
     }
@@ -1421,17 +1565,14 @@ pub const App = struct {
                 const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
                 self.setStatus("staged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
                 if (active_matches) {
-                    try self.reloadAfterGitAction(ctx);
-                } else {
-                    self.clearPendingSelectionRestore(ctx.allocator());
+                    try self.staged_hunks.add(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
+                    self.startStatusLoad(ctx, result.repo_root);
                 }
             },
             .failed => |message| {
-                self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("hunk stage failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
             },
             .failed_static => |message| {
-                self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("hunk stage failed: {s}", .{message});
             },
         }
@@ -1455,6 +1596,31 @@ pub const App = struct {
             .failed_static => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("unstage failed: {s}", .{message});
+            },
+        }
+    }
+
+    fn finishUnstageHunk(self: *App, ctx: *chasen.Ctx(Msg), finished: UnstageHunkFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (!self.actions.finish(result.pending)) return;
+
+        switch (result.result) {
+            .ok => {
+                const active_root = self.activeRepoRoot();
+                const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+                self.setStatus("unstaged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
+                if (active_matches) {
+                    _ = self.staged_hunks.remove(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
+                    self.startStatusLoad(ctx, result.repo_root);
+                }
+            },
+            .failed => |message| {
+                self.setStatus("hunk unstage failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+            },
+            .failed_static => |message| {
+                self.setStatus("hunk unstage failed: {s}", .{message});
             },
         }
     }
@@ -1940,10 +2106,13 @@ pub const App = struct {
 
     fn clearLoadedDiff(self: *App) void {
         self.load.clearCurrent(self.allocator);
-        if (self.allocator) |allocator| self.review_projection.deinit(allocator);
+        if (self.allocator) |allocator| {
+            self.review_projection.deinit(allocator);
+            self.staged_hunks.clear(allocator);
+        }
         self.viewer.diff_scroll = 0;
         self.viewer.diff_horizontal_scroll = 0;
-        self.viewer.selected_hunk = 0;
+        self.viewer.diff_cursor = .{ .metadata = 0 };
         self.clearSearchMatch();
     }
 
@@ -2129,18 +2298,50 @@ pub const App = struct {
         self.clampDiffNavigation();
     }
 
+    fn moveDiffCursorRows(self: *App, delta: i2) void {
+        const current = self.selectedDiffCursorOffset() orelse {
+            self.initializeDiffCursorForSelectedFile();
+            self.applyDiffCursorScrolloff();
+            return;
+        };
+        const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
+        if (line_count == 0) return;
+        const target = if (delta < 0) current -| 1 else @min(current + 1, line_count - 1);
+        self.viewer.diff_cursor = self.selectedCoordinateAtOffset(target) orelse self.viewer.diff_cursor;
+        self.applyDiffCursorScrolloff();
+    }
+
+    fn moveDiffCursorPage(self: *App, delta: i2) void {
+        const current = self.selectedDiffCursorOffset() orelse {
+            self.initializeDiffCursorForSelectedFile();
+            self.applyDiffCursorScrolloff();
+            return;
+        };
+        const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
+        if (line_count == 0) return;
+        const step = @max(self.diffVisibleRows(), 1);
+        const target = if (delta < 0) current -| step else @min(current + step, line_count - 1);
+        self.viewer.diff_cursor = self.selectedCoordinateAtOffset(target) orelse self.viewer.diff_cursor;
+        self.applyDiffCursorScrolloff();
+    }
+
     fn selectHunkDelta(self: *App, delta: i2) void {
         const file = self.selectedFile() orelse return;
         if (file.hunks.len == 0) return;
 
-        if (delta < 0) {
-            if (self.viewer.selected_hunk > 0) self.viewer.selected_hunk -= 1;
-        } else if (self.viewer.selected_hunk + 1 < file.hunks.len) {
-            self.viewer.selected_hunk += 1;
-        }
-
-        self.scrollSelectedHunkIntoView();
-        self.clampDiffNavigation();
+        const current = self.selectedHunkIndex();
+        const target = if (delta < 0) blk: {
+            if (current) |hunk_index| {
+                if (self.viewer.diff_cursor == .hunk_line) break :blk hunk_index;
+                break :blk hunk_index -| 1;
+            }
+            break :blk 0;
+        } else blk: {
+            if (current) |hunk_index| break :blk @min(hunk_index + 1, file.hunks.len - 1);
+            break :blk 0;
+        };
+        self.viewer.diff_cursor = .{ .hunk_header = target };
+        self.applyDiffCursorScrolloff();
     }
 
     fn toggleSelectedHunkFold(self: *App) void {
@@ -2148,23 +2349,34 @@ pub const App = struct {
         const file_index = self.selectedFileIndex(loaded) orelse return;
         if (file_index >= loaded.document.files.len) return;
         const file = loaded.document.files[file_index];
-        if (self.viewer.selected_hunk >= file.hunks.len) return;
+        const hunk_index = self.selectedHunkIndex() orelse return;
+        if (hunk_index >= file.hunks.len) return;
 
-        if (!loaded.isHunkFolded(file_index, self.viewer.selected_hunk) and
-            self.currentSearchMatchInHunkBody(self.viewer.selected_hunk))
+        if (!loaded.isHunkFolded(file_index, hunk_index) and
+            self.currentSearchMatchInHunkBody(hunk_index))
         {
             return;
         }
 
-        loaded.toggleHunkFold(file_index, self.viewer.selected_hunk);
+        const folding = !loaded.isHunkFolded(file_index, hunk_index);
+        loaded.toggleHunkFold(file_index, hunk_index);
+        if (folding) {
+            switch (self.viewer.diff_cursor) {
+                .hunk_line => |line| if (line.hunk_index == hunk_index) {
+                    self.viewer.diff_cursor = .{ .hunk_header = hunk_index };
+                },
+                else => {},
+            }
+        }
         self.updateSearchMatchOffset();
-        self.scrollSelectedHunkIntoView();
+        self.applyDiffCursorScrolloff();
         self.clampDiffNavigation();
     }
 
     fn scrollSelectedHunkIntoView(self: *App) void {
         const mode = self.effectiveDisplayMode();
-        const target = self.selectedHunkOffset(mode, self.viewer.selected_hunk);
+        const hunk_index = self.selectedHunkIndex() orelse return;
+        const target = self.selectedHunkOffset(mode, hunk_index);
         const visible_rows = self.diffVisibleRows();
         if (target < self.viewer.diff_scroll) {
             self.viewer.diff_scroll = target;
@@ -2174,19 +2386,16 @@ pub const App = struct {
     }
 
     fn clampDiffNavigation(self: *App) void {
-        const file = self.selectedFile() orelse {
+        if (self.selectedFile() == null) {
             const line_count = self.selectedProjectionLineCount();
             const visible_rows = self.diffVisibleRows();
             const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
             if (self.viewer.diff_scroll > max_scroll) self.viewer.diff_scroll = max_scroll;
-            self.viewer.selected_hunk = 0;
             return;
-        };
+        }
 
-        if (file.hunks.len == 0) {
-            self.viewer.selected_hunk = 0;
-        } else if (self.viewer.selected_hunk >= file.hunks.len) {
-            self.viewer.selected_hunk = file.hunks.len - 1;
+        if (self.selectedDiffCursorOffset() == null) {
+            self.initializeDiffCursorForSelectedFile();
         }
 
         const mode = self.effectiveDisplayMode();
@@ -2214,9 +2423,7 @@ pub const App = struct {
 
     fn clampDiffNavigationKeepingHunkVisible(self: *App) void {
         self.clampDiffNavigation();
-        if (self.selectedFile()) |file| {
-            if (file.hunks.len > 0) self.scrollSelectedHunkIntoView();
-        }
+        self.applyDiffCursorScrolloff();
         self.clampDiffNavigation();
     }
 
@@ -2252,7 +2459,7 @@ pub const App = struct {
 
     fn resetDiffPosition(self: *App) void {
         self.viewer.diff_scroll = 0;
-        self.viewer.selected_hunk = 0;
+        self.initializeDiffCursorForSelectedFile();
         self.clearSearchMatch();
     }
 
@@ -2769,8 +2976,9 @@ pub const App = struct {
         };
         self.unfoldSearchMatchIfNeeded(next);
         self.setSearchMatch(next);
+        self.viewer.diff_cursor = next.coordinate;
         self.resetDiffHorizontalScroll();
-        if (self.search.match_offset) |offset| self.viewer.diff_scroll = offset;
+        self.applyDiffCursorScrolloff();
         self.clampDiffNavigation();
     }
 
@@ -2781,7 +2989,8 @@ pub const App = struct {
         const next = diff_search.findMatch(file, self.effectiveDisplayMode(), self.search.query.slice(), null, .forward) orelse return;
         self.unfoldSearchMatchIfNeeded(next);
         self.setSearchMatch(next);
-        if (self.search.match_offset) |offset| self.viewer.diff_scroll = offset;
+        self.viewer.diff_cursor = next.coordinate;
+        self.applyDiffCursorScrolloff();
     }
 
     fn clearSearchMatch(self: *App) void {
@@ -3054,7 +3263,10 @@ pub const App = struct {
             .file_index = file_index,
             .display_path = diff_file.displayPath(file),
             .path_key = diff_file.canonicalPathKey(file),
-            .hunk_index = if (self.viewer.selected_hunk < file.hunks.len) self.viewer.selected_hunk else null,
+            .hunk_index = if (self.selectedHunkIndex()) |hunk_index|
+                if (hunk_index < file.hunks.len) hunk_index else null
+            else
+                null,
         } };
     }
 
@@ -3142,6 +3354,89 @@ pub const App = struct {
         const file_index = self.selectedFileIndex(loaded) orelse return 0;
         if (loaded.rendered_line_cache.indexFor(file_index, mode)) |index| return index.hunkOffset(hunk_index);
         return diff_view_model.hunkBodyLineOffsetFolded(loaded.document.files[file_index], mode, hunk_index, loaded.foldedHunksForFile(file_index));
+    }
+
+    pub fn selectedHunkIndex(self: *const App) ?usize {
+        return switch (self.viewer.diff_cursor) {
+            .hunk_header => |hunk_index| hunk_index,
+            .hunk_line => |line| line.hunk_index,
+            .metadata, .binary_marker => null,
+        };
+    }
+
+    pub fn stagedHunkFlagsForFile(self: *const App, allocator: std.mem.Allocator, file: diff_parser.FileDiff) ![]const bool {
+        if (self.staged_hunks.items.items.len == 0 or file.hunks.len == 0) return &.{};
+        const repo_root = self.activeRepoRoot() orelse return &.{};
+        const path = diff_file.canonicalPathKey(file) orelse return &.{};
+
+        const flags = try allocator.alloc(bool, file.hunks.len);
+        @memset(flags, false);
+        for (flags, 0..) |*flag, hunk_index| {
+            flag.* = self.staged_hunks.contains(repo_root, path, hunk_index);
+        }
+        return flags;
+    }
+
+    fn selectedDiffCursorOffset(self: *const App) ?usize {
+        const file = self.selectedFile() orelse return null;
+        const mode = self.effectiveDisplayMode();
+        return diff_view_model.renderedOffsetForCoordinate(file, mode, self.viewer.diff_cursor, self.selectedFileCachedLineIndex(mode));
+    }
+
+    fn selectedCoordinateAtOffset(self: *const App, offset: usize) ?diff_view_model.BodyCoordinate {
+        const file = self.selectedFile() orelse return null;
+        const mode = self.effectiveDisplayMode();
+        return diff_view_model.coordinateAtOffset(file, mode, offset, self.selectedFoldedHunks(), self.selectedFileCachedLineIndex(mode));
+    }
+
+    fn initializeDiffCursorForSelectedFile(self: *App) void {
+        const file = self.selectedFile() orelse {
+            self.viewer.diff_cursor = .{ .metadata = 0 };
+            return;
+        };
+        if (file.hunks.len > 0) {
+            self.viewer.diff_cursor = .{ .hunk_header = 0 };
+        } else if (file.metadata.len > 0) {
+            self.viewer.diff_cursor = .{ .metadata = 0 };
+        } else if (file.is_binary) {
+            self.viewer.diff_cursor = .binary_marker;
+        } else {
+            self.viewer.diff_cursor = .{ .metadata = 0 };
+        }
+    }
+
+    pub fn visibleDiffCursorOffset(self: *const App) ?usize {
+        const offset = self.selectedDiffCursorOffset() orelse return null;
+        const visible_rows = self.diffVisibleRows();
+        if (offset < self.viewer.diff_scroll) return null;
+        if (visible_rows == 0 or offset >= self.viewer.diff_scroll + visible_rows) return null;
+        return offset;
+    }
+
+    fn diffCursorIsVisible(self: *const App) bool {
+        return self.visibleDiffCursorOffset() != null;
+    }
+
+    fn applyDiffCursorScrolloff(self: *App) void {
+        const cursor_offset = self.selectedDiffCursorOffset() orelse {
+            self.clampDiffNavigation();
+            return;
+        };
+        const visible_rows = self.diffVisibleRows();
+        if (visible_rows == 0) {
+            self.clampDiffNavigation();
+            return;
+        }
+        const margin = @min(@as(usize, 8), visible_rows / 3);
+        if (cursor_offset < self.viewer.diff_scroll + margin) {
+            self.viewer.diff_scroll = cursor_offset -| margin;
+        } else {
+            const lower_edge = self.viewer.diff_scroll + visible_rows -| margin;
+            if (cursor_offset >= lower_edge) {
+                self.viewer.diff_scroll = cursor_offset + margin + 1 - visible_rows;
+            }
+        }
+        self.clampDiffNavigation();
     }
 
     fn loadedFileCount(self: *const App) ?usize {
@@ -3425,18 +3720,18 @@ test "file selection boundary does not reset diff position" {
         .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{
             .diff_scroll = 4,
-            .selected_hunk = 1,
+            .diff_cursor = .{ .hunk_header = 1 },
         },
     };
 
     app.selectFileDelta(-1);
     try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
     try std.testing.expectEqual(@as(usize, 4), app.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_hunk);
+    try std.testing.expectEqual(@as(?usize, 1), app.selectedHunkIndex());
 
     app.selectFileAbsolute(0);
     try std.testing.expectEqual(@as(usize, 4), app.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_hunk);
+    try std.testing.expectEqual(@as(?usize, 1), app.selectedHunkIndex());
 }
 
 test "mode toggle keeps selected hunk visible" {
@@ -3445,7 +3740,7 @@ test "mode toggle keeps selected hunk visible" {
         .load = testLoadState(testLoadedDiffOne()),
         .viewer = .{
             .display_mode = .unified,
-            .selected_hunk = 1,
+            .diff_cursor = .{ .hunk_header = 1 },
         },
     };
 
@@ -3456,7 +3751,7 @@ test "mode toggle keeps selected hunk visible" {
     app.clampDiffNavigationKeepingHunkVisible();
 
     const file = testFileWithHunks();
-    const target = diff_render.hunkBodyLineOffset(file, app.effectiveDisplayMode(), app.viewer.selected_hunk);
+    const target = diff_render.hunkBodyLineOffset(file, app.effectiveDisplayMode(), app.selectedHunkIndex().?);
     const visible_rows = app.diffVisibleRows();
     try std.testing.expect(target >= app.viewer.diff_scroll);
     try std.testing.expect(visible_rows == 0 or target < app.viewer.diff_scroll + visible_rows);
@@ -3662,12 +3957,32 @@ test "display mode toggle keeps nearby vertical scroll position" {
             .sidebar_hidden = true,
         },
     };
+    app.viewer.diff_cursor = app.selectedCoordinateAtOffset(app.viewer.diff_scroll) orelse app.viewer.diff_cursor;
 
     try app.update(.toggle_display_mode, undefined);
 
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
     try std.testing.expect(app.viewer.diff_scroll > 0);
     try std.testing.expect(app.viewer.diff_scroll <= app.selectedFileLineIndex(app.effectiveDisplayMode()).lineCount());
+}
+
+test "display mode toggle brings cursor back into view after wheel scroll" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 8 },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+            .diff_scroll = 12,
+            .diff_cursor = .{ .hunk_header = 0 },
+        },
+    };
+
+    try std.testing.expect(app.visibleDiffCursorOffset() == null);
+
+    try app.update(.toggle_display_mode, undefined);
+
+    try std.testing.expect(app.visibleDiffCursorOffset() != null);
 }
 
 test "display mode scroll remap preserves hunk-local ratio" {
@@ -4010,7 +4325,7 @@ test "toggle selected hunk fold updates active rendered line cache" {
     var app: App = .{
         .terminal_size = .{ .width = 100, .height = 12 },
         .load = testLoadStateWithArena(arena, loaded),
-        .viewer = .{ .selected_hunk = 0 },
+        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
     defer app.clearLoadedDiff();
 
@@ -4529,7 +4844,7 @@ test "selectionContext exposes selected diff file model coordinate" {
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
             .selected_file = 0,
-            .selected_hunk = 1,
+            .diff_cursor = .{ .hunk_header = 1 },
         },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "gitframe",
@@ -4707,6 +5022,107 @@ test "selectedUnstageTarget requires fresh staged status" {
         },
         else => return error.ExpectedConflictUnstageTarget,
     }
+}
+
+test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 10 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer app.staged_hunks.deinit(std.testing.allocator);
+
+    switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
+        .not_staged_hunk => {},
+        else => return error.ExpectedNotStagedHunk,
+    }
+
+    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
+        .ready => |target| {
+            defer std.testing.allocator.free(target.patch);
+            try std.testing.expectEqualStrings("/repo", target.repo_root);
+            try std.testing.expectEqualStrings("a", target.path);
+            try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
+            try std.testing.expect(target.patch.len > 0);
+        },
+        else => return error.ExpectedReadyHunkUnstageTarget,
+    }
+
+    app.viewer.diff_scroll = 100;
+    switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
+        .offscreen_cursor => {},
+        else => return error.ExpectedOffscreenHunkUnstageTarget,
+    }
+}
+
+test "hunk action results mutate session staged marks" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffOne()),
+    };
+    defer app.staged_hunks.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusTasks(&ctx, allocator);
+
+    const stage_pending = app.actions.begin(.stage_hunk);
+    try app.finishStageHunk(&ctx, .{
+        .pending = stage_pending,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .path = try allocator.dupe(u8, "a"),
+        .hunk_index = 1,
+        .result = .ok,
+    });
+
+    try std.testing.expect(app.staged_hunks.contains("/repo", "a", 1));
+    try std.testing.expectEqual(@as(usize, 1), app.staged_hunks.items.items.len);
+
+    const unstage_pending = app.actions.begin(.unstage_hunk);
+    try app.finishUnstageHunk(&ctx, .{
+        .pending = unstage_pending,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .path = try allocator.dupe(u8, "a"),
+        .hunk_index = 1,
+        .result = .ok,
+    });
+
+    try std.testing.expect(!app.staged_hunks.contains("/repo", "a", 1));
+    try std.testing.expectEqual(@as(usize, 0), app.staged_hunks.items.items.len);
+}
+
+test "clearLoadedDiff clears session staged hunk marks" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffOne()),
+    };
+    defer app.staged_hunks.deinit(allocator);
+
+    try app.staged_hunks.add(allocator, "/repo", "a", 0);
+    try std.testing.expect(app.staged_hunks.contains("/repo", "a", 0));
+
+    app.clearLoadedDiff();
+
+    try std.testing.expectEqual(@as(usize, 0), app.staged_hunks.items.items.len);
 }
 
 test "directory stage target uses sidebar cursor and status subtree" {
@@ -5497,7 +5913,8 @@ test "search marker gutter does not overwrite diff content" {
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(0, diff_body_start_row, ">");
-    try ts.expectCellText(1, diff_body_start_row, "i");
+    try ts.expectCellText(1, diff_body_start_row, ">");
+    try ts.expectCellText(2, diff_body_start_row, "i");
 }
 
 test "status mode label uses diff content width after marker gutter" {
@@ -5828,6 +6245,17 @@ fn testMouseEventTyped(col: anytype, row: anytype, button: anytype, mouse_type: 
         .mods = .{},
         .type = mouse_type,
     } };
+}
+
+fn clearPendingStatusTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
+    // finishStageHunk queues a status refresh. These tests assert the App-side
+    // state transition only, so clean up the queued task context explicitly.
+    for (ctx.pendingTaskWithSlice()) |entry| {
+        const task: *StatusLoadTask = @ptrCast(@alignCast(entry.ctx));
+        allocator.free(task.repo_root);
+        allocator.destroy(task);
+    }
+    ctx.pending_tasks_with_len = 0;
 }
 
 fn testLoadedSession(loaded: LoadedDiff) LoadedSession {

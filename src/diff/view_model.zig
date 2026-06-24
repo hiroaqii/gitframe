@@ -283,10 +283,72 @@ pub fn renderedOffsetForCoordinate(
     };
 }
 
+pub fn coordinateAtOffset(
+    file: diff_parser.FileDiff,
+    mode: DisplayMode,
+    offset: usize,
+    folded_hunks: []const bool,
+    index_opt: ?RenderedLineIndex,
+) ?BodyCoordinate {
+    const index = if (index_opt) |index|
+        if (index.mode == mode and index.hunk_offsets.len == file.hunks.len) index else null
+    else
+        null;
+
+    if (index) |line_index| {
+        if (offset >= line_index.lineCount()) return null;
+    }
+
+    if (offset < file.metadata.len) return .{ .metadata = offset };
+
+    if (file.is_binary and offset == file.metadata.len) return .binary_marker;
+
+    const hunk_index = if (index) |line_index|
+        line_index.hunkIndexAtOffset(offset)
+    else
+        hunkIndexAtOffsetByWalk(file, mode, offset, folded_hunks);
+    const hunk_idx = hunk_index orelse return null;
+    const hunk_offset = hunkOffsetForCoordinate(file, mode, index, hunk_idx) orelse return null;
+    const local_offset = offset - hunk_offset;
+    if (local_offset == 0) return .{ .hunk_header = hunk_idx };
+
+    if (isFolded(folded_hunks, hunk_idx)) return null;
+    const hunk = file.hunks[hunk_idx];
+    const local_line_offset = local_offset - 1;
+    const line_index = switch (mode) {
+        .unified => if (local_line_offset < hunk.lines.len) local_line_offset else return null,
+        .side_by_side => sideBySideLineIndexAtRenderedOffset(hunk.lines, local_line_offset) orelse return null,
+    };
+
+    return .{ .hunk_line = .{
+        .hunk_index = hunk_idx,
+        .line_index = line_index,
+    } };
+}
+
 fn hunkOffsetForCoordinate(file: diff_parser.FileDiff, mode: DisplayMode, index: ?RenderedLineIndex, hunk_index: usize) ?usize {
     if (hunk_index >= file.hunks.len) return null;
     if (index) |line_index| return line_index.hunkOffset(hunk_index);
     return hunkBodyLineOffset(file, mode, hunk_index);
+}
+
+fn hunkIndexAtOffsetByWalk(file: diff_parser.FileDiff, mode: DisplayMode, offset: usize, folded_hunks: []const bool) ?usize {
+    var rows = BodyRowIterator.initWithFolded(file, mode, folded_hunks);
+    var current_offset: usize = 0;
+    var current_hunk: ?usize = null;
+    while (rows.next()) |row| : (current_offset += 1) {
+        switch (row) {
+            .hunk_header => |hunk| current_hunk = hunk.hunk_index,
+            .unified_line, .side_by_side => {},
+            .metadata, .binary_marker => current_hunk = null,
+        }
+        if (current_offset == offset) return current_hunk;
+    }
+    return null;
+}
+
+fn isFolded(folded_hunks: []const bool, hunk_index: usize) bool {
+    return hunk_index < folded_hunks.len and folded_hunks[hunk_index];
 }
 
 pub const RenderedLineIndex = struct {
@@ -494,6 +556,24 @@ pub fn sideBySideRenderedOffsetForLine(lines: []const diff_parser.DiffLine, targ
                 }
             },
         }
+    }
+    return null;
+}
+
+pub fn sideBySideLineIndexAtRenderedOffset(lines: []const diff_parser.DiffLine, target_offset: usize) ?usize {
+    var rows = SideBySideIndexedIterator.init(lines);
+    var offset: usize = 0;
+    while (rows.next()) |row| : (offset += 1) {
+        if (offset != target_offset) continue;
+        return switch (row) {
+            .single => |line| line.line_index,
+            .paired => |pair| if (pair.removed) |line|
+                line.line_index
+            else if (pair.added) |line|
+                line.line_index
+            else
+                null,
+        };
     }
     return null;
 }
@@ -871,6 +951,53 @@ test "rendered offset maps added side of paired rows to the paired row" {
 
     try std.testing.expectEqual(removed_offset, added_offset);
     try std.testing.expectEqual(@as(?usize, index.hunkOffset(0) + 2), added_offset);
+}
+
+test "coordinateAtOffset maps rendered rows back to body coordinates" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 2,
+                .new_start = 1,
+                .new_count = 2,
+                .section = "first",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old one", .old_line = 1 },
+                    .{ .kind = .removed, .text = "old two", .old_line = 2 },
+                    .{ .kind = .added, .text = "new one", .new_line = 1 },
+                    .{ .kind = .added, .text = "new two", .new_line = 2 },
+                    .{ .kind = .context, .text = "same", .old_line = 3, .new_line = 3 },
+                },
+            },
+        },
+    };
+
+    var unified = try RenderedLineIndex.build(std.testing.allocator, file, .unified);
+    defer unified.deinit(std.testing.allocator);
+    var side_by_side = try RenderedLineIndex.build(std.testing.allocator, file, .side_by_side);
+    defer side_by_side.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(BodyCoordinate{ .metadata = 0 }, coordinateAtOffset(file, .unified, 0, &.{}, unified).?);
+    try std.testing.expectEqual(BodyCoordinate{ .hunk_header = 0 }, coordinateAtOffset(file, .unified, unified.hunkOffset(0), &.{}, unified).?);
+    try std.testing.expectEqual(BodyCoordinate{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } }, coordinateAtOffset(file, .unified, unified.hunkOffset(0) + 2, &.{}, unified).?);
+
+    // Paired side-by-side rows use the first raw hunk line represented by the row.
+    try std.testing.expectEqual(BodyCoordinate{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } }, coordinateAtOffset(file, .side_by_side, side_by_side.hunkOffset(0) + 1, &.{}, side_by_side).?);
+    try std.testing.expectEqual(BodyCoordinate{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } }, coordinateAtOffset(file, .side_by_side, side_by_side.hunkOffset(0) + 2, &.{}, side_by_side).?);
+}
+
+test "coordinateAtOffset maps binary marker" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/bin b/bin",
+        .metadata = &.{"Binary files a/bin and b/bin differ"},
+        .hunks = &.{},
+        .is_binary = true,
+    };
+
+    try std.testing.expectEqual(BodyCoordinate.binary_marker, coordinateAtOffset(file, .unified, 1, &.{}, null).?);
 }
 
 test "rendered offset rejects stale coordinates" {

@@ -353,13 +353,16 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         const prompt_text = std.fmt.allocPrint(surface.frameAllocator(), "search: {s}", .{app.search.input.slice()}) catch "search";
         draw.copyClippedTextAt(surface, 0, 2, prompt_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
     }
+    const staged_hunks = try app.stagedHunkFlagsForFile(surface.frameAllocator(), file);
     try diff_render.renderFile(&diff_content, file, .{
         .requested_mode = app.viewer.display_mode,
         .scroll = app.viewer.diff_scroll,
         .horizontal_scroll = app.viewer.diff_horizontal_scroll,
         .pane_active = active,
         .line_numbers = app.viewer.view_options.line_numbers,
-        .highlighted_hunk = if (file.hunks.len > 0) app.viewer.selected_hunk else null,
+        .highlighted_hunk = app.selectedHunkIndex(),
+        .cursor_offset = app.visibleDiffCursorOffset(),
+        .staged_hunks = staged_hunks,
         .line_index = loaded.cachedRenderedLineIndex(selected, mode),
         .folded_hunks = loaded.foldedHunksForFile(selected),
     });

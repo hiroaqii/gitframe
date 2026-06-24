@@ -94,6 +94,78 @@ pub const PendingSelectionRestore = struct {
     }
 };
 
+pub const StagedHunkMark = struct {
+    repo_root: []u8,
+    path_key: []u8,
+    hunk_index: usize,
+
+    pub fn deinit(self: *StagedHunkMark, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.path_key);
+        self.* = undefined;
+    }
+};
+
+/// Session-only marks for hunks staged from the review pane.
+///
+/// Git reloads expose only unstaged hunks, but review needs staged hunks to
+/// remain visible as dim context. These marks keep that UI projection local to
+/// the current session and are cleared on a full diff reload.
+pub const StagedHunkMarks = struct {
+    items: std.ArrayList(StagedHunkMark) = .empty,
+
+    pub fn deinit(self: *StagedHunkMarks, allocator: std.mem.Allocator) void {
+        self.clear(allocator);
+        self.items.deinit(allocator);
+    }
+
+    pub fn clear(self: *StagedHunkMarks, allocator: std.mem.Allocator) void {
+        for (self.items.items) |*item| item.deinit(allocator);
+        self.items.clearRetainingCapacity();
+    }
+
+    pub fn add(self: *StagedHunkMarks, allocator: std.mem.Allocator, repo_root: []const u8, path_key: []const u8, hunk_index: usize) !void {
+        if (self.contains(repo_root, path_key, hunk_index)) return;
+
+        const owned_root = try allocator.dupe(u8, repo_root);
+        errdefer allocator.free(owned_root);
+        const owned_path = try allocator.dupe(u8, path_key);
+        errdefer allocator.free(owned_path);
+
+        try self.items.append(allocator, .{
+            .repo_root = owned_root,
+            .path_key = owned_path,
+            .hunk_index = hunk_index,
+        });
+    }
+
+    pub fn contains(self: StagedHunkMarks, repo_root: []const u8, path_key: []const u8, hunk_index: usize) bool {
+        for (self.items.items) |item| {
+            if (item.hunk_index == hunk_index and
+                std.mem.eql(u8, item.repo_root, repo_root) and
+                std.mem.eql(u8, item.path_key, path_key))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn remove(self: *StagedHunkMarks, allocator: std.mem.Allocator, repo_root: []const u8, path_key: []const u8, hunk_index: usize) bool {
+        for (self.items.items, 0..) |*item, index| {
+            if (item.hunk_index == hunk_index and
+                std.mem.eql(u8, item.repo_root, repo_root) and
+                std.mem.eql(u8, item.path_key, path_key))
+            {
+                item.deinit(allocator);
+                _ = self.items.swapRemove(index);
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
 test "OverlayState opens help and resets its scroll" {
     var overlay: OverlayState = .{ .kind = .help, .help_scroll = 5 };
 
@@ -121,4 +193,21 @@ test "StatusMessage remains self-contained after value copy" {
     const copied = status;
 
     try std.testing.expectEqualStrings("loaded 3", copied.text());
+}
+
+test "StagedHunkMarks owns keys and deduplicates hunk marks" {
+    var marks: StagedHunkMarks = .{};
+    defer marks.deinit(std.testing.allocator);
+
+    try marks.add(std.testing.allocator, "/repo", "src/app.zig", 2);
+    try marks.add(std.testing.allocator, "/repo", "src/app.zig", 2);
+
+    try std.testing.expectEqual(@as(usize, 1), marks.items.items.len);
+    try std.testing.expect(marks.contains("/repo", "src/app.zig", 2));
+    try std.testing.expect(!marks.contains("/repo", "src/app.zig", 3));
+    try std.testing.expect(!marks.contains("/other", "src/app.zig", 2));
+
+    try std.testing.expect(marks.remove(std.testing.allocator, "/repo", "src/app.zig", 2));
+    try std.testing.expect(!marks.contains("/repo", "src/app.zig", 2));
+    try std.testing.expectEqual(@as(usize, 0), marks.items.items.len);
 }

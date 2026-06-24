@@ -139,7 +139,9 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (matchesShiftedAscii(key, 'h', 'H')) return voidMsg(Msg, "toggle_hide_reviewed_files");
     if (matchesShiftedAscii(key, 'b', 'B')) return voidMsg(Msg, "toggle_sidebar_visibility");
     if (matchesShiftedAscii(key, 'l', 'L')) return voidMsg(Msg, "toggle_line_numbers");
-    if (matchesShiftedAscii(key, 's', 'S')) return voidMsg(Msg, "unstage_selected_file");
+    if (matchesShiftedAscii(key, 's', 'S')) {
+        return if (context.focus == .diff) voidMsg(Msg, "unstage_selected_hunk") else voidMsg(Msg, "unstage_selected_file");
+    }
     if (matchesShiftedAscii(key, 'd', 'D')) return voidMsg(Msg, "request_discard_selected_file");
     if (key.matches('c', .{})) return voidMsg(Msg, "enter_commit_panel");
     if (hasCommandModifier(key)) return null;
@@ -291,6 +293,7 @@ const TestMsg = union(enum) {
     stage_selected_file,
     stage_selected_hunk,
     unstage_selected_file,
+    unstage_selected_hunk,
     request_discard_selected_file,
     confirm_discard_file,
     cancel_discard_file,
@@ -347,9 +350,12 @@ test "keyToMsg maps view option toggles" {
 test "keyToMsg maps stage action by focused pane" {
     try std.testing.expectEqual(TestMsg.stage_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 's' }).?);
     try std.testing.expectEqual(TestMsg.stage_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 's' }).?);
-    try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{}, .{ .codepoint = 'S' }).?);
-    try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{}, shiftedAscii('s', 'S')).?);
-    try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{}, shiftedLowerOnly('s')).?);
+    try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'S' }).?);
+    try std.testing.expectEqual(TestMsg.unstage_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 'S' }).?);
+    try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedAscii('s', 'S')).?);
+    try std.testing.expectEqual(TestMsg.unstage_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, shiftedAscii('s', 'S')).?);
+    try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedLowerOnly('s')).?);
+    try std.testing.expectEqual(TestMsg.unstage_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, shiftedLowerOnly('s')).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'S', .mods = .{ .ctrl = true } }));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'S', .mods = .{ .alt = true } }));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 's', .mods = .{ .shift = true, .ctrl = true } }));
