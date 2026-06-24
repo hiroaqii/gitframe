@@ -1371,7 +1371,7 @@ const help_global_items = [_]HelpItem{
     .{ .key = "r", .description = "reload active repository" },
     .{ .key = "R", .description = "switch repository" },
     .{ .key = "c", .description = "open commit panel" },
-    .{ .key = "s", .description = "stage selected file / directory" },
+    .{ .key = "s", .description = "stage file / directory / hunk" },
     .{ .key = "S", .description = "unstage selected file / directory" },
     .{ .key = "D", .description = "discard selected file changes" },
     .{ .key = "Home/End", .description = "first / last file" },

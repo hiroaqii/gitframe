@@ -10,7 +10,6 @@ pub const ActionKind = enum {
     stage_file,
     unstage_file,
     stage_hunk,
-    unstage_hunk,
     discard_file,
     commit,
     amend,
@@ -85,6 +84,27 @@ pub const UnstageFileFinished = struct {
         self.* = .{
             .pending = .{ .generation = 0, .kind = .unstage_file },
             .path = &.{},
+            .result = .ok,
+        };
+    }
+};
+
+pub const StageHunkFinished = struct {
+    pending: PendingAction,
+    repo_root: []u8,
+    path: []u8,
+    hunk_index: usize,
+    result: FileActionTaskResult,
+
+    pub fn deinit(self: *StageHunkFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.path);
+        self.result.deinit(allocator);
+        self.* = .{
+            .pending = .{ .generation = 0, .kind = .stage_hunk },
+            .repo_root = &.{},
+            .path = &.{},
+            .hunk_index = 0,
             .result = .ok,
         };
     }
@@ -202,6 +222,44 @@ pub fn UnstageFileTask(comptime Msg: type) type {
     };
 }
 
+/// Async task for `git apply --cached -` with a single-hunk patch.
+///
+/// The patch is generated before spawning so the task never re-reads App state
+/// after the user may have moved to another file or repository.
+pub fn StageHunkTask(comptime Msg: type) type {
+    return struct {
+        pending: PendingAction,
+        repo_root: []u8,
+        path: []u8,
+        patch: []u8,
+        hunk_index: usize,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                if (task.path.len > 0) allocator.free(task.path);
+                allocator.free(task.patch);
+                allocator.destroy(task);
+            }
+
+            const result = runStageHunk(task.repo_root, task.patch, allocator, io);
+            const repo_root = task.repo_root;
+            const path = task.path;
+            task.repo_root = &.{};
+            task.path = &.{};
+
+            return @unionInit(Msg, "stage_hunk_finished", StageHunkFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .path = path,
+                .hunk_index = task.hunk_index,
+                .result = result,
+            });
+        }
+    };
+}
+
 /// Async task for `git restore -- <path>`.
 ///
 /// This intentionally discards only unstaged tracked changes. Untracked file
@@ -297,6 +355,25 @@ pub fn runUnstageFile(repo_root: []const u8, path: []const u8, allocator: std.me
         return .{
             .failed = std.fmt.allocPrint(allocator, "Unstage failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Unstage failed: OutOfMemory" },
+        };
+    };
+
+    return switch (raw_result) {
+        .ok => .ok,
+        .failed => |message| .{ .failed = message },
+        .failed_static => |message| .{ .failed_static = message },
+    };
+}
+
+pub fn runStageHunk(repo_root: []const u8, patch: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+    var local_backend: git_backend.LocalCommandBackend = .{};
+    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+        .repo_root = repo_root,
+        .kind = .{ .stage_patch = .{ .patch = patch } },
+    }) catch |err| {
+        return .{
+            .failed = std.fmt.allocPrint(allocator, "Stage hunk failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Stage hunk failed: OutOfMemory" },
         };
     };
 

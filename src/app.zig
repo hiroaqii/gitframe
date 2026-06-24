@@ -14,6 +14,7 @@ const context = @import("context.zig");
 const context_export = @import("context_export.zig");
 const diff_parser = @import("diff/parser.zig");
 const diff_file = @import("diff/file.zig");
+const diff_patch = @import("diff/patch.zig");
 const diff_render = @import("diff/render.zig");
 const diff_search = @import("diff/search.zig");
 const diff_source = @import("diff/source.zig");
@@ -55,6 +56,8 @@ const CommitFinished = app_actions.CommitFinished;
 const CommitTask = app_actions.CommitTask(App.Msg);
 const DiscardFileFinished = app_actions.DiscardFileFinished;
 const DiscardFileTask = app_actions.DiscardFileTask(App.Msg);
+const StageHunkFinished = app_actions.StageHunkFinished;
+const StageHunkTask = app_actions.StageHunkTask(App.Msg);
 const StageFileFinished = app_actions.StageFileFinished;
 const StageFileTask = app_actions.StageFileTask(App.Msg);
 const UnstageFileFinished = app_actions.UnstageFileFinished;
@@ -188,6 +191,7 @@ pub const App = struct {
         status_loaded: StatusLoadFinished,
         review_projection_loaded: ReviewProjectionFinished,
         stage_file_finished: StageFileFinished,
+        stage_hunk_finished: StageHunkFinished,
         unstage_file_finished: UnstageFileFinished,
         discard_file_finished: DiscardFileFinished,
         commit_finished: CommitFinished,
@@ -266,6 +270,7 @@ pub const App = struct {
         toggle_hide_reviewed_files,
         cycle_changed_file_filter,
         stage_selected_file,
+        stage_selected_hunk,
         unstage_selected_file,
         request_discard_selected_file,
         confirm_discard_file,
@@ -327,6 +332,7 @@ pub const App = struct {
             .status_loaded => |finished| try self.finishStatusLoad(ctx, finished),
             .review_projection_loaded => |finished| try self.finishReviewProjectionLoad(ctx, finished),
             .stage_file_finished => |finished| try self.finishStageFile(ctx, finished),
+            .stage_hunk_finished => |finished| try self.finishStageHunk(ctx, finished),
             .unstage_file_finished => |finished| try self.finishUnstageFile(ctx, finished),
             .discard_file_finished => |finished| try self.finishDiscardFile(ctx, finished),
             .commit_finished => |finished| try self.finishCommit(ctx, finished),
@@ -452,6 +458,7 @@ pub const App = struct {
             .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
             .stage_selected_file => try self.stageSelectedFile(ctx),
+            .stage_selected_hunk => try self.stageSelectedHunk(ctx),
             .unstage_selected_file => try self.unstageSelectedFile(ctx),
             .request_discard_selected_file => try self.requestDiscardSelectedFile(ctx.allocator()),
             .confirm_discard_file => try self.confirmDiscardFile(ctx),
@@ -906,6 +913,87 @@ pub const App = struct {
         self.setStatus("staging: {s}", .{target.path});
     }
 
+    fn stageSelectedHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.actions.pending != null) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+        const target = switch (self.selectedHunkStageTarget(ctx.allocator())) {
+            .ready => |target| target,
+            .unavailable_source, .no_repo => {
+                self.setStatus("hunk stage unavailable for this source", .{});
+                return;
+            },
+            .no_file => {
+                self.setStatus("no file selected", .{});
+                return;
+            },
+            .no_path => {
+                self.setStatus("hunk stage unavailable for status-only file", .{});
+                return;
+            },
+            .no_hunk => {
+                self.setStatus("no hunk selected", .{});
+                return;
+            },
+            .stale_status => {
+                self.setStatus("status is still loading", .{});
+                return;
+            },
+            .conflict_unsupported => {
+                self.setStatus("conflict hunk stage is not supported yet", .{});
+                return;
+            },
+            .binary_unsupported => {
+                self.setStatus("binary hunk stage is not supported", .{});
+                return;
+            },
+            .unsupported_file_state => {
+                self.setStatus("hunk stage supports modified files only", .{});
+                return;
+            },
+            .patch_failed => {
+                self.setStatus("could not build hunk patch", .{});
+                return;
+            },
+        };
+
+        var owned_patch = target.patch;
+        errdefer if (owned_patch.len > 0) ctx.allocator().free(owned_patch);
+
+        try self.setPendingSelectionRestore(ctx.allocator(), target.path);
+        errdefer self.clearPendingSelectionRestore(ctx.allocator());
+
+        const pending = self.actions.begin(.stage_hunk);
+        errdefer _ = self.actions.finish(pending);
+
+        const task = try ctx.allocator().create(StageHunkTask);
+        task.* = .{
+            .pending = pending,
+            .repo_root = &.{},
+            .path = &.{},
+            .patch = &.{},
+            .hunk_index = target.hunk_index,
+        };
+        errdefer {
+            if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
+            if (task.path.len > 0) ctx.allocator().free(task.path);
+            if (task.patch.len > 0) ctx.allocator().free(task.patch);
+            ctx.allocator().destroy(task);
+        }
+
+        task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
+        task.path = try ctx.allocator().dupe(u8, target.path);
+        task.patch = owned_patch;
+        owned_patch = &.{};
+
+        ctx.task().spawnWith(task, StageHunkTask.run) catch |err| {
+            self.setStatus("could not start hunk stage task", .{});
+            return err;
+        };
+        self.setStatus("staging hunk: {s}", .{target.path});
+    }
+
     const GitActionTargetKind = enum {
         file,
         directory,
@@ -932,6 +1020,53 @@ pub const App = struct {
         no_repo,
         no_path,
     };
+
+    const HunkStageTarget = struct {
+        repo_root: []const u8,
+        path: []const u8,
+        hunk_index: usize,
+        patch: []u8,
+    };
+
+    const HunkStageTargetResult = union(enum) {
+        ready: HunkStageTarget,
+        unavailable_source,
+        no_repo,
+        no_file,
+        no_path,
+        no_hunk,
+        stale_status,
+        conflict_unsupported,
+        binary_unsupported,
+        unsupported_file_state,
+        patch_failed,
+    };
+
+    fn selectedHunkStageTarget(self: *const App, allocator: std.mem.Allocator) HunkStageTargetResult {
+        if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
+        const repo_root = self.activeRepoRoot() orelse return .no_repo;
+        const file = self.selectedFile() orelse return .no_file;
+        const path = diff_file.canonicalPathKey(file) orelse return .no_path;
+        if (file.hunks.len == 0 or self.viewer.selected_hunk >= file.hunks.len) return .no_hunk;
+        const entry = self.freshStatusEntryForPathKey(repo_root, path) orelse return .stale_status;
+        if (entry.isConflict()) return .conflict_unsupported;
+        if (file.is_binary) return .binary_unsupported;
+        if (diff_file.status(file) != .modified or diff_file.hasModeChange(file)) return .unsupported_file_state;
+
+        const patch = diff_patch.formatSingleHunkPatch(allocator, file, self.viewer.selected_hunk) catch |err| switch (err) {
+            error.BinaryFile => return .binary_unsupported,
+            error.UnsupportedFileState => return .unsupported_file_state,
+            error.NoPath => return .no_path,
+            error.InvalidHunk => return .no_hunk,
+            error.OutOfMemory => return .patch_failed,
+        };
+        return .{ .ready = .{
+            .repo_root = repo_root,
+            .path = path,
+            .hunk_index = self.viewer.selected_hunk,
+            .patch = patch,
+        } };
+    }
 
     fn selectedStageTarget(self: *const App) StageTargetResult {
         if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
@@ -1270,6 +1405,34 @@ pub const App = struct {
             .failed_static => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("stage failed: {s}", .{message});
+            },
+        }
+    }
+
+    fn finishStageHunk(self: *App, ctx: *chasen.Ctx(Msg), finished: StageHunkFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (!self.actions.finish(result.pending)) return;
+
+        switch (result.result) {
+            .ok => {
+                const active_root = self.activeRepoRoot();
+                const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+                self.setStatus("staged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
+                if (active_matches) {
+                    try self.reloadAfterGitAction(ctx);
+                } else {
+                    self.clearPendingSelectionRestore(ctx.allocator());
+                }
+            },
+            .failed => |message| {
+                self.clearPendingSelectionRestore(ctx.allocator());
+                self.setStatus("hunk stage failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+            },
+            .failed_static => |message| {
+                self.clearPendingSelectionRestore(ctx.allocator());
+                self.setStatus("hunk stage failed: {s}", .{message});
             },
         }
     }

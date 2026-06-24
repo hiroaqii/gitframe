@@ -155,7 +155,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         'v' => voidMsg(Msg, "toggle_reviewed_file"),
         '[' => voidMsg(Msg, "decrease_sidebar_width"),
         ']' => voidMsg(Msg, "increase_sidebar_width"),
-        's' => voidMsg(Msg, "stage_selected_file"),
+        's' => if (context.focus == .diff) voidMsg(Msg, "stage_selected_hunk") else voidMsg(Msg, "stage_selected_file"),
         'e' => voidMsg(Msg, "open_selected_file_in_editor"),
         'u' => voidMsg(Msg, "toggle_display_mode"),
         'q' => voidMsg(Msg, "quit"),
@@ -289,6 +289,7 @@ const TestMsg = union(enum) {
     increase_sidebar_width,
     enter_commit_panel,
     stage_selected_file,
+    stage_selected_hunk,
     unstage_selected_file,
     request_discard_selected_file,
     confirm_discard_file,
@@ -343,8 +344,9 @@ test "keyToMsg maps view option toggles" {
     try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, shiftedAscii('l', 'L')).?);
 }
 
-test "keyToMsg maps stage file action" {
-    try std.testing.expectEqual(TestMsg.stage_selected_file, keyToMsg(TestMsg, .{}, .{ .codepoint = 's' }).?);
+test "keyToMsg maps stage action by focused pane" {
+    try std.testing.expectEqual(TestMsg.stage_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 's' }).?);
+    try std.testing.expectEqual(TestMsg.stage_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 's' }).?);
     try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{}, .{ .codepoint = 'S' }).?);
     try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{}, shiftedAscii('s', 'S')).?);
     try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{}, shiftedLowerOnly('s')).?);

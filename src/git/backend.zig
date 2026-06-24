@@ -101,7 +101,12 @@ pub const OperationKind = union(enum) {
     stage_file: []const u8,
     unstage_file: []const u8,
     discard_file: []const u8,
+    stage_patch: StagePatchRequest,
     commit: CommitRequest,
+};
+
+pub const StagePatchRequest = struct {
+    patch: []const u8,
 };
 
 pub const CommitRequest = struct {
@@ -174,6 +179,7 @@ pub const LocalCommandBackend = struct {
             .stage_file => |path| runGitAdd(allocator, io, request.repo_root, path),
             .unstage_file => |path| runGitUnstage(allocator, io, request.repo_root, path),
             .discard_file => |path| runGitDiscard(allocator, io, request.repo_root, path),
+            .stage_patch => |patch| runGitApplyCached(allocator, io, request.repo_root, patch.patch),
             .commit => |commit| runGitCommit(allocator, io, request.repo_root, commit),
         };
     }
@@ -359,6 +365,35 @@ fn runGitDiscard(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8
     return .{ .failed = std.fmt.allocPrint(allocator, "git restore failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
+fn runGitApplyCached(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, patch: []const u8) LoadError!OperationResult {
+    const argv = [_][]const u8{ "git", "apply", "--cached", "--whitespace=nowarn", "-" };
+    const result = runWithStdin(allocator, io, .{
+        .argv = &argv,
+        .cwd = .{ .path = repo_root },
+        .stdin = patch,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.StreamTooLong,
+        else => error.SpawnFailed,
+    };
+
+    allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .ok;
+        },
+        else => {},
+    }
+
+    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    allocator.free(result.stderr);
+
+    return .{ .failed = std.fmt.allocPrint(allocator, "git apply --cached failed: {any}", .{result.term}) catch return error.OutOfMemory };
+}
+
 fn runGitCommit(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest) LoadError!OperationResult {
     const argv_subject = [_][]const u8{ "git", "commit", "-m", request.subject };
     const argv_with_body = [_][]const u8{ "git", "commit", "-m", request.subject, "-m", request.body orelse "" };
@@ -388,6 +423,72 @@ fn runGitCommit(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8,
     allocator.free(result.stderr);
 
     return .{ .failed = std.fmt.allocPrint(allocator, "git commit failed: {any}", .{result.term}) catch return error.OutOfMemory };
+}
+
+const RunWithStdinError = error{
+    StreamTooLong,
+    WriteFailed,
+} || std.process.SpawnError || std.process.Child.WaitError || std.Io.File.MultiReader.UnendingError || std.Io.Timeout.Error || std.Io.File.Writer.Error;
+
+const RunWithStdinOptions = struct {
+    argv: []const []const u8,
+    cwd: std.process.Child.Cwd = .inherit,
+    stdin: []const u8,
+    stdout_limit: std.Io.Limit = .unlimited,
+    stderr_limit: std.Io.Limit = .unlimited,
+};
+
+const RunWithStdinResult = struct {
+    term: std.process.Child.Term,
+    stdout: []u8,
+    stderr: []u8,
+};
+
+fn runWithStdin(allocator: std.mem.Allocator, io: std.Io, options: RunWithStdinOptions) RunWithStdinError!RunWithStdinResult {
+    var child = try std.process.spawn(io, .{
+        .argv = options.argv,
+        .cwd = options.cwd,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    var child_waited = false;
+    defer if (!child_waited) child.kill(io);
+
+    var write_buffer: [4096]u8 = undefined;
+    var stdin_writer = child.stdin.?.writerStreaming(io, &write_buffer);
+    try stdin_writer.interface.writeAll(options.stdin);
+    try stdin_writer.interface.flush();
+    child.stdin.?.close(io);
+    child.stdin = null;
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+    while (multi_reader.fill(64, .none)) |_| {
+        if (options.stdout_limit.toInt()) |limit| {
+            if (stdout_reader.buffered().len > limit) return error.StreamTooLong;
+        }
+        if (options.stderr_limit.toInt()) |limit| {
+            if (stderr_reader.buffered().len > limit) return error.StreamTooLong;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+
+    try multi_reader.checkAnyError();
+
+    const term = try child.wait(io);
+    child_waited = true;
+    const stdout = try multi_reader.toOwnedSlice(0);
+    errdefer allocator.free(stdout);
+    const stderr = try multi_reader.toOwnedSlice(1);
+    return .{ .term = term, .stdout = stdout, .stderr = stderr };
 }
 
 fn loadNoIndexDiff(allocator: std.mem.Allocator, io: std.Io, paths: PathPair) LoadError!LoadResult {
@@ -470,6 +571,12 @@ test "Backend exposes operation interface" {
     };
     try std.testing.expectEqualStrings("subject", commit_request.kind.commit.subject);
     try std.testing.expectEqualStrings("body", commit_request.kind.commit.body.?);
+
+    const patch_request: OperationRequest = .{
+        .repo_root = "/repo",
+        .kind = .{ .stage_patch = .{ .patch = "diff --git a/a b/a\n" } },
+    };
+    try std.testing.expectEqualStrings("diff --git a/a b/a\n", patch_request.kind.stage_patch.patch);
 }
 
 test "GitDiffRequest cannot represent raw input sources" {
