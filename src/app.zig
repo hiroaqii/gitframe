@@ -222,6 +222,8 @@ pub const App = struct {
     git_status: git_status.GitStatusState = .{},
     status_load_generation: u64 = 0,
     status_load_pending: ?u64 = null,
+    /// One-shot startup selection intent used when diff finishes before status.
+    pending_initial_first_visible_selection: bool = false,
     tree_order: file_tree.StableOrder = .{},
     tree_order_scope: ?[]u8 = null,
     pending_selection_restore: ?app_state.PendingSelectionRestore = null,
@@ -825,6 +827,7 @@ pub const App = struct {
     fn invalidateStatusSnapshot(self: *App) void {
         self.status_load_generation +%= 1;
         self.status_load_pending = null;
+        self.pending_initial_first_visible_selection = false;
         self.git_status.clear();
     }
 
@@ -2050,6 +2053,10 @@ pub const App = struct {
         _ = self.load.finishPending(.{ .diff_load = finished.generation });
         if (!self.load.isCurrent(finished.generation)) return;
 
+        // Capture this before clearLoadedDiff(): the previous loaded session is
+        // what distinguishes first load from reload/restore paths.
+        const had_loaded_before = self.activeLoadedDiffConst() != null;
+        const had_pending_restore = self.pending_selection_restore != null;
         self.clearLoadedDiff();
 
         switch (result) {
@@ -2079,7 +2086,11 @@ pub const App = struct {
                 });
 
                 const active_loaded = self.activeLoadedDiff().?;
-                self.syncSidebarNodeToSelectedFile(active_loaded);
+                if (!had_loaded_before and !had_pending_restore) {
+                    self.selectFirstVisibleFile(active_loaded);
+                } else {
+                    self.syncSidebarNodeToSelectedFile(active_loaded);
+                }
                 self.clampSelection(active_loaded.document.files.len);
                 if (self.review_display.hide_reviewed_files) {
                     self.reconcileSelectionAfterVisibleNodeChange(active_loaded);
@@ -2101,7 +2112,11 @@ pub const App = struct {
         // Diff and status loads run independently. Re-apply the status overlay
         // here so the final sidebar does not depend on which task finished
         // first.
-        if (can_project_status) try self.applyStatusProjection(ctx.allocator());
+        const prefer_first_visible_file = !had_loaded_before and !had_pending_restore;
+        if (prefer_first_visible_file and self.status_load_pending != null) {
+            self.pending_initial_first_visible_selection = true;
+        }
+        if (can_project_status) try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
     }
 
     fn finishStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: StatusLoadFinished) !void {
@@ -2114,20 +2129,26 @@ pub const App = struct {
         switch (result.result) {
             .empty => {
                 self.git_status.clear();
-                try self.applyStatusProjection(ctx.allocator());
+                const prefer_first_visible_file = self.pending_initial_first_visible_selection;
+                self.pending_initial_first_visible_selection = false;
+                try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
             },
             .loaded => |*bundle| {
                 try self.git_status.replace(result.repo_root, bundle);
                 result.result = .empty;
-                try self.applyStatusProjection(ctx.allocator());
+                const prefer_first_visible_file = self.pending_initial_first_visible_selection;
+                self.pending_initial_first_visible_selection = false;
+                try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
             },
             .failed => |message| {
                 self.git_status.clear();
+                self.pending_initial_first_visible_selection = false;
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
             },
             .failed_static => |message| {
                 self.git_status.clear();
+                self.pending_initial_first_visible_selection = false;
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{message});
             },
@@ -2195,7 +2216,7 @@ pub const App = struct {
         }
     }
 
-    fn applyStatusProjection(self: *App, allocator: std.mem.Allocator) !void {
+    fn applyStatusProjection(self: *App, allocator: std.mem.Allocator, prefer_first_visible_file: bool) !void {
         if (!diff_source.sourceAllowsStageProjection(self.config.source)) return;
 
         const status_document = self.git_status.document;
@@ -2210,7 +2231,7 @@ pub const App = struct {
         }
 
         if (self.activeLoadedDiff()) |loaded| {
-            try self.rebuildLoadedTreeWithStatus(allocator, loaded);
+            try self.rebuildLoadedTreeWithStatus(allocator, loaded, prefer_first_visible_file);
             return;
         }
 
@@ -2224,7 +2245,7 @@ pub const App = struct {
         }
     }
 
-    fn rebuildLoadedTreeWithStatus(self: *App, app_allocator: std.mem.Allocator, loaded: *LoadedDiff) !void {
+    fn rebuildLoadedTreeWithStatus(self: *App, app_allocator: std.mem.Allocator, loaded: *LoadedDiff, prefer_first_visible_file: bool) !void {
         const allocator = self.loadArenaAllocator() orelse return;
         try self.ensureTreeOrderScope(app_allocator);
         loaded.tree = try file_tree.buildWithStatusStable(allocator, loaded.document, self.git_status.document, self.stableOrderOptions(app_allocator));
@@ -2233,7 +2254,9 @@ pub const App = struct {
         // In that case this projection is over the old diff, so keep the
         // pending path restore for the incoming loaded diff.
         if (self.pending_selection_restore != null and self.load.hasPending()) return;
-        if (!self.restorePendingSelectionOrFallback(app_allocator, loaded)) {
+        if (prefer_first_visible_file) {
+            self.selectFirstVisibleFile(loaded);
+        } else if (!self.restorePendingSelectionOrFallback(app_allocator, loaded)) {
             self.reconcileSelectionAfterVisibleNodeChange(loaded);
         }
     }
@@ -3857,6 +3880,15 @@ pub const App = struct {
         self.viewer.selected_node = loaded.tree.selectedNodeIndex(file_index) orelse 0;
     }
 
+    fn selectFirstVisibleFile(self: *App, loaded: *LoadedDiff) void {
+        if (loaded.firstVisibleFileNode()) |node_index| {
+            self.selectSidebarNode(loaded, node_index);
+            return;
+        }
+        // Empty or fully filtered trees keep the existing fallback selection.
+        self.syncSidebarNodeToSelectedFile(loaded);
+    }
+
     fn materializeReviewedFiles(self: *App, allocator: std.mem.Allocator, loaded: *LoadedDiff) !void {
         const reviewed_files = try allocator.alloc(bool, loaded.document.files.len);
         errdefer allocator.free(reviewed_files);
@@ -4710,7 +4742,7 @@ test "sidebar navigation keeps status-only target through clamp" {
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/status-only.zig\x00");
     try app.git_status.replace("/repo", &status_bundle);
-    try app.applyStatusProjection(std.testing.allocator);
+    try app.applyStatusProjection(std.testing.allocator, false);
 
     const loaded = app.loadedDiff().?;
     const status_node = blk: {
@@ -4779,13 +4811,13 @@ test "pending selection restore waits for status projection after stage" {
 
     // Diff reload can finish before the status reload. In that intermediate
     // tree the staged file is absent, so do not consume the pending restore yet.
-    try app.applyStatusProjection(std.testing.allocator);
+    try app.applyStatusProjection(std.testing.allocator, false);
     try std.testing.expect(app.pending_selection_restore != null);
 
     app.status_load_pending = null;
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
     try app.git_status.replace("/repo", &status_bundle);
-    try app.applyStatusProjection(std.testing.allocator);
+    try app.applyStatusProjection(std.testing.allocator, false);
 
     try std.testing.expect(app.pending_selection_restore == null);
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target.?);
@@ -4835,7 +4867,7 @@ test "pending selection restore survives status projection while diff reload is 
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
     try app.git_status.replace("/repo", &status_bundle);
-    try app.applyStatusProjection(std.testing.allocator);
+    try app.applyStatusProjection(std.testing.allocator, false);
 
     try std.testing.expect(app.pending_selection_restore != null);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.viewer.selected_target.?);
@@ -6653,6 +6685,102 @@ test "finishDiffLoad takes current loaded bundle ownership" {
     try std.testing.expectEqual(@as(usize, 1), app.load.state.loaded.loaded.document.files.len);
 }
 
+test "finishDiffLoad initially selects first visible file node" {
+    var app: App = .{ .load = .{ .generation = 1 } };
+    defer app.clearLoadedDiff();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    const bundle = app_load.LoadedDiffBundle{
+        .arena = .init(std.testing.allocator),
+        .loaded = testLoadedDiffFileOneFirst(),
+    };
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 1,
+        .result = .{ .loaded = bundle },
+    });
+
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
+}
+
+test "finishDiffLoad initially selects first visible file after status projection" {
+    var app: App = .{ .load = .{ .generation = 1 } };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    const bundle = app_load.LoadedDiffBundle{
+        .arena = .init(std.testing.allocator),
+        .loaded = testLoadedDiffFileOneFirst(),
+    };
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 1,
+        .result = .{ .loaded = bundle },
+    });
+
+    const loaded = app.activeLoadedDiffConst().?;
+    const first_node_index = loaded.firstVisibleFileNode() orelse return error.ExpectedVisibleFileNode;
+    const first_node = loaded.tree.nodes[first_node_index];
+    const expected_target: context.SelectedTarget = switch (first_node.target) {
+        .diff_file => |file_index| .{ .diff_file = file_index },
+        .status_entry => |status_index| .{ .status_only = status_index },
+        .directory => return error.ExpectedVisibleFileNode,
+    };
+
+    try std.testing.expectEqual(first_node_index, app.viewer.selected_node);
+    try std.testing.expectEqual(expected_target, app.viewer.selected_target.?);
+}
+
+test "finishDiffLoad keeps initial visible selection intent for later status projection" {
+    var app: App = .{
+        .load = .{ .generation = 1 },
+        .status_load_generation = 7,
+        .status_load_pending = 7,
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    const bundle = app_load.LoadedDiffBundle{
+        .arena = .init(std.testing.allocator),
+        .loaded = testLoadedDiffFileOneFirst(),
+    };
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 1,
+        .result = .{ .loaded = bundle },
+    });
+
+    try std.testing.expect(app.pending_initial_first_visible_selection);
+
+    const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 7,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = status_bundle },
+    });
+
+    try std.testing.expect(!app.pending_initial_first_visible_selection);
+
+    const loaded = app.activeLoadedDiffConst().?;
+    const first_node_index = loaded.firstVisibleFileNode() orelse return error.ExpectedVisibleFileNode;
+    const first_node = loaded.tree.nodes[first_node_index];
+    const expected_target: context.SelectedTarget = switch (first_node.target) {
+        .diff_file => |file_index| .{ .diff_file = file_index },
+        .status_entry => |status_index| .{ .status_only = status_index },
+        .directory => return error.ExpectedVisibleFileNode,
+    };
+
+    try std.testing.expectEqual(first_node_index, app.viewer.selected_node);
+    try std.testing.expectEqual(expected_target, app.viewer.selected_target.?);
+}
+
 test "finishDiffLoad frees stale loaded bundle" {
     var app: App = .{ .load = .{ .generation = 2 } };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -6876,6 +7004,17 @@ fn testLoadedDiffTwoWithStatuses() LoadedDiff {
     };
 }
 
+fn testLoadedDiffFileOneFirst() LoadedDiff {
+    return .{
+        .text = "",
+        .document = .{ .files = &test_files_two },
+        .tree = .{ .nodes = &test_tree_file_one_first_nodes },
+        .collapsed_dirs = .{},
+        .bytes = 0,
+        .lines = 0,
+    };
+}
+
 fn testLoadedDiffWide() LoadedDiff {
     return .{
         .text = "",
@@ -6917,6 +7056,11 @@ const test_tree_one_nodes = [_]file_tree.Node{
 const test_tree_two_nodes = [_]file_tree.Node{
     .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
     .{ .kind = .file, .name = "b", .path = "b", .depth = 0, .target = .{ .diff_file = 1 } },
+};
+
+const test_tree_file_one_first_nodes = [_]file_tree.Node{
+    .{ .kind = .file, .name = "b", .path = "b", .depth = 0, .target = .{ .diff_file = 1 } },
+    .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
 };
 
 const test_tree_nested_nodes = [_]file_tree.Node{
