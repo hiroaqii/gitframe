@@ -2433,12 +2433,15 @@ pub const App = struct {
     }
 
     fn scrollDiff(self: *App, delta: i2) void {
+        const old_scroll = self.viewer.diff_scroll;
+        const old_cursor_offset = self.selectedDiffCursorOffset();
         if (delta < 0) {
             self.viewer.diff_scroll -|= 1;
         } else {
             self.viewer.diff_scroll += 1;
         }
         self.clampDiffNavigation();
+        self.syncDiffCursorAfterViewportScroll(delta, old_scroll, old_cursor_offset);
     }
 
     fn scrollDiffHorizontal(self: *App, delta: i2) void {
@@ -3729,6 +3732,30 @@ pub const App = struct {
         self.clampDiffNavigation();
     }
 
+    fn syncDiffCursorAfterViewportScroll(self: *App, delta: i2, old_scroll: usize, old_cursor_offset: ?usize) void {
+        const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
+        if (line_count == 0) return;
+        const visible_rows = self.diffVisibleRows();
+        if (visible_rows == 0) return;
+
+        // Mouse-wheel scrolling is viewport-first, but hunk actions still use
+        // the diff cursor. Keep the cursor near the user's visible scroll
+        // position without letting normal scrolloff pull the viewport back.
+        const margin = @min(@as(usize, 8), visible_rows / 3);
+        const target = if (old_cursor_offset) |offset| blk: {
+            if (offset >= old_scroll and offset < old_scroll + visible_rows) {
+                break :blk self.viewer.diff_scroll + (offset - old_scroll);
+            }
+            if (delta < 0) break :blk self.viewer.diff_scroll + margin;
+            break :blk self.viewer.diff_scroll + visible_rows - 1 -| margin;
+        } else blk: {
+            if (delta < 0) break :blk self.viewer.diff_scroll + margin;
+            break :blk self.viewer.diff_scroll + visible_rows - 1 -| margin;
+        };
+
+        self.viewer.diff_cursor = self.selectedCoordinateAtOffset(@min(target, line_count - 1)) orelse self.viewer.diff_cursor;
+    }
+
     fn loadedFileCount(self: *const App) ?usize {
         const loaded = self.activeLoadedDiffConst() orelse return null;
         return loaded.document.files.len;
@@ -4282,6 +4309,130 @@ test "display mode toggle brings cursor back into view after wheel scroll" {
     try app.update(.toggle_display_mode, undefined);
 
     try std.testing.expect(app.visibleDiffCursorOffset() != null);
+}
+
+test "mouse diff scroll keeps cursor in the viewport" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 8 },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+            .diff_scroll = 12,
+            .diff_cursor = .{ .hunk_header = 0 },
+        },
+    };
+
+    try std.testing.expect(app.visibleDiffCursorOffset() == null);
+
+    app.scrollDiff(1);
+
+    try std.testing.expect(app.visibleDiffCursorOffset() != null);
+}
+
+test "diff scroll keeps visible cursor screen position stable" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 8 },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+            .diff_scroll = 3,
+        },
+    };
+    const old_scroll = app.viewer.diff_scroll;
+    const old_offset = old_scroll + 1;
+    app.viewer.diff_cursor = app.selectedCoordinateAtOffset(old_offset) orelse return error.ExpectedCoordinate;
+
+    app.scrollDiff(1);
+
+    const new_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
+    try std.testing.expectEqual(old_offset - old_scroll, new_offset - app.viewer.diff_scroll);
+}
+
+test "diff scroll syncs invisible cursor to scrolloff margin" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 8 },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+        },
+    };
+    const line_count = app.selectedFileLineIndex(app.effectiveDisplayMode()).lineCount();
+    const visible_rows = app.diffVisibleRows();
+    const margin = @min(@as(usize, 8), visible_rows / 3);
+
+    app.viewer.diff_scroll = 0;
+    app.viewer.diff_cursor = app.selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
+    app.scrollDiff(-1);
+    try std.testing.expectEqual(app.viewer.diff_scroll + margin, app.selectedDiffCursorOffset().?);
+
+    app.viewer.diff_scroll = line_count - visible_rows;
+    app.viewer.diff_cursor = app.selectedCoordinateAtOffset(0) orelse return error.ExpectedCoordinate;
+    app.scrollDiff(1);
+    try std.testing.expectEqual(app.viewer.diff_scroll + visible_rows - 1 -| margin, app.selectedDiffCursorOffset().?);
+}
+
+test "diff row movement continues from wheel-synced visible cursor" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 8 },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+        },
+    };
+    const line_count = app.selectedFileLineIndex(app.effectiveDisplayMode()).lineCount();
+    app.viewer.diff_scroll = 0;
+    app.viewer.diff_cursor = app.selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
+
+    app.scrollDiff(-1);
+    const synced_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
+    app.moveDiffCursorRows(1);
+
+    try std.testing.expectEqual(synced_offset + 1, app.selectedDiffCursorOffset().?);
+}
+
+test "mouse wheel routes through diff scroll cursor sync" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 8 },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+            .focus = .sidebar,
+            .diff_scroll = 12,
+            .diff_cursor = .{ .hunk_header = 0 },
+        },
+    };
+
+    try app.update(.mouse_diff_wheel_down, undefined);
+
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expect(app.visibleDiffCursorOffset() != null);
+}
+
+test "diff scroll cursor sync keeps search state" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 8 },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+            .diff_scroll = 12,
+            .diff_cursor = .{ .hunk_header = 0 },
+        },
+    };
+    setDiffSearchQuery(&app, "late new");
+    app.submitSearch();
+    const old_match = app.search.match orelse return error.ExpectedSearchMatch;
+    const old_match_offset = app.search.match_offset;
+
+    app.scrollDiff(1);
+
+    try std.testing.expect(std.meta.eql(old_match, app.search.match.?));
+    try std.testing.expectEqual(old_match_offset, app.search.match_offset);
 }
 
 test "display mode scroll remap preserves hunk-local ratio" {
