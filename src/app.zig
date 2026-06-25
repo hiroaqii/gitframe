@@ -14,6 +14,7 @@ const context = @import("context.zig");
 const context_export = @import("context_export.zig");
 const diff_parser = @import("diff/parser.zig");
 const diff_file = @import("diff/file.zig");
+const diff_hunk_projection = @import("diff/hunk_projection.zig");
 const diff_patch = @import("diff/patch.zig");
 const diff_render = @import("diff/render.zig");
 const diff_search = @import("diff/search.zig");
@@ -73,6 +74,49 @@ const MousePane = enum {
 const MousePoint = struct {
     col: u16,
     row: u16,
+};
+
+pub const ActiveDiffDisplay = union(enum) {
+    loaded: struct {
+        file: diff_parser.FileDiff,
+        line_index: ?diff_view_model.RenderedLineIndex,
+        folded_hunks: []const bool,
+        staged_flags: []const bool,
+    },
+    combined_projection: struct {
+        file: diff_parser.FileDiff,
+        line_index: diff_view_model.RenderedLineIndex,
+        staged_flags: []const bool,
+        hunk_states: []const diff_hunk_projection.ProjectedHunkState,
+    },
+
+    pub fn file(self: ActiveDiffDisplay) diff_parser.FileDiff {
+        return switch (self) {
+            .loaded => |loaded| loaded.file,
+            .combined_projection => |projection| projection.file,
+        };
+    }
+
+    pub fn lineIndex(self: ActiveDiffDisplay) ?diff_view_model.RenderedLineIndex {
+        return switch (self) {
+            .loaded => |loaded| loaded.line_index,
+            .combined_projection => |projection| projection.line_index,
+        };
+    }
+
+    pub fn foldedHunks(self: ActiveDiffDisplay) []const bool {
+        return switch (self) {
+            .loaded => |loaded| loaded.folded_hunks,
+            .combined_projection => &.{},
+        };
+    }
+
+    pub fn stagedFlags(self: ActiveDiffDisplay) []const bool {
+        return switch (self) {
+            .loaded => |loaded| loaded.staged_flags,
+            .combined_projection => |projection| projection.staged_flags,
+        };
+    }
 };
 
 const RepoPickerItemSource = union(enum) {
@@ -796,6 +840,7 @@ pub const App = struct {
             target.repo_root,
             target.path_key,
             target.kind,
+            target.source_kind,
             self.load.generation,
             self.status_load_generation,
         )) return;
@@ -808,6 +853,7 @@ pub const App = struct {
             target.repo_root,
             target.path_key,
             target.kind,
+            target.source_kind,
             self.load.generation,
             self.status_load_generation,
         );
@@ -819,6 +865,7 @@ pub const App = struct {
             target.repo_root,
             target.path_key,
             target.kind,
+            target.source_kind,
             self.load.generation,
             self.status_load_generation,
         );
@@ -843,22 +890,63 @@ pub const App = struct {
         repo_root: []const u8,
         path_key: []const u8,
         kind: app_review_projection.Kind,
+        source_kind: app_review_projection.SourceKind,
     };
 
     fn reviewProjectionTarget(self: *const App) ?ProjectionTarget {
-        const entry = self.selectedStatusEntry() orelse return null;
         const repo_root = self.activeRepoRoot() orelse return null;
+        const source_kind = reviewProjectionSourceKind(self.config.source);
+
+        if (self.selectedFile()) |file| {
+            const path_key = diff_file.canonicalPathKey(file) orelse return null;
+            const entry = self.freshStatusEntryForPathKey(repo_root, path_key) orelse return null;
+            if (sourceIsUnstaged(self.config.source) and isCombinedHunkProjectionCandidate(file, entry)) {
+                return .{
+                    .repo_root = repo_root,
+                    .path_key = path_key,
+                    .kind = .combined_hunks,
+                    .source_kind = source_kind,
+                };
+            }
+        }
+
+        const entry = self.selectedStatusEntry() orelse return null;
         const path_key = entry.canonicalPathKey() orelse return null;
 
         return switch (file_tree.stagePresenceFromEntry(entry)) {
-            .staged_only => .{ .repo_root = repo_root, .path_key = path_key, .kind = .cached_diff },
+            .staged_only => .{ .repo_root = repo_root, .path_key = path_key, .kind = .cached_diff, .source_kind = source_kind },
             // Mixed files normally have an unstaged diff in the parsed document.
             // This projection is only for the status-only edge case where the
             // current source has no diff body but status still reports the path.
-            .mixed => .{ .repo_root = repo_root, .path_key = path_key, .kind = .cached_diff },
-            .untracked => .{ .repo_root = repo_root, .path_key = path_key, .kind = .generated_added_file },
+            .mixed => .{ .repo_root = repo_root, .path_key = path_key, .kind = .cached_diff, .source_kind = source_kind },
+            .untracked => .{ .repo_root = repo_root, .path_key = path_key, .kind = .generated_added_file, .source_kind = source_kind },
             else => null,
         };
+    }
+
+    fn reviewProjectionSourceKind(source: diff_source.SourceMode) app_review_projection.SourceKind {
+        return switch (source) {
+            .unstaged => .unstaged,
+            .cached => .cached,
+            .stdin, .pager, .patch_file, .range, .no_index => .other,
+        };
+    }
+
+    fn sourceIsUnstaged(source: diff_source.SourceMode) bool {
+        return switch (source) {
+            .unstaged => true,
+            .cached, .stdin, .pager, .patch_file, .range, .no_index => false,
+        };
+    }
+
+    fn isCombinedHunkProjectionCandidate(file: diff_parser.FileDiff, entry: git_status.StatusEntry) bool {
+        if (file.is_binary) return false;
+        if (file.hunks.len == 0) return false;
+        if (entry.index != .modified or entry.worktree != .modified) return false;
+        if (entry.isConflict()) return false;
+        if (diff_file.status(file) != .modified) return false;
+        if (diff_file.hasModeChange(file)) return false;
+        return file_tree.stagePresenceFromEntry(entry) == .mixed;
     }
 
     fn stageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -988,6 +1076,7 @@ pub const App = struct {
             .path = &.{},
             .patch = &.{},
             .hunk_index = target.hunk_index,
+            .mark_source = target.mark_source,
         };
         errdefer {
             if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
@@ -1066,6 +1155,7 @@ pub const App = struct {
             .path = &.{},
             .patch = &.{},
             .hunk_index = target.hunk_index,
+            .mark_source = target.mark_source,
         };
         errdefer {
             if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
@@ -1118,6 +1208,7 @@ pub const App = struct {
         path: []const u8,
         hunk_index: usize,
         patch: []u8,
+        mark_source: app_actions.HunkMarkSource = .session,
     };
 
     const HunkStageTargetResult = union(enum) {
@@ -1155,6 +1246,9 @@ pub const App = struct {
     fn selectedHunkStageTarget(self: *const App, allocator: std.mem.Allocator) HunkStageTargetResult {
         if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
+        if (self.activeCombinedProjection()) |bundle| {
+            return self.selectedProjectedHunkStageTarget(allocator, repo_root, bundle);
+        }
         const file = self.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
         if (!self.diffCursorIsVisible()) return .offscreen_cursor;
@@ -1184,6 +1278,9 @@ pub const App = struct {
     fn selectedHunkUnstageTarget(self: *const App, allocator: std.mem.Allocator) HunkUnstageTargetResult {
         if (!diff_source.sourceAllowsUnstageAction(self.config.source)) return .unavailable_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
+        if (self.activeCombinedProjection()) |bundle| {
+            return self.selectedProjectedHunkUnstageTarget(allocator, repo_root, bundle);
+        }
         const file = self.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
         if (!self.diffCursorIsVisible()) return .offscreen_cursor;
@@ -1209,6 +1306,78 @@ pub const App = struct {
             .path = path,
             .hunk_index = hunk_index,
             .patch = patch,
+        } };
+    }
+
+    fn selectedProjectedHunkStageTarget(
+        self: *const App,
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        bundle: *const app_review_projection.CombinedHunkBundle,
+    ) HunkStageTargetResult {
+        const path = diff_file.canonicalPathKey(bundle.projection.file) orelse return .no_path;
+        if (!self.diffCursorIsVisible()) return .offscreen_cursor;
+        const projected_index = self.selectedHunkIndex() orelse return .no_hunk;
+        if (projected_index >= bundle.projection.hunk_states.len) return .no_hunk;
+        const state = bundle.projection.hunk_states[projected_index];
+        const origin_index = switch (state.origin) {
+            .unstaged => |index| index,
+            .cached => return .already_staged_hunk,
+        };
+        const file = if (bundle.unstaged_bundle.loaded.document.files.len > 0)
+            bundle.unstaged_bundle.loaded.document.files[0]
+        else
+            return .no_file;
+        if (origin_index >= file.hunks.len) return .no_hunk;
+        const patch = diff_patch.formatSingleHunkPatch(allocator, file, origin_index) catch |err| switch (err) {
+            error.BinaryFile => return .binary_unsupported,
+            error.UnsupportedFileState => return .unsupported_file_state,
+            error.NoPath => return .no_path,
+            error.InvalidHunk => return .no_hunk,
+            error.OutOfMemory => return .patch_failed,
+        };
+        return .{ .ready = .{
+            .repo_root = repo_root,
+            .path = path,
+            .hunk_index = projected_index,
+            .patch = patch,
+            .mark_source = .projection,
+        } };
+    }
+
+    fn selectedProjectedHunkUnstageTarget(
+        self: *const App,
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        bundle: *const app_review_projection.CombinedHunkBundle,
+    ) HunkUnstageTargetResult {
+        const path = diff_file.canonicalPathKey(bundle.projection.file) orelse return .no_path;
+        if (!self.diffCursorIsVisible()) return .offscreen_cursor;
+        const projected_index = self.selectedHunkIndex() orelse return .no_hunk;
+        if (projected_index >= bundle.projection.hunk_states.len) return .no_hunk;
+        const state = bundle.projection.hunk_states[projected_index];
+        const origin_index = switch (state.origin) {
+            .cached => |index| index,
+            .unstaged => return .not_staged_hunk,
+        };
+        const file = if (bundle.cached_bundle.loaded.document.files.len > 0)
+            bundle.cached_bundle.loaded.document.files[0]
+        else
+            return .no_file;
+        if (origin_index >= file.hunks.len) return .no_hunk;
+        const patch = diff_patch.formatSingleHunkPatch(allocator, file, origin_index) catch |err| switch (err) {
+            error.BinaryFile => return .binary_unsupported,
+            error.UnsupportedFileState => return .unsupported_file_state,
+            error.NoPath => return .no_path,
+            error.InvalidHunk => return .no_hunk,
+            error.OutOfMemory => return .patch_failed,
+        };
+        return .{ .ready = .{
+            .repo_root = repo_root,
+            .path = path,
+            .hunk_index = projected_index,
+            .patch = patch,
+            .mark_source = .projection,
         } };
     }
 
@@ -1565,7 +1734,9 @@ pub const App = struct {
                 const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
                 self.setStatus("staged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
                 if (active_matches) {
-                    try self.staged_hunks.add(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
+                    if (result.mark_source == .session) {
+                        try self.staged_hunks.add(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
+                    }
                     self.startStatusLoad(ctx, result.repo_root);
                 }
             },
@@ -1612,7 +1783,9 @@ pub const App = struct {
                 const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
                 self.setStatus("unstaged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
                 if (active_matches) {
-                    _ = self.staged_hunks.remove(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
+                    if (result.mark_source == .session) {
+                        _ = self.staged_hunks.remove(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
+                    }
                     self.startStatusLoad(ctx, result.repo_root);
                 }
             },
@@ -1977,6 +2150,7 @@ pub const App = struct {
             current.repo_root,
             current.path_key,
             current.kind,
+            current.source_kind,
             self.load.generation,
             self.status_load_generation,
         )) return;
@@ -2004,6 +2178,7 @@ pub const App = struct {
                     result.request.repo_root,
                     result.request.path_key,
                     result.request.kind,
+                    result.request.source_kind,
                     result.request.load_generation,
                     result.request.status_generation,
                 );
@@ -2345,6 +2520,10 @@ pub const App = struct {
     }
 
     fn toggleSelectedHunkFold(self: *App) void {
+        if (self.activeCombinedProjection() != null) {
+            self.setStatus("hunk fold is unavailable for mixed staged/unstaged view", .{});
+            return;
+        }
         const loaded = self.activeLoadedDiff() orelse return;
         const file_index = self.selectedFileIndex(loaded) orelse return;
         if (file_index >= loaded.document.files.len) return;
@@ -2414,6 +2593,7 @@ pub const App = struct {
                 else
                     0,
                 .generated_added_file => |bundle| bundle.file.lines.len + @as(usize, if (bundle.file.truncated) 1 else 0),
+                .combined_hunks => |bundle| bundle.projection.lineIndex(self.effectiveDisplayMode()).lineCount(),
                 .status_body => 1,
             },
             .pending, .failed => 1,
@@ -2464,6 +2644,11 @@ pub const App = struct {
     }
 
     fn enterSearchMode(self: *App) void {
+        if (self.activeCombinedProjection() != null) {
+            self.clearSearchMatch();
+            self.setStatus("search is unavailable for mixed staged/unstaged view", .{});
+            return;
+        }
         self.search.input = self.search.query;
         self.search.mode = true;
     }
@@ -2955,6 +3140,11 @@ pub const App = struct {
 
     fn submitSearch(self: *App) void {
         self.search.mode = false;
+        if (self.activeCombinedProjection() != null) {
+            self.clearSearchMatch();
+            self.setStatus("search is unavailable for mixed staged/unstaged view", .{});
+            return;
+        }
         self.search.query = self.search.input;
         self.clearSearchMatch();
         if (self.search.query.len == 0) {
@@ -2964,6 +3154,11 @@ pub const App = struct {
     }
 
     fn selectSearchMatch(self: *App, direction: diff_search.Direction) void {
+        if (self.activeCombinedProjection() != null) {
+            self.clearSearchMatch();
+            self.setStatus("search is unavailable for mixed staged/unstaged view", .{});
+            return;
+        }
         const file = self.selectedFile() orelse return;
         if (self.search.query.len == 0) return;
 
@@ -2985,6 +3180,7 @@ pub const App = struct {
     fn refreshSearchForSelectedFile(self: *App) void {
         self.clearSearchMatch();
         if (self.search.query.len == 0) return;
+        if (self.activeCombinedProjection() != null) return;
         const file = self.selectedFile() orelse return;
         const next = diff_search.findMatch(file, self.effectiveDisplayMode(), self.search.query.slice(), null, .forward) orelse return;
         self.unfoldSearchMatchIfNeeded(next);
@@ -3006,6 +3202,10 @@ pub const App = struct {
     fn updateSearchMatchOffset(self: *App) void {
         self.search.match_offset = null;
         const match = self.search.match orelse return;
+        if (self.activeCombinedProjection() != null) {
+            self.clearSearchMatch();
+            return;
+        }
         const file = self.selectedFile() orelse return;
         const mode = self.effectiveDisplayMode();
         const offset = diff_view_model.renderedOffsetForCoordinate(file, mode, match.coordinate, self.selectedFileCachedLineIndex(mode)) orelse {
@@ -3336,7 +3536,57 @@ pub const App = struct {
         return loaded.document.files[file_index];
     }
 
+    pub fn activeDiffDisplay(self: *const App, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?ActiveDiffDisplay {
+        if (self.activeCombinedProjection()) |bundle| {
+            const states = bundle.projection.hunk_states;
+            const flags = try allocator.alloc(bool, states.len);
+            for (states, flags) |state, *flag| flag.* = state.state == .staged;
+            return .{ .combined_projection = .{
+                .file = bundle.projection.file,
+                .line_index = bundle.projection.lineIndex(mode),
+                .staged_flags = flags,
+                .hunk_states = states,
+            } };
+        }
+
+        const loaded = self.activeLoadedDiffConst() orelse return null;
+        const file_index = self.selectedFileIndex(loaded) orelse return null;
+        const file = loaded.document.files[file_index];
+        return .{ .loaded = .{
+            .file = file,
+            .line_index = loaded.cachedRenderedLineIndex(file_index, mode),
+            .folded_hunks = loaded.foldedHunksForFile(file_index),
+            .staged_flags = try self.stagedHunkFlagsForFile(allocator, file),
+        } };
+    }
+
+    fn activeCombinedProjection(self: *const App) ?*const app_review_projection.CombinedHunkBundle {
+        // Recompute the target identity on each call so reload/status
+        // generation changes cannot leave a stale projection active.
+        const target = self.reviewProjectionTarget() orelse return null;
+        if (target.kind != .combined_hunks) return null;
+
+        return switch (self.review_projection) {
+            .ready => |*ready| blk: {
+                if (!ready.request.matchesBorrowed(
+                    target.repo_root,
+                    target.path_key,
+                    target.kind,
+                    target.source_kind,
+                    self.load.generation,
+                    self.status_load_generation,
+                )) break :blk null;
+                break :blk switch (ready.value) {
+                    .combined_hunks => |*bundle| bundle,
+                    else => null,
+                };
+            },
+            else => null,
+        };
+    }
+
     fn selectedFileLineIndex(self: *const App, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {
+        if (self.activeCombinedProjection()) |bundle| return bundle.projection.lineIndex(mode);
         const loaded = self.activeLoadedDiffConst() orelse return .{ .mode = mode };
         const file_index = self.selectedFileIndex(loaded) orelse return .{ .mode = mode };
         return loaded.renderedLineIndex(file_index, mode);
@@ -3349,12 +3599,14 @@ pub const App = struct {
     }
 
     fn selectedFoldedHunks(self: *const App) []const bool {
+        if (self.activeCombinedProjection() != null) return &.{};
         const loaded = self.activeLoadedDiffConst() orelse return &.{};
         const file_index = self.selectedFileIndex(loaded) orelse return &.{};
         return loaded.foldedHunksForFile(file_index);
     }
 
     fn selectedHunkOffset(self: *const App, mode: diff_render.DisplayMode, hunk_index: usize) usize {
+        if (self.activeCombinedProjection()) |bundle| return bundle.projection.lineIndex(mode).hunkOffset(hunk_index);
         const loaded = self.activeLoadedDiffConst() orelse return 0;
         const file_index = self.selectedFileIndex(loaded) orelse return 0;
         if (loaded.rendered_line_cache.indexFor(file_index, mode)) |index| return index.hunkOffset(hunk_index);
@@ -3391,19 +3643,21 @@ pub const App = struct {
     }
 
     fn selectedDiffCursorOffset(self: *const App) ?usize {
-        const file = self.selectedFile() orelse return null;
         const mode = self.effectiveDisplayMode();
-        return diff_view_model.renderedOffsetForCoordinate(file, mode, self.viewer.diff_cursor, self.selectedFileCachedLineIndex(mode));
+        const file = if (self.activeCombinedProjection()) |bundle| bundle.projection.file else self.selectedFile() orelse return null;
+        const index = if (self.activeCombinedProjection()) |bundle| bundle.projection.lineIndex(mode) else self.selectedFileCachedLineIndex(mode);
+        return diff_view_model.renderedOffsetForCoordinate(file, mode, self.viewer.diff_cursor, index);
     }
 
     fn selectedCoordinateAtOffset(self: *const App, offset: usize) ?diff_view_model.BodyCoordinate {
-        const file = self.selectedFile() orelse return null;
         const mode = self.effectiveDisplayMode();
-        return diff_view_model.coordinateAtOffset(file, mode, offset, self.selectedFoldedHunks(), self.selectedFileCachedLineIndex(mode));
+        const file = if (self.activeCombinedProjection()) |bundle| bundle.projection.file else self.selectedFile() orelse return null;
+        const index = if (self.activeCombinedProjection()) |bundle| bundle.projection.lineIndex(mode) else self.selectedFileCachedLineIndex(mode);
+        return diff_view_model.coordinateAtOffset(file, mode, offset, self.selectedFoldedHunks(), index);
     }
 
     fn initializeDiffCursorForSelectedFile(self: *App) void {
-        const file = self.selectedFile() orelse {
+        const file = if (self.activeCombinedProjection()) |bundle| bundle.projection.file else self.selectedFile() orelse {
             self.viewer.diff_cursor = .{ .metadata = 0 };
             return;
         };
@@ -5040,7 +5294,7 @@ test "selectedUnstageTarget requires fresh staged status" {
 test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
     var app: App = .{
         .allocator = std.testing.allocator,
-        .terminal_size = .{ .width = 100, .height = 10 },
+        .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
@@ -5073,6 +5327,138 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
     switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
         .offscreen_cursor => {},
         else => return error.ExpectedOffscreenHunkUnstageTarget,
+    }
+}
+
+test "combined projection target is requested for mixed modified unstaged files" {
+    var app: App = .{
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer app.git_status.deinit();
+
+    var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
+    try app.git_status.replace("/repo", &mixed_bundle);
+
+    const target = app.reviewProjectionTarget() orelse return error.ExpectedCombinedProjectionTarget;
+    try std.testing.expectEqual(app_review_projection.Kind.combined_hunks, target.kind);
+    try std.testing.expectEqual(app_review_projection.SourceKind.unstaged, target.source_kind);
+    try std.testing.expectEqualStrings("/repo", target.repo_root);
+    try std.testing.expectEqualStrings("a", target.path_key);
+
+    app.config.source = .cached;
+    try std.testing.expect(app.reviewProjectionTarget() == null);
+}
+
+test "active diff display uses ready combined projection by identity" {
+    var app: App = .{
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 7, .state = .{ .loaded = testLoadedSession(testLoadedDiffOne()) } },
+        .status_load_generation = 3,
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer app.git_status.deinit();
+    defer app.review_projection.deinit(std.testing.allocator);
+
+    var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
+    try app.git_status.replace("/repo", &mixed_bundle);
+
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .combined_hunks,
+        .unstaged,
+        app.load.generation,
+        app.status_load_generation,
+    );
+    app.review_projection = .{ .ready = .{
+        .request = request,
+        .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
+    } };
+
+    var frame_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer frame_arena.deinit();
+    const display = (try app.activeDiffDisplay(frame_arena.allocator(), .unified)) orelse return error.ExpectedActiveDisplay;
+    try std.testing.expect(display == .combined_projection);
+    try std.testing.expectEqual(@as(usize, 2), display.combined_projection.file.hunks.len);
+    try std.testing.expectEqual(@as(usize, 2), display.combined_projection.staged_flags.len);
+    try std.testing.expect(display.combined_projection.staged_flags[0]);
+    try std.testing.expect(!display.combined_projection.staged_flags[1]);
+}
+
+test "projected hunk actions route through original cached and unstaged origins" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 7, .state = .{ .loaded = testLoadedSession(testLoadedDiffOne()) } },
+        .status_load_generation = 3,
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer app.git_status.deinit();
+    defer app.review_projection.deinit(std.testing.allocator);
+
+    var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
+    try app.git_status.replace("/repo", &mixed_bundle);
+
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .combined_hunks,
+        .unstaged,
+        app.load.generation,
+        app.status_load_generation,
+    );
+    app.review_projection = .{ .ready = .{
+        .request = request,
+        .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
+    } };
+
+    switch (app.selectedHunkStageTarget(std.testing.allocator)) {
+        .already_staged_hunk => {},
+        else => return error.ExpectedAlreadyStagedProjectedHunk,
+    }
+    switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
+        .ready => |target| {
+            defer std.testing.allocator.free(target.patch);
+            try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
+            try std.testing.expectEqual(app_actions.HunkMarkSource.projection, target.mark_source);
+        },
+        else => return error.ExpectedReadyProjectedUnstage,
+    }
+
+    app.viewer.diff_cursor = .{ .hunk_header = 1 };
+    switch (app.selectedHunkStageTarget(std.testing.allocator)) {
+        .ready => |target| {
+            defer std.testing.allocator.free(target.patch);
+            try std.testing.expectEqual(@as(usize, 1), target.hunk_index);
+            try std.testing.expectEqual(app_actions.HunkMarkSource.projection, target.mark_source);
+        },
+        else => return error.ExpectedReadyProjectedStage,
+    }
+    switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
+        .not_staged_hunk => {},
+        else => return error.ExpectedNotStagedProjectedHunk,
     }
 }
 
@@ -5223,6 +5609,53 @@ test "hunk action results mutate session staged marks" {
 
     try std.testing.expect(!app.staged_hunks.contains("/repo", "a", 1));
     try std.testing.expectEqual(@as(usize, 0), app.staged_hunks.items.items.len);
+}
+
+test "projection hunk action results reload status without mutating session marks" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffOne()),
+    };
+    defer app.staged_hunks.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusTasks(&ctx, allocator);
+
+    const stage_pending = app.actions.begin(.stage_hunk);
+    try app.finishStageHunk(&ctx, .{
+        .pending = stage_pending,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .path = try allocator.dupe(u8, "a"),
+        .hunk_index = 1,
+        .mark_source = .projection,
+        .result = .ok,
+    });
+
+    try std.testing.expect(!app.staged_hunks.contains("/repo", "a", 1));
+    try std.testing.expectEqual(@as(usize, 0), app.staged_hunks.items.items.len);
+    try std.testing.expect(app.status_load_pending != null);
+    clearPendingStatusTasks(&ctx, allocator);
+
+    try app.staged_hunks.add(allocator, "/repo", "a", 1);
+    const unstage_pending = app.actions.begin(.unstage_hunk);
+    try app.finishUnstageHunk(&ctx, .{
+        .pending = unstage_pending,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .path = try allocator.dupe(u8, "a"),
+        .hunk_index = 1,
+        .mark_source = .projection,
+        .result = .ok,
+    });
+
+    try std.testing.expect(app.staged_hunks.contains("/repo", "a", 1));
+    try std.testing.expectEqual(@as(usize, 1), app.staged_hunks.items.items.len);
+    try std.testing.expect(app.status_load_pending != null);
 }
 
 test "clearLoadedDiff clears session staged hunk marks" {
@@ -6454,6 +6887,29 @@ fn testLoadedDiffWide() LoadedDiff {
     };
 }
 
+fn testCombinedHunkBundle(allocator: std.mem.Allocator) !app_review_projection.CombinedHunkBundle {
+    var cached_bundle = try app_load.buildLoadedBundle(allocator, test_diff_cached_projection);
+    errdefer cached_bundle.deinit();
+
+    var unstaged_bundle = try app_load.buildLoadedBundle(allocator, test_diff_unstaged_projection);
+    errdefer unstaged_bundle.deinit();
+
+    var projection_arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer projection_arena.deinit();
+    const projection = try diff_hunk_projection.build(
+        projection_arena.allocator(),
+        cached_bundle.loaded.document.files[0],
+        unstaged_bundle.loaded.document.files[0],
+    );
+
+    return .{
+        .arena = projection_arena,
+        .projection = projection,
+        .cached_bundle = cached_bundle,
+        .unstaged_bundle = unstaged_bundle,
+    };
+}
+
 const test_tree_one_nodes = [_]file_tree.Node{
     .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
 };
@@ -6558,6 +7014,32 @@ const test_diff_added_deleted =
     \\+++ /dev/null
     \\@@ -1 +0,0 @@
     \\-deleted
+    \\
+;
+
+const test_diff_cached_projection =
+    \\diff --git a/a b/a
+    \\index 1..2 100644
+    \\--- a/a
+    \\+++ b/a
+    \\@@ -10,3 +10,3 @@
+    \\ context
+    \\-old staged
+    \\+new staged
+    \\ context
+    \\
+;
+
+const test_diff_unstaged_projection =
+    \\diff --git a/a b/a
+    \\index 2..3 100644
+    \\--- a/a
+    \\+++ b/a
+    \\@@ -20,3 +20,3 @@
+    \\ context
+    \\-old unstaged
+    \\+new unstaged
+    \\ context
     \\
 ;
 

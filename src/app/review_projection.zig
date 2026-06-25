@@ -1,4 +1,5 @@
 const std = @import("std");
+const diff_hunk_projection = @import("../diff/hunk_projection.zig");
 const app_load = @import("load.zig");
 
 pub const max_generated_file_bytes = 1024 * 1024;
@@ -6,6 +7,13 @@ pub const max_generated_file_bytes = 1024 * 1024;
 pub const Kind = enum {
     cached_diff,
     generated_added_file,
+    combined_hunks,
+};
+
+pub const SourceKind = enum {
+    unstaged,
+    cached,
+    other,
 };
 
 pub const Request = struct {
@@ -13,6 +21,7 @@ pub const Request = struct {
     repo_root: []u8,
     path_key: []u8,
     kind: Kind,
+    source_kind: SourceKind,
     load_generation: u64,
     status_generation: u64,
 
@@ -22,8 +31,9 @@ pub const Request = struct {
         self.* = undefined;
     }
 
-    pub fn matchesBorrowed(self: Request, repo_root: []const u8, path_key: []const u8, kind: Kind, load_generation: u64, status_generation: u64) bool {
+    pub fn matchesBorrowed(self: Request, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, load_generation: u64, status_generation: u64) bool {
         return self.kind == kind and
+            self.source_kind == source_kind and
             self.load_generation == load_generation and
             self.status_generation == status_generation and
             std.mem.eql(u8, self.repo_root, repo_root) and
@@ -48,6 +58,21 @@ pub const GeneratedFileBundle = struct {
     }
 };
 
+pub const CombinedHunkBundle = struct {
+    arena: ?std.heap.ArenaAllocator,
+    projection: diff_hunk_projection.Projection,
+    cached_bundle: app_load.LoadedDiffBundle,
+    unstaged_bundle: app_load.LoadedDiffBundle,
+
+    pub fn deinit(self: *CombinedHunkBundle) void {
+        if (self.arena) |*arena| arena.deinit();
+        self.arena = null;
+        self.cached_bundle.deinit();
+        self.unstaged_bundle.deinit();
+        self.projection = undefined;
+    }
+};
+
 pub const StatusBody = struct {
     path: []u8,
     message: []u8,
@@ -62,12 +87,14 @@ pub const StatusBody = struct {
 pub const Ready = union(enum) {
     cached_diff: app_load.LoadedDiffBundle,
     generated_added_file: GeneratedFileBundle,
+    combined_hunks: CombinedHunkBundle,
     status_body: StatusBody,
 
     pub fn deinit(self: *Ready, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .cached_diff => |*bundle| bundle.deinit(),
             .generated_added_file => |*bundle| bundle.deinit(),
+            .combined_hunks => |*bundle| bundle.deinit(),
             .status_body => |*body| body.deinit(allocator),
         }
         self.* = undefined;
@@ -127,12 +154,12 @@ pub const State = union(enum) {
         self.* = .idle;
     }
 
-    pub fn matches(self: State, repo_root: []const u8, path_key: []const u8, kind: Kind, load_generation: u64, status_generation: u64) bool {
+    pub fn matches(self: State, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, load_generation: u64, status_generation: u64) bool {
         return switch (self) {
             .idle => false,
-            .pending => |request| request.matchesBorrowed(repo_root, path_key, kind, load_generation, status_generation),
-            .ready => |ready| ready.request.matchesBorrowed(repo_root, path_key, kind, load_generation, status_generation),
-            .failed => |failed| failed.request.matchesBorrowed(repo_root, path_key, kind, load_generation, status_generation),
+            .pending => |request| request.matchesBorrowed(repo_root, path_key, kind, source_kind, load_generation, status_generation),
+            .ready => |ready| ready.request.matchesBorrowed(repo_root, path_key, kind, source_kind, load_generation, status_generation),
+            .failed => |failed| failed.request.matchesBorrowed(repo_root, path_key, kind, source_kind, load_generation, status_generation),
         };
     }
 };
@@ -143,6 +170,7 @@ pub fn cloneRequest(
     repo_root: []const u8,
     path_key: []const u8,
     kind: Kind,
+    source_kind: SourceKind,
     load_generation: u64,
     status_generation: u64,
 ) !Request {
@@ -154,6 +182,7 @@ pub fn cloneRequest(
         .repo_root = owned_root,
         .path_key = owned_path,
         .kind = kind,
+        .source_kind = source_kind,
         .load_generation = load_generation,
         .status_generation = status_generation,
     };
@@ -208,13 +237,14 @@ test "generated file splits content lines in an owned arena" {
 }
 
 test "state matches projection request identity" {
-    var request = try cloneRequest(std.testing.allocator, 1, "/repo", "src/main.zig", .cached_diff, 10, 20);
+    var request = try cloneRequest(std.testing.allocator, 1, "/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20);
     defer request.deinit(std.testing.allocator);
 
     const state = State{ .pending = request };
 
-    try std.testing.expect(state.matches("/repo", "src/main.zig", .cached_diff, 10, 20));
-    try std.testing.expect(!state.matches("/repo", "src/main.zig", .generated_added_file, 10, 20));
-    try std.testing.expect(!state.matches("/repo", "src/main.zig", .cached_diff, 11, 20));
-    try std.testing.expect(!state.matches("/other", "src/main.zig", .cached_diff, 10, 20));
+    try std.testing.expect(state.matches("/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20));
+    try std.testing.expect(!state.matches("/repo", "src/main.zig", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(!state.matches("/repo", "src/main.zig", .cached_diff, .cached, 10, 20));
+    try std.testing.expect(!state.matches("/repo", "src/main.zig", .cached_diff, .unstaged, 11, 20));
+    try std.testing.expect(!state.matches("/other", "src/main.zig", .cached_diff, .unstaged, 10, 20));
 }

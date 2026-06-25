@@ -1,5 +1,6 @@
 const std = @import("std");
 const diff_parser = @import("../diff/parser.zig");
+const diff_hunk_projection = @import("../diff/hunk_projection.zig");
 const diff_source = @import("../diff/source.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
@@ -316,40 +317,91 @@ pub fn runReviewProjectionLoad(request: review_projection.Request, allocator: st
     return switch (request.kind) {
         .cached_diff => loadCachedFileDiff(request, allocator, io),
         .generated_added_file => loadGeneratedAddedFile(request, allocator, io),
+        .combined_hunks => loadCombinedHunks(request, allocator, io),
     };
 }
 
 fn loadCachedFileDiff(request: review_projection.Request, allocator: std.mem.Allocator, io: std.Io) review_projection.TaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().loadDiff(allocator, io, .{
-        .repo_root = request.repo_root,
-        .kind = .{ .file = .{ .base = .cached, .path = request.path_key } },
-    }) catch |err| {
+    const bundle = loadFileDiffBundle(request, allocator, io, .cached) catch |err| {
         return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Cached diff load failed: {s}", .{@errorName(err)}) catch
             return .{ .failed_static = "Cached diff load failed: OutOfMemory" } };
     };
+    if (bundle == null) {
+        return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No staged diff for this file.", .{}) catch
+            return .{ .failed_static = "Projection allocation failed" } } };
+    }
+    return .{ .ready = .{ .cached_diff = bundle.? } };
+}
+
+fn loadFileDiffBundle(
+    request: review_projection.Request,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    base: git_backend.FileDiffBase,
+) !?LoadedDiffBundle {
+    var local_backend: git_backend.LocalCommandBackend = .{};
+    const raw_result = try local_backend.backend().loadDiff(allocator, io, .{
+        .repo_root = request.repo_root,
+        .kind = .{ .file = .{ .base = base, .path = request.path_key } },
+    });
 
     switch (raw_result) {
         .ok => |bytes| {
             defer allocator.free(bytes);
-            if (bytes.len == 0) {
-                return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No staged diff for this file.", .{}) catch
-                    return .{ .failed_static = "Projection allocation failed" } } };
-            }
-            const bundle = buildLoadedBundle(allocator, bytes) catch |err| {
-                return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Cached diff parse failed: {s}", .{@errorName(err)}) catch
-                    return .{ .failed_static = "Cached diff parse failed: OutOfMemory" } };
-            };
-            return .{ .ready = .{ .cached_diff = bundle } };
+            if (bytes.len == 0) return null;
+            return try buildLoadedBundle(allocator, bytes);
         },
         .failed => |message| {
             defer allocator.free(message);
-            return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "{s}", .{std.mem.trim(u8, message, " \t\r\n")}) catch
-                return .{ .failed_static = "Projection allocation failed" } };
+            return error.GitCommandFailed;
         },
-        .failed_static => |message| return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "{s}", .{message}) catch
-            return .{ .failed_static = "Projection allocation failed" } },
+        .failed_static => return error.GitCommandFailed,
     }
+}
+
+fn loadCombinedHunks(request: review_projection.Request, allocator: std.mem.Allocator, io: std.Io) review_projection.TaskResult {
+    var cached_bundle = loadFileDiffBundle(request, allocator, io, .cached) catch |err| {
+        return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Staged hunk projection load failed: {s}", .{@errorName(err)}) catch
+            return .{ .failed_static = "Projection load failed: OutOfMemory" } };
+    } orelse return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No staged hunks for this file.", .{}) catch
+        return .{ .failed_static = "Projection allocation failed" } } };
+    defer cached_bundle.deinit();
+
+    var unstaged_bundle = loadFileDiffBundle(request, allocator, io, .unstaged) catch |err| {
+        return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Unstaged hunk projection load failed: {s}", .{@errorName(err)}) catch
+            return .{ .failed_static = "Projection load failed: OutOfMemory" } };
+    } orelse return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No unstaged hunks for this file.", .{}) catch
+        return .{ .failed_static = "Projection allocation failed" } } };
+    defer unstaged_bundle.deinit();
+
+    if (cached_bundle.loaded.document.files.len != 1 or unstaged_bundle.loaded.document.files.len != 1) {
+        return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "Cannot combine staged and unstaged hunks for this file.", .{}) catch
+            return .{ .failed_static = "Projection allocation failed" } } };
+    }
+
+    // The local cached/unstaged bundles are cleaned up on every early return.
+    // On success, CombinedHunkBundle takes their arenas and nulls the locals so
+    // the defers below become no-ops instead of double-freeing moved ownership.
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    const projection = diff_hunk_projection.build(
+        arena.allocator(),
+        cached_bundle.loaded.document.files[0],
+        unstaged_bundle.loaded.document.files[0],
+    ) catch |err| {
+        arena.deinit();
+        return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "Cannot combine staged and unstaged hunks: {s}", .{@errorName(err)}) catch
+            return .{ .failed_static = "Projection allocation failed" } } };
+    };
+
+    const bundle = review_projection.CombinedHunkBundle{
+        .arena = arena,
+        .projection = projection,
+        .cached_bundle = cached_bundle,
+        .unstaged_bundle = unstaged_bundle,
+    };
+    cached_bundle.arena = null;
+    unstaged_bundle.arena = null;
+    return .{ .ready = .{ .combined_hunks = bundle } };
 }
 
 fn loadGeneratedAddedFile(request: review_projection.Request, allocator: std.mem.Allocator, io: std.Io) review_projection.TaskResult {

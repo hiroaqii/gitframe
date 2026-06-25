@@ -24,6 +24,11 @@ pub const PendingAction = struct {
     kind: ActionKind,
 };
 
+pub const HunkMarkSource = enum {
+    session,
+    projection,
+};
+
 /// Small App-facing receiver for future Git actions.
 ///
 /// Keep this limited to in-flight ownership. Result text remains in App's
@@ -95,6 +100,7 @@ pub const StageHunkFinished = struct {
     repo_root: []u8,
     path: []u8,
     hunk_index: usize,
+    mark_source: HunkMarkSource = .session,
     result: FileActionTaskResult,
 
     pub fn deinit(self: *StageHunkFinished, allocator: std.mem.Allocator) void {
@@ -106,6 +112,7 @@ pub const StageHunkFinished = struct {
             .repo_root = &.{},
             .path = &.{},
             .hunk_index = 0,
+            .mark_source = .session,
             .result = .ok,
         };
     }
@@ -116,6 +123,7 @@ pub const UnstageHunkFinished = struct {
     repo_root: []u8,
     path: []u8,
     hunk_index: usize,
+    mark_source: HunkMarkSource = .session,
     result: FileActionTaskResult,
 
     pub fn deinit(self: *UnstageHunkFinished, allocator: std.mem.Allocator) void {
@@ -127,6 +135,7 @@ pub const UnstageHunkFinished = struct {
             .repo_root = &.{},
             .path = &.{},
             .hunk_index = 0,
+            .mark_source = .session,
             .result = .ok,
         };
     }
@@ -255,6 +264,7 @@ pub fn StageHunkTask(comptime Msg: type) type {
         path: []u8,
         patch: []u8,
         hunk_index: usize,
+        mark_source: HunkMarkSource = .session,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
@@ -276,6 +286,7 @@ pub fn StageHunkTask(comptime Msg: type) type {
                 .repo_root = repo_root,
                 .path = path,
                 .hunk_index = task.hunk_index,
+                .mark_source = task.mark_source,
                 .result = result,
             });
         }
@@ -290,6 +301,7 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
         path: []u8,
         patch: []u8,
         hunk_index: usize,
+        mark_source: HunkMarkSource = .session,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
@@ -311,6 +323,7 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
                 .repo_root = repo_root,
                 .path = path,
                 .hunk_index = task.hunk_index,
+                .mark_source = task.mark_source,
                 .result = result,
             });
         }
