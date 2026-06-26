@@ -657,9 +657,11 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
         .dialog_width = 64,
         .dialog_height = 14,
         .title = "Repositories",
+        .backdrop = false,
         .border = .rounded,
         .title_style = .{ .bold = true, .fg = .{ .index = 14 } },
     };
+    fillModalDialog(surface, opts);
     modal.view(surface, opts);
 
     const content_rect = ui.Modal.contentRect(surface, opts);
@@ -748,11 +750,12 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
         .dialog_width = @min(surface.size().width, commit_dialog_width),
         .dialog_height = @min(surface.size().height, commit_dialog_height),
         .title = app.commit_panel.title(),
+        .backdrop = false,
         .border = .rounded,
         .title_style = title_style,
         .border_style = .{ .fg = .gray },
-        .backdrop_style = .{ .dim = true },
     };
+    fillModalDialog(surface, opts);
     modal.view(surface, opts);
 
     const content_rect = ui.Modal.contentRect(surface, opts);
@@ -890,11 +893,12 @@ fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
         .dialog_width = @min(surface.size().width, discard_dialog_width),
         .dialog_height = @min(surface.size().height, discard_dialog_height),
         .title = "Discard file changes?",
+        .backdrop = false,
         .border = .rounded,
         .title_style = .{ .bold = true, .fg = .{ .index = 9 } },
         .border_style = .{ .fg = .{ .index = 9 } },
-        .backdrop_style = .{ .dim = true },
     };
+    fillModalDialog(surface, opts);
     modal.view(surface, opts);
 
     const content_rect = ui.Modal.contentRect(surface, opts);
@@ -921,11 +925,12 @@ fn viewAmendConfirmation(app: anytype, surface: *chasen.Surface) !void {
         .dialog_width = @min(surface.size().width, discard_dialog_width),
         .dialog_height = @min(surface.size().height, discard_dialog_height),
         .title = "Amend last commit?",
+        .backdrop = false,
         .border = .rounded,
         .title_style = .{ .bold = true, .fg = amend_accent },
         .border_style = .{ .fg = amend_accent },
-        .backdrop_style = .{ .dim = true },
     };
+    fillModalDialog(surface, opts);
     modal.view(surface, opts);
 
     const content_rect = ui.Modal.contentRect(surface, opts);
@@ -1031,6 +1036,7 @@ fn footerItems(app: anytype) []const ui.key_hint.Item {
 fn viewHelpPopup(app: anytype, surface: *chasen.Surface) !void {
     const modal = ui.Modal.init(.{});
     const opts = helpModalOptions(surface.size());
+    fillModalDialog(surface, opts);
     modal.view(surface, opts);
 
     const content_rect = ui.Modal.contentRect(surface, opts);
@@ -1084,6 +1090,18 @@ fn viewHelpPopup(app: anytype, surface: *chasen.Surface) !void {
     try drawHelpSections(&right, &help_right_sections, scroll);
 }
 
+fn fillModalDialog(surface: *chasen.Surface, opts: ui.Modal.ViewOptions) void {
+    // Keep the normal screen visible outside the dialog while still making the
+    // dialog itself an opaque surface, so diff text never bleeds into modal UI.
+    const rect = ui.Modal.dialogRect(surface, opts);
+    if (rect.width == 0 or rect.height == 0) return;
+    var dialog = surface.child(rect);
+    dialog.fillAll(.{
+        .char = .{ .grapheme = " ", .width = 1 },
+        .style = .{},
+    });
+}
+
 const HelpBodyLayout = struct {
     visible_rows: u16,
     overflow: bool,
@@ -1094,10 +1112,10 @@ fn helpModalOptions(size: chasen.Size) ui.Modal.ViewOptions {
         .dialog_width = @min(size.width, help_dialog_max_width),
         .dialog_height = @min(size.height, help_dialog_max_height),
         .title = "Shortcuts",
+        .backdrop = false,
         .border = .rounded,
         .title_style = .{ .bold = true, .fg = .{ .index = 14 } },
         .border_style = .{ .fg = .gray },
-        .backdrop_style = .{ .dim = true },
     };
 }
 
