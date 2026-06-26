@@ -16,7 +16,7 @@ const sidebar_view_model = @import("../sidebar/view_model.zig");
 /// shared with tests through small public helpers.
 pub const footer_rows: u16 = 1;
 pub const sidebar_header_rows: u16 = 3;
-pub const diff_body_start_row: u16 = 3;
+pub const diff_body_start_row: u16 = 2;
 
 const search_marker_gutter_width: u16 = 1;
 const shell_frame_min_width: u16 = 30;
@@ -328,37 +328,11 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         return;
     }
 
-    const selected = app.selectedFileIndex(&loaded) orelse 0;
     var diff_content = diffContentSurface(surface);
     const mode = diff_render.effectiveMode(diff_content.size().width, app.viewer.display_mode);
-    const mode_label = diff_render.modeLabel(diff_content.size().width, app.viewer.display_mode);
     const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
-    const status_style = paneStatusStyle(active);
     const display = (try app.activeDiffDisplay(surface.frameAllocator(), mode)) orelse return;
     const display_file = display.file();
-    const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "{s} {d}/{d}  {d} hunks  {s}  scroll:{d}{s}", .{
-        paneTitleText("Diff", active),
-        selected + 1,
-        loaded.document.files.len,
-        display_file.hunks.len,
-        mode_label,
-        app.viewer.diff_scroll,
-        horizontalScrollStatus(surface, app.viewer.diff_horizontal_scroll),
-    });
-    try draw.copyClippedTextAt(surface, 0, 2, status_text, status_style);
-    if (app.search.query.len > 0 or app.search.mode) {
-        surface.clear(.{ .col = 0, .row = 2, .width = size.width, .height = 1 });
-    }
-    if (!app.search.mode and app.search.query.len > 0 and size.width > 0) {
-        const match_text = if (app.search.match_offset) |offset|
-            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ app.search.query.slice(), offset + 1 }) catch "search"
-        else
-            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{app.search.query.slice()}) catch "search";
-        draw.copyClippedTextAt(surface, 0, 2, match_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
-    } else if (app.search.mode and size.width > 0) {
-        const prompt_text = std.fmt.allocPrint(surface.frameAllocator(), "search: {s}", .{app.search.input.slice()}) catch "search";
-        draw.copyClippedTextAt(surface, 0, 2, prompt_text, paneSearchStyle(app.viewer.focus == .diff)) catch {};
-    }
     try diff_render.renderFile(&diff_content, display_file, .{
         .requested_mode = app.viewer.display_mode,
         .scroll = app.viewer.diff_scroll,
@@ -371,14 +345,35 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         .line_index = display.lineIndex(),
         .folded_hunks = display.foldedHunks(),
     });
+    drawDiffHeaderDetailRow(app, surface, active);
     drawSearchMatchMarker(app, surface);
+}
+
+fn drawDiffHeaderDetailRow(app: anytype, surface: *chasen.Surface, active: bool) void {
+    const size = surface.size();
+    if (size.width == 0 or size.height <= 1) return;
+
+    surface.clear(.{ .col = 0, .row = 1, .width = size.width, .height = 1 });
+    if (!app.search.mode and app.search.query.len > 0) {
+        const match_text = if (app.search.match_offset) |offset|
+            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ app.search.query.slice(), offset + 1 }) catch "search"
+        else
+            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{app.search.query.slice()}) catch "search";
+        draw.copyClippedTextAt(surface, 0, 1, match_text, paneSearchStyle(active)) catch {};
+        return;
+    }
+
+    if (app.search.mode) {
+        const prompt_text = std.fmt.allocPrint(surface.frameAllocator(), "search: {s}", .{app.search.input.slice()}) catch "search";
+        draw.copyClippedTextAt(surface, 0, 1, prompt_text, paneSearchStyle(active)) catch {};
+        return;
+    }
+
+    drawPaneHeaderRule(surface, active);
 }
 
 fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.StatusEntry) !void {
     const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
-    const style = paneStatusStyle(active);
-    const title = try std.fmt.allocPrint(surface.frameAllocator(), "{s} {s}", .{ paneTitleText("Status", active), stagePresenceLabel(entry) });
-    try draw.copyClippedTextAt(surface, 0, 2, title, style);
 
     var content = diffContentSurface(surface);
     const path = entry.canonicalPathKey() orelse entry.path;
@@ -396,6 +391,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                             .line_numbers = app.viewer.view_options.line_numbers,
                             .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(content.size().width, app.viewer.display_mode)),
                         });
+                        drawPaneHeaderRule(surface, active);
                         return;
                     }
                 },
@@ -407,21 +403,25 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                         .pane_active = active,
                         .line_numbers = app.viewer.view_options.line_numbers,
                     });
+                    drawPaneHeaderRule(surface, active);
                     return;
                 },
                 .combined_hunks => {},
                 .status_body => |body| {
                     try drawStatusBody(&content, body.path, body.message, active);
+                    drawPaneHeaderRule(surface, active);
                     return;
                 },
             }
         },
         .failed => |failed| {
             try drawStatusBody(&content, failed.body.path, failed.body.message, active);
+            drawPaneHeaderRule(surface, active);
             return;
         },
         .pending => {
             try drawStatusBody(&content, path, "Loading review projection...", active);
+            drawPaneHeaderRule(surface, active);
             return;
         },
         .idle => {},
@@ -442,20 +442,18 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
     }
 }
 
+fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool) void {
+    const size = surface.size();
+    if (size.width == 0 or size.height <= 1) return;
+
+    for (0..size.width) |col| {
+        _ = surface.borrowTextAt(@intCast(col), 1, "─", paneHeaderRuleStyle(active));
+    }
+}
+
 fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u8, active: bool) !void {
     try draw.copyClippedTextAt(surface, 0, 0, path, .{ .bold = true, .fg = .{ .index = 11 }, .dim = !active });
     try draw.copyClippedTextAt(surface, 0, 2, message, .{ .fg = .gray, .dim = !active });
-}
-
-fn stagePresenceLabel(entry: git_status.StatusEntry) []const u8 {
-    return switch (file_tree.stagePresenceFromEntry(entry)) {
-        .staged_only => "staged",
-        .mixed => "mixed",
-        .untracked => "untracked",
-        .conflict => "conflict",
-        .unstaged_only => "unstaged",
-        .clean_or_unknown => "status-only file",
-    };
 }
 
 fn statusName(status: git_status.StatusCode) []const u8 {
@@ -476,11 +474,6 @@ fn statusName(status: git_status.StatusCode) []const u8 {
 fn statusSuffix(entry: git_status.StatusEntry) []const u8 {
     if (entry.isConflict()) return " (conflict)";
     return "";
-}
-
-fn horizontalScrollStatus(surface: *chasen.Surface, offset: usize) []const u8 {
-    if (offset == 0) return "";
-    return std.fmt.allocPrint(surface.frameAllocator(), "  x:{d}", .{offset}) catch "";
 }
 
 fn viewLoadState(app: anytype, col: *chasen.Column) void {
@@ -1287,18 +1280,15 @@ fn paneTitleStyle(active: bool) chasen.TextStyle {
         .{ .bold = true, .fg = .gray };
 }
 
-fn paneStatusStyle(active: bool) chasen.TextStyle {
-    return if (active)
-        .{ .reverse = true, .fg = .{ .index = 14 } }
-    else
-        .{ .fg = .gray };
-}
-
 fn paneSearchStyle(active: bool) chasen.TextStyle {
     return if (active)
         .{ .reverse = true, .fg = .{ .index = 11 } }
     else
         .{ .fg = .{ .index = 11 } };
+}
+
+fn paneHeaderRuleStyle(active: bool) chasen.TextStyle {
+    return .{ .fg = if (active) .{ .index = 14 } else .gray, .dim = true };
 }
 
 fn shellSeparatorStyle() chasen.TextStyle {

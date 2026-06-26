@@ -150,13 +150,13 @@ fn renderFileHeader(
     pane_active: bool,
 ) !void {
     const stats = fileStats(file);
-    try draw.copyClippedTextAt(surface, 0, 0, displayPath(file), fileHeaderStyle(pane_active));
-    const summary = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  +{d} -{d}", .{
+    const summary = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  +{d} -{d}  {d} hunks", .{
         modeLabel(surface.size().width, requested_mode),
         stats.added,
         stats.removed,
+        file.hunks.len,
     });
-    try draw.copyClippedTextAt(surface, 0, 1, summary, style_metadata);
+    try drawHeaderLine(surface, displayPath(file), summary, pane_active);
 }
 
 fn renderGeneratedFileHeader(
@@ -167,14 +167,31 @@ fn renderGeneratedFileHeader(
     requested_mode: DisplayMode,
     pane_active: bool,
 ) !void {
-    try draw.copyClippedTextAt(surface, 0, 0, path, fileHeaderStyle(pane_active));
     const suffix = if (truncated) "  truncated" else "";
     const summary = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  +{d} -0  generated{s}", .{
         modeLabel(surface.size().width, requested_mode),
         added_lines,
         suffix,
     });
-    try draw.copyClippedTextAt(surface, 0, 1, summary, style_metadata);
+    try drawHeaderLine(surface, path, summary, pane_active);
+}
+
+fn drawHeaderLine(surface: *chasen.Surface, path: []const u8, summary: []const u8, pane_active: bool) !void {
+    const size = surface.size();
+    if (size.width == 0) return;
+
+    const summary_width = chasen.text.displayWidth(summary);
+    if (size.width > summary_width + 2) {
+        const path_width: u16 = @intCast(size.width - summary_width - 2);
+        var path_area = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
+        try draw.copyClippedTextAt(&path_area, 0, 0, path, fileHeaderStyle(pane_active));
+
+        const summary_col: u16 = @intCast(size.width - summary_width);
+        try draw.copyClippedTextAt(surface, summary_col, 0, summary, style_metadata);
+        return;
+    }
+
+    try draw.copyClippedTextAt(surface, 0, 0, path, fileHeaderStyle(pane_active));
 }
 
 fn drawHunkHeader(surface: *chasen.Surface, row: u16, header: []const u8, style: chasen.TextStyle, mode: DisplayMode) !void {
@@ -226,7 +243,7 @@ fn hunkHeaderStyle(highlighted: bool, staged: bool) chasen.TextStyle {
     return style;
 }
 
-const body_start_row: u16 = 3;
+const body_start_row: u16 = 2;
 const cursor_gutter_width: u16 = 1;
 
 fn drawCursorMarker(surface: *chasen.Surface, row: u16, body_offset: usize, cursor_offset: ?usize) void {
@@ -503,13 +520,13 @@ test "renderFile dims staged hunk body without removing it" {
         .staged_hunks = &.{true},
     });
 
-    const header_cell = ts.surface.readCell(1, 3).?;
+    const header_cell = ts.surface.readCell(1, 2).?;
     try std.testing.expect(header_cell.style.bg.eql(.{ .index = 8 }));
-    try ts.expectCellText(13, 4, "o");
-    const old_cell = ts.surface.readCell(13, 4).?;
+    try ts.expectCellText(13, 3, "o");
+    const old_cell = ts.surface.readCell(13, 3).?;
     try std.testing.expect(old_cell.style.dim);
-    try ts.expectCellText(13, 5, "n");
-    const new_cell = ts.surface.readCell(13, 5).?;
+    try ts.expectCellText(13, 4, "n");
+    const new_cell = ts.surface.readCell(13, 4).?;
     try std.testing.expect(new_cell.style.dim);
 }
 
@@ -541,10 +558,9 @@ test "renderGeneratedAddedFile draws content on new side in side-by-side mode" {
     try renderGeneratedAddedFile(&ts.surface, "src/new.zig", &.{ "const value = 1;", "pub fn main() void {}" }, false, .{ .requested_mode = .side_by_side });
 
     try ts.expectCellText(0, 0, "s");
-    try ts.expectCellText(0, 1, "s");
-    try ts.expectCellText(45, 3, "│");
-    try ts.expectCellText(51, 3, "+");
-    try ts.expectCellText(53, 3, "c");
+    try ts.expectCellText(45, 2, "│");
+    try ts.expectCellText(51, 2, "+");
+    try ts.expectCellText(53, 2, "c");
 }
 
 test "narrow side-by-side request labels file header as automatic unified fallback" {
@@ -574,9 +590,9 @@ test "narrow side-by-side request labels file header as automatic unified fallba
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side });
 
-    try ts.expectCellText(0, 1, "u");
-    try ts.expectCellText(8, 1, "(");
-    try ts.expectCellText(9, 1, "a");
+    try ts.expectCellText(20, 0, "u");
+    try ts.expectCellText(28, 0, "(");
+    try ts.expectCellText(29, 0, "a");
 }
 
 test "side-by-side clips old column before new column" {
@@ -615,11 +631,11 @@ test "side-by-side clips old column before new column" {
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side });
 
     const gutter_col: u16 = 40;
-    try ts.expectCellText(gutter_col, 4, "│");
-    try ts.expectCellText(gutter_col + 8, 4, "n");
-    try ts.expectCellText(gutter_col + 9, 4, "e");
-    try ts.expectCellText(gutter_col + 10, 4, "w");
-    try ts.expectCellText(gutter_col + 12, 4, " ");
+    try ts.expectCellText(gutter_col, 3, "│");
+    try ts.expectCellText(gutter_col + 8, 3, "n");
+    try ts.expectCellText(gutter_col + 9, 3, "e");
+    try ts.expectCellText(gutter_col + 10, 3, "w");
+    try ts.expectCellText(gutter_col + 12, 3, " ");
 }
 
 test "side-by-side hunk header is clipped before the new column" {
@@ -647,11 +663,11 @@ test "side-by-side hunk header is clipped before the new column" {
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side });
 
     const gutter_col: u16 = 40;
-    try ts.expectCellText(3, 3, "@");
-    try ts.expectCellText(4, 3, "@");
-    try ts.expectCellText(gutter_col, 3, "│");
-    try ts.expectCellText(gutter_col + 1, 3, " ");
-    try ts.expectCellText(gutter_col + 8, 3, " ");
+    try ts.expectCellText(3, 2, "@");
+    try ts.expectCellText(4, 2, "@");
+    try ts.expectCellText(gutter_col, 2, "│");
+    try ts.expectCellText(gutter_col + 1, 2, " ");
+    try ts.expectCellText(gutter_col + 8, 2, " ");
 }
 
 test "marked clipping shows ellipsis in fixed metadata rows" {
@@ -698,13 +714,13 @@ test "unified horizontal scroll keeps line numbers and prefix fixed" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .horizontal_scroll = 4 });
 
-    try ts.expectCellText(0, 4, " ");
-    try ts.expectCellText(4, 4, "1");
-    try ts.expectCellText(9, 4, "1");
-    try ts.expectCellText(11, 4, " ");
-    try ts.expectCellText(13, 4, "4");
-    try ts.expectCellText(14, 4, "5");
-    try ts.expectCellText(31, 4, "m");
+    try ts.expectCellText(0, 3, " ");
+    try ts.expectCellText(4, 3, "1");
+    try ts.expectCellText(9, 3, "1");
+    try ts.expectCellText(11, 3, " ");
+    try ts.expectCellText(13, 3, "4");
+    try ts.expectCellText(14, 3, "5");
+    try ts.expectCellText(31, 3, "m");
 }
 
 test "unified line numbers can be hidden while keeping prefix" {
@@ -733,10 +749,10 @@ test "unified line numbers can be hidden while keeping prefix" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .line_numbers = false });
 
-    try ts.expectCellText(1, 4, "+");
-    try ts.expectCellText(3, 4, "n");
-    try ts.expectCellText(4, 4, "e");
-    try ts.expectCellText(5, 4, "w");
+    try ts.expectCellText(1, 3, "+");
+    try ts.expectCellText(3, 3, "n");
+    try ts.expectCellText(4, 3, "e");
+    try ts.expectCellText(5, 3, "w");
 }
 
 test "inactive pane dims file header only" {
@@ -756,8 +772,8 @@ test "inactive pane dims file header only" {
 
     try ts.expectCellText(0, 0, "s");
     try std.testing.expect(ts.surface.readCell(0, 0).?.style.dim);
-    try ts.expectCellText(0, 1, "u");
-    try std.testing.expect(!ts.surface.readCell(0, 1).?.style.dim);
+    try ts.expectCellText(17, 0, "u");
+    try std.testing.expect(!ts.surface.readCell(17, 0).?.style.dim);
 }
 
 test "side-by-side horizontal scroll keeps gutter fixed" {
@@ -787,9 +803,9 @@ test "side-by-side horizontal scroll keeps gutter fixed" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side, .horizontal_scroll = 4 });
 
-    try ts.expectCellText(8, 4, "0");
-    try ts.expectCellText(40, 4, "│");
-    try ts.expectCellText(48, 4, "a");
+    try ts.expectCellText(8, 3, "0");
+    try ts.expectCellText(40, 3, "│");
+    try ts.expectCellText(48, 3, "a");
 }
 
 test "side-by-side line numbers can be hidden while keeping prefixes" {
@@ -819,11 +835,11 @@ test "side-by-side line numbers can be hidden while keeping prefixes" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side, .line_numbers = false });
 
-    try ts.expectCellText(1, 4, "-");
-    try ts.expectCellText(3, 4, "o");
-    try ts.expectCellText(40, 4, "│");
-    try ts.expectCellText(41, 4, "+");
-    try ts.expectCellText(43, 4, "n");
+    try ts.expectCellText(1, 3, "-");
+    try ts.expectCellText(3, 3, "o");
+    try ts.expectCellText(40, 3, "│");
+    try ts.expectCellText(41, 3, "+");
+    try ts.expectCellText(43, 3, "n");
 }
 
 test "renderFile can start from cached viewport offset" {
@@ -870,12 +886,12 @@ test "renderFile can start from cached viewport offset" {
         .line_index = index,
     });
 
-    try ts.expectCellText(3, 3, "@");
-    try ts.expectCellText(4, 3, "@");
-    try ts.expectCellText(13, 4, "s");
-    try ts.expectCellText(14, 4, "a");
-    try ts.expectCellText(15, 4, "m");
-    try ts.expectCellText(16, 4, "e");
+    try ts.expectCellText(3, 2, "@");
+    try ts.expectCellText(4, 2, "@");
+    try ts.expectCellText(13, 3, "s");
+    try ts.expectCellText(14, 3, "a");
+    try ts.expectCellText(15, 3, "m");
+    try ts.expectCellText(16, 3, "e");
 }
 
 test "renderFile cursor marker uses absolute body offset with cached viewport" {
@@ -918,8 +934,8 @@ test "renderFile cursor marker uses absolute body offset with cached viewport" {
         .line_index = index,
     });
 
-    try ts.expectCellText(0, 3, " ");
-    try ts.expectCellText(0, 4, ">");
+    try ts.expectCellText(0, 2, " ");
+    try ts.expectCellText(0, 3, ">");
 }
 
 test "renderFile can start from cached side-by-side viewport offset" {
@@ -958,11 +974,11 @@ test "renderFile can start from cached side-by-side viewport offset" {
         .line_index = index,
     });
 
-    try ts.expectCellText(8, 3, "o");
-    try ts.expectCellText(9, 3, "l");
-    try ts.expectCellText(10, 3, "d");
-    try ts.expectCellText(40, 3, "│");
-    try ts.expectCellText(48, 3, "n");
-    try ts.expectCellText(49, 3, "e");
-    try ts.expectCellText(50, 3, "w");
+    try ts.expectCellText(8, 2, "o");
+    try ts.expectCellText(9, 2, "l");
+    try ts.expectCellText(10, 2, "d");
+    try ts.expectCellText(40, 2, "│");
+    try ts.expectCellText(48, 2, "n");
+    try ts.expectCellText(49, 2, "e");
+    try ts.expectCellText(50, 2, "w");
 }

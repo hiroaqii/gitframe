@@ -5481,7 +5481,7 @@ test "sidebar title indicates active focus" {
     try std.testing.expect(ts.surface.readCell(0, 0).?.style.reverse);
 }
 
-test "diff status row indicates active focus" {
+test "diff header detail row draws active separator" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(90, 10);
     defer ts.deinit();
@@ -5494,8 +5494,8 @@ test "diff status row indicates active focus" {
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
-    try ts.expectCellText(0, 2, "▸");
-    try std.testing.expect(ts.surface.readCell(0, 2).?.style.reverse);
+    try ts.expectCellText(0, 1, "─");
+    try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.{ .index = 14 }));
 }
 
 test "selectionContext exposes selected diff file model coordinate" {
@@ -6252,8 +6252,8 @@ test "diff search row keeps active focus style" {
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
-    try ts.expectCellText(0, 2, "s");
-    try std.testing.expect(ts.surface.readCell(0, 2).?.style.reverse);
+    try ts.expectCellText(0, 1, "s");
+    try std.testing.expect(ts.surface.readCell(0, 1).?.style.reverse);
 }
 
 test "changed file filter keeps only matching status rows" {
@@ -6878,11 +6878,11 @@ test "status mode label uses diff content width after marker gutter" {
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
-    try ts.expectCellText(19, 2, "u");
-    try ts.expectCellText(20, 2, "n");
-    try ts.expectCellText(21, 2, "i");
-    try ts.expectCellText(27, 2, "(");
-    try ts.expectCellText(28, 2, "a");
+    try ts.expectCellText(42, 0, "u");
+    try ts.expectCellText(43, 0, "n");
+    try ts.expectCellText(44, 0, "i");
+    try ts.expectCellText(50, 0, "(");
+    try ts.expectCellText(51, 0, "a");
 }
 
 test "search input header does not show no match before submit" {
@@ -6899,9 +6899,9 @@ test "search input header does not show no match before submit" {
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
-    try ts.expectCellText(0, 2, "s");
-    try ts.expectCellText(8, 2, "m");
-    try ts.expectCellText(15, 2, " ");
+    try ts.expectCellText(0, 1, "s");
+    try ts.expectCellText(8, 1, "m");
+    try ts.expectCellText(15, 1, " ");
 }
 
 test "canceling edited search restores committed query and match" {
