@@ -181,12 +181,13 @@ fn drawHeaderLine(surface: *chasen.Surface, path: []const u8, summary: []const u
     if (size.width == 0) return;
 
     const summary_width = chasen.text.displayWidth(summary);
-    if (size.width > summary_width + 2) {
-        const path_width: u16 = @intCast(size.width - summary_width - 2);
+    const right_padding: u16 = 1;
+    if (size.width > summary_width + 2 + right_padding) {
+        const path_width: u16 = @intCast(size.width - summary_width - 2 - right_padding);
         var path_area = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
         try draw.copyClippedTextAt(&path_area, 0, 0, path, fileHeaderStyle(pane_active));
 
-        const summary_col: u16 = @intCast(size.width - summary_width);
+        const summary_col: u16 = @intCast(size.width - summary_width - right_padding);
         try draw.copyClippedTextAt(surface, summary_col, 0, summary, style_metadata);
         return;
     }
@@ -590,9 +591,9 @@ test "narrow side-by-side request labels file header as automatic unified fallba
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side });
 
-    try ts.expectCellText(20, 0, "u");
-    try ts.expectCellText(28, 0, "(");
-    try ts.expectCellText(29, 0, "a");
+    try ts.expectCellText(19, 0, "u");
+    try ts.expectCellText(27, 0, "(");
+    try ts.expectCellText(28, 0, "a");
 }
 
 test "side-by-side clips old column before new column" {
@@ -772,8 +773,8 @@ test "inactive pane dims file header only" {
 
     try ts.expectCellText(0, 0, "s");
     try std.testing.expect(ts.surface.readCell(0, 0).?.style.dim);
-    try ts.expectCellText(17, 0, "u");
-    try std.testing.expect(!ts.surface.readCell(17, 0).?.style.dim);
+    try ts.expectCellText(16, 0, "u");
+    try std.testing.expect(!ts.surface.readCell(16, 0).?.style.dim);
 }
 
 test "side-by-side horizontal scroll keeps gutter fixed" {

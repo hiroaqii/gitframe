@@ -6893,11 +6893,11 @@ test "status mode label uses diff content width after marker gutter" {
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
-    try ts.expectCellText(42, 0, "u");
-    try ts.expectCellText(43, 0, "n");
-    try ts.expectCellText(44, 0, "i");
-    try ts.expectCellText(50, 0, "(");
-    try ts.expectCellText(51, 0, "a");
+    try ts.expectCellText(41, 0, "u");
+    try ts.expectCellText(42, 0, "n");
+    try ts.expectCellText(43, 0, "i");
+    try ts.expectCellText(49, 0, "(");
+    try ts.expectCellText(50, 0, "a");
 }
 
 test "search input header does not show no match before submit" {

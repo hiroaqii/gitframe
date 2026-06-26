@@ -208,18 +208,18 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
 
     const active = app.viewer.focus == .sidebar;
     _ = surface.borrowTextAt(0, 0, paneTitleText("Files", active), paneTitleStyle(active));
-    _ = try surface.printAt(0, 1, .{ .fg = .gray }, "{d} files / {d} hunks", .{
+    _ = try surface.printAt(1, 1, .{ .fg = .gray }, "{d} files / {d} hunks", .{
         loaded.document.files.len,
         loaded.document.totalHunks(),
     });
     if (size.width > 2) {
         if (app.review_display.hide_reviewed_files and app.review_display.changed_file_filter != .all) {
             const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{app.review_display.changed_file_filter.label()});
-            try draw.copyClippedTextAt(surface, 0, 2, text, .{ .fg = .{ .index = 11 } });
+            try draw.copyClippedTextAt(surface, 1, 2, text, .{ .fg = .{ .index = 11 } });
         } else if (app.review_display.hide_reviewed_files) {
-            try draw.copyClippedTextAt(surface, 0, 2, "hiding reviewed", .{ .fg = .{ .index = 11 } });
+            try draw.copyClippedTextAt(surface, 1, 2, "hiding reviewed", .{ .fg = .{ .index = 11 } });
         } else if (app.review_display.changed_file_filter != .all) {
-            try draw.copyClippedTextAt(surface, 0, 2, app.review_display.changed_file_filter.label(), .{ .fg = .{ .index = 11 } });
+            try draw.copyClippedTextAt(surface, 1, 2, app.review_display.changed_file_filter.label(), .{ .fg = .{ .index = 11 } });
         }
     }
 
@@ -607,7 +607,18 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         return;
     }
 
-    var col: u16 = 0;
+    const size_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
+        app.terminal_size.width,
+        app.terminal_size.height,
+    }) catch return;
+    const size_width: u16 = @intCast(@min(chasen.text.displayWidth(size_text), std.math.maxInt(u16)));
+
+    var col: u16 = 1;
+    if (width > col + size_width) {
+        _ = surface.copyTextAt(col, 0, size_text, .{ .fg = .gray }) catch {};
+        col +|= @intCast(@min(size_width + 2, std.math.maxInt(u16)));
+    }
+
     if (app.config.watch and width > col + 8) {
         _ = surface.borrowTextAt(col, 0, "watch", .{ .fg = .{ .index = 10 } });
         col +|= 7;
@@ -618,28 +629,26 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         col +|= @intCast(@min(message_width + 2, std.math.maxInt(u16)));
     }
 
-    const size_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
-        app.terminal_size.width,
-        app.terminal_size.height,
-    }) catch return;
-    const size_width: u16 = @intCast(@min(chasen.text.displayWidth(size_text), std.math.maxInt(u16)));
-    const reserved_size_width: u16 = if (width > size_width + 1) size_width + 1 else 0;
-    if (width > col + reserved_size_width) {
+    const hint_items = footerItems(app);
+    const hint_width = ui.key_hint.width(hint_items, footerKeyHintOptions());
+    const hint_col = if (width > hint_width + 1) width - hint_width - 1 else 0;
+    const draw_col = if (hint_col > col) hint_col else col;
+    if (width > draw_col) {
         var hint_area = surface.child(.{
-            .col = col,
+            .col = draw_col,
             .row = 0,
-            .width = width - col - reserved_size_width,
+            .width = width - draw_col,
             .height = 1,
         });
-        _ = ui.key_hint.draw(&hint_area, 0, 0, footerItems(app), .{
-            .style = .{ .fg = .gray },
-            .key_style = .{ .bold = true, .fg = .gray },
-        });
+        _ = ui.key_hint.draw(&hint_area, 0, 0, hint_items, footerKeyHintOptions());
     }
+}
 
-    if (width > size_width + 1) {
-        _ = surface.copyTextAt(width - size_width, 0, size_text, .{ .fg = .gray }) catch {};
-    }
+fn footerKeyHintOptions() ui.key_hint.DrawOptions {
+    return .{
+        .style = .{ .fg = .gray },
+        .key_style = .{ .bold = true, .fg = .gray },
+    };
 }
 
 fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
