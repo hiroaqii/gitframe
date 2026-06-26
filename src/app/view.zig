@@ -254,8 +254,8 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
         if (width > fold_col) {
             const fold_marker = switch (row_model.fold) {
                 .none => "",
-                .expanded => "▾",
-                .collapsed => "▸",
+                .expanded => "▼",
+                .collapsed => "▶",
             };
             _ = surface.borrowTextAt(fold_col, row, fold_marker, style);
         }
@@ -301,7 +301,7 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
 
 fn sidebarRowStyle(row: sidebar_view_model.Row, pane_active: bool) chasen.TextStyle {
     if (row.selected) return .{ .reverse = true, .bold = true };
-    if (row.kind == .directory) return .{ .bold = true, .fg = .gray, .dim = !pane_active };
+    if (row.kind == .directory) return .{ .bold = true, .dim = !pane_active };
     return switch (row.stage_presence) {
         .staged_only => .{ .fg = .{ .index = 10 }, .dim = !pane_active },
         .mixed => .{ .fg = .{ .index = 11 }, .dim = !pane_active },
