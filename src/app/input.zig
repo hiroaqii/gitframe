@@ -32,6 +32,86 @@ pub const KeyContext = struct {
     review_mode: bool = false,
 };
 
+const Action = enum {
+    cancel_search,
+    submit_search,
+    search_backspace,
+    cancel_file_search,
+    submit_file_search,
+    file_search_backspace,
+    cancel_commit_panel,
+    submit_commit_panel,
+    commit_panel_tab,
+    commit_panel_enter,
+    commit_panel_backspace,
+    commit_panel_move_left,
+    commit_panel_move_right,
+    commit_panel_move_up,
+    commit_panel_move_down,
+    cancel_repo_picker,
+    submit_repo_picker,
+    repo_picker_backspace,
+    repo_picker_enter_path_input,
+    repo_picker_move_previous,
+    repo_picker_move_next,
+    repo_picker_move_left,
+    repo_picker_move_right,
+    toggle_focus,
+    page_diff_up,
+    page_diff_down,
+    select_first_file,
+    select_last_file,
+    clear_search,
+    toggle_directory,
+    toggle_hunk_fold,
+    expand_directory,
+    collapse_or_parent_directory,
+    scroll_diff_right,
+    scroll_diff_left,
+    scroll_diff_up,
+    select_previous_file,
+    scroll_diff_down,
+    select_next_file,
+    enter_search,
+    select_next_search_match,
+    select_next_hunk,
+    select_previous_search_match,
+    select_previous_hunk,
+    enter_file_search,
+    enter_repo_picker,
+    open_help,
+    close_help,
+    help_scroll_up,
+    help_scroll_down,
+    help_page_up,
+    help_page_down,
+    cycle_changed_file_filter,
+    toggle_reviewed_file,
+    toggle_hide_reviewed_files,
+    toggle_sidebar_visibility,
+    decrease_sidebar_width,
+    increase_sidebar_width,
+    enter_commit_panel,
+    enter_amend_panel,
+    stage_selected_file,
+    stage_selected_hunk,
+    unstage_selected_file,
+    unstage_selected_hunk,
+    request_discard_selected_file,
+    confirm_discard_file,
+    cancel_discard_file,
+    confirm_amend,
+    cancel_amend,
+    open_selected_file_in_editor,
+    toggle_display_mode,
+    toggle_line_numbers,
+    finish_review_approved,
+    finish_review_needs_changes,
+    finish_review_canceled,
+    quit,
+    reload,
+};
+
 pub fn eventToMsg(comptime Msg: type, context: KeyContext, event: chasen.Event) ?Msg {
     return switch (event) {
         .key_press => |key| keyToMsg(Msg, context, key),
@@ -55,137 +135,189 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
 }
 
 fn searchKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_search");
-    if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "submit_search");
-    if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "search_backspace");
+    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .cancel_search);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .submit_search);
+    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .search_backspace);
     if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "search_insert", codepoint);
     return null;
 }
 
 fn fileSearchKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_file_search");
-    if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "submit_file_search");
-    if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "file_search_backspace");
+    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .cancel_file_search);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .submit_file_search);
+    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .file_search_backspace);
     if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "file_search_insert", codepoint);
     return null;
 }
 
 fn repoPickerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_repo_picker");
-    if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "submit_repo_picker");
-    if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "repo_picker_backspace");
-    if (key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "repo_picker_move_left");
-    if (key.matches(chasen.Key.right, .{})) return voidMsg(Msg, "repo_picker_move_right");
+    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .cancel_repo_picker);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .submit_repo_picker);
+    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .repo_picker_backspace);
+    if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .repo_picker_move_left);
+    if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .repo_picker_move_right);
     if (context.repo_picker_path_input) {
         if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
         return null;
     }
-    if (isColonKey(key)) return voidMsg(Msg, "repo_picker_enter_path_input");
+    if (isColonKey(key)) return actionToMsg(Msg, .repo_picker_enter_path_input);
     return switch (key.codepoint) {
-        'k', chasen.Key.up => voidMsg(Msg, "repo_picker_move_previous"),
-        'j', chasen.Key.down => voidMsg(Msg, "repo_picker_move_next"),
-        'q' => voidMsg(Msg, "cancel_repo_picker"),
+        'k', chasen.Key.up => actionToMsg(Msg, .repo_picker_move_previous),
+        'j', chasen.Key.down => actionToMsg(Msg, .repo_picker_move_next),
+        'q' => actionToMsg(Msg, .cancel_repo_picker),
         else => if (textInputCodepoint(key)) |codepoint| payloadMsg(Msg, "repo_picker_insert", codepoint) else null,
     };
 }
 
 fn helpKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "close_help");
-    if (key.matches('c', .{})) return voidMsg(Msg, "enter_commit_panel");
-    if (isHelpKey(key) or key.codepoint == 'q') return voidMsg(Msg, "close_help");
-    if (key.matches(chasen.Key.page_up, .{})) return voidMsg(Msg, "help_page_up");
-    if (key.matches(chasen.Key.page_down, .{})) return voidMsg(Msg, "help_page_down");
-    if (key.matches(chasen.Key.up, .{})) return voidMsg(Msg, "help_scroll_up");
-    if (key.matches(chasen.Key.down, .{})) return voidMsg(Msg, "help_scroll_down");
-    if (key.codepoint == 'k') return voidMsg(Msg, "help_scroll_up");
-    if (key.codepoint == 'j') return voidMsg(Msg, "help_scroll_down");
+    if (helpActionForKey(key)) |action| return actionToMsg(Msg, action);
     return null;
 }
 
 fn discardConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return voidMsg(Msg, "cancel_discard_file");
-    if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "confirm_discard_file");
+    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_discard_file);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_discard_file);
     return null;
 }
 
 fn amendConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return voidMsg(Msg, "cancel_amend");
-    if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "confirm_amend");
+    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_amend);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_amend);
     return null;
 }
 
 fn commitPanelKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_commit_panel");
-    if (key.matches(chasen.Key.enter, .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return voidMsg(Msg, "submit_commit_panel");
-    if (key.matches(chasen.Key.tab, .{})) return voidMsg(Msg, "commit_panel_tab");
-    if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "commit_panel_enter");
-    if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "commit_panel_backspace");
-    if (key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "commit_panel_move_left");
-    if (key.matches(chasen.Key.right, .{})) return voidMsg(Msg, "commit_panel_move_right");
-    if (key.matches(chasen.Key.up, .{})) return voidMsg(Msg, "commit_panel_move_up");
-    if (key.matches(chasen.Key.down, .{})) return voidMsg(Msg, "commit_panel_move_down");
+    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .cancel_commit_panel);
+    if (key.matches(chasen.Key.enter, .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return actionToMsg(Msg, .submit_commit_panel);
+    if (key.matches(chasen.Key.tab, .{})) return actionToMsg(Msg, .commit_panel_tab);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .commit_panel_enter);
+    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .commit_panel_backspace);
+    if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .commit_panel_move_left);
+    if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .commit_panel_move_right);
+    if (key.matches(chasen.Key.up, .{})) return actionToMsg(Msg, .commit_panel_move_up);
+    if (key.matches(chasen.Key.down, .{})) return actionToMsg(Msg, .commit_panel_move_down);
     if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "commit_panel_insert", codepoint);
     return null;
 }
 
 fn viewerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.tab, .{}) and !context.sidebar_hidden) return voidMsg(Msg, "toggle_focus");
-    if (key.matches(chasen.Key.page_up, .{})) return voidMsg(Msg, "page_diff_up");
-    if (key.matches(chasen.Key.page_down, .{})) return voidMsg(Msg, "page_diff_down");
-    if (key.matches(chasen.Key.home, .{})) return voidMsg(Msg, "select_first_file");
-    if (key.matches(chasen.Key.end, .{})) return voidMsg(Msg, "select_last_file");
-    if (key.matches(chasen.Key.escape, .{}) and context.search_query_len > 0) return voidMsg(Msg, "clear_search");
-    if (context.focus == .sidebar and key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "toggle_directory");
-    if (context.focus == .diff and key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "toggle_hunk_fold");
-    if (context.focus == .sidebar and key.matches(chasen.Key.right, .{})) return voidMsg(Msg, "expand_directory");
-    if (context.focus == .sidebar and key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "collapse_or_parent_directory");
-    if (context.focus == .diff and key.matches(chasen.Key.right, .{})) return voidMsg(Msg, "scroll_diff_right");
-    if (context.focus == .diff and key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "scroll_diff_left");
-    if (isHelpKey(key)) return voidMsg(Msg, "open_help");
+    if (key.matches(chasen.Key.tab, .{}) and !context.sidebar_hidden) return actionToMsg(Msg, .toggle_focus);
+    if (key.matches(chasen.Key.escape, .{}) and context.search_query_len > 0) return actionToMsg(Msg, .clear_search);
+    if (context.focus == .sidebar and key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .toggle_directory);
+    if (context.focus == .diff and key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .toggle_hunk_fold);
+    if (context.focus == .sidebar and key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .expand_directory);
+    if (context.focus == .sidebar and key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .collapse_or_parent_directory);
+    if (context.focus == .diff and key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .scroll_diff_right);
+    if (context.focus == .diff and key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .scroll_diff_left);
+
+    if (viewerActionForStaticKey(key)) |action| return actionToMsg(Msg, action);
 
     if (matchesShiftedAscii(key, 'j', 'J')) {
-        return if (context.focus == .diff) voidMsg(Msg, "select_next_hunk") else null;
+        return if (context.focus == .diff) actionToMsg(Msg, .select_next_hunk) else null;
     }
     if (matchesShiftedAscii(key, 'k', 'K')) {
-        return if (context.focus == .diff) voidMsg(Msg, "select_previous_hunk") else null;
+        return if (context.focus == .diff) actionToMsg(Msg, .select_previous_hunk) else null;
     }
     if (matchesShiftedAscii(key, 'n', 'N')) {
-        if (context.search_query_len > 0) return voidMsg(Msg, "select_previous_search_match");
-        return if (context.review_mode) voidMsg(Msg, "finish_review_needs_changes") else null;
+        if (context.search_query_len > 0) return actionToMsg(Msg, .select_previous_search_match);
+        return if (context.review_mode) actionToMsg(Msg, .finish_review_needs_changes) else null;
     }
-    if (matchesShiftedAscii(key, 'g', 'G')) return voidMsg(Msg, "select_last_file");
-    if (matchesShiftedAscii(key, 'r', 'R')) return voidMsg(Msg, "enter_repo_picker");
-    if (matchesShiftedAscii(key, 'f', 'F')) return voidMsg(Msg, "cycle_changed_file_filter");
-    if (matchesShiftedAscii(key, 'h', 'H')) return voidMsg(Msg, "toggle_hide_reviewed_files");
-    if (matchesShiftedAscii(key, 'b', 'B')) return voidMsg(Msg, "toggle_sidebar_visibility");
-    if (matchesShiftedAscii(key, 'l', 'L')) return voidMsg(Msg, "toggle_line_numbers");
     if (matchesShiftedAscii(key, 's', 'S')) {
-        return if (context.focus == .diff) voidMsg(Msg, "unstage_selected_hunk") else voidMsg(Msg, "unstage_selected_file");
+        return if (context.focus == .diff) actionToMsg(Msg, .unstage_selected_hunk) else actionToMsg(Msg, .unstage_selected_file);
     }
-    if (matchesShiftedAscii(key, 'd', 'D')) return voidMsg(Msg, "request_discard_selected_file");
-    if (matchesShiftedAscii(key, 'a', 'A')) return voidMsg(Msg, "enter_amend_panel");
-    if (context.review_mode and key.matches('a', .{})) return voidMsg(Msg, "finish_review_approved");
-    if (key.matches('c', .{})) return voidMsg(Msg, "enter_commit_panel");
+    if (context.review_mode and key.matches('a', .{})) return actionToMsg(Msg, .finish_review_approved);
     if (hasCommandModifier(key)) return null;
 
     return switch (key.codepoint) {
-        'k', chasen.Key.up => if (context.focus == .diff) voidMsg(Msg, "scroll_diff_up") else voidMsg(Msg, "select_previous_file"),
-        'j', chasen.Key.down => if (context.focus == .diff) voidMsg(Msg, "scroll_diff_down") else voidMsg(Msg, "select_next_file"),
-        '/' => voidMsg(Msg, "enter_search"),
-        'n' => if (context.search_query_len > 0) voidMsg(Msg, "select_next_search_match") else voidMsg(Msg, "select_next_hunk"),
-        'p' => if (context.search_query_len > 0) voidMsg(Msg, "select_previous_search_match") else voidMsg(Msg, "select_previous_hunk"),
-        'g' => voidMsg(Msg, "select_first_file"),
-        'f' => voidMsg(Msg, "enter_file_search"),
-        'v' => voidMsg(Msg, "toggle_reviewed_file"),
-        '[' => voidMsg(Msg, "decrease_sidebar_width"),
-        ']' => voidMsg(Msg, "increase_sidebar_width"),
-        's' => if (context.focus == .diff) voidMsg(Msg, "stage_selected_hunk") else voidMsg(Msg, "stage_selected_file"),
-        'e' => voidMsg(Msg, "open_selected_file_in_editor"),
-        'u' => voidMsg(Msg, "toggle_display_mode"),
-        'q' => if (context.review_mode) voidMsg(Msg, "finish_review_canceled") else voidMsg(Msg, "quit"),
-        'r' => voidMsg(Msg, "reload"),
+        'k', chasen.Key.up => if (context.focus == .diff) actionToMsg(Msg, .scroll_diff_up) else actionToMsg(Msg, .select_previous_file),
+        'j', chasen.Key.down => if (context.focus == .diff) actionToMsg(Msg, .scroll_diff_down) else actionToMsg(Msg, .select_next_file),
+        'n' => if (context.search_query_len > 0) actionToMsg(Msg, .select_next_search_match) else actionToMsg(Msg, .select_next_hunk),
+        'p' => if (context.search_query_len > 0) actionToMsg(Msg, .select_previous_search_match) else actionToMsg(Msg, .select_previous_hunk),
+        's' => if (context.focus == .diff) actionToMsg(Msg, .stage_selected_hunk) else actionToMsg(Msg, .stage_selected_file),
+        'q' => if (context.review_mode) actionToMsg(Msg, .finish_review_canceled) else actionToMsg(Msg, .quit),
         else => null,
     };
+}
+
+const KeyMatcher = union(enum) {
+    plain_codepoint: u21,
+    exact: u21,
+    help_key,
+    shifted_ascii: struct {
+        lower: u21,
+        upper: u21,
+    },
+
+    fn matches(self: KeyMatcher, key: chasen.Key) bool {
+        return switch (self) {
+            .plain_codepoint => |codepoint| !hasCommandModifier(key) and key.codepoint == codepoint,
+            .exact => |codepoint| key.matches(codepoint, .{}),
+            .help_key => isHelpKey(key),
+            .shifted_ascii => |ascii| matchesShiftedAscii(key, ascii.lower, ascii.upper),
+        };
+    }
+};
+
+const KeyBinding = struct {
+    matcher: KeyMatcher,
+    action: Action,
+};
+
+const viewer_static_bindings = [_]KeyBinding{
+    .{ .matcher = .{ .exact = chasen.Key.page_up }, .action = .page_diff_up },
+    .{ .matcher = .{ .exact = chasen.Key.page_down }, .action = .page_diff_down },
+    .{ .matcher = .{ .exact = chasen.Key.home }, .action = .select_first_file },
+    .{ .matcher = .{ .exact = chasen.Key.end }, .action = .select_last_file },
+    .{ .matcher = .help_key, .action = .open_help },
+    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'g', .upper = 'G' } }, .action = .select_last_file },
+    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'r', .upper = 'R' } }, .action = .enter_repo_picker },
+    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'f', .upper = 'F' } }, .action = .cycle_changed_file_filter },
+    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'h', .upper = 'H' } }, .action = .toggle_hide_reviewed_files },
+    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'b', .upper = 'B' } }, .action = .toggle_sidebar_visibility },
+    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'l', .upper = 'L' } }, .action = .toggle_line_numbers },
+    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'd', .upper = 'D' } }, .action = .request_discard_selected_file },
+    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'a', .upper = 'A' } }, .action = .enter_amend_panel },
+    // Use exact matching so Shift+c is not treated as the commit command.
+    .{ .matcher = .{ .exact = 'c' }, .action = .enter_commit_panel },
+    .{ .matcher = .{ .plain_codepoint = '/' }, .action = .enter_search },
+    .{ .matcher = .{ .plain_codepoint = 'g' }, .action = .select_first_file },
+    .{ .matcher = .{ .plain_codepoint = 'f' }, .action = .enter_file_search },
+    .{ .matcher = .{ .plain_codepoint = 'v' }, .action = .toggle_reviewed_file },
+    .{ .matcher = .{ .plain_codepoint = '[' }, .action = .decrease_sidebar_width },
+    .{ .matcher = .{ .plain_codepoint = ']' }, .action = .increase_sidebar_width },
+    .{ .matcher = .{ .plain_codepoint = 'e' }, .action = .open_selected_file_in_editor },
+    .{ .matcher = .{ .plain_codepoint = 'u' }, .action = .toggle_display_mode },
+    .{ .matcher = .{ .plain_codepoint = 'r' }, .action = .reload },
+};
+
+const help_bindings = [_]KeyBinding{
+    .{ .matcher = .{ .exact = chasen.Key.escape }, .action = .close_help },
+    .{ .matcher = .{ .exact = 'c' }, .action = .enter_commit_panel },
+    .{ .matcher = .help_key, .action = .close_help },
+    .{ .matcher = .{ .plain_codepoint = 'q' }, .action = .close_help },
+    .{ .matcher = .{ .exact = chasen.Key.page_up }, .action = .help_page_up },
+    .{ .matcher = .{ .exact = chasen.Key.page_down }, .action = .help_page_down },
+    .{ .matcher = .{ .exact = chasen.Key.up }, .action = .help_scroll_up },
+    .{ .matcher = .{ .exact = chasen.Key.down }, .action = .help_scroll_down },
+    .{ .matcher = .{ .plain_codepoint = 'k' }, .action = .help_scroll_up },
+    .{ .matcher = .{ .plain_codepoint = 'j' }, .action = .help_scroll_down },
+};
+
+// Static: the key alone determines the action. Context-dependent keys
+// (s/S, n/N, q, Tab, Esc, Enter, arrows) stay in viewerKeyToMsg.
+fn viewerActionForStaticKey(key: chasen.Key) ?Action {
+    return actionForKey(&viewer_static_bindings, key);
+}
+
+fn helpActionForKey(key: chasen.Key) ?Action {
+    return actionForKey(&help_bindings, key);
+}
+
+fn actionForKey(bindings: []const KeyBinding, key: chasen.Key) ?Action {
+    for (bindings) |binding| {
+        if (binding.matcher.matches(key)) return binding.action;
+    }
+    return null;
 }
 
 fn isHelpKey(key: chasen.Key) bool {
@@ -237,6 +369,88 @@ fn isVaxisSpecialCodepoint(codepoint: u21) bool {
 
 fn isPrintableCodepoint(codepoint: u21) bool {
     return codepoint >= 0x20 and codepoint != 0x7f and !(codepoint >= 0x80 and codepoint <= 0x9f);
+}
+
+fn actionToMsg(comptime Msg: type, action: Action) Msg {
+    return switch (action) {
+        .cancel_search => voidMsg(Msg, "cancel_search"),
+        .submit_search => voidMsg(Msg, "submit_search"),
+        .search_backspace => voidMsg(Msg, "search_backspace"),
+        .cancel_file_search => voidMsg(Msg, "cancel_file_search"),
+        .submit_file_search => voidMsg(Msg, "submit_file_search"),
+        .file_search_backspace => voidMsg(Msg, "file_search_backspace"),
+        .cancel_commit_panel => voidMsg(Msg, "cancel_commit_panel"),
+        .submit_commit_panel => voidMsg(Msg, "submit_commit_panel"),
+        .commit_panel_tab => voidMsg(Msg, "commit_panel_tab"),
+        .commit_panel_enter => voidMsg(Msg, "commit_panel_enter"),
+        .commit_panel_backspace => voidMsg(Msg, "commit_panel_backspace"),
+        .commit_panel_move_left => voidMsg(Msg, "commit_panel_move_left"),
+        .commit_panel_move_right => voidMsg(Msg, "commit_panel_move_right"),
+        .commit_panel_move_up => voidMsg(Msg, "commit_panel_move_up"),
+        .commit_panel_move_down => voidMsg(Msg, "commit_panel_move_down"),
+        .cancel_repo_picker => voidMsg(Msg, "cancel_repo_picker"),
+        .submit_repo_picker => voidMsg(Msg, "submit_repo_picker"),
+        .repo_picker_backspace => voidMsg(Msg, "repo_picker_backspace"),
+        .repo_picker_enter_path_input => voidMsg(Msg, "repo_picker_enter_path_input"),
+        .repo_picker_move_previous => voidMsg(Msg, "repo_picker_move_previous"),
+        .repo_picker_move_next => voidMsg(Msg, "repo_picker_move_next"),
+        .repo_picker_move_left => voidMsg(Msg, "repo_picker_move_left"),
+        .repo_picker_move_right => voidMsg(Msg, "repo_picker_move_right"),
+        .toggle_focus => voidMsg(Msg, "toggle_focus"),
+        .page_diff_up => voidMsg(Msg, "page_diff_up"),
+        .page_diff_down => voidMsg(Msg, "page_diff_down"),
+        .select_first_file => voidMsg(Msg, "select_first_file"),
+        .select_last_file => voidMsg(Msg, "select_last_file"),
+        .clear_search => voidMsg(Msg, "clear_search"),
+        .toggle_directory => voidMsg(Msg, "toggle_directory"),
+        .toggle_hunk_fold => voidMsg(Msg, "toggle_hunk_fold"),
+        .expand_directory => voidMsg(Msg, "expand_directory"),
+        .collapse_or_parent_directory => voidMsg(Msg, "collapse_or_parent_directory"),
+        .scroll_diff_right => voidMsg(Msg, "scroll_diff_right"),
+        .scroll_diff_left => voidMsg(Msg, "scroll_diff_left"),
+        .scroll_diff_up => voidMsg(Msg, "scroll_diff_up"),
+        .select_previous_file => voidMsg(Msg, "select_previous_file"),
+        .scroll_diff_down => voidMsg(Msg, "scroll_diff_down"),
+        .select_next_file => voidMsg(Msg, "select_next_file"),
+        .enter_search => voidMsg(Msg, "enter_search"),
+        .select_next_search_match => voidMsg(Msg, "select_next_search_match"),
+        .select_next_hunk => voidMsg(Msg, "select_next_hunk"),
+        .select_previous_search_match => voidMsg(Msg, "select_previous_search_match"),
+        .select_previous_hunk => voidMsg(Msg, "select_previous_hunk"),
+        .enter_file_search => voidMsg(Msg, "enter_file_search"),
+        .enter_repo_picker => voidMsg(Msg, "enter_repo_picker"),
+        .open_help => voidMsg(Msg, "open_help"),
+        .close_help => voidMsg(Msg, "close_help"),
+        .help_scroll_up => voidMsg(Msg, "help_scroll_up"),
+        .help_scroll_down => voidMsg(Msg, "help_scroll_down"),
+        .help_page_up => voidMsg(Msg, "help_page_up"),
+        .help_page_down => voidMsg(Msg, "help_page_down"),
+        .cycle_changed_file_filter => voidMsg(Msg, "cycle_changed_file_filter"),
+        .toggle_reviewed_file => voidMsg(Msg, "toggle_reviewed_file"),
+        .toggle_hide_reviewed_files => voidMsg(Msg, "toggle_hide_reviewed_files"),
+        .toggle_sidebar_visibility => voidMsg(Msg, "toggle_sidebar_visibility"),
+        .decrease_sidebar_width => voidMsg(Msg, "decrease_sidebar_width"),
+        .increase_sidebar_width => voidMsg(Msg, "increase_sidebar_width"),
+        .enter_commit_panel => voidMsg(Msg, "enter_commit_panel"),
+        .enter_amend_panel => voidMsg(Msg, "enter_amend_panel"),
+        .stage_selected_file => voidMsg(Msg, "stage_selected_file"),
+        .stage_selected_hunk => voidMsg(Msg, "stage_selected_hunk"),
+        .unstage_selected_file => voidMsg(Msg, "unstage_selected_file"),
+        .unstage_selected_hunk => voidMsg(Msg, "unstage_selected_hunk"),
+        .request_discard_selected_file => voidMsg(Msg, "request_discard_selected_file"),
+        .confirm_discard_file => voidMsg(Msg, "confirm_discard_file"),
+        .cancel_discard_file => voidMsg(Msg, "cancel_discard_file"),
+        .confirm_amend => voidMsg(Msg, "confirm_amend"),
+        .cancel_amend => voidMsg(Msg, "cancel_amend"),
+        .open_selected_file_in_editor => voidMsg(Msg, "open_selected_file_in_editor"),
+        .toggle_display_mode => voidMsg(Msg, "toggle_display_mode"),
+        .toggle_line_numbers => voidMsg(Msg, "toggle_line_numbers"),
+        .finish_review_approved => voidMsg(Msg, "finish_review_approved"),
+        .finish_review_needs_changes => voidMsg(Msg, "finish_review_needs_changes"),
+        .finish_review_canceled => voidMsg(Msg, "finish_review_canceled"),
+        .quit => voidMsg(Msg, "quit"),
+        .reload => voidMsg(Msg, "reload"),
+    };
 }
 
 fn voidMsg(comptime Msg: type, comptime tag: []const u8) Msg {
@@ -566,6 +780,20 @@ test "keyToMsg ignores ctrl printable in text input modes" {
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, ctrl_c));
 }
 
+test "keyToMsg ignores command modifiers for static viewer bindings" {
+    const cases = [_]chasen.Key{
+        .{ .codepoint = '/', .mods = .{ .ctrl = true } },
+        .{ .codepoint = 'r', .mods = .{ .ctrl = true } },
+        .{ .codepoint = 'g', .mods = .{ .alt = true } },
+        .{ .codepoint = 'f', .mods = .{ .super = true } },
+        .{ .codepoint = 'e', .mods = .{ .meta = true } },
+    };
+
+    for (cases) |key| {
+        try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, key));
+    }
+}
+
 test "keyToMsg keeps printable text input modes working" {
     try std.testing.expectEqual(TestMsg{ .search_insert = 'x' }, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = 'x' }).?);
     try std.testing.expectEqual(TestMsg{ .file_search_insert = 'x' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = 'x' }).?);
@@ -686,6 +914,12 @@ test "keyToMsg opens and closes help outside prompt modes" {
     try std.testing.expectEqual(TestMsg.help_page_up, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = chasen.Key.page_up }).?);
     try std.testing.expectEqual(TestMsg.help_page_down, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = chasen.Key.page_down }).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'x' }));
+}
+
+test "keyToMsg ignores command modifiers for help overlay printable shortcuts" {
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'q', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'k', .mods = .{ .alt = true } }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'j', .mods = .{ .super = true } }));
 }
 
 test "keyToMsg keeps prompt modes above help overlay" {
