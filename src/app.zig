@@ -6846,7 +6846,7 @@ test "search match marker is drawn on visible match row" {
 
     app.drawSearchMatchMarker(&ts.surface);
 
-    try ts.expectCellText(0, diff_body_start_row + 1, ">");
+    try ts.expectCellText(0, diff_body_start_row + 1, "»");
 }
 
 test "search marker gutter does not overwrite diff content" {
@@ -6862,8 +6862,8 @@ test "search marker gutter does not overwrite diff content" {
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
-    try ts.expectCellText(0, diff_body_start_row, ">");
-    try ts.expectCellText(1, diff_body_start_row, ">");
+    try ts.expectCellText(0, diff_body_start_row, "»");
+    try ts.expectCellText(1, diff_body_start_row, "▌");
     try ts.expectCellText(2, diff_body_start_row, "i");
 }
 

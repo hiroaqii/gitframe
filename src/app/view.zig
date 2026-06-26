@@ -244,7 +244,7 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
     const width = surface.size().width;
     const row_layout = sidebar_view_model.layout(row_model, width);
     const style = sidebarRowStyle(row_model, pane_active);
-    const marker = if (row_model.selected) ">" else " ";
+    const marker = if (row_model.selected) "▌" else " ";
 
     if (width > row_layout.marker_col) {
         _ = surface.borrowTextAt(0, row, marker, style);
@@ -1229,7 +1229,7 @@ pub fn drawSearchMatchMarker(app: anytype, surface: *chasen.Surface) void {
     if (visible_offset >= body_rows) return;
 
     const row: u16 = @intCast(diff_body_start_row + visible_offset);
-    _ = surface.borrowTextAt(0, row, ">", .{ .bold = true, .reverse = true, .fg = .{ .index = 11 } });
+    _ = surface.borrowTextAt(0, row, "»", .{ .bold = true, .reverse = true, .fg = .{ .index = 11 } });
 }
 
 fn diffContentSurface(surface: *chasen.Surface) chasen.Surface {

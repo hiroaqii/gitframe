@@ -248,7 +248,7 @@ const cursor_gutter_width: u16 = 1;
 
 fn drawCursorMarker(surface: *chasen.Surface, row: u16, body_offset: usize, cursor_offset: ?usize) void {
     if (cursor_offset == null or cursor_offset.? != body_offset) return;
-    _ = surface.borrowTextAt(0, row, ">", style_cursor);
+    _ = surface.borrowTextAt(0, row, "▌", style_cursor);
 }
 
 const BodyCursor = struct {
@@ -935,7 +935,7 @@ test "renderFile cursor marker uses absolute body offset with cached viewport" {
     });
 
     try ts.expectCellText(0, 2, " ");
-    try ts.expectCellText(0, 3, ">");
+    try ts.expectCellText(0, 3, "▌");
 }
 
 test "renderFile can start from cached side-by-side viewport offset" {
