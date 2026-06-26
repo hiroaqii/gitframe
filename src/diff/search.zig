@@ -230,6 +230,17 @@ test "search match does not repeat paired row when base is added side" {
     );
 }
 
+test "search match ignores hidden patch metadata" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a", "old mode 100644" },
+        .hunks = &.{},
+    };
+
+    try std.testing.expect(findMatch(file, .unified, "index", null, .forward) == null);
+    try expectMatch(.{ .metadata = 3 }, findMatch(file, .unified, "old mode", null, .forward));
+}
+
 fn expectMatch(expected: diff_view_model.BodyCoordinate, actual: ?Match) !void {
     try std.testing.expect(actual != null);
     try std.testing.expect(std.meta.eql(expected, actual.?.coordinate));

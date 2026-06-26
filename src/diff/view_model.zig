@@ -356,9 +356,11 @@ fn isFolded(folded_hunks: []const bool, hunk_index: usize) bool {
 }
 
 pub fn isVisibleMetadataLine(line: []const u8) bool {
-    // Path headers are kept in the parsed model for patch generation, but the
-    // viewer chrome already shows the active file path.
-    return !std.mem.startsWith(u8, line, "--- ") and !std.mem.startsWith(u8, line, "+++ ");
+    // Keep patch metadata in the parsed model, but hide rows already covered by
+    // the viewer chrome or too low-level for human review.
+    return !std.mem.startsWith(u8, line, "--- ") and
+        !std.mem.startsWith(u8, line, "+++ ") and
+        !std.mem.startsWith(u8, line, "index ");
 }
 
 fn visibleMetadataRowCount(file: diff_parser.FileDiff) usize {
@@ -786,10 +788,10 @@ test "body line offsets account for metadata and side-by-side pairs" {
         },
     };
 
-    try std.testing.expectEqual(@as(usize, 4), hunkBodyLineOffset(file, .side_by_side, 1));
-    try std.testing.expectEqual(@as(usize, 6), renderedBodyLineCount(file, .side_by_side));
-    try std.testing.expectEqual(@as(usize, 5), hunkBodyLineOffset(file, .unified, 1));
-    try std.testing.expectEqual(@as(usize, 7), renderedBodyLineCount(file, .unified));
+    try std.testing.expectEqual(@as(usize, 3), hunkBodyLineOffset(file, .side_by_side, 1));
+    try std.testing.expectEqual(@as(usize, 5), renderedBodyLineCount(file, .side_by_side));
+    try std.testing.expectEqual(@as(usize, 4), hunkBodyLineOffset(file, .unified, 1));
+    try std.testing.expectEqual(@as(usize, 6), renderedBodyLineCount(file, .unified));
 }
 
 test "rendered line index matches iterator wrappers" {
@@ -833,7 +835,7 @@ test "rendered line index matches iterator wrappers" {
     try std.testing.expectEqual(renderedBodyLineCount(file, .side_by_side), side_by_side.lineCount());
     try std.testing.expectEqual(hunkBodyLineOffset(file, .unified, 1), unified.hunkOffset(1));
     try std.testing.expectEqual(hunkBodyLineOffset(file, .side_by_side, 1), side_by_side.hunkOffset(1));
-    try std.testing.expectEqual(@as(usize, 1), unified.metadata_rows);
+    try std.testing.expectEqual(@as(usize, 0), unified.metadata_rows);
     try std.testing.expectEqual(@as(usize, 0), unified.binary_rows);
     try std.testing.expectEqual(@as(usize, 6), unified.hunkLineCount(0));
     try std.testing.expectEqual(@as(usize, 5), side_by_side.hunkLineCount(0));
@@ -873,7 +875,7 @@ test "rendered line index can fold hunk bodies in place" {
     defer index.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), index.hunkLineCount(0));
-    try std.testing.expectEqual(@as(usize, 2), index.hunkOffset(1));
+    try std.testing.expectEqual(@as(usize, 1), index.hunkOffset(1));
     try std.testing.expectEqual(@as(?usize, null), renderedOffsetForCoordinate(file, .unified, .{
         .hunk_line = .{ .hunk_index = 0, .line_index = 0 },
     }, index));
@@ -1021,7 +1023,7 @@ test "coordinateAtOffset maps rendered rows back to body coordinates" {
     var side_by_side = try RenderedLineIndex.build(std.testing.allocator, file, .side_by_side);
     defer side_by_side.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(BodyCoordinate{ .metadata = 0 }, coordinateAtOffset(file, .unified, 0, &.{}, unified).?);
+    try std.testing.expectEqual(BodyCoordinate{ .hunk_header = 0 }, coordinateAtOffset(file, .unified, 0, &.{}, unified).?);
     try std.testing.expectEqual(BodyCoordinate{ .hunk_header = 0 }, coordinateAtOffset(file, .unified, unified.hunkOffset(0), &.{}, unified).?);
     try std.testing.expectEqual(BodyCoordinate{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } }, coordinateAtOffset(file, .unified, unified.hunkOffset(0) + 2, &.{}, unified).?);
 

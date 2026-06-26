@@ -16,7 +16,7 @@ const sidebar_view_model = @import("../sidebar/view_model.zig");
 /// shared with tests through small public helpers.
 pub const footer_rows: u16 = 1;
 pub const sidebar_header_rows: u16 = 3;
-pub const diff_body_start_row: u16 = 2;
+pub const diff_body_start_row: u16 = diff_render.body_start_row;
 
 const search_marker_gutter_width: u16 = 1;
 const shell_frame_min_width: u16 = 30;

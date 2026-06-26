@@ -3845,19 +3845,7 @@ pub const App = struct {
     }
 
     fn initializeDiffCursorForSelectedFile(self: *App) void {
-        const file = if (self.activeCombinedProjection()) |bundle| bundle.projection.file else self.selectedFile() orelse {
-            self.viewer.diff_cursor = .{ .metadata = 0 };
-            return;
-        };
-        if (file.hunks.len > 0) {
-            self.viewer.diff_cursor = .{ .hunk_header = 0 };
-        } else if (file.metadata.len > 0) {
-            self.viewer.diff_cursor = .{ .metadata = 0 };
-        } else if (file.is_binary) {
-            self.viewer.diff_cursor = .binary_marker;
-        } else {
-            self.viewer.diff_cursor = .{ .metadata = 0 };
-        }
+        self.viewer.diff_cursor = self.selectedCoordinateAtOffset(0) orelse .{ .metadata = 0 };
     }
 
     pub fn visibleDiffCursorOffset(self: *const App) ?usize {
@@ -4496,6 +4484,30 @@ test "mouse diff scroll keeps cursor in the viewport" {
     try std.testing.expect(app.visibleDiffCursorOffset() != null);
 }
 
+test "diff cursor initialization skips hidden metadata rows" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load = testLoadState(testLoadedDiffMetadataOnly()),
+    };
+
+    app.initializeDiffCursorForSelectedFile();
+
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
+}
+
+test "diff cursor initialization selects binary marker after hidden metadata" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .load = testLoadState(testLoadedDiffBinaryOnly()),
+    };
+
+    app.initializeDiffCursorForSelectedFile();
+
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate.binary_marker, app.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
+}
+
 test "diff scroll keeps visible cursor screen position stable" {
     var app: App = .{
         .terminal_size = .{ .width = 140, .height = 8 },
@@ -4940,14 +4952,14 @@ test "mode change resyncs search match to rendered body offsets" {
 
     app.submitSearch();
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 10), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 9), app.search.match_offset);
 
     app.viewer.display_mode = .side_by_side;
     app.clampDiffNavigationKeepingHunkVisible();
     app.updateSearchMatchOffset();
 
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 8), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 7), app.search.match_offset);
     try std.testing.expect(app.search.match_offset.? >= app.viewer.diff_scroll);
     try std.testing.expect(app.search.match_offset.? < app.viewer.diff_scroll + app.diffVisibleRows());
 }
@@ -4962,17 +4974,17 @@ test "mode change keeps search near later matches" {
 
     app.submitSearch();
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 5), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 4), app.search.match_offset);
     app.selectSearchMatch(.forward);
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 10), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 9), app.search.match_offset);
 
     app.viewer.display_mode = .side_by_side;
     app.clampDiffNavigationKeepingHunkVisible();
     app.updateSearchMatchOffset();
 
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 8), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 7), app.search.match_offset);
 }
 
 test "toggle selected hunk fold updates active rendered line cache" {
@@ -4990,14 +5002,14 @@ test "toggle selected hunk fold updates active rendered line cache" {
     };
     defer app.clearLoadedDiff();
 
-    try std.testing.expectEqual(@as(usize, 11), app.selectedFileLineIndex(.unified).lineCount());
+    try std.testing.expectEqual(@as(usize, 10), app.selectedFileLineIndex(.unified).lineCount());
     app.toggleSelectedHunkFold();
 
     const active = app.loadedDiff().?;
     try std.testing.expect(active.isHunkFolded(0, 0));
-    try std.testing.expectEqual(@as(usize, 6), app.selectedFileLineIndex(.unified).lineCount());
+    try std.testing.expectEqual(@as(usize, 5), app.selectedFileLineIndex(.unified).lineCount());
     try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .unified).hunkLineCount(0));
-    try std.testing.expectEqual(@as(usize, 5), app.selectedFileLineIndex(.side_by_side).lineCount());
+    try std.testing.expectEqual(@as(usize, 4), app.selectedFileLineIndex(.side_by_side).lineCount());
     try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .side_by_side).hunkLineCount(0));
 }
 
@@ -5022,7 +5034,7 @@ test "search unfolds folded hunk body matches before setting offset" {
     const active = app.loadedDiff().?;
     try std.testing.expect(!active.isHunkFolded(0, 0));
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 5), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 4), app.search.match_offset);
 }
 
 test "manual fold keeps hunk open when it contains active search match" {
@@ -5046,7 +5058,7 @@ test "manual fold keeps hunk open when it contains active search match" {
     const active = app.loadedDiff().?;
     try std.testing.expect(!active.isHunkFolded(0, 0));
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 5), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 4), app.search.match_offset);
 }
 
 test "file change resyncs retained search query to selected file" {
@@ -6858,13 +6870,14 @@ test "search marker gutter does not overwrite diff content" {
         .terminal_size = .{ .width = 90, .height = 11 },
         .load = testLoadState(testLoadedDiffOne()),
         .search = .{ .match_offset = 0 },
+        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(0, diff_body_start_row, "»");
     try ts.expectCellText(1, diff_body_start_row, "▌");
-    try ts.expectCellText(2, diff_body_start_row, "i");
+    try ts.expectCellText(2, diff_body_start_row, "▾");
 }
 
 test "status mode label uses diff content width after marker gutter" {
@@ -6912,7 +6925,7 @@ test "canceling edited search restores committed query and match" {
         .load = testLoadState(testLoadedDiffOne()),
         .search = .{
             .match = .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } },
-            .match_offset = 5,
+            .match_offset = 4,
         },
     };
     setDiffSearchQuery(&app, "new");
@@ -6925,7 +6938,7 @@ test "canceling edited search restores committed query and match" {
     try std.testing.expectEqualStrings("new", app.search.query.slice());
     try std.testing.expectEqualStrings("new", app.search.input.slice());
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 5), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 4), app.search.match_offset);
 }
 
 test "load empty state shows actionable no changes message" {
@@ -7390,6 +7403,28 @@ fn testLoadedDiffWide() LoadedDiff {
     };
 }
 
+fn testLoadedDiffMetadataOnly() LoadedDiff {
+    return .{
+        .text = "",
+        .document = .{ .files = &test_files_metadata_only },
+        .tree = .{ .nodes = &test_tree_one_nodes },
+        .collapsed_dirs = .{},
+        .bytes = 0,
+        .lines = 0,
+    };
+}
+
+fn testLoadedDiffBinaryOnly() LoadedDiff {
+    return .{
+        .text = "",
+        .document = .{ .files = &test_files_binary_only },
+        .tree = .{ .nodes = &test_tree_one_nodes },
+        .collapsed_dirs = .{},
+        .bytes = 0,
+        .lines = 0,
+    };
+}
+
 fn testCombinedHunkBundle(allocator: std.mem.Allocator) !app_review_projection.CombinedHunkBundle {
     var cached_bundle = try app_load.buildLoadedBundle(allocator, test_diff_cached_projection);
     errdefer cached_bundle.deinit();
@@ -7474,6 +7509,27 @@ const test_files_two_statuses = [_]diff_parser.FileDiff{
 
 const test_files_wide = [_]diff_parser.FileDiff{
     test_file_wide,
+};
+
+const test_files_metadata_only = [_]diff_parser.FileDiff{
+    .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{ "index 1..2", "old mode 100644" },
+        .hunks = &.{},
+    },
+};
+
+const test_files_binary_only = [_]diff_parser.FileDiff{
+    .{
+        .header = "diff --git a/bin b/bin",
+        .old_path = "a/bin",
+        .new_path = "b/bin",
+        .metadata = &.{"index 1..2"},
+        .hunks = &.{},
+        .is_binary = true,
+    },
 };
 
 const test_file_wide = diff_parser.FileDiff{
