@@ -4940,14 +4940,14 @@ test "mode change resyncs search match to rendered body offsets" {
 
     app.submitSearch();
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 12), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 10), app.search.match_offset);
 
     app.viewer.display_mode = .side_by_side;
     app.clampDiffNavigationKeepingHunkVisible();
     app.updateSearchMatchOffset();
 
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 10), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 8), app.search.match_offset);
     try std.testing.expect(app.search.match_offset.? >= app.viewer.diff_scroll);
     try std.testing.expect(app.search.match_offset.? < app.viewer.diff_scroll + app.diffVisibleRows());
 }
@@ -4962,17 +4962,17 @@ test "mode change keeps search near later matches" {
 
     app.submitSearch();
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 7), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 5), app.search.match_offset);
     app.selectSearchMatch(.forward);
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 12), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 10), app.search.match_offset);
 
     app.viewer.display_mode = .side_by_side;
     app.clampDiffNavigationKeepingHunkVisible();
     app.updateSearchMatchOffset();
 
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 10), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 8), app.search.match_offset);
 }
 
 test "toggle selected hunk fold updates active rendered line cache" {
@@ -4990,14 +4990,14 @@ test "toggle selected hunk fold updates active rendered line cache" {
     };
     defer app.clearLoadedDiff();
 
-    try std.testing.expectEqual(@as(usize, 13), app.selectedFileLineIndex(.unified).lineCount());
+    try std.testing.expectEqual(@as(usize, 11), app.selectedFileLineIndex(.unified).lineCount());
     app.toggleSelectedHunkFold();
 
     const active = app.loadedDiff().?;
     try std.testing.expect(active.isHunkFolded(0, 0));
-    try std.testing.expectEqual(@as(usize, 8), app.selectedFileLineIndex(.unified).lineCount());
+    try std.testing.expectEqual(@as(usize, 6), app.selectedFileLineIndex(.unified).lineCount());
     try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .unified).hunkLineCount(0));
-    try std.testing.expectEqual(@as(usize, 7), app.selectedFileLineIndex(.side_by_side).lineCount());
+    try std.testing.expectEqual(@as(usize, 5), app.selectedFileLineIndex(.side_by_side).lineCount());
     try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .side_by_side).hunkLineCount(0));
 }
 
@@ -5022,7 +5022,7 @@ test "search unfolds folded hunk body matches before setting offset" {
     const active = app.loadedDiff().?;
     try std.testing.expect(!active.isHunkFolded(0, 0));
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 7), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 5), app.search.match_offset);
 }
 
 test "manual fold keeps hunk open when it contains active search match" {
@@ -5046,7 +5046,7 @@ test "manual fold keeps hunk open when it contains active search match" {
     const active = app.loadedDiff().?;
     try std.testing.expect(!active.isHunkFolded(0, 0));
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 7), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 5), app.search.match_offset);
 }
 
 test "file change resyncs retained search query to selected file" {
@@ -6910,7 +6910,7 @@ test "canceling edited search restores committed query and match" {
         .load = testLoadState(testLoadedDiffOne()),
         .search = .{
             .match = .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } },
-            .match_offset = 7,
+            .match_offset = 5,
         },
     };
     setDiffSearchQuery(&app, "new");
@@ -6923,7 +6923,7 @@ test "canceling edited search restores committed query and match" {
     try std.testing.expectEqualStrings("new", app.search.query.slice());
     try std.testing.expectEqualStrings("new", app.search.input.slice());
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 7), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 5), app.search.match_offset);
 }
 
 test "load empty state shows actionable no changes message" {

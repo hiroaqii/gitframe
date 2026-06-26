@@ -109,7 +109,7 @@ pub const BodyRowIterator = struct {
                 .file = file,
                 .mode = mode,
                 .folded_hunks = folded_hunks,
-                .metadata_index = body_offset,
+                .metadata_index = metadataIndexAtVisibleRow(file, body_offset) orelse file.metadata.len,
             };
         }
 
@@ -166,6 +166,7 @@ pub const BodyRowIterator = struct {
                     if (self.metadata_index < self.file.metadata.len) {
                         const line = self.file.metadata[self.metadata_index];
                         self.metadata_index += 1;
+                        if (!isVisibleMetadataLine(line)) continue;
                         return .{ .metadata = line };
                     }
                     self.phase = if (self.file.is_binary) .binary else .hunk_header;
@@ -262,8 +263,8 @@ pub fn renderedOffsetForCoordinate(
         null;
 
     return switch (coordinate) {
-        .metadata => |metadata_index| if (metadata_index < file.metadata.len) metadata_index else null,
-        .binary_marker => if (file.is_binary) file.metadata.len else null,
+        .metadata => |metadata_index| visibleMetadataOffset(file, metadata_index),
+        .binary_marker => if (file.is_binary) visibleMetadataRowCount(file) else null,
         .hunk_header => |hunk_index| hunkOffsetForCoordinate(file, mode, index, hunk_index),
         .hunk_line => |line| blk: {
             if (line.hunk_index >= file.hunks.len) break :blk null;
@@ -299,9 +300,12 @@ pub fn coordinateAtOffset(
         if (offset >= line_index.lineCount()) return null;
     }
 
-    if (offset < file.metadata.len) return .{ .metadata = offset };
+    const metadata_rows = visibleMetadataRowCount(file);
+    if (offset < metadata_rows) {
+        return .{ .metadata = metadataIndexAtVisibleRow(file, offset) orelse return null };
+    }
 
-    if (file.is_binary and offset == file.metadata.len) return .binary_marker;
+    if (file.is_binary and offset == metadata_rows) return .binary_marker;
 
     const hunk_index = if (index) |line_index|
         line_index.hunkIndexAtOffset(offset)
@@ -349,6 +353,43 @@ fn hunkIndexAtOffsetByWalk(file: diff_parser.FileDiff, mode: DisplayMode, offset
 
 fn isFolded(folded_hunks: []const bool, hunk_index: usize) bool {
     return hunk_index < folded_hunks.len and folded_hunks[hunk_index];
+}
+
+pub fn isVisibleMetadataLine(line: []const u8) bool {
+    // Path headers are kept in the parsed model for patch generation, but the
+    // viewer chrome already shows the active file path.
+    return !std.mem.startsWith(u8, line, "--- ") and !std.mem.startsWith(u8, line, "+++ ");
+}
+
+fn visibleMetadataRowCount(file: diff_parser.FileDiff) usize {
+    var count: usize = 0;
+    for (file.metadata) |line| {
+        if (isVisibleMetadataLine(line)) count += 1;
+    }
+    return count;
+}
+
+fn metadataIndexAtVisibleRow(file: diff_parser.FileDiff, visible_row: usize) ?usize {
+    var row: usize = 0;
+    for (file.metadata, 0..) |line, index| {
+        if (!isVisibleMetadataLine(line)) continue;
+        if (row == visible_row) return index;
+        row += 1;
+    }
+    return null;
+}
+
+fn visibleMetadataOffset(file: diff_parser.FileDiff, metadata_index: usize) ?usize {
+    if (metadata_index >= file.metadata.len) return null;
+    if (!isVisibleMetadataLine(file.metadata[metadata_index])) return null;
+
+    var row: usize = 0;
+    for (file.metadata, 0..) |line, index| {
+        if (!isVisibleMetadataLine(line)) continue;
+        if (index == metadata_index) return row;
+        row += 1;
+    }
+    return null;
 }
 
 pub const RenderedLineIndex = struct {
@@ -745,10 +786,10 @@ test "body line offsets account for metadata and side-by-side pairs" {
         },
     };
 
-    try std.testing.expectEqual(@as(usize, 6), hunkBodyLineOffset(file, .side_by_side, 1));
-    try std.testing.expectEqual(@as(usize, 8), renderedBodyLineCount(file, .side_by_side));
-    try std.testing.expectEqual(@as(usize, 7), hunkBodyLineOffset(file, .unified, 1));
-    try std.testing.expectEqual(@as(usize, 9), renderedBodyLineCount(file, .unified));
+    try std.testing.expectEqual(@as(usize, 4), hunkBodyLineOffset(file, .side_by_side, 1));
+    try std.testing.expectEqual(@as(usize, 6), renderedBodyLineCount(file, .side_by_side));
+    try std.testing.expectEqual(@as(usize, 5), hunkBodyLineOffset(file, .unified, 1));
+    try std.testing.expectEqual(@as(usize, 7), renderedBodyLineCount(file, .unified));
 }
 
 test "rendered line index matches iterator wrappers" {
@@ -792,7 +833,7 @@ test "rendered line index matches iterator wrappers" {
     try std.testing.expectEqual(renderedBodyLineCount(file, .side_by_side), side_by_side.lineCount());
     try std.testing.expectEqual(hunkBodyLineOffset(file, .unified, 1), unified.hunkOffset(1));
     try std.testing.expectEqual(hunkBodyLineOffset(file, .side_by_side, 1), side_by_side.hunkOffset(1));
-    try std.testing.expectEqual(@as(usize, 3), unified.metadata_rows);
+    try std.testing.expectEqual(@as(usize, 1), unified.metadata_rows);
     try std.testing.expectEqual(@as(usize, 0), unified.binary_rows);
     try std.testing.expectEqual(@as(usize, 6), unified.hunkLineCount(0));
     try std.testing.expectEqual(@as(usize, 5), side_by_side.hunkLineCount(0));

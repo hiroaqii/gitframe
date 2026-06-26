@@ -37,6 +37,7 @@ pub fn findMatch(
     var offset: usize = 0;
 
     for (file.metadata, 0..) |line, index| {
+        if (!diff_view_model.isVisibleMetadataLine(line)) continue;
         collectCandidate(.{ .metadata = index }, line, query, offset, base_offset, &first, &last, &after_base, &before_base);
         offset += 1;
     }
