@@ -25,6 +25,7 @@ pub const KeyContext = struct {
     repo_picker_path_input: bool = false,
     help_mode: bool = false,
     discard_confirmation_mode: bool = false,
+    amend_confirmation_mode: bool = false,
     search_query_len: usize = 0,
     focus: Focus = .sidebar,
     sidebar_hidden: bool = false,
@@ -55,20 +56,6 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "submit_file_search");
         if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "file_search_backspace");
         if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "file_search_insert", codepoint);
-        return null;
-    }
-
-    if (context.commit_panel_mode) {
-        if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_commit_panel");
-        if (key.matches(chasen.Key.enter, .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return voidMsg(Msg, "submit_commit_panel");
-        if (key.matches(chasen.Key.tab, .{})) return voidMsg(Msg, "commit_panel_tab");
-        if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "commit_panel_enter");
-        if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "commit_panel_backspace");
-        if (key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "commit_panel_move_left");
-        if (key.matches(chasen.Key.right, .{})) return voidMsg(Msg, "commit_panel_move_right");
-        if (key.matches(chasen.Key.up, .{})) return voidMsg(Msg, "commit_panel_move_up");
-        if (key.matches(chasen.Key.down, .{})) return voidMsg(Msg, "commit_panel_move_down");
-        if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "commit_panel_insert", codepoint);
         return null;
     }
 
@@ -110,6 +97,26 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         return null;
     }
 
+    if (context.amend_confirmation_mode) {
+        if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return voidMsg(Msg, "cancel_amend");
+        if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "confirm_amend");
+        return null;
+    }
+
+    if (context.commit_panel_mode) {
+        if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_commit_panel");
+        if (key.matches(chasen.Key.enter, .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return voidMsg(Msg, "submit_commit_panel");
+        if (key.matches(chasen.Key.tab, .{})) return voidMsg(Msg, "commit_panel_tab");
+        if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "commit_panel_enter");
+        if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "commit_panel_backspace");
+        if (key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "commit_panel_move_left");
+        if (key.matches(chasen.Key.right, .{})) return voidMsg(Msg, "commit_panel_move_right");
+        if (key.matches(chasen.Key.up, .{})) return voidMsg(Msg, "commit_panel_move_up");
+        if (key.matches(chasen.Key.down, .{})) return voidMsg(Msg, "commit_panel_move_down");
+        if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "commit_panel_insert", codepoint);
+        return null;
+    }
+
     if (key.matches(chasen.Key.tab, .{}) and !context.sidebar_hidden) return voidMsg(Msg, "toggle_focus");
     if (key.matches(chasen.Key.page_up, .{})) return voidMsg(Msg, "page_diff_up");
     if (key.matches(chasen.Key.page_down, .{})) return voidMsg(Msg, "page_diff_down");
@@ -143,6 +150,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         return if (context.focus == .diff) voidMsg(Msg, "unstage_selected_hunk") else voidMsg(Msg, "unstage_selected_file");
     }
     if (matchesShiftedAscii(key, 'd', 'D')) return voidMsg(Msg, "request_discard_selected_file");
+    if (matchesShiftedAscii(key, 'a', 'A')) return voidMsg(Msg, "enter_amend_panel");
     if (key.matches('c', .{})) return voidMsg(Msg, "enter_commit_panel");
     if (hasCommandModifier(key)) return null;
 
@@ -290,6 +298,7 @@ const TestMsg = union(enum) {
     decrease_sidebar_width,
     increase_sidebar_width,
     enter_commit_panel,
+    enter_amend_panel,
     stage_selected_file,
     stage_selected_hunk,
     unstage_selected_file,
@@ -297,6 +306,8 @@ const TestMsg = union(enum) {
     request_discard_selected_file,
     confirm_discard_file,
     cancel_discard_file,
+    confirm_amend,
+    cancel_amend,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
@@ -374,6 +385,10 @@ test "keyToMsg maps discard confirmation flow" {
 
 test "keyToMsg maps commit panel command and routes panel input" {
     try std.testing.expectEqual(TestMsg.enter_commit_panel, keyToMsg(TestMsg, .{}, .{ .codepoint = 'c' }).?);
+    try std.testing.expectEqual(TestMsg.enter_amend_panel, keyToMsg(TestMsg, .{}, .{ .codepoint = 'A' }).?);
+    try std.testing.expectEqual(TestMsg.enter_amend_panel, keyToMsg(TestMsg, .{}, shiftedAscii('a', 'A')).?);
+    try std.testing.expectEqual(TestMsg.enter_amend_panel, keyToMsg(TestMsg, .{}, shiftedLowerOnly('a')).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'a' }));
     try std.testing.expectEqual(TestMsg.cancel_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(TestMsg.submit_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter, .mods = .{ .ctrl = true } }).?);
     try std.testing.expectEqual(TestMsg.submit_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 's', .mods = .{ .ctrl = true } }).?);
@@ -389,6 +404,24 @@ test "keyToMsg maps commit panel command and routes panel input" {
     try std.testing.expectEqual(TestMsg.enter_commit_panel, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'c' }).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
+}
+
+test "keyToMsg maps amend confirmation flow" {
+    try std.testing.expectEqual(TestMsg.confirm_amend, keyToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(TestMsg.cancel_amend, keyToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(TestMsg.cancel_amend, keyToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .codepoint = 'A' }));
+}
+
+test "keyToMsg prioritizes amend confirmation over open commit panel" {
+    const context: KeyContext = .{
+        .commit_panel_mode = true,
+        .amend_confirmation_mode = true,
+    };
+
+    try std.testing.expectEqual(TestMsg.confirm_amend, keyToMsg(TestMsg, context, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(TestMsg.cancel_amend, keyToMsg(TestMsg, context, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(TestMsg.cancel_amend, keyToMsg(TestMsg, context, .{ .codepoint = 'q' }).?);
 }
 
 test "keyToMsg maps repo picker path input command across shifted colon variants" {

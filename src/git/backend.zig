@@ -104,6 +104,7 @@ pub const OperationKind = union(enum) {
     stage_patch: StagePatchRequest,
     unstage_patch: StagePatchRequest,
     commit: CommitRequest,
+    amend: CommitRequest,
 };
 
 pub const StagePatchRequest = struct {
@@ -183,6 +184,7 @@ pub const LocalCommandBackend = struct {
             .stage_patch => |patch| runGitApplyCached(allocator, io, request.repo_root, patch.patch),
             .unstage_patch => |patch| runGitApplyCachedReverse(allocator, io, request.repo_root, patch.patch),
             .commit => |commit| runGitCommit(allocator, io, request.repo_root, commit),
+            .amend => |commit| runGitAmend(allocator, io, request.repo_root, commit),
         };
     }
 
@@ -426,9 +428,21 @@ fn runGitApplyCachedReverse(allocator: std.mem.Allocator, io: std.Io, repo_root:
 }
 
 fn runGitCommit(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest) LoadError!OperationResult {
+    return runGitCommitLike(allocator, io, repo_root, request, false);
+}
+
+fn runGitAmend(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest) LoadError!OperationResult {
+    return runGitCommitLike(allocator, io, repo_root, request, true);
+}
+
+fn runGitCommitLike(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest, amend: bool) LoadError!OperationResult {
     const argv_subject = [_][]const u8{ "git", "commit", "-m", request.subject };
     const argv_with_body = [_][]const u8{ "git", "commit", "-m", request.subject, "-m", request.body orelse "" };
-    const argv = if (request.body == null) argv_subject[0..] else argv_with_body[0..];
+    const amend_argv_subject = [_][]const u8{ "git", "commit", "--amend", "-m", request.subject };
+    const amend_argv_with_body = [_][]const u8{ "git", "commit", "--amend", "-m", request.subject, "-m", request.body orelse "" };
+    const argv = if (amend)
+        if (request.body == null) amend_argv_subject[0..] else amend_argv_with_body[0..]
+    else if (request.body == null) argv_subject[0..] else argv_with_body[0..];
 
     const result = std.process.run(allocator, io, .{
         .argv = argv,
@@ -608,6 +622,12 @@ test "Backend exposes operation interface" {
         .kind = .{ .stage_patch = .{ .patch = "diff --git a/a b/a\n" } },
     };
     try std.testing.expectEqualStrings("diff --git a/a b/a\n", patch_request.kind.stage_patch.patch);
+
+    const amend_request: OperationRequest = .{
+        .repo_root = "/repo",
+        .kind = .{ .amend = .{ .subject = "subject", .body = null } },
+    };
+    try std.testing.expectEqualStrings("subject", amend_request.kind.amend.subject);
 }
 
 test "GitDiffRequest cannot represent raw input sources" {

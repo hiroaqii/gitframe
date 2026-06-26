@@ -12,6 +12,7 @@ pub const CommitError = enum {
     status_unavailable,
     action_pending,
     commit_failed,
+    amend_failed,
 
     pub fn message(self: CommitError) []const u8 {
         return switch (self) {
@@ -24,8 +25,14 @@ pub const CommitError = enum {
             .status_unavailable => "Status is unavailable",
             .action_pending => "Another git action is running",
             .commit_failed => "Commit failed",
+            .amend_failed => "Amend failed",
         };
     }
+};
+
+pub const Mode = enum {
+    commit,
+    amend,
 };
 
 pub const Field = enum {
@@ -192,7 +199,8 @@ pub const StagedSummary = union(enum) {
 /// deinit is the only operation that releases the buffers.
 pub const State = struct {
     allocator: ?std.mem.Allocator = null,
-    mode: bool = false,
+    is_open: bool = false,
+    mode: Mode = .commit,
     active_field: Field = .subject,
     subject: text_buffer.TextBuffer = .{},
     body: BodyText = .{},
@@ -212,17 +220,47 @@ pub const State = struct {
         self.* = .{};
     }
 
-    pub fn open(self: *State) void {
-        self.mode = true;
+    pub fn open(self: *State, mode: Mode) void {
+        self.is_open = true;
+        self.mode = mode;
         self.commit_error = null;
     }
 
     pub fn close(self: *State) void {
-        self.mode = false;
+        self.is_open = false;
+        self.mode = .commit;
         self.active_field = .subject;
         self.subject.clearRetainingCapacity();
         self.body.clearRetainingCapacity();
         self.commit_error = null;
+    }
+
+    pub fn title(self: *const State) []const u8 {
+        return switch (self.mode) {
+            .commit => "Commit",
+            .amend => "Amend commit",
+        };
+    }
+
+    pub fn submitLabel(self: *const State) []const u8 {
+        return switch (self.mode) {
+            .commit => "commit",
+            .amend => "amend",
+        };
+    }
+
+    pub fn pendingStatusText(self: *const State) []const u8 {
+        return switch (self.mode) {
+            .commit => "committing...",
+            .amend => "amending...",
+        };
+    }
+
+    pub fn failedError(self: *const State) CommitError {
+        return switch (self.mode) {
+            .commit => .commit_failed,
+            .amend => .amend_failed,
+        };
     }
 
     pub fn insert(self: *State, codepoint: u21) void {
@@ -320,6 +358,7 @@ pub const State = struct {
         if (trimmedSubject(self).len == 0) return .subject_empty;
         if (self.subjectCharCount() > max_subject_chars) return .subject_too_long;
         if (self.totalRawBytes() > max_message_bytes) return .message_too_large;
+        if (self.mode == .amend) return null;
         return switch (summary) {
             .ready => |ready| if (ready.count == 0) .no_staged_changes else null,
             .loading_or_stale => .status_loading,
@@ -374,7 +413,7 @@ pub const State = struct {
         }
         if (self.commit_error) |err| {
             switch (err) {
-                .subject_too_long, .message_too_large, .input_allocation_failed, .commit_failed => self.commit_error = null,
+                .subject_too_long, .message_too_large, .input_allocation_failed, .commit_failed, .amend_failed => self.commit_error = null,
                 else => {},
             }
         }
@@ -418,6 +457,31 @@ test "State validates commit message and staged summary" {
     try std.testing.expectEqual(CommitError.status_loading, state.validateSubmit(.loading_or_stale).?);
     try std.testing.expectEqual(CommitError.status_unavailable, state.validateSubmit(.unavailable).?);
     try std.testing.expect(state.validateSubmit(.{ .ready = .{ .count = 1 } }) == null);
+}
+
+test "State amend mode skips staged summary gate" {
+    var state: State = .init(std.testing.allocator);
+    defer state.deinit();
+
+    state.open(.amend);
+    state.insert('x');
+
+    try std.testing.expect(state.validateSubmit(.{ .ready = .{ .count = 0 } }) == null);
+    try std.testing.expect(state.validateSubmit(.loading_or_stale) == null);
+    try std.testing.expect(state.validateSubmit(.unavailable) == null);
+}
+
+test "State exposes mode-specific title and submit label" {
+    var state: State = .init(std.testing.allocator);
+    defer state.deinit();
+
+    state.open(.commit);
+    try std.testing.expectEqualStrings("Commit", state.title());
+    try std.testing.expectEqualStrings("commit", state.submitLabel());
+
+    state.open(.amend);
+    try std.testing.expectEqualStrings("Amend commit", state.title());
+    try std.testing.expectEqualStrings("amend", state.submitLabel());
 }
 
 test "State reports subject overflow as panel error" {
@@ -527,17 +591,18 @@ test "State close clears content and remains reusable" {
     var state: State = .init(std.testing.allocator);
     defer state.deinit();
 
-    state.open();
+    state.open(.amend);
     state.insert('s');
     state.enter();
     state.insert('b');
     state.close();
 
-    try std.testing.expect(!state.mode);
+    try std.testing.expect(!state.is_open);
+    try std.testing.expectEqual(Mode.commit, state.mode);
     try std.testing.expectEqualStrings("", state.subject.slice());
     try std.testing.expectEqualStrings("", state.body.slice());
 
-    state.open();
+    state.open(.commit);
     state.insert('x');
     try std.testing.expectEqualStrings("x", state.subject.slice());
 }

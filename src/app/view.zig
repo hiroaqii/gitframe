@@ -33,6 +33,8 @@ const commit_dialog_width: u16 = 72;
 const commit_dialog_height: u16 = 22;
 const discard_dialog_width: u16 = 72;
 const discard_dialog_height: u16 = 9;
+// Amend rewrites history, so it uses a distinct accent from normal commit UI.
+const amend_accent = chasen.Color{ .rgb = .{ 203, 166, 247 } };
 
 const StateTone = enum {
     muted,
@@ -92,11 +94,14 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
     if (app.overlay.isHelp()) {
         try viewHelpPopup(app, surface);
     }
+    if (app.commit_panel.is_open) {
+        try viewCommitPanel(app, surface);
+    }
     if (app.overlay.isDiscardFile()) {
         try viewDiscardConfirmation(app, surface);
     }
-    if (app.commit_panel.mode) {
-        try viewCommitPanel(app, surface);
+    if (app.overlay.isAmendCommit()) {
+        try viewAmendConfirmation(app, surface);
     }
 }
 
@@ -733,12 +738,16 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
 
 fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
     const modal = ui.Modal.init(.{});
+    const title_style: chasen.TextStyle = if (app.commit_panel.mode == .amend)
+        .{ .bold = true, .fg = amend_accent }
+    else
+        .{ .bold = true, .fg = .{ .index = 14 } };
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, commit_dialog_width),
         .dialog_height = @min(surface.size().height, commit_dialog_height),
-        .title = "Commit",
+        .title = app.commit_panel.title(),
         .border = .rounded,
-        .title_style = .{ .bold = true, .fg = .{ .index = 14 } },
+        .title_style = title_style,
         .border_style = .{ .fg = .gray },
         .backdrop_style = .{ .dim = true },
     };
@@ -759,21 +768,22 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
 
     if (size.height > 2 and 2 < field_limit_row) {
         const active = app.commit_panel.active_field == .subject;
-        const label_style: chasen.TextStyle = if (active) .{ .bold = true, .fg = .{ .index = 14 } } else .{ .bold = true };
+        const label_style: chasen.TextStyle = commitFieldLabelStyle(app, active);
         _ = content.borrowTextAt(0, 2, if (active) ">" else " ", label_style);
         _ = content.borrowTextAt(2, 2, "Subject:", label_style);
         try drawCommitCounter(&content, 2, app.commit_panel.subjectCharCount(), app_commit_panel.max_subject_chars);
         const input_col: u16 = @min(2, size.width);
         if (size.height > 3 and 3 < field_limit_row and size.width > input_col) {
             const cursor = if (active) app.commit_panel.subject.cursor else null;
-            try drawCommitInputLine(&content, input_col, 3, app.commit_panel.subject.slice(), cursor, .{ .fg = .{ .index = 11 } });
+            const input_style: chasen.TextStyle = if (app.commit_panel.mode == .amend) .{} else .{ .fg = .{ .index = 11 } };
+            try drawCommitInputLine(&content, input_col, 3, app.commit_panel.subject.slice(), cursor, input_style);
             if (active) showInputCursor(&content, input_col, 3, app.commit_panel.subject.slice(), app.commit_panel.subject.cursor);
         }
     }
 
     if (size.height > 5 and 5 < field_limit_row) {
         const active = app.commit_panel.active_field == .body;
-        const label_style: chasen.TextStyle = if (active) .{ .bold = true, .fg = .{ .index = 14 } } else .{ .bold = true };
+        const label_style: chasen.TextStyle = commitFieldLabelStyle(app, active);
         _ = content.borrowTextAt(0, 5, if (active) ">" else " ", label_style);
         _ = content.borrowTextAt(2, 5, "Body:", label_style);
         try drawCommitCounter(&content, 5, app.commit_panel.bodyCharCount(), null);
@@ -794,11 +804,12 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
         if (app.commit_panel.commit_error) |err| {
             try draw.copyClippedTextAt(&content, 0, error_row, err.message(), .{ .fg = .{ .index = 9 } });
         } else {
-            try draw.copyClippedTextAt(&content, 0, error_row, "Commit execution is added later.", .{ .fg = .gray });
+            const hint = try std.fmt.allocPrint(content.frameAllocator(), "Ctrl+s/Ctrl+Enter: {s}", .{app.commit_panel.submitLabel()});
+            try draw.copyClippedTextAt(&content, 0, error_row, hint, .{ .fg = .gray });
         }
     }
 
-    try viewCommitHelp(&content, help_start_row, help_rows);
+    try viewCommitHelp(app, &content, help_start_row, help_rows);
 }
 
 fn drawCommitCounter(surface: *chasen.Surface, row: u16, len: usize, max: ?usize) !void {
@@ -821,20 +832,30 @@ fn commitHelpRows(width: u16) u16 {
     return if (chasen.text.displayWidth(single_line) <= width) 1 else 2;
 }
 
-fn viewCommitHelp(surface: *chasen.Surface, start_row: u16, rows: u16) !void {
+fn viewCommitHelp(app: anytype, surface: *chasen.Surface, start_row: u16, rows: u16) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0 or start_row >= size.height) return;
 
     const style: chasen.TextStyle = .{ .fg = .gray };
+    const submit_label = app.commit_panel.submitLabel();
     if (rows <= 1) {
-        try draw.copyClippedTextAt(surface, 0, start_row, "Tab: field  Enter: newline  Ctrl+s/Ctrl+Enter: validate  Esc: close", style);
+        const text = try std.fmt.allocPrint(surface.frameAllocator(), "Tab: field  Enter: newline  Ctrl+s/Ctrl+Enter: {s}  Esc: close", .{submit_label});
+        try draw.copyClippedTextAt(surface, 0, start_row, text, style);
         return;
     }
 
-    try draw.copyClippedTextAt(surface, 0, start_row, "Tab: field  Enter: newline  Ctrl+s: validate", style);
+    const line1 = try std.fmt.allocPrint(surface.frameAllocator(), "Tab: field  Enter: newline  Ctrl+s: {s}", .{submit_label});
+    try draw.copyClippedTextAt(surface, 0, start_row, line1, style);
     if (start_row + 1 < size.height) {
-        try draw.copyClippedTextAt(surface, 0, start_row + 1, "Ctrl+Enter: validate  Esc: close", style);
+        const line2 = try std.fmt.allocPrint(surface.frameAllocator(), "Ctrl+Enter: {s}  Esc: close", .{submit_label});
+        try draw.copyClippedTextAt(surface, 0, start_row + 1, line2, style);
     }
+}
+
+fn commitFieldLabelStyle(app: anytype, active: bool) chasen.TextStyle {
+    if (active and app.commit_panel.mode == .amend) return .{ .bold = true, .fg = amend_accent };
+    if (active) return .{ .bold = true, .fg = .{ .index = 14 } };
+    return .{ .bold = true };
 }
 
 fn viewCommitBody(body: *const app_commit_panel.BodyText, surface: *chasen.Surface, active: bool) !void {
@@ -888,6 +909,37 @@ fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
     }
     if (size.height > 4) {
         try draw.copyClippedTextAt(&content, 0, 4, "Enter: discard    Esc/q: cancel", .{ .fg = .gray });
+    }
+}
+
+fn viewAmendConfirmation(app: anytype, surface: *chasen.Surface) !void {
+    const confirmation = app.amend_confirmation orelse return;
+    const modal = ui.Modal.init(.{});
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, discard_dialog_width),
+        .dialog_height = @min(surface.size().height, discard_dialog_height),
+        .title = "Amend last commit?",
+        .border = .rounded,
+        .title_style = .{ .bold = true, .fg = amend_accent },
+        .border_style = .{ .fg = amend_accent },
+        .backdrop_style = .{ .dim = true },
+    };
+    modal.view(surface, opts);
+
+    const content_rect = ui.Modal.contentRect(surface, opts);
+    if (content_rect.width == 0 or content_rect.height == 0) return;
+    var content = surface.child(content_rect);
+    const size = content.size();
+
+    try draw.copyClippedTextAt(&content, 0, 0, "This rewrites the current branch history.", .{ .fg = amend_accent });
+    if (size.height > 2) {
+        try draw.copyClippedTextAt(&content, 0, 2, "Subject:", .{ .bold = true });
+        if (size.width > 9) {
+            try draw.copyClippedTextAt(&content, 9, 2, confirmation.subject, .{ .fg = amend_accent });
+        }
+    }
+    if (size.height > 4) {
+        try draw.copyClippedTextAt(&content, 0, 4, "Enter: amend    Esc/q: cancel", .{ .fg = amend_accent });
     }
 }
 

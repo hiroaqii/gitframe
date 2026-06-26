@@ -5,6 +5,7 @@ pub const OverlayKind = enum {
     none,
     help,
     discard_file,
+    amend_commit,
 };
 
 /// App-owned modal/overlay state.
@@ -23,6 +24,10 @@ pub const OverlayState = struct {
         return self.kind == .discard_file;
     }
 
+    pub fn isAmendCommit(self: OverlayState) bool {
+        return self.kind == .amend_commit;
+    }
+
     pub fn openHelp(self: *OverlayState) void {
         self.kind = .help;
         self.help_scroll = 0;
@@ -30,6 +35,10 @@ pub const OverlayState = struct {
 
     pub fn openDiscardFile(self: *OverlayState) void {
         self.kind = .discard_file;
+    }
+
+    pub fn openAmendCommit(self: *OverlayState) void {
+        self.kind = .amend_commit;
     }
 
     pub fn close(self: *OverlayState) void {
@@ -48,6 +57,23 @@ pub const DiscardFileConfirmation = struct {
     pub fn deinit(self: *DiscardFileConfirmation, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_root);
         allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+/// Owned snapshot for an amend confirmation.
+///
+/// The draft remains editable in the commit panel while this confirmation is
+/// open, so the command payload must be copied before asking for confirmation.
+pub const AmendConfirmation = struct {
+    repo_root: []u8,
+    subject: []u8,
+    body: ?[]u8 = null,
+
+    pub fn deinit(self: *AmendConfirmation, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.subject);
+        if (self.body) |body| allocator.free(body);
         self.* = undefined;
     }
 };

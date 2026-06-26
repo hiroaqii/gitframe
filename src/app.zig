@@ -53,6 +53,8 @@ const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
 const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
+const AmendFinished = app_actions.AmendFinished;
+const AmendTask = app_actions.AmendTask(App.Msg);
 const CommitFinished = app_actions.CommitFinished;
 const CommitTask = app_actions.CommitTask(App.Msg);
 const DiscardFileFinished = app_actions.DiscardFileFinished;
@@ -231,6 +233,7 @@ pub const App = struct {
     /// keeps a materialized bool slice so hide-reviewed hot paths stay O(1).
     reviewed_store: review_state.Store = .{},
     discard_confirmation: ?app_state.DiscardFileConfirmation = null,
+    amend_confirmation: ?app_state.AmendConfirmation = null,
 
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
@@ -245,6 +248,7 @@ pub const App = struct {
         unstage_hunk_finished: UnstageHunkFinished,
         discard_file_finished: DiscardFileFinished,
         commit_finished: CommitFinished,
+        amend_finished: AmendFinished,
         select_previous_file,
         select_next_file,
         toggle_directory,
@@ -290,6 +294,7 @@ pub const App = struct {
         file_search_insert: u21,
         file_search_backspace,
         enter_commit_panel,
+        enter_amend_panel,
         cancel_commit_panel,
         submit_commit_panel,
         commit_panel_tab,
@@ -326,6 +331,8 @@ pub const App = struct {
         request_discard_selected_file,
         confirm_discard_file,
         cancel_discard_file,
+        confirm_amend,
+        cancel_amend,
         open_selected_file_in_editor,
         editor_finished: chasen.ForegroundCommandResult,
         reload,
@@ -361,6 +368,7 @@ pub const App = struct {
         self.staged_hunks.deinit(deinit_ctx.allocator);
         self.review_projection.deinit(deinit_ctx.allocator);
         self.cancelDiscardConfirmation(deinit_ctx.allocator);
+        self.cancelAmendConfirmation(deinit_ctx.allocator);
         self.tree_order.deinit(deinit_ctx.allocator);
         if (self.tree_order_scope) |scope| deinit_ctx.allocator.free(scope);
         if (self.pending_selection_restore) |*restore| restore.deinit(deinit_ctx.allocator);
@@ -389,6 +397,7 @@ pub const App = struct {
             .unstage_hunk_finished => |finished| try self.finishUnstageHunk(ctx, finished),
             .discard_file_finished => |finished| try self.finishDiscardFile(ctx, finished),
             .commit_finished => |finished| try self.finishCommit(ctx, finished),
+            .amend_finished => |finished| try self.finishAmend(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
             .toggle_directory => try self.toggleSelectedDirectory(),
@@ -475,7 +484,8 @@ pub const App = struct {
                 self.file_search.resetNoMatch();
                 self.file_search.input.backspace();
             },
-            .enter_commit_panel => self.enterCommitPanelMode(),
+            .enter_commit_panel => self.enterCommitPanelMode(.commit),
+            .enter_amend_panel => self.enterCommitPanelMode(.amend),
             .cancel_commit_panel => self.commit_panel.close(),
             .submit_commit_panel => try self.submitCommitPanel(ctx),
             .commit_panel_tab => self.commit_panel.toggleField(),
@@ -518,6 +528,8 @@ pub const App = struct {
             .request_discard_selected_file => try self.requestDiscardSelectedFile(ctx.allocator()),
             .confirm_discard_file => try self.confirmDiscardFile(ctx),
             .cancel_discard_file => self.cancelDiscardConfirmation(ctx.allocator()),
+            .confirm_amend => try self.confirmAmend(ctx),
+            .cancel_amend => self.cancelAmendConfirmation(ctx.allocator()),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .editor_finished => |result| try self.finishEditorCommand(ctx, result),
             .reload => {
@@ -548,7 +560,7 @@ pub const App = struct {
     }
 
     fn mouseToMsg(self: *const App, mouse: anytype) ?Msg {
-        if (self.search.mode or self.file_search.mode or self.commit_panel.mode or self.repo_picker.mode) return null;
+        if (self.search.mode or self.file_search.mode or self.commit_panel.is_open or self.repo_picker.mode) return null;
         if (mouse.type != .press) return null;
 
         if (self.overlay.isHelp()) {
@@ -640,10 +652,11 @@ pub const App = struct {
         return .{
             .search_mode = self.search.mode,
             .file_search_mode = self.file_search.mode,
-            .commit_panel_mode = self.commit_panel.mode,
+            .commit_panel_mode = self.commit_panel.is_open,
             .repo_picker_mode = self.repo_picker.mode,
             .help_mode = self.overlay.isHelp(),
             .discard_confirmation_mode = self.overlay.isDiscardFile(),
+            .amend_confirmation_mode = self.overlay.isAmendCommit(),
             .search_query_len = self.search.query.len,
             .focus = self.viewer.focus,
             .sidebar_hidden = self.viewer.sidebar_hidden,
@@ -1537,6 +1550,7 @@ pub const App = struct {
         };
 
         self.cancelDiscardConfirmation(allocator);
+        self.cancelAmendConfirmation(allocator);
         const owned_repo_root = try allocator.dupe(u8, target.repo_root);
         errdefer allocator.free(owned_repo_root);
         const owned_path = try allocator.dupe(u8, target.path);
@@ -1623,7 +1637,7 @@ pub const App = struct {
         };
     }
 
-    fn enterCommitPanelMode(self: *App) void {
+    fn enterCommitPanelMode(self: *App, mode: app_commit_panel.Mode) void {
         if (self.actions.pending != null) {
             self.setStatus("finish current git action before committing", .{});
             return;
@@ -1633,8 +1647,10 @@ pub const App = struct {
             return;
         }
 
+        self.cancelDiscardConfirmation(self.allocator.?);
+        self.cancelAmendConfirmation(self.allocator.?);
         self.overlay.close();
-        self.commit_panel.open();
+        self.commit_panel.open(mode);
     }
 
     fn submitCommitPanel(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -1655,6 +1671,15 @@ pub const App = struct {
             return;
         };
 
+        if (self.commit_panel.mode == .amend) {
+            try self.openAmendConfirmation(ctx.allocator(), repo_root);
+            return;
+        }
+
+        try self.startCommitTask(ctx, repo_root);
+    }
+
+    fn startCommitTask(self: *App, ctx: *chasen.Ctx(Msg), repo_root: []const u8) !void {
         var parts = self.commit_panel.formatMessageParts(ctx.allocator()) catch {
             self.commit_panel.commit_error = .input_allocation_failed;
             return;
@@ -1686,6 +1711,71 @@ pub const App = struct {
         };
 
         self.setStatus("committing...", .{});
+    }
+
+    fn openAmendConfirmation(self: *App, allocator: std.mem.Allocator, repo_root: []const u8) !void {
+        var parts = self.commit_panel.formatMessageParts(allocator) catch {
+            self.commit_panel.commit_error = .input_allocation_failed;
+            return;
+        };
+        errdefer parts.deinit(allocator);
+
+        const owned_root = try allocator.dupe(u8, repo_root);
+        errdefer allocator.free(owned_root);
+
+        self.cancelDiscardConfirmation(allocator);
+        self.cancelAmendConfirmation(allocator);
+        self.amend_confirmation = .{
+            .repo_root = owned_root,
+            .subject = parts.subject,
+            .body = parts.body,
+        };
+        parts = .{ .subject = &.{}, .body = null };
+        self.overlay.openAmendCommit();
+    }
+
+    fn confirmAmend(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.actions.pending != null) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+        var confirmation = self.amend_confirmation orelse return;
+        self.amend_confirmation = null;
+        errdefer confirmation.deinit(ctx.allocator());
+
+        const task = try ctx.allocator().create(AmendTask);
+        errdefer ctx.allocator().destroy(task);
+
+        const pending = self.actions.begin(.amend);
+        errdefer _ = self.actions.finish(pending);
+
+        task.* = .{
+            .pending = pending,
+            .repo_root = confirmation.repo_root,
+            .subject = confirmation.subject,
+            .body = confirmation.body,
+        };
+        confirmation = .{ .repo_root = &.{}, .subject = &.{}, .body = null };
+
+        ctx.task().spawnWith(task, AmendTask.run) catch |err| {
+            self.actions.clear();
+            ctx.allocator().free(task.repo_root);
+            ctx.allocator().free(task.subject);
+            if (task.body) |body| ctx.allocator().free(body);
+            if (self.overlay.isAmendCommit()) self.overlay.close();
+            self.commit_panel.commit_error = .amend_failed;
+            self.setStatus("could not start amend task", .{});
+            return err;
+        };
+
+        self.overlay.close();
+        self.setStatus("amending...", .{});
+    }
+
+    fn cancelAmendConfirmation(self: *App, allocator: std.mem.Allocator) void {
+        if (self.amend_confirmation) |*confirmation| confirmation.deinit(allocator);
+        self.amend_confirmation = null;
+        if (self.overlay.isAmendCommit()) self.overlay.close();
     }
 
     pub fn stagedSummaryForActiveRepo(self: *const App) app_commit_panel.StagedSummary {
@@ -1867,6 +1957,46 @@ pub const App = struct {
         }
     }
 
+    fn finishAmend(self: *App, ctx: *chasen.Ctx(Msg), finished: AmendFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (!self.actions.finish(result.pending)) return;
+
+        switch (result.result) {
+            .ok => {
+                const reviewed_clear_failed = if (self.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
+                const active_root = self.activeRepoRoot();
+                const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+                self.commit_panel.close();
+                self.cancelAmendConfirmation(ctx.allocator());
+
+                if (active_matches) {
+                    if (reviewed_clear_failed) {
+                        self.setStatus("amended; could not clear reviewed marks", .{});
+                    } else {
+                        self.setStatus("amended", .{});
+                    }
+                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, false);
+                } else {
+                    if (reviewed_clear_failed) {
+                        self.setStatus("amended: {s}; could not clear reviewed marks", .{result.repo_root});
+                    } else {
+                        self.setStatus("amended: {s}", .{result.repo_root});
+                    }
+                }
+            },
+            .failed => |message| {
+                self.commit_panel.commit_error = .amend_failed;
+                self.setStatus("amend failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+            },
+            .failed_static => |message| {
+                self.commit_panel.commit_error = .amend_failed;
+                self.setStatus("amend failed: {s}", .{message});
+            },
+        }
+    }
+
     fn reloadAfterGitAction(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (diff_source.sourceIsOneShotInput(self.config.source)) {
             ctx.redraw().skip();
@@ -2009,7 +2139,7 @@ pub const App = struct {
     fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (!self.config.watch) return;
         if (diff_source.sourceIsOneShotInput(self.config.source)) return;
-        if (self.repo_picker.mode or self.search.mode or self.file_search.mode or self.commit_panel.mode) {
+        if (self.repo_picker.mode or self.search.mode or self.file_search.mode or self.commit_panel.is_open) {
             ctx.redraw().skip();
             return;
         }
@@ -4502,6 +4632,51 @@ test "help overlay reopen resets help scroll" {
 
     try std.testing.expectEqual(OverlayKind.help, app.overlay.kind);
     try std.testing.expectEqual(@as(usize, 0), app.overlay.help_scroll);
+}
+
+test "opening amend confirmation cancels active discard confirmation" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .commit_panel = app_commit_panel.State.init(std.testing.allocator),
+    };
+    defer app.commit_panel.deinit();
+    defer app.cancelAmendConfirmation(std.testing.allocator);
+    defer app.cancelDiscardConfirmation(std.testing.allocator);
+
+    app.discard_confirmation = .{
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .path = try std.testing.allocator.dupe(u8, "src/app.zig"),
+    };
+    app.overlay.openDiscardFile();
+    app.commit_panel.open(.amend);
+    app.commit_panel.insert('x');
+
+    try app.openAmendConfirmation(std.testing.allocator, "/repo");
+
+    try std.testing.expect(app.discard_confirmation == null);
+    try std.testing.expect(app.amend_confirmation != null);
+    try std.testing.expectEqual(OverlayKind.amend_commit, app.overlay.kind);
+}
+
+test "canceling amend confirmation keeps commit panel draft" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .commit_panel = app_commit_panel.State.init(std.testing.allocator),
+    };
+    defer app.commit_panel.deinit();
+    defer app.cancelAmendConfirmation(std.testing.allocator);
+
+    app.commit_panel.open(.amend);
+    app.commit_panel.insert('x');
+    try app.openAmendConfirmation(std.testing.allocator, "/repo");
+
+    app.cancelAmendConfirmation(std.testing.allocator);
+
+    try std.testing.expect(app.amend_confirmation == null);
+    try std.testing.expectEqual(OverlayKind.none, app.overlay.kind);
+    try std.testing.expect(app.commit_panel.is_open);
+    try std.testing.expectEqual(app_commit_panel.Mode.amend, app.commit_panel.mode);
+    try std.testing.expectEqualStrings("x", app.commit_panel.subject.slice());
 }
 
 test "prompt input stays above help overlay" {

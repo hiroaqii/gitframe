@@ -176,6 +176,22 @@ pub const CommitFinished = struct {
     }
 };
 
+pub const AmendFinished = struct {
+    pending: PendingAction,
+    repo_root: []u8,
+    result: FileActionTaskResult,
+
+    pub fn deinit(self: *AmendFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        self.result.deinit(allocator);
+        self.* = .{
+            .pending = .{ .generation = 0, .kind = .amend },
+            .repo_root = &.{},
+            .result = .ok,
+        };
+    }
+};
+
 pub const FileActionTaskResult = union(enum) {
     ok,
     failed: []u8,
@@ -397,6 +413,36 @@ pub fn CommitTask(comptime Msg: type) type {
     };
 }
 
+/// Async task for `git commit --amend -m subject [-m body]`.
+pub fn AmendTask(comptime Msg: type) type {
+    return struct {
+        pending: PendingAction,
+        repo_root: []u8,
+        subject: []u8,
+        body: ?[]u8,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                allocator.free(task.subject);
+                if (task.body) |body| allocator.free(body);
+                allocator.destroy(task);
+            }
+
+            const result = runAmend(task.repo_root, task.subject, task.body, allocator, io);
+            const repo_root = task.repo_root;
+            task.repo_root = &.{};
+
+            return @unionInit(Msg, "amend_finished", AmendFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .result = result,
+            });
+        }
+    };
+}
+
 pub fn runStageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     var local_backend: git_backend.LocalCommandBackend = .{};
     const raw_result = local_backend.backend().runOperation(allocator, io, .{
@@ -501,6 +547,25 @@ pub fn runCommit(repo_root: []const u8, subject: []const u8, body: ?[]const u8, 
         return .{
             .failed = std.fmt.allocPrint(allocator, "Commit failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Commit failed: OutOfMemory" },
+        };
+    };
+
+    return switch (raw_result) {
+        .ok => .ok,
+        .failed => |message| .{ .failed = message },
+        .failed_static => |message| .{ .failed_static = message },
+    };
+}
+
+pub fn runAmend(repo_root: []const u8, subject: []const u8, body: ?[]const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+    var local_backend: git_backend.LocalCommandBackend = .{};
+    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+        .repo_root = repo_root,
+        .kind = .{ .amend = .{ .subject = subject, .body = body } },
+    }) catch |err| {
+        return .{
+            .failed = std.fmt.allocPrint(allocator, "Amend failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Amend failed: OutOfMemory" },
         };
     };
 
