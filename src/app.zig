@@ -5477,8 +5477,10 @@ test "sidebar title indicates active focus" {
 
     try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
 
-    try ts.expectCellText(0, 0, "▸");
-    try std.testing.expect(ts.surface.readCell(0, 0).?.style.reverse);
+    try ts.expectCellText(0, 0, " ");
+    try ts.expectCellText(1, 0, "F");
+    try std.testing.expect(ts.surface.readCell(1, 0).?.style.fg.eql(.{ .index = 14 }));
+    try std.testing.expect(!ts.surface.readCell(1, 0).?.style.reverse);
 }
 
 test "diff header detail row draws active separator" {

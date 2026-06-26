@@ -1275,9 +1275,9 @@ fn modeBadgeStyle(selected: bool) chasen.TextStyle {
 
 fn paneTitleStyle(active: bool) chasen.TextStyle {
     return if (active)
-        .{ .bold = true, .reverse = true, .fg = .{ .index = 14 } }
+        .{ .bold = true, .fg = .{ .index = 14 } }
     else
-        .{ .bold = true, .fg = .gray };
+        .{ .bold = true, .fg = .gray, .dim = true };
 }
 
 fn paneSearchStyle(active: bool) chasen.TextStyle {
@@ -1296,8 +1296,8 @@ fn shellSeparatorStyle() chasen.TextStyle {
 }
 
 fn paneTitleText(label: []const u8, active: bool) []const u8 {
+    if (std.mem.eql(u8, label, "Files")) return " Files";
     if (!active) return label;
-    if (std.mem.eql(u8, label, "Files")) return "▸ Files";
     if (std.mem.eql(u8, label, "Diff")) return "▸ Diff";
     return label;
 }
