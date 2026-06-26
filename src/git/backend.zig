@@ -1,4 +1,5 @@
 const std = @import("std");
+const process_runner = @import("../process/runner.zig");
 
 pub const max_diff_bytes = 16 * 1024 * 1024;
 pub const max_status_bytes = 8 * 1024 * 1024;
@@ -371,7 +372,7 @@ fn runGitDiscard(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8
 
 fn runGitApplyCached(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, patch: []const u8) LoadError!OperationResult {
     const argv = [_][]const u8{ "git", "apply", "--cached", "--whitespace=nowarn", "-" };
-    const result = runWithStdin(allocator, io, .{
+    const result = process_runner.runWithStdin(allocator, io, .{
         .argv = &argv,
         .cwd = .{ .path = repo_root },
         .stdin = patch,
@@ -400,7 +401,7 @@ fn runGitApplyCached(allocator: std.mem.Allocator, io: std.Io, repo_root: []cons
 
 fn runGitApplyCachedReverse(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, patch: []const u8) LoadError!OperationResult {
     const argv = [_][]const u8{ "git", "apply", "--cached", "--reverse", "--whitespace=nowarn", "-" };
-    const result = runWithStdin(allocator, io, .{
+    const result = process_runner.runWithStdin(allocator, io, .{
         .argv = &argv,
         .cwd = .{ .path = repo_root },
         .stdin = patch,
@@ -468,72 +469,6 @@ fn runGitCommitLike(allocator: std.mem.Allocator, io: std.Io, repo_root: []const
     allocator.free(result.stderr);
 
     return .{ .failed = std.fmt.allocPrint(allocator, "git commit failed: {any}", .{result.term}) catch return error.OutOfMemory };
-}
-
-const RunWithStdinError = error{
-    StreamTooLong,
-    WriteFailed,
-} || std.process.SpawnError || std.process.Child.WaitError || std.Io.File.MultiReader.UnendingError || std.Io.Timeout.Error || std.Io.File.Writer.Error;
-
-const RunWithStdinOptions = struct {
-    argv: []const []const u8,
-    cwd: std.process.Child.Cwd = .inherit,
-    stdin: []const u8,
-    stdout_limit: std.Io.Limit = .unlimited,
-    stderr_limit: std.Io.Limit = .unlimited,
-};
-
-const RunWithStdinResult = struct {
-    term: std.process.Child.Term,
-    stdout: []u8,
-    stderr: []u8,
-};
-
-fn runWithStdin(allocator: std.mem.Allocator, io: std.Io, options: RunWithStdinOptions) RunWithStdinError!RunWithStdinResult {
-    var child = try std.process.spawn(io, .{
-        .argv = options.argv,
-        .cwd = options.cwd,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
-    var child_waited = false;
-    defer if (!child_waited) child.kill(io);
-
-    var write_buffer: [4096]u8 = undefined;
-    var stdin_writer = child.stdin.?.writerStreaming(io, &write_buffer);
-    try stdin_writer.interface.writeAll(options.stdin);
-    try stdin_writer.interface.flush();
-    child.stdin.?.close(io);
-    child.stdin = null;
-
-    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
-    var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
-    defer multi_reader.deinit();
-
-    const stdout_reader = multi_reader.reader(0);
-    const stderr_reader = multi_reader.reader(1);
-    while (multi_reader.fill(64, .none)) |_| {
-        if (options.stdout_limit.toInt()) |limit| {
-            if (stdout_reader.buffered().len > limit) return error.StreamTooLong;
-        }
-        if (options.stderr_limit.toInt()) |limit| {
-            if (stderr_reader.buffered().len > limit) return error.StreamTooLong;
-        }
-    } else |err| switch (err) {
-        error.EndOfStream => {},
-        else => |e| return e,
-    }
-
-    try multi_reader.checkAnyError();
-
-    const term = try child.wait(io);
-    child_waited = true;
-    const stdout = try multi_reader.toOwnedSlice(0);
-    errdefer allocator.free(stdout);
-    const stderr = try multi_reader.toOwnedSlice(1);
-    return .{ .term = term, .stdout = stdout, .stderr = stderr };
 }
 
 fn loadNoIndexDiff(allocator: std.mem.Allocator, io: std.Io, paths: PathPair) LoadError!LoadResult {

@@ -27,8 +27,10 @@ test {
     _ = @import("draw");
     _ = @import("diff/hunk_projection.zig");
     _ = @import("editor.zig");
+    _ = @import("external/action.zig");
     _ = @import("git/backend.zig");
     _ = @import("git/status.zig");
+    _ = @import("process/runner.zig");
     _ = @import("repo/state.zig");
     _ = @import("review/state.zig");
 }
