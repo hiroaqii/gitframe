@@ -29,6 +29,7 @@ pub const KeyContext = struct {
     search_query_len: usize = 0,
     focus: Focus = .sidebar,
     sidebar_hidden: bool = false,
+    review_mode: bool = false,
 };
 
 pub fn eventToMsg(comptime Msg: type, context: KeyContext, event: chasen.Event) ?Msg {
@@ -138,7 +139,8 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         return if (context.focus == .diff) voidMsg(Msg, "select_previous_hunk") else null;
     }
     if (matchesShiftedAscii(key, 'n', 'N')) {
-        return if (context.search_query_len > 0) voidMsg(Msg, "select_previous_search_match") else null;
+        if (context.search_query_len > 0) return voidMsg(Msg, "select_previous_search_match");
+        return if (context.review_mode) voidMsg(Msg, "finish_review_needs_changes") else null;
     }
     if (matchesShiftedAscii(key, 'g', 'G')) return voidMsg(Msg, "select_last_file");
     if (matchesShiftedAscii(key, 'r', 'R')) return voidMsg(Msg, "enter_repo_picker");
@@ -151,6 +153,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     }
     if (matchesShiftedAscii(key, 'd', 'D')) return voidMsg(Msg, "request_discard_selected_file");
     if (matchesShiftedAscii(key, 'a', 'A')) return voidMsg(Msg, "enter_amend_panel");
+    if (context.review_mode and key.matches('a', .{})) return voidMsg(Msg, "finish_review_approved");
     if (key.matches('c', .{})) return voidMsg(Msg, "enter_commit_panel");
     if (hasCommandModifier(key)) return null;
 
@@ -168,7 +171,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
         's' => if (context.focus == .diff) voidMsg(Msg, "stage_selected_hunk") else voidMsg(Msg, "stage_selected_file"),
         'e' => voidMsg(Msg, "open_selected_file_in_editor"),
         'u' => voidMsg(Msg, "toggle_display_mode"),
-        'q' => voidMsg(Msg, "quit"),
+        'q' => if (context.review_mode) voidMsg(Msg, "finish_review_canceled") else voidMsg(Msg, "quit"),
         'r' => voidMsg(Msg, "reload"),
         else => null,
     };
@@ -311,6 +314,9 @@ const TestMsg = union(enum) {
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
+    finish_review_approved,
+    finish_review_needs_changes,
+    finish_review_canceled,
     quit,
     reload,
 };
@@ -570,6 +576,21 @@ test "keyToMsg uses search query to disambiguate navigation" {
     try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, .{ .codepoint = 'N' }).?);
     try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, shiftedAscii('n', 'N')).?);
     try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, shiftedLowerOnly('n')).?);
+}
+
+test "keyToMsg maps review result commands only in review mode" {
+    try std.testing.expectEqual(TestMsg.finish_review_approved, keyToMsg(TestMsg, .{ .review_mode = true }, .{ .codepoint = 'a' }).?);
+    try std.testing.expectEqual(TestMsg.finish_review_needs_changes, keyToMsg(TestMsg, .{ .review_mode = true }, .{ .codepoint = 'N' }).?);
+    try std.testing.expectEqual(TestMsg.finish_review_needs_changes, keyToMsg(TestMsg, .{ .review_mode = true }, shiftedAscii('n', 'N')).?);
+    try std.testing.expectEqual(TestMsg.finish_review_needs_changes, keyToMsg(TestMsg, .{ .review_mode = true }, shiftedLowerOnly('n')).?);
+    try std.testing.expectEqual(TestMsg.finish_review_canceled, keyToMsg(TestMsg, .{ .review_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .review_mode = true, .search_query_len = 4 }, .{ .codepoint = 'N' }).?);
+    try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .review_mode = true, .search_query_len = 4 }, shiftedAscii('n', 'N')).?);
+    try std.testing.expectEqual(TestMsg.enter_amend_panel, keyToMsg(TestMsg, .{ .review_mode = true }, .{ .codepoint = 'A' }).?);
+
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'a' }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'N' }));
+    try std.testing.expectEqual(TestMsg.quit, keyToMsg(TestMsg, .{}, .{ .codepoint = 'q' }).?);
 }
 
 test "keyToMsg maps dedicated hunk jumps only in diff focus" {

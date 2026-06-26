@@ -5,15 +5,15 @@ pub fn writeSelectionContext(writer: *std.Io.Writer, selection: context.Selectio
     try writer.writeAll("{");
     try writer.writeAll("\"schema_version\":1");
     try writer.writeAll(",\"source_kind\":");
-    try writeString(writer, sourceKindName(selection.source.kind));
+    try writeStringValue(writer, sourceKindName(selection.source.kind));
     try writer.writeAll(",\"source_label\":");
-    try writeString(writer, selection.source.label);
+    try writeStringValue(writer, selection.source.label);
     try writer.writeAll(",\"source_detail\":");
     try writeSourceDetail(writer, selection.source);
     try writer.writeAll(",\"repo_root\":");
-    try writeOptionalString(writer, selection.repo_root);
+    try writeOptionalStringValue(writer, selection.repo_root);
     try writer.writeAll(",\"selection\":");
-    try writeSelection(writer, selection.selected);
+    try writeSelectionValue(writer, selection.selected);
     try writer.writeAll("}\n");
 }
 
@@ -22,17 +22,17 @@ fn writeSourceDetail(writer: *std.Io.Writer, source: context.SourceContext) !voi
     // needs a structured pair so consumers do not have to parse a display label.
     if (source.kind == .no_index) {
         try writer.writeAll("{\"left_path\":");
-        try writeOptionalString(writer, source.left_path);
+        try writeOptionalStringValue(writer, source.left_path);
         try writer.writeAll(",\"right_path\":");
-        try writeOptionalString(writer, source.right_path);
+        try writeOptionalStringValue(writer, source.right_path);
         try writer.writeAll("}");
         return;
     }
 
-    try writeOptionalString(writer, source.detail);
+    try writeOptionalStringValue(writer, source.detail);
 }
 
-fn writeSelection(writer: *std.Io.Writer, selection: ?context.Selection) !void {
+pub fn writeSelectionValue(writer: *std.Io.Writer, selection: ?context.Selection) !void {
     const value = selection orelse {
         try writer.writeAll("null");
         return;
@@ -44,9 +44,9 @@ fn writeSelection(writer: *std.Io.Writer, selection: ?context.Selection) !void {
             try writer.writeAll("\"kind\":\"diff_file\"");
             try writer.print(",\"file_index\":{d}", .{file.file_index});
             try writer.writeAll(",\"display_path\":");
-            try writeString(writer, file.display_path);
+            try writeStringValue(writer, file.display_path);
             try writer.writeAll(",\"path_key\":");
-            try writeOptionalString(writer, file.path_key);
+            try writeOptionalStringValue(writer, file.path_key);
             try writer.writeAll(",\"hunk_index\":");
             try writeOptionalNumber(writer, file.hunk_index);
         },
@@ -54,7 +54,7 @@ fn writeSelection(writer: *std.Io.Writer, selection: ?context.Selection) !void {
             try writer.writeAll("\"kind\":\"status_only\"");
             try writer.print(",\"status_index\":{d}", .{status.status_index});
             try writer.writeAll(",\"path_key\":");
-            try writeOptionalString(writer, status.path_key);
+            try writeOptionalStringValue(writer, status.path_key);
         },
     }
     try writer.writeAll("}");
@@ -68,15 +68,15 @@ fn writeOptionalNumber(writer: *std.Io.Writer, value: ?usize) !void {
     }
 }
 
-fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
+pub fn writeOptionalStringValue(writer: *std.Io.Writer, value: ?[]const u8) !void {
     if (value) |text| {
-        try writeString(writer, text);
+        try writeStringValue(writer, text);
     } else {
         try writer.writeAll("null");
     }
 }
 
-fn writeString(writer: *std.Io.Writer, text: []const u8) !void {
+pub fn writeStringValue(writer: *std.Io.Writer, text: []const u8) !void {
     try writer.writeByte('"');
     for (text) |byte| {
         switch (byte) {
@@ -92,7 +92,7 @@ fn writeString(writer: *std.Io.Writer, text: []const u8) !void {
     try writer.writeByte('"');
 }
 
-fn sourceKindName(kind: context.SourceKind) []const u8 {
+pub fn sourceKindName(kind: context.SourceKind) []const u8 {
     return switch (kind) {
         .unstaged => "unstaged",
         .cached => "cached",

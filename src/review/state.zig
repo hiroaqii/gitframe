@@ -81,6 +81,25 @@ pub const Store = struct {
             allocator.free(entry.key);
         }
     }
+
+    /// Appends borrowed path-key slices for the given repo.
+    ///
+    /// The returned slices point into this store's owned keys, so callers must
+    /// only use them while the store is alive and unchanged.
+    pub fn appendPathKeysForRepo(
+        self: *const Store,
+        allocator: std.mem.Allocator,
+        repo_root: ?[]const u8,
+        out: *std.ArrayList([]const u8),
+    ) !void {
+        const root = repo_root orelse return;
+
+        var keys = self.entries.keyIterator();
+        while (keys.next()) |key| {
+            if (!isRepoKey(key.*, root)) continue;
+            try out.append(allocator, key.*[root.len + 1 ..]);
+        }
+    }
 };
 
 fn keyAlloc(allocator: std.mem.Allocator, repo_root: []const u8, file: diff_parser.FileDiff) !?[]u8 {
@@ -166,6 +185,44 @@ test "store clears reviewed keys for one repository" {
 
     try std.testing.expect(!try store.containsFile(allocator, "/repo/one", file));
     try std.testing.expect(try store.containsFile(allocator, "/repo/two", file));
+}
+
+test "store appends borrowed path keys for a repository" {
+    const allocator = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(allocator);
+
+    const main_file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{},
+    };
+    const app_file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/app.zig b/src/app.zig",
+        .old_path = "src/app.zig",
+        .new_path = "src/app.zig",
+        .metadata = &.{},
+        .hunks = &.{},
+    };
+
+    try store.set(allocator, "/repo", main_file, true);
+    try store.set(allocator, "/repo", app_file, true);
+    try store.set(allocator, "/other", main_file, true);
+
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(allocator);
+    try store.appendPathKeysForRepo(allocator, "/repo", &paths);
+
+    std.mem.sort([]const u8, paths.items, {}, pathLessThan);
+    try std.testing.expectEqual(@as(usize, 2), paths.items.len);
+    try std.testing.expectEqualStrings("src/app.zig", paths.items[0]);
+    try std.testing.expectEqualStrings("src/main.zig", paths.items[1]);
+}
+
+fn pathLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.lessThan(u8, lhs, rhs);
 }
 
 test "store clearForRepo does not match prefix-only repository names" {

@@ -25,6 +25,7 @@ const file_tree = @import("file_tree.zig");
 const git_status = @import("git/status.zig");
 const loaded_diff = @import("loaded_diff.zig");
 const repo_discovery = @import("repo/discovery.zig");
+const review_session = @import("review/session.zig");
 const repo_state = @import("repo/state.zig");
 const review_state = @import("review/state.zig");
 
@@ -197,6 +198,7 @@ const OverlayKind = app_state.OverlayKind;
 pub const App = struct {
     config: CliConfig = .{},
     env_map: ?*std.process.Environ.Map = null,
+    review_output: ?*review_session.Output = null,
     allocator: ?std.mem.Allocator = null,
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
     actions: app_actions.ActionState = .{},
@@ -335,6 +337,9 @@ pub const App = struct {
         cancel_amend,
         open_selected_file_in_editor,
         editor_finished: chasen.ForegroundCommandResult,
+        finish_review_approved,
+        finish_review_needs_changes,
+        finish_review_canceled,
         reload,
         auto_reload_tick,
         quit,
@@ -532,6 +537,9 @@ pub const App = struct {
             .cancel_amend => self.cancelAmendConfirmation(ctx.allocator()),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .editor_finished => |result| try self.finishEditorCommand(ctx, result),
+            .finish_review_approved => try self.finishReview(ctx, .approved),
+            .finish_review_needs_changes => try self.finishReview(ctx, .needs_changes),
+            .finish_review_canceled => try self.finishReview(ctx, .canceled),
             .reload => {
                 self.clearPendingSelectionRestore(ctx.allocator());
                 if (diff_source.sourceIsOneShotInput(self.config.source)) {
@@ -661,6 +669,7 @@ pub const App = struct {
             .focus = self.viewer.focus,
             .sidebar_hidden = self.viewer.sidebar_hidden,
             .repo_picker_path_input = self.repo_picker.prompt_mode == .path_input,
+            .review_mode = self.config.review_mode,
         };
     }
 
@@ -3400,6 +3409,29 @@ pub const App = struct {
         }
     }
 
+    fn finishReview(self: *App, ctx: *chasen.Ctx(Msg), decision: review_session.Decision) !void {
+        const output = self.review_output orelse {
+            self.setStatus("review output is not configured", .{});
+            return;
+        };
+
+        var reviewed_paths: std.ArrayList([]const u8) = .empty;
+        defer reviewed_paths.deinit(ctx.allocator());
+        self.reviewed_store.appendPathKeysForRepo(ctx.allocator(), self.activeRepoRoot(), &reviewed_paths) catch {
+            self.setStatus("could not finalize review result", .{});
+            return;
+        };
+        std.mem.sort([]const u8, reviewed_paths.items, {}, pathLessThan);
+
+        // Quit only after serialization succeeds; otherwise the TUI remains
+        // open and stdout never receives a partial machine-readable result.
+        output.set(ctx.allocator(), decision, self.selectionContext(), reviewed_paths.items) catch {
+            self.setStatus("could not finalize review result", .{});
+            return;
+        };
+        ctx.quit();
+    }
+
     pub fn selectionContext(self: *const App) context.SelectionContext {
         const loaded = self.activeLoadedDiffConst();
         return .{
@@ -4161,6 +4193,10 @@ fn maxHorizontalScrollForText(text: []const u8, visible_width: u16) usize {
     const width = chasen.text.displayWidth(text);
     if (width <= visible_width) return 0;
     return width - visible_width;
+}
+
+fn pathLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.lessThan(u8, lhs, rhs);
 }
 
 test "countLines handles empty and trailing newline inputs" {

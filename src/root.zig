@@ -1,5 +1,6 @@
 const app = @import("app.zig");
 pub const context = @import("context.zig");
+pub const review_session = @import("review/session.zig");
 const diff_source = @import("diff/source.zig");
 
 pub const App = app.App;
@@ -32,5 +33,6 @@ test {
     _ = @import("git/status.zig");
     _ = @import("process/runner.zig");
     _ = @import("repo/state.zig");
+    _ = @import("review/session.zig");
     _ = @import("review/state.zig");
 }
