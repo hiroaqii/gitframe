@@ -24,7 +24,7 @@ const shell_frame_min_height: u16 = 6;
 const shell_frame_border = ui.Panel.Border.rounded;
 const shell_frame_padding: ui.layout.Insets = .{};
 const help_dialog_max_width: u16 = 108;
-const help_dialog_max_height: u16 = 28;
+const help_dialog_max_height: u16 = 34;
 const help_two_column_min_width: u16 = 96;
 const help_column_gap: u16 = 2;
 const help_header_rows: u16 = 2;
@@ -1444,10 +1444,12 @@ const help_global_items = [_]HelpItem{
     .{ .key = "r", .description = "reload active repository" },
     .{ .key = "R", .description = "switch repository" },
     .{ .key = "c", .description = "open commit panel" },
-    .{ .key = "s", .description = "stage file / directory / hunk" },
-    .{ .key = "S", .description = "unstage selected file / directory" },
+    .{ .key = "A", .description = "amend last commit" },
     .{ .key = "D", .description = "discard selected file changes" },
+    .{ .key = "e", .description = "open selected file in editor" },
+    .{ .key = "a / N", .description = "approve / needs changes in review mode" },
     .{ .key = "Home/End", .description = "first / last file" },
+    .{ .key = "g / G", .description = "first / last file" },
 };
 
 const help_sidebar_items = [_]HelpItem{
@@ -1456,6 +1458,7 @@ const help_sidebar_items = [_]HelpItem{
     .{ .key = "←/→", .description = "collapse / expand directory" },
     .{ .key = "f", .description = "search files" },
     .{ .key = "F", .description = "cycle file filter" },
+    .{ .key = "s / S", .description = "stage / unstage file or directory" },
     .{ .key = "v", .description = "mark reviewed" },
     .{ .key = "H", .description = "hide reviewed" },
     .{ .key = "[ / ]", .description = "resize sidebar" },
@@ -1463,6 +1466,7 @@ const help_sidebar_items = [_]HelpItem{
 
 const help_diff_items = [_]HelpItem{
     .{ .key = "↑/↓ j/k", .description = "scroll" },
+    .{ .key = "PgUp/PgDn", .description = "page scroll" },
     .{ .key = "←/→", .description = "horizontal scroll" },
     .{ .key = "Enter", .description = "fold / unfold hunk" },
     .{ .key = "/", .description = "search diff" },
@@ -1471,12 +1475,12 @@ const help_diff_items = [_]HelpItem{
     .{ .key = "J / K", .description = "next / previous hunk" },
     .{ .key = "n / p", .description = "next / previous match or hunk" },
     .{ .key = "N", .description = "previous search match" },
-    .{ .key = "e", .description = "open selected file in editor" },
+    .{ .key = "s / S", .description = "stage / unstage hunk" },
 };
 
 const help_mouse_items = [_]HelpItem{
     .{ .key = "wheel", .description = "scroll pane under pointer" },
-    .{ .key = "click", .description = "focus pane" },
+    .{ .key = "click", .description = "focus pane / select sidebar row" },
 };
 
 const help_left_sections = [_]HelpSection{
