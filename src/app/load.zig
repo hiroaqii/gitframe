@@ -141,7 +141,8 @@ pub const LoadedDiffBundle = struct {
 ///
 /// The task returns App's concrete Msg union, but this module must not import
 /// App. Passing Msg at comptime keeps ownership logic here without creating an
-/// app/app_load import cycle.
+/// app/app_load import cycle. Msg supplies loadFinished() so nested message
+/// construction stays centralized in App's Msg definition.
 pub fn RepoDiscoveryTask(comptime Msg: type) type {
     return struct {
         generation: u64,
@@ -150,10 +151,10 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
 
-            return @unionInit(Msg, "repos_discovered", RepoDiscoveryFinished{
+            return Msg.loadFinished(.{ .repos_discovered = RepoDiscoveryFinished{
                 .generation = task.generation,
                 .result = runDiscovery(allocator, io),
-            });
+            } });
         }
     };
 }
@@ -180,11 +181,11 @@ pub fn RepoPathDiscoveryTask(comptime Msg: type) type {
             const submitted_path = task.path;
             task.path = &.{};
 
-            return @unionInit(Msg, "repo_path_discovered", RepoPathDiscoveryFinished{
+            return Msg.loadFinished(.{ .repo_path_discovered = RepoPathDiscoveryFinished{
                 .generation = task.generation,
                 .submitted_path = submitted_path,
                 .result = runPathDiscovery(submitted_path, allocator, io),
-            });
+            } });
         }
     };
 }
@@ -218,10 +219,10 @@ pub fn DiffLoadTask(comptime Msg: type) type {
                 allocator.destroy(task);
             }
 
-            return @unionInit(Msg, "diff_loaded", DiffLoadFinished{
+            return Msg.loadFinished(.{ .diff_loaded = DiffLoadFinished{
                 .generation = task.generation,
                 .result = runLoad(task.request, allocator, io),
-            });
+            } });
         }
     };
 }
@@ -242,7 +243,7 @@ pub fn StatusLoadTask(comptime Msg: type) type {
             };
             task.repo_root = &.{};
 
-            return @unionInit(Msg, "status_loaded", result);
+            return Msg.loadFinished(.{ .status_loaded = result });
         }
     };
 }
@@ -258,10 +259,10 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
             const request = task.request;
             task.request = undefined;
 
-            return @unionInit(Msg, "review_projection_loaded", ReviewProjectionFinished{
+            return Msg.loadFinished(.{ .review_projection_loaded = ReviewProjectionFinished{
                 .request = request,
                 .result = runReviewProjectionLoad(request, allocator, io),
-            });
+            } });
         }
     };
 }

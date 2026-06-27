@@ -230,11 +230,11 @@ pub fn StageFileTask(comptime Msg: type) type {
             const path = task.path;
             task.path = &.{};
 
-            return @unionInit(Msg, "stage_file_finished", StageFileFinished{
+            return Msg.actionFinished(.{ .stage_file = StageFileFinished{
                 .pending = task.pending,
                 .path = path,
                 .result = result,
-            });
+            } });
         }
     };
 }
@@ -262,11 +262,11 @@ pub fn UnstageFileTask(comptime Msg: type) type {
             const path = task.path;
             task.path = &.{};
 
-            return @unionInit(Msg, "unstage_file_finished", UnstageFileFinished{
+            return Msg.actionFinished(.{ .unstage_file = UnstageFileFinished{
                 .pending = task.pending,
                 .path = path,
                 .result = result,
-            });
+            } });
         }
     };
 }
@@ -299,14 +299,14 @@ pub fn StageHunkTask(comptime Msg: type) type {
             task.repo_root = &.{};
             task.path = &.{};
 
-            return @unionInit(Msg, "stage_hunk_finished", StageHunkFinished{
+            return Msg.actionFinished(.{ .stage_hunk = StageHunkFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
                 .path = path,
                 .hunk_index = task.hunk_index,
                 .mark_source = task.mark_source,
                 .result = result,
-            });
+            } });
         }
     };
 }
@@ -337,7 +337,7 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
             task.repo_root = &.{};
             task.path = &.{};
 
-            return @unionInit(Msg, "unstage_hunk_finished", UnstageHunkFinished{
+            return Msg.actionFinished(.{ .unstage_hunk = UnstageHunkFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
                 .path = path,
@@ -345,7 +345,7 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
                 .mark_source = task.mark_source,
                 .reload_after_success = task.reload_after_success,
                 .result = result,
-            });
+            } });
         }
     };
 }
@@ -374,12 +374,12 @@ pub fn DiscardFileTask(comptime Msg: type) type {
             task.repo_root = &.{};
             task.path = &.{};
 
-            return @unionInit(Msg, "discard_file_finished", DiscardFileFinished{
+            return Msg.actionFinished(.{ .discard_file = DiscardFileFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
                 .path = path,
                 .result = result,
-            });
+            } });
         }
     };
 }
@@ -408,11 +408,11 @@ pub fn CommitTask(comptime Msg: type) type {
             const repo_root = task.repo_root;
             task.repo_root = &.{};
 
-            return @unionInit(Msg, "commit_finished", CommitFinished{
+            return Msg.actionFinished(.{ .commit = CommitFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
                 .result = result,
-            });
+            } });
         }
     };
 }
@@ -438,11 +438,11 @@ pub fn AmendTask(comptime Msg: type) type {
             const repo_root = task.repo_root;
             task.repo_root = &.{};
 
-            return @unionInit(Msg, "amend_finished", AmendFinished{
+            return Msg.actionFinished(.{ .amend = AmendFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
                 .result = result,
-            });
+            } });
         }
     };
 }

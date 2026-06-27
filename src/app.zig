@@ -143,6 +143,25 @@ const RepoPickerItem = struct {
     }
 };
 
+const LoadFinishedMsg = union(enum) {
+    repos_discovered: RepoDiscoveryFinished,
+    repo_path_discovered: RepoPathDiscoveryFinished,
+    diff_loaded: DiffLoadFinished,
+    status_loaded: StatusLoadFinished,
+    review_projection_loaded: ReviewProjectionFinished,
+};
+
+const ActionFinishedMsg = union(enum) {
+    stage_file: StageFileFinished,
+    stage_hunk: StageHunkFinished,
+    unstage_file: UnstageFileFinished,
+    unstage_hunk: UnstageHunkFinished,
+    discard_file: DiscardFileFinished,
+    commit: CommitFinished,
+    amend: AmendFinished,
+    editor: chasen.ForegroundCommandResult,
+};
+
 const ViewerState = struct {
     /// Sticky target shown in the diff pane or used by file actions.
     ///
@@ -241,18 +260,8 @@ pub const App = struct {
 
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
-        repos_discovered: RepoDiscoveryFinished,
-        repo_path_discovered: app_load.RepoPathDiscoveryFinished,
-        diff_loaded: DiffLoadFinished,
-        status_loaded: StatusLoadFinished,
-        review_projection_loaded: ReviewProjectionFinished,
-        stage_file_finished: StageFileFinished,
-        stage_hunk_finished: StageHunkFinished,
-        unstage_file_finished: UnstageFileFinished,
-        unstage_hunk_finished: UnstageHunkFinished,
-        discard_file_finished: DiscardFileFinished,
-        commit_finished: CommitFinished,
-        amend_finished: AmendFinished,
+        load_finished: LoadFinishedMsg,
+        action_finished: ActionFinishedMsg,
         select_previous_file,
         select_next_file,
         toggle_directory,
@@ -352,13 +361,20 @@ pub const App = struct {
         confirm_amend,
         cancel_amend,
         open_selected_file_in_editor,
-        editor_finished: chasen.ForegroundCommandResult,
         finish_review_approved,
         finish_review_needs_changes,
         finish_review_canceled,
         reload,
         auto_reload_tick,
         quit,
+
+        pub fn loadFinished(inner: LoadFinishedMsg) @This() {
+            return .{ .load_finished = inner };
+        }
+
+        pub fn actionFinished(inner: ActionFinishedMsg) @This() {
+            return .{ .action_finished = inner };
+        }
     };
 
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -410,18 +426,8 @@ pub const App = struct {
                 self.clampDiffNavigation();
                 self.clampHelpScroll();
             },
-            .repos_discovered => |finished| try self.finishRepoDiscovery(ctx, finished),
-            .repo_path_discovered => |finished| try self.finishRepoPathDiscovery(ctx, finished),
-            .diff_loaded => |finished| try self.finishDiffLoad(ctx, finished),
-            .status_loaded => |finished| try self.finishStatusLoad(ctx, finished),
-            .review_projection_loaded => |finished| try self.finishReviewProjectionLoad(ctx, finished),
-            .stage_file_finished => |finished| try self.finishStageFile(ctx, finished),
-            .stage_hunk_finished => |finished| try self.finishStageHunk(ctx, finished),
-            .unstage_file_finished => |finished| try self.finishUnstageFile(ctx, finished),
-            .unstage_hunk_finished => |finished| try self.finishUnstageHunk(ctx, finished),
-            .discard_file_finished => |finished| try self.finishDiscardFile(ctx, finished),
-            .commit_finished => |finished| try self.finishCommit(ctx, finished),
-            .amend_finished => |finished| try self.finishAmend(ctx, finished),
+            .load_finished => |finished| try self.finishLoadResult(ctx, finished),
+            .action_finished => |finished| try self.finishActionResult(ctx, finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
             .toggle_directory => try self.toggleSelectedDirectory(),
@@ -574,7 +580,6 @@ pub const App = struct {
             .confirm_amend => try self.confirmAmend(ctx),
             .cancel_amend => self.cancelAmendConfirmation(ctx.allocator()),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
-            .editor_finished => |result| try self.finishEditorCommand(ctx, result),
             .finish_review_approved => try self.finishReview(ctx, .approved),
             .finish_review_needs_changes => try self.finishReview(ctx, .needs_changes),
             .finish_review_canceled => try self.finishReview(ctx, .canceled),
@@ -594,6 +599,29 @@ pub const App = struct {
         try self.ensureReviewProjection(ctx);
     }
 
+    fn finishLoadResult(self: *App, ctx: *chasen.Ctx(Msg), finished: LoadFinishedMsg) !void {
+        switch (finished) {
+            .repos_discovered => |result| try self.finishRepoDiscovery(ctx, result),
+            .repo_path_discovered => |result| try self.finishRepoPathDiscovery(ctx, result),
+            .diff_loaded => |result| try self.finishDiffLoad(ctx, result),
+            .status_loaded => |result| try self.finishStatusLoad(ctx, result),
+            .review_projection_loaded => |result| try self.finishReviewProjectionLoad(ctx, result),
+        }
+    }
+
+    fn finishActionResult(self: *App, ctx: *chasen.Ctx(Msg), finished: ActionFinishedMsg) !void {
+        switch (finished) {
+            .stage_file => |result| try self.finishStageFile(ctx, result),
+            .stage_hunk => |result| try self.finishStageHunk(ctx, result),
+            .unstage_file => |result| try self.finishUnstageFile(ctx, result),
+            .unstage_hunk => |result| try self.finishUnstageHunk(ctx, result),
+            .discard_file => |result| try self.finishDiscardFile(ctx, result),
+            .commit => |result| try self.finishCommit(ctx, result),
+            .amend => |result| try self.finishAmend(ctx, result),
+            .editor => |result| try self.finishEditorCommand(ctx, result),
+        }
+    }
+
     fn clearEphemeralStatusForUserAction(self: *App, msg: Msg) void {
         if (msgKeepsEphemeralStatus(msg)) return;
         self.status.clearIfEphemeral();
@@ -602,19 +630,8 @@ pub const App = struct {
     fn msgKeepsEphemeralStatus(msg: Msg) bool {
         return switch (msg) {
             .terminal_resized,
-            .repos_discovered,
-            .repo_path_discovered,
-            .diff_loaded,
-            .status_loaded,
-            .review_projection_loaded,
-            .stage_file_finished,
-            .stage_hunk_finished,
-            .unstage_file_finished,
-            .unstage_hunk_finished,
-            .discard_file_finished,
-            .commit_finished,
-            .amend_finished,
-            .editor_finished,
+            .load_finished,
+            .action_finished,
             .auto_reload_tick,
             => true,
             else => false,
@@ -2369,7 +2386,7 @@ pub const App = struct {
     }
 
     fn editorDone(result: chasen.ForegroundCommandResult) Msg {
-        return .{ .editor_finished = result };
+        return Msg.actionFinished(.{ .editor = result });
     }
 
     fn setStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
@@ -5004,6 +5021,11 @@ test "system events keep previous ephemeral status" {
     try app.update(.{ .terminal_resized = .{ .width = 120, .height = 40 } }, undefined);
 
     try std.testing.expectEqualStrings("staged: src/app.zig", app.status.text());
+}
+
+test "grouped result messages keep previous ephemeral status" {
+    try std.testing.expect(App.msgKeepsEphemeralStatus(.{ .load_finished = undefined }));
+    try std.testing.expect(App.msgKeepsEphemeralStatus(.{ .action_finished = undefined }));
 }
 
 test "modal transitions clear previous ephemeral status" {
