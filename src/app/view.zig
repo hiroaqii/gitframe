@@ -33,6 +33,15 @@ const commit_dialog_width: u16 = 72;
 const commit_dialog_height: u16 = 22;
 const discard_dialog_width: u16 = 72;
 const discard_dialog_height: u16 = 9;
+
+const color_accent = chasen.Color{ .index = 14 };
+const color_prompt = chasen.Color{ .index = 11 };
+const color_staged = chasen.Color{ .index = 10 };
+const color_success = chasen.Color{ .index = 2 };
+const color_warning = chasen.Color{ .index = 11 };
+const color_danger = chasen.Color{ .index = 9 };
+const color_info = chasen.Color{ .index = 12 };
+const color_binary = chasen.Color{ .index = 13 };
 // Amend rewrites history, so it uses a distinct accent from normal commit UI.
 const amend_accent = chasen.Color{ .rgb = .{ 203, 166, 247 } };
 
@@ -152,7 +161,7 @@ fn viewBody(app: anytype, surface: *chasen.Surface) !void {
         .height = if (size.height > 10) 10 else size.height,
     });
     var col = panel.column(.{ .gap = 1 });
-    col.borrowText(title, .{ .bold = true, .fg = .{ .index = 14 } });
+    col.borrowText(title, .{ .bold = true, .fg = color_accent });
     col.borrowText(subtitle, .{ .fg = .gray });
     try col.print("Source: {s}", .{app.config.sourceLabel()});
     viewLoadState(app, &col);
@@ -215,11 +224,11 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
     if (size.width > 2) {
         if (app.review_display.hide_reviewed_files and app.review_display.changed_file_filter != .all) {
             const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{app.review_display.changed_file_filter.label()});
-            try draw.copyClippedTextAt(surface, 1, 2, text, .{ .fg = .{ .index = 11 } });
+            try draw.copyClippedTextAt(surface, 1, 2, text, .{ .fg = color_prompt });
         } else if (app.review_display.hide_reviewed_files) {
-            try draw.copyClippedTextAt(surface, 1, 2, "hiding reviewed", .{ .fg = .{ .index = 11 } });
+            try draw.copyClippedTextAt(surface, 1, 2, "hiding reviewed", .{ .fg = color_prompt });
         } else if (app.review_display.changed_file_filter != .all) {
-            try draw.copyClippedTextAt(surface, 1, 2, app.review_display.changed_file_filter.label(), .{ .fg = .{ .index = 11 } });
+            try draw.copyClippedTextAt(surface, 1, 2, app.review_display.changed_file_filter.label(), .{ .fg = color_prompt });
         }
     }
 
@@ -303,9 +312,9 @@ fn sidebarRowStyle(row: sidebar_view_model.Row, pane_active: bool) chasen.TextSt
     if (row.selected) return .{ .reverse = true, .bold = true };
     if (row.kind == .directory) return .{ .bold = true, .dim = !pane_active };
     return switch (row.stage_presence) {
-        .staged_only => .{ .fg = .{ .index = 10 }, .dim = !pane_active },
-        .mixed => .{ .fg = .{ .index = 11 }, .dim = !pane_active },
-        .conflict => .{ .fg = .{ .index = 9 }, .bold = true, .dim = !pane_active },
+        .staged_only => .{ .fg = color_staged, .dim = !pane_active },
+        .mixed => .{ .fg = color_prompt, .dim = !pane_active },
+        .conflict => .{ .fg = color_danger, .bold = true, .dim = !pane_active },
         else => .{ .dim = !pane_active },
     };
 }
@@ -435,7 +444,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
         .idle => {},
     }
 
-    try draw.copyClippedTextAt(&content, 0, 0, path, .{ .bold = true, .fg = .{ .index = 11 }, .dim = !active });
+    try draw.copyClippedTextAt(&content, 0, 0, path, .{ .bold = true, .fg = color_prompt, .dim = !active });
     const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "status: {s}{s}", .{ statusName(entry.index), statusSuffix(entry) });
     try draw.copyClippedTextAt(&content, 0, 2, status_text, .{ .fg = .gray, .dim = !active });
     switch (file_tree.stagePresenceFromEntry(entry)) {
@@ -460,7 +469,7 @@ fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool) void {
 }
 
 fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u8, active: bool) !void {
-    try draw.copyClippedTextAt(surface, 0, 0, path, .{ .bold = true, .fg = .{ .index = 11 }, .dim = !active });
+    try draw.copyClippedTextAt(surface, 0, 0, path, .{ .bold = true, .fg = color_prompt, .dim = !active });
     try draw.copyClippedTextAt(surface, 0, 2, message, .{ .fg = .gray, .dim = !active });
 }
 
@@ -573,15 +582,15 @@ fn drawStateMessageColumn(col: *chasen.Column, message: StateMessage) void {
 fn stateTitleStyle(tone: StateTone) chasen.TextStyle {
     return switch (tone) {
         .muted => .{ .bold = true, .fg = .gray },
-        .loading => .{ .bold = true, .fg = .{ .index = 11 } },
-        .warning => .{ .bold = true, .fg = .{ .index = 11 } },
-        .failure => .{ .bold = true, .fg = .{ .index = 9 } },
+        .loading => .{ .bold = true, .fg = color_prompt },
+        .warning => .{ .bold = true, .fg = color_warning },
+        .failure => .{ .bold = true, .fg = color_danger },
     };
 }
 
 fn stateBodyStyle(tone: StateTone) chasen.TextStyle {
     return switch (tone) {
-        .failure => .{ .fg = .{ .index = 9 } },
+        .failure => .{ .fg = color_danger },
         else => .{ .fg = .gray },
     };
 }
@@ -602,12 +611,12 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
     if (app.file_search.mode) {
         const label = "file: ";
         const label_col: u16 = 1;
-        _ = surface.borrowTextAt(label_col, 0, label, .{ .fg = .{ .index = 11 }, .bold = true });
+        _ = surface.borrowTextAt(label_col, 0, label, .{ .fg = color_prompt, .bold = true });
         const input_col: u16 = label_col + @as(u16, @intCast(label.len));
-        _ = surface.copyTextAt(input_col, 0, app.file_search.input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
+        _ = surface.copyTextAt(input_col, 0, app.file_search.input.slice(), .{ .fg = color_prompt }) catch {};
         if (app.file_search.no_match) {
             const col: u16 = @intCast(@min(input_col + chasen.text.displayWidth(app.file_search.input.slice()) + 1, std.math.maxInt(u16)));
-            if (surface.size().width > col) _ = surface.borrowTextAt(col, 0, "(no match)", .{ .fg = .{ .index = 9 } });
+            if (surface.size().width > col) _ = surface.borrowTextAt(col, 0, "(no match)", .{ .fg = color_danger });
         }
         return;
     }
@@ -625,11 +634,11 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
     }
 
     if (app.config.watch and width > col + 8) {
-        _ = surface.borrowTextAt(col, 0, "watch", .{ .fg = .{ .index = 10 } });
+        _ = surface.borrowTextAt(col, 0, "watch", .{ .fg = color_staged });
         col +|= 7;
     }
     if (app.status.text().len > 0 and width > col + 2) {
-        draw.copyClippedTextAt(surface, col, 0, app.status.text(), .{ .fg = .{ .index = 11 } }) catch {};
+        draw.copyClippedTextAt(surface, col, 0, app.status.text(), .{ .fg = color_prompt }) catch {};
         const message_width = chasen.text.displayWidth(app.status.text());
         col +|= @intCast(@min(message_width + 2, std.math.maxInt(u16)));
     }
@@ -664,7 +673,7 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
         .title = "Repositories",
         .backdrop = false,
         .border = .rounded,
-        .title_style = .{ .bold = true, .fg = .{ .index = 14 } },
+        .title_style = .{ .bold = true, .fg = color_accent },
     };
     fillModalDialog(surface, opts);
     modal.view(surface, opts);
@@ -675,30 +684,30 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
     const size = content.size();
 
     if (app.repo_picker.prompt_mode == .path_input) {
-        _ = content.borrowTextAt(0, 0, "path: ", .{ .fg = .{ .index = 11 }, .bold = true });
-        try drawCommitInputLine(&content, 6, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor, .{ .fg = .{ .index = 11 } });
+        _ = content.borrowTextAt(0, 0, "path: ", .{ .fg = color_prompt, .bold = true });
+        try drawCommitInputLine(&content, 6, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor, .{ .fg = color_prompt });
         showInputCursor(&content, 6, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor);
         if (app.repo_picker.path_pending and size.width > 16) {
             _ = content.borrowTextAt(0, 2, "checking path...", .{ .fg = .gray });
         } else if (app.repo_picker.path_error) |err| {
-            _ = content.borrowTextAt(0, 2, err.message(), .{ .fg = .{ .index = 9 } });
+            _ = content.borrowTextAt(0, 2, err.message(), .{ .fg = color_danger });
         } else if (size.height > 2) {
             _ = content.borrowTextAt(0, 2, "Enter: open path  Esc: back", .{ .fg = .gray });
         }
         return;
     }
 
-    _ = content.borrowTextAt(0, 0, "filter: ", .{ .fg = .{ .index = 11 }, .bold = true });
-    try drawCommitInputLine(&content, 8, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor, .{ .fg = .{ .index = 11 } });
+    _ = content.borrowTextAt(0, 0, "filter: ", .{ .fg = color_prompt, .bold = true });
+    try drawCommitInputLine(&content, 8, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor, .{ .fg = color_prompt });
     showInputCursor(&content, 8, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor);
 
     if (size.height > 1) {
         if (app.repo_picker.list.no_match) {
-            _ = content.borrowTextAt(0, 1, "(no match)", .{ .fg = .{ .index = 9 } });
+            _ = content.borrowTextAt(0, 1, "(no match)", .{ .fg = color_danger });
         } else if (app.repo_picker.path_pending) {
             _ = content.borrowTextAt(0, 1, "(checking path...)", .{ .fg = .gray });
         } else if (app.repo_picker.path_error) |err| {
-            try draw.copyClippedTextAt(&content, 0, 1, err.message(), .{ .fg = .{ .index = 9 } });
+            try draw.copyClippedTextAt(&content, 0, 1, err.message(), .{ .fg = color_danger });
         } else {
             try draw.copyClippedTextAt(&content, 0, 1, "Enter: switch  /: filter  : enter path  Esc: close", .{ .fg = .gray });
         }
@@ -728,7 +737,7 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
         const style: chasen.TextStyle = if (focused_row)
             .{ .reverse = true, .bold = true }
         else if (active)
-            .{ .fg = .{ .index = 10 }, .bold = true }
+            .{ .fg = color_staged, .bold = true }
         else
             .{};
         const marker = if (focused_row) ">" else " ";
@@ -750,7 +759,7 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
     const title_style: chasen.TextStyle = if (app.commit_panel.mode == .amend)
         .{ .bold = true, .fg = amend_accent }
     else
-        .{ .bold = true, .fg = .{ .index = 14 } };
+        .{ .bold = true, .fg = color_accent };
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, commit_dialog_width),
         .dialog_height = @min(surface.size().height, commit_dialog_height),
@@ -785,7 +794,7 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
         const input_col: u16 = @min(2, size.width);
         if (size.height > 3 and 3 < field_limit_row and size.width > input_col) {
             const cursor = if (active) app.commit_panel.subject.cursor else null;
-            const input_style: chasen.TextStyle = if (app.commit_panel.mode == .amend) .{} else .{ .fg = .{ .index = 11 } };
+            const input_style: chasen.TextStyle = if (app.commit_panel.mode == .amend) .{} else .{ .fg = color_prompt };
             try drawCommitInputLine(&content, input_col, 3, app.commit_panel.subject.slice(), cursor, input_style);
             if (active) showInputCursor(&content, input_col, 3, app.commit_panel.subject.slice(), app.commit_panel.subject.cursor);
         }
@@ -812,7 +821,7 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
 
     if (size.height > 2) {
         if (app.commit_panel.commit_error) |err| {
-            try draw.copyClippedTextAt(&content, 0, error_row, err.message(), .{ .fg = .{ .index = 9 } });
+            try draw.copyClippedTextAt(&content, 0, error_row, err.message(), .{ .fg = color_danger });
         } else {
             const hint = try std.fmt.allocPrint(content.frameAllocator(), "Ctrl+s/Ctrl+Enter: {s}", .{app.commit_panel.submitLabel()});
             try draw.copyClippedTextAt(&content, 0, error_row, hint, .{ .fg = .gray });
@@ -864,7 +873,7 @@ fn viewCommitHelp(app: anytype, surface: *chasen.Surface, start_row: u16, rows: 
 
 fn commitFieldLabelStyle(app: anytype, active: bool) chasen.TextStyle {
     if (active and app.commit_panel.mode == .amend) return .{ .bold = true, .fg = amend_accent };
-    if (active) return .{ .bold = true, .fg = .{ .index = 14 } };
+    if (active) return .{ .bold = true, .fg = color_accent };
     return .{ .bold = true };
 }
 
@@ -900,8 +909,8 @@ fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
         .title = "Discard file changes?",
         .backdrop = false,
         .border = .rounded,
-        .title_style = .{ .bold = true, .fg = .{ .index = 9 } },
-        .border_style = .{ .fg = .{ .index = 9 } },
+        .title_style = .{ .bold = true, .fg = color_danger },
+        .border_style = .{ .fg = color_danger },
     };
     fillModalDialog(surface, opts);
     modal.view(surface, opts);
@@ -911,11 +920,11 @@ fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
     var content = surface.child(content_rect);
     const size = content.size();
 
-    try draw.copyClippedTextAt(&content, 0, 0, "This will discard unstaged tracked changes.", .{ .fg = .{ .index = 9 } });
+    try draw.copyClippedTextAt(&content, 0, 0, "This will discard unstaged tracked changes.", .{ .fg = color_danger });
     if (size.height > 2) {
         try draw.copyClippedTextAt(&content, 0, 2, "File:", .{ .bold = true });
         if (size.width > 6) {
-            try draw.copyClippedTextAt(&content, 6, 2, confirmation.path, .{ .fg = .{ .index = 11 } });
+            try draw.copyClippedTextAt(&content, 6, 2, confirmation.path, .{ .fg = color_prompt });
         }
     }
     if (size.height > 4) {
@@ -1119,7 +1128,7 @@ fn helpModalOptions(size: chasen.Size) ui.Modal.ViewOptions {
         .title = "Shortcuts",
         .backdrop = false,
         .border = .rounded,
-        .title_style = .{ .bold = true, .fg = .{ .index = 14 } },
+        .title_style = .{ .bold = true, .fg = color_accent },
         .border_style = .{ .fg = .gray },
     };
 }
@@ -1225,7 +1234,7 @@ fn drawHelpLine(
 
     const row: u16 = @intCast(row_offset);
     switch (kind) {
-        .section_title => try draw.copyClippedTextAt(surface, 0, row, first, .{ .bold = true, .fg = .{ .index = 11 } }),
+        .section_title => try draw.copyClippedTextAt(surface, 0, row, first, .{ .bold = true, .fg = color_prompt }),
         .item => try drawHelpItem(surface, row, .{ .key = first, .description = second }),
         .blank => {},
     }
@@ -1261,7 +1270,7 @@ pub fn drawSearchMatchMarker(app: anytype, surface: *chasen.Surface) void {
     if (visible_offset >= body_rows) return;
 
     const row: u16 = @intCast(diff_body_start_row + visible_offset);
-    _ = surface.borrowTextAt(0, row, "»", .{ .bold = true, .reverse = true, .fg = .{ .index = 11 } });
+    _ = surface.borrowTextAt(0, row, "»", .{ .bold = true, .reverse = true, .fg = color_prompt });
 }
 
 fn diffContentSurface(surface: *chasen.Surface) chasen.Surface {
@@ -1283,44 +1292,44 @@ pub fn contentWidth(width: u16) u16 {
 
 fn statusStyle(row: sidebar_view_model.Row, status: file_tree.Status) chasen.TextStyle {
     const fg: chasen.Color = switch (row.stage_presence) {
-        .staged_only => .{ .index = 10 },
-        .mixed => .{ .index = 11 },
-        .conflict => .{ .index = 9 },
+        .staged_only => color_staged,
+        .mixed => color_prompt,
+        .conflict => color_danger,
         else => switch (status) {
-            .modified => .{ .index = 11 },
-            .added => .{ .index = 2 },
-            .deleted => .{ .index = 9 },
-            .renamed => .{ .index = 14 },
-            .binary => .{ .index = 13 },
+            .modified => color_prompt,
+            .added => color_success,
+            .deleted => color_danger,
+            .renamed => color_accent,
+            .binary => color_binary,
         },
     };
     return .{ .fg = fg, .bold = true, .reverse = row.selected };
 }
 
 fn reviewedStyle(selected: bool) chasen.TextStyle {
-    return .{ .fg = .{ .index = 2 }, .bold = true, .reverse = selected };
+    return .{ .fg = color_success, .bold = true, .reverse = selected };
 }
 
 fn modeBadgeStyle(selected: bool) chasen.TextStyle {
-    return .{ .fg = .{ .index = 12 }, .bold = true, .reverse = selected };
+    return .{ .fg = color_info, .bold = true, .reverse = selected };
 }
 
 fn paneTitleStyle(active: bool) chasen.TextStyle {
     return if (active)
-        .{ .bold = true, .fg = .{ .index = 14 } }
+        .{ .bold = true, .fg = color_accent }
     else
         .{ .bold = true, .fg = .gray, .dim = true };
 }
 
 fn paneSearchStyle(active: bool) chasen.TextStyle {
     return if (active)
-        .{ .bold = true, .fg = .{ .index = 11 } }
+        .{ .bold = true, .fg = color_prompt }
     else
-        .{ .fg = .{ .index = 11 } };
+        .{ .fg = color_prompt };
 }
 
 fn paneHeaderRuleStyle(active: bool) chasen.TextStyle {
-    return .{ .fg = if (active) .{ .index = 14 } else .gray, .dim = true };
+    return .{ .fg = if (active) color_accent else .gray, .dim = true };
 }
 
 fn shellSeparatorStyle() chasen.TextStyle {

@@ -448,16 +448,22 @@ fn prefixForLine(kind: diff_parser.DiffLine.Kind) []const u8 {
 
 const side_by_side_min_width: u16 = 72;
 
-const style_file_header: chasen.TextStyle = .{ .bold = true, .fg = .{ .index = 11 } };
-const style_hunk: chasen.TextStyle = .{ .bold = true, .fg = .{ .index = 14 } };
-const style_selected_hunk: chasen.TextStyle = .{ .bold = true, .reverse = true, .fg = .{ .index = 14 } };
-const style_cursor: chasen.TextStyle = .{ .bold = true, .fg = .{ .index = 11 } };
-const style_added: chasen.TextStyle = .{ .fg = .{ .index = 2 } };
-const style_removed: chasen.TextStyle = .{ .fg = .{ .index = 9 } };
+const color_accent = chasen.Color{ .index = 14 };
+const color_prompt = chasen.Color{ .index = 11 };
+const color_success = chasen.Color{ .index = 2 };
+const color_warning = chasen.Color{ .index = 11 };
+const color_danger = chasen.Color{ .index = 9 };
+
+const style_file_header: chasen.TextStyle = .{ .bold = true, .fg = color_prompt };
+const style_hunk: chasen.TextStyle = .{ .bold = true, .fg = color_accent };
+const style_selected_hunk: chasen.TextStyle = .{ .bold = true, .reverse = true, .fg = color_accent };
+const style_cursor: chasen.TextStyle = .{ .bold = true, .fg = color_prompt };
+const style_added: chasen.TextStyle = .{ .fg = color_success };
+const style_removed: chasen.TextStyle = .{ .fg = color_danger };
 const style_context: chasen.TextStyle = .{};
 const style_metadata: chasen.TextStyle = .{ .fg = .gray };
 const style_line_number: chasen.TextStyle = .{ .fg = .gray };
-const style_warning: chasen.TextStyle = .{ .fg = .{ .index = 11 } };
+const style_warning: chasen.TextStyle = .{ .fg = color_warning };
 
 test "display mode falls back to unified on narrow panes" {
     try std.testing.expectEqual(DisplayMode.unified, effectiveMode(40, .side_by_side));
