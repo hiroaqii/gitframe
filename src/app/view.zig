@@ -875,7 +875,6 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
         .backdrop = false,
         .border = .rounded,
         .title_style = title_style,
-        .border_style = .{ .fg = .gray },
     };
     fillModalDialog(surface, opts);
     modal.view(surface, opts);
@@ -1237,7 +1236,6 @@ fn helpModalOptions(size: chasen.Size) ui.Modal.ViewOptions {
         .backdrop = false,
         .border = .rounded,
         .title_style = .{ .bold = true, .fg = color_accent },
-        .border_style = .{ .fg = .gray },
     };
 }
 
