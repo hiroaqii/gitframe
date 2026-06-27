@@ -1614,7 +1614,7 @@ const help_sidebar_items = [_]HelpItem{
     .{ .key = "h / l", .description = "scroll file tree horizontally" },
     .{ .key = "f", .description = "search files" },
     .{ .key = "F", .description = "cycle file filter" },
-    .{ .key = "s / S", .description = "stage / unstage file or directory" },
+    .{ .key = "s", .description = "stage / unstage file or directory" },
     .{ .key = "v", .description = "mark reviewed" },
     .{ .key = "H / L", .description = "hide reviewed / line numbers" },
     .{ .key = "[ / ]", .description = "resize sidebar" },
@@ -1631,7 +1631,7 @@ const help_diff_items = [_]HelpItem{
     .{ .key = "J / K", .description = "next / previous hunk" },
     .{ .key = "n / p", .description = "next / previous match or hunk" },
     .{ .key = "N", .description = "previous search match" },
-    .{ .key = "s / S", .description = "stage / unstage hunk" },
+    .{ .key = "s", .description = "stage / unstage hunk" },
 };
 
 const help_mouse_items = [_]HelpItem{

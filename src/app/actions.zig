@@ -124,6 +124,7 @@ pub const UnstageHunkFinished = struct {
     path: []u8,
     hunk_index: usize,
     mark_source: HunkMarkSource = .session,
+    reload_after_success: bool = false,
     result: FileActionTaskResult,
 
     pub fn deinit(self: *UnstageHunkFinished, allocator: std.mem.Allocator) void {
@@ -136,6 +137,7 @@ pub const UnstageHunkFinished = struct {
             .path = &.{},
             .hunk_index = 0,
             .mark_source = .session,
+            .reload_after_success = false,
             .result = .ok,
         };
     }
@@ -318,6 +320,7 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
         patch: []u8,
         hunk_index: usize,
         mark_source: HunkMarkSource = .session,
+        reload_after_success: bool = false,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
@@ -340,6 +343,7 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
                 .path = path,
                 .hunk_index = task.hunk_index,
                 .mark_source = task.mark_source,
+                .reload_after_success = task.reload_after_success,
                 .result = result,
             });
         }

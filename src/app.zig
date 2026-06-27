@@ -340,6 +340,8 @@ pub const App = struct {
         toggle_reviewed_file,
         toggle_hide_reviewed_files,
         cycle_changed_file_filter,
+        toggle_selected_file,
+        toggle_selected_hunk,
         stage_selected_file,
         stage_selected_hunk,
         unstage_selected_file,
@@ -560,6 +562,8 @@ pub const App = struct {
             .toggle_reviewed_file => try self.toggleReviewedFile(ctx.allocator()),
             .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
+            .toggle_selected_file => try self.toggleSelectedFileStage(ctx),
+            .toggle_selected_hunk => try self.toggleSelectedHunkStage(ctx),
             .stage_selected_file => try self.stageSelectedFile(ctx),
             .stage_selected_hunk => try self.stageSelectedHunk(ctx),
             .unstage_selected_file => try self.unstageSelectedFile(ctx),
@@ -1025,6 +1029,13 @@ pub const App = struct {
         };
     }
 
+    fn sourceIsCached(source: diff_source.SourceMode) bool {
+        return switch (source) {
+            .cached => true,
+            .unstaged, .stdin, .pager, .patch_file, .range, .no_index => false,
+        };
+    }
+
     fn isCombinedHunkProjectionCandidate(file: diff_parser.FileDiff, entry: git_status.StatusEntry) bool {
         if (file.is_binary) return false;
         if (file.hunks.len == 0) return false;
@@ -1094,6 +1105,52 @@ pub const App = struct {
             return err;
         };
         self.setStatus("staging: {s}", .{target.path});
+    }
+
+    const ToggleStageOperation = enum {
+        stage,
+        unstage,
+    };
+
+    const ToggleStageTargetResult = union(enum) {
+        operation: ToggleStageOperation,
+        unavailable_source,
+        no_repo,
+        no_path,
+        stale_status,
+        conflict_unsupported: GitActionPath,
+        no_content: GitActionPath,
+    };
+
+    fn toggleSelectedFileStage(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.actions.pending != null) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+
+        switch (self.selectedStageToggleOperation()) {
+            .operation => |operation| switch (operation) {
+                .stage => try self.stageSelectedFile(ctx),
+                .unstage => try self.unstageSelectedFile(ctx),
+            },
+            .unavailable_source, .no_repo => self.setStatus("stage toggle unavailable for this source", .{}),
+            .no_path => self.setStatus("no file selected", .{}),
+            .stale_status => self.setStatus("status is still loading", .{}),
+            .conflict_unsupported => |target| {
+                if (target.kind == .directory) {
+                    self.setStatus("conflict under directory: {s}", .{target.path});
+                } else {
+                    self.setStatus("conflict stage toggle is not supported yet", .{});
+                }
+            },
+            .no_content => |target| {
+                if (target.kind == .directory) {
+                    self.setStatus("no stageable or staged files under: {s}", .{target.path});
+                } else {
+                    self.setStatus("no stageable or staged content selected", .{});
+                }
+            },
+        }
     }
 
     fn stageSelectedHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -1183,6 +1240,25 @@ pub const App = struct {
         self.setStatus("staging hunk: {s}", .{target.path});
     }
 
+    fn toggleSelectedHunkStage(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.actions.pending != null) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+
+        switch (self.selectedHunkToggleOperation()) {
+            .operation => |operation| switch (operation) {
+                .stage => try self.stageSelectedHunk(ctx),
+                .unstage => try self.unstageSelectedHunk(ctx),
+            },
+            .unavailable_source, .no_repo => self.setStatus("hunk stage toggle unavailable for this source", .{}),
+            .no_file => self.setStatus("no file selected", .{}),
+            .no_path => self.setStatus("hunk stage toggle unavailable for status-only file", .{}),
+            .no_hunk => self.setStatus("no hunk selected", .{}),
+            .offscreen_cursor => self.setStatus("cursor is offscreen; move cursor first", .{}),
+        }
+    }
+
     fn unstageSelectedHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (self.actions.pending != null) {
             self.setStatus("another git action is running", .{});
@@ -1242,6 +1318,7 @@ pub const App = struct {
             .patch = &.{},
             .hunk_index = target.hunk_index,
             .mark_source = target.mark_source,
+            .reload_after_success = target.reload_after_success,
         };
         errdefer {
             if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
@@ -1295,6 +1372,7 @@ pub const App = struct {
         hunk_index: usize,
         patch: []u8,
         mark_source: app_actions.HunkMarkSource = .session,
+        reload_after_success: bool = false,
     };
 
     const HunkStageTargetResult = union(enum) {
@@ -1328,6 +1406,48 @@ pub const App = struct {
         unsupported_file_state,
         patch_failed,
     };
+
+    const ToggleHunkTargetResult = union(enum) {
+        operation: ToggleStageOperation,
+        unavailable_source,
+        no_repo,
+        no_file,
+        no_path,
+        no_hunk,
+        offscreen_cursor,
+    };
+
+    fn selectedHunkToggleOperation(self: *const App) ToggleHunkTargetResult {
+        const can_stage = diff_source.sourceAllowsStageAction(self.config.source);
+        const can_unstage = diff_source.sourceAllowsUnstageAction(self.config.source);
+        if (!can_stage and !can_unstage) return .unavailable_source;
+
+        const repo_root = self.activeRepoRoot() orelse return .no_repo;
+        if (self.activeCombinedProjection()) |bundle| {
+            if (!self.diffCursorIsVisible()) return .offscreen_cursor;
+            const projected_index = self.selectedHunkIndex() orelse return .no_hunk;
+            if (projected_index >= bundle.projection.hunk_states.len) return .no_hunk;
+            return switch (bundle.projection.hunk_states[projected_index].origin) {
+                .unstaged => if (can_stage) .{ .operation = .stage } else .unavailable_source,
+                .cached => if (can_unstage) .{ .operation = .unstage } else .unavailable_source,
+            };
+        }
+
+        const file = self.selectedFile() orelse return .no_file;
+        const path = diff_file.canonicalPathKey(file) orelse return .no_path;
+        if (!self.diffCursorIsVisible()) return .offscreen_cursor;
+        const hunk_index = self.selectedHunkIndex() orelse return .no_hunk;
+        if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
+
+        if (sourceIsCached(self.config.source)) {
+            return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
+        }
+
+        if (self.staged_hunks.contains(repo_root, path, hunk_index)) {
+            return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
+        }
+        return if (can_stage) .{ .operation = .stage } else .unavailable_source;
+    }
 
     fn selectedHunkStageTarget(self: *const App, allocator: std.mem.Allocator) HunkStageTargetResult {
         if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
@@ -1374,7 +1494,7 @@ pub const App = struct {
         if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
         if (file.is_binary) return .binary_unsupported;
         if (diff_file.status(file) != .modified or diff_file.hasModeChange(file)) return .unsupported_file_state;
-        if (!self.staged_hunks.contains(repo_root, path, hunk_index)) return .not_staged_hunk;
+        if (!sourceIsCached(self.config.source) and !self.staged_hunks.contains(repo_root, path, hunk_index)) return .not_staged_hunk;
 
         // This reverses a session-staged hunk from the same loaded FileDiff.
         // finishStageHunk intentionally avoids a full diff reload, and
@@ -1392,6 +1512,8 @@ pub const App = struct {
             .path = path,
             .hunk_index = hunk_index,
             .patch = patch,
+            .mark_source = if (sourceIsCached(self.config.source)) .projection else .session,
+            .reload_after_success = sourceIsCached(self.config.source),
         } };
     }
 
@@ -1480,6 +1602,50 @@ pub const App = struct {
             },
             .directory => self.selectedDirectoryStageTarget(repo_root, action_target.path),
         };
+    }
+
+    fn selectedStageToggleOperation(self: *const App) ToggleStageTargetResult {
+        const can_stage = diff_source.sourceAllowsStageAction(self.config.source);
+        const can_unstage = diff_source.sourceAllowsUnstageAction(self.config.source);
+        if (!can_stage and !can_unstage) return .unavailable_source;
+
+        // Toggle resolution is status-driven so `s` never starts a stage task
+        // that should have been an unstage task, or the reverse.
+        const repo_root = self.activeRepoRoot() orelse return .no_repo;
+        const action_target = self.selectedSidebarActionTarget() orelse return .no_path;
+        if (self.status_load_pending != null) return .stale_status;
+        const snapshot_root = self.git_status.repo_root orelse return .stale_status;
+        if (!std.mem.eql(u8, snapshot_root, repo_root)) return .stale_status;
+
+        return switch (action_target.kind) {
+            .file => self.fileStageToggleOperation(action_target, can_stage, can_unstage),
+            .directory => self.directoryStageToggleOperation(action_target, can_stage, can_unstage),
+        };
+    }
+
+    fn fileStageToggleOperation(self: *const App, action_target: GitActionPath, can_stage: bool, can_unstage: bool) ToggleStageTargetResult {
+        const entry = self.statusEntryForPathKey(action_target.path) orelse return .{ .no_content = action_target };
+        if (entry.isConflict()) return .{ .conflict_unsupported = action_target };
+        if (entry.isUnstaged()) return if (can_stage) .{ .operation = .stage } else .unavailable_source;
+        if (entry.isStaged()) return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
+        return .{ .no_content = action_target };
+    }
+
+    fn directoryStageToggleOperation(self: *const App, action_target: GitActionPath, can_stage: bool, can_unstage: bool) ToggleStageTargetResult {
+        var has_unstaged = false;
+        var has_staged = false;
+        for (self.git_status.document.entries) |entry| {
+            const key = entry.canonicalPathKey() orelse continue;
+            if (!file_tree.isPathDescendantOfDirectory(key, action_target.path)) continue;
+
+            if (entry.isConflict()) return .{ .conflict_unsupported = action_target };
+            if (entry.isUnstaged()) has_unstaged = true;
+            if (entry.isStaged()) has_staged = true;
+        }
+
+        if (has_unstaged) return if (can_stage) .{ .operation = .stage } else .unavailable_source;
+        if (has_staged) return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
+        return .{ .no_content = action_target };
     }
 
     fn unstageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -1946,6 +2112,10 @@ pub const App = struct {
                 const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
                 self.setStatus("unstaged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
                 if (active_matches) {
+                    if (result.reload_after_success) {
+                        try self.reloadAfterGitAction(ctx);
+                        return;
+                    }
                     if (result.mark_source == .session) {
                         _ = self.staged_hunks.remove(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
                     }
@@ -5987,6 +6157,103 @@ test "selectedStageTarget skips only fresh staged-only files" {
     }
 }
 
+test "selectedStageToggleOperation resolves file operation from fresh status" {
+    var app: App = .{
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffTwoWithStatuses()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer app.git_status.deinit();
+
+    var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "AM src/added.zig\x00");
+    try app.git_status.replace("/repo", &mixed_bundle);
+    switch (app.selectedStageToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.stage, operation),
+        else => return error.ExpectedToggleStageOperation,
+    }
+
+    var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
+    try app.git_status.replace("/repo", &staged_bundle);
+    switch (app.selectedStageToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.unstage, operation),
+        else => return error.ExpectedToggleUnstageOperation,
+    }
+
+    app.status_load_pending = 1;
+    switch (app.selectedStageToggleOperation()) {
+        .stale_status => {},
+        else => return error.ExpectedToggleStaleStatus,
+    }
+    app.status_load_pending = null;
+
+    var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "UU src/added.zig\x00");
+    try app.git_status.replace("/repo", &conflict_bundle);
+    switch (app.selectedStageToggleOperation()) {
+        .conflict_unsupported => |target| {
+            try std.testing.expectEqual(App.GitActionTargetKind.file, target.kind);
+            try std.testing.expectEqualStrings("src/added.zig", target.path);
+        },
+        else => return error.ExpectedToggleConflict,
+    }
+
+    app.config.source = .cached;
+    var cached_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
+    try app.git_status.replace("/repo", &cached_bundle);
+    switch (app.selectedStageToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.unstage, operation),
+        else => return error.ExpectedCachedToggleUnstage,
+    }
+
+    app.config.source = .{ .range = "main...HEAD" };
+    switch (app.selectedStageToggleOperation()) {
+        .unavailable_source => {},
+        else => return error.ExpectedToggleUnavailableSource,
+    }
+}
+
+test "selectedStageToggleOperation resolves directory operation from descendants" {
+    var app: App = .{
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffNested()),
+        .viewer = .{ .selected_node = 0 },
+    };
+    defer app.git_status.deinit();
+
+    var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00A  src/b\x00");
+    try app.git_status.replace("/repo", &mixed_bundle);
+    switch (app.selectedStageToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.stage, operation),
+        else => return error.ExpectedDirectoryToggleStage,
+    }
+
+    var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/a\x00M  src/b\x00");
+    try app.git_status.replace("/repo", &staged_bundle);
+    switch (app.selectedStageToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.unstage, operation),
+        else => return error.ExpectedDirectoryToggleUnstage,
+    }
+
+    var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "UU src/a\x00");
+    try app.git_status.replace("/repo", &conflict_bundle);
+    switch (app.selectedStageToggleOperation()) {
+        .conflict_unsupported => |target| {
+            try std.testing.expectEqual(App.GitActionTargetKind.directory, target.kind);
+            try std.testing.expectEqualStrings("src", target.path);
+        },
+        else => return error.ExpectedDirectoryToggleConflict,
+    }
+}
+
 test "selectedUnstageTarget requires fresh staged status" {
     var app: App = .{
         .config = .{ .source = .unstaged },
@@ -6095,6 +6362,71 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
     }
 }
 
+test "selectedHunkUnstageTarget supports cached source without session mark" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .cached },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+    };
+
+    switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
+        .ready => |target| {
+            defer std.testing.allocator.free(target.patch);
+            try std.testing.expectEqual(app_actions.HunkMarkSource.projection, target.mark_source);
+            try std.testing.expectEqualStrings("/repo", target.repo_root);
+            try std.testing.expectEqualStrings("a", target.path);
+            try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
+        },
+        else => return error.ExpectedCachedHunkUnstageTarget,
+    }
+}
+
+test "selectedHunkToggleOperation resolves source and session staged state" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffOne()),
+        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer app.staged_hunks.deinit(std.testing.allocator);
+
+    switch (app.selectedHunkToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.stage, operation),
+        else => return error.ExpectedHunkToggleStage,
+    }
+
+    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    switch (app.selectedHunkToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.unstage, operation),
+        else => return error.ExpectedHunkToggleUnstage,
+    }
+
+    app.config.source = .cached;
+    switch (app.selectedHunkToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.unstage, operation),
+        else => return error.ExpectedCachedHunkToggleUnstage,
+    }
+
+    app.config.source = .{ .range = "main...HEAD" };
+    switch (app.selectedHunkToggleOperation()) {
+        .unavailable_source => {},
+        else => return error.ExpectedHunkToggleUnavailable,
+    }
+}
+
 test "combined projection target is requested for mixed modified unstaged files" {
     var app: App = .{
         .config = .{ .source = .unstaged },
@@ -6199,6 +6531,10 @@ test "projected hunk actions route through original cached and unstaged origins"
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
 
+    switch (app.selectedHunkToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.unstage, operation),
+        else => return error.ExpectedProjectedToggleUnstage,
+    }
     switch (app.selectedHunkStageTarget(std.testing.allocator)) {
         .already_staged_hunk => {},
         else => return error.ExpectedAlreadyStagedProjectedHunk,
@@ -6213,6 +6549,10 @@ test "projected hunk actions route through original cached and unstaged origins"
     }
 
     app.viewer.diff_cursor = .{ .hunk_header = 1 };
+    switch (app.selectedHunkToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.stage, operation),
+        else => return error.ExpectedProjectedToggleStage,
+    }
     switch (app.selectedHunkStageTarget(std.testing.allocator)) {
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
@@ -6421,6 +6761,42 @@ test "projection hunk action results reload status without mutating session mark
     try std.testing.expect(app.staged_hunks.contains("/repo", "a", 1));
     try std.testing.expectEqual(@as(usize, 1), app.staged_hunks.items.items.len);
     try std.testing.expect(app.status_load_pending != null);
+}
+
+test "cached source hunk unstage reload decision travels with task result" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffOne()),
+    };
+    defer app.staged_hunks.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+
+    try app.staged_hunks.add(allocator, "/repo", "a", 1);
+    const unstage_pending = app.actions.begin(.unstage_hunk);
+    try app.finishUnstageHunk(&ctx, .{
+        .pending = unstage_pending,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .path = try allocator.dupe(u8, "a"),
+        .hunk_index = 1,
+        .mark_source = .projection,
+        .reload_after_success = true,
+        .result = .ok,
+    });
+
+    try std.testing.expect(app.staged_hunks.contains("/repo", "a", 1));
+    switch (app.load.pending orelse return error.ExpectedReloadAfterCachedHunkUnstage) {
+        .diff_load => {},
+        .repo_discovery => return error.ExpectedReloadAfterCachedHunkUnstage,
+    }
+    try std.testing.expectEqual(@as(usize, 2), ctx.pendingTaskWithSlice().len);
 }
 
 test "clearLoadedDiff clears session staged hunk marks" {
@@ -7671,6 +8047,21 @@ fn clearPendingStatusTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocat
     for (ctx.pendingTaskWithSlice()) |entry| {
         const task: *StatusLoadTask = @ptrCast(@alignCast(entry.ctx));
         allocator.free(task.repo_root);
+        allocator.destroy(task);
+    }
+    ctx.pending_tasks_with_len = 0;
+}
+
+fn clearPendingStatusAndDiffTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
+    const entries = ctx.pendingTaskWithSlice();
+    if (entries.len >= 1) {
+        const task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
+        allocator.free(task.repo_root);
+        allocator.destroy(task);
+    }
+    if (entries.len >= 2) {
+        const task: *DiffLoadTask = @ptrCast(@alignCast(entries[1].ctx));
+        diff_source.freeLoadRequest(allocator, task.request);
         allocator.destroy(task);
     }
     ctx.pending_tasks_with_len = 0;

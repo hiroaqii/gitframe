@@ -97,6 +97,8 @@ const Action = enum {
     increase_sidebar_width,
     enter_commit_panel,
     enter_amend_panel,
+    toggle_selected_file,
+    toggle_selected_hunk,
     stage_selected_file,
     stage_selected_hunk,
     unstage_selected_file,
@@ -241,9 +243,7 @@ fn viewerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg
         if (context.search_query_len > 0) return actionToMsg(Msg, .select_previous_search_match);
         return if (context.review_mode) actionToMsg(Msg, .finish_review_needs_changes) else null;
     }
-    if (matchesShiftedAscii(key, 's', 'S')) {
-        return if (context.focus == .diff) actionToMsg(Msg, .unstage_selected_hunk) else actionToMsg(Msg, .unstage_selected_file);
-    }
+    if (matchesShiftedAscii(key, 's', 'S')) return null;
     if (context.review_mode and key.matches('a', .{})) return actionToMsg(Msg, .finish_review_approved);
     if (hasCommandModifier(key)) return null;
 
@@ -252,7 +252,7 @@ fn viewerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg
         'j', chasen.Key.down => if (context.focus == .diff) actionToMsg(Msg, .scroll_diff_down) else actionToMsg(Msg, .select_next_file),
         'n' => if (context.search_query_len > 0) actionToMsg(Msg, .select_next_search_match) else actionToMsg(Msg, .select_next_hunk),
         'p' => if (context.search_query_len > 0) actionToMsg(Msg, .select_previous_search_match) else actionToMsg(Msg, .select_previous_hunk),
-        's' => if (context.focus == .diff) actionToMsg(Msg, .stage_selected_hunk) else actionToMsg(Msg, .stage_selected_file),
+        's' => if (context.focus == .diff) actionToMsg(Msg, .toggle_selected_hunk) else actionToMsg(Msg, .toggle_selected_file),
         'q' => if (context.review_mode) actionToMsg(Msg, .finish_review_canceled) else actionToMsg(Msg, .quit),
         else => null,
     };
@@ -456,6 +456,8 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .increase_sidebar_width => voidMsg(Msg, "increase_sidebar_width"),
         .enter_commit_panel => voidMsg(Msg, "enter_commit_panel"),
         .enter_amend_panel => voidMsg(Msg, "enter_amend_panel"),
+        .toggle_selected_file => voidMsg(Msg, "toggle_selected_file"),
+        .toggle_selected_hunk => voidMsg(Msg, "toggle_selected_hunk"),
         .stage_selected_file => voidMsg(Msg, "stage_selected_file"),
         .stage_selected_hunk => voidMsg(Msg, "stage_selected_hunk"),
         .unstage_selected_file => voidMsg(Msg, "unstage_selected_file"),
@@ -558,6 +560,8 @@ const TestMsg = union(enum) {
     increase_sidebar_width,
     enter_commit_panel,
     enter_amend_panel,
+    toggle_selected_file,
+    toggle_selected_hunk,
     stage_selected_file,
     stage_selected_hunk,
     unstage_selected_file,
@@ -651,14 +655,14 @@ test "keyToMsg maps view option toggles" {
 }
 
 test "keyToMsg maps stage action by focused pane" {
-    try std.testing.expectEqual(TestMsg.stage_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 's' }).?);
-    try std.testing.expectEqual(TestMsg.stage_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 's' }).?);
-    try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'S' }).?);
-    try std.testing.expectEqual(TestMsg.unstage_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 'S' }).?);
-    try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedAscii('s', 'S')).?);
-    try std.testing.expectEqual(TestMsg.unstage_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, shiftedAscii('s', 'S')).?);
-    try std.testing.expectEqual(TestMsg.unstage_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedLowerOnly('s')).?);
-    try std.testing.expectEqual(TestMsg.unstage_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, shiftedLowerOnly('s')).?);
+    try std.testing.expectEqual(TestMsg.toggle_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 's' }).?);
+    try std.testing.expectEqual(TestMsg.toggle_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 's' }).?);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'S' }) == null);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 'S' }) == null);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedAscii('s', 'S')) == null);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .diff }, shiftedAscii('s', 'S')) == null);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedLowerOnly('s')) == null);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .diff }, shiftedLowerOnly('s')) == null);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'S', .mods = .{ .ctrl = true } }));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'S', .mods = .{ .alt = true } }));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 's', .mods = .{ .shift = true, .ctrl = true } }));
