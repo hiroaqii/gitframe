@@ -31,8 +31,8 @@ const help_header_rows: u16 = 2;
 const help_scroll_indicator_rows: u16 = 1;
 const commit_dialog_width: u16 = 72;
 const commit_dialog_height: u16 = 22;
-const discard_dialog_width: u16 = 72;
-const discard_dialog_height: u16 = 9;
+const confirmation_dialog_width: u16 = 72;
+const confirmation_dialog_height: u16 = 9;
 
 const color_accent = chasen.Color{ .index = 14 };
 const color_prompt = chasen.Color{ .index = 11 };
@@ -103,7 +103,7 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
     if (app.overlay.isHelp()) {
         try viewHelpPopup(app, surface);
     }
-    if (app.commit_panel.is_open) {
+    if (app.commit_panel.is_open and !app.overlay.isAmendCommit()) {
         try viewCommitPanel(app, surface);
     }
     if (app.overlay.isDiscardFile()) {
@@ -929,9 +929,6 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
     if (size.height > 2) {
         if (app.commit_panel.commit_error) |err| {
             try draw.copyClippedTextAt(&content, 0, error_row, err.message(), .{ .fg = color_danger });
-        } else {
-            const hint = try std.fmt.allocPrint(content.frameAllocator(), "Ctrl+s/Ctrl+Enter: {s}", .{app.commit_panel.submitLabel()});
-            try draw.copyClippedTextAt(&content, 0, error_row, hint, .{ .fg = .gray });
         }
     }
 
@@ -1011,8 +1008,8 @@ fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
     const confirmation = app.discard_confirmation orelse return;
     const modal = ui.Modal.init(.{});
     const opts: ui.Modal.ViewOptions = .{
-        .dialog_width = @min(surface.size().width, discard_dialog_width),
-        .dialog_height = @min(surface.size().height, discard_dialog_height),
+        .dialog_width = @min(surface.size().width, confirmation_dialog_width),
+        .dialog_height = @min(surface.size().height, confirmation_dialog_height),
         .title = "Discard file changes?",
         .backdrop = false,
         .border = .rounded,
@@ -1027,24 +1024,21 @@ fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
     var content = surface.child(content_rect);
     const size = content.size();
 
-    try draw.copyClippedTextAt(&content, 0, 0, "This will discard unstaged tracked changes.", .{ .fg = color_danger });
+    try drawCenteredText(&content, 0, "This will discard unstaged tracked changes.", .{ .fg = color_danger });
     if (size.height > 2) {
-        try draw.copyClippedTextAt(&content, 0, 2, "File:", .{ .bold = true });
-        if (size.width > 6) {
-            try draw.copyClippedTextAt(&content, 6, 2, confirmation.path, .{ .fg = color_prompt });
-        }
+        try drawCenteredLabelValue(&content, 2, "File:", confirmation.path, .{ .bold = true }, .{});
     }
     if (size.height > 4) {
-        try draw.copyClippedTextAt(&content, 0, 4, "Enter: discard    Esc/q: cancel", .{ .fg = .gray });
+        try drawCenteredText(&content, 4, "Enter: discard    Esc/q: cancel", .{ .fg = color_danger });
     }
 }
 
 fn viewAmendConfirmation(app: anytype, surface: *chasen.Surface) !void {
-    const confirmation = app.amend_confirmation orelse return;
+    _ = app.amend_confirmation orelse return;
     const modal = ui.Modal.init(.{});
     const opts: ui.Modal.ViewOptions = .{
-        .dialog_width = @min(surface.size().width, discard_dialog_width),
-        .dialog_height = @min(surface.size().height, discard_dialog_height),
+        .dialog_width = @min(surface.size().width, confirmation_dialog_width),
+        .dialog_height = @min(surface.size().height, confirmation_dialog_height),
         .title = "Amend last commit?",
         .backdrop = false,
         .border = .rounded,
@@ -1059,16 +1053,36 @@ fn viewAmendConfirmation(app: anytype, surface: *chasen.Surface) !void {
     var content = surface.child(content_rect);
     const size = content.size();
 
-    try draw.copyClippedTextAt(&content, 0, 0, "This rewrites the current branch history.", .{ .fg = amend_accent });
-    if (size.height > 2) {
-        try draw.copyClippedTextAt(&content, 0, 2, "Subject:", .{ .bold = true });
-        if (size.width > 9) {
-            try draw.copyClippedTextAt(&content, 9, 2, confirmation.subject, .{ .fg = amend_accent });
-        }
+    const line_count: u16 = 3;
+    const start_row: u16 = if (size.height > line_count) (size.height - line_count) / 2 else 0;
+    try drawCenteredText(&content, start_row, "This rewrites the current branch history.", .{ .fg = amend_accent });
+    if (start_row + 2 < size.height) {
+        try drawCenteredText(&content, start_row + 2, "Enter: amend    Esc/q: cancel", .{ .fg = amend_accent });
     }
-    if (size.height > 4) {
-        try draw.copyClippedTextAt(&content, 0, 4, "Enter: amend    Esc/q: cancel", .{ .fg = amend_accent });
-    }
+}
+
+fn drawCenteredText(surface: *chasen.Surface, row: u16, text: []const u8, style: chasen.TextStyle) !void {
+    const size = surface.size();
+    if (row >= size.height or size.width == 0) return;
+
+    const text_width = chasen.text.displayWidth(text);
+    const col: u16 = if (text_width < size.width) (size.width - text_width) / 2 else 0;
+    try draw.copyClippedTextAt(surface, col, row, text, style);
+}
+
+fn drawCenteredLabelValue(surface: *chasen.Surface, row: u16, label: []const u8, value: []const u8, label_style: chasen.TextStyle, value_style: chasen.TextStyle) !void {
+    const size = surface.size();
+    if (row >= size.height or size.width == 0) return;
+
+    const gap_width: u16 = 1;
+    const label_width = chasen.text.displayWidth(label);
+    const value_width = chasen.text.displayWidth(value);
+    const line_width = label_width + gap_width + value_width;
+    var col: u16 = if (line_width < size.width) (size.width - line_width) / 2 else 0;
+
+    try draw.copyClippedTextAt(surface, col, row, label, label_style);
+    col +|= @intCast(label_width + gap_width);
+    if (col < size.width) try draw.copyClippedTextAt(surface, col, row, value, value_style);
 }
 
 fn drawCommitInputLine(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, cursor: ?usize, style: chasen.TextStyle) !void {
