@@ -103,6 +103,13 @@ pub fn sourceAllowsStageProjection(source: SourceMode) bool {
     };
 }
 
+pub fn sourceAllowsEditorAction(source: SourceMode) bool {
+    return switch (source) {
+        .unstaged, .cached => true,
+        .stdin, .pager, .patch_file, .range, .no_index => false,
+    };
+}
+
 pub const ParseArgsError = error{
     UnknownOption,
     MissingOptionValue,
@@ -562,6 +569,10 @@ test "stage action is narrower than stage projection" {
     try std.testing.expect(sourceAllowsStageProjection(.unstaged));
     try std.testing.expect(sourceAllowsStageProjection(.cached));
     try std.testing.expect(!sourceAllowsStageProjection(.{ .range = "main...HEAD" }));
+
+    try std.testing.expect(sourceAllowsEditorAction(.unstaged));
+    try std.testing.expect(sourceAllowsEditorAction(.cached));
+    try std.testing.expect(!sourceAllowsEditorAction(.{ .range = "main...HEAD" }));
 }
 
 test "cloneLoadRequest duplicates source payload and repo root" {

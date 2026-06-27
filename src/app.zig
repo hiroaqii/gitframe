@@ -2054,21 +2054,28 @@ pub const App = struct {
     }
 
     fn openSelectedFileInEditor(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        const repo_root = self.activeRepoRoot() orelse {
-            self.setStatus("editor unavailable for this source", .{});
-            return;
-        };
-        const file = self.selectedFile() orelse {
-            self.setStatus("no file selected", .{});
-            return;
-        };
-        const target_path = diff_file.editorPath(file) orelse {
-            self.setStatus("deleted files cannot be opened", .{});
-            return;
+        const target = switch (self.selectedEditorTarget()) {
+            .ready => |target| target,
+            .unavailable_source, .no_repo => {
+                self.setStatus("editor unavailable for this source", .{});
+                return;
+            },
+            .no_path => {
+                self.setStatus("no file selected", .{});
+                return;
+            },
+            .directory_unsupported => {
+                self.setStatus("directories cannot be opened in editor", .{});
+                return;
+            },
+            .deleted_file => {
+                self.setStatus("deleted files cannot be opened", .{});
+                return;
+            },
         };
 
         var argv_buf: [editor.max_argv][]const u8 = undefined;
-        const argv = editor.argv(self.env_map, target_path, &argv_buf);
+        const argv = editor.argv(self.env_map, target.path, &argv_buf);
         if (argv.len == 0) {
             self.setStatus("editor command is empty", .{});
             return;
@@ -2076,7 +2083,7 @@ pub const App = struct {
 
         _ = ctx.terminal().runForegroundCommand(.{
             .argv = argv,
-            .cwd = repo_root,
+            .cwd = target.repo_root,
             .finished = editorDone,
         }) catch |err| switch (err) {
             error.ForegroundCommandLimitExceeded => {
@@ -2089,7 +2096,49 @@ pub const App = struct {
             },
             else => return err,
         };
-        self.setStatus("opening editor: {s}", .{target_path});
+        self.setStatus("opening editor: {s}", .{target.path});
+    }
+
+    const EditorTarget = struct {
+        repo_root: []const u8,
+        path: []const u8,
+    };
+
+    const EditorTargetResult = union(enum) {
+        ready: EditorTarget,
+        unavailable_source,
+        no_repo,
+        no_path,
+        directory_unsupported,
+        deleted_file,
+    };
+
+    fn selectedEditorTarget(self: *const App) EditorTargetResult {
+        // Editor actions open the current worktree path selected in the
+        // sidebar. Do not derive this from the rendered diff/projection, which
+        // can represent staged or synthetic content for the same file.
+        if (!diff_source.sourceAllowsEditorAction(self.config.source)) return .unavailable_source;
+        const repo_root = self.activeRepoRoot() orelse return .no_repo;
+        const action_target = self.selectedSidebarActionTarget() orelse return .no_path;
+
+        return switch (action_target.kind) {
+            .directory => .directory_unsupported,
+            .file => blk: {
+                if (self.editorTargetIsDeleted(repo_root, action_target.path)) return .deleted_file;
+                break :blk .{ .ready = .{ .repo_root = repo_root, .path = action_target.path } };
+            },
+        };
+    }
+
+    fn editorTargetIsDeleted(self: *const App, repo_root: []const u8, path_key: []const u8) bool {
+        if (self.freshStatusEntryForPathKey(repo_root, path_key)) |entry| {
+            return entry.worktree == .deleted or (entry.index == .deleted and !entry.isUnstaged());
+        }
+
+        const file = self.selectedFile() orelse return false;
+        const selected_key = diff_file.canonicalPathKey(file) orelse return false;
+        if (!std.mem.eql(u8, selected_key, path_key)) return false;
+        return diff_file.status(file) == .deleted;
     }
 
     fn finishEditorCommand(self: *App, ctx: *chasen.Ctx(Msg), result: chasen.ForegroundCommandResult) !void {
@@ -5692,6 +5741,135 @@ test "selectedStagePathKey accepts diff and status-only selections" {
     app.viewer.selected_target = .{ .status_only = 0 };
 
     try std.testing.expectEqualStrings("src/new.zig", app.selectedStagePathKey().?);
+}
+
+test "selectedEditorTarget accepts status-only file rows" {
+    const status_nodes = [_]file_tree.Node{
+        .{
+            .kind = .file,
+            .name = "staged.zig",
+            .path = "src/staged.zig",
+            .path_key = "src/staged.zig",
+            .depth = 0,
+            .target = .{ .status_entry = 0 },
+        },
+    };
+    var app: App = .{
+        .config = .{ .source = .cached },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(.{
+            .text = "",
+            .document = .{ .files = &.{} },
+            .tree = .{ .nodes = &status_nodes },
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        }),
+        .viewer = .{
+            .selected_node = 0,
+            .selected_target = .{ .status_only = 0 },
+        },
+    };
+    defer app.git_status.deinit();
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/staged.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    switch (app.selectedEditorTarget()) {
+        .ready => |target| {
+            try std.testing.expectEqualStrings("/repo", target.repo_root);
+            try std.testing.expectEqualStrings("src/staged.zig", target.path);
+        },
+        else => return error.ExpectedEditorTarget,
+    }
+}
+
+test "selectedEditorTarget rejects deleted and historical sources" {
+    var app: App = .{
+        .config = .{ .source = .cached },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffTwoWithStatuses()),
+        .viewer = .{
+            .selected_node = 1,
+            .selected_target = .{ .diff_file = 1 },
+        },
+    };
+
+    try std.testing.expectEqual(App.EditorTargetResult.deleted_file, app.selectedEditorTarget());
+
+    app.config.source = .{ .range = "main...HEAD" };
+    try std.testing.expectEqual(App.EditorTargetResult.unavailable_source, app.selectedEditorTarget());
+}
+
+test "selectedEditorTarget rejects deleted status-only file rows from fresh status" {
+    const status_nodes = [_]file_tree.Node{
+        .{
+            .kind = .file,
+            .name = "deleted.zig",
+            .path = "src/deleted.zig",
+            .path_key = "src/deleted.zig",
+            .depth = 0,
+            .target = .{ .status_entry = 0 },
+        },
+    };
+    var app: App = .{
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(.{
+            .text = "",
+            .document = .{ .files = &.{} },
+            .tree = .{ .nodes = &status_nodes },
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        }),
+        .viewer = .{
+            .selected_node = 0,
+            .selected_target = .{ .status_only = 0 },
+        },
+    };
+    defer app.git_status.deinit();
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " D src/deleted.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    try std.testing.expectEqual(App.EditorTargetResult.deleted_file, app.selectedEditorTarget());
+}
+
+test "selectedEditorTarget rejects live sources without active repo" {
+    const app: App = .{
+        .config = .{ .source = .unstaged },
+        .load = testLoadState(testLoadedDiffOne()),
+    };
+
+    try std.testing.expectEqual(App.EditorTargetResult.no_repo, app.selectedEditorTarget());
+}
+
+test "selectedEditorTarget rejects directory rows" {
+    var app: App = .{
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = testLoadState(testLoadedDiffNested()),
+        .viewer = .{ .selected_node = 0 },
+    };
+
+    try std.testing.expectEqual(App.EditorTargetResult.directory_unsupported, app.selectedEditorTarget());
 }
 
 test "selectedStageTarget skips only fresh staged-only files" {
