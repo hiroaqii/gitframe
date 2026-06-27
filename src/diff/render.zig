@@ -449,15 +449,14 @@ fn prefixForLine(kind: diff_parser.DiffLine.Kind) []const u8 {
 const side_by_side_min_width: u16 = 72;
 
 const color_accent = chasen.Color{ .index = 14 };
-const color_prompt = chasen.Color{ .index = 11 };
 const color_success = chasen.Color{ .index = 2 };
 const color_warning = chasen.Color{ .index = 11 };
 const color_danger = chasen.Color{ .index = 9 };
 
-const style_file_header: chasen.TextStyle = .{ .bold = true, .fg = color_prompt };
+const style_file_header: chasen.TextStyle = .{ .bold = true, .fg = color_accent };
 const style_hunk: chasen.TextStyle = .{ .bold = true, .fg = color_accent };
 const style_selected_hunk: chasen.TextStyle = .{ .bold = true, .reverse = true, .fg = color_accent };
-const style_cursor: chasen.TextStyle = .{ .bold = true, .fg = color_prompt };
+const style_cursor: chasen.TextStyle = .{ .bold = true, .fg = color_warning };
 const style_added: chasen.TextStyle = .{ .fg = color_success };
 const style_removed: chasen.TextStyle = .{ .fg = color_danger };
 const style_context: chasen.TextStyle = .{};

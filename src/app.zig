@@ -5539,7 +5539,7 @@ test "sidebar title indicates active focus" {
     try std.testing.expect(!ts.surface.readCell(1, 0).?.style.reverse);
 }
 
-test "diff header detail row draws active separator" {
+test "diff header detail row draws neutral separator" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(90, 10);
     defer ts.deinit();
@@ -5553,7 +5553,8 @@ test "diff header detail row draws active separator" {
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(0, 1, "─");
-    try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.{ .index = 14 }));
+    try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.gray));
+    try std.testing.expect(ts.surface.readCell(0, 1).?.style.dim);
 }
 
 test "selectionContext exposes selected diff file model coordinate" {

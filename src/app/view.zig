@@ -386,7 +386,7 @@ fn drawDiffHeaderDetailRow(app: anytype, surface: *chasen.Surface, active: bool)
         return;
     }
 
-    drawPaneHeaderRule(surface, active);
+    drawPaneHeaderRule(surface);
 }
 
 fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.StatusEntry) !void {
@@ -408,7 +408,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                             .line_numbers = app.viewer.view_options.line_numbers,
                             .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(content.size().width, app.viewer.display_mode)),
                         });
-                        drawPaneHeaderRule(surface, active);
+                        drawPaneHeaderRule(surface);
                         return;
                     }
                 },
@@ -420,31 +420,31 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                         .pane_active = active,
                         .line_numbers = app.viewer.view_options.line_numbers,
                     });
-                    drawPaneHeaderRule(surface, active);
+                    drawPaneHeaderRule(surface);
                     return;
                 },
                 .combined_hunks => {},
                 .status_body => |body| {
                     try drawStatusBody(&content, body.path, body.message, active);
-                    drawPaneHeaderRule(surface, active);
+                    drawPaneHeaderRule(surface);
                     return;
                 },
             }
         },
         .failed => |failed| {
             try drawStatusBody(&content, failed.body.path, failed.body.message, active);
-            drawPaneHeaderRule(surface, active);
+            drawPaneHeaderRule(surface);
             return;
         },
         .pending => {
             try drawStatusBody(&content, path, "Loading review projection...", active);
-            drawPaneHeaderRule(surface, active);
+            drawPaneHeaderRule(surface);
             return;
         },
         .idle => {},
     }
 
-    try draw.copyClippedTextAt(&content, 0, 0, path, .{ .bold = true, .fg = color_prompt, .dim = !active });
+    try draw.copyClippedTextAt(&content, 0, 0, path, paneTitleStyle(active));
     const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "status: {s}{s}", .{ statusName(entry.index), statusSuffix(entry) });
     try draw.copyClippedTextAt(&content, 0, 2, status_text, .{ .fg = .gray, .dim = !active });
     switch (file_tree.stagePresenceFromEntry(entry)) {
@@ -459,17 +459,17 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
     }
 }
 
-fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool) void {
+fn drawPaneHeaderRule(surface: *chasen.Surface) void {
     const size = surface.size();
     if (size.width == 0 or size.height <= 1) return;
 
     for (0..size.width) |col| {
-        _ = surface.borrowTextAt(@intCast(col), 1, "─", paneHeaderRuleStyle(active));
+        _ = surface.borrowTextAt(@intCast(col), 1, "─", paneHeaderRuleStyle());
     }
 }
 
 fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u8, active: bool) !void {
-    try draw.copyClippedTextAt(surface, 0, 0, path, .{ .bold = true, .fg = color_prompt, .dim = !active });
+    try draw.copyClippedTextAt(surface, 0, 0, path, paneTitleStyle(active));
     try draw.copyClippedTextAt(surface, 0, 2, message, .{ .fg = .gray, .dim = !active });
 }
 
@@ -1436,8 +1436,8 @@ fn paneSearchStyle(active: bool) chasen.TextStyle {
         .{ .fg = color_prompt };
 }
 
-fn paneHeaderRuleStyle(active: bool) chasen.TextStyle {
-    return .{ .fg = if (active) color_accent else .gray, .dim = true };
+fn paneHeaderRuleStyle() chasen.TextStyle {
+    return .{ .fg = .gray, .dim = true };
 }
 
 fn shellSeparatorStyle() chasen.TextStyle {
