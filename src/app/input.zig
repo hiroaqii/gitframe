@@ -36,6 +36,8 @@ const Action = enum {
     cancel_search,
     submit_search,
     search_backspace,
+    search_move_left,
+    search_move_right,
     cancel_file_search,
     submit_file_search,
     file_search_backspace,
@@ -149,6 +151,8 @@ fn searchKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .cancel_search);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .submit_search);
     if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .search_backspace);
+    if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .search_move_left);
+    if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .search_move_right);
     if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "search_insert", codepoint);
     return null;
 }
@@ -387,6 +391,8 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .cancel_search => voidMsg(Msg, "cancel_search"),
         .submit_search => voidMsg(Msg, "submit_search"),
         .search_backspace => voidMsg(Msg, "search_backspace"),
+        .search_move_left => voidMsg(Msg, "search_move_left"),
+        .search_move_right => voidMsg(Msg, "search_move_right"),
         .cancel_file_search => voidMsg(Msg, "cancel_file_search"),
         .submit_file_search => voidMsg(Msg, "submit_file_search"),
         .file_search_backspace => voidMsg(Msg, "file_search_backspace"),
@@ -477,6 +483,8 @@ const TestMsg = union(enum) {
     cancel_search,
     submit_search,
     search_backspace,
+    search_move_left,
+    search_move_right,
     search_insert: u21,
     search_paste: []const u8,
     cancel_file_search,
@@ -753,7 +761,9 @@ test "keyToMsg ignores special keys in text input modes" {
     };
 
     for (common_cases) |key| {
-        try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .search_mode = true }, key));
+        if (key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right) {
+            try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .search_mode = true }, key));
+        }
         try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .file_search_mode = true }, key));
         if (key.codepoint != chasen.Key.tab and key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right and key.codepoint != chasen.Key.up and key.codepoint != chasen.Key.down) {
             try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .commit_panel_mode = true }, key));
@@ -806,6 +816,16 @@ test "keyToMsg maps repo picker cursor movement" {
     try std.testing.expectEqual(TestMsg.repo_picker_move_right, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.right }).?);
     try std.testing.expectEqual(TestMsg.repo_picker_move_left, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = chasen.Key.left }).?);
     try std.testing.expectEqual(TestMsg.repo_picker_move_right, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = chasen.Key.right }).?);
+}
+
+test "keyToMsg maps search cursor movement" {
+    try std.testing.expectEqual(TestMsg.search_move_left, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = chasen.Key.left }).?);
+    try std.testing.expectEqual(TestMsg.search_move_right, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = chasen.Key.right }).?);
+}
+
+test "keyToMsg ignores modified search cursor movement" {
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = chasen.Key.left, .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = chasen.Key.right, .mods = .{ .ctrl = true } }));
 }
 
 test "keyToMsg ignores ctrl printable in text input modes" {

@@ -355,17 +355,25 @@ fn drawDiffHeaderDetailRow(app: anytype, surface: *chasen.Surface, active: bool)
 
     surface.clear(.{ .col = 0, .row = 1, .width = size.width, .height = 1 });
     if (!app.search.mode and app.search.query.len > 0) {
+        const label_col: u16 = 1;
         const match_text = if (app.search.match_offset) |offset|
             std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ app.search.query.slice(), offset + 1 }) catch "search"
         else
             std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{app.search.query.slice()}) catch "search";
-        draw.copyClippedTextAt(surface, 0, 1, match_text, paneSearchStyle(active)) catch {};
+        draw.copyClippedTextAt(surface, label_col, 1, match_text, paneSearchStyle(active)) catch {};
         return;
     }
 
     if (app.search.mode) {
-        const prompt_text = std.fmt.allocPrint(surface.frameAllocator(), "search: {s}", .{app.search.input.slice()}) catch "search";
-        draw.copyClippedTextAt(surface, 0, 1, prompt_text, paneSearchStyle(active)) catch {};
+        const label = "search: ";
+        const label_col: u16 = 1;
+        const style = paneSearchStyle(active);
+        draw.copyClippedTextAt(surface, label_col, 1, label, style) catch {};
+        if (size.width > label_col + label.len) {
+            const input_col: u16 = label_col + @as(u16, @intCast(label.len));
+            drawCommitInputLine(surface, input_col, 1, app.search.input.slice(), app.search.input.cursor, style) catch {};
+            showInputCursor(surface, input_col, 1, app.search.input.slice(), app.search.input.cursor);
+        }
         return;
     }
 
@@ -591,17 +599,14 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
     const width = surface.size().width;
     if (width == 0) return;
 
-    if (app.search.mode) {
-        _ = surface.borrowTextAt(0, 0, "/", .{ .fg = .{ .index = 11 }, .bold = true });
-        _ = surface.copyTextAt(1, 0, app.search.input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
-        return;
-    }
-
     if (app.file_search.mode) {
-        _ = surface.borrowTextAt(0, 0, "file: ", .{ .fg = .{ .index = 11 }, .bold = true });
-        _ = surface.copyTextAt(6, 0, app.file_search.input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
+        const label = "file: ";
+        const label_col: u16 = 1;
+        _ = surface.borrowTextAt(label_col, 0, label, .{ .fg = .{ .index = 11 }, .bold = true });
+        const input_col: u16 = label_col + @as(u16, @intCast(label.len));
+        _ = surface.copyTextAt(input_col, 0, app.file_search.input.slice(), .{ .fg = .{ .index = 11 } }) catch {};
         if (app.file_search.no_match) {
-            const col: u16 = @intCast(@min(6 + chasen.text.displayWidth(app.file_search.input.slice()) + 1, std.math.maxInt(u16)));
+            const col: u16 = @intCast(@min(input_col + chasen.text.displayWidth(app.file_search.input.slice()) + 1, std.math.maxInt(u16)));
             if (surface.size().width > col) _ = surface.borrowTextAt(col, 0, "(no match)", .{ .fg = .{ .index = 9 } });
         }
         return;
@@ -1309,7 +1314,7 @@ fn paneTitleStyle(active: bool) chasen.TextStyle {
 
 fn paneSearchStyle(active: bool) chasen.TextStyle {
     return if (active)
-        .{ .reverse = true, .fg = .{ .index = 11 } }
+        .{ .bold = true, .fg = .{ .index = 11 } }
     else
         .{ .fg = .{ .index = 11 } };
 }

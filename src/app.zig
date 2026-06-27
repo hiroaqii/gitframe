@@ -290,6 +290,8 @@ pub const App = struct {
         /// Borrowed from `chasen.Event.paste`; valid only in the synchronous handleEvent/update dispatch.
         search_paste: []const u8,
         search_backspace,
+        search_move_left,
+        search_move_right,
         select_next_search_match,
         select_previous_search_match,
         enter_file_search,
@@ -487,6 +489,8 @@ pub const App = struct {
                 self.setStatus("search paste is too long", .{});
             },
             .search_backspace => self.search.input.backspace(),
+            .search_move_left => self.search.input.moveLeft(),
+            .search_move_right => self.search.input.moveRight(),
             .select_next_search_match => self.selectSearchMatch(.forward),
             .select_previous_search_match => self.selectSearchMatch(.backward),
             .enter_file_search => self.enterFileSearchMode(),
@@ -6306,8 +6310,10 @@ test "diff search row keeps active focus style" {
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
-    try ts.expectCellText(0, 1, "s");
-    try std.testing.expect(ts.surface.readCell(0, 1).?.style.reverse);
+    try ts.expectCellText(1, 1, "s");
+    const style = ts.surface.readCell(1, 1).?.style;
+    try std.testing.expect(style.bold);
+    try std.testing.expect(!style.reverse);
 }
 
 test "changed file filter keeps only matching status rows" {
@@ -6954,9 +6960,9 @@ test "search input header does not show no match before submit" {
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
-    try ts.expectCellText(0, 1, "s");
-    try ts.expectCellText(8, 1, "m");
-    try ts.expectCellText(15, 1, " ");
+    try ts.expectCellText(1, 1, "s");
+    try ts.expectCellText(9, 1, "m");
+    try ts.expectCellText(16, 1, " ");
 }
 
 test "canceling edited search restores committed query and match" {
