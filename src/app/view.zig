@@ -621,32 +621,49 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         return;
     }
 
-    const size_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
-        app.terminal_size.width,
-        app.terminal_size.height,
-    }) catch return;
-    const size_width: u16 = @intCast(@min(chasen.text.displayWidth(size_text), std.math.maxInt(u16)));
-
-    var col: u16 = 1;
-    if (width > col + size_width) {
-        _ = surface.copyTextAt(col, 0, size_text, .{ .fg = .gray }) catch {};
-        col +|= @intCast(@min(size_width + 2, std.math.maxInt(u16)));
-    }
-
-    if (app.config.watch and width > col + 8) {
-        _ = surface.borrowTextAt(col, 0, "watch", .{ .fg = color_staged });
-        col +|= 7;
-    }
-    if (app.status.text().len > 0 and width > col + 2) {
-        draw.copyClippedTextAt(surface, col, 0, app.status.text(), .{ .fg = color_prompt }) catch {};
-        const message_width = chasen.text.displayWidth(app.status.text());
-        col +|= @intCast(@min(message_width + 2, std.math.maxInt(u16)));
-    }
-
     const hint_items = footerItems(app);
     const hint_width = ui.key_hint.width(hint_items, footerKeyHintOptions());
     const hint_col = if (width > hint_width + 1) width - hint_width - 1 else 0;
-    const draw_col = if (hint_col > col) hint_col else col;
+    const left_limit = if (hint_col > 0) hint_col else width;
+
+    var footer_segments = FooterSegments{};
+    footer_segments.append(.{
+        .text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
+            app.terminal_size.width,
+            app.terminal_size.height,
+        }) catch return,
+        .style = .{ .fg = .gray },
+    });
+    if (sourceFooterLabel(app.config)) |label| footer_segments.append(.{
+        .text = label,
+        .style = .{ .fg = color_prompt },
+        .drop_priority = .source,
+    });
+    if (repoFooterLabel(app)) |label| footer_segments.append(.{
+        .text = label,
+        .style = .{ .fg = .gray },
+        .drop_priority = .repo,
+    });
+    if (app.config.watch) footer_segments.append(.{
+        .text = "watch",
+        .style = .{ .fg = color_staged },
+        .drop_priority = .watch,
+    });
+    if (app.status.text().len > 0) footer_segments.append(.{
+        .text = app.status.text(),
+        .style = .{ .fg = color_prompt },
+    });
+
+    footer_segments.fit(left_limit);
+    var left_area = surface.child(.{
+        .col = 0,
+        .row = 0,
+        .width = left_limit,
+        .height = 1,
+    });
+    footer_segments.render(&left_area, left_limit);
+
+    const draw_col = if (hint_col > 0) hint_col else footer_segments.endCol();
     if (width > draw_col) {
         var hint_area = surface.child(.{
             .col = draw_col,
@@ -656,6 +673,97 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         });
         _ = ui.key_hint.draw(&hint_area, 0, 0, hint_items, footerKeyHintOptions());
     }
+}
+
+const FooterDropPriority = enum {
+    repo,
+    source,
+    watch,
+};
+
+const FooterSegment = struct {
+    text: []const u8,
+    style: chasen.TextStyle,
+    drop_priority: ?FooterDropPriority = null,
+    visible: bool = true,
+};
+
+const FooterSegments = struct {
+    items: [5]FooterSegment = undefined,
+    len: usize = 0,
+
+    fn append(self: *FooterSegments, segment: FooterSegment) void {
+        if (self.len >= self.items.len) return;
+        self.items[self.len] = segment;
+        self.len += 1;
+    }
+
+    fn fit(self: *FooterSegments, width: u16) void {
+        const order = [_]FooterDropPriority{ .repo, .source, .watch };
+        for (order) |priority| {
+            if (self.requiredWidth() <= width) return;
+            self.drop(priority);
+        }
+    }
+
+    fn drop(self: *FooterSegments, priority: FooterDropPriority) void {
+        for (self.items[0..self.len]) |*item| {
+            if (item.drop_priority != null and item.drop_priority.? == priority) {
+                item.visible = false;
+                return;
+            }
+        }
+    }
+
+    fn contentWidth(self: *const FooterSegments) u16 {
+        var result: usize = 0;
+        for (self.items[0..self.len]) |item| {
+            if (!item.visible) continue;
+            if (result > 0) result += 2;
+            result += chasen.text.displayWidth(item.text);
+        }
+        return @intCast(@min(result, std.math.maxInt(u16)));
+    }
+
+    fn requiredWidth(self: *const FooterSegments) u16 {
+        const content_width = self.contentWidth();
+        if (content_width == 0) return 0;
+        return content_width + 1;
+    }
+
+    fn render(self: *const FooterSegments, surface: *chasen.Surface, width: u16) void {
+        var col: u16 = 1;
+        for (self.items[0..self.len]) |item| {
+            if (!item.visible or item.text.len == 0) continue;
+            if (col >= width) return;
+            draw.copyClippedTextAt(surface, col, 0, item.text, item.style) catch {};
+            const segment_width = chasen.text.displayWidth(item.text);
+            col +|= @intCast(@min(segment_width + 2, std.math.maxInt(u16)));
+        }
+    }
+
+    fn endCol(self: *const FooterSegments) u16 {
+        return self.requiredWidth();
+    }
+};
+
+fn repoFooterLabel(app: anytype) ?[]const u8 {
+    const root = app.repo_state.activeRoot() orelse return null;
+    const base = std.fs.path.basename(root);
+    if (base.len == 0) return root;
+    return base;
+}
+
+fn sourceFooterLabel(config: anytype) ?[]const u8 {
+    return switch (config.source) {
+        .unstaged => "unstaged",
+        .cached => "staged",
+        .stdin => "stdin",
+        .pager => "pager",
+        .patch_file => "patch",
+        .range => "range",
+        .no_index => "difftool",
+    };
 }
 
 fn footerKeyHintOptions() ui.key_hint.DrawOptions {
@@ -1364,6 +1472,18 @@ pub fn clampSidebarWidth(total_width: u16, width: u16) u16 {
     const max_width = @min(hard_max_width, max_available);
     const min_width = @min(@as(u16, 18), max_width);
     return @min(@max(width, min_width), max_width);
+}
+
+test "footer segment fit includes left inset" {
+    var segments = FooterSegments{};
+    segments.append(.{ .text = "aa", .style = .{} });
+    segments.append(.{ .text = "bb", .style = .{}, .drop_priority = .repo });
+
+    try std.testing.expectEqual(@as(u16, 7), segments.requiredWidth());
+    segments.fit(6);
+
+    try std.testing.expectEqual(@as(u16, 3), segments.requiredWidth());
+    try std.testing.expect(!segments.items[1].visible);
 }
 
 test "shell content size matches panel content surface" {
