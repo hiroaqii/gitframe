@@ -27,6 +27,18 @@ pub const TextBuffer = struct {
         self.cursor += written;
     }
 
+    pub fn insertSlice(self: *TextBuffer, allocator: std.mem.Allocator, text: []const u8) InsertError!void {
+        if (text.len == 0) return;
+        std.debug.assert(std.unicode.utf8ValidateSlice(text));
+
+        try self.bytes.ensureUnusedCapacity(allocator, text.len);
+        const old_len = self.bytes.items.len;
+        self.bytes.items.len += text.len;
+        std.mem.copyBackwards(u8, self.bytes.items[self.cursor + text.len .. old_len + text.len], self.bytes.items[self.cursor..old_len]);
+        @memcpy(self.bytes.items[self.cursor .. self.cursor + text.len], text);
+        self.cursor += text.len;
+    }
+
     pub fn backspace(self: *TextBuffer) void {
         if (self.cursor == 0) return;
 
@@ -94,6 +106,18 @@ test "TextBuffer edits at the cursor and preserves UTF-8 boundaries" {
 
     buffer.backspace();
     try std.testing.expectEqualStrings("a🐈c", buffer.slice());
+}
+
+test "TextBuffer inserts slices at the cursor" {
+    var buffer: TextBuffer = .{};
+    defer buffer.deinit(std.testing.allocator);
+
+    try buffer.insertSlice(std.testing.allocator, "ac");
+    buffer.moveLeft();
+    try buffer.insertSlice(std.testing.allocator, "🐈b");
+
+    try std.testing.expectEqualStrings("a🐈bc", buffer.slice());
+    try std.testing.expectEqual(@as(usize, "a🐈b".len), buffer.cursor);
 }
 
 test "TextBuffer clear retains reusable allocation" {

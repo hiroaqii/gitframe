@@ -74,6 +74,10 @@ pub const BodyText = struct {
         try self.text.insert(allocator, codepoint);
     }
 
+    pub fn insertSlice(self: *BodyText, allocator: std.mem.Allocator, text: []const u8) text_buffer.TextBuffer.InsertError!void {
+        try self.text.insertSlice(allocator, text);
+    }
+
     pub fn newline(self: *BodyText, allocator: std.mem.Allocator) text_buffer.TextBuffer.InsertError!void {
         try self.insert(allocator, '\n');
     }
@@ -286,6 +290,15 @@ pub const State = struct {
         self.refreshInputError();
     }
 
+    pub fn paste(self: *State, text: []const u8) void {
+        std.debug.assert(std.unicode.utf8ValidateSlice(text));
+
+        switch (self.active_field) {
+            .subject => self.pasteSubject(text),
+            .body => self.pasteBody(text),
+        }
+    }
+
     pub fn enter(self: *State) void {
         switch (self.active_field) {
             .subject => {
@@ -400,6 +413,67 @@ pub const State = struct {
 
     fn totalRawBytes(self: *const State) usize {
         return self.subject.slice().len + self.body.slice().len;
+    }
+
+    fn pasteSubject(self: *State, text: []const u8) void {
+        const allocator = self.allocator orelse {
+            self.commit_error = .input_allocation_failed;
+            return;
+        };
+
+        var normalized: std.ArrayList(u8) = .empty;
+        defer normalized.deinit(allocator);
+
+        normalized.ensureTotalCapacity(allocator, text.len) catch {
+            self.commit_error = .input_allocation_failed;
+            return;
+        };
+
+        var index: usize = 0;
+        while (index < text.len) {
+            if (text[index] == '\r') {
+                normalized.appendAssumeCapacity(' ');
+                index += 1;
+                if (index < text.len and text[index] == '\n') index += 1;
+                continue;
+            }
+            if (text[index] == '\n') {
+                normalized.appendAssumeCapacity(' ');
+                index += 1;
+                continue;
+            }
+            normalized.appendAssumeCapacity(text[index]);
+            index += 1;
+        }
+
+        self.insertPasteSlice(allocator, normalized.items);
+    }
+
+    fn pasteBody(self: *State, text: []const u8) void {
+        const allocator = self.allocator orelse {
+            self.commit_error = .input_allocation_failed;
+            return;
+        };
+        self.insertPasteSlice(allocator, text);
+    }
+
+    fn insertPasteSlice(self: *State, allocator: std.mem.Allocator, text: []const u8) void {
+        if (self.totalRawBytes() + text.len > max_message_bytes) {
+            self.commit_error = .message_too_large;
+            return;
+        }
+
+        switch (self.active_field) {
+            .subject => self.subject.insertSlice(allocator, text) catch {
+                self.commit_error = .input_allocation_failed;
+                return;
+            },
+            .body => self.body.insertSlice(allocator, text) catch {
+                self.commit_error = .input_allocation_failed;
+                return;
+            },
+        }
+        self.refreshInputError();
     }
 
     fn refreshInputError(self: *State) void {
@@ -537,6 +611,31 @@ test "State routes enter and body text" {
 
     state.backspace();
     try std.testing.expectEqualStrings("b\n", state.body.slice());
+}
+
+test "State paste normalizes subject newlines and preserves body newlines" {
+    var state: State = .init(std.testing.allocator);
+    defer state.deinit();
+
+    state.paste("subject\r\nline\nnext\rlast");
+    try std.testing.expectEqualStrings("subject line next last", state.subject.slice());
+
+    state.enter();
+    state.paste("body\r\nline\nnext");
+    try std.testing.expectEqualStrings("body\r\nline\nnext", state.body.slice());
+}
+
+test "State paste reports message size overflow without mutation" {
+    var state: State = .init(std.testing.allocator);
+    defer state.deinit();
+
+    const bytes = try std.testing.allocator.alloc(u8, max_message_bytes + 1);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'x');
+
+    state.paste(bytes);
+    try std.testing.expectEqual(CommitError.message_too_large, state.commit_error.?);
+    try std.testing.expectEqualStrings("", state.subject.slice());
 }
 
 test "State formats commit message payload" {

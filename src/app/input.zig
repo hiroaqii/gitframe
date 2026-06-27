@@ -115,12 +115,23 @@ const Action = enum {
 pub fn eventToMsg(comptime Msg: type, context: KeyContext, event: chasen.Event) ?Msg {
     return switch (event) {
         .key_press => |key| keyToMsg(Msg, context, key),
+        .paste => |text| pasteToMsg(Msg, context, text),
         .winsize => |winsize| payloadMsg(Msg, "terminal_resized", chasen.Size{
             .width = winsize.cols,
             .height = winsize.rows,
         }),
         else => null,
     };
+}
+
+fn pasteToMsg(comptime Msg: type, context: KeyContext, text: []const u8) ?Msg {
+    if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
+    if (context.search_mode) return payloadMsg(Msg, "search_paste", text);
+    if (context.file_search_mode) return payloadMsg(Msg, "file_search_paste", text);
+    if (context.repo_picker_mode) return payloadMsg(Msg, "repo_picker_paste", text);
+    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode) return null;
+    if (context.commit_panel_mode) return payloadMsg(Msg, "commit_panel_paste", text);
+    return null;
 }
 
 pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
@@ -467,10 +478,12 @@ const TestMsg = union(enum) {
     submit_search,
     search_backspace,
     search_insert: u21,
+    search_paste: []const u8,
     cancel_file_search,
     submit_file_search,
     file_search_backspace,
     file_search_insert: u21,
+    file_search_paste: []const u8,
     cancel_commit_panel,
     submit_commit_panel,
     commit_panel_tab,
@@ -481,6 +494,7 @@ const TestMsg = union(enum) {
     commit_panel_move_up,
     commit_panel_move_down,
     commit_panel_insert: u21,
+    commit_panel_paste: []const u8,
     cancel_repo_picker,
     submit_repo_picker,
     repo_picker_backspace,
@@ -490,6 +504,7 @@ const TestMsg = union(enum) {
     repo_picker_move_left,
     repo_picker_move_right,
     repo_picker_insert: u21,
+    repo_picker_paste: []const u8,
     toggle_focus,
     page_diff_up,
     page_diff_down,
@@ -554,6 +569,29 @@ test "eventToMsg maps winsize event" {
         .y_pixel = 0,
     } }).?;
     try std.testing.expectEqual(TestMsg{ .terminal_resized = .{ .width = 120, .height = 40 } }, msg);
+}
+
+test "eventToMsg routes paste by active text input mode" {
+    const search_msg = eventToMsg(TestMsg, .{ .search_mode = true }, .{ .paste = "render" }).?;
+    try std.testing.expectEqualStrings("render", search_msg.search_paste);
+
+    const file_msg = eventToMsg(TestMsg, .{ .file_search_mode = true }, .{ .paste = "app.zig" }).?;
+    try std.testing.expectEqualStrings("app.zig", file_msg.file_search_paste);
+
+    const repo_msg = eventToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .paste = "/tmp/repo" }).?;
+    try std.testing.expectEqualStrings("/tmp/repo", repo_msg.repo_picker_paste);
+
+    const commit_msg = eventToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .paste = "subject" }).?;
+    try std.testing.expectEqualStrings("subject", commit_msg.commit_panel_paste);
+}
+
+test "eventToMsg rejects invalid paste and ignores non-input modes" {
+    const invalid = [_]u8{0xff};
+    try std.testing.expect(eventToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .paste = invalid[0..] }) == null);
+    try std.testing.expect(eventToMsg(TestMsg, .{}, .{ .paste = "ignored" }) == null);
+    try std.testing.expect(eventToMsg(TestMsg, .{ .help_mode = true }, .{ .paste = "ignored" }) == null);
+    try std.testing.expect(eventToMsg(TestMsg, .{ .discard_confirmation_mode = true }, .{ .paste = "ignored" }) == null);
+    try std.testing.expect(eventToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .paste = "ignored" }) == null);
 }
 
 test "keyToMsg routes text while search is active" {

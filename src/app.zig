@@ -287,6 +287,8 @@ pub const App = struct {
         clear_search,
         submit_search,
         search_insert: u21,
+        /// Borrowed from `chasen.Event.paste`; valid only in the synchronous handleEvent/update dispatch.
+        search_paste: []const u8,
         search_backspace,
         select_next_search_match,
         select_previous_search_match,
@@ -294,6 +296,8 @@ pub const App = struct {
         cancel_file_search,
         submit_file_search,
         file_search_insert: u21,
+        /// Borrowed from `chasen.Event.paste`; valid only in the synchronous handleEvent/update dispatch.
+        file_search_paste: []const u8,
         file_search_backspace,
         enter_commit_panel,
         enter_amend_panel,
@@ -302,6 +306,8 @@ pub const App = struct {
         commit_panel_tab,
         commit_panel_enter,
         commit_panel_insert: u21,
+        /// Borrowed from `chasen.Event.paste`; valid only in the synchronous handleEvent/update dispatch.
+        commit_panel_paste: []const u8,
         commit_panel_backspace,
         commit_panel_move_left,
         commit_panel_move_right,
@@ -312,6 +318,8 @@ pub const App = struct {
         submit_repo_picker,
         repo_picker_enter_path_input,
         repo_picker_insert: u21,
+        /// Borrowed from `chasen.Event.paste`; valid only in the synchronous handleEvent/update dispatch.
+        repo_picker_paste: []const u8,
         repo_picker_backspace,
         repo_picker_move_previous,
         repo_picker_move_next,
@@ -475,6 +483,9 @@ pub const App = struct {
             .clear_search => self.clearSearch(),
             .submit_search => self.submitSearch(),
             .search_insert => |codepoint| self.search.input.insert(codepoint) catch {},
+            .search_paste => |text| self.search.input.insertSlice(text) catch {
+                self.setStatus("search paste is too long", .{});
+            },
             .search_backspace => self.search.input.backspace(),
             .select_next_search_match => self.selectSearchMatch(.forward),
             .select_previous_search_match => self.selectSearchMatch(.backward),
@@ -484,6 +495,12 @@ pub const App = struct {
             .file_search_insert => |codepoint| {
                 self.file_search.resetNoMatch();
                 self.file_search.input.insert(codepoint) catch {};
+            },
+            .file_search_paste => |text| {
+                self.file_search.resetNoMatch();
+                self.file_search.input.insertSlice(text) catch {
+                    self.setStatus("file search paste is too long", .{});
+                };
             },
             .file_search_backspace => {
                 self.file_search.resetNoMatch();
@@ -496,6 +513,7 @@ pub const App = struct {
             .commit_panel_tab => self.commit_panel.toggleField(),
             .commit_panel_enter => self.commit_panel.enter(),
             .commit_panel_insert => |codepoint| self.commit_panel.insert(codepoint),
+            .commit_panel_paste => |text| self.commit_panel.paste(text),
             .commit_panel_backspace => self.commit_panel.backspace(),
             .commit_panel_move_left => self.commit_panel.moveLeft(),
             .commit_panel_move_right => self.commit_panel.moveRight(),
@@ -507,6 +525,9 @@ pub const App = struct {
             .repo_picker_enter_path_input => self.enterRepoPickerPathInput(),
             .repo_picker_insert => |codepoint| {
                 try self.insertRepoPickerCodepoint(ctx.allocator(), codepoint);
+            },
+            .repo_picker_paste => |text| {
+                try self.insertRepoPickerSlice(ctx.allocator(), text);
             },
             .repo_picker_backspace => {
                 try self.backspaceRepoPicker(ctx.allocator());
@@ -3009,6 +3030,25 @@ pub const App = struct {
             .path_input => {
                 self.repo_picker.clearPathStatus();
                 self.repo_picker.path_input.insert(codepoint) catch {
+                    self.repo_picker.path_error = .path_too_long;
+                };
+            },
+        }
+    }
+
+    fn insertRepoPickerSlice(self: *App, allocator: std.mem.Allocator, text: []const u8) !void {
+        switch (self.repo_picker.prompt_mode) {
+            .list => {
+                self.repo_picker.list.resetNoMatch();
+                self.repo_picker.list.input.insertSlice(text) catch {
+                    self.setStatus("repository filter paste is too long", .{});
+                    return;
+                };
+                try self.refreshRepoPickerFilter(allocator);
+            },
+            .path_input => {
+                self.repo_picker.clearPathStatus();
+                self.repo_picker.path_input.insertSlice(text) catch {
                     self.repo_picker.path_error = .path_too_long;
                 };
             },

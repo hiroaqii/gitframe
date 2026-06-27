@@ -26,6 +26,16 @@ pub const TextInput = struct {
         self.cursor += written;
     }
 
+    pub fn insertSlice(self: *TextInput, text: []const u8) InsertError!void {
+        if (text.len == 0) return;
+        std.debug.assert(std.unicode.utf8ValidateSlice(text));
+        if (self.len + text.len > self.buffer.len) return error.BufferFull;
+        std.mem.copyBackwards(u8, self.buffer[self.cursor + text.len .. self.len + text.len], self.buffer[self.cursor..self.len]);
+        @memcpy(self.buffer[self.cursor .. self.cursor + text.len], text);
+        self.len += text.len;
+        self.cursor += text.len;
+    }
+
     pub fn backspace(self: *TextInput) void {
         if (self.cursor == 0) return;
         const previous = previousBoundary(self.slice(), self.cursor);
@@ -71,6 +81,16 @@ pub const PathInput = struct {
         @memcpy(self.buffer[self.cursor .. self.cursor + written], bytes[0..written]);
         self.len += written;
         self.cursor += written;
+    }
+
+    pub fn insertSlice(self: *PathInput, text: []const u8) InsertError!void {
+        if (text.len == 0) return;
+        std.debug.assert(std.unicode.utf8ValidateSlice(text));
+        if (self.len + text.len > self.buffer.len) return error.BufferFull;
+        std.mem.copyBackwards(u8, self.buffer[self.cursor + text.len .. self.len + text.len], self.buffer[self.cursor..self.len]);
+        @memcpy(self.buffer[self.cursor .. self.cursor + text.len], text);
+        self.len += text.len;
+        self.cursor += text.len;
     }
 
     pub fn backspace(self: *PathInput) void {
@@ -217,6 +237,17 @@ test "TextInput edits at the cursor" {
     try std.testing.expectEqual(@as(usize, 1), input.cursor);
 }
 
+test "TextInput inserts slices at the cursor" {
+    var input: TextInput = .{};
+
+    try input.insertSlice("ac");
+    input.moveLeft();
+    try input.insertSlice("🐈b");
+
+    try std.testing.expectEqualStrings("a🐈bc", input.slice());
+    try std.testing.expectEqual(@as(usize, "a🐈b".len), input.cursor);
+}
+
 test "TextInput reports BufferFull without changing existing bytes" {
     var input: TextInput = .{};
     @memset(input.buffer[0..], 'x');
@@ -226,6 +257,19 @@ test "TextInput reports BufferFull without changing existing bytes" {
     try std.testing.expectError(error.BufferFull, input.insert('y'));
     try std.testing.expectEqual(@as(usize, input.buffer.len), input.len);
     try std.testing.expectEqual(@as(u8, 'x'), input.buffer[0]);
+}
+
+test "TextInput reports BufferFull for slices without changing state" {
+    var input: TextInput = .{};
+    @memset(input.buffer[0..], 'x');
+    input.len = input.buffer.len - 1;
+    input.cursor = 1;
+    const before = input;
+
+    try std.testing.expectError(error.BufferFull, input.insertSlice("yy"));
+    try std.testing.expectEqual(before.len, input.len);
+    try std.testing.expectEqual(before.cursor, input.cursor);
+    try std.testing.expectEqualSlices(u8, before.buffer[0..before.len], input.buffer[0..input.len]);
 }
 
 test "PathInput accepts longer paths than TextInput" {
@@ -251,6 +295,28 @@ test "PathInput edits at the cursor" {
     input.backspace();
     try std.testing.expectEqualStrings("ac", input.slice());
     try std.testing.expectEqual(@as(usize, 1), input.cursor);
+}
+
+test "PathInput inserts slices and preserves state on overflow" {
+    var input: PathInput = .{};
+
+    try input.insertSlice("/tmp/giframe");
+    input.moveLeft();
+    input.moveLeft();
+    input.moveLeft();
+    input.moveLeft();
+    input.moveLeft();
+    try input.insertSlice("t");
+    try std.testing.expectEqualStrings("/tmp/gitframe", input.slice());
+
+    @memset(input.buffer[0..], 'x');
+    input.len = input.buffer.len - 1;
+    input.cursor = 2;
+    const before = input;
+    try std.testing.expectError(error.BufferFull, input.insertSlice("yy"));
+    try std.testing.expectEqual(before.len, input.len);
+    try std.testing.expectEqual(before.cursor, input.cursor);
+    try std.testing.expectEqualSlices(u8, before.buffer[0..before.len], input.buffer[0..input.len]);
 }
 
 test "FilterPromptState deinit resets reusable prompt state" {
