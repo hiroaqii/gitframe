@@ -245,11 +245,11 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
         row += 1;
     }) {
         const row_model = loaded.sidebarRowAt(visible_index, app.viewer.selected_node) orelse continue;
-        try drawSidebarRow(surface, row, row_model, app.viewer.focus == .sidebar);
+        try drawSidebarRow(surface, row, row_model, app.viewer.focus == .sidebar, app.viewer.sidebar_horizontal_scroll);
     }
 }
 
-fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_model.Row, pane_active: bool) !void {
+fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_model.Row, pane_active: bool, horizontal_scroll: usize) !void {
     const width = surface.size().width;
     const row_layout = sidebar_view_model.layout(row_model, width);
     const style = sidebarRowStyle(row_model, pane_active);
@@ -257,17 +257,6 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
 
     if (width > row_layout.marker_col) {
         _ = surface.borrowTextAt(0, row, marker, style);
-    }
-
-    if (row_layout.fold_col) |fold_col| {
-        if (width > fold_col) {
-            const fold_marker = switch (row_model.fold) {
-                .none => "",
-                .expanded => "▼",
-                .collapsed => "▶",
-            };
-            _ = surface.borrowTextAt(fold_col, row, fold_marker, style);
-        }
     }
 
     if (row_model.status) |status| {
@@ -290,14 +279,17 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
         }
     }
 
-    if (row_layout.name_width > 0) {
+    if (row_layout.tree_content_width > 0) {
         var path_area = surface.child(.{
-            .col = row_layout.name_col,
+            .col = row_layout.tree_content_col,
             .row = row,
-            .width = row_layout.name_width,
+            .width = row_layout.tree_content_width,
             .height = 1,
         });
-        try draw.copyClippedTextAt(&path_area, 0, 0, row_model.name, style);
+        const content = try sidebarTreeContent(surface.frameAllocator(), row_model);
+        const effective_scroll = @min(horizontal_scroll, sidebar_view_model.maxHorizontalScroll(row_model, width));
+        const visible = chasen.text.dropToWidth(content, effective_scroll);
+        try draw.copyClippedTextAt(&path_area, 0, 0, visible, style);
     }
 
     if (row_layout.stats_col) |stats_col| {
@@ -306,6 +298,21 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
             row_model.stats.removed,
         });
     }
+}
+
+fn sidebarTreeContent(allocator: std.mem.Allocator, row: sidebar_view_model.Row) ![]const u8 {
+    const indent = @as(usize, row.depth) * 2;
+    const fold_marker = switch (row.fold) {
+        .none => "",
+        .expanded => "▼ ",
+        .collapsed => "▶ ",
+    };
+    const len = indent + fold_marker.len + row.name.len;
+    const buf = try allocator.alloc(u8, len);
+    @memset(buf[0..indent], ' ');
+    @memcpy(buf[indent..][0..fold_marker.len], fold_marker);
+    @memcpy(buf[indent + fold_marker.len ..][0..row.name.len], row.name);
+    return buf;
 }
 
 fn sidebarRowStyle(row: sidebar_view_model.Row, pane_active: bool) chasen.TextStyle {
@@ -1604,11 +1611,12 @@ const help_sidebar_items = [_]HelpItem{
     .{ .key = "↑/↓ j/k", .description = "move selection" },
     .{ .key = "Enter", .description = "toggle directory" },
     .{ .key = "←/→", .description = "collapse / expand directory" },
+    .{ .key = "h / l", .description = "scroll file tree horizontally" },
     .{ .key = "f", .description = "search files" },
     .{ .key = "F", .description = "cycle file filter" },
     .{ .key = "s / S", .description = "stage / unstage file or directory" },
     .{ .key = "v", .description = "mark reviewed" },
-    .{ .key = "H", .description = "hide reviewed" },
+    .{ .key = "H / L", .description = "hide reviewed / line numbers" },
     .{ .key = "[ / ]", .description = "resize sidebar" },
 };
 

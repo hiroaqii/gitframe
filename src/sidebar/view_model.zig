@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const chasen = @import("chasen");
 const file_tree = @import("../file_tree.zig");
 
 pub const Row = struct {
@@ -28,9 +29,10 @@ pub const RowLayout = struct {
     reviewed_col: ?u16,
     badge_col: ?u16,
     mode_col: ?u16,
-    fold_col: ?u16,
     name_col: u16,
     name_width: u16,
+    tree_content_col: u16,
+    tree_content_width: u16,
     stats_col: ?u16,
     stats_width: u16,
 };
@@ -88,12 +90,11 @@ pub fn layout(row: Row, width: u16) RowLayout {
     // right-aligned stats. The indent shifts tree-specific columns while
     // keeping marker, reviewed mark, and stats fixed.
     const reviewed_col: ?u16 = if (row.kind == .file and row.reviewed) 1 else null;
-    const badge_col: ?u16 = if (row.status != null) 2 +| indent else null;
+    const badge_col: ?u16 = if (row.status != null) 2 else null;
     const mode_col: ?u16 = if (row.kind == .file and row.mode_changed)
-        if (row.status != null) 4 +| indent else 2 +| indent
+        if (row.status != null) 4 else 2
     else
         null;
-    const fold_col: ?u16 = if (row.kind == .directory) 2 +| indent else null;
     const name_col: u16 = if (row.kind == .directory)
         4 +| indent
     else if (row.mode_changed and row.status != null)
@@ -105,17 +106,41 @@ pub fn layout(row: Row, width: u16) RowLayout {
     const stats_width: u16 = if (shouldShowStats(row, width, name_col)) 12 else 0;
     const name_width: u16 = if (width > name_col + stats_width) width - name_col - stats_width else 0;
     const stats_col: ?u16 = if (stats_width > 0) width - stats_width else null;
+    const tree_content_col: u16 = if (row.mode_changed and row.status != null)
+        6
+    else if (row.mode_changed or row.status != null)
+        4
+    else
+        2;
+    const tree_content_width: u16 = if (width > tree_content_col + stats_width) width - tree_content_col - stats_width else 0;
 
     return .{
         .badge_col = badge_col,
         .mode_col = mode_col,
         .reviewed_col = reviewed_col,
-        .fold_col = fold_col,
         .name_col = name_col,
         .name_width = name_width,
+        .tree_content_col = tree_content_col,
+        .tree_content_width = tree_content_width,
         .stats_col = stats_col,
         .stats_width = stats_width,
     };
+}
+
+pub fn treeContentDisplayWidth(row: Row) usize {
+    const indent: usize = @as(usize, row.depth) * 2;
+    const fold_width: usize = switch (row.fold) {
+        .none => 0,
+        .expanded, .collapsed => chasen.text.displayWidth("▼ "),
+    };
+    return indent + fold_width + chasen.text.displayWidth(row.name);
+}
+
+pub fn maxHorizontalScroll(row: Row, width: u16) usize {
+    const row_layout = layout(row, width);
+    const content_width = treeContentDisplayWidth(row);
+    if (content_width <= row_layout.tree_content_width) return 0;
+    return content_width - row_layout.tree_content_width;
 }
 
 fn hasLineStats(stats: file_tree.Stats) bool {
@@ -189,10 +214,12 @@ test "layout keeps sidebar columns in one place" {
     try std.testing.expect(!row.selected);
     try std.testing.expect(row.reviewed);
     try std.testing.expectEqual(@as(u16, 1), row_layout.reviewed_col.?);
-    try std.testing.expectEqual(@as(u16, 4), row_layout.badge_col.?);
+    try std.testing.expectEqual(@as(u16, 2), row_layout.badge_col.?);
     try std.testing.expectEqual(@as(?u16, null), row_layout.mode_col);
     try std.testing.expectEqual(@as(u16, 6), row_layout.name_col);
     try std.testing.expectEqual(@as(u16, 22), row_layout.name_width);
+    try std.testing.expectEqual(@as(u16, 4), row_layout.tree_content_col);
+    try std.testing.expectEqual(@as(u16, 24), row_layout.tree_content_width);
     try std.testing.expectEqual(@as(u16, 28), row_layout.stats_col.?);
 }
 

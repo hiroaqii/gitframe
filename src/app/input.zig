@@ -70,6 +70,8 @@ const Action = enum {
     collapse_or_parent_directory,
     scroll_diff_right,
     scroll_diff_left,
+    scroll_sidebar_right,
+    scroll_sidebar_left,
     scroll_diff_up,
     select_previous_file,
     scroll_diff_down,
@@ -224,6 +226,8 @@ fn viewerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg
     if (context.focus == .sidebar and key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .collapse_or_parent_directory);
     if (context.focus == .diff and key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .scroll_diff_right);
     if (context.focus == .diff and key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .scroll_diff_left);
+    if (context.focus == .sidebar and key.matches('h', .{})) return actionToMsg(Msg, .scroll_sidebar_left);
+    if (context.focus == .sidebar and key.matches('l', .{})) return actionToMsg(Msg, .scroll_sidebar_right);
 
     if (viewerActionForStaticKey(key)) |action| return actionToMsg(Msg, action);
 
@@ -425,6 +429,8 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .collapse_or_parent_directory => voidMsg(Msg, "collapse_or_parent_directory"),
         .scroll_diff_right => voidMsg(Msg, "scroll_diff_right"),
         .scroll_diff_left => voidMsg(Msg, "scroll_diff_left"),
+        .scroll_sidebar_right => voidMsg(Msg, "scroll_sidebar_right"),
+        .scroll_sidebar_left => voidMsg(Msg, "scroll_sidebar_left"),
         .scroll_diff_up => voidMsg(Msg, "scroll_diff_up"),
         .select_previous_file => voidMsg(Msg, "select_previous_file"),
         .scroll_diff_down => voidMsg(Msg, "scroll_diff_down"),
@@ -525,6 +531,8 @@ const TestMsg = union(enum) {
     collapse_or_parent_directory,
     scroll_diff_right,
     scroll_diff_left,
+    scroll_sidebar_right,
+    scroll_sidebar_left,
     scroll_diff_up,
     select_previous_file,
     scroll_diff_down,
@@ -617,6 +625,13 @@ test "keyToMsg maps left and right by focused pane" {
     try std.testing.expectEqual(TestMsg.collapse_or_parent_directory, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = chasen.Key.left }).?);
     try std.testing.expectEqual(TestMsg.scroll_diff_right, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = chasen.Key.right }).?);
     try std.testing.expectEqual(TestMsg.scroll_diff_left, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = chasen.Key.left }).?);
+}
+
+test "keyToMsg maps sidebar h and l to horizontal scroll without stealing shifted toggles" {
+    try std.testing.expectEqual(TestMsg.scroll_sidebar_left, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'h' }).?);
+    try std.testing.expectEqual(TestMsg.scroll_sidebar_right, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'l' }).?);
+    try std.testing.expectEqual(TestMsg.toggle_hide_reviewed_files, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'H' }).?);
+    try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'L' }).?);
 }
 
 test "keyToMsg maps sidebar visibility and suppresses focus toggle while hidden" {

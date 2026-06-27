@@ -28,6 +28,7 @@ const repo_discovery = @import("repo/discovery.zig");
 const review_session = @import("review/session.zig");
 const repo_state = @import("repo/state.zig");
 const review_state = @import("review/state.zig");
+const sidebar_view_model = @import("sidebar/view_model.zig");
 
 const auto_reload_timer_id = "gitframe.auto_reload";
 const auto_reload_interval_ns = 2 * std.time.ns_per_s;
@@ -158,6 +159,7 @@ const ViewerState = struct {
     focus: Focus = .sidebar,
     sidebar_hidden: bool = false,
     sidebar_width: ?u16 = null,
+    sidebar_horizontal_scroll: usize = 0,
     diff_scroll: usize = 0,
     diff_horizontal_scroll: usize = 0,
     diff_cursor: diff_view_model.BodyCoordinate = .{ .metadata = 0 },
@@ -260,6 +262,8 @@ pub const App = struct {
         scroll_diff_down,
         scroll_diff_left,
         scroll_diff_right,
+        scroll_sidebar_left,
+        scroll_sidebar_right,
         page_diff_up,
         page_diff_down,
         select_previous_hunk,
@@ -395,6 +399,7 @@ pub const App = struct {
                 const previous_width = self.diffPaneWidth();
                 self.terminal_size = size;
                 self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
+                self.clampSidebarHorizontalScroll();
                 self.clampDiffNavigationKeepingHunkVisible();
                 self.updateSearchMatchOffset();
                 self.scrollSearchMatchIntoView();
@@ -422,6 +427,8 @@ pub const App = struct {
             .scroll_diff_down => self.moveDiffCursorRows(1),
             .scroll_diff_left => self.scrollDiffHorizontal(-1),
             .scroll_diff_right => self.scrollDiffHorizontal(1),
+            .scroll_sidebar_left => self.scrollSidebarHorizontal(-1),
+            .scroll_sidebar_right => self.scrollSidebarHorizontal(1),
             .page_diff_up => self.moveDiffCursorPage(-1),
             .page_diff_down => self.moveDiffCursorPage(1),
             .select_previous_hunk => self.selectHunkDelta(-1),
@@ -2474,6 +2481,7 @@ pub const App = struct {
         }
         self.viewer.diff_scroll = 0;
         self.viewer.diff_horizontal_scroll = 0;
+        self.viewer.sidebar_horizontal_scroll = 0;
         self.viewer.diff_cursor = .{ .metadata = 0 };
         self.clearSearchMatch();
     }
@@ -2552,6 +2560,7 @@ pub const App = struct {
         try file_tree.toggle(allocator, &loaded.collapsed_dirs, node.path);
         try loaded.rebuildVisibleNodes(allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
         self.clampSelection(loaded.document.files.len);
+        self.clampSidebarHorizontalScroll();
     }
 
     fn clickSidebarNode(self: *App, node_index: usize) !void {
@@ -2577,6 +2586,7 @@ pub const App = struct {
         file_tree.expand(&loaded.collapsed_dirs, node.path);
         try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
         self.clampSelection(loaded.document.files.len);
+        self.clampSidebarHorizontalScroll();
     }
 
     fn collapseOrSelectParentDirectory(self: *App) !void {
@@ -2588,6 +2598,7 @@ pub const App = struct {
             try file_tree.collapse(allocator, &loaded.collapsed_dirs, node.path);
             try loaded.rebuildVisibleNodes(allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
             self.clampSelection(loaded.document.files.len);
+            self.clampSidebarHorizontalScroll();
             return;
         }
         if (loaded.tree.parentDirectoryNodeIndex(self.viewer.selected_node)) |parent| {
@@ -2616,6 +2627,34 @@ pub const App = struct {
             self.viewer.diff_horizontal_scroll += step;
             self.clampDiffHorizontalScrollToVisibleRows();
         }
+    }
+
+    fn scrollSidebarHorizontal(self: *App, delta: i2) void {
+        const step: usize = 4;
+        if (delta < 0) {
+            self.viewer.sidebar_horizontal_scroll -|= step;
+        } else {
+            self.viewer.sidebar_horizontal_scroll += step;
+            self.clampSidebarHorizontalScroll();
+        }
+    }
+
+    fn clampSidebarHorizontalScroll(self: *App) void {
+        const max_scroll = self.visibleSidebarMaxHorizontalScroll();
+        if (self.viewer.sidebar_horizontal_scroll > max_scroll) {
+            self.viewer.sidebar_horizontal_scroll = max_scroll;
+        }
+    }
+
+    fn visibleSidebarMaxHorizontalScroll(self: *const App) usize {
+        const loaded = self.activeLoadedDiffConst() orelse return 0;
+        const width = sidebarWidth(self.layoutSize().width, self.viewer.sidebar_width);
+        var max_scroll: usize = 0;
+        for (loaded.visible_nodes) |node_index| {
+            const row = sidebar_view_model.rowForNode(loaded.tree, &loaded.collapsed_dirs, loaded.reviewed_files, node_index, self.viewer.selected_node) orelse continue;
+            max_scroll = @max(max_scroll, sidebar_view_model.maxHorizontalScroll(row, width));
+        }
+        return max_scroll;
     }
 
     fn clampDiffHorizontalScrollToVisibleRows(self: *App) void {
@@ -3292,6 +3331,7 @@ pub const App = struct {
         if (self.review_display.hide_reviewed_files) {
             try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, true, self.review_display.changed_file_filter);
             self.reconcileSelectionAfterVisibleNodeChange(loaded);
+            self.clampSidebarHorizontalScroll();
             self.clampDiffNavigation();
         }
     }
@@ -3301,6 +3341,7 @@ pub const App = struct {
         const loaded = self.activeLoadedDiff() orelse return;
         try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
         self.reconcileSelectionAfterVisibleNodeChange(loaded);
+        self.clampSidebarHorizontalScroll();
         self.clampDiffNavigation();
     }
 
@@ -3309,6 +3350,7 @@ pub const App = struct {
         const loaded = self.activeLoadedDiff() orelse return;
         try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
         self.reconcileSelectionAfterVisibleNodeChange(loaded);
+        self.clampSidebarHorizontalScroll();
         self.clampDiffNavigation();
     }
 
@@ -3997,6 +4039,7 @@ pub const App = struct {
             current +| step;
 
         self.viewer.sidebar_width = sidebarWidth(total_width, next);
+        self.clampSidebarHorizontalScroll();
         self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
         self.clampDiffNavigationKeepingHunkVisible();
         self.updateSearchMatchOffset();
@@ -5482,8 +5525,8 @@ test "sidebar renders file status badges" {
 
     try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
 
-    try ts.expectCellText(4, sidebar_header_rows, "A");
-    try ts.expectCellText(4, sidebar_header_rows + 1, "D");
+    try ts.expectCellText(2, sidebar_header_rows, "A");
+    try ts.expectCellText(2, sidebar_header_rows + 1, "D");
 }
 
 test "sidebar renders mode change badge next to file status" {
@@ -5518,6 +5561,40 @@ test "sidebar renders mode change badge next to file status" {
 
     try ts.expectCellText(2, sidebar_header_rows, "M");
     try ts.expectCellText(4, sidebar_header_rows, "m");
+}
+
+test "sidebar horizontal scroll reveals deep file name" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(24, 8);
+    defer ts.deinit();
+
+    const nodes = [_]file_tree.Node{
+        .{
+            .kind = .file,
+            .name = "very_long_tail_file.zig",
+            .path = "a/b/c/d/e/f/very_long_tail_file.zig",
+            .depth = 6,
+            .target = .{ .diff_file = 0 },
+        },
+    };
+    const app: App = .{
+        .terminal_size = .{ .width = 80, .height = 9 },
+        .load = testLoadState(.{
+            .text = "",
+            .document = .{ .files = &test_files_one },
+            .tree = .{ .nodes = &nodes },
+            .collapsed_dirs = .{},
+            .bytes = 0,
+            .lines = 0,
+        }),
+        .viewer = .{ .sidebar_horizontal_scroll = 12 },
+    };
+
+    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "very_long") != null);
 }
 
 test "sidebar title indicates active focus" {
@@ -6773,7 +6850,7 @@ test "sidebar renders reviewed marker" {
     try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
 
     try ts.expectCellText(1, sidebar_header_rows, "✓");
-    try ts.expectCellText(4, sidebar_header_rows, "A");
+    try ts.expectCellText(2, sidebar_header_rows, "A");
 }
 
 test "hide reviewed files removes reviewed file rows from visible list" {

@@ -142,6 +142,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/sidebar_view_model_test.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+            },
         }),
     });
     const run_sidebar_view_model_tests = b.addRunArtifact(sidebar_view_model_tests);
