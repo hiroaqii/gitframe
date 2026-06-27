@@ -394,6 +394,8 @@ pub const App = struct {
     }
 
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
+        self.clearEphemeralStatusForUserAction(msg);
+
         switch (msg) {
             .terminal_resized => |size| {
                 const previous_width = self.diffPaneWidth();
@@ -586,6 +588,33 @@ pub const App = struct {
             .quit => ctx.quit(),
         }
         try self.ensureReviewProjection(ctx);
+    }
+
+    fn clearEphemeralStatusForUserAction(self: *App, msg: Msg) void {
+        if (msgKeepsEphemeralStatus(msg)) return;
+        self.status.clearIfEphemeral();
+    }
+
+    fn msgKeepsEphemeralStatus(msg: Msg) bool {
+        return switch (msg) {
+            .terminal_resized,
+            .repos_discovered,
+            .repo_path_discovered,
+            .diff_loaded,
+            .status_loaded,
+            .review_projection_loaded,
+            .stage_file_finished,
+            .stage_hunk_finished,
+            .unstage_file_finished,
+            .unstage_hunk_finished,
+            .discard_file_finished,
+            .commit_finished,
+            .amend_finished,
+            .editor_finished,
+            .auto_reload_tick,
+            => true,
+            else => false,
+        };
     }
 
     pub fn view(self: *const App, surface: *chasen.Surface) !void {
@@ -4787,6 +4816,34 @@ test "hidden sidebar keeps tab from changing focus" {
     try app.update(.toggle_focus, undefined);
 
     try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+}
+
+test "user actions clear previous ephemeral status" {
+    var app: App = .{};
+    app.setStatus("staged: {s}", .{"src/app.zig"});
+
+    try app.update(.toggle_focus, undefined);
+
+    try std.testing.expectEqualStrings("", app.status.text());
+}
+
+test "system events keep previous ephemeral status" {
+    var app: App = .{};
+    app.setStatus("staged: {s}", .{"src/app.zig"});
+
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 40 } }, undefined);
+
+    try std.testing.expectEqualStrings("staged: src/app.zig", app.status.text());
+}
+
+test "modal transitions clear previous ephemeral status" {
+    var app: App = .{};
+    app.setStatus("staged: {s}", .{"src/app.zig"});
+
+    try app.update(.open_help, undefined);
+
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expectEqual(OverlayKind.help, app.overlay.kind);
 }
 
 test "help overlay opens and closes before normal shortcuts" {

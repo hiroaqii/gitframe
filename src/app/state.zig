@@ -85,10 +85,21 @@ pub const AmendConfirmation = struct {
 pub const StatusMessage = struct {
     buf: [160]u8 = undefined,
     len: usize = 0,
+    clear_on_next_input: bool = false,
 
     pub fn set(self: *StatusMessage, comptime fmt: []const u8, args: anytype) void {
         const formatted = std.fmt.bufPrint(&self.buf, fmt, args) catch "status formatting failed";
         self.len = formatted.len;
+        self.clear_on_next_input = true;
+    }
+
+    pub fn clear(self: *StatusMessage) void {
+        self.len = 0;
+        self.clear_on_next_input = false;
+    }
+
+    pub fn clearIfEphemeral(self: *StatusMessage) void {
+        if (self.clear_on_next_input) self.clear();
     }
 
     pub fn text(self: *const StatusMessage) []const u8 {
@@ -210,6 +221,7 @@ test "StatusMessage owns its formatted text buffer" {
     status.set("loaded {d}", .{3});
 
     try std.testing.expectEqualStrings("loaded 3", status.text());
+    try std.testing.expect(status.clear_on_next_input);
 }
 
 test "StatusMessage remains self-contained after value copy" {
@@ -219,6 +231,16 @@ test "StatusMessage remains self-contained after value copy" {
     const copied = status;
 
     try std.testing.expectEqualStrings("loaded 3", copied.text());
+}
+
+test "StatusMessage clears only ephemeral text" {
+    var status: StatusMessage = .{};
+
+    status.set("loaded {d}", .{3});
+    status.clearIfEphemeral();
+
+    try std.testing.expectEqualStrings("", status.text());
+    try std.testing.expect(!status.clear_on_next_input);
 }
 
 test "StagedHunkMarks owns keys and deduplicates hunk marks" {
