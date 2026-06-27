@@ -12,6 +12,7 @@ pub const RenderOptions = struct {
     scroll: usize = 0,
     horizontal_scroll: usize = 0,
     pane_active: bool = true,
+    title_prefix: ?[]const u8 = null,
     line_numbers: bool = true,
     highlighted_hunk: ?usize = null,
     cursor_offset: ?usize = null,
@@ -58,7 +59,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     if (size.width == 0 or size.height == 0) return;
 
     const mode = effectiveMode(size.width, options.requested_mode);
-    try renderFileHeader(surface, file, options.requested_mode, options.pane_active);
+    try renderFileHeader(surface, file, options.requested_mode, options.pane_active, options.title_prefix);
     var body_surface = surface.child(.{
         .col = cursor_gutter_width,
         .row = 0,
@@ -110,7 +111,7 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, line
     if (size.width == 0 or size.height == 0) return;
 
     const mode = effectiveMode(size.width, options.requested_mode);
-    try renderGeneratedFileHeader(surface, path, lines.len, truncated, options.requested_mode, options.pane_active);
+    try renderGeneratedFileHeader(surface, path, lines.len, truncated, options.requested_mode, options.pane_active, options.title_prefix);
 
     var cursor: BodyCursor = .{
         .scroll = options.scroll,
@@ -148,6 +149,7 @@ fn renderFileHeader(
     file: diff_parser.FileDiff,
     requested_mode: DisplayMode,
     pane_active: bool,
+    title_prefix: ?[]const u8,
 ) !void {
     const stats = fileStats(file);
     const summary = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  +{d} -{d}  {d} hunks", .{
@@ -156,7 +158,7 @@ fn renderFileHeader(
         stats.removed,
         file.hunks.len,
     });
-    try drawHeaderLine(surface, displayPath(file), summary, pane_active);
+    try drawHeaderLine(surface, title_prefix, displayPath(file), summary, pane_active);
 }
 
 fn renderGeneratedFileHeader(
@@ -166,6 +168,7 @@ fn renderGeneratedFileHeader(
     truncated: bool,
     requested_mode: DisplayMode,
     pane_active: bool,
+    title_prefix: ?[]const u8,
 ) !void {
     const suffix = if (truncated) "  truncated" else "";
     const summary = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  +{d} -0  generated{s}", .{
@@ -173,10 +176,10 @@ fn renderGeneratedFileHeader(
         added_lines,
         suffix,
     });
-    try drawHeaderLine(surface, path, summary, pane_active);
+    try drawHeaderLine(surface, title_prefix, path, summary, pane_active);
 }
 
-fn drawHeaderLine(surface: *chasen.Surface, path: []const u8, summary: []const u8, pane_active: bool) !void {
+fn drawHeaderLine(surface: *chasen.Surface, title_prefix: ?[]const u8, path: []const u8, summary: []const u8, pane_active: bool) !void {
     const size = surface.size();
     if (size.width == 0) return;
 
@@ -185,14 +188,18 @@ fn drawHeaderLine(surface: *chasen.Surface, path: []const u8, summary: []const u
     if (size.width > summary_width + 2 + right_padding) {
         const path_width: u16 = @intCast(size.width - summary_width - 2 - right_padding);
         var path_area = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
-        try draw.copyClippedTextAt(&path_area, 0, 0, path, fileHeaderStyle(pane_active));
+        try drawHeaderPath(&path_area, title_prefix, path, fileHeaderStyle(pane_active));
 
         const summary_col: u16 = @intCast(size.width - summary_width - right_padding);
         try draw.copyClippedTextAt(surface, summary_col, 0, summary, style_metadata);
         return;
     }
 
-    try draw.copyClippedTextAt(surface, 0, 0, path, fileHeaderStyle(pane_active));
+    try drawHeaderPath(surface, title_prefix, path, fileHeaderStyle(pane_active));
+}
+
+fn drawHeaderPath(surface: *chasen.Surface, title_prefix: ?[]const u8, path: []const u8, style: chasen.TextStyle) !void {
+    try draw.copyPrefixedTailClippedPathAt(surface, 0, 0, title_prefix, path, style);
 }
 
 fn drawHunkHeader(surface: *chasen.Surface, row: u16, header: []const u8, style: chasen.TextStyle, mode: DisplayMode) !void {
@@ -676,7 +683,7 @@ test "side-by-side hunk header is clipped before the new column" {
     try ts.expectCellText(gutter_col + 8, 3, " ");
 }
 
-test "marked clipping shows ellipsis in fixed metadata rows" {
+test "header clipping keeps filename tail visible" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(16, 5);
     defer ts.deinit();
@@ -691,7 +698,32 @@ test "marked clipping shows ellipsis in fixed metadata rows" {
 
     try renderFile(&ts.surface, file, .{});
 
-    try ts.expectCellText(15, 0, "…");
+    try ts.expectCellText(0, 0, "…");
+    try ts.expectCellText(15, 0, "g");
+}
+
+test "header clipping preserves repo prefix" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(24, 5);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/very/deep/path/example.zig b/very/deep/path/example.zig",
+        .old_path = "a/very/deep/path/example.zig",
+        .new_path = "b/very/deep/path/example.zig",
+        .metadata = &.{},
+        .hunks = &.{},
+    };
+
+    try renderFile(&ts.surface, file, .{ .title_prefix = "gitframe" });
+
+    try ts.expectCellText(0, 0, "g");
+    try ts.expectCellText(7, 0, "e");
+    try ts.expectCellText(8, 0, " ");
+    try ts.expectCellText(9, 0, "/");
+    try ts.expectCellText(10, 0, " ");
+    try ts.expectCellText(11, 0, "…");
+    try ts.expectCellText(23, 0, "g");
 }
 
 test "unified horizontal scroll keeps line numbers and prefix fixed" {

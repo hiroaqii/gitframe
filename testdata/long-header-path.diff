@@ -1,0 +1,13 @@
+diff --git a/src/review/workflow/remote/actions/credential/prompts/very/deep/module/tree/with/a/header/path/that/should/force/the/diff-pane-title/to/clip/before/the/summary/remains/visible/example.zig b/src/review/workflow/remote/actions/credential/prompts/very/deep/module/tree/with/a/header/path/that/should/force/the/diff-pane-title/to/clip/before/the/summary/remains/visible/example.zig
+index 1111111..2222222 100644
+--- a/src/review/workflow/remote/actions/credential/prompts/very/deep/module/tree/with/a/header/path/that/should/force/the/diff-pane-title/to/clip/before/the/summary/remains/visible/example.zig
++++ b/src/review/workflow/remote/actions/credential/prompts/very/deep/module/tree/with/a/header/path/that/should/force/the/diff-pane-title/to/clip/before/the/summary/remains/visible/example.zig
+@@ -1,7 +1,7 @@
+ const std = @import("std");
+ 
+ pub fn title() []const u8 {
+-    return "old header clipping fixture";
++    return "new header clipping fixture";
+ }
+ 
+ pub fn main() void {

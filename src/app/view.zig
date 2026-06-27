@@ -342,11 +342,13 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
     const display = (try app.activeDiffDisplay(surface.frameAllocator(), mode)) orelse return;
     const display_file = display.file();
+    const title_prefix = repoHeaderLabel(app);
     try diff_render.renderFile(&diff_content, display_file, .{
         .requested_mode = app.viewer.display_mode,
         .scroll = app.viewer.diff_scroll,
         .horizontal_scroll = app.viewer.diff_horizontal_scroll,
         .pane_active = active,
+        .title_prefix = title_prefix,
         .line_numbers = app.viewer.view_options.line_numbers,
         .highlighted_hunk = app.selectedHunkIndex(),
         .cursor_offset = app.visibleDiffCursorOffset(),
@@ -405,6 +407,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                             .scroll = app.viewer.diff_scroll,
                             .horizontal_scroll = app.viewer.diff_horizontal_scroll,
                             .pane_active = active,
+                            .title_prefix = repoHeaderLabel(app),
                             .line_numbers = app.viewer.view_options.line_numbers,
                             .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(content.size().width, app.viewer.display_mode)),
                         });
@@ -418,6 +421,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                         .scroll = app.viewer.diff_scroll,
                         .horizontal_scroll = app.viewer.diff_horizontal_scroll,
                         .pane_active = active,
+                        .title_prefix = repoHeaderLabel(app),
                         .line_numbers = app.viewer.view_options.line_numbers,
                     });
                     drawPaneHeaderRule(surface);
@@ -425,26 +429,26 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                 },
                 .combined_hunks => {},
                 .status_body => |body| {
-                    try drawStatusBody(&content, body.path, body.message, active);
+                    try drawStatusBody(&content, repoHeaderLabel(app), body.path, body.message, active);
                     drawPaneHeaderRule(surface);
                     return;
                 },
             }
         },
         .failed => |failed| {
-            try drawStatusBody(&content, failed.body.path, failed.body.message, active);
+            try drawStatusBody(&content, repoHeaderLabel(app), failed.body.path, failed.body.message, active);
             drawPaneHeaderRule(surface);
             return;
         },
         .pending => {
-            try drawStatusBody(&content, path, "Loading review projection...", active);
+            try drawStatusBody(&content, repoHeaderLabel(app), path, "Loading review projection...", active);
             drawPaneHeaderRule(surface);
             return;
         },
         .idle => {},
     }
 
-    try draw.copyClippedTextAt(&content, 0, 0, path, paneTitleStyle(active));
+    try drawTitlePath(&content, repoHeaderLabel(app), path, paneTitleStyle(active));
     const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "status: {s}{s}", .{ statusName(entry.index), statusSuffix(entry) });
     try draw.copyClippedTextAt(&content, 0, 2, status_text, .{ .fg = .gray, .dim = !active });
     switch (file_tree.stagePresenceFromEntry(entry)) {
@@ -468,9 +472,13 @@ fn drawPaneHeaderRule(surface: *chasen.Surface) void {
     }
 }
 
-fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u8, active: bool) !void {
-    try draw.copyClippedTextAt(surface, 0, 0, path, paneTitleStyle(active));
+fn drawStatusBody(surface: *chasen.Surface, repo_label: ?[]const u8, path: []const u8, message: []const u8, active: bool) !void {
+    try drawTitlePath(surface, repo_label, path, paneTitleStyle(active));
     try draw.copyClippedTextAt(surface, 0, 2, message, .{ .fg = .gray, .dim = !active });
+}
+
+fn drawTitlePath(surface: *chasen.Surface, repo_label: ?[]const u8, path: []const u8, style: chasen.TextStyle) !void {
+    try draw.copyPrefixedTailClippedPathAt(surface, 0, 0, repo_label, path, style);
 }
 
 fn statusName(status: git_status.StatusCode) []const u8 {
@@ -639,11 +647,6 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         .style = .{ .fg = color_prompt },
         .drop_priority = .source,
     });
-    if (repoFooterLabel(app)) |label| footer_segments.append(.{
-        .text = label,
-        .style = .{ .fg = .gray },
-        .drop_priority = .repo,
-    });
     if (app.config.watch) footer_segments.append(.{
         .text = "watch",
         .style = .{ .fg = color_staged },
@@ -676,7 +679,6 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
 }
 
 const FooterDropPriority = enum {
-    repo,
     source,
     watch,
 };
@@ -699,7 +701,7 @@ const FooterSegments = struct {
     }
 
     fn fit(self: *FooterSegments, width: u16) void {
-        const order = [_]FooterDropPriority{ .repo, .source, .watch };
+        const order = [_]FooterDropPriority{ .source, .watch };
         for (order) |priority| {
             if (self.requiredWidth() <= width) return;
             self.drop(priority);
@@ -747,7 +749,7 @@ const FooterSegments = struct {
     }
 };
 
-fn repoFooterLabel(app: anytype) ?[]const u8 {
+fn repoHeaderLabel(app: anytype) ?[]const u8 {
     const root = app.repo_state.activeRoot() orelse return null;
     const base = std.fs.path.basename(root);
     if (base.len == 0) return root;
@@ -756,7 +758,7 @@ fn repoFooterLabel(app: anytype) ?[]const u8 {
 
 fn sourceFooterLabel(config: anytype) ?[]const u8 {
     return switch (config.source) {
-        .unstaged => "unstaged",
+        .unstaged => null,
         .cached => "staged",
         .stdin => "stdin",
         .pager => "pager",
@@ -1489,7 +1491,7 @@ pub fn clampSidebarWidth(total_width: u16, width: u16) u16 {
 test "footer segment fit includes left inset" {
     var segments = FooterSegments{};
     segments.append(.{ .text = "aa", .style = .{} });
-    segments.append(.{ .text = "bb", .style = .{}, .drop_priority = .repo });
+    segments.append(.{ .text = "bb", .style = .{}, .drop_priority = .source });
 
     try std.testing.expectEqual(@as(u16, 7), segments.requiredWidth());
     segments.fit(6);
