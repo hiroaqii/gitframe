@@ -243,6 +243,13 @@ test "StatusMessage clears only ephemeral text" {
     try std.testing.expect(!status.clear_on_next_input);
 }
 
+test "ReviewDisplayState defaults to showing all files" {
+    const review_display: ReviewDisplayState = .{};
+
+    try std.testing.expect(!review_display.hide_reviewed_files);
+    try std.testing.expectEqual(loaded_diff.ChangedFileFilter.all, review_display.changed_file_filter);
+}
+
 test "StagedHunkMarks owns keys and deduplicates hunk marks" {
     var marks: StagedHunkMarks = .{};
     defer marks.deinit(std.testing.allocator);
