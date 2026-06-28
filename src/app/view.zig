@@ -244,7 +244,12 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
         visible_index += 1;
         row += 1;
     }) {
-        const row_model = loaded.sidebarRowAt(visible_index, app.viewer.selected_node) orelse continue;
+        const row_model = sidebar_view_model.rowAt(.{
+            .tree = loaded.tree,
+            .collapsed = &loaded.collapsed_dirs,
+            .reviewed_files = loaded.reviewed_files,
+            .visible_nodes = loaded.materializedVisibleNodes(),
+        }, visible_index, app.viewer.selected_node) orelse continue;
         try drawSidebarRow(surface, row, row_model, app.viewer.focus == .sidebar, app.viewer.sidebar_horizontal_scroll);
     }
 }

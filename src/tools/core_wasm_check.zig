@@ -46,7 +46,12 @@ pub fn gitframeCoreWasmCompileCheck() usize {
     var collapsed: file_tree.CollapsedSet = .empty;
     const visible_nodes = [_]usize{0};
     const reviewed_files = [_]bool{false};
-    const row = sidebar_view_model.visibleRowAt(tree, &collapsed, &reviewed_files, &visible_nodes, 0, 0) orelse unreachable;
+    const row = sidebar_view_model.rowAt(.{
+        .tree = tree,
+        .collapsed = &collapsed,
+        .reviewed_files = &reviewed_files,
+        .visible_nodes = &visible_nodes,
+    }, 0, 0) orelse unreachable;
 
     return document.files.len +
         tree.nodes.len +

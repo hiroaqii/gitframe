@@ -4,7 +4,6 @@ const diff_parser = @import("diff/parser.zig");
 const diff_render = @import("diff/render.zig");
 const diff_view_model = @import("diff/view_model.zig");
 const file_tree = @import("file_tree.zig");
-const sidebar_view_model = @import("sidebar/view_model.zig");
 
 pub const ChangedFileFilter = enum {
     all,
@@ -148,18 +147,6 @@ pub const LoadedDiff = struct {
             return if (visible_index < nodes.len) nodes[visible_index] else null;
         }
         return self.tree.visibleNodeAt(&self.collapsed_dirs, visible_index);
-    }
-
-    pub fn sidebarRowAt(self: *const LoadedDiff, visible_index: usize, selected_node: usize) ?sidebar_view_model.Row {
-        // This is still a small projection into sidebar view-model rows. If the
-        // sidebar renderer grows, move this projection to the sidebar layer and
-        // keep LoadedDiff focused on visible node access.
-        if (self.materializedVisibleNodes()) |nodes| {
-            return sidebar_view_model.visibleRowAt(self.tree, &self.collapsed_dirs, self.reviewed_files, nodes, visible_index, selected_node);
-        }
-
-        const node_index = self.visibleNodeAt(visible_index) orelse return null;
-        return sidebar_view_model.rowForNode(self.tree, &self.collapsed_dirs, self.reviewed_files, node_index, selected_node);
     }
 
     pub fn sidebarVisibleRange(self: *const LoadedDiff, selected_node: usize, visible_rows: usize) ui.ListViewport.Range {

@@ -2914,9 +2914,17 @@ pub const App = struct {
     fn visibleSidebarMaxHorizontalScroll(self: *const App) usize {
         const loaded = self.activeLoadedDiffConst() orelse return 0;
         const width = sidebarWidth(self.layoutSize().width, self.viewer.sidebar_width);
+        const source = sidebar_view_model.Source{
+            .tree = loaded.tree,
+            .collapsed = &loaded.collapsed_dirs,
+            .reviewed_files = loaded.reviewed_files,
+            .visible_nodes = loaded.materializedVisibleNodes(),
+        };
+
         var max_scroll: usize = 0;
-        for (loaded.visible_nodes) |node_index| {
-            const row = sidebar_view_model.rowForNode(loaded.tree, &loaded.collapsed_dirs, loaded.reviewed_files, node_index, self.viewer.selected_node) orelse continue;
+        var visible_index: usize = 0;
+        while (visible_index < loaded.visibleNodeCount()) : (visible_index += 1) {
+            const row = sidebar_view_model.rowAt(source, visible_index, self.viewer.selected_node) orelse continue;
             max_scroll = @max(max_scroll, sidebar_view_model.maxHorizontalScroll(row, width));
         }
         return max_scroll;

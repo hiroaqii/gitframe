@@ -37,6 +37,16 @@ pub const RowLayout = struct {
     stats_width: u16,
 };
 
+pub const Source = struct {
+    tree: file_tree.FileTree,
+    collapsed: *const file_tree.CollapsedSet,
+    reviewed_files: []const bool,
+    /// Null means the caller has no materialized visible-node cache; use the
+    /// tree's collapsed-directory traversal instead. An empty slice means the
+    /// materialized result is intentionally empty.
+    visible_nodes: ?[]const usize,
+};
+
 pub fn rowForNode(
     tree: file_tree.FileTree,
     collapsed: *const file_tree.CollapsedSet,
@@ -71,7 +81,16 @@ pub fn rowForNode(
     };
 }
 
-pub fn visibleRowAt(
+pub fn rowAt(source: Source, visible_index: usize, selected_node: usize) ?Row {
+    if (source.visible_nodes) |nodes| {
+        return visibleRowAt(source.tree, source.collapsed, source.reviewed_files, nodes, visible_index, selected_node);
+    }
+
+    const node_index = source.tree.visibleNodeAt(source.collapsed, visible_index) orelse return null;
+    return rowForNode(source.tree, source.collapsed, source.reviewed_files, node_index, selected_node);
+}
+
+fn visibleRowAt(
     tree: file_tree.FileTree,
     collapsed: *const file_tree.CollapsedSet,
     reviewed_files: []const bool,
