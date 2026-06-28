@@ -99,7 +99,7 @@ test "formatSingleHunkPatch reconstructs a modified hunk with newline terminator
     ;
 
     const document = try diff_parser.parse(std.testing.allocator, text);
-    defer freeParsedDocument(std.testing.allocator, document);
+    defer document.deinit(std.testing.allocator);
 
     const patch = try formatSingleHunkPatch(std.testing.allocator, document.files[0], 1);
     defer std.testing.allocator.free(patch);
@@ -131,7 +131,7 @@ test "formatSingleHunkPatch preserves hunk metadata lines" {
     ;
 
     const document = try diff_parser.parse(std.testing.allocator, text);
-    defer freeParsedDocument(std.testing.allocator, document);
+    defer document.deinit(std.testing.allocator);
 
     const patch = try formatSingleHunkPatch(std.testing.allocator, document.files[0], 0);
     defer std.testing.allocator.free(patch);
@@ -177,13 +177,4 @@ test "formatSingleHunkPatch rejects unsupported files" {
         .hunks = &.{},
     };
     try std.testing.expectError(error.UnsupportedFileState, formatSingleHunkPatch(std.testing.allocator, copied, 0));
-}
-
-fn freeParsedDocument(allocator: std.mem.Allocator, document: diff_parser.DiffDocument) void {
-    for (document.files) |file| {
-        for (file.hunks) |hunk| allocator.free(hunk.lines);
-        allocator.free(file.hunks);
-        allocator.free(file.metadata);
-    }
-    allocator.free(document.files);
 }

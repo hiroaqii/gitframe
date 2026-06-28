@@ -461,6 +461,8 @@ pub fn buildLoadedBundle(allocator: std.mem.Allocator, bytes: []const u8) !Loade
     errdefer arena.deinit();
     const arena_allocator = arena.allocator();
 
+    // DiffDocument string fields borrow from the input bytes, so keep the raw
+    // diff text and parser-allocated arrays in the same arena.
     const copied = try arena_allocator.dupe(u8, bytes);
     const document = try diff_parser.parse(arena_allocator, copied);
     const tree = try file_tree.build(arena_allocator, document);

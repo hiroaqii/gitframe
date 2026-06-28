@@ -3,7 +3,8 @@ const std = @import("std");
 /// Parsed, normalized representation of a unified diff.
 ///
 /// String fields are slices into the caller-owned raw diff text. The array
-/// fields are allocated with the allocator passed to `parse`.
+/// fields are allocated with the allocator passed to `parse` and can be freed
+/// with `deinit`.
 pub const DiffDocument = struct {
     files: []const FileDiff,
 
@@ -11,6 +12,20 @@ pub const DiffDocument = struct {
         var count: usize = 0;
         for (self.files) |file| count += file.hunks.len;
         return count;
+    }
+
+    /// Free parser-allocated arrays.
+    ///
+    /// This does not free any string data: headers, paths, metadata line text,
+    /// hunk sections, and diff line text all borrow from the input passed to
+    /// `parse`.
+    pub fn deinit(self: DiffDocument, allocator: std.mem.Allocator) void {
+        for (self.files) |file| {
+            for (file.hunks) |hunk| allocator.free(hunk.lines);
+            allocator.free(file.hunks);
+            allocator.free(file.metadata);
+        }
+        allocator.free(self.files);
     }
 };
 
@@ -59,8 +74,15 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
+/// Parse a unified diff without copying string data.
+///
+/// The returned document borrows all string fields from `text`; keep `text`
+/// alive for the lifetime of the document. For long-lived app state, copy
+/// `text` into the same arena used for parsing so the borrowed strings and
+/// parser-allocated arrays share one cleanup boundary.
 pub fn parse(allocator: std.mem.Allocator, text: []const u8) ParseError!DiffDocument {
     var parser: Parser = .{ .allocator = allocator };
+    errdefer parser.deinitPartial();
     return parser.parse(text);
 }
 
@@ -71,6 +93,25 @@ const Parser = struct {
     current_hunk: ?HunkBuilder = null,
     old_line: u32 = 0,
     new_line: u32 = 0,
+
+    fn deinitPartial(self: *Parser) void {
+        if (self.current_hunk) |*hunk| hunk.lines.deinit(self.allocator);
+        self.current_hunk = null;
+
+        if (self.current_file) |*file| {
+            for (file.hunks.items) |hunk| self.allocator.free(hunk.lines);
+            file.hunks.deinit(self.allocator);
+            file.metadata.deinit(self.allocator);
+        }
+        self.current_file = null;
+
+        for (self.files.items) |file| {
+            for (file.hunks) |hunk| self.allocator.free(hunk.lines);
+            self.allocator.free(file.hunks);
+            self.allocator.free(file.metadata);
+        }
+        self.files.deinit(self.allocator);
+    }
 
     fn parse(self: *Parser, text: []const u8) ParseError!DiffDocument {
         // Avoid splitScalar here: a trailing '\n' would produce a phantom empty
@@ -137,12 +178,21 @@ const Parser = struct {
 
     fn finishFile(self: *Parser) ParseError!void {
         if (self.current_file) |*file| {
+            const metadata = try file.metadata.toOwnedSlice(self.allocator);
+            errdefer self.allocator.free(metadata);
+
+            const hunks = try file.hunks.toOwnedSlice(self.allocator);
+            errdefer {
+                for (hunks) |hunk| self.allocator.free(hunk.lines);
+                self.allocator.free(hunks);
+            }
+
             try self.files.append(self.allocator, .{
                 .header = file.header,
                 .old_path = file.old_path,
                 .new_path = file.new_path,
-                .metadata = try file.metadata.toOwnedSlice(self.allocator),
-                .hunks = try file.hunks.toOwnedSlice(self.allocator),
+                .metadata = metadata,
+                .hunks = hunks,
                 .is_binary = file.is_binary,
             });
         }
@@ -167,13 +217,16 @@ const Parser = struct {
 
     fn finishHunk(self: *Parser) ParseError!void {
         if (self.current_hunk) |*hunk| {
+            const lines = try hunk.lines.toOwnedSlice(self.allocator);
+            errdefer self.allocator.free(lines);
+
             try self.current_file.?.hunks.append(self.allocator, .{
                 .old_start = hunk.old_start,
                 .old_count = hunk.old_count,
                 .new_start = hunk.new_start,
                 .new_count = hunk.new_count,
                 .section = hunk.section,
-                .lines = try hunk.lines.toOwnedSlice(self.allocator),
+                .lines = lines,
             });
         }
         self.current_hunk = null;
@@ -328,7 +381,7 @@ test "parse unified diff with one file and one hunk" {
     ;
 
     const doc = try parse(std.testing.allocator, text);
-    defer freeDocument(std.testing.allocator, doc);
+    defer doc.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), doc.files.len);
     try std.testing.expectEqual(@as(usize, 1), doc.totalHunks());
@@ -355,7 +408,7 @@ test "parse multiple files and binary metadata" {
     ;
 
     const doc = try parse(std.testing.allocator, text);
-    defer freeDocument(std.testing.allocator, doc);
+    defer doc.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 2), doc.files.len);
     try std.testing.expectEqual(@as(usize, 1), doc.totalHunks());
@@ -373,7 +426,7 @@ test "parse hunk ranges without explicit counts" {
     ;
 
     const doc = try parse(std.testing.allocator, text);
-    defer freeDocument(std.testing.allocator, doc);
+    defer doc.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u32, 4), doc.files[0].hunks[0].old_start);
     try std.testing.expectEqual(@as(u32, 1), doc.files[0].hunks[0].old_count);
@@ -392,7 +445,7 @@ test "parse hunk lines that look like file path headers" {
     ;
 
     const doc = try parse(std.testing.allocator, text);
-    defer freeDocument(std.testing.allocator, doc);
+    defer doc.deinit(std.testing.allocator);
 
     const lines = doc.files[0].hunks[0].lines;
     try std.testing.expectEqual(@as(usize, 2), lines.len);
@@ -420,7 +473,7 @@ test "parse plain unified diff with multiple files" {
     ;
 
     const doc = try parse(std.testing.allocator, text);
-    defer freeDocument(std.testing.allocator, doc);
+    defer doc.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 2), doc.files.len);
     try std.testing.expectEqualStrings("old/one.txt", doc.files[0].old_path.?);
@@ -442,7 +495,7 @@ test "parse ignores trailing newline after final hunk line" {
     ;
 
     const doc = try parse(std.testing.allocator, text);
-    defer freeDocument(std.testing.allocator, doc);
+    defer doc.deinit(std.testing.allocator);
 
     const lines = doc.files[0].hunks[0].lines;
     try std.testing.expectEqual(@as(usize, 2), lines.len);
@@ -468,7 +521,7 @@ test "parse skips git show preamble before diff header" {
     ;
 
     const doc = try parse(std.testing.allocator, text);
-    defer freeDocument(std.testing.allocator, doc);
+    defer doc.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), doc.files.len);
     try std.testing.expectEqualStrings("diff --git a/src/app.zig b/src/app.zig", doc.files[0].header);
@@ -485,16 +538,21 @@ test "parse non-diff text as empty document" {
     ;
 
     const doc = try parse(std.testing.allocator, text);
-    defer freeDocument(std.testing.allocator, doc);
+    defer doc.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 0), doc.files.len);
 }
 
-fn freeDocument(allocator: std.mem.Allocator, doc: DiffDocument) void {
-    for (doc.files) |file| {
-        for (file.hunks) |hunk| allocator.free(hunk.lines);
-        allocator.free(file.hunks);
-        allocator.free(file.metadata);
-    }
-    allocator.free(doc.files);
+test "parse cleans partial allocations on error" {
+    const text =
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\@@ invalid
+        \\
+    ;
+
+    try std.testing.expectError(error.InvalidHunkHeader, parse(std.testing.allocator, text));
 }
