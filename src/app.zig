@@ -1942,10 +1942,12 @@ pub const App = struct {
         const owned_root = try ctx.allocator().dupe(u8, repo_root);
         errdefer ctx.allocator().free(owned_root);
 
+        const pending = self.actions.begin(.commit);
+        errdefer _ = self.actions.finish(pending);
+
         const task = try ctx.allocator().create(CommitTask);
         errdefer ctx.allocator().destroy(task);
 
-        const pending = self.actions.begin(.commit);
         task.* = .{
             .pending = pending,
             .repo_root = owned_root,
@@ -1955,7 +1957,6 @@ pub const App = struct {
         parts = .{ .subject = &.{}, .body = null };
 
         ctx.task().spawnWith(task, CommitTask.run) catch |err| {
-            self.actions.clear();
             ctx.allocator().free(task.subject);
             if (task.body) |body| ctx.allocator().free(body);
             self.commit_panel.commit_error = .commit_failed;
@@ -2011,7 +2012,6 @@ pub const App = struct {
         confirmation = .{ .repo_root = &.{}, .subject = &.{}, .body = null };
 
         ctx.task().spawnWith(task, AmendTask.run) catch |err| {
-            self.actions.clear();
             ctx.allocator().free(task.repo_root);
             ctx.allocator().free(task.subject);
             if (task.body) |body| ctx.allocator().free(body);
