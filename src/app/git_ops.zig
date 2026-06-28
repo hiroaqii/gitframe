@@ -13,6 +13,11 @@ pub const TargetKind = enum {
     directory,
 };
 
+/// Trim leading/trailing whitespace from command output before showing it in UI.
+pub fn trimGitOutput(message: []const u8) []const u8 {
+    return std.mem.trim(u8, message, " \t\r\n");
+}
+
 pub const PathTarget = struct {
     path: []const u8,
     kind: TargetKind,

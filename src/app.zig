@@ -825,7 +825,7 @@ pub const App = struct {
                 try self.startDiffLoad(ctx);
             },
             .failed => |message| {
-                try self.storeFailedMessage(ctx.allocator(), std.mem.trim(u8, message, " \t\r\n"));
+                try self.storeFailedMessage(ctx.allocator(), git_ops.trimGitOutput(message));
             },
             .failed_static => |message| {
                 try self.storeFailedMessage(ctx.allocator(), message);
@@ -1789,7 +1789,7 @@ pub const App = struct {
             },
             .failed => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
-                self.setStatus("stage failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+                self.setStatus("stage failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
@@ -1817,7 +1817,7 @@ pub const App = struct {
                 }
             },
             .failed => |message| {
-                self.setStatus("hunk stage failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+                self.setStatus("hunk stage failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
                 self.setStatus("hunk stage failed: {s}", .{message});
@@ -1838,7 +1838,7 @@ pub const App = struct {
             },
             .failed => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
-                self.setStatus("unstage failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+                self.setStatus("unstage failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
@@ -1870,7 +1870,7 @@ pub const App = struct {
                 }
             },
             .failed => |message| {
-                self.setStatus("hunk unstage failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+                self.setStatus("hunk unstage failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
                 self.setStatus("hunk unstage failed: {s}", .{message});
@@ -1896,7 +1896,7 @@ pub const App = struct {
             },
             .failed => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
-                self.setStatus("discard failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+                self.setStatus("discard failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
@@ -1935,7 +1935,7 @@ pub const App = struct {
             },
             .failed => |message| {
                 self.commit_panel.commit_error = .commit_failed;
-                self.setStatus("commit failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+                self.setStatus("commit failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
                 self.commit_panel.commit_error = .commit_failed;
@@ -1975,7 +1975,7 @@ pub const App = struct {
             },
             .failed => |message| {
                 self.commit_panel.commit_error = .amend_failed;
-                self.setStatus("amend failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+                self.setStatus("amend failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
                 self.commit_panel.commit_error = .amend_failed;
@@ -2267,7 +2267,7 @@ pub const App = struct {
             },
             .failed => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
-                try self.storeFailedMessage(ctx.allocator(), std.mem.trim(u8, message, " \t\r\n"));
+                try self.storeFailedMessage(ctx.allocator(), git_ops.trimGitOutput(message));
             },
             .failed_static => |message| {
                 self.clearPendingSelectionRestore(ctx.allocator());
@@ -2310,7 +2310,7 @@ pub const App = struct {
                 self.git_status.clear();
                 self.pending_initial_first_visible_selection = false;
                 self.clearPendingSelectionRestore(ctx.allocator());
-                self.setStatus("status load failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+                self.setStatus("status load failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
                 self.git_status.clear();
@@ -2470,6 +2470,8 @@ pub const App = struct {
 
     fn clearLoadedDiff(self: *App) void {
         self.load.clearCurrent(self.allocator);
+        // allocator is null only before App.init has completed; deinit paths can
+        // still call this while no owned projection/session state exists.
         if (self.allocator) |allocator| {
             self.review_projection.deinit(allocator);
             self.staged_hunks.clear(allocator);
@@ -3107,7 +3109,7 @@ pub const App = struct {
                 self.repo_picker.path_error = app_prompt.repoPickerPathErrorFromDiscovery(err);
             },
             .failed => |message| {
-                self.setStatus("repo path discovery failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
+                self.setStatus("repo path discovery failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
                 self.setStatus("repo path discovery failed: {s}", .{message});
