@@ -2967,17 +2967,13 @@ pub const App = struct {
                     return;
                 }
 
-                self.repo_picker.deinit(ctx.allocator());
-                self.clearRepoPickerItems(ctx.allocator());
-                self.clearPendingSelectionRestore(ctx.allocator());
+                self.closeRepoPickerForSwitch(ctx.allocator());
                 try self.recent_repos.rememberRepo(ctx.allocator(), repos[repo_index].canonical_root);
                 if (repo_index == self.repo_state.active_index) return;
 
                 try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root, true);
                 self.repo_state.active_index = repo_index;
-                self.setSelectedDiffFile(0);
-                self.viewer.selected_node = 0;
-                self.clearSearch();
+                self.resetViewAfterRepoSwitch();
             },
             .pending_workspace_repo => |repo_index| {
                 try self.acceptPendingRepoPickerWorkspace(ctx, repo_index);
@@ -3040,6 +3036,18 @@ pub const App = struct {
             .refresh_filter => try self.refreshRepoPickerFilter(allocator),
             .filter_too_long => self.setStatus("repository filter paste is too long", .{}),
         }
+    }
+
+    fn closeRepoPickerForSwitch(self: *App, allocator: std.mem.Allocator) void {
+        self.repo_picker.deinit(allocator);
+        self.clearRepoPickerItems(allocator);
+        self.clearPendingSelectionRestore(allocator);
+    }
+
+    fn resetViewAfterRepoSwitch(self: *App) void {
+        self.setSelectedDiffFile(0);
+        self.viewer.selected_node = 0;
+        self.clearSearch();
     }
 
     fn submitRepoPickerPath(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -3114,17 +3122,13 @@ pub const App = struct {
         switch (owned_discovery) {
             .single_repo => |entry| {
                 try self.recent_repos.rememberRepo(ctx.allocator(), entry.canonical_root);
-                self.repo_picker.deinit(ctx.allocator());
+                self.closeRepoPickerForSwitch(ctx.allocator());
                 self.clearRepoPickerDiscovery(ctx.allocator());
-                self.clearRepoPickerItems(ctx.allocator());
-                self.clearPendingSelectionRestore(ctx.allocator());
                 self.repo_state.replace(ctx.allocator(), owned_discovery);
                 owned_discovery = .{ .none = .{ .current_root = "" } };
                 self.repo_state.active_index = 0;
                 try self.startDiffLoad(ctx);
-                self.setSelectedDiffFile(0);
-                self.viewer.selected_node = 0;
-                self.clearSearch();
+                self.resetViewAfterRepoSwitch();
             },
             .workspace => |workspace| {
                 try self.recent_repos.rememberWorkspace(ctx.allocator(), workspace.current_root);
@@ -3158,16 +3162,12 @@ pub const App = struct {
         }
 
         try self.recent_repos.rememberRepo(ctx.allocator(), workspace.repos[repo_index].canonical_root);
-        self.repo_picker.deinit(ctx.allocator());
-        self.clearRepoPickerItems(ctx.allocator());
-        self.clearPendingSelectionRestore(ctx.allocator());
+        self.closeRepoPickerForSwitch(ctx.allocator());
         self.repo_state.replace(ctx.allocator(), discovery);
         discovery = .{ .none = .{ .current_root = "" } };
         self.repo_state.active_index = repo_index;
         try self.startDiffLoad(ctx);
-        self.setSelectedDiffFile(0);
-        self.viewer.selected_node = 0;
-        self.clearSearch();
+        self.resetViewAfterRepoSwitch();
     }
 
     fn clearRepoPickerItems(self: *App, allocator: std.mem.Allocator) void {
