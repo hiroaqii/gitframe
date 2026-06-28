@@ -3,6 +3,7 @@ const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const app_actions = @import("app/actions.zig");
 const app_commit_panel = @import("app/commit_panel.zig");
+const app_direction = @import("app/direction.zig");
 const app_input = @import("app/input.zig");
 const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
@@ -42,6 +43,7 @@ pub const parseArgs = diff_source.parseArgs;
 const DiffLoadFinished = app_load.DiffLoadFinished;
 const DiffLoadTask = app_load.DiffLoadTask(App.Msg);
 const EmptyReason = app_load_state.EmptyReason;
+const HorizontalDirection = app_direction.Horizontal;
 const LoadedSession = app_load_state.LoadedSession;
 const Focus = app_input.Focus;
 const LoadedDiff = loaded_diff.LoadedDiff;
@@ -65,10 +67,12 @@ const StageHunkFinished = app_actions.StageHunkFinished;
 const StageHunkTask = app_actions.StageHunkTask(App.Msg);
 const StageFileFinished = app_actions.StageFileFinished;
 const StageFileTask = app_actions.StageFileTask(App.Msg);
+const SizeDirection = app_direction.Size;
 const UnstageFileFinished = app_actions.UnstageFileFinished;
 const UnstageFileTask = app_actions.UnstageFileTask(App.Msg);
 const UnstageHunkFinished = app_actions.UnstageHunkFinished;
 const UnstageHunkTask = app_actions.UnstageHunkTask(App.Msg);
+const VerticalDirection = app_direction.Vertical;
 
 const MousePane = enum {
     sidebar,
@@ -433,14 +437,14 @@ pub const App = struct {
             .toggle_directory => try self.toggleSelectedDirectory(),
             .expand_directory => try self.expandSelectedDirectory(),
             .collapse_or_parent_directory => try self.collapseOrSelectParentDirectory(),
-            .scroll_diff_up => self.moveDiffCursorRows(-1),
-            .scroll_diff_down => self.moveDiffCursorRows(1),
-            .scroll_diff_left => self.scrollDiffHorizontal(-1),
-            .scroll_diff_right => self.scrollDiffHorizontal(1),
-            .scroll_sidebar_left => self.scrollSidebarHorizontal(-1),
-            .scroll_sidebar_right => self.scrollSidebarHorizontal(1),
-            .page_diff_up => self.moveDiffCursorPage(-1),
-            .page_diff_down => self.moveDiffCursorPage(1),
+            .scroll_diff_up => self.moveDiffCursorRows(.up),
+            .scroll_diff_down => self.moveDiffCursorRows(.down),
+            .scroll_diff_left => self.scrollDiffHorizontal(.left),
+            .scroll_diff_right => self.scrollDiffHorizontal(.right),
+            .scroll_sidebar_left => self.scrollSidebarHorizontal(.left),
+            .scroll_sidebar_right => self.scrollSidebarHorizontal(.right),
+            .page_diff_up => self.moveDiffCursorPage(.up),
+            .page_diff_down => self.moveDiffCursorPage(.down),
             .select_previous_hunk => self.selectHunkDelta(-1),
             .select_next_hunk => self.selectHunkDelta(1),
             .toggle_hunk_fold => self.toggleSelectedHunkFold(),
@@ -450,8 +454,8 @@ pub const App = struct {
                 if (!self.viewer.sidebar_hidden) self.viewer.focus = self.viewer.focus.toggled();
             },
             .toggle_sidebar_visibility => self.toggleSidebarVisibility(),
-            .decrease_sidebar_width => self.adjustSidebarWidth(-1),
-            .increase_sidebar_width => self.adjustSidebarWidth(1),
+            .decrease_sidebar_width => self.adjustSidebarWidth(.shrink),
+            .increase_sidebar_width => self.adjustSidebarWidth(.grow),
             .focus_sidebar => {
                 if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
             },
@@ -467,19 +471,19 @@ pub const App = struct {
             },
             .mouse_diff_wheel_up => {
                 self.viewer.focus = .diff;
-                self.scrollDiff(-1);
+                self.scrollDiff(.up);
             },
             .mouse_diff_wheel_down => {
                 self.viewer.focus = .diff;
-                self.scrollDiff(1);
+                self.scrollDiff(.down);
             },
             .mouse_diff_wheel_left => {
                 self.viewer.focus = .diff;
-                self.scrollDiffHorizontal(-1);
+                self.scrollDiffHorizontal(.left);
             },
             .mouse_diff_wheel_right => {
                 self.viewer.focus = .diff;
-                self.scrollDiffHorizontal(1);
+                self.scrollDiffHorizontal(.right);
             },
             .toggle_display_mode => {
                 const old_mode = self.effectiveDisplayMode();
@@ -2872,35 +2876,36 @@ pub const App = struct {
         }
     }
 
-    fn scrollDiff(self: *App, delta: i2) void {
+    fn scrollDiff(self: *App, direction: VerticalDirection) void {
         const old_scroll = self.viewer.diff_scroll;
         const old_cursor_offset = self.selectedDiffCursorOffset();
-        if (delta < 0) {
-            self.viewer.diff_scroll -|= 1;
-        } else {
-            self.viewer.diff_scroll += 1;
+        switch (direction) {
+            .up => self.viewer.diff_scroll -|= 1,
+            .down => self.viewer.diff_scroll += 1,
         }
         self.clampDiffNavigation();
-        self.syncDiffCursorAfterViewportScroll(delta, old_scroll, old_cursor_offset);
+        self.syncDiffCursorAfterViewportScroll(direction, old_scroll, old_cursor_offset);
     }
 
-    fn scrollDiffHorizontal(self: *App, delta: i2) void {
+    fn scrollDiffHorizontal(self: *App, direction: HorizontalDirection) void {
         const step: usize = 8;
-        if (delta < 0) {
-            self.viewer.diff_horizontal_scroll -|= step;
-        } else {
-            self.viewer.diff_horizontal_scroll += step;
-            self.clampDiffHorizontalScrollToVisibleRows();
+        switch (direction) {
+            .left => self.viewer.diff_horizontal_scroll -|= step,
+            .right => {
+                self.viewer.diff_horizontal_scroll += step;
+                self.clampDiffHorizontalScrollToVisibleRows();
+            },
         }
     }
 
-    fn scrollSidebarHorizontal(self: *App, delta: i2) void {
+    fn scrollSidebarHorizontal(self: *App, direction: HorizontalDirection) void {
         const step: usize = 4;
-        if (delta < 0) {
-            self.viewer.sidebar_horizontal_scroll -|= step;
-        } else {
-            self.viewer.sidebar_horizontal_scroll += step;
-            self.clampSidebarHorizontalScroll();
+        switch (direction) {
+            .left => self.viewer.sidebar_horizontal_scroll -|= step,
+            .right => {
+                self.viewer.sidebar_horizontal_scroll += step;
+                self.clampSidebarHorizontalScroll();
+            },
         }
     }
 
@@ -2964,18 +2969,17 @@ pub const App = struct {
         return max_scroll;
     }
 
-    fn pageDiff(self: *App, delta: i2) void {
+    fn pageDiff(self: *App, direction: VerticalDirection) void {
         const rows = self.diffVisibleRows();
         const step: usize = @max(rows, 1);
-        if (delta < 0) {
-            self.viewer.diff_scroll -|= step;
-        } else {
-            self.viewer.diff_scroll += step;
+        switch (direction) {
+            .up => self.viewer.diff_scroll -|= step,
+            .down => self.viewer.diff_scroll += step,
         }
         self.clampDiffNavigation();
     }
 
-    fn moveDiffCursorRows(self: *App, delta: i2) void {
+    fn moveDiffCursorRows(self: *App, direction: VerticalDirection) void {
         const current = self.selectedDiffCursorOffset() orelse {
             self.initializeDiffCursorForSelectedFile();
             self.applyDiffCursorScrolloff();
@@ -2983,12 +2987,15 @@ pub const App = struct {
         };
         const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
         if (line_count == 0) return;
-        const target = if (delta < 0) current -| 1 else @min(current + 1, line_count - 1);
+        const target = switch (direction) {
+            .up => current -| 1,
+            .down => @min(current + 1, line_count - 1),
+        };
         self.viewer.diff_cursor = self.selectedCoordinateAtOffset(target) orelse self.viewer.diff_cursor;
         self.applyDiffCursorScrolloff();
     }
 
-    fn moveDiffCursorPage(self: *App, delta: i2) void {
+    fn moveDiffCursorPage(self: *App, direction: VerticalDirection) void {
         const current = self.selectedDiffCursorOffset() orelse {
             self.initializeDiffCursorForSelectedFile();
             self.applyDiffCursorScrolloff();
@@ -2997,7 +3004,10 @@ pub const App = struct {
         const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
         if (line_count == 0) return;
         const step = @max(self.diffVisibleRows(), 1);
-        const target = if (delta < 0) current -| step else @min(current + step, line_count - 1);
+        const target = switch (direction) {
+            .up => current -| step,
+            .down => @min(current + step, line_count - 1),
+        };
         self.viewer.diff_cursor = self.selectedCoordinateAtOffset(target) orelse self.viewer.diff_cursor;
         self.applyDiffCursorScrolloff();
     }
@@ -4241,7 +4251,7 @@ pub const App = struct {
         self.clampDiffNavigation();
     }
 
-    fn syncDiffCursorAfterViewportScroll(self: *App, delta: i2, old_scroll: usize, old_cursor_offset: ?usize) void {
+    fn syncDiffCursorAfterViewportScroll(self: *App, direction: VerticalDirection, old_scroll: usize, old_cursor_offset: ?usize) void {
         const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
         if (line_count == 0) return;
         const visible_rows = self.diffVisibleRows();
@@ -4255,11 +4265,15 @@ pub const App = struct {
             if (offset >= old_scroll and offset < old_scroll + visible_rows) {
                 break :blk self.viewer.diff_scroll + (offset - old_scroll);
             }
-            if (delta < 0) break :blk self.viewer.diff_scroll + margin;
-            break :blk self.viewer.diff_scroll + visible_rows - 1 -| margin;
+            break :blk switch (direction) {
+                .up => self.viewer.diff_scroll + margin,
+                .down => self.viewer.diff_scroll + visible_rows - 1 -| margin,
+            };
         } else blk: {
-            if (delta < 0) break :blk self.viewer.diff_scroll + margin;
-            break :blk self.viewer.diff_scroll + visible_rows - 1 -| margin;
+            break :blk switch (direction) {
+                .up => self.viewer.diff_scroll + margin,
+                .down => self.viewer.diff_scroll + visible_rows - 1 -| margin,
+            };
         };
 
         self.viewer.diff_cursor = self.selectedCoordinateAtOffset(@min(target, line_count - 1)) orelse self.viewer.diff_cursor;
@@ -4301,15 +4315,15 @@ pub const App = struct {
         self.clampDiffNavigation();
     }
 
-    fn adjustSidebarWidth(self: *App, direction: i2) void {
+    fn adjustSidebarWidth(self: *App, direction: SizeDirection) void {
         const total_width = self.layoutSize().width;
         const previous_width = self.diffPaneWidth();
         const current = sidebarWidth(total_width, self.viewer.sidebar_width);
         const step: u16 = 4;
-        const next = if (direction < 0)
-            if (current > step) current - step else 0
-        else
-            current +| step;
+        const next = switch (direction) {
+            .shrink => if (current > step) current - step else 0,
+            .grow => current +| step,
+        };
 
         self.viewer.sidebar_width = sidebarWidth(total_width, next);
         self.clampSidebarHorizontalScroll();
@@ -4636,15 +4650,15 @@ test "sidebar width adjustment clamps and affects effective mode" {
     try std.testing.expectEqual(@as(?u16, null), app.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
 
-    app.adjustSidebarWidth(-1);
+    app.adjustSidebarWidth(.shrink);
     try std.testing.expectEqual(@as(?u16, 30), app.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
 
-    app.adjustSidebarWidth(-1);
+    app.adjustSidebarWidth(.shrink);
     try std.testing.expectEqual(@as(?u16, 26), app.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
 
-    app.adjustSidebarWidth(1);
+    app.adjustSidebarWidth(.grow);
     try std.testing.expectEqual(@as(?u16, 30), app.viewer.sidebar_width);
 }
 
@@ -4655,9 +4669,9 @@ test "sidebar width remains stored while sidebar is hidden" {
         .viewer = .{ .display_mode = .side_by_side },
     };
 
-    app.adjustSidebarWidth(-1);
+    app.adjustSidebarWidth(.shrink);
     app.toggleSidebarVisibility();
-    app.adjustSidebarWidth(-1);
+    app.adjustSidebarWidth(.shrink);
 
     try std.testing.expect(app.viewer.sidebar_hidden);
     try std.testing.expectEqual(@as(?u16, 26), app.viewer.sidebar_width);
@@ -4677,14 +4691,14 @@ test "horizontal scroll uses diff focus arrows and clamps to visible text" {
         .viewer = .{ .focus = .diff, .display_mode = .unified },
     };
 
-    app.scrollDiffHorizontal(1);
+    app.scrollDiffHorizontal(.right);
     try std.testing.expectEqual(@as(usize, 8), app.viewer.diff_horizontal_scroll);
 
-    for (0..20) |_| app.scrollDiffHorizontal(1);
+    for (0..20) |_| app.scrollDiffHorizontal(.right);
     try std.testing.expect(app.viewer.diff_horizontal_scroll > 0);
     try std.testing.expect(app.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
 
-    app.scrollDiffHorizontal(-1);
+    app.scrollDiffHorizontal(.left);
     try std.testing.expect(app.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
 }
 
@@ -4702,12 +4716,12 @@ test "layout changes reset horizontal scroll only when diff pane width changes" 
     try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
 
     app.viewer.diff_horizontal_scroll = 16;
-    app.adjustSidebarWidth(-1);
+    app.adjustSidebarWidth(.shrink);
     try std.testing.expectEqual(@as(usize, 16), app.viewer.diff_horizontal_scroll);
 
     app.toggleSidebarVisibility();
     app.viewer.diff_horizontal_scroll = 16;
-    app.adjustSidebarWidth(-1);
+    app.adjustSidebarWidth(.shrink);
     try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
 }
 
@@ -4725,7 +4739,7 @@ test "search resync without pane width change keeps horizontal scroll" {
     app.submitSearch();
     app.viewer.diff_horizontal_scroll = 16;
 
-    app.adjustSidebarWidth(-1);
+    app.adjustSidebarWidth(.shrink);
 
     try std.testing.expectEqual(@as(usize, 16), app.viewer.diff_horizontal_scroll);
 }
@@ -4839,7 +4853,7 @@ test "mouse diff scroll keeps cursor in the viewport" {
 
     try std.testing.expect(app.visibleDiffCursorOffset() == null);
 
-    app.scrollDiff(1);
+    app.scrollDiff(.down);
 
     try std.testing.expect(app.visibleDiffCursorOffset() != null);
 }
@@ -4882,7 +4896,7 @@ test "diff scroll keeps visible cursor screen position stable" {
     const old_offset = old_scroll + 1;
     app.viewer.diff_cursor = app.selectedCoordinateAtOffset(old_offset) orelse return error.ExpectedCoordinate;
 
-    app.scrollDiff(1);
+    app.scrollDiff(.down);
 
     const new_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
     try std.testing.expectEqual(old_offset - old_scroll, new_offset - app.viewer.diff_scroll);
@@ -4903,12 +4917,12 @@ test "diff scroll syncs invisible cursor to scrolloff margin" {
 
     app.viewer.diff_scroll = 0;
     app.viewer.diff_cursor = app.selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
-    app.scrollDiff(-1);
+    app.scrollDiff(.up);
     try std.testing.expectEqual(app.viewer.diff_scroll + margin, app.selectedDiffCursorOffset().?);
 
     app.viewer.diff_scroll = line_count - visible_rows;
     app.viewer.diff_cursor = app.selectedCoordinateAtOffset(0) orelse return error.ExpectedCoordinate;
-    app.scrollDiff(1);
+    app.scrollDiff(.down);
     try std.testing.expectEqual(app.viewer.diff_scroll + visible_rows - 1 -| margin, app.selectedDiffCursorOffset().?);
 }
 
@@ -4925,9 +4939,9 @@ test "diff row movement continues from wheel-synced visible cursor" {
     app.viewer.diff_scroll = 0;
     app.viewer.diff_cursor = app.selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
 
-    app.scrollDiff(-1);
+    app.scrollDiff(.up);
     const synced_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
-    app.moveDiffCursorRows(1);
+    app.moveDiffCursorRows(.down);
 
     try std.testing.expectEqual(synced_offset + 1, app.selectedDiffCursorOffset().?);
 }
@@ -4967,7 +4981,7 @@ test "diff scroll cursor sync keeps search state" {
     const old_match = app.search.match orelse return error.ExpectedSearchMatch;
     const old_match_offset = app.search.match_offset;
 
-    app.scrollDiff(1);
+    app.scrollDiff(.down);
 
     try std.testing.expect(std.meta.eql(old_match, app.search.match.?));
     try std.testing.expectEqual(old_match_offset, app.search.match_offset);
