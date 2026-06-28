@@ -25,6 +25,7 @@ test {
     _ = @import("app/git_ops.zig");
     _ = @import("app/input.zig");
     _ = @import("app/prompt.zig");
+    _ = @import("app/repo_picker.zig");
     _ = @import("app/state.zig");
     _ = @import("app/view.zig");
     _ = @import("context.zig");

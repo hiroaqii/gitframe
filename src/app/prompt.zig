@@ -1,5 +1,6 @@
 const std = @import("std");
 const ui = @import("chasen_ui");
+const repo_discovery = @import("../repo/discovery.zig");
 
 /// Fixed-capacity UTF-8 text input used by prompt-like modes.
 ///
@@ -163,6 +164,16 @@ pub const RepoPickerPathError = enum {
         };
     }
 };
+
+pub fn repoPickerPathErrorFromDiscovery(err: repo_discovery.PathDiscoveryError) RepoPickerPathError {
+    return switch (err) {
+        error.PathDoesNotExist => .path_does_not_exist,
+        error.PathIsNotDirectory => .path_is_not_directory,
+        error.CannotAccessPath => .cannot_access_path,
+        error.NoGitRepositoriesFound => .no_git_repositories_found,
+        else => .cannot_access_path,
+    };
+}
 
 pub const RepoPickerState = struct {
     mode: bool = false,

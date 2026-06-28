@@ -83,6 +83,17 @@ pub const RecentStore = struct {
         try self.remember(allocator, .workspace, path);
     }
 
+    pub fn rememberDiscovery(self: *RecentStore, allocator: std.mem.Allocator, discovery: repo_discovery.DiscoveryResult) !void {
+        switch (discovery) {
+            .single_repo => |entry| try self.rememberRepo(allocator, entry.canonical_root),
+            .workspace => |workspace| {
+                try self.rememberWorkspace(allocator, workspace.current_root);
+                if (workspace.repos.len > 0) try self.rememberRepo(allocator, workspace.repos[0].canonical_root);
+            },
+            .none => {},
+        }
+    }
+
     fn remember(self: *RecentStore, allocator: std.mem.Allocator, kind: RecentKind, path: []const u8) !void {
         if (path.len == 0) return;
         if (self.find(kind, path)) |index| {

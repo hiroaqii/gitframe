@@ -9,6 +9,7 @@ const app_input = @import("app/input.zig");
 const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
 const app_prompt = @import("app/prompt.zig");
+const app_repo_picker = @import("app/repo_picker.zig");
 const app_review_projection = @import("app/review_projection.zig");
 const app_state = @import("app/state.zig");
 const app_test_support = if (builtin.is_test) @import("app/test_support.zig") else struct {};
@@ -139,26 +140,6 @@ pub const ActiveDiffDisplay = union(enum) {
     }
 };
 
-const RepoPickerItemSource = union(enum) {
-    active_repo,
-    workspace_repo: usize,
-    pending_workspace_repo: usize,
-    recent_repo: usize,
-    recent_workspace: usize,
-};
-
-const RepoPickerItem = struct {
-    label: []u8,
-    detail: []u8,
-    source: RepoPickerItemSource,
-
-    fn deinit(self: *RepoPickerItem, allocator: std.mem.Allocator) void {
-        allocator.free(self.label);
-        allocator.free(self.detail);
-        self.* = undefined;
-    }
-};
-
 const LoadFinishedMsg = union(enum) {
     repos_discovered: RepoDiscoveryFinished,
     repo_path_discovered: RepoPathDiscoveryFinished,
@@ -252,7 +233,7 @@ pub const App = struct {
     /// Keeping this outside repo_state lets the picker show candidates without
     /// changing the active repository until the user presses Enter on a repo.
     repo_picker_discovery: ?repo_discovery.DiscoveryResult = null,
-    repo_picker_items: std.ArrayList(RepoPickerItem) = .empty,
+    repo_picker_items: app_repo_picker.ItemList = .empty,
     recent_repos: repo_state.RecentStore = .{},
     overlay: app_state.OverlayState = .{},
     review_display: app_state.ReviewDisplayState = .{},
@@ -831,7 +812,7 @@ pub const App = struct {
         switch (result) {
             .empty => unreachable,
             .discovered => |discovery| {
-                try self.rememberDiscovery(ctx.allocator(), discovery);
+                try self.recent_repos.rememberDiscovery(ctx.allocator(), discovery);
                 result = .empty;
                 self.repo_state.replace(ctx.allocator(), discovery);
 
@@ -849,17 +830,6 @@ pub const App = struct {
             .failed_static => |message| {
                 try self.storeFailedMessage(ctx.allocator(), message);
             },
-        }
-    }
-
-    fn rememberDiscovery(self: *App, allocator: std.mem.Allocator, discovery: repo_discovery.DiscoveryResult) !void {
-        switch (discovery) {
-            .single_repo => |entry| try self.recent_repos.rememberRepo(allocator, entry.canonical_root),
-            .workspace => |workspace| {
-                try self.recent_repos.rememberWorkspace(allocator, workspace.current_root);
-                if (workspace.repos.len > 0) try self.recent_repos.rememberRepo(allocator, workspace.repos[0].canonical_root);
-            },
-            .none => {},
         }
     }
 
@@ -3029,71 +2999,18 @@ pub const App = struct {
     }
 
     fn refreshRepoPickerFilter(self: *App, allocator: std.mem.Allocator) !void {
-        self.clearRepoPickerItems(allocator);
-
-        var labels: std.ArrayList([]const u8) = .empty;
-        defer labels.deinit(allocator);
-
-        if (self.repo_picker_discovery) |discovery| {
-            switch (discovery) {
-                .workspace => |workspace| {
-                    for (workspace.repos, 0..) |repo, index| {
-                        try self.appendRepoPickerItem(allocator, repo.display_path, repo.canonical_root, .{ .pending_workspace_repo = index });
-                    }
-                },
-                .single_repo, .none => {},
-            }
-        } else if (self.repo_state.discovery) |discovery| {
-            switch (discovery) {
-                .single_repo => |entry| {
-                    try self.appendRepoPickerItem(allocator, entry.label, entry.canonical_root, .active_repo);
-                },
-                .workspace => |workspace| {
-                    for (workspace.repos, 0..) |repo, index| {
-                        try self.appendRepoPickerItem(allocator, repo.display_path, repo.canonical_root, .{ .workspace_repo = index });
-                    }
-                },
-                .none => {},
-            }
-        }
-
-        for (self.recent_repos.entries.items, 0..) |entry, index| {
-            if (self.repoPickerAlreadyHasPath(entry.path)) continue;
-            const label = std.fs.path.basename(entry.path);
-            const source: RepoPickerItemSource = switch (entry.kind) {
-                .repo => .{ .recent_repo = index },
-                .workspace => .{ .recent_workspace = index },
-            };
-            try self.appendRepoPickerItem(allocator, label, entry.path, source);
-        }
-
-        for (self.repo_picker_items.items) |item| {
-            try labels.append(allocator, item.label);
-        }
-
-        // ListFilter owns the filtered index arrays; repository labels remain
-        // borrowed from repo_picker_items, which App owns until the picker is
-        // refreshed or closed.
-        try self.repo_picker.list.filter.apply(allocator, labels.items, self.repo_picker.list.input.slice());
+        try app_repo_picker.refreshFilter(
+            allocator,
+            &self.repo_picker,
+            &self.repo_picker_items,
+            self.repo_picker_discovery,
+            self.repo_state.discovery,
+            &self.recent_repos,
+        );
     }
 
     fn focusRepoPickerOnActive(self: *App) void {
-        var visible_index: usize = 0;
-        while (visible_index < self.repo_picker.list.filter.labels.len) : (visible_index += 1) {
-            const source_index = self.repo_picker.list.filter.sourceIndex(visible_index) orelse continue;
-            if (source_index >= self.repo_picker_items.items.len) continue;
-            const source = self.repo_picker_items.items[source_index].source;
-            const active = switch (source) {
-                .active_repo => true,
-                .workspace_repo => |repo_index| repo_index == self.repo_state.active_index,
-                .pending_workspace_repo, .recent_repo, .recent_workspace => false,
-            };
-            if (!active) continue;
-            while (self.repo_picker.list.filter.list.focusedIndex() < visible_index) {
-                self.repo_picker.list.filter.update(.move_next);
-            }
-            return;
-        }
+        app_repo_picker.focusOnActive(&self.repo_picker, self.repo_picker_items.items, self.repo_state.active_index);
     }
 
     fn enterRepoPickerPathInput(self: *App) void {
@@ -3219,7 +3136,7 @@ pub const App = struct {
                 try self.acceptRepoPathDiscovery(ctx, discovery);
             },
             .input_error => |err| {
-                self.repo_picker.path_error = repoPickerPathError(err);
+                self.repo_picker.path_error = app_prompt.repoPickerPathErrorFromDiscovery(err);
             },
             .failed => |message| {
                 self.setStatus("repo path discovery failed: {s}", .{std.mem.trim(u8, message, " \t\r\n")});
@@ -3293,66 +3210,17 @@ pub const App = struct {
         self.clearSearch();
     }
 
-    fn repoPickerPathError(err: repo_discovery.PathDiscoveryError) app_prompt.RepoPickerPathError {
-        return switch (err) {
-            error.PathDoesNotExist => .path_does_not_exist,
-            error.PathIsNotDirectory => .path_is_not_directory,
-            error.CannotAccessPath => .cannot_access_path,
-            error.NoGitRepositoriesFound => .no_git_repositories_found,
-            else => .cannot_access_path,
-        };
-    }
-
-    fn appendRepoPickerItem(self: *App, allocator: std.mem.Allocator, label: []const u8, detail: []const u8, source: RepoPickerItemSource) !void {
-        const owned_label = try allocator.dupe(u8, label);
-        errdefer allocator.free(owned_label);
-        const owned_detail = try allocator.dupe(u8, detail);
-        errdefer allocator.free(owned_detail);
-        try self.repo_picker_items.append(allocator, .{
-            .label = owned_label,
-            .detail = owned_detail,
-            .source = source,
-        });
-    }
-
     fn clearRepoPickerItems(self: *App, allocator: std.mem.Allocator) void {
-        for (self.repo_picker_items.items) |*item| item.deinit(allocator);
-        self.repo_picker_items.clearRetainingCapacity();
+        app_repo_picker.clearItems(&self.repo_picker_items, allocator);
     }
 
     fn deinitRepoPickerItems(self: *App, allocator: std.mem.Allocator) void {
-        self.clearRepoPickerItems(allocator);
-        self.repo_picker_items.deinit(allocator);
+        app_repo_picker.deinitItems(&self.repo_picker_items, allocator);
     }
 
     fn clearRepoPickerDiscovery(self: *App, allocator: std.mem.Allocator) void {
         if (self.repo_picker_discovery) |*discovery| discovery.deinit(allocator);
         self.repo_picker_discovery = null;
-    }
-
-    fn repoPickerAlreadyHasPath(self: *const App, path: []const u8) bool {
-        if (self.repo_picker_discovery) |discovery| {
-            switch (discovery) {
-                .workspace => |workspace| {
-                    if (std.mem.eql(u8, workspace.current_root, path)) return true;
-                    for (workspace.repos) |repo| {
-                        if (std.mem.eql(u8, repo.canonical_root, path)) return true;
-                    }
-                },
-                .single_repo => |entry| if (std.mem.eql(u8, entry.canonical_root, path)) return true,
-                .none => {},
-            }
-        }
-        if (self.repo_state.discovery) |discovery| {
-            switch (discovery) {
-                .workspace => |workspace| if (std.mem.eql(u8, workspace.current_root, path)) return true,
-                .single_repo, .none => {},
-            }
-        }
-        for (self.repo_picker_items.items) |item| {
-            if (std.mem.eql(u8, item.detail, path)) return true;
-        }
-        return false;
     }
 
     fn toggleReviewedFile(self: *App, allocator: std.mem.Allocator) !void {
