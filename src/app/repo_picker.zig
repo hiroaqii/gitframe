@@ -99,6 +99,13 @@ pub fn focusOnActive(picker: *app_prompt.RepoPickerState, items: []const Item, a
     }
 }
 
+pub fn resolveSelection(picker: *const app_prompt.RepoPickerState, items: []const Item) ?ItemSource {
+    const focused = picker.list.filter.list.focusedIndex();
+    const item_index = picker.list.filter.sourceIndex(focused) orelse return null;
+    if (item_index >= items.len) return null;
+    return items[item_index].source;
+}
+
 pub fn appendItem(allocator: std.mem.Allocator, items: *ItemList, label: []const u8, detail: []const u8, source: ItemSource) !void {
     const owned_label = try allocator.dupe(u8, label);
     errdefer allocator.free(owned_label);

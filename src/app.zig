@@ -2950,17 +2950,12 @@ pub const App = struct {
             return;
         }
 
-        const focused = self.repo_picker.list.filter.list.focusedIndex();
-        const item_index = self.repo_picker.list.filter.sourceIndex(focused) orelse {
+        const source = app_repo_picker.resolveSelection(&self.repo_picker, self.repo_picker_items.items) orelse {
             self.repo_picker.list.no_match = true;
             return;
         };
-        if (item_index >= self.repo_picker_items.items.len) {
-            self.repo_picker.list.no_match = true;
-            return;
-        }
 
-        switch (self.repo_picker_items.items[item_index].source) {
+        switch (source) {
             .active_repo => {
                 self.repo_picker.deinit(ctx.allocator());
                 self.clearRepoPickerItems(ctx.allocator());
