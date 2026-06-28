@@ -1532,62 +1532,11 @@ pub const App = struct {
     }
 
     fn selectedStageTarget(self: *const App) StageTargetResult {
-        if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
-        const repo_root = self.activeRepoRoot() orelse return .no_repo;
-        const action_target = self.selectedSidebarActionTarget() orelse return .no_path;
-        return switch (action_target.kind) {
-            .file => blk: {
-                if (self.freshStatusEntryForPathKey(repo_root, action_target.path)) |entry| {
-                    if (!entry.isConflict() and entry.isStaged() and !entry.isUnstaged()) return .{ .already_staged = action_target.path };
-                }
-                break :blk .{ .ready = .{ .repo_root = repo_root, .path = action_target.path, .kind = .file } };
-            },
-            .directory => self.selectedDirectoryStageTarget(repo_root, action_target.path),
-        };
+        return git_ops.stageTarget(self.gitOperationTargetContext());
     }
 
     fn selectedStageToggleOperation(self: *const App) ToggleStageTargetResult {
-        const can_stage = diff_source.sourceAllowsStageAction(self.config.source);
-        const can_unstage = diff_source.sourceAllowsUnstageAction(self.config.source);
-        if (!can_stage and !can_unstage) return .unavailable_source;
-
-        // Toggle resolution is status-driven so `s` never starts a stage task
-        // that should have been an unstage task, or the reverse.
-        const repo_root = self.activeRepoRoot() orelse return .no_repo;
-        const action_target = self.selectedSidebarActionTarget() orelse return .no_path;
-        if (self.status_load_pending != null) return .stale_status;
-        const snapshot_root = self.git_status.repo_root orelse return .stale_status;
-        if (!std.mem.eql(u8, snapshot_root, repo_root)) return .stale_status;
-
-        return switch (action_target.kind) {
-            .file => self.fileStageToggleOperation(action_target, can_stage, can_unstage),
-            .directory => self.directoryStageToggleOperation(action_target, can_stage, can_unstage),
-        };
-    }
-
-    fn fileStageToggleOperation(self: *const App, action_target: PathTarget, can_stage: bool, can_unstage: bool) ToggleStageTargetResult {
-        const entry = self.statusEntryForPathKey(action_target.path) orelse return .{ .no_content = action_target };
-        if (entry.isConflict()) return .{ .conflict_unsupported = action_target };
-        if (entry.isUnstaged()) return if (can_stage) .{ .operation = .stage } else .unavailable_source;
-        if (entry.isStaged()) return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
-        return .{ .no_content = action_target };
-    }
-
-    fn directoryStageToggleOperation(self: *const App, action_target: PathTarget, can_stage: bool, can_unstage: bool) ToggleStageTargetResult {
-        var has_unstaged = false;
-        var has_staged = false;
-        for (self.git_status.document.entries) |entry| {
-            const key = entry.canonicalPathKey() orelse continue;
-            if (!file_tree.isPathDescendantOfDirectory(key, action_target.path)) continue;
-
-            if (entry.isConflict()) return .{ .conflict_unsupported = action_target };
-            if (entry.isUnstaged()) has_unstaged = true;
-            if (entry.isStaged()) has_staged = true;
-        }
-
-        if (has_unstaged) return if (can_stage) .{ .operation = .stage } else .unavailable_source;
-        if (has_staged) return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
-        return .{ .no_content = action_target };
+        return git_ops.toggleStageTarget(self.gitOperationTargetContext());
     }
 
     fn unstageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -1656,21 +1605,7 @@ pub const App = struct {
     }
 
     fn selectedUnstageTarget(self: *const App) UnstageTargetResult {
-        if (!diff_source.sourceAllowsUnstageAction(self.config.source)) return .unavailable_source;
-        const repo_root = self.activeRepoRoot() orelse return .no_repo;
-        const action_target = self.selectedSidebarActionTarget() orelse return .no_path;
-        if (self.status_load_pending != null) return .stale_status;
-        const snapshot_root = self.git_status.repo_root orelse return .stale_status;
-        if (!std.mem.eql(u8, snapshot_root, repo_root)) return .stale_status;
-        return switch (action_target.kind) {
-            .file => blk: {
-                const entry = self.statusEntryForPathKey(action_target.path) orelse return .{ .no_staged_content = action_target };
-                if (entry.isConflict()) return .{ .conflict_unsupported = action_target };
-                if (!entry.isStaged()) return .{ .no_staged_content = action_target };
-                break :blk .{ .ready = .{ .repo_root = repo_root, .path = action_target.path, .kind = .file } };
-            },
-            .directory => self.selectedDirectoryUnstageTarget(repo_root, action_target.path),
-        };
+        return git_ops.unstageTarget(self.gitOperationTargetContext());
     }
 
     fn requestDiscardSelectedFile(self: *App, allocator: std.mem.Allocator) !void {
@@ -1769,17 +1704,7 @@ pub const App = struct {
     }
 
     fn selectedDiscardTarget(self: *const App) DiscardTargetResult {
-        if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
-        const repo_root = self.activeRepoRoot() orelse return .no_repo;
-        const action_target = self.selectedSidebarActionTarget() orelse return .no_path;
-        if (action_target.kind == .directory) return .directory_unsupported;
-        const entry = self.freshStatusEntryForPathKey(repo_root, action_target.path) orelse return .stale_status;
-        if (entry.isConflict()) return .conflict_unsupported;
-        return switch (file_tree.stagePresenceFromEntry(entry)) {
-            .unstaged_only, .mixed => .{ .ready = .{ .repo_root = repo_root, .path = action_target.path } },
-            .untracked => .untracked_unsupported,
-            .staged_only, .clean_or_unknown, .conflict => .no_unstaged_content,
-        };
+        return git_ops.discardTarget(self.gitOperationTargetContext());
     }
 
     fn enterCommitPanelMode(self: *App, mode: app_commit_panel.Mode) void {
@@ -3755,58 +3680,25 @@ pub const App = struct {
         };
     }
 
+    fn gitOperationTargetContext(self: *const App) git_ops.TargetContext {
+        return .{
+            .source = self.config.source,
+            .repo_root = self.activeRepoRoot(),
+            .action_target = self.selectedSidebarActionTarget(),
+            .status = .{
+                .repo_root = self.git_status.repo_root,
+                .loading = self.status_load_pending != null,
+                .entries = self.git_status.document.entries,
+            },
+        };
+    }
+
     fn statusEntryForPathKey(self: *const App, path_key: []const u8) ?git_status.StatusEntry {
         for (self.git_status.document.entries) |entry| {
             const entry_key = entry.canonicalPathKey() orelse continue;
             if (std.mem.eql(u8, entry_key, path_key)) return entry;
         }
         return null;
-    }
-
-    fn selectedDirectoryStageTarget(self: *const App, repo_root: []const u8, directory: []const u8) StageTargetResult {
-        if (self.status_load_pending != null) return .stale_status;
-        const snapshot_root = self.git_status.repo_root orelse return .stale_status;
-        if (!std.mem.eql(u8, snapshot_root, repo_root)) return .stale_status;
-
-        var has_stageable = false;
-        for (self.git_status.document.entries) |entry| {
-            const key = entry.canonicalPathKey() orelse continue;
-            if (!file_tree.isPathDescendantOfDirectory(key, directory)) continue;
-
-            // Git operates on the whole directory path. Reject conflicts here
-            // so first-slice directory actions cannot resolve them implicitly.
-            if (entry.isConflict()) return .{ .conflict_unsupported = directory };
-
-            switch (file_tree.stagePresenceFromEntry(entry)) {
-                .untracked, .unstaged_only, .mixed => has_stageable = true,
-                .staged_only, .clean_or_unknown, .conflict => {},
-            }
-        }
-
-        if (!has_stageable) return .{ .no_stageable_content = directory };
-        return .{ .ready = .{ .repo_root = repo_root, .path = directory, .kind = .directory } };
-    }
-
-    fn selectedDirectoryUnstageTarget(self: *const App, repo_root: []const u8, directory: []const u8) UnstageTargetResult {
-        if (self.status_load_pending != null) return .stale_status;
-        const snapshot_root = self.git_status.repo_root orelse return .stale_status;
-        if (!std.mem.eql(u8, snapshot_root, repo_root)) return .stale_status;
-
-        var has_staged = false;
-        for (self.git_status.document.entries) |entry| {
-            const key = entry.canonicalPathKey() orelse continue;
-            if (!file_tree.isPathDescendantOfDirectory(key, directory)) continue;
-
-            if (entry.isConflict()) return .{ .conflict_unsupported = .{ .path = directory, .kind = .directory } };
-
-            switch (file_tree.stagePresenceFromEntry(entry)) {
-                .staged_only, .mixed => has_staged = true,
-                .untracked, .unstaged_only, .clean_or_unknown, .conflict => {},
-            }
-        }
-
-        if (!has_staged) return .{ .no_staged_content = .{ .path = directory, .kind = .directory } };
-        return .{ .ready = .{ .repo_root = repo_root, .path = directory, .kind = .directory } };
     }
 
     fn freshStatusEntryForPathKey(self: *const App, repo_root: []const u8, path_key: []const u8) ?git_status.StatusEntry {
