@@ -25,6 +25,7 @@ const diff_source = @import("diff/source.zig");
 const diff_view_model = @import("diff/view_model.zig");
 const editor = @import("editor.zig");
 const file_tree = @import("file_tree.zig");
+const git_ops = @import("app/git_ops.zig");
 const git_status = @import("git/status.zig");
 const loaded_diff = @import("loaded_diff.zig");
 const repo_discovery = @import("repo/discovery.zig");
@@ -44,7 +45,11 @@ pub const parseArgs = diff_source.parseArgs;
 
 const DiffLoadFinished = app_load.DiffLoadFinished;
 const DiffLoadTask = app_load.DiffLoadTask(App.Msg);
+const DiscardTargetResult = git_ops.DiscardTargetResult;
 const EmptyReason = app_load_state.EmptyReason;
+const HunkMarkSource = git_ops.HunkMarkSource;
+const HunkStageTargetResult = git_ops.HunkStageTargetResult;
+const HunkUnstageTargetResult = git_ops.HunkUnstageTargetResult;
 const HorizontalDirection = app_direction.Horizontal;
 const LoadedSession = app_load_state.LoadedSession;
 const Focus = app_input.Focus;
@@ -57,6 +62,7 @@ const RepoPathDiscoveryFinished = app_load.RepoPathDiscoveryFinished;
 const RepoPathDiscoveryTask = app_load.RepoPathDiscoveryTask(App.Msg);
 const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
+const PathTarget = git_ops.PathTarget;
 const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
 const AmendFinished = app_actions.AmendFinished;
@@ -69,11 +75,17 @@ const StageHunkFinished = app_actions.StageHunkFinished;
 const StageHunkTask = app_actions.StageHunkTask(App.Msg);
 const StageFileFinished = app_actions.StageFileFinished;
 const StageFileTask = app_actions.StageFileTask(App.Msg);
+const StageTargetResult = git_ops.StageTargetResult;
 const SizeDirection = app_direction.Size;
+const TargetKind = git_ops.TargetKind;
+const ToggleHunkTargetResult = git_ops.ToggleHunkTargetResult;
+const ToggleStageTargetResult = git_ops.ToggleStageTargetResult;
+const ToggleStageOperation = git_ops.ToggleStageOperation;
 const UnstageFileFinished = app_actions.UnstageFileFinished;
 const UnstageFileTask = app_actions.UnstageFileTask(App.Msg);
 const UnstageHunkFinished = app_actions.UnstageHunkFinished;
 const UnstageHunkTask = app_actions.UnstageHunkTask(App.Msg);
+const UnstageTargetResult = git_ops.UnstageTargetResult;
 const VerticalDirection = app_direction.Vertical;
 
 const MousePane = enum {
@@ -1130,21 +1142,6 @@ pub const App = struct {
         self.setStatus("staging: {s}", .{target.path});
     }
 
-    const ToggleStageOperation = enum {
-        stage,
-        unstage,
-    };
-
-    const ToggleStageTargetResult = union(enum) {
-        operation: ToggleStageOperation,
-        unavailable_source,
-        no_repo,
-        no_path,
-        stale_status,
-        conflict_unsupported: GitActionPath,
-        no_content: GitActionPath,
-    };
-
     fn toggleSelectedFileStage(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (self.actions.pending != null) {
             self.setStatus("another git action is running", .{});
@@ -1362,84 +1359,6 @@ pub const App = struct {
         self.setStatus("unstaging hunk: {s}", .{target.path});
     }
 
-    const GitActionTargetKind = enum {
-        file,
-        directory,
-    };
-
-    const GitActionPath = struct {
-        path: []const u8,
-        kind: GitActionTargetKind,
-    };
-
-    const StageTarget = struct {
-        repo_root: []const u8,
-        path: []const u8,
-        kind: GitActionTargetKind,
-    };
-
-    const StageTargetResult = union(enum) {
-        ready: StageTarget,
-        already_staged: []const u8,
-        stale_status,
-        conflict_unsupported: []const u8,
-        no_stageable_content: []const u8,
-        unavailable_source,
-        no_repo,
-        no_path,
-    };
-
-    const HunkStageTarget = struct {
-        repo_root: []const u8,
-        path: []const u8,
-        hunk_index: usize,
-        patch: []u8,
-        mark_source: app_actions.HunkMarkSource = .session,
-        reload_after_success: bool = false,
-    };
-
-    const HunkStageTargetResult = union(enum) {
-        ready: HunkStageTarget,
-        unavailable_source,
-        no_repo,
-        no_file,
-        no_path,
-        no_hunk,
-        offscreen_cursor,
-        stale_status,
-        conflict_unsupported,
-        binary_unsupported,
-        unsupported_file_state,
-        already_staged_hunk,
-        patch_failed,
-    };
-
-    const HunkUnstageTarget = HunkStageTarget;
-
-    const HunkUnstageTargetResult = union(enum) {
-        ready: HunkUnstageTarget,
-        unavailable_source,
-        no_repo,
-        no_file,
-        no_path,
-        no_hunk,
-        offscreen_cursor,
-        not_staged_hunk,
-        binary_unsupported,
-        unsupported_file_state,
-        patch_failed,
-    };
-
-    const ToggleHunkTargetResult = union(enum) {
-        operation: ToggleStageOperation,
-        unavailable_source,
-        no_repo,
-        no_file,
-        no_path,
-        no_hunk,
-        offscreen_cursor,
-    };
-
     fn selectedHunkToggleOperation(self: *const App) ToggleHunkTargetResult {
         const can_stage = diff_source.sourceAllowsStageAction(self.config.source);
         const can_unstage = diff_source.sourceAllowsUnstageAction(self.config.source);
@@ -1646,7 +1565,7 @@ pub const App = struct {
         };
     }
 
-    fn fileStageToggleOperation(self: *const App, action_target: GitActionPath, can_stage: bool, can_unstage: bool) ToggleStageTargetResult {
+    fn fileStageToggleOperation(self: *const App, action_target: PathTarget, can_stage: bool, can_unstage: bool) ToggleStageTargetResult {
         const entry = self.statusEntryForPathKey(action_target.path) orelse return .{ .no_content = action_target };
         if (entry.isConflict()) return .{ .conflict_unsupported = action_target };
         if (entry.isUnstaged()) return if (can_stage) .{ .operation = .stage } else .unavailable_source;
@@ -1654,7 +1573,7 @@ pub const App = struct {
         return .{ .no_content = action_target };
     }
 
-    fn directoryStageToggleOperation(self: *const App, action_target: GitActionPath, can_stage: bool, can_unstage: bool) ToggleStageTargetResult {
+    fn directoryStageToggleOperation(self: *const App, action_target: PathTarget, can_stage: bool, can_unstage: bool) ToggleStageTargetResult {
         var has_unstaged = false;
         var has_staged = false;
         for (self.git_status.document.entries) |entry| {
@@ -1735,22 +1654,6 @@ pub const App = struct {
         };
         self.setStatus("unstaging: {s}", .{target.path});
     }
-
-    const UnstageTarget = struct {
-        repo_root: []const u8,
-        path: []const u8,
-        kind: GitActionTargetKind,
-    };
-
-    const UnstageTargetResult = union(enum) {
-        ready: UnstageTarget,
-        unavailable_source,
-        no_repo,
-        no_path,
-        stale_status,
-        conflict_unsupported: GitActionPath,
-        no_staged_content: GitActionPath,
-    };
 
     fn selectedUnstageTarget(self: *const App) UnstageTargetResult {
         if (!diff_source.sourceAllowsUnstageAction(self.config.source)) return .unavailable_source;
@@ -1864,23 +1767,6 @@ pub const App = struct {
         self.discard_confirmation = null;
         if (self.overlay.isDiscardFile()) self.overlay.close();
     }
-
-    const DiscardTarget = struct {
-        repo_root: []const u8,
-        path: []const u8,
-    };
-
-    const DiscardTargetResult = union(enum) {
-        ready: DiscardTarget,
-        unavailable_source,
-        no_repo,
-        no_path,
-        stale_status,
-        directory_unsupported,
-        conflict_unsupported,
-        untracked_unsupported,
-        no_unstaged_content,
-    };
 
     fn selectedDiscardTarget(self: *const App) DiscardTargetResult {
         if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
@@ -3850,7 +3736,7 @@ pub const App = struct {
         };
     }
 
-    fn selectedSidebarActionTarget(self: *const App) ?GitActionPath {
+    fn selectedSidebarActionTarget(self: *const App) ?PathTarget {
         const loaded = self.activeLoadedDiffConst() orelse {
             const path = self.selectedStagePathKey() orelse return null;
             return .{ .path = path, .kind = .file };
@@ -6175,14 +6061,14 @@ test "selectedStageToggleOperation resolves file operation from fresh status" {
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "AM src/added.zig\x00");
     try app.git_status.replace("/repo", &mixed_bundle);
     switch (app.selectedStageToggleOperation()) {
-        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.stage, operation),
+        .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
         else => return error.ExpectedToggleStageOperation,
     }
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
     try app.git_status.replace("/repo", &staged_bundle);
     switch (app.selectedStageToggleOperation()) {
-        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.unstage, operation),
+        .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.unstage, operation),
         else => return error.ExpectedToggleUnstageOperation,
     }
 
@@ -6197,7 +6083,7 @@ test "selectedStageToggleOperation resolves file operation from fresh status" {
     try app.git_status.replace("/repo", &conflict_bundle);
     switch (app.selectedStageToggleOperation()) {
         .conflict_unsupported => |target| {
-            try std.testing.expectEqual(App.GitActionTargetKind.file, target.kind);
+            try std.testing.expectEqual(TargetKind.file, target.kind);
             try std.testing.expectEqualStrings("src/added.zig", target.path);
         },
         else => return error.ExpectedToggleConflict,
@@ -6207,7 +6093,7 @@ test "selectedStageToggleOperation resolves file operation from fresh status" {
     var cached_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
     try app.git_status.replace("/repo", &cached_bundle);
     switch (app.selectedStageToggleOperation()) {
-        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.unstage, operation),
+        .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.unstage, operation),
         else => return error.ExpectedCachedToggleUnstage,
     }
 
@@ -6234,14 +6120,14 @@ test "selectedStageToggleOperation resolves directory operation from descendants
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00A  src/b\x00");
     try app.git_status.replace("/repo", &mixed_bundle);
     switch (app.selectedStageToggleOperation()) {
-        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.stage, operation),
+        .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
         else => return error.ExpectedDirectoryToggleStage,
     }
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/a\x00M  src/b\x00");
     try app.git_status.replace("/repo", &staged_bundle);
     switch (app.selectedStageToggleOperation()) {
-        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.unstage, operation),
+        .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.unstage, operation),
         else => return error.ExpectedDirectoryToggleUnstage,
     }
 
@@ -6249,7 +6135,7 @@ test "selectedStageToggleOperation resolves directory operation from descendants
     try app.git_status.replace("/repo", &conflict_bundle);
     switch (app.selectedStageToggleOperation()) {
         .conflict_unsupported => |target| {
-            try std.testing.expectEqual(App.GitActionTargetKind.directory, target.kind);
+            try std.testing.expectEqual(TargetKind.directory, target.kind);
             try std.testing.expectEqualStrings("src", target.path);
         },
         else => return error.ExpectedDirectoryToggleConflict,
@@ -6381,7 +6267,7 @@ test "selectedHunkUnstageTarget supports cached source without session mark" {
     switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
-            try std.testing.expectEqual(app_actions.HunkMarkSource.projection, target.mark_source);
+            try std.testing.expectEqual(HunkMarkSource.projection, target.mark_source);
             try std.testing.expectEqualStrings("/repo", target.repo_root);
             try std.testing.expectEqualStrings("a", target.path);
             try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
@@ -6406,19 +6292,19 @@ test "selectedHunkToggleOperation resolves source and session staged state" {
     defer app.staged_hunks.deinit(std.testing.allocator);
 
     switch (app.selectedHunkToggleOperation()) {
-        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.stage, operation),
+        .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
         else => return error.ExpectedHunkToggleStage,
     }
 
     try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
     switch (app.selectedHunkToggleOperation()) {
-        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.unstage, operation),
+        .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.unstage, operation),
         else => return error.ExpectedHunkToggleUnstage,
     }
 
     app.config.source = .cached;
     switch (app.selectedHunkToggleOperation()) {
-        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.unstage, operation),
+        .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.unstage, operation),
         else => return error.ExpectedCachedHunkToggleUnstage,
     }
 
@@ -6534,7 +6420,7 @@ test "projected hunk actions route through original cached and unstaged origins"
     } };
 
     switch (app.selectedHunkToggleOperation()) {
-        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.unstage, operation),
+        .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.unstage, operation),
         else => return error.ExpectedProjectedToggleUnstage,
     }
     switch (app.selectedHunkStageTarget(std.testing.allocator)) {
@@ -6545,21 +6431,21 @@ test "projected hunk actions route through original cached and unstaged origins"
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
             try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
-            try std.testing.expectEqual(app_actions.HunkMarkSource.projection, target.mark_source);
+            try std.testing.expectEqual(HunkMarkSource.projection, target.mark_source);
         },
         else => return error.ExpectedReadyProjectedUnstage,
     }
 
     app.viewer.diff_cursor = .{ .hunk_header = 1 };
     switch (app.selectedHunkToggleOperation()) {
-        .operation => |operation| try std.testing.expectEqual(App.ToggleStageOperation.stage, operation),
+        .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
         else => return error.ExpectedProjectedToggleStage,
     }
     switch (app.selectedHunkStageTarget(std.testing.allocator)) {
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
             try std.testing.expectEqual(@as(usize, 1), target.hunk_index);
-            try std.testing.expectEqual(app_actions.HunkMarkSource.projection, target.mark_source);
+            try std.testing.expectEqual(HunkMarkSource.projection, target.mark_source);
         },
         else => return error.ExpectedReadyProjectedStage,
     }

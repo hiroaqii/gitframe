@@ -1,5 +1,6 @@
 const std = @import("std");
 const git_backend = @import("../git/backend.zig");
+const git_ops = @import("git_ops.zig");
 
 /// Git operation categories that can become App-facing actions.
 ///
@@ -22,11 +23,6 @@ pub const ActionKind = enum {
 pub const PendingAction = struct {
     generation: u64,
     kind: ActionKind,
-};
-
-pub const HunkMarkSource = enum {
-    session,
-    projection,
 };
 
 /// Small App-facing receiver for future Git actions.
@@ -100,7 +96,7 @@ pub const StageHunkFinished = struct {
     repo_root: []u8,
     path: []u8,
     hunk_index: usize,
-    mark_source: HunkMarkSource = .session,
+    mark_source: git_ops.HunkMarkSource = .session,
     result: FileActionTaskResult,
 
     pub fn deinit(self: *StageHunkFinished, allocator: std.mem.Allocator) void {
@@ -123,7 +119,7 @@ pub const UnstageHunkFinished = struct {
     repo_root: []u8,
     path: []u8,
     hunk_index: usize,
-    mark_source: HunkMarkSource = .session,
+    mark_source: git_ops.HunkMarkSource = .session,
     reload_after_success: bool = false,
     result: FileActionTaskResult,
 
@@ -282,7 +278,7 @@ pub fn StageHunkTask(comptime Msg: type) type {
         path: []u8,
         patch: []u8,
         hunk_index: usize,
-        mark_source: HunkMarkSource = .session,
+        mark_source: git_ops.HunkMarkSource = .session,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
@@ -319,7 +315,7 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
         path: []u8,
         patch: []u8,
         hunk_index: usize,
-        mark_source: HunkMarkSource = .session,
+        mark_source: git_ops.HunkMarkSource = .session,
         reload_after_success: bool = false,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
