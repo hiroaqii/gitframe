@@ -18,6 +18,8 @@ test {
     // Keep module-local tests in the package test target while root.zig stays a
     // thin facade. Add extracted modules here when they start owning tests.
     _ = @import("app.zig");
+    _ = @import("app/test_support.zig");
+    _ = @import("app_test.zig");
     _ = @import("app/actions.zig");
     _ = @import("app/input.zig");
     _ = @import("app/prompt.zig");
