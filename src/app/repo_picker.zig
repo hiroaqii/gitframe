@@ -26,6 +26,12 @@ pub const Item = struct {
 
 pub const ItemList = std.ArrayList(Item);
 
+pub const EditResult = enum {
+    none,
+    refresh_filter,
+    filter_too_long,
+};
+
 pub fn refreshFilter(
     allocator: std.mem.Allocator,
     picker: *app_prompt.RepoPickerState,
@@ -104,6 +110,69 @@ pub fn resolveSelection(picker: *const app_prompt.RepoPickerState, items: []cons
     const item_index = picker.list.filter.sourceIndex(focused) orelse return null;
     if (item_index >= items.len) return null;
     return items[item_index].source;
+}
+
+pub fn insertCodepoint(picker: *app_prompt.RepoPickerState, codepoint: u21) EditResult {
+    switch (picker.prompt_mode) {
+        .list => {
+            picker.list.resetNoMatch();
+            picker.list.input.insert(codepoint) catch {};
+            return .refresh_filter;
+        },
+        .path_input => {
+            picker.clearPathStatus();
+            picker.path_input.insert(codepoint) catch {
+                picker.path_error = .path_too_long;
+            };
+            return .none;
+        },
+    }
+}
+
+pub fn insertSlice(picker: *app_prompt.RepoPickerState, text: []const u8) EditResult {
+    switch (picker.prompt_mode) {
+        .list => {
+            picker.list.resetNoMatch();
+            picker.list.input.insertSlice(text) catch return .filter_too_long;
+            return .refresh_filter;
+        },
+        .path_input => {
+            picker.clearPathStatus();
+            picker.path_input.insertSlice(text) catch {
+                picker.path_error = .path_too_long;
+            };
+            return .none;
+        },
+    }
+}
+
+pub fn backspace(picker: *app_prompt.RepoPickerState) EditResult {
+    switch (picker.prompt_mode) {
+        .list => {
+            picker.list.resetNoMatch();
+            picker.list.input.backspace();
+            return .refresh_filter;
+        },
+        .path_input => {
+            picker.clearPathStatus();
+            picker.path_input.backspace();
+            return .none;
+        },
+    }
+}
+
+pub fn moveLeft(picker: *app_prompt.RepoPickerState) void {
+    switch (picker.prompt_mode) {
+        .list => picker.list.input.moveLeft(),
+        .path_input => picker.path_input.moveLeft(),
+    }
+}
+
+pub fn moveRight(picker: *app_prompt.RepoPickerState) void {
+    switch (picker.prompt_mode) {
+        .list => picker.list.input.moveRight(),
+        .path_input => picker.path_input.moveRight(),
+    }
 }
 
 pub fn appendItem(allocator: std.mem.Allocator, items: *ItemList, label: []const u8, detail: []const u8, source: ItemSource) !void {

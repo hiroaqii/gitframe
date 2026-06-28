@@ -3015,65 +3015,30 @@ pub const App = struct {
     }
 
     fn insertRepoPickerCodepoint(self: *App, allocator: std.mem.Allocator, codepoint: u21) !void {
-        switch (self.repo_picker.prompt_mode) {
-            .list => {
-                self.repo_picker.list.resetNoMatch();
-                self.repo_picker.list.input.insert(codepoint) catch {};
-                try self.refreshRepoPickerFilter(allocator);
-            },
-            .path_input => {
-                self.repo_picker.clearPathStatus();
-                self.repo_picker.path_input.insert(codepoint) catch {
-                    self.repo_picker.path_error = .path_too_long;
-                };
-            },
-        }
+        try self.applyRepoPickerEditResult(allocator, app_repo_picker.insertCodepoint(&self.repo_picker, codepoint));
     }
 
     fn insertRepoPickerSlice(self: *App, allocator: std.mem.Allocator, text: []const u8) !void {
-        switch (self.repo_picker.prompt_mode) {
-            .list => {
-                self.repo_picker.list.resetNoMatch();
-                self.repo_picker.list.input.insertSlice(text) catch {
-                    self.setStatus("repository filter paste is too long", .{});
-                    return;
-                };
-                try self.refreshRepoPickerFilter(allocator);
-            },
-            .path_input => {
-                self.repo_picker.clearPathStatus();
-                self.repo_picker.path_input.insertSlice(text) catch {
-                    self.repo_picker.path_error = .path_too_long;
-                };
-            },
-        }
+        try self.applyRepoPickerEditResult(allocator, app_repo_picker.insertSlice(&self.repo_picker, text));
     }
 
     fn backspaceRepoPicker(self: *App, allocator: std.mem.Allocator) !void {
-        switch (self.repo_picker.prompt_mode) {
-            .list => {
-                self.repo_picker.list.resetNoMatch();
-                self.repo_picker.list.input.backspace();
-                try self.refreshRepoPickerFilter(allocator);
-            },
-            .path_input => {
-                self.repo_picker.clearPathStatus();
-                self.repo_picker.path_input.backspace();
-            },
-        }
+        try self.applyRepoPickerEditResult(allocator, app_repo_picker.backspace(&self.repo_picker));
     }
 
     fn moveRepoPickerCursorLeft(self: *App) void {
-        switch (self.repo_picker.prompt_mode) {
-            .list => self.repo_picker.list.input.moveLeft(),
-            .path_input => self.repo_picker.path_input.moveLeft(),
-        }
+        app_repo_picker.moveLeft(&self.repo_picker);
     }
 
     fn moveRepoPickerCursorRight(self: *App) void {
-        switch (self.repo_picker.prompt_mode) {
-            .list => self.repo_picker.list.input.moveRight(),
-            .path_input => self.repo_picker.path_input.moveRight(),
+        app_repo_picker.moveRight(&self.repo_picker);
+    }
+
+    fn applyRepoPickerEditResult(self: *App, allocator: std.mem.Allocator, result: app_repo_picker.EditResult) !void {
+        switch (result) {
+            .none => {},
+            .refresh_filter => try self.refreshRepoPickerFilter(allocator),
+            .filter_too_long => self.setStatus("repository filter paste is too long", .{}),
         }
     }
 
