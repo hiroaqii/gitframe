@@ -13,6 +13,7 @@ const app_review_projection = @import("app/review_projection.zig");
 const app_state = @import("app/state.zig");
 const app_test_support = if (builtin.is_test) @import("app/test_support.zig") else struct {};
 const app_view = @import("app/view.zig");
+const app_git_requests = @import("app/git_requests.zig");
 const context = @import("context.zig");
 const context_export = @import("context_export.zig");
 const diff_parser = @import("diff/parser.zig");
@@ -70,11 +71,9 @@ const AmendTask = app_actions.AmendTask(App.Msg);
 const CommitFinished = app_actions.CommitFinished;
 const CommitTask = app_actions.CommitTask(App.Msg);
 const DiscardFileFinished = app_actions.DiscardFileFinished;
-const DiscardFileTask = app_actions.DiscardFileTask(App.Msg);
 const StageHunkFinished = app_actions.StageHunkFinished;
 const StageHunkTask = app_actions.StageHunkTask(App.Msg);
 const StageFileFinished = app_actions.StageFileFinished;
-const StageFileTask = app_actions.StageFileTask(App.Msg);
 const StageTargetResult = git_ops.StageTargetResult;
 const SizeDirection = app_direction.Size;
 const TargetKind = git_ops.TargetKind;
@@ -82,7 +81,6 @@ const ToggleHunkTargetResult = git_ops.ToggleHunkTargetResult;
 const ToggleStageTargetResult = git_ops.ToggleStageTargetResult;
 const ToggleStageOperation = git_ops.ToggleStageOperation;
 const UnstageFileFinished = app_actions.UnstageFileFinished;
-const UnstageFileTask = app_actions.UnstageFileTask(App.Msg);
 const UnstageHunkFinished = app_actions.UnstageHunkFinished;
 const UnstageHunkTask = app_actions.UnstageHunkTask(App.Msg);
 const UnstageTargetResult = git_ops.UnstageTargetResult;
@@ -1116,26 +1114,7 @@ pub const App = struct {
         try self.setPendingSelectionRestore(ctx.allocator(), target.path);
         errdefer self.clearPendingSelectionRestore(ctx.allocator());
 
-        // Keep rollback active until the task is successfully handed to Chasen.
-        const pending = self.actions.begin(.stage_file);
-        errdefer _ = self.actions.finish(pending);
-
-        const task = try ctx.allocator().create(StageFileTask);
-        task.* = .{
-            .pending = pending,
-            .repo_root = &.{},
-            .path = &.{},
-        };
-        errdefer {
-            if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
-            if (task.path.len > 0) ctx.allocator().free(task.path);
-            ctx.allocator().destroy(task);
-        }
-
-        task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
-        task.path = try ctx.allocator().dupe(u8, target.path);
-
-        ctx.task().spawnWith(task, StageFileTask.run) catch |err| {
+        app_git_requests.startStageFile(Msg, ctx, &self.actions, target) catch |err| {
             self.setStatus("could not start stage task", .{});
             return err;
         };
@@ -1579,25 +1558,7 @@ pub const App = struct {
         try self.setPendingSelectionRestore(ctx.allocator(), target.path);
         errdefer self.clearPendingSelectionRestore(ctx.allocator());
 
-        const pending = self.actions.begin(.unstage_file);
-        errdefer _ = self.actions.finish(pending);
-
-        const task = try ctx.allocator().create(UnstageFileTask);
-        task.* = .{
-            .pending = pending,
-            .repo_root = &.{},
-            .path = &.{},
-        };
-        errdefer {
-            if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
-            if (task.path.len > 0) ctx.allocator().free(task.path);
-            ctx.allocator().destroy(task);
-        }
-
-        task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
-        task.path = try ctx.allocator().dupe(u8, target.path);
-
-        ctx.task().spawnWith(task, UnstageFileTask.run) catch |err| {
+        app_git_requests.startUnstageFile(Msg, ctx, &self.actions, target) catch |err| {
             self.setStatus("could not start unstage task", .{});
             return err;
         };
@@ -1670,25 +1631,7 @@ pub const App = struct {
         try self.setPendingSelectionRestore(ctx.allocator(), confirmation.path);
         errdefer self.clearPendingSelectionRestore(ctx.allocator());
 
-        const pending = self.actions.begin(.discard_file);
-        errdefer _ = self.actions.finish(pending);
-
-        const task = try ctx.allocator().create(DiscardFileTask);
-        task.* = .{
-            .pending = pending,
-            .repo_root = &.{},
-            .path = &.{},
-        };
-        errdefer {
-            if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
-            if (task.path.len > 0) ctx.allocator().free(task.path);
-            ctx.allocator().destroy(task);
-        }
-
-        task.repo_root = try ctx.allocator().dupe(u8, confirmation.repo_root);
-        task.path = try ctx.allocator().dupe(u8, confirmation.path);
-
-        ctx.task().spawnWith(task, DiscardFileTask.run) catch |err| {
+        app_git_requests.startDiscardFile(Msg, ctx, &self.actions, confirmation.repo_root, confirmation.path) catch |err| {
             self.setStatus("could not start discard task", .{});
             return err;
         };

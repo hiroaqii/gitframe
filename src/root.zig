@@ -21,6 +21,7 @@ test {
     _ = @import("app/test_support.zig");
     _ = @import("app_test.zig");
     _ = @import("app/actions.zig");
+    _ = @import("app/git_requests.zig");
     _ = @import("app/git_ops.zig");
     _ = @import("app/input.zig");
     _ = @import("app/prompt.zig");
