@@ -2,6 +2,7 @@ const app = @import("app.zig");
 pub const config = @import("config.zig");
 pub const context = @import("context.zig");
 pub const review_session = @import("review/session.zig");
+pub const theme = @import("theme");
 const diff_source = @import("diff/source.zig");
 
 pub const App = app.App;
@@ -42,4 +43,5 @@ test {
     _ = @import("repo/state.zig");
     _ = @import("review/session.zig");
     _ = @import("review/state.zig");
+    _ = @import("theme");
 }

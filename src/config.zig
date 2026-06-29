@@ -1,4 +1,5 @@
 const std = @import("std");
+const theme = @import("theme");
 
 const max_config_bytes = 64 * 1024;
 const supported_schema_version = 1;
@@ -27,7 +28,17 @@ pub const EditorConfig = struct {
         return self.argv[0..self.argv_len];
     }
 };
-pub const ThemeConfig = struct {};
+pub const ThemeConfig = struct {
+    overrides: [theme.role_count]?theme.ColorValue = [_]?theme.ColorValue{null} ** theme.role_count,
+
+    pub fn set(self: *ThemeConfig, role: theme.Role, value: theme.ColorValue) void {
+        self.overrides[@intFromEnum(role)] = value;
+    }
+
+    pub fn get(self: ThemeConfig, role: theme.Role) ?theme.ColorValue {
+        return self.overrides[@intFromEnum(role)];
+    }
+};
 pub const KeymapConfig = struct {};
 pub const ExternalActionsConfig = struct {};
 
@@ -207,6 +218,7 @@ const TomlParseError = error{
     InvalidString,
     InvalidArray,
     UnsupportedEscape,
+    InvalidColor,
     UnknownSection,
     UnknownKey,
     TooManyArguments,
@@ -245,7 +257,11 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
                 if (!std.mem.eql(u8, key, "argv")) return error.UnknownKey;
                 config.editor = try parseEditorArgv(value);
             },
-            .theme, .keymap, .actions, .remote => return error.UnknownKey,
+            .theme => {
+                const role = theme.roleFromKey(key) orelse return error.UnknownKey;
+                config.theme.set(role, try parseThemeColor(value));
+            },
+            .keymap, .actions, .remote => return error.UnknownKey,
         }
     }
 
@@ -341,6 +357,19 @@ fn validateEditorConfig(editor: EditorConfig) TomlParseError!void {
         try validatePlaceholders(arg);
     }
     if (!has_path) return error.MissingPathPlaceholder;
+}
+
+fn parseThemeColor(value: []const u8) TomlParseError!theme.ColorValue {
+    const color_text = try parseTomlString(value);
+    return theme.parseColorValue(color_text) orelse error.InvalidColor;
+}
+
+fn parseTomlString(value: []const u8) TomlParseError![]const u8 {
+    if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') return error.InvalidString;
+    const inner = value[1 .. value.len - 1];
+    if (std.mem.indexOfScalar(u8, inner, '\\') != null) return error.UnsupportedEscape;
+    if (std.mem.indexOfScalar(u8, inner, '"') != null) return error.InvalidString;
+    return inner;
 }
 
 fn validatePlaceholders(arg: []const u8) TomlParseError!void {
@@ -530,6 +559,83 @@ test "loadConfig accepts editor argv template" {
     try std.testing.expectEqualStrings("nvim", result.config.value.editor.argv[0]);
     try std.testing.expectEqualStrings("+{line}", result.config.value.editor.argv[1]);
     try std.testing.expectEqualStrings("{path}", result.config.value.editor.argv[2]);
+}
+
+test "loadConfig accepts theme color overrides" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-theme-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[theme]
+        \\accent = "bright-cyan"
+        \\success = "#010203"
+        \\diff_added = "index:10"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expect(result.warning == null);
+    try std.testing.expect(result.config.value.theme.get(.accent).?.toChasen().eql(.{ .index = 14 }));
+    try std.testing.expect(result.config.value.theme.get(.success).?.toChasen().eql(.{ .rgb = .{ 1, 2, 3 } }));
+    try std.testing.expect(result.config.value.theme.get(.diff_added).?.toChasen().eql(.{ .index = 10 }));
+}
+
+test "loaded theme config feeds palette derivation" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-theme-derived-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[theme]
+        \\success = "#010203"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expect(result.warning == null);
+
+    const palette = theme.Palette.fromConfig(result.config.value.theme);
+    try std.testing.expect(palette.color(.success).eql(.{ .rgb = .{ 1, 2, 3 } }));
+    try std.testing.expect(palette.color(.diff_added).eql(.{ .rgb = .{ 1, 2, 3 } }));
+}
+
+test "loadConfig rejects unknown theme keys" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-theme-unknown-key-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[theme]
+        \\diff-added = "green"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects invalid theme color values" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-theme-invalid-color-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[theme]
+        \\accent = "not-a-color"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
 }
 
 test "loadConfig rejects editor argv without path placeholder" {

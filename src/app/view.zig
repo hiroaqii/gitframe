@@ -367,6 +367,7 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         .staged_hunks = display.stagedFlags(),
         .line_index = display.lineIndex(),
         .folded_hunks = display.foldedHunks(),
+        .palette = app.theme,
     });
     drawDiffHeaderDetailRow(app, surface, active);
     drawSearchMatchMarker(app, surface);
@@ -422,6 +423,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                             .title_prefix = repoHeaderLabel(app),
                             .line_numbers = app.viewer.view_options.line_numbers,
                             .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(content.size().width, app.viewer.display_mode)),
+                            .palette = app.theme,
                         });
                         drawPaneHeaderRule(surface);
                         return;
@@ -435,6 +437,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                         .pane_active = active,
                         .title_prefix = repoHeaderLabel(app),
                         .line_numbers = app.viewer.view_options.line_numbers,
+                        .palette = app.theme,
                     });
                     drawPaneHeaderRule(surface);
                     return;
