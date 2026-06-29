@@ -1,4 +1,5 @@
 const std = @import("std");
+const keymap = @import("keymap");
 const theme = @import("theme");
 
 const max_config_bytes = 64 * 1024;
@@ -39,7 +40,7 @@ pub const ThemeConfig = struct {
         return self.overrides[@intFromEnum(role)];
     }
 };
-pub const KeymapConfig = struct {};
+pub const KeymapConfig = keymap.Config;
 pub const ExternalActionsConfig = struct {};
 
 pub const RemoteWorkflowConfig = struct {
@@ -219,6 +220,7 @@ const TomlParseError = error{
     InvalidArray,
     UnsupportedEscape,
     InvalidColor,
+    InvalidKeyBinding,
     UnknownSection,
     UnknownKey,
     TooManyArguments,
@@ -261,11 +263,18 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
                 const role = theme.roleFromKey(key) orelse return error.UnknownKey;
                 config.theme.set(role, try parseThemeColor(value));
             },
-            .keymap, .actions, .remote => return error.UnknownKey,
+            .keymap => {
+                const action = keymap.actionFromKey(key) orelse return error.UnknownKey;
+                const spec_text = try parseTomlString(value);
+                const spec = keymap.parseKeySpec(spec_text) orelse return error.InvalidKeyBinding;
+                config.keymap.set(action, spec);
+            },
+            .actions, .remote => return error.UnknownKey,
         }
     }
 
     try validateEditorConfig(config.editor);
+    if (!keymap.validateConfig(config.keymap)) return error.InvalidKeyBinding;
     if (config.schema_version != supported_schema_version) return error.UnsupportedSchemaVersion;
     return config;
 }
@@ -581,6 +590,43 @@ test "loadConfig accepts theme color overrides" {
     try std.testing.expect(result.config.value.theme.get(.accent).?.toChasen().eql(.{ .index = 14 }));
     try std.testing.expect(result.config.value.theme.get(.success).?.toChasen().eql(.{ .rgb = .{ 1, 2, 3 } }));
     try std.testing.expect(result.config.value.theme.get(.diff_added).?.toChasen().eql(.{ .index = 10 }));
+}
+
+test "loadConfig accepts keymap overrides" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-keymap-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[keymap]
+        \\commit = "m"
+        \\repo_picker = "P"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expect(result.warning == null);
+    try std.testing.expect(result.config.value.keymap.get(.commit).?.eql(.{ .plain_codepoint = 'm' }));
+    try std.testing.expect(result.config.value.keymap.get(.repo_picker).?.eql(.{ .shifted_ascii = .{ .lower = 'p', .upper = 'P' } }));
+}
+
+test "loadConfig rejects invalid keymap overrides" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-keymap-invalid-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[keymap]
+        \\commit = "s"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
 }
 
 test "loaded theme config feeds palette derivation" {

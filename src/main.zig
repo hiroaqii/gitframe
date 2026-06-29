@@ -42,6 +42,7 @@ pub fn main(init: std.process.Init) !void {
     var user_config = gitframe.config.loadConfig(init.gpa, init.io, config_paths.config);
     defer user_config.deinit();
     const palette = gitframe.theme.Palette.fromConfig(user_config.config.value.theme);
+    const effective_keymap = gitframe.keymap.Effective.fromConfig(user_config.config.value.keymap);
 
     if (config.stats_summary) {
         var summary: StatsSummary = .{};
@@ -64,6 +65,7 @@ pub fn main(init: std.process.Init) !void {
             .env_map = init.environ_map,
             .review_output = review_output_ptr,
             .user_config = user_config.config.value,
+            .keymap = effective_keymap,
             .theme = palette,
         });
         try printStatsSummary(init.io, summary);
@@ -88,6 +90,7 @@ pub fn main(init: std.process.Init) !void {
         .env_map = init.environ_map,
         .review_output = review_output_ptr,
         .user_config = user_config.config.value,
+        .keymap = effective_keymap,
         .theme = palette,
     });
     try finishReviewOutputIfNeeded(init.io, config, &review_output);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const chasen = @import("chasen");
+const keymap = @import("keymap");
 
 /// App focus state used by key mapping. The state lives on App, but the
 /// transition vocabulary belongs with input handling.
@@ -30,6 +31,7 @@ pub const KeyContext = struct {
     focus: Focus = .sidebar,
     sidebar_hidden: bool = false,
     review_mode: bool = false,
+    keymap: keymap.Effective = .{},
 };
 
 const Action = enum {
@@ -144,7 +146,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.search_mode) return searchKeyToMsg(Msg, key);
     if (context.file_search_mode) return fileSearchKeyToMsg(Msg, key);
     if (context.repo_picker_mode) return repoPickerKeyToMsg(Msg, context, key);
-    if (context.help_mode) return helpKeyToMsg(Msg, key);
+    if (context.help_mode) return helpKeyToMsg(Msg, context, key);
     if (context.discard_confirmation_mode) return discardConfirmationKeyToMsg(Msg, key);
     if (context.amend_confirmation_mode) return amendConfirmationKeyToMsg(Msg, key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(Msg, key);
@@ -188,7 +190,9 @@ fn repoPickerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) 
     };
 }
 
-fn helpKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
+fn helpKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
+    if (context.keymap.spec(.help).matches(key)) return actionToMsg(Msg, .close_help);
+    if (context.keymap.spec(.commit).matches(key)) return actionToMsg(Msg, .enter_commit_panel);
     if (helpActionForKey(key)) |action| return actionToMsg(Msg, action);
     return null;
 }
@@ -230,8 +234,10 @@ fn viewerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg
     if (context.focus == .diff and key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .scroll_diff_left);
     if (context.focus == .sidebar and key.matches('h', .{})) return actionToMsg(Msg, .scroll_sidebar_left);
     if (context.focus == .sidebar and key.matches('l', .{})) return actionToMsg(Msg, .scroll_sidebar_right);
+    if (key.matches(chasen.Key.home, .{})) return actionToMsg(Msg, .select_first_file);
+    if (key.matches(chasen.Key.end, .{})) return actionToMsg(Msg, .select_last_file);
 
-    if (viewerActionForStaticKey(key)) |action| return actionToMsg(Msg, action);
+    if (viewerActionForStaticKey(context.keymap, key)) |action| return actionToMsg(Msg, action);
 
     if (matchesShiftedAscii(key, 'j', 'J')) {
         return if (context.focus == .diff) actionToMsg(Msg, .select_next_hunk) else null;
@@ -261,7 +267,6 @@ fn viewerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg
 const KeyMatcher = union(enum) {
     plain_codepoint: u21,
     exact: u21,
-    help_key,
     shifted_ascii: struct {
         lower: u21,
         upper: u21,
@@ -271,7 +276,6 @@ const KeyMatcher = union(enum) {
         return switch (self) {
             .plain_codepoint => |codepoint| !hasCommandModifier(key) and key.codepoint == codepoint,
             .exact => |codepoint| key.matches(codepoint, .{}),
-            .help_key => isHelpKey(key),
             .shifted_ascii => |ascii| matchesShiftedAscii(key, ascii.lower, ascii.upper),
         };
     }
@@ -282,37 +286,8 @@ const KeyBinding = struct {
     action: Action,
 };
 
-const viewer_static_bindings = [_]KeyBinding{
-    .{ .matcher = .{ .exact = chasen.Key.page_up }, .action = .page_diff_up },
-    .{ .matcher = .{ .exact = chasen.Key.page_down }, .action = .page_diff_down },
-    .{ .matcher = .{ .exact = chasen.Key.home }, .action = .select_first_file },
-    .{ .matcher = .{ .exact = chasen.Key.end }, .action = .select_last_file },
-    .{ .matcher = .help_key, .action = .open_help },
-    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'g', .upper = 'G' } }, .action = .select_last_file },
-    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'r', .upper = 'R' } }, .action = .enter_repo_picker },
-    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'f', .upper = 'F' } }, .action = .cycle_changed_file_filter },
-    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'h', .upper = 'H' } }, .action = .toggle_hide_reviewed_files },
-    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'b', .upper = 'B' } }, .action = .toggle_sidebar_visibility },
-    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'l', .upper = 'L' } }, .action = .toggle_line_numbers },
-    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'd', .upper = 'D' } }, .action = .request_discard_selected_file },
-    .{ .matcher = .{ .shifted_ascii = .{ .lower = 'a', .upper = 'A' } }, .action = .enter_amend_panel },
-    // Use exact matching so Shift+c is not treated as the commit command.
-    .{ .matcher = .{ .exact = 'c' }, .action = .enter_commit_panel },
-    .{ .matcher = .{ .plain_codepoint = '/' }, .action = .enter_search },
-    .{ .matcher = .{ .plain_codepoint = 'g' }, .action = .select_first_file },
-    .{ .matcher = .{ .plain_codepoint = 'f' }, .action = .enter_file_search },
-    .{ .matcher = .{ .plain_codepoint = 'v' }, .action = .toggle_reviewed_file },
-    .{ .matcher = .{ .plain_codepoint = '[' }, .action = .decrease_sidebar_width },
-    .{ .matcher = .{ .plain_codepoint = ']' }, .action = .increase_sidebar_width },
-    .{ .matcher = .{ .plain_codepoint = 'e' }, .action = .open_selected_file_in_editor },
-    .{ .matcher = .{ .plain_codepoint = 'u' }, .action = .toggle_display_mode },
-    .{ .matcher = .{ .plain_codepoint = 'r' }, .action = .reload },
-};
-
 const help_bindings = [_]KeyBinding{
     .{ .matcher = .{ .exact = chasen.Key.escape }, .action = .close_help },
-    .{ .matcher = .{ .exact = 'c' }, .action = .enter_commit_panel },
-    .{ .matcher = .help_key, .action = .close_help },
     .{ .matcher = .{ .plain_codepoint = 'q' }, .action = .close_help },
     .{ .matcher = .{ .exact = chasen.Key.page_up }, .action = .help_page_up },
     .{ .matcher = .{ .exact = chasen.Key.page_down }, .action = .help_page_down },
@@ -322,10 +297,12 @@ const help_bindings = [_]KeyBinding{
     .{ .matcher = .{ .plain_codepoint = 'j' }, .action = .help_scroll_down },
 };
 
-// Static: the key alone determines the action. Context-dependent keys
-// (s/S, n/N, q, Tab, Esc, Enter, arrows) stay in viewerKeyToMsg.
-fn viewerActionForStaticKey(key: chasen.Key) ?Action {
-    return actionForKey(&viewer_static_bindings, key);
+// Static configurable bindings are safe to evaluate without focus/search state.
+// Context-dependent keys (s/S, n/N, q, Tab, Esc, Enter, arrows) stay in
+// viewerKeyToMsg and are deliberately not exposed by the first keymap slice.
+fn viewerActionForStaticKey(effective: keymap.Effective, key: chasen.Key) ?Action {
+    const public_action = effective.actionForKey(key) orelse return null;
+    return publicActionToAction(public_action);
 }
 
 fn helpActionForKey(key: chasen.Key) ?Action {
@@ -339,8 +316,30 @@ fn actionForKey(bindings: []const KeyBinding, key: chasen.Key) ?Action {
     return null;
 }
 
-fn isHelpKey(key: chasen.Key) bool {
-    return key.matches('?', .{});
+fn publicActionToAction(action: keymap.PublicAction) Action {
+    return switch (action) {
+        .help => .open_help,
+        .reload => .reload,
+        .search => .enter_search,
+        .file_search => .enter_file_search,
+        .repo_picker => .enter_repo_picker,
+        .open_editor => .open_selected_file_in_editor,
+        .commit => .enter_commit_panel,
+        .amend => .enter_amend_panel,
+        .discard => .request_discard_selected_file,
+        .toggle_display_mode => .toggle_display_mode,
+        .toggle_line_numbers => .toggle_line_numbers,
+        .toggle_sidebar => .toggle_sidebar_visibility,
+        .decrease_sidebar_width => .decrease_sidebar_width,
+        .increase_sidebar_width => .increase_sidebar_width,
+        .changed_file_filter => .cycle_changed_file_filter,
+        .mark_reviewed => .toggle_reviewed_file,
+        .hide_reviewed => .toggle_hide_reviewed_files,
+        .first_file => .select_first_file,
+        .last_file => .select_last_file,
+        .page_up => .page_diff_up,
+        .page_down => .page_diff_down,
+    };
 }
 
 fn isColonKey(key: chasen.Key) bool {
@@ -702,6 +701,43 @@ test "keyToMsg maps commit panel command and routes panel input" {
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
 }
 
+test "keyToMsg uses configurable viewer bindings" {
+    var config: keymap.Config = .{};
+    config.set(.commit, .{ .plain_codepoint = 'm' });
+    config.set(.help, .{ .plain_codepoint = 'z' });
+    const effective = keymap.Effective.fromConfig(config);
+
+    try std.testing.expectEqual(TestMsg.enter_commit_panel, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'm' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'c' }));
+    try std.testing.expectEqual(TestMsg.open_help, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'z' }).?);
+    try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true, .keymap = effective }, .{ .codepoint = 'z' }).?);
+}
+
+test "keyToMsg uses configured keys inside help mode" {
+    var config: keymap.Config = .{};
+    config.set(.commit, .{ .plain_codepoint = 'm' });
+    config.set(.help, .{ .plain_codepoint = 'z' });
+    const effective = keymap.Effective.fromConfig(config);
+    const context: KeyContext = .{
+        .help_mode = true,
+        .keymap = effective,
+    };
+
+    try std.testing.expectEqual(TestMsg.enter_commit_panel, keyToMsg(TestMsg, context, .{ .codepoint = 'm' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, context, .{ .codepoint = 'c' }));
+    try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, context, .{ .codepoint = 'z' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, context, .{ .codepoint = '?' }));
+}
+
+test "keyToMsg keeps context-dependent keys outside configurable bindings" {
+    var config: keymap.Config = .{};
+    config.set(.commit, .{ .plain_codepoint = 'm' });
+    const effective = keymap.Effective.fromConfig(config);
+
+    try std.testing.expectEqual(TestMsg.toggle_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar, .keymap = effective }, .{ .codepoint = 's' }).?);
+    try std.testing.expectEqual(TestMsg.toggle_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .keymap = effective }, .{ .codepoint = 's' }).?);
+}
+
 test "keyToMsg maps amend confirmation flow" {
     try std.testing.expectEqual(TestMsg.confirm_amend, keyToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
     try std.testing.expectEqual(TestMsg.cancel_amend, keyToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
@@ -948,6 +984,8 @@ test "keyToMsg maps shifted letter commands consistently" {
     try std.testing.expectEqual(TestMsg.select_last_file, keyToMsg(TestMsg, .{}, .{ .codepoint = 'G' }).?);
     try std.testing.expectEqual(TestMsg.select_last_file, keyToMsg(TestMsg, .{}, shiftedAscii('g', 'G')).?);
     try std.testing.expectEqual(TestMsg.select_last_file, keyToMsg(TestMsg, .{}, shiftedLowerOnly('g')).?);
+    try std.testing.expectEqual(TestMsg.select_first_file, keyToMsg(TestMsg, .{}, .{ .codepoint = chasen.Key.home }).?);
+    try std.testing.expectEqual(TestMsg.select_last_file, keyToMsg(TestMsg, .{}, .{ .codepoint = chasen.Key.end }).?);
     try std.testing.expectEqual(TestMsg.enter_repo_picker, keyToMsg(TestMsg, .{}, .{ .codepoint = 'R' }).?);
     try std.testing.expectEqual(TestMsg.enter_repo_picker, keyToMsg(TestMsg, .{}, shiftedAscii('r', 'R')).?);
     try std.testing.expectEqual(TestMsg.enter_repo_picker, keyToMsg(TestMsg, .{}, shiftedLowerOnly('r')).?);

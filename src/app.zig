@@ -30,6 +30,7 @@ const editor = @import("editor.zig");
 const file_tree = @import("file_tree.zig");
 const git_ops = @import("app/git_ops.zig");
 const git_status = @import("git/status.zig");
+const keymap = @import("keymap");
 const loaded_diff = @import("loaded_diff.zig");
 const repo_discovery = @import("repo/discovery.zig");
 const review_session = @import("review/session.zig");
@@ -218,6 +219,7 @@ const OverlayKind = app_state.OverlayKind;
 pub const App = struct {
     config: CliConfig = .{},
     user_config: config_mod.Config = .{},
+    keymap: keymap.Effective = .{},
     theme: theme.Palette = .default(),
     env_map: ?*std.process.Environ.Map = null,
     review_output: ?*review_session.Output = null,
@@ -753,6 +755,7 @@ pub const App = struct {
             .sidebar_hidden = self.viewer.sidebar_hidden,
             .repo_picker_path_input = self.repo_picker.prompt_mode == .path_input,
             .review_mode = self.config.review_mode,
+            .keymap = self.keymap,
         };
     }
 

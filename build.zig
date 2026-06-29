@@ -29,6 +29,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "chasen", .module = chasen_dep.module("chasen") },
         },
     });
+    const keymap_mod = b.createModule(.{
+        .root_source_file = b.path("src/keymap.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+        },
+    });
 
     const mod = b.addModule("gitframe", .{
         .root_source_file = b.path("src/root.zig"),
@@ -38,6 +46,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
             .{ .name = "draw", .module = draw_mod },
             .{ .name = "theme", .module = theme_mod },
+            .{ .name = "keymap", .module = keymap_mod },
         },
     });
 
@@ -115,6 +124,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "chasen", .module = chasen_dep.module("chasen") },
                 .{ .name = "draw", .module = draw_mod },
                 .{ .name = "theme", .module = theme_mod },
+                .{ .name = "keymap", .module = keymap_mod },
             },
         }),
     });
@@ -178,6 +188,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "chasen", .module = chasen_dep.module("chasen") },
                 .{ .name = "draw", .module = draw_mod },
                 .{ .name = "theme", .module = theme_mod },
+                .{ .name = "keymap", .module = keymap_mod },
             },
         }),
     });
@@ -217,4 +228,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_repo_discovery_tests.step);
     test_step.dependOn(&perf_baseline_exe.step);
     test_step.dependOn(&core_wasm.step);
+    const keymap_tests = b.addTest(.{
+        .root_module = keymap_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(keymap_tests).step);
 }

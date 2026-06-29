@@ -5,6 +5,7 @@ const app_commit_panel = @import("commit_panel.zig");
 const draw = @import("draw");
 const diff_render = @import("../diff/render.zig");
 const git_status = @import("../git/status.zig");
+const keymap = @import("keymap");
 const loaded_diff = @import("../loaded_diff.zig");
 const file_tree = @import("../file_tree.zig");
 const sidebar_view_model = @import("../sidebar/view_model.zig");
@@ -644,7 +645,9 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         return;
     }
 
-    const hint_items = footerItems(app);
+    var footer_item_storage: [4]ui.key_hint.Item = undefined;
+    var footer_key_buffers: [4][16]u8 = undefined;
+    const hint_items = footerItems(app, &footer_item_storage, &footer_key_buffers);
     const hint_width = ui.key_hint.width(hint_items, footerKeyHintOptions());
     const hint_col = if (width > hint_width + 1) width - hint_width - 1 else 0;
     const left_limit = if (hint_col > 0) hint_col else width;
@@ -1180,9 +1183,32 @@ fn stagedSummaryText(allocator: std.mem.Allocator, summary: app_commit_panel.Sta
     };
 }
 
-fn footerItems(app: anytype) []const ui.key_hint.Item {
-    if (app.viewer.sidebar_hidden) return &footer_hidden_sidebar_items;
-    return &footer_items;
+fn footerItems(app: anytype, storage: *[4]ui.key_hint.Item, key_buffers: *[4][16]u8) []const ui.key_hint.Item {
+    var len: usize = 0;
+    if (app.viewer.sidebar_hidden) {
+        appendFooterItem(app, storage, key_buffers, &len, .toggle_sidebar, "sidebar");
+    } else {
+        storage[len] = ui.key_hint.item("Tab", "focus");
+        len += 1;
+    }
+    appendFooterItem(app, storage, key_buffers, &len, .commit, "commit");
+    appendFooterItem(app, storage, key_buffers, &len, .help, "help");
+    storage[len] = ui.key_hint.item("q", "quit");
+    len += 1;
+    return storage[0..len];
+}
+
+fn appendFooterItem(
+    app: anytype,
+    storage: *[4]ui.key_hint.Item,
+    key_buffers: *[4][16]u8,
+    len: *usize,
+    action: keymap.PublicAction,
+    description: []const u8,
+) void {
+    const key = app.keymap.display(action, key_buffers[len.*][0..]);
+    storage[len.*] = ui.key_hint.item(key, description);
+    len.* += 1;
 }
 
 fn viewHelpPopup(app: anytype, surface: *chasen.Surface) !void {
@@ -1217,7 +1243,7 @@ fn viewHelpPopup(app: anytype, surface: *chasen.Surface) !void {
             .width = size.width,
             .height = body.visible_rows,
         });
-        try drawHelpSections(&list, helpAllSections(), scroll);
+        try drawHelpSections(app, &list, helpAllSections(), scroll);
         return;
     }
 
@@ -1238,8 +1264,8 @@ fn viewHelpPopup(app: anytype, surface: *chasen.Surface) !void {
         .height = body.visible_rows,
     });
 
-    try drawHelpSections(&left, &help_left_sections, scroll);
-    try drawHelpSections(&right, &help_right_sections, scroll);
+    try drawHelpSections(app, &left, &help_left_sections, scroll);
+    try drawHelpSections(app, &right, &help_right_sections, scroll);
 }
 
 fn fillModalDialog(surface: *chasen.Surface, opts: ui.Modal.ViewOptions) void {
@@ -1326,25 +1352,25 @@ fn rowsForSections(sections: []const HelpSection) usize {
     return rows;
 }
 
-fn drawHelpSections(surface: *chasen.Surface, sections: []const HelpSection, scroll: usize) !void {
+fn drawHelpSections(app: anytype, surface: *chasen.Surface, sections: []const HelpSection, scroll: usize) !void {
     const height: usize = surface.size().height;
     var source_row: usize = 0;
     var drawn_rows: usize = 0;
 
     for (sections, 0..) |section, section_index| {
         if (drawn_rows >= height) return;
-        try drawHelpLine(surface, scroll, source_row, &drawn_rows, .section_title, section.title, "");
+        try drawHelpLine(app, surface, scroll, source_row, &drawn_rows, .section_title, section.title, .{ .key = .{ .text = "" }, .description = "" });
         source_row += 1;
 
         for (section.items) |item| {
             if (drawn_rows >= height) return;
-            try drawHelpLine(surface, scroll, source_row, &drawn_rows, .item, item.key, item.description);
+            try drawHelpLine(app, surface, scroll, source_row, &drawn_rows, .item, "", item);
             source_row += 1;
         }
 
         if (section_index + 1 < sections.len) {
             if (drawn_rows >= height) return;
-            try drawHelpLine(surface, scroll, source_row, &drawn_rows, .blank, "", "");
+            try drawHelpLine(app, surface, scroll, source_row, &drawn_rows, .blank, "", .{ .key = .{ .text = "" }, .description = "" });
             source_row += 1;
         }
     }
@@ -1357,13 +1383,14 @@ const HelpLineKind = enum {
 };
 
 fn drawHelpLine(
+    app: anytype,
     surface: *chasen.Surface,
     scroll: usize,
     source_row: usize,
     drawn_rows: *usize,
     kind: HelpLineKind,
     first: []const u8,
-    second: []const u8,
+    item: HelpItem,
 ) !void {
     if (source_row < scroll) return;
     const row_offset = source_row - scroll;
@@ -1372,16 +1399,29 @@ fn drawHelpLine(
     const row: u16 = @intCast(row_offset);
     switch (kind) {
         .section_title => try draw.copyClippedTextAt(surface, 0, row, first, .{ .bold = true, .fg = color_prompt }),
-        .item => try drawHelpItem(surface, row, .{ .key = first, .description = second }),
+        .item => try drawHelpItem(app, surface, row, item),
         .blank => {},
     }
     drawn_rows.* = row_offset + 1;
 }
 
-fn drawHelpItem(surface: *chasen.Surface, row: u16, item: HelpItem) !void {
+fn drawHelpItem(app: anytype, surface: *chasen.Surface, row: u16, item: HelpItem) !void {
     if (surface.size().width == 0) return;
-    const key_width: u16 = @min(10, surface.size().width);
-    try draw.copyClippedTextAt(surface, 0, row, item.key, .{ .bold = true });
+    const key_width: u16 = @min(12, surface.size().width);
+    var key_buffer: [16]u8 = undefined;
+    var left_buffer: [16]u8 = undefined;
+    var right_buffer: [16]u8 = undefined;
+    var pair_buffer: [40]u8 = undefined;
+    const key = switch (item.key) {
+        .text => |text| text,
+        .action => |action| app.keymap.display(action, key_buffer[0..]),
+        .pair => |pair| blk: {
+            const left = app.keymap.display(pair.left, left_buffer[0..]);
+            const right = app.keymap.display(pair.right, right_buffer[0..]);
+            break :blk std.fmt.bufPrint(pair_buffer[0..], "{s} / {s}", .{ left, right }) catch left;
+        },
+    };
+    try draw.copyClippedTextAt(surface, 0, row, key, .{ .bold = true });
     if (surface.size().width <= key_width) return;
     try draw.copyClippedTextAt(surface, key_width, row, item.description, .{});
 }
@@ -1575,23 +1615,18 @@ test "help popup max scroll helper separates outer and content sizes" {
     try std.testing.expectEqual(helpMaxScrollForContentSize(content), helpMaxScroll(outer));
 }
 
-const footer_items = [_]ui.key_hint.Item{
-    ui.key_hint.item("Tab", "focus"),
-    ui.key_hint.item("c", "commit"),
-    ui.key_hint.item("?", "help"),
-    ui.key_hint.item("q", "quit"),
-};
-
-const footer_hidden_sidebar_items = [_]ui.key_hint.Item{
-    ui.key_hint.item("B", "sidebar"),
-    ui.key_hint.item("c", "commit"),
-    ui.key_hint.item("?", "help"),
-    ui.key_hint.item("q", "quit"),
-};
-
 const HelpItem = struct {
-    key: []const u8,
+    key: HelpKey,
     description: []const u8,
+};
+
+const HelpKey = union(enum) {
+    text: []const u8,
+    action: keymap.PublicAction,
+    pair: struct {
+        left: keymap.PublicAction,
+        right: keymap.PublicAction,
+    },
 };
 
 const HelpSection = struct {
@@ -1600,51 +1635,51 @@ const HelpSection = struct {
 };
 
 const help_global_items = [_]HelpItem{
-    .{ .key = "Tab", .description = "focus sidebar / diff" },
-    .{ .key = "?", .description = "open / close help" },
-    .{ .key = "q", .description = "quit" },
-    .{ .key = "B", .description = "show / hide sidebar" },
-    .{ .key = "r", .description = "reload active repository" },
-    .{ .key = "R", .description = "switch repository" },
-    .{ .key = "c", .description = "open commit panel" },
-    .{ .key = "A", .description = "amend last commit" },
-    .{ .key = "D", .description = "discard selected file changes" },
-    .{ .key = "e", .description = "open selected file in editor" },
-    .{ .key = "a / N", .description = "approve / needs changes in review mode" },
-    .{ .key = "Home/End", .description = "first / last file" },
-    .{ .key = "g / G", .description = "first / last file" },
+    .{ .key = .{ .text = "Tab" }, .description = "focus sidebar / diff" },
+    .{ .key = .{ .action = .help }, .description = "open / close help" },
+    .{ .key = .{ .text = "q" }, .description = "quit" },
+    .{ .key = .{ .action = .toggle_sidebar }, .description = "show / hide sidebar" },
+    .{ .key = .{ .action = .reload }, .description = "reload active repository" },
+    .{ .key = .{ .action = .repo_picker }, .description = "switch repository" },
+    .{ .key = .{ .action = .commit }, .description = "open commit panel" },
+    .{ .key = .{ .action = .amend }, .description = "amend last commit" },
+    .{ .key = .{ .action = .discard }, .description = "discard selected file changes" },
+    .{ .key = .{ .action = .open_editor }, .description = "open selected file in editor" },
+    .{ .key = .{ .text = "a / N" }, .description = "approve / needs changes in review mode" },
+    .{ .key = .{ .text = "Home/End" }, .description = "first / last file" },
+    .{ .key = .{ .pair = .{ .left = .first_file, .right = .last_file } }, .description = "first / last file" },
 };
 
 const help_sidebar_items = [_]HelpItem{
-    .{ .key = "↑/↓ j/k", .description = "move selection" },
-    .{ .key = "Enter", .description = "toggle directory" },
-    .{ .key = "←/→", .description = "collapse / expand directory" },
-    .{ .key = "h / l", .description = "scroll file tree horizontally" },
-    .{ .key = "f", .description = "search files" },
-    .{ .key = "F", .description = "cycle file filter" },
-    .{ .key = "s", .description = "stage / unstage file or directory" },
-    .{ .key = "v", .description = "mark reviewed" },
-    .{ .key = "H / L", .description = "hide reviewed / line numbers" },
-    .{ .key = "[ / ]", .description = "resize sidebar" },
+    .{ .key = .{ .text = "↑/↓ j/k" }, .description = "move selection" },
+    .{ .key = .{ .text = "Enter" }, .description = "toggle directory" },
+    .{ .key = .{ .text = "←/→" }, .description = "collapse / expand directory" },
+    .{ .key = .{ .text = "h / l" }, .description = "scroll file tree horizontally" },
+    .{ .key = .{ .action = .file_search }, .description = "search files" },
+    .{ .key = .{ .action = .changed_file_filter }, .description = "cycle file filter" },
+    .{ .key = .{ .text = "s" }, .description = "stage / unstage file or directory" },
+    .{ .key = .{ .action = .mark_reviewed }, .description = "mark reviewed" },
+    .{ .key = .{ .pair = .{ .left = .hide_reviewed, .right = .toggle_line_numbers } }, .description = "hide reviewed / line numbers" },
+    .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize sidebar" },
 };
 
 const help_diff_items = [_]HelpItem{
-    .{ .key = "↑/↓ j/k", .description = "scroll" },
-    .{ .key = "PgUp/PgDn", .description = "page scroll" },
-    .{ .key = "←/→", .description = "horizontal scroll" },
-    .{ .key = "Enter", .description = "fold / unfold hunk" },
-    .{ .key = "/", .description = "search diff" },
-    .{ .key = "u", .description = "unified / side-by-side" },
-    .{ .key = "L", .description = "toggle line numbers" },
-    .{ .key = "J / K", .description = "next / previous hunk" },
-    .{ .key = "n / p", .description = "next / previous match or hunk" },
-    .{ .key = "N", .description = "previous search match" },
-    .{ .key = "s", .description = "stage / unstage hunk" },
+    .{ .key = .{ .text = "↑/↓ j/k" }, .description = "scroll" },
+    .{ .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "page scroll" },
+    .{ .key = .{ .text = "←/→" }, .description = "horizontal scroll" },
+    .{ .key = .{ .text = "Enter" }, .description = "fold / unfold hunk" },
+    .{ .key = .{ .action = .search }, .description = "search diff" },
+    .{ .key = .{ .action = .toggle_display_mode }, .description = "unified / side-by-side" },
+    .{ .key = .{ .action = .toggle_line_numbers }, .description = "toggle line numbers" },
+    .{ .key = .{ .text = "J / K" }, .description = "next / previous hunk" },
+    .{ .key = .{ .text = "n / p" }, .description = "next / previous match or hunk" },
+    .{ .key = .{ .text = "N" }, .description = "previous search match" },
+    .{ .key = .{ .text = "s" }, .description = "stage / unstage hunk" },
 };
 
 const help_mouse_items = [_]HelpItem{
-    .{ .key = "wheel", .description = "scroll pane under pointer" },
-    .{ .key = "click", .description = "focus pane / select sidebar row" },
+    .{ .key = .{ .text = "wheel" }, .description = "scroll pane under pointer" },
+    .{ .key = .{ .text = "click" }, .description = "focus pane / select sidebar row" },
 };
 
 const help_left_sections = [_]HelpSection{
