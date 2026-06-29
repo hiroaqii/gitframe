@@ -41,11 +41,19 @@ pub fn main(init: std.process.Init) !void {
     defer config_paths.deinit(init.gpa);
     var user_config = gitframe.config.loadConfig(init.gpa, init.io, config_paths.config);
     defer user_config.deinit();
+    var app_state = gitframe.config.loadState(init.gpa, init.io, config_paths.state);
+    defer app_state.deinit();
+    var recent_repos: gitframe.repo_state.RecentStore = .{};
+    errdefer recent_repos.deinit(init.gpa);
+    try recent_repos.loadFromRecentState(init.gpa, app_state.state.value.recent_repositories);
+
     const palette = gitframe.theme.Palette.fromConfig(user_config.config.value.theme);
     const effective_keymap = gitframe.keymap.Effective.fromConfig(user_config.config.value.keymap);
 
     if (config.stats_summary) {
         var summary: StatsSummary = .{};
+        const app_recent_repos = recent_repos;
+        recent_repos = .{};
         try chasen.runWith(.{
             .runtime = .{
                 .allocator = init.gpa,
@@ -65,6 +73,8 @@ pub fn main(init: std.process.Init) !void {
             .env_map = init.environ_map,
             .review_output = review_output_ptr,
             .user_config = user_config.config.value,
+            .state_path = config_paths.state,
+            .recent_repos = app_recent_repos,
             .keymap = effective_keymap,
             .theme = palette,
         });
@@ -73,6 +83,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    const app_recent_repos = recent_repos;
+    recent_repos = .{};
     try chasen.runWith(.{
         .runtime = .{
             .allocator = init.gpa,
@@ -90,6 +102,8 @@ pub fn main(init: std.process.Init) !void {
         .env_map = init.environ_map,
         .review_output = review_output_ptr,
         .user_config = user_config.config.value,
+        .state_path = config_paths.state,
+        .recent_repos = app_recent_repos,
         .keymap = effective_keymap,
         .theme = palette,
     });

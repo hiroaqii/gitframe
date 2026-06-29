@@ -3,7 +3,7 @@ const keymap = @import("keymap");
 const theme = @import("theme");
 
 const max_config_bytes = 64 * 1024;
-const supported_schema_version = 1;
+pub const supported_schema_version = 1;
 
 pub const editor_max_argv = 16;
 
@@ -49,7 +49,19 @@ pub const RemoteWorkflowConfig = struct {
     // agents, environment, keychains, or foreground prompts.
 };
 
-pub const RecentRepositoriesState = struct {};
+pub const RecentRepositoryKind = enum {
+    repo,
+    workspace,
+};
+
+pub const RecentRepositoryEntry = struct {
+    kind: RecentRepositoryKind,
+    path: []const u8,
+};
+
+pub const RecentRepositoriesState = struct {
+    entries: []const RecentRepositoryEntry = &.{},
+};
 
 pub const Paths = struct {
     config: ?[]u8 = null,

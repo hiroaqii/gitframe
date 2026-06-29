@@ -2,6 +2,7 @@ const app = @import("app.zig");
 pub const config = @import("config.zig");
 pub const context = @import("context.zig");
 pub const keymap = @import("keymap");
+pub const repo_state = @import("repo/state.zig");
 pub const review_session = @import("review/session.zig");
 pub const theme = @import("theme");
 const diff_source = @import("diff/source.zig");

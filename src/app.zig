@@ -219,6 +219,7 @@ const OverlayKind = app_state.OverlayKind;
 pub const App = struct {
     config: CliConfig = .{},
     user_config: config_mod.Config = .{},
+    state_path: ?[]const u8 = null,
     keymap: keymap.Effective = .{},
     theme: theme.Palette = .default(),
     env_map: ?*std.process.Environ.Map = null,
@@ -820,6 +821,7 @@ pub const App = struct {
             .empty => unreachable,
             .discovered => |discovery| {
                 try self.recent_repos.rememberDiscovery(ctx.allocator(), discovery);
+                self.persistRecentRepositories(ctx);
                 result = .empty;
                 self.repo_state.replace(ctx.allocator(), discovery);
 
@@ -2178,6 +2180,48 @@ pub const App = struct {
         self.status.set(fmt, args);
     }
 
+    fn persistRecentRepositories(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        const path = self.state_path orelse return;
+        saveRecentRepositoriesState(ctx.io(), path, &self.recent_repos) catch {
+            self.setStatus("could not save recent repositories", .{});
+        };
+    }
+
+    fn saveRecentRepositoriesState(
+        io: std.Io,
+        path: []const u8,
+        recent_repos: *const repo_state.RecentStore,
+    ) !void {
+        const parent = std.fs.path.dirname(path) orelse ".";
+        const basename = std.fs.path.basename(path);
+        try std.Io.Dir.cwd().createDirPath(io, parent);
+
+        var dir = try std.Io.Dir.openDirAbsolute(io, parent, .{});
+        defer dir.close(io);
+
+        var atomic_file = try dir.createFileAtomic(io, basename, .{ .make_path = false, .replace = true });
+        defer atomic_file.deinit(io);
+
+        var buffer: [4096]u8 = undefined;
+        var file_writer = atomic_file.file.writer(io, &buffer);
+        try writeStateJson(&file_writer.interface, recent_repos);
+        try file_writer.flush();
+        try atomic_file.replace(io);
+    }
+
+    fn writeStateJson(writer: *std.Io.Writer, recent_repos: *const repo_state.RecentStore) !void {
+        var stringify: std.json.Stringify = .{
+            .writer = writer,
+            .options = .{ .whitespace = .indent_2 },
+        };
+        try stringify.beginObject();
+        try stringify.objectField("schema_version");
+        try stringify.write(config_mod.supported_schema_version);
+        try stringify.objectField("recent_repositories");
+        try repo_state.writeRecentRepositoriesJson(recent_repos, &stringify);
+        try stringify.endObject();
+    }
+
     pub fn exportInitialSelectionContextJson(allocator: std.mem.Allocator, io: std.Io, config: CliConfig, writer: *std.Io.Writer) !void {
         var discovery: ?repo_discovery.DiscoveryResult = null;
         defer if (discovery) |*result| result.deinit(allocator);
@@ -3026,6 +3070,7 @@ pub const App = struct {
 
                 self.closeRepoPickerForSwitch(ctx.allocator());
                 try self.recent_repos.rememberRepo(ctx.allocator(), repos[repo_index].canonical_root);
+                self.persistRecentRepositories(ctx);
                 if (repo_index == self.repo_state.active_index) return;
 
                 try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root, true);
@@ -3179,6 +3224,7 @@ pub const App = struct {
         switch (owned_discovery) {
             .single_repo => |entry| {
                 try self.recent_repos.rememberRepo(ctx.allocator(), entry.canonical_root);
+                self.persistRecentRepositories(ctx);
                 self.closeRepoPickerForSwitch(ctx.allocator());
                 self.clearRepoPickerDiscovery(ctx.allocator());
                 self.repo_state.replace(ctx.allocator(), owned_discovery);
@@ -3189,6 +3235,7 @@ pub const App = struct {
             },
             .workspace => |workspace| {
                 try self.recent_repos.rememberWorkspace(ctx.allocator(), workspace.current_root);
+                self.persistRecentRepositories(ctx);
                 self.clearRepoPickerDiscovery(ctx.allocator());
                 self.repo_picker_discovery = owned_discovery;
                 owned_discovery = .{ .none = .{ .current_root = "" } };
@@ -3219,6 +3266,7 @@ pub const App = struct {
         }
 
         try self.recent_repos.rememberRepo(ctx.allocator(), workspace.repos[repo_index].canonical_root);
+        self.persistRecentRepositories(ctx);
         self.closeRepoPickerForSwitch(ctx.allocator());
         self.repo_state.replace(ctx.allocator(), discovery);
         discovery = .{ .none = .{ .current_root = "" } };
@@ -7570,6 +7618,33 @@ test "finishDiffLoad failure clears pending selection restore" {
     });
 
     try std.testing.expect(app.pending_selection_restore == null);
+}
+
+test "saveRecentRepositoriesState writes reloadable state atomically" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "nested", "state.json" });
+    defer allocator.free(path);
+
+    var store: repo_state.RecentStore = .{};
+    defer store.deinit(allocator);
+    try store.rememberWorkspace(allocator, "/tmp/work");
+    try store.rememberRepo(allocator, "/tmp/work/repo");
+
+    try App.saveRecentRepositoriesState(std.testing.io, path, &store);
+
+    var loaded = config_mod.loadState(allocator, std.testing.io, path);
+    defer loaded.deinit();
+    try std.testing.expect(loaded.warning == null);
+    try std.testing.expectEqual(@as(usize, 2), loaded.state.value.recent_repositories.entries.len);
+    try std.testing.expectEqual(config_mod.RecentRepositoryKind.repo, loaded.state.value.recent_repositories.entries[0].kind);
+    try std.testing.expectEqualStrings("/tmp/work/repo", loaded.state.value.recent_repositories.entries[0].path);
+    try std.testing.expectEqual(config_mod.RecentRepositoryKind.workspace, loaded.state.value.recent_repositories.entries[1].kind);
+    try std.testing.expectEqualStrings("/tmp/work", loaded.state.value.recent_repositories.entries[1].path);
 }
 
 fn expectSearchCoordinate(app: *const App, expected: diff_view_model.BodyCoordinate) !void {
