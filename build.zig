@@ -21,6 +21,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "chasen", .module = chasen_dep.module("chasen") },
         },
     });
+    const theme_mod = b.createModule(.{
+        .root_source_file = b.path("src/theme.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+        },
+    });
 
     const mod = b.addModule("gitframe", .{
         .root_source_file = b.path("src/root.zig"),
@@ -29,6 +37,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "chasen", .module = chasen_dep.module("chasen") },
             .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
             .{ .name = "draw", .module = draw_mod },
+            .{ .name = "theme", .module = theme_mod },
         },
     });
 
@@ -105,6 +114,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "chasen", .module = chasen_dep.module("chasen") },
                 .{ .name = "draw", .module = draw_mod },
+                .{ .name = "theme", .module = theme_mod },
             },
         }),
     });
@@ -167,6 +177,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "chasen", .module = chasen_dep.module("chasen") },
                 .{ .name = "draw", .module = draw_mod },
+                .{ .name = "theme", .module = theme_mod },
             },
         }),
     });
