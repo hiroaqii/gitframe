@@ -3,6 +3,8 @@ const std = @import("std");
 const max_config_bytes = 64 * 1024;
 const supported_schema_version = 1;
 
+pub const editor_max_argv = 16;
+
 pub const Config = struct {
     schema_version: u32 = supported_schema_version,
     editor: EditorConfig = .{},
@@ -17,7 +19,14 @@ pub const State = struct {
     recent_repositories: RecentRepositoriesState = .{},
 };
 
-pub const EditorConfig = struct {};
+pub const EditorConfig = struct {
+    argv: [editor_max_argv][]const u8 = undefined,
+    argv_len: u8 = 0,
+
+    pub fn argvSlice(self: *const EditorConfig) []const []const u8 {
+        return self.argv[0..self.argv_len];
+    }
+};
 pub const ThemeConfig = struct {};
 pub const KeymapConfig = struct {};
 pub const ExternalActionsConfig = struct {};
@@ -195,8 +204,14 @@ const TomlParseError = error{
     InvalidSection,
     InvalidKeyValue,
     InvalidInteger,
+    InvalidString,
+    InvalidArray,
+    UnsupportedEscape,
     UnknownSection,
     UnknownKey,
+    TooManyArguments,
+    MissingPathPlaceholder,
+    UnknownPlaceholder,
     UnsupportedSchemaVersion,
 };
 
@@ -226,10 +241,15 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
             },
             // Section names are reserved now so later settings can grow under a
             // stable TOML shape. Empty sections are valid in the foundation slice.
-            .editor, .theme, .keymap, .actions, .remote => return error.UnknownKey,
+            .editor => {
+                if (!std.mem.eql(u8, key, "argv")) return error.UnknownKey;
+                config.editor = try parseEditorArgv(value);
+            },
+            .theme, .keymap, .actions, .remote => return error.UnknownKey,
         }
     }
 
+    try validateEditorConfig(config.editor);
     if (config.schema_version != supported_schema_version) return error.UnsupportedSchemaVersion;
     return config;
 }
@@ -271,6 +291,78 @@ fn parseConfigSection(line: []const u8) TomlParseError!ConfigSection {
     if (std.mem.eql(u8, name, "actions")) return .actions;
     if (std.mem.eql(u8, name, "remote")) return .remote;
     return error.UnknownSection;
+}
+
+fn parseEditorArgv(value: []const u8) TomlParseError!EditorConfig {
+    if (value.len < 2 or value[0] != '[' or value[value.len - 1] != ']') return error.InvalidArray;
+    const inner = std.mem.trim(u8, value[1 .. value.len - 1], " \t\r");
+    if (inner.len == 0) return error.InvalidArray;
+
+    var config: EditorConfig = .{};
+    var index: usize = 0;
+    while (index < inner.len) {
+        if (config.argv_len >= editor_max_argv) return error.TooManyArguments;
+
+        while (index < inner.len and isTomlSpace(inner[index])) : (index += 1) {}
+        if (index >= inner.len) break;
+        if (inner[index] != '"') return error.InvalidString;
+
+        const start = index;
+        index += 1;
+        while (index < inner.len and inner[index] != '"') : (index += 1) {
+            if (inner[index] == '\\') return error.UnsupportedEscape;
+        }
+        if (index >= inner.len) return error.InvalidString;
+        const token = inner[start + 1 .. index];
+        index += 1;
+
+        config.argv[config.argv_len] = token;
+        config.argv_len += 1;
+
+        while (index < inner.len and isTomlSpace(inner[index])) : (index += 1) {}
+        if (index == inner.len) break;
+        if (inner[index] != ',') return error.InvalidArray;
+        index += 1;
+    }
+
+    if (config.argv_len == 0) return error.InvalidArray;
+    return config;
+}
+
+fn validateEditorConfig(editor: EditorConfig) TomlParseError!void {
+    if (editor.argv_len == 0) return;
+
+    const argv = editor.argvSlice();
+    if (argv[0].len == 0) return error.InvalidString;
+
+    var has_path = false;
+    for (argv) |arg| {
+        if (std.mem.indexOf(u8, arg, "{path}") != null) has_path = true;
+        try validatePlaceholders(arg);
+    }
+    if (!has_path) return error.MissingPathPlaceholder;
+}
+
+fn validatePlaceholders(arg: []const u8) TomlParseError!void {
+    var cursor: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, arg, cursor, '{')) |open| {
+        const close = std.mem.indexOfScalarPos(u8, arg, open + 1, '}') orelse return error.UnknownPlaceholder;
+        const placeholder = arg[open .. close + 1];
+        if (!isKnownPlaceholder(placeholder)) return error.UnknownPlaceholder;
+        cursor = close + 1;
+    }
+    if (std.mem.indexOfScalarPos(u8, arg, cursor, '}') != null) return error.UnknownPlaceholder;
+}
+
+fn isKnownPlaceholder(value: []const u8) bool {
+    return std.mem.eql(u8, value, "{path}") or
+        std.mem.eql(u8, value, "{line}") or
+        std.mem.eql(u8, value, "{column}") or
+        std.mem.eql(u8, value, "{repo_root}");
+}
+
+fn isTomlSpace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r';
 }
 
 fn loadJson(
@@ -417,4 +509,76 @@ test "loadConfig accepts reserved empty TOML sections" {
     defer result.deinit();
     try std.testing.expect(result.warning == null);
     try std.testing.expectEqual(@as(u32, supported_schema_version), result.config.value.schema_version);
+}
+
+test "loadConfig accepts editor argv template" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-editor-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[editor]
+        \\argv = ["nvim", "+{line}", "{path}"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expect(result.warning == null);
+    try std.testing.expectEqual(@as(u8, 3), result.config.value.editor.argv_len);
+    try std.testing.expectEqualStrings("nvim", result.config.value.editor.argv[0]);
+    try std.testing.expectEqualStrings("+{line}", result.config.value.editor.argv[1]);
+    try std.testing.expectEqualStrings("{path}", result.config.value.editor.argv[2]);
+}
+
+test "loadConfig rejects editor argv without path placeholder" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-editor-missing-path-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[editor]
+        \\argv = ["nvim", "+{line}"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects unknown editor placeholders" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-editor-unknown-placeholder-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[editor]
+        \\argv = ["nvim", "{path}", "{unknown}"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects empty editor command" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-editor-empty-command-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[editor]
+        \\argv = ["", "{path}"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
 }

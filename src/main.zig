@@ -37,6 +37,11 @@ pub fn main(init: std.process.Init) !void {
     defer review_output.deinit(init.gpa);
     const review_output_ptr: ?*gitframe.review_session.Output = if (config.review_mode) &review_output else null;
 
+    var config_paths = try gitframe.config.resolvePaths(init.gpa, init.environ_map);
+    defer config_paths.deinit(init.gpa);
+    var user_config = gitframe.config.loadConfig(init.gpa, init.io, config_paths.config);
+    defer user_config.deinit();
+
     if (config.stats_summary) {
         var summary: StatsSummary = .{};
         try chasen.runWith(.{
@@ -53,7 +58,12 @@ pub fn main(init: std.process.Init) !void {
                 // in the terminal/input-method layer.
                 .keyboard_protocol = .legacy,
             },
-        }, gitframe.App{ .config = config, .env_map = init.environ_map, .review_output = review_output_ptr });
+        }, gitframe.App{
+            .config = config,
+            .env_map = init.environ_map,
+            .review_output = review_output_ptr,
+            .user_config = user_config.config.value,
+        });
         try printStatsSummary(init.io, summary);
         try finishReviewOutputIfNeeded(init.io, config, &review_output);
         return;
@@ -71,7 +81,12 @@ pub fn main(init: std.process.Init) !void {
             // in the terminal/input-method layer.
             .keyboard_protocol = .legacy,
         },
-    }, gitframe.App{ .config = config, .env_map = init.environ_map, .review_output = review_output_ptr });
+    }, gitframe.App{
+        .config = config,
+        .env_map = init.environ_map,
+        .review_output = review_output_ptr,
+        .user_config = user_config.config.value,
+    });
     try finishReviewOutputIfNeeded(init.io, config, &review_output);
 }
 

@@ -17,6 +17,7 @@ const app_view = @import("app/view.zig");
 const app_git_requests = @import("app/git_requests.zig");
 const context = @import("context.zig");
 const context_export = @import("context_export.zig");
+const config_mod = @import("config.zig");
 const diff_parser = @import("diff/parser.zig");
 const diff_file = @import("diff/file.zig");
 const diff_hunk_projection = @import("diff/hunk_projection.zig");
@@ -215,6 +216,7 @@ const OverlayKind = app_state.OverlayKind;
 
 pub const App = struct {
     config: CliConfig = .{},
+    user_config: config_mod.Config = .{},
     env_map: ?*std.process.Environ.Map = null,
     review_output: ?*review_session.Output = null,
     allocator: ?std.mem.Allocator = null,
@@ -2020,15 +2022,30 @@ pub const App = struct {
             },
         };
 
-        var argv_buf: [editor.max_argv][]const u8 = undefined;
-        const argv = editor.argv(self.env_map, target.path, &argv_buf);
-        if (argv.len == 0) {
+        var argv = editor.build(ctx.allocator(), self.user_config.editor, self.env_map, .{
+            .repo_root = target.repo_root,
+            .path = target.path,
+            .line = self.editorTargetLine(),
+            .column = 1,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.EmptyArgv => {
+                self.setStatus("editor command is empty", .{});
+                return;
+            },
+            error.MissingPathPlaceholder, error.UnknownPlaceholder, error.TooManyArguments => {
+                self.setStatus("editor config invalid: {s}", .{@errorName(err)});
+                return;
+            },
+        };
+        defer argv.deinit(ctx.allocator());
+        if (argv.argv.len == 0) {
             self.setStatus("editor command is empty", .{});
             return;
         }
 
         _ = ctx.terminal().runForegroundCommand(.{
-            .argv = argv,
+            .argv = argv.argv,
             .cwd = target.repo_root,
             .finished = editorDone,
         }) catch |err| switch (err) {
@@ -2040,7 +2057,7 @@ pub const App = struct {
                 self.setStatus("editor command is empty", .{});
                 return;
             },
-            else => return err,
+            error.OutOfMemory => return err,
         };
         self.setStatus("opening editor: {s}", .{target.path});
     }
@@ -2085,6 +2102,39 @@ pub const App = struct {
         const selected_key = diff_file.canonicalPathKey(file) orelse return false;
         if (!std.mem.eql(u8, selected_key, path_key)) return false;
         return diff_file.status(file) == .deleted;
+    }
+
+    fn editorTargetLine(self: *const App) ?u32 {
+        const file = self.selectedFile() orelse return null;
+        return switch (self.viewer.diff_cursor) {
+            .hunk_line => |line| worktreeLineForHunkLine(file, line.hunk_index, line.line_index),
+            .hunk_header => |hunk_index| worktreeLineForHunkLine(file, hunk_index, 0),
+            else => null,
+        };
+    }
+
+    fn worktreeLineForHunkLine(file: diff_parser.FileDiff, hunk_index: usize, line_index: usize) ?u32 {
+        if (hunk_index >= file.hunks.len) return null;
+        const lines = file.hunks[hunk_index].lines;
+        if (lines.len == 0) return null;
+
+        if (line_index < lines.len) {
+            if (lines[line_index].new_line) |line| return line;
+        }
+
+        var index = line_index;
+        while (index < lines.len) : (index += 1) {
+            if (lines[index].new_line) |line| return line;
+        }
+
+        index = @min(line_index, lines.len - 1);
+        while (true) {
+            if (lines[index].new_line) |line| return line;
+            if (index == 0) break;
+            index -= 1;
+        }
+
+        return null;
     }
 
     fn finishEditorCommand(self: *App, ctx: *chasen.Ctx(Msg), result: chasen.ForegroundCommandResult) !void {
