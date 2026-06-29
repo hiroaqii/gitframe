@@ -6,6 +6,8 @@ const max_config_bytes = 64 * 1024;
 pub const supported_schema_version = 1;
 
 pub const editor_max_argv = 16;
+pub const max_external_actions = 16;
+pub const max_external_action_argv = 32;
 
 pub const Config = struct {
     schema_version: u32 = supported_schema_version,
@@ -41,7 +43,31 @@ pub const ThemeConfig = struct {
     }
 };
 pub const KeymapConfig = keymap.Config;
-pub const ExternalActionsConfig = struct {};
+pub const ExternalActionsConfig = struct {
+    items: [max_external_actions]ExternalActionConfig = undefined,
+    len: u8 = 0,
+
+    pub fn slice(self: *const ExternalActionsConfig) []const ExternalActionConfig {
+        return self.items[0..self.len];
+    }
+};
+
+pub const ExternalActionInput = enum {
+    selection_context,
+    review_context,
+};
+
+pub const ExternalActionConfig = struct {
+    id: []const u8 = "",
+    label: ?[]const u8 = null,
+    argv: [max_external_action_argv][]const u8 = undefined,
+    argv_len: u8 = 0,
+    stdin: ExternalActionInput = .selection_context,
+
+    pub fn argvSlice(self: *const ExternalActionConfig) []const []const u8 {
+        return self.argv[0..self.argv_len];
+    }
+};
 
 pub const RemoteWorkflowConfig = struct {
     // Remote workflow config may hold policy/command preferences, but never
@@ -233,17 +259,27 @@ const TomlParseError = error{
     UnsupportedEscape,
     InvalidColor,
     InvalidKeyBinding,
+    InvalidActionId,
+    InvalidActionInput,
     UnknownSection,
     UnknownKey,
     TooManyArguments,
+    TooManyActions,
     MissingPathPlaceholder,
+    MissingActionId,
+    MissingActionArgv,
     UnknownPlaceholder,
+    DuplicateKey,
+    DuplicateActionId,
     UnsupportedSchemaVersion,
 };
 
 fn parseConfigToml(input: []const u8) TomlParseError!Config {
     var config: Config = .{};
     var section: ConfigSection = .root;
+    var action_state: ?ExternalActionParseState = null;
+    var saw_empty_actions_section = false;
+    var saw_actions_array = false;
 
     var lines = std.mem.splitScalar(u8, input, '\n');
     while (lines.next()) |raw_line| {
@@ -251,7 +287,20 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
         if (line.len == 0) continue;
 
         if (line[0] == '[') {
-            section = try parseConfigSection(line);
+            if (isActionsArrayHeader(line)) {
+                if (saw_empty_actions_section) return error.InvalidSection;
+                try flushExternalAction(&config.actions, &action_state);
+                saw_actions_array = true;
+                action_state = .{};
+                section = .action_entry;
+            } else {
+                try flushExternalAction(&config.actions, &action_state);
+                section = try parseConfigSection(line);
+                if (section == .actions) {
+                    if (saw_actions_array) return error.InvalidSection;
+                    saw_empty_actions_section = true;
+                }
+            }
             continue;
         }
 
@@ -281,11 +330,20 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
                 const spec = keymap.parseKeySpec(spec_text) orelse return error.InvalidKeyBinding;
                 config.keymap.set(action, spec);
             },
+            .action_entry => {
+                if (action_state) |*state| {
+                    try parseExternalActionField(state, key, value);
+                } else {
+                    return error.InvalidSection;
+                }
+            },
             .actions, .remote => return error.UnknownKey,
         }
     }
+    try flushExternalAction(&config.actions, &action_state);
 
     try validateEditorConfig(config.editor);
+    try validateExternalActionsConfig(config.actions);
     if (!keymap.validateConfig(config.keymap)) return error.InvalidKeyBinding;
     if (config.schema_version != supported_schema_version) return error.UnsupportedSchemaVersion;
     return config;
@@ -297,6 +355,7 @@ const ConfigSection = enum {
     theme,
     keymap,
     actions,
+    action_entry,
     remote,
 };
 
@@ -330,15 +389,84 @@ fn parseConfigSection(line: []const u8) TomlParseError!ConfigSection {
     return error.UnknownSection;
 }
 
+fn isActionsArrayHeader(line: []const u8) bool {
+    if (line.len < 4) return false;
+    if (line[0] != '[' or line[1] != '[') return false;
+    if (line[line.len - 1] != ']' or line[line.len - 2] != ']') return false;
+    const name = std.mem.trim(u8, line[2 .. line.len - 2], " \t\r");
+    return std.mem.eql(u8, name, "actions");
+}
+
+const ExternalActionParseState = struct {
+    value: ExternalActionConfig = .{},
+    seen_id: bool = false,
+    seen_label: bool = false,
+    seen_argv: bool = false,
+    seen_stdin: bool = false,
+};
+
+fn flushExternalAction(config: *ExternalActionsConfig, state: *?ExternalActionParseState) TomlParseError!void {
+    const current = state.* orelse return;
+    if (config.len >= max_external_actions) return error.TooManyActions;
+    try validateExternalActionConfig(current.value, current.seen_id, current.seen_argv);
+
+    config.items[config.len] = current.value;
+    config.len += 1;
+    state.* = null;
+}
+
+fn parseExternalActionField(state: *ExternalActionParseState, key: []const u8, value: []const u8) TomlParseError!void {
+    if (std.mem.eql(u8, key, "id")) {
+        if (state.seen_id) return error.DuplicateKey;
+        const id = try parseTomlString(value);
+        if (!isValidExternalActionId(id)) return error.InvalidActionId;
+        state.value.id = id;
+        state.seen_id = true;
+    } else if (std.mem.eql(u8, key, "label")) {
+        if (state.seen_label) return error.DuplicateKey;
+        const label = try parseTomlString(value);
+        if (label.len == 0) return error.InvalidString;
+        state.value.label = label;
+        state.seen_label = true;
+    } else if (std.mem.eql(u8, key, "argv")) {
+        if (state.seen_argv) return error.DuplicateKey;
+        try parseStringArrayInto(max_external_action_argv, &state.value.argv, &state.value.argv_len, value);
+        state.seen_argv = true;
+    } else if (std.mem.eql(u8, key, "stdin")) {
+        if (state.seen_stdin) return error.DuplicateKey;
+        state.value.stdin = try parseExternalActionInput(value);
+        state.seen_stdin = true;
+    } else {
+        return error.UnknownKey;
+    }
+}
+
+fn parseExternalActionInput(value: []const u8) TomlParseError!ExternalActionInput {
+    const text = try parseTomlString(value);
+    if (std.mem.eql(u8, text, "selection_context")) return .selection_context;
+    if (std.mem.eql(u8, text, "review_context")) return .review_context;
+    return error.InvalidActionInput;
+}
+
 fn parseEditorArgv(value: []const u8) TomlParseError!EditorConfig {
+    var config: EditorConfig = .{};
+    try parseStringArrayInto(editor_max_argv, &config.argv, &config.argv_len, value);
+    return config;
+}
+
+fn parseStringArrayInto(
+    comptime max_len: usize,
+    output: *[max_len][]const u8,
+    len: *u8,
+    value: []const u8,
+) TomlParseError!void {
     if (value.len < 2 or value[0] != '[' or value[value.len - 1] != ']') return error.InvalidArray;
     const inner = std.mem.trim(u8, value[1 .. value.len - 1], " \t\r");
     if (inner.len == 0) return error.InvalidArray;
 
-    var config: EditorConfig = .{};
     var index: usize = 0;
     while (index < inner.len) {
-        if (config.argv_len >= editor_max_argv) return error.TooManyArguments;
+        if (@as(usize, len.*) >= max_len) return error.TooManyArguments;
 
         while (index < inner.len and isTomlSpace(inner[index])) : (index += 1) {}
         if (index >= inner.len) break;
@@ -353,8 +481,8 @@ fn parseEditorArgv(value: []const u8) TomlParseError!EditorConfig {
         const token = inner[start + 1 .. index];
         index += 1;
 
-        config.argv[config.argv_len] = token;
-        config.argv_len += 1;
+        output[@as(usize, len.*)] = token;
+        len.* += 1;
 
         while (index < inner.len and isTomlSpace(inner[index])) : (index += 1) {}
         if (index == inner.len) break;
@@ -362,8 +490,7 @@ fn parseEditorArgv(value: []const u8) TomlParseError!EditorConfig {
         index += 1;
     }
 
-    if (config.argv_len == 0) return error.InvalidArray;
-    return config;
+    if (len.* == 0) return error.InvalidArray;
 }
 
 fn validateEditorConfig(editor: EditorConfig) TomlParseError!void {
@@ -378,6 +505,49 @@ fn validateEditorConfig(editor: EditorConfig) TomlParseError!void {
         try validatePlaceholders(arg);
     }
     if (!has_path) return error.MissingPathPlaceholder;
+}
+
+fn validateExternalActionConfig(action: ExternalActionConfig, seen_id: bool, seen_argv: bool) TomlParseError!void {
+    if (!seen_id) return error.MissingActionId;
+    if (!seen_argv) return error.MissingActionArgv;
+
+    // Keep the entry-level contract here even when field parsers already reject
+    // the same bad values; callers that construct this type directly get the
+    // same validation boundary as TOML-loaded config.
+    if (!isValidExternalActionId(action.id)) return error.InvalidActionId;
+    if (action.argv_len == 0) return error.MissingActionArgv;
+
+    for (action.argvSlice()) |arg| {
+        if (arg.len == 0) return error.InvalidString;
+        try validatePlaceholders(arg);
+    }
+}
+
+fn validateExternalActionsConfig(actions: ExternalActionsConfig) TomlParseError!void {
+    const items = actions.slice();
+    for (items, 0..) |action, i| {
+        var other_index = i + 1;
+        while (other_index < items.len) : (other_index += 1) {
+            if (std.mem.eql(u8, action.id, items[other_index].id)) {
+                return error.DuplicateActionId;
+            }
+        }
+    }
+}
+
+fn isValidExternalActionId(id: []const u8) bool {
+    if (id.len == 0) return false;
+    if (!isActionIdAlphaNum(id[0])) return false;
+    for (id[1..]) |byte| {
+        if (!isActionIdAlphaNum(byte) and byte != '_' and byte != '-') return false;
+    }
+    return true;
+}
+
+fn isActionIdAlphaNum(byte: u8) bool {
+    return (byte >= 'a' and byte <= 'z') or
+        (byte >= 'A' and byte <= 'Z') or
+        (byte >= '0' and byte <= '9');
 }
 
 fn parseThemeColor(value: []const u8) TomlParseError!theme.ColorValue {
@@ -396,6 +566,9 @@ fn parseTomlString(value: []const u8) TomlParseError![]const u8 {
 fn validatePlaceholders(arg: []const u8) TomlParseError!void {
     var cursor: usize = 0;
     while (std.mem.indexOfScalarPos(u8, arg, cursor, '{')) |open| {
+        if (std.mem.indexOfScalarPos(u8, arg, cursor, '}')) |stray| {
+            if (stray < open) return error.UnknownPlaceholder;
+        }
         const close = std.mem.indexOfScalarPos(u8, arg, open + 1, '}') orelse return error.UnknownPlaceholder;
         const placeholder = arg[open .. close + 1];
         if (!isKnownPlaceholder(placeholder)) return error.UnknownPlaceholder;
@@ -582,6 +755,25 @@ test "loadConfig accepts editor argv template" {
     try std.testing.expectEqualStrings("{path}", result.config.value.editor.argv[2]);
 }
 
+test "loadConfig accepts editor argv empty non-command argument" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-editor-empty-arg-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[editor]
+        \\argv = ["sh", "-c", "exec nvim", "", "{path}"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expect(result.warning == null);
+    try std.testing.expectEqual(@as(u8, 5), result.config.value.editor.argv_len);
+    try std.testing.expectEqualStrings("", result.config.value.editor.argv[3]);
+}
+
 test "loadConfig accepts theme color overrides" {
     const allocator = std.testing.allocator;
     const path = "zig-cache/tmp/gitframe-theme-config.toml";
@@ -622,6 +814,295 @@ test "loadConfig accepts keymap overrides" {
     try std.testing.expect(result.warning == null);
     try std.testing.expect(result.config.value.keymap.get(.commit).?.eql(.{ .plain_codepoint = 'm' }));
     try std.testing.expect(result.config.value.keymap.get(.repo_picker).?.eql(.{ .shifted_ascii = .{ .lower = 'p', .upper = 'P' } }));
+}
+
+test "loadConfig accepts external action definitions" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\
+        \\[[actions]]
+        \\id = "ai-review-selection"
+        \\label = "AI review selection"
+        \\argv = ["gitframe-ai-review", "--input-json", "{path}"]
+        \\stdin = "selection_context"
+        \\
+        \\[[actions]]
+        \\id = "copy_context"
+        \\argv = ["cat"]
+        \\stdin = "review_context"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expect(result.warning == null);
+
+    const actions = result.config.value.actions.slice();
+    try std.testing.expectEqual(@as(usize, 2), actions.len);
+    try std.testing.expectEqualStrings("ai-review-selection", actions[0].id);
+    try std.testing.expectEqualStrings("AI review selection", actions[0].label.?);
+    try std.testing.expectEqual(@as(u8, 3), actions[0].argv_len);
+    try std.testing.expectEqualStrings("gitframe-ai-review", actions[0].argv[0]);
+    try std.testing.expectEqualStrings("{path}", actions[0].argv[2]);
+    try std.testing.expectEqual(ExternalActionInput.selection_context, actions[0].stdin);
+    try std.testing.expectEqualStrings("copy_context", actions[1].id);
+    try std.testing.expect(actions[1].label == null);
+    try std.testing.expectEqual(ExternalActionInput.review_context, actions[1].stdin);
+}
+
+test "loadConfig accepts empty actions section" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-empty-section-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[actions]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expect(result.warning == null);
+    try std.testing.expectEqual(@as(usize, 0), result.config.value.actions.slice().len);
+}
+
+test "loadConfig rejects mixed actions table forms" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-mixed-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[actions]
+        \\
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects invalid external action ids" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-invalid-id-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\id = "-bad"
+        \\argv = ["tool"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects duplicate external action ids" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-duplicate-id-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["other-tool"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects external action missing required fields" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-missing-required-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\label = "No argv"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects external action missing id" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-missing-id-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\argv = ["tool"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects invalid external action argv" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-invalid-argv-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool", ""]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects too many external actions" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-too-many-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\id = "tool0"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool1"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool2"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool3"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool4"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool5"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool6"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool7"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool8"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool9"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool10"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool11"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool12"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool13"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool14"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool15"
+        \\argv = ["tool"]
+        \\[[actions]]
+        \\id = "tool16"
+        \\argv = ["tool"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects too many external action argv items" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-too-many-argv-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10", "a11", "a12", "a13", "a14", "a15", "a16", "a17", "a18", "a19", "a20", "a21", "a22", "a23", "a24", "a25", "a26", "a27", "a28", "a29", "a30", "a31", "a32"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects unknown external action stdin values" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-unknown-stdin-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\stdin = "everything"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects unknown external action keys" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-unknown-key-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\command = "tool"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
 }
 
 test "loadConfig rejects invalid keymap overrides" {
@@ -721,6 +1202,23 @@ test "loadConfig rejects unknown editor placeholders" {
         \\schema_version = 1
         \\[editor]
         \\argv = ["nvim", "{path}", "{unknown}"]
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects stray editor placeholder closing brace" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-editor-stray-placeholder-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[editor]
+        \\argv = ["nvim", "}{path}", "{path}"]
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
