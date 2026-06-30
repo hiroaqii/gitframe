@@ -32,6 +32,10 @@ const help_column_gap: u16 = 2;
 const help_header_rows: u16 = 2;
 const help_scroll_indicator_rows: u16 = 1;
 const commit_dialog_width: u16 = 72;
+const repo_picker_dialog_width: u16 = 78;
+const repo_picker_filter_input_col: u16 = 8;
+const repo_picker_path_input_col: u16 = 11;
+const repo_picker_list_label_col: u16 = 4;
 const commit_dialog_height: u16 = 22;
 const confirmation_dialog_width: u16 = 72;
 const confirmation_dialog_height: u16 = 9;
@@ -819,10 +823,37 @@ fn footerKeyHintOptions() ui.key_hint.DrawOptions {
     };
 }
 
+const RepoPickerLayout = struct {
+    list_title_row: u16,
+    list_start_row: u16,
+    footer_rows: u16,
+    footer_row: u16,
+    detail_row: ?u16,
+};
+
+fn repoPickerLayout(height: u16, has_path_status: bool) RepoPickerLayout {
+    const list_title_row: u16 = if (has_path_status) 3 else 2;
+    // Reserve bottom rows from the outside in: footer, optional spacer, and
+    // optional selected-path detail. The list viewport then uses the remainder.
+    const reserved_footer_rows: u16 = if (height > 9) 4 else if (height > 8) 3 else if (height > 7) 2 else if (height > 6) 1 else 0;
+    const detail_row: ?u16 = if (reserved_footer_rows > 1)
+        if (reserved_footer_rows > 2) height - 3 else height - 2
+    else
+        null;
+
+    return .{
+        .list_title_row = list_title_row,
+        .list_start_row = list_title_row + 1,
+        .footer_rows = reserved_footer_rows,
+        .footer_row = if (reserved_footer_rows > 0) height - 1 else 0,
+        .detail_row = detail_row,
+    };
+}
+
 fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
     const modal = ui.Modal.init(.{});
     const opts: ui.Modal.ViewOptions = .{
-        .dialog_width = @min(surface.size().width, 88),
+        .dialog_width = @min(surface.size().width, repo_picker_dialog_width),
         .dialog_height = @min(surface.size().height, 18),
         .title = "Switch repository",
         .backdrop = false,
@@ -841,17 +872,18 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
         .list => _ = content.borrowTextAt(0, 0, "Repository list", .{ .fg = color_prompt, .bold = true }),
         .filter => {
             _ = content.borrowTextAt(0, 0, "Filter: ", .{ .fg = color_prompt, .bold = true });
-            try drawCommitInputLine(&content, 8, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor, .{ .fg = color_prompt });
-            showInputCursor(&content, 8, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor);
+            try drawCommitInputLine(&content, repo_picker_filter_input_col, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor, .{ .fg = color_prompt });
+            showInputCursor(&content, repo_picker_filter_input_col, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor);
         },
         .path_input => {
-            _ = content.borrowTextAt(0, 0, "Path: ", .{ .fg = color_prompt, .bold = true });
-            try drawCommitInputLine(&content, 6, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor, .{ .fg = color_prompt });
-            showInputCursor(&content, 6, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor);
+            _ = content.borrowTextAt(0, 0, "Repo path: ", .{ .fg = color_prompt, .bold = true });
+            try drawCommitInputLine(&content, repo_picker_path_input_col, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor, .{ .fg = color_prompt });
+            showInputCursor(&content, repo_picker_path_input_col, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor);
         },
     }
 
-    if (size.height > 1) {
+    const has_path_status = app.repo_picker.path_pending or app.repo_picker.path_error != null;
+    if (size.height > 1 and has_path_status) {
         if (app.repo_picker.path_pending) {
             _ = content.borrowTextAt(0, 1, "checking path...", .{ .fg = .gray });
         } else if (app.repo_picker.path_error) |err| {
@@ -860,40 +892,32 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
     }
 
     if (size.height <= 3) return;
+    const layout = repoPickerLayout(size.height, has_path_status);
     const list_title = try app_repo_picker.listTitle(content.frameAllocator(), app.repo_picker_discovery, app.repo_state.discovery, &app.recent_repos);
-    try draw.copyClippedTextAt(&content, 0, 3, list_title, .{ .fg = color_accent, .bold = true });
+    try draw.copyClippedTextAt(&content, 0, layout.list_title_row, list_title, .{ .fg = color_accent, .bold = true });
 
-    const repo_picker_footer_rows: u16 = if (size.height > 7) 2 else if (size.height > 6) 1 else 0;
     defer {
-        if (repo_picker_footer_rows > 0) {
+        if (layout.footer_rows > 0) {
             const has_row = app.repo_picker.list.filter.labels.len > 0;
-            const hint = switch (app.repo_picker.input_mode) {
-                .path_input => "Enter: open path    Esc: list",
-                .filter => "Enter: open selected    Up/Down: select row    Esc: list",
-                .list => if (has_row)
-                    "Enter: open selected    /: filter    p: path    d: remove recent    b/Esc: back    q: close"
-                else
-                    "p: path    Esc/q: close",
-            };
-            draw.copyClippedTextAt(&content, 0, size.height - 1, hint, .{ .fg = .gray }) catch {};
+            drawRepoPickerFooter(&content, layout.footer_row, app.repo_picker.input_mode, has_row);
         }
     }
 
     if (app.repo_picker.list.filter.labels.len == 0) {
-        if (size.height > 4) {
+        if (size.height > layout.list_start_row) {
             const empty_text = if (app.repo_picker.input_mode == .filter and app.repo_picker.list.input.len > 0)
                 "No matching repositories."
             else
                 "No recent repositories yet.";
-            _ = content.borrowTextAt(2, 4, empty_text, .{ .fg = .gray });
+            _ = content.borrowTextAt(2, layout.list_start_row, empty_text, .{ .fg = .gray });
         }
         return;
     }
 
-    const rows = size.height - 4 - repo_picker_footer_rows;
+    const rows = size.height -| layout.list_start_row -| layout.footer_rows;
     const focused = app.repo_picker.list.filter.list.focusedIndex();
     const range = ui.ListViewport.visibleRange(app.repo_picker.list.filter.labels.len, focused, rows);
-    var row: u16 = 4;
+    var row: u16 = layout.list_start_row;
     var visible_index: usize = range.start;
     while (visible_index < range.end) : ({
         visible_index += 1;
@@ -902,7 +926,8 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
         const source_index = app.repo_picker.list.filter.sourceIndex(visible_index) orelse continue;
         const label = app.repo_picker.list.filter.labels[visible_index];
         const item = if (source_index < app.repo_picker_items.items.len) app.repo_picker_items.items[source_index] else null;
-        const focused_row = visible_index == focused;
+        const list_active = app.repo_picker.input_mode == .list or app.repo_picker.input_mode == .filter;
+        const focused_row = list_active and visible_index == focused;
         const active = if (item) |repo_item|
             switch (repo_item.source) {
                 .active_repo => true,
@@ -914,32 +939,80 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
         const style: chasen.TextStyle = if (focused_row)
             .{ .reverse = true, .bold = true }
         else if (active)
-            .{ .fg = color_staged, .bold = true }
+            .{ .fg = color_staged, .bold = true, .dim = !list_active }
         else
-            .{};
+            .{ .dim = !list_active };
         const marker = if (focused_row) ">" else " ";
         const active_marker = if (active) "*" else " ";
         _ = content.borrowTextAt(0, row, marker, style);
         _ = content.borrowTextAt(2, row, active_marker, style);
         var label_area = content.child(.{
-            .col = 4,
+            .col = repo_picker_list_label_col,
             .row = row,
-            .width = if (size.width > 4) size.width - 4 else 0,
+            .width = size.width -| repo_picker_list_label_col,
             .height = 1,
         });
         try draw.copyClippedTextAt(&label_area, 0, 0, label, style);
     }
 
-    if (repo_picker_footer_rows > 1) {
-        const detail_row = size.height - 2;
+    if (layout.detail_row) |detail_row| {
+        const total = app.repo_picker.list.filter.labels.len;
+        const position_text = if (total > 1)
+            try std.fmt.allocPrint(content.frameAllocator(), "{d}/{d}", .{ @min(focused + 1, total), total })
+        else
+            "";
+        const position_width = chasen.text.displayWidth(position_text);
+        const detail_width = if (position_width > 0 and size.width > position_width + 1)
+            size.width - position_width - 1
+        else
+            size.width;
+        const detail_col: u16 = if (size.width > repo_picker_list_label_col) repo_picker_list_label_col else 0;
+        const detail_text_width = detail_width -| detail_col;
         const focused_source_index = app.repo_picker.list.filter.sourceIndex(focused);
         if (focused_source_index) |source_index| {
             if (source_index < app.repo_picker_items.items.len) {
                 const detail = app.repo_picker_items.items[source_index].detail;
-                try draw.copyClippedTextAt(&content, 0, detail_row, detail, .{ .fg = .gray });
+                var detail_area = content.child(.{
+                    .col = detail_col,
+                    .row = detail_row,
+                    .width = detail_text_width,
+                    .height = 1,
+                });
+                try draw.copyClippedTextAt(&detail_area, 0, 0, detail, .{ .fg = .gray });
             }
         }
+        if (position_width > 0 and size.width > position_width) {
+            try draw.copyClippedTextAt(&content, size.width - position_width, detail_row, position_text, .{ .fg = .gray });
+        }
     }
+}
+
+fn drawRepoPickerFooter(surface: *chasen.Surface, row: u16, input_mode: anytype, has_row: bool) void {
+    const Item = ui.key_hint.Item;
+    const items: []const Item = switch (input_mode) {
+        .path_input => &.{
+            ui.key_hint.item("Enter", "open path"),
+            ui.key_hint.item("Esc", "list"),
+        },
+        .filter => &.{
+            ui.key_hint.item("Enter", "open selected"),
+            ui.key_hint.item("Up/Down", "select row"),
+            ui.key_hint.item("Esc", "list"),
+        },
+        .list => if (has_row) &.{
+            ui.key_hint.item("p", "repo path"),
+            ui.key_hint.item("/", "filter"),
+            ui.key_hint.item("d", "remove recent"),
+            ui.key_hint.item("b/Esc", "back"),
+            ui.key_hint.item("q", "close"),
+        } else &.{
+            ui.key_hint.item("p", "repo path"),
+            ui.key_hint.item("Esc/q", "close"),
+        },
+    };
+
+    const opts = footerKeyHintOptions();
+    _ = ui.key_hint.draw(surface, 0, row, items, opts);
 }
 
 fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
