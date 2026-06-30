@@ -2,6 +2,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const app_commit_panel = @import("commit_panel.zig");
+const app_repo_picker = @import("repo_picker.zig");
 const draw = @import("draw");
 const diff_render = @import("../diff/render.zig");
 const git_status = @import("../git/status.zig");
@@ -796,9 +797,9 @@ fn footerKeyHintOptions() ui.key_hint.DrawOptions {
 fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
     const modal = ui.Modal.init(.{});
     const opts: ui.Modal.ViewOptions = .{
-        .dialog_width = 64,
-        .dialog_height = 14,
-        .title = "Repositories",
+        .dialog_width = @min(surface.size().width, 88),
+        .dialog_height = @min(surface.size().height, 18),
+        .title = "Switch repository",
         .backdrop = false,
         .border = .rounded,
         .title_style = .{ .bold = true, .fg = color_accent },
@@ -811,41 +812,63 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
     var content = surface.child(content_rect);
     const size = content.size();
 
-    if (app.repo_picker.prompt_mode == .path_input) {
-        _ = content.borrowTextAt(0, 0, "path: ", .{ .fg = color_prompt, .bold = true });
-        try drawCommitInputLine(&content, 6, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor, .{ .fg = color_prompt });
-        showInputCursor(&content, 6, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor);
-        if (app.repo_picker.path_pending and size.width > 16) {
-            _ = content.borrowTextAt(0, 2, "checking path...", .{ .fg = .gray });
+    switch (app.repo_picker.input_mode) {
+        .list => _ = content.borrowTextAt(0, 0, "Repository list", .{ .fg = color_prompt, .bold = true }),
+        .filter => {
+            _ = content.borrowTextAt(0, 0, "Filter: ", .{ .fg = color_prompt, .bold = true });
+            try drawCommitInputLine(&content, 8, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor, .{ .fg = color_prompt });
+            showInputCursor(&content, 8, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor);
+        },
+        .path_input => {
+            _ = content.borrowTextAt(0, 0, "Path: ", .{ .fg = color_prompt, .bold = true });
+            try drawCommitInputLine(&content, 6, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor, .{ .fg = color_prompt });
+            showInputCursor(&content, 6, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor);
+        },
+    }
+
+    if (size.height > 1) {
+        if (app.repo_picker.path_pending) {
+            _ = content.borrowTextAt(0, 1, "checking path...", .{ .fg = .gray });
         } else if (app.repo_picker.path_error) |err| {
-            _ = content.borrowTextAt(0, 2, err.message(), .{ .fg = color_danger });
-        } else if (size.height > 2) {
-            _ = content.borrowTextAt(0, 2, "Enter: open path  Esc: back", .{ .fg = .gray });
+            try draw.copyClippedTextAt(&content, 0, 1, err.message(), .{ .fg = color_danger });
+        }
+    }
+
+    if (size.height <= 3) return;
+    const list_title = try app_repo_picker.listTitle(content.frameAllocator(), app.repo_picker_discovery, app.repo_state.discovery, &app.recent_repos);
+    try draw.copyClippedTextAt(&content, 0, 3, list_title, .{ .fg = color_accent, .bold = true });
+
+    const repo_picker_footer_rows: u16 = if (size.height > 7) 2 else if (size.height > 6) 1 else 0;
+    defer {
+        if (repo_picker_footer_rows > 0) {
+            const has_row = app.repo_picker.list.filter.labels.len > 0;
+            const hint = switch (app.repo_picker.input_mode) {
+                .path_input => "Enter: open path    Esc: list",
+                .filter => "Enter: open selected    Up/Down: select row    Esc: list",
+                .list => if (has_row)
+                    "Enter: open selected    /: filter    p: path    b/Esc: back    q: close"
+                else
+                    "p: path    Esc/q: close",
+            };
+            draw.copyClippedTextAt(&content, 0, size.height - 1, hint, .{ .fg = .gray }) catch {};
+        }
+    }
+
+    if (app.repo_picker.list.filter.labels.len == 0) {
+        if (size.height > 4) {
+            const empty_text = if (app.repo_picker.input_mode == .filter and app.repo_picker.list.input.len > 0)
+                "No matching repositories."
+            else
+                "No recent repositories yet.";
+            _ = content.borrowTextAt(2, 4, empty_text, .{ .fg = .gray });
         }
         return;
     }
 
-    _ = content.borrowTextAt(0, 0, "filter: ", .{ .fg = color_prompt, .bold = true });
-    try drawCommitInputLine(&content, 8, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor, .{ .fg = color_prompt });
-    showInputCursor(&content, 8, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor);
-
-    if (size.height > 1) {
-        if (app.repo_picker.list.no_match) {
-            _ = content.borrowTextAt(0, 1, "(no match)", .{ .fg = color_danger });
-        } else if (app.repo_picker.path_pending) {
-            _ = content.borrowTextAt(0, 1, "(checking path...)", .{ .fg = .gray });
-        } else if (app.repo_picker.path_error) |err| {
-            try draw.copyClippedTextAt(&content, 0, 1, err.message(), .{ .fg = color_danger });
-        } else {
-            try draw.copyClippedTextAt(&content, 0, 1, "Enter: switch  /: filter  : enter path  Esc: close", .{ .fg = .gray });
-        }
-    }
-
-    if (size.height <= 2) return;
-    const rows = size.height - 2;
+    const rows = size.height - 4 - repo_picker_footer_rows;
     const focused = app.repo_picker.list.filter.list.focusedIndex();
     const range = ui.ListViewport.visibleRange(app.repo_picker.list.filter.labels.len, focused, rows);
-    var row: u16 = 2;
+    var row: u16 = 4;
     var visible_index: usize = range.start;
     while (visible_index < range.end) : ({
         visible_index += 1;
@@ -853,9 +876,10 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
     }) {
         const source_index = app.repo_picker.list.filter.sourceIndex(visible_index) orelse continue;
         const label = app.repo_picker.list.filter.labels[visible_index];
+        const item = if (source_index < app.repo_picker_items.items.len) app.repo_picker_items.items[source_index] else null;
         const focused_row = visible_index == focused;
-        const active = if (source_index < app.repo_picker_items.items.len)
-            switch (app.repo_picker_items.items[source_index].source) {
+        const active = if (item) |repo_item|
+            switch (repo_item.source) {
                 .active_repo => true,
                 .workspace_repo => |repo_index| repo_index == app.repo_state.active_index,
                 .pending_workspace_repo, .recent_repo, .recent_workspace => false,
@@ -879,6 +903,17 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
             .height = 1,
         });
         try draw.copyClippedTextAt(&label_area, 0, 0, label, style);
+    }
+
+    if (repo_picker_footer_rows > 1) {
+        const detail_row = size.height - 2;
+        const focused_source_index = app.repo_picker.list.filter.sourceIndex(focused);
+        if (focused_source_index) |source_index| {
+            if (source_index < app.repo_picker_items.items.len) {
+                const detail = app.repo_picker_items.items[source_index].detail;
+                try draw.copyClippedTextAt(&content, 0, detail_row, detail, .{ .fg = .gray });
+            }
+        }
     }
 }
 

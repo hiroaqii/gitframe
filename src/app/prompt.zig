@@ -142,11 +142,6 @@ pub const FilterPromptState = struct {
     }
 };
 
-pub const RepoPickerMode = enum {
-    list,
-    path_input,
-};
-
 pub const RepoPickerPathError = enum {
     path_does_not_exist,
     path_is_not_directory,
@@ -177,7 +172,7 @@ pub fn repoPickerPathErrorFromDiscovery(err: repo_discovery.PathDiscoveryError) 
 
 pub const RepoPickerState = struct {
     mode: bool = false,
-    prompt_mode: RepoPickerMode = .list,
+    input_mode: RepoPickerInputMode = .list,
     list: FilterPromptState = .{},
     path_input: PathInput = .{},
     path_error: ?RepoPickerPathError = null,
@@ -216,6 +211,12 @@ pub const RepoPickerState = struct {
     pub fn isCurrentPathDiscovery(self: *const RepoPickerState, generation: u64) bool {
         return self.path_generation == generation;
     }
+};
+
+pub const RepoPickerInputMode = enum {
+    list,
+    filter,
+    path_input,
 };
 
 test "TextInput inserts UTF-8 codepoints and backspaces by codepoint" {

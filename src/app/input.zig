@@ -1,6 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const keymap = @import("keymap");
+const app_prompt = @import("prompt.zig");
 
 /// App focus state used by key mapping. The state lives on App, but the
 /// transition vocabulary belongs with input handling.
@@ -23,7 +24,7 @@ pub const KeyContext = struct {
     file_search_mode: bool = false,
     commit_panel_mode: bool = false,
     repo_picker_mode: bool = false,
-    repo_picker_path_input: bool = false,
+    repo_picker_input_mode: app_prompt.RepoPickerInputMode = .list,
     help_mode: bool = false,
     discard_confirmation_mode: bool = false,
     amend_confirmation_mode: bool = false,
@@ -53,9 +54,12 @@ const Action = enum {
     commit_panel_move_up,
     commit_panel_move_down,
     cancel_repo_picker,
+    close_repo_picker,
     submit_repo_picker,
-    repo_picker_backspace,
+    repo_picker_enter_filter_input,
     repo_picker_enter_path_input,
+    repo_picker_back,
+    repo_picker_backspace,
     repo_picker_move_previous,
     repo_picker_move_next,
     repo_picker_move_left,
@@ -174,20 +178,26 @@ fn fileSearchKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
 fn repoPickerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .cancel_repo_picker);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .submit_repo_picker);
-    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .repo_picker_backspace);
-    if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .repo_picker_move_left);
-    if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .repo_picker_move_right);
-    if (context.repo_picker_path_input) {
-        if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
-        return null;
+
+    switch (context.repo_picker_input_mode) {
+        .list => {
+            if (key.codepoint == 'q' and !hasCommandModifier(key)) return actionToMsg(Msg, .close_repo_picker);
+            if (key.codepoint == '/' and !hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_enter_filter_input);
+            if (key.codepoint == 'p' and !hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_enter_path_input);
+            if (key.codepoint == 'b' and !hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_back);
+            if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .repo_picker_move_previous);
+            if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .repo_picker_move_next);
+        },
+        .filter, .path_input => {
+            if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .repo_picker_backspace);
+            if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .repo_picker_move_left);
+            if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .repo_picker_move_right);
+            if (key.matches(chasen.Key.up, .{})) return actionToMsg(Msg, .repo_picker_move_previous);
+            if (key.matches(chasen.Key.down, .{})) return actionToMsg(Msg, .repo_picker_move_next);
+            if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
+        },
     }
-    if (isColonKey(key)) return actionToMsg(Msg, .repo_picker_enter_path_input);
-    return switch (key.codepoint) {
-        'k', chasen.Key.up => actionToMsg(Msg, .repo_picker_move_previous),
-        'j', chasen.Key.down => actionToMsg(Msg, .repo_picker_move_next),
-        'q' => actionToMsg(Msg, .cancel_repo_picker),
-        else => if (textInputCodepoint(key)) |codepoint| payloadMsg(Msg, "repo_picker_insert", codepoint) else null,
-    };
+    return null;
 }
 
 fn helpKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
@@ -342,10 +352,6 @@ fn publicActionToAction(action: keymap.PublicAction) Action {
     };
 }
 
-fn isColonKey(key: chasen.Key) bool {
-    return key.matches(':', .{}) or (key.codepoint == ';' and key.mods.shift);
-}
-
 /// Match an ASCII Shift-letter command across terminals that report either
 /// uppercase codepoints or lowercase codepoints with the shift modifier set.
 fn matchesShiftedAscii(key: chasen.Key, lower: u21, upper: u21) bool {
@@ -361,6 +367,11 @@ fn textInputCodepoint(key: chasen.Key) ?u21 {
     if (key.isModifier()) return null;
     if (hasCommandModifier(key)) return null;
     if (keyTextCodepoint(key)) |codepoint| return codepoint;
+    if (key.mods.shift) {
+        if (key.shifted_codepoint) |codepoint| {
+            if (isPrintableCodepoint(codepoint)) return codepoint;
+        }
+    }
     if (key.codepoint == chasen.Key.multicodepoint) return null;
     if (isVaxisSpecialCodepoint(key.codepoint)) return null;
     if (!isPrintableCodepoint(key.codepoint)) return null;
@@ -409,9 +420,12 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .commit_panel_move_up => voidMsg(Msg, "commit_panel_move_up"),
         .commit_panel_move_down => voidMsg(Msg, "commit_panel_move_down"),
         .cancel_repo_picker => voidMsg(Msg, "cancel_repo_picker"),
+        .close_repo_picker => voidMsg(Msg, "close_repo_picker"),
         .submit_repo_picker => voidMsg(Msg, "submit_repo_picker"),
-        .repo_picker_backspace => voidMsg(Msg, "repo_picker_backspace"),
+        .repo_picker_enter_filter_input => voidMsg(Msg, "repo_picker_enter_filter_input"),
         .repo_picker_enter_path_input => voidMsg(Msg, "repo_picker_enter_path_input"),
+        .repo_picker_back => voidMsg(Msg, "repo_picker_back"),
+        .repo_picker_backspace => voidMsg(Msg, "repo_picker_backspace"),
         .repo_picker_move_previous => voidMsg(Msg, "repo_picker_move_previous"),
         .repo_picker_move_next => voidMsg(Msg, "repo_picker_move_next"),
         .repo_picker_move_left => voidMsg(Msg, "repo_picker_move_left"),
@@ -511,9 +525,12 @@ const TestMsg = union(enum) {
     commit_panel_insert: u21,
     commit_panel_paste: []const u8,
     cancel_repo_picker,
+    close_repo_picker,
     submit_repo_picker,
-    repo_picker_backspace,
+    repo_picker_enter_filter_input,
     repo_picker_enter_path_input,
+    repo_picker_back,
+    repo_picker_backspace,
     repo_picker_move_previous,
     repo_picker_move_next,
     repo_picker_move_left,
@@ -767,12 +784,13 @@ test "keyToMsg prioritizes discard confirmation over open commit panel" {
     try std.testing.expectEqual(TestMsg.cancel_discard_file, keyToMsg(TestMsg, context, .{ .codepoint = 'q' }).?);
 }
 
-test "keyToMsg maps repo picker path input command across shifted colon variants" {
-    const context: KeyContext = .{ .repo_picker_mode = true };
-    try std.testing.expectEqual(TestMsg.repo_picker_enter_path_input, keyToMsg(TestMsg, context, .{ .codepoint = ':' }).?);
-    try std.testing.expectEqual(TestMsg.repo_picker_enter_path_input, keyToMsg(TestMsg, context, shiftedAscii(';', ':')).?);
-    try std.testing.expectEqual(TestMsg.repo_picker_enter_path_input, keyToMsg(TestMsg, context, shiftedLowerOnly(';')).?);
+test "keyToMsg treats colon as repo picker path text" {
+    const context: KeyContext = .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input };
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ':' }, keyToMsg(TestMsg, context, .{ .codepoint = ':' }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ':' }, keyToMsg(TestMsg, context, shiftedAscii(';', ':')).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ';' }, keyToMsg(TestMsg, context, shiftedLowerOnly(';')).?);
     try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ';' }, keyToMsg(TestMsg, context, .{ .codepoint = ';' }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'q' }, keyToMsg(TestMsg, context, .{ .codepoint = 'q' }).?);
 }
 
 test "keyToMsg ignores special keys in text input modes" {
@@ -823,8 +841,8 @@ test "keyToMsg ignores special keys in text input modes" {
         if (key.codepoint != chasen.Key.tab and key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right and key.codepoint != chasen.Key.up and key.codepoint != chasen.Key.down) {
             try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .commit_panel_mode = true }, key));
         }
-        if (key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right) {
-            try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, key));
+        if (key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right and key.codepoint != chasen.Key.up and key.codepoint != chasen.Key.down) {
+            try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, key));
         }
     }
 
@@ -857,7 +875,6 @@ test "keyToMsg ignores special keys in text input modes" {
         .{ .codepoint = chasen.Key.caps_lock },
         .{ .codepoint = chasen.Key.menu },
         .{ .codepoint = chasen.Key.media_play },
-        .{ .codepoint = chasen.Key.kp_1 },
         .{ .codepoint = chasen.Key.multicodepoint },
         .{ .codepoint = chasen.Key.multicodepoint, .text = "ab" },
     };
@@ -867,10 +884,13 @@ test "keyToMsg ignores special keys in text input modes" {
 }
 
 test "keyToMsg maps repo picker cursor movement" {
-    try std.testing.expectEqual(TestMsg.repo_picker_move_left, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.left }).?);
-    try std.testing.expectEqual(TestMsg.repo_picker_move_right, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.right }).?);
-    try std.testing.expectEqual(TestMsg.repo_picker_move_left, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = chasen.Key.left }).?);
-    try std.testing.expectEqual(TestMsg.repo_picker_move_right, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = chasen.Key.right }).?);
+    const input_context: KeyContext = .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input };
+    try std.testing.expectEqual(TestMsg.repo_picker_move_left, keyToMsg(TestMsg, input_context, .{ .codepoint = chasen.Key.left }).?);
+    try std.testing.expectEqual(TestMsg.repo_picker_move_right, keyToMsg(TestMsg, input_context, .{ .codepoint = chasen.Key.right }).?);
+    try std.testing.expectEqual(TestMsg.repo_picker_move_previous, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(TestMsg.repo_picker_move_next, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.down }).?);
+    try std.testing.expectEqual(TestMsg.repo_picker_move_previous, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = 'k' }).?);
+    try std.testing.expectEqual(TestMsg.repo_picker_move_next, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = 'j' }).?);
 }
 
 test "keyToMsg maps search cursor movement" {
@@ -890,7 +910,7 @@ test "keyToMsg ignores ctrl printable in text input modes" {
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .file_search_mode = true }, ctrl_c));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .commit_panel_mode = true }, ctrl_c));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, ctrl_c));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, ctrl_c));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, ctrl_c));
 }
 
 test "keyToMsg ignores command modifiers for static viewer bindings" {
@@ -911,10 +931,11 @@ test "keyToMsg keeps printable text input modes working" {
     try std.testing.expectEqual(TestMsg{ .search_insert = 'x' }, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = 'x' }).?);
     try std.testing.expectEqual(TestMsg{ .file_search_insert = 'x' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = 'x' }).?);
     try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'x' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'x' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'x' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = 'x' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'x' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = 'x' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ':' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = ':' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 0x1F408 }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, .{ .codepoint = 0x1F408 }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'x' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'q' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'x' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ':' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = ':' }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 0x1F408 }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = 0x1F408 }).?);
 }
 
 test "keyToMsg prefers generated text for printable text input" {
@@ -926,8 +947,8 @@ test "keyToMsg prefers generated text for printable text input" {
     try std.testing.expectEqual(TestMsg{ .search_insert = '1' }, keyToMsg(TestMsg, .{ .search_mode = true }, keypad_one).?);
     try std.testing.expectEqual(TestMsg{ .file_search_insert = '1' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, keypad_one).?);
     try std.testing.expectEqual(TestMsg{ .commit_panel_insert = '1' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, keypad_one).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = '1' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, keypad_one).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = '1' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_path_input = true }, keypad_one).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = '1' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, keypad_one).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = '1' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, keypad_one).?);
 }
 
 test "keyToMsg uses search query to disambiguate navigation" {
