@@ -300,11 +300,36 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
     }
 
     if (row_layout.stats_col) |stats_col| {
-        _ = try surface.printAt(stats_col, row, style, "+{d} -{d}", .{
-            row_model.stats.added,
-            row_model.stats.removed,
+        var stats_area = surface.child(.{
+            .col = stats_col,
+            .row = row,
+            .width = row_layout.stats_width,
+            .height = 1,
         });
+        try drawSidebarStats(&stats_area, row_model, pane_active);
     }
+}
+
+fn drawSidebarStats(surface: *chasen.Surface, row: sidebar_view_model.Row, pane_active: bool) !void {
+    const added_text = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{row.stats.added});
+    const removed_text = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{row.stats.removed});
+    const added_style = sidebarStatStyle(row, pane_active, color_success);
+    const removed_style = sidebarStatStyle(row, pane_active, color_danger);
+
+    try draw.copyClippedTextAt(surface, 0, 0, added_text, added_style);
+    const removed_col = chasen.text.displayWidth(added_text) + 1;
+    if (removed_col < surface.size().width) {
+        try draw.copyClippedTextAt(surface, removed_col, 0, removed_text, removed_style);
+    }
+}
+
+fn sidebarStatStyle(row: sidebar_view_model.Row, pane_active: bool, fg: chasen.Color) chasen.TextStyle {
+    return .{
+        .fg = fg,
+        .bold = true,
+        .dim = !pane_active and !row.selected,
+        .reverse = row.selected,
+    };
 }
 
 fn sidebarTreeContent(allocator: std.mem.Allocator, row: sidebar_view_model.Row) ![]const u8 {
