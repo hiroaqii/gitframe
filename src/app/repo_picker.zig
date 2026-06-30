@@ -106,11 +106,22 @@ pub fn focusOnActive(picker: *app_prompt.RepoPickerState, items: []const Item, a
     }
 }
 
+pub fn focusVisibleIndex(picker: *app_prompt.RepoPickerState, preferred_index: usize) void {
+    const len = picker.list.filter.labels.len;
+    picker.list.filter.list.focus.len = len;
+    picker.list.filter.list.focus.index = if (len == 0) 0 else @min(preferred_index, len - 1);
+}
+
 pub fn resolveSelection(picker: *const app_prompt.RepoPickerState, items: []const Item) ?ItemSource {
+    const item = selectedItem(picker, items) orelse return null;
+    return item.source;
+}
+
+pub fn selectedItem(picker: *const app_prompt.RepoPickerState, items: []const Item) ?Item {
     const focused = picker.list.filter.list.focusedIndex();
     const item_index = picker.list.filter.sourceIndex(focused) orelse return null;
     if (item_index >= items.len) return null;
-    return items[item_index].source;
+    return items[item_index];
 }
 
 pub fn insertCodepoint(picker: *app_prompt.RepoPickerState, codepoint: u21) EditResult {

@@ -59,6 +59,7 @@ const Action = enum {
     repo_picker_enter_filter_input,
     repo_picker_enter_path_input,
     repo_picker_back,
+    repo_picker_remove_recent,
     repo_picker_backspace,
     repo_picker_move_previous,
     repo_picker_move_next,
@@ -185,6 +186,7 @@ fn repoPickerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) 
             if (key.codepoint == '/' and !hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_enter_filter_input);
             if (key.codepoint == 'p' and !hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_enter_path_input);
             if (key.codepoint == 'b' and !hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_back);
+            if (key.codepoint == 'd' and !hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_remove_recent);
             if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .repo_picker_move_previous);
             if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .repo_picker_move_next);
         },
@@ -425,6 +427,7 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .repo_picker_enter_filter_input => voidMsg(Msg, "repo_picker_enter_filter_input"),
         .repo_picker_enter_path_input => voidMsg(Msg, "repo_picker_enter_path_input"),
         .repo_picker_back => voidMsg(Msg, "repo_picker_back"),
+        .repo_picker_remove_recent => voidMsg(Msg, "repo_picker_remove_recent"),
         .repo_picker_backspace => voidMsg(Msg, "repo_picker_backspace"),
         .repo_picker_move_previous => voidMsg(Msg, "repo_picker_move_previous"),
         .repo_picker_move_next => voidMsg(Msg, "repo_picker_move_next"),
@@ -530,6 +533,7 @@ const TestMsg = union(enum) {
     repo_picker_enter_filter_input,
     repo_picker_enter_path_input,
     repo_picker_back,
+    repo_picker_remove_recent,
     repo_picker_backspace,
     repo_picker_move_previous,
     repo_picker_move_next,
@@ -891,6 +895,12 @@ test "keyToMsg maps repo picker cursor movement" {
     try std.testing.expectEqual(TestMsg.repo_picker_move_next, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.down }).?);
     try std.testing.expectEqual(TestMsg.repo_picker_move_previous, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = 'k' }).?);
     try std.testing.expectEqual(TestMsg.repo_picker_move_next, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = 'j' }).?);
+}
+
+test "keyToMsg maps repo picker recent removal only in list mode" {
+    try std.testing.expectEqual(TestMsg.repo_picker_remove_recent, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = 'd' }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'd' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, .{ .codepoint = 'd' }).?);
+    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'd' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = 'd' }).?);
 }
 
 test "keyToMsg maps search cursor movement" {

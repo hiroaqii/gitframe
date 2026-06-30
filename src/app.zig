@@ -42,6 +42,11 @@ const sidebar_view_model = @import("sidebar/view_model.zig");
 const auto_reload_timer_id = "gitframe.auto_reload";
 const auto_reload_interval_ns = 2 * std.time.ns_per_s;
 
+const PendingRecentPathDiscovery = struct {
+    kind: repo_state.RecentKind,
+    index: usize,
+};
+
 pub const SourceMode = diff_source.SourceMode;
 pub const CliConfig = diff_source.CliConfig;
 pub const LoadRequest = diff_source.LoadRequest;
@@ -242,6 +247,7 @@ pub const App = struct {
     repo_picker_discovery: ?repo_discovery.DiscoveryResult = null,
     repo_picker_items: app_repo_picker.ItemList = .empty,
     recent_repos: repo_state.RecentStore = .{},
+    pending_repo_path_recent_source: ?PendingRecentPathDiscovery = null,
     overlay: app_state.OverlayState = .{},
     review_display: app_state.ReviewDisplayState = .{},
     staged_hunks: app_state.StagedHunkMarks = .{},
@@ -339,6 +345,7 @@ pub const App = struct {
         repo_picker_enter_filter_input,
         repo_picker_enter_path_input,
         repo_picker_back,
+        repo_picker_remove_recent,
         repo_picker_insert: u21,
         /// Borrowed from `chasen.Event.paste`; valid only in the synchronous handleEvent/update dispatch.
         repo_picker_paste: []const u8,
@@ -554,6 +561,7 @@ pub const App = struct {
             .repo_picker_enter_filter_input => try self.enterRepoPickerFilterInput(ctx.allocator()),
             .repo_picker_enter_path_input => self.enterRepoPickerPathInput(),
             .repo_picker_back => try self.backRepoPicker(ctx.allocator()),
+            .repo_picker_remove_recent => try self.removeSelectedRecentRepository(ctx),
             .repo_picker_insert => |codepoint| {
                 try self.insertRepoPickerCodepoint(ctx.allocator(), codepoint);
             },
@@ -3055,6 +3063,7 @@ pub const App = struct {
             .path_input => {
                 self.repo_picker.input_mode = .list;
                 self.repo_picker.invalidatePathDiscovery();
+                self.pending_repo_path_recent_source = null;
                 self.repo_picker.list.resetNoMatch();
                 return;
             },
@@ -3070,6 +3079,7 @@ pub const App = struct {
 
     fn closeRepoPickerMode(self: *App, allocator: std.mem.Allocator) void {
         self.repo_picker.deinit(allocator);
+        self.pending_repo_path_recent_source = null;
         self.clearRepoPickerDiscovery(allocator);
         self.clearRepoPickerItems(allocator);
     }
@@ -3111,11 +3121,17 @@ pub const App = struct {
             },
             .recent_repo => |recent_index| {
                 if (recent_index >= self.recent_repos.entries.items.len) return;
-                try self.startRepoPathDiscovery(ctx, self.recent_repos.entries.items[recent_index].path);
+                try self.startRepoPathDiscovery(ctx, self.recent_repos.entries.items[recent_index].path, .{
+                    .kind = .repo,
+                    .index = recent_index,
+                });
             },
             .recent_workspace => |recent_index| {
                 if (recent_index >= self.recent_repos.entries.items.len) return;
-                try self.startRepoPathDiscovery(ctx, self.recent_repos.entries.items[recent_index].path);
+                try self.startRepoPathDiscovery(ctx, self.recent_repos.entries.items[recent_index].path, .{
+                    .kind = .workspace,
+                    .index = recent_index,
+                });
             },
         }
     }
@@ -3146,6 +3162,7 @@ pub const App = struct {
         if (!self.repo_picker.mode) return;
         self.repo_picker.input_mode = .path_input;
         self.repo_picker.invalidatePathDiscovery();
+        self.pending_repo_path_recent_source = null;
     }
 
     fn insertRepoPickerCodepoint(self: *App, allocator: std.mem.Allocator, codepoint: u21) !void {
@@ -3180,6 +3197,35 @@ pub const App = struct {
         }
     }
 
+    fn recentSourceIdentity(source: app_repo_picker.ItemSource) ?PendingRecentPathDiscovery {
+        return switch (source) {
+            .recent_repo => |index| .{ .kind = .repo, .index = index },
+            .recent_workspace => |index| .{ .kind = .workspace, .index = index },
+            .active_repo, .workspace_repo, .pending_workspace_repo => null,
+        };
+    }
+
+    fn removeSelectedRecentRepository(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (!self.repo_picker.mode or self.repo_picker.input_mode != .list) return;
+        const item = app_repo_picker.selectedItem(&self.repo_picker, self.repo_picker_items.items) orelse return;
+        const recent = recentSourceIdentity(item.source) orelse {
+            self.setStatus("only recent repositories can be removed", .{});
+            return;
+        };
+        if (!self.recent_repos.entryMatches(recent.index, recent.kind, item.detail)) {
+            self.setStatus("recent repository changed; refresh and try again", .{});
+            return;
+        }
+
+        const focused = self.repo_picker.list.filter.list.focusedIndex();
+        if (!self.recent_repos.removeAt(ctx.allocator(), recent.index)) return;
+        self.persistRecentRepositories(ctx);
+        try self.refreshRepoPickerFilter(ctx.allocator());
+        app_repo_picker.focusVisibleIndex(&self.repo_picker, focused);
+        self.repo_picker.clearPathStatus();
+        self.setStatus("removed recent repository", .{});
+    }
+
     fn applyRepoPickerEditResult(self: *App, allocator: std.mem.Allocator, result: app_repo_picker.EditResult) !void {
         switch (result) {
             .none => {},
@@ -3197,6 +3243,7 @@ pub const App = struct {
 
     fn closeRepoPickerForSwitch(self: *App, allocator: std.mem.Allocator) void {
         self.repo_picker.deinit(allocator);
+        self.pending_repo_path_recent_source = null;
         self.clearRepoPickerItems(allocator);
         self.clearPendingSelectionRestore(allocator);
     }
@@ -3213,10 +3260,10 @@ pub const App = struct {
             self.repo_picker.path_error = .no_git_repositories_found;
             return;
         }
-        try self.startRepoPathDiscovery(ctx, path);
+        try self.startRepoPathDiscovery(ctx, path, null);
     }
 
-    fn startRepoPathDiscovery(self: *App, ctx: *chasen.Ctx(Msg), path: []const u8) !void {
+    fn startRepoPathDiscovery(self: *App, ctx: *chasen.Ctx(Msg), path: []const u8, recent_source: ?PendingRecentPathDiscovery) !void {
         if (self.actions.pending != null) {
             self.setStatus("finish current git action before switching repos", .{});
             return;
@@ -3232,9 +3279,11 @@ pub const App = struct {
             .path = owned_path,
             .generation = self.repo_picker.beginPathDiscovery(),
         };
+        self.pending_repo_path_recent_source = recent_source;
 
         ctx.task().spawnWith(task, RepoPathDiscoveryTask.run) catch |err| {
             _ = self.repo_picker.finishPathDiscovery(task.generation);
+            self.pending_repo_path_recent_source = null;
             self.setStatus("could not start repo path discovery task", .{});
             return err;
         };
@@ -3257,19 +3306,61 @@ pub const App = struct {
         switch (result.result) {
             .empty => unreachable,
             .discovered => |discovery| {
+                self.pending_repo_path_recent_source = null;
                 result.result = .empty;
                 try self.acceptRepoPathDiscovery(ctx, discovery);
             },
             .input_error => |err| {
+                if (try self.removeStaleRecentAfterPathError(ctx, err, result.submitted_path)) return;
+                self.pending_repo_path_recent_source = null;
                 self.repo_picker.path_error = app_prompt.repoPickerPathErrorFromDiscovery(err);
             },
             .failed => |message| {
+                self.pending_repo_path_recent_source = null;
                 self.setStatus("repo path discovery failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
+                self.pending_repo_path_recent_source = null;
                 self.setStatus("repo path discovery failed: {s}", .{message});
             },
         }
+    }
+
+    fn removeStaleRecentAfterPathError(self: *App, ctx: *chasen.Ctx(Msg), err: repo_discovery.PathDiscoveryError, submitted_path: []const u8) !bool {
+        if (!isStaleRecentPathError(err)) return false;
+        const pending = self.pending_repo_path_recent_source orelse return false;
+        self.pending_repo_path_recent_source = null;
+
+        const focused = self.repo_picker.list.filter.list.focusedIndex();
+        const removed = if (self.recent_repos.entryMatches(pending.index, pending.kind, submitted_path))
+            self.recent_repos.removeAt(ctx.allocator(), pending.index)
+        else
+            self.recent_repos.removeFirstMatching(ctx.allocator(), pending.kind, submitted_path);
+        if (!removed) {
+            self.repo_picker.clearPathStatus();
+            return true;
+        }
+
+        self.persistRecentRepositories(ctx);
+        try self.refreshRepoPickerFilter(ctx.allocator());
+        app_repo_picker.focusVisibleIndex(&self.repo_picker, focused);
+        self.repo_picker.clearPathStatus();
+        self.setStatus("removed stale recent repository", .{});
+        return true;
+    }
+
+    fn isStaleRecentPathError(err: repo_discovery.PathDiscoveryError) bool {
+        return switch (err) {
+            error.PathDoesNotExist,
+            error.PathIsNotDirectory,
+            error.NoGitRepositoriesFound,
+            => true,
+            error.CannotAccessPath,
+            error.OutOfMemory,
+            error.SpawnFailed,
+            error.StreamTooLong,
+            => false,
+        };
     }
 
     fn acceptRepoPathDiscovery(self: *App, ctx: *chasen.Ctx(Msg), discovery: repo_discovery.DiscoveryResult) !void {
@@ -6976,6 +7067,215 @@ test "repo picker opens for a single repository" {
     try std.testing.expect(app.repo_picker.mode);
     try std.testing.expectEqual(@as(usize, 1), app.repo_picker.list.filter.labels.len);
     try std.testing.expectEqualStrings("repo", app.repo_picker.list.filter.labels[0]);
+}
+
+test "repo picker removes selected recent entry only" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .repo_state = .{
+            .discovery = .{ .single_repo = .{
+                .label = try allocator.dupe(u8, "active"),
+                .display_path = try allocator.dupe(u8, "."),
+                .canonical_root = try allocator.dupe(u8, "/work/active"),
+            } },
+        },
+    };
+    defer app.repo_state.deinit(allocator);
+    defer app.repo_picker.deinit(allocator);
+    defer app.deinitRepoPickerItems(allocator);
+    defer app.recent_repos.deinit(allocator);
+    try app.recent_repos.rememberRepo(allocator, "/work/recent");
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.enterRepoPickerMode(allocator);
+    try std.testing.expectEqual(@as(usize, 2), app.repo_picker.list.filter.labels.len);
+
+    try app.removeSelectedRecentRepository(&ctx);
+    try std.testing.expectEqual(@as(usize, 1), app.recent_repos.entries.items.len);
+
+    app.repo_picker.list.filter.update(.move_next);
+    try app.removeSelectedRecentRepository(&ctx);
+    try std.testing.expectEqual(@as(usize, 0), app.recent_repos.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.repo_picker.list.filter.labels.len);
+    try std.testing.expectEqualStrings("active", app.repo_picker.list.filter.labels[0]);
+}
+
+test "repo picker removes stale recent entry after path discovery error" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .repo_picker = .{ .mode = true },
+        .repo_state = .{
+            .discovery = .{ .single_repo = .{
+                .label = try allocator.dupe(u8, "active"),
+                .display_path = try allocator.dupe(u8, "."),
+                .canonical_root = try allocator.dupe(u8, "/work/active"),
+            } },
+        },
+    };
+    defer app.repo_state.deinit(allocator);
+    defer app.repo_picker.deinit(allocator);
+    defer app.deinitRepoPickerItems(allocator);
+    defer app.recent_repos.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.recent_repos.rememberRepo(allocator, "/gone/repo");
+    try app.enterRepoPickerMode(allocator);
+    const generation = app.repo_picker.beginPathDiscovery();
+    app.pending_repo_path_recent_source = .{ .kind = .repo, .index = 0 };
+
+    var finished = RepoPathDiscoveryFinished{
+        .generation = generation,
+        .submitted_path = try allocator.dupe(u8, "/gone/repo"),
+        .result = .{ .input_error = error.PathDoesNotExist },
+    };
+    try app.finishRepoPathDiscovery(&ctx, finished);
+    finished = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
+
+    try std.testing.expectEqual(@as(usize, 0), app.recent_repos.entries.items.len);
+    try std.testing.expectEqual(@as(?app_prompt.RepoPickerPathError, null), app.repo_picker.path_error);
+    try std.testing.expectEqual(@as(usize, 1), app.repo_picker.list.filter.labels.len);
+    try std.testing.expectEqualStrings("active", app.repo_picker.list.filter.labels[0]);
+}
+
+test "repo picker keeps recent entry for non-stale path discovery error" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .repo_picker = .{ .mode = true },
+        .repo_state = .{
+            .discovery = .{ .single_repo = .{
+                .label = try allocator.dupe(u8, "active"),
+                .display_path = try allocator.dupe(u8, "."),
+                .canonical_root = try allocator.dupe(u8, "/work/active"),
+            } },
+        },
+    };
+    defer app.repo_state.deinit(allocator);
+    defer app.repo_picker.deinit(allocator);
+    defer app.deinitRepoPickerItems(allocator);
+    defer app.recent_repos.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.recent_repos.rememberRepo(allocator, "/mounted/repo");
+    try app.enterRepoPickerMode(allocator);
+    const generation = app.repo_picker.beginPathDiscovery();
+    app.pending_repo_path_recent_source = .{ .kind = .repo, .index = 0 };
+
+    var finished = RepoPathDiscoveryFinished{
+        .generation = generation,
+        .submitted_path = try allocator.dupe(u8, "/mounted/repo"),
+        .result = .{ .input_error = error.CannotAccessPath },
+    };
+    try app.finishRepoPathDiscovery(&ctx, finished);
+    finished = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
+
+    try std.testing.expectEqual(@as(usize, 1), app.recent_repos.entries.items.len);
+    try std.testing.expectEqual(app_prompt.RepoPickerPathError.cannot_access_path, app.repo_picker.path_error.?);
+}
+
+test "repo picker removes stale recent workspace after no repos remain" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .repo_picker = .{ .mode = true },
+        .repo_state = .{
+            .discovery = .{ .single_repo = .{
+                .label = try allocator.dupe(u8, "active"),
+                .display_path = try allocator.dupe(u8, "."),
+                .canonical_root = try allocator.dupe(u8, "/work/active"),
+            } },
+        },
+    };
+    defer app.repo_state.deinit(allocator);
+    defer app.repo_picker.deinit(allocator);
+    defer app.deinitRepoPickerItems(allocator);
+    defer app.recent_repos.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.recent_repos.rememberWorkspace(allocator, "/gone/workspace");
+    try app.enterRepoPickerMode(allocator);
+    const generation = app.repo_picker.beginPathDiscovery();
+    app.pending_repo_path_recent_source = .{ .kind = .workspace, .index = 0 };
+
+    var finished = RepoPathDiscoveryFinished{
+        .generation = generation,
+        .submitted_path = try allocator.dupe(u8, "/gone/workspace"),
+        .result = .{ .input_error = error.NoGitRepositoriesFound },
+    };
+    try app.finishRepoPathDiscovery(&ctx, finished);
+    finished = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
+
+    try std.testing.expectEqual(@as(usize, 0), app.recent_repos.entries.items.len);
+    try std.testing.expectEqual(@as(?app_prompt.RepoPickerPathError, null), app.repo_picker.path_error);
+}
+
+test "repo picker path input errors do not remove recent history" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .repo_picker = .{ .mode = true, .input_mode = .path_input },
+        .repo_state = .{
+            .discovery = .{ .single_repo = .{
+                .label = try allocator.dupe(u8, "active"),
+                .display_path = try allocator.dupe(u8, "."),
+                .canonical_root = try allocator.dupe(u8, "/work/active"),
+            } },
+        },
+    };
+    defer app.repo_state.deinit(allocator);
+    defer app.repo_picker.deinit(allocator);
+    defer app.deinitRepoPickerItems(allocator);
+    defer app.recent_repos.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.recent_repos.rememberRepo(allocator, "/kept/repo");
+    try app.enterRepoPickerMode(allocator);
+    const generation = app.repo_picker.beginPathDiscovery();
+
+    var finished = RepoPathDiscoveryFinished{
+        .generation = generation,
+        .submitted_path = try allocator.dupe(u8, "/typed/missing"),
+        .result = .{ .input_error = error.PathDoesNotExist },
+    };
+    try app.finishRepoPathDiscovery(&ctx, finished);
+    finished = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
+
+    try std.testing.expectEqual(@as(usize, 1), app.recent_repos.entries.items.len);
+    try std.testing.expectEqualStrings("/kept/repo", app.recent_repos.entries.items[0].path);
+    try std.testing.expectEqual(app_prompt.RepoPickerPathError.path_does_not_exist, app.repo_picker.path_error.?);
+}
+
+test "repo picker stale recent removal falls back to matching path after index shift" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .repo_picker = .{ .mode = true },
+        .repo_state = .{
+            .discovery = .{ .single_repo = .{
+                .label = try allocator.dupe(u8, "active"),
+                .display_path = try allocator.dupe(u8, "."),
+                .canonical_root = try allocator.dupe(u8, "/work/active"),
+            } },
+        },
+    };
+    defer app.repo_state.deinit(allocator);
+    defer app.repo_picker.deinit(allocator);
+    defer app.deinitRepoPickerItems(allocator);
+    defer app.recent_repos.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.recent_repos.rememberRepo(allocator, "/old/first");
+    try app.recent_repos.rememberRepo(allocator, "/old/second");
+    try app.enterRepoPickerMode(allocator);
+    const generation = app.repo_picker.beginPathDiscovery();
+    app.pending_repo_path_recent_source = .{ .kind = .repo, .index = 1 };
+    try std.testing.expect(app.recent_repos.removeAt(allocator, 0));
+
+    var finished = RepoPathDiscoveryFinished{
+        .generation = generation,
+        .submitted_path = try allocator.dupe(u8, "/old/first"),
+        .result = .{ .input_error = error.PathDoesNotExist },
+    };
+    try app.finishRepoPathDiscovery(&ctx, finished);
+    finished = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
+
+    try std.testing.expectEqual(@as(usize, 0), app.recent_repos.entries.items.len);
 }
 
 test "workspace path discovery keeps picker open for explicit repo selection" {

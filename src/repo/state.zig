@@ -97,6 +97,24 @@ pub const RecentStore = struct {
         }
     }
 
+    pub fn removeAt(self: *RecentStore, allocator: std.mem.Allocator, index: usize) bool {
+        if (index >= self.entries.items.len) return false;
+        var removed = self.entries.orderedRemove(index);
+        removed.deinit(allocator);
+        return true;
+    }
+
+    pub fn entryMatches(self: *const RecentStore, index: usize, kind: RecentKind, path: []const u8) bool {
+        if (index >= self.entries.items.len) return false;
+        const entry = self.entries.items[index];
+        return entry.kind == kind and std.mem.eql(u8, entry.path, path);
+    }
+
+    pub fn removeFirstMatching(self: *RecentStore, allocator: std.mem.Allocator, kind: RecentKind, path: []const u8) bool {
+        const index = self.find(kind, path) orelse return false;
+        return self.removeAt(allocator, index);
+    }
+
     pub fn loadFromRecentState(self: *RecentStore, allocator: std.mem.Allocator, state: config.RecentRepositoriesState) !void {
         // Persisted JSON belongs to OwnedState; duplicate into RecentStore so
         // the app can outlive the parsed state buffer.
@@ -244,6 +262,28 @@ test "RecentStore caps remembered entries" {
     try std.testing.expectEqual(@as(usize, max_recent_entries), store.entries.items.len);
     try std.testing.expectEqualStrings("/tmp/repo-34", store.entries.items[0].path);
     try std.testing.expectEqualStrings("/tmp/repo-3", store.entries.items[store.entries.items.len - 1].path);
+}
+
+test "RecentStore removes entries by index and matching identity" {
+    const allocator = std.testing.allocator;
+    var store: RecentStore = .{};
+    defer store.deinit(allocator);
+
+    try store.rememberRepo(allocator, "/tmp/one");
+    try store.rememberWorkspace(allocator, "/tmp/work");
+    try store.rememberRepo(allocator, "/tmp/two");
+
+    try std.testing.expect(store.entryMatches(1, .workspace, "/tmp/work"));
+    try std.testing.expect(!store.entryMatches(1, .repo, "/tmp/work"));
+    try std.testing.expect(!store.entryMatches(9, .repo, "/tmp/work"));
+
+    try std.testing.expect(store.removeFirstMatching(allocator, .workspace, "/tmp/work"));
+    try std.testing.expectEqual(@as(usize, 2), store.entries.items.len);
+    try std.testing.expect(!store.removeFirstMatching(allocator, .workspace, "/tmp/work"));
+
+    try std.testing.expect(store.removeAt(allocator, 0));
+    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+    try std.testing.expect(!store.removeAt(allocator, 9));
 }
 
 test "writeRecentRepositoriesJson writes recent entries only" {

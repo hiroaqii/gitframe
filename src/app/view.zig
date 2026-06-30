@@ -846,7 +846,7 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
                 .path_input => "Enter: open path    Esc: list",
                 .filter => "Enter: open selected    Up/Down: select row    Esc: list",
                 .list => if (has_row)
-                    "Enter: open selected    /: filter    p: path    b/Esc: back    q: close"
+                    "Enter: open selected    /: filter    p: path    d: remove recent    b/Esc: back    q: close"
                 else
                     "p: path    Esc/q: close",
             };
