@@ -2538,6 +2538,7 @@ pub const App = struct {
                     .request = result.request,
                     .value = ready,
                 } };
+                self.refreshSearchForSelectedFile();
                 consumed = true;
             },
             .failed => |body| {
@@ -3594,13 +3595,14 @@ pub const App = struct {
 
     fn selectSearchMatch(self: *App, direction: diff_search.Direction) void {
         if (self.blockUnsupportedSearchTarget()) return;
-        const file = self.selectedFile() orelse return;
+        const mode = self.effectiveDisplayMode();
+        const target = self.displayedSearchTarget(mode) orelse return;
         if (self.search.query.len == 0) return;
 
-        const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
+        const line_count = target.line_index.lineCount();
         if (line_count == 0) return;
         const base = if (self.search.match) |match| match.coordinate else null;
-        const next = diff_search.findMatch(file, self.effectiveDisplayMode(), self.search.query.slice(), base, direction) orelse {
+        const next = diff_search.findMatch(target.file, mode, self.search.query.slice(), base, direction) orelse {
             self.clearSearchMatch();
             return;
         };
@@ -3615,9 +3617,9 @@ pub const App = struct {
     fn refreshSearchForSelectedFile(self: *App) void {
         self.clearSearchMatch();
         if (self.search.query.len == 0) return;
-        if (self.activeCombinedProjection() != null or self.activeGeneratedFileProjection() != null) return;
-        const file = self.selectedFile() orelse return;
-        const next = diff_search.findMatch(file, self.effectiveDisplayMode(), self.search.query.slice(), null, .forward) orelse return;
+        const mode = self.effectiveDisplayMode();
+        const target = self.displayedSearchTarget(mode) orelse return;
+        const next = diff_search.findMatch(target.file, mode, self.search.query.slice(), null, .forward) orelse return;
         self.unfoldSearchMatchIfNeeded(next);
         self.setSearchMatch(next);
         self.viewer.diff_cursor = next.coordinate;
@@ -3637,13 +3639,12 @@ pub const App = struct {
     fn updateSearchMatchOffset(self: *App) void {
         self.search.match_offset = null;
         const match = self.search.match orelse return;
-        if (self.activeCombinedProjection() != null or self.activeGeneratedFileProjection() != null) {
+        const mode = self.effectiveDisplayMode();
+        const target = self.displayedSearchTarget(mode) orelse {
             self.clearSearchMatch();
             return;
-        }
-        const file = self.selectedFile() orelse return;
-        const mode = self.effectiveDisplayMode();
-        const offset = diff_view_model.renderedOffsetForCoordinate(file, mode, match.coordinate, self.selectedFileCachedLineIndex(mode)) orelse {
+        };
+        const offset = diff_view_model.renderedOffsetForCoordinate(target.file, mode, match.coordinate, target.line_index) orelse {
             self.clearSearchMatch();
             return;
         };
@@ -3665,6 +3666,10 @@ pub const App = struct {
     }
 
     fn unfoldSearchMatchIfNeeded(self: *App, match: diff_search.Match) void {
+        if (self.activeCombinedProjection() != null or
+            self.activeCachedDiffProjection() != null or
+            self.activeGeneratedFileProjection() != null) return;
+
         const hunk_index = switch (match.coordinate) {
             .hunk_line => |line| line.hunk_index,
             else => return,
@@ -3982,6 +3987,33 @@ pub const App = struct {
             return bundle.loaded.document.files[0];
         }
         return self.selectedFile();
+    }
+
+    const SearchTarget = struct {
+        file: diff_parser.FileDiff,
+        line_index: diff_view_model.RenderedLineIndex,
+        folded_hunks: []const bool,
+    };
+
+    fn displayedSearchTarget(self: *const App, mode: diff_render.DisplayMode) ?SearchTarget {
+        if (self.activeGeneratedFileProjection() != null) return null;
+        if (self.activeCombinedProjection() != null) return null;
+
+        if (self.activeCachedDiffProjection()) |bundle| {
+            if (bundle.loaded.document.files.len == 0) return null;
+            return .{
+                .file = bundle.loaded.document.files[0],
+                .line_index = bundle.loaded.cachedRenderedLineIndex(0, mode) orelse bundle.loaded.renderedLineIndex(0, mode),
+                .folded_hunks = &.{},
+            };
+        }
+
+        const file = self.displayedDiffFile() orelse return null;
+        return .{
+            .file = file,
+            .line_index = self.selectedFileLineIndex(mode),
+            .folded_hunks = self.selectedFoldedHunks(),
+        };
     }
 
     fn displayedGeneratedLineCount(self: *const App) ?usize {
@@ -6532,6 +6564,110 @@ test "cached preview uses displayed diff for cursor movement" {
     try std.testing.expectEqual(@as(?usize, 1), app.visibleDiffCursorOffset());
     app.selectHunkDelta(1);
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 0 }, app.viewer.diff_cursor);
+}
+
+test "cached preview supports diff search" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 7 },
+        .status_load_generation = 3,
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer app.git_status.deinit();
+    defer app.review_projection.deinit(std.testing.allocator);
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .cached_diff,
+        .unstaged,
+        app.load.generation,
+        app.status_load_generation,
+    );
+    app.review_projection = .{ .ready = .{
+        .request = request,
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
+    } };
+
+    setDiffSearchInput(&app, "staged");
+    app.submitSearch();
+
+    try std.testing.expect(app.search.match != null);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{
+        .hunk_line = .{ .hunk_index = 0, .line_index = 1 },
+    }, app.search.match.?.coordinate);
+    try std.testing.expectEqual(@as(?usize, 2), app.search.match_offset);
+    try std.testing.expectEqual(app.search.match.?.coordinate, app.viewer.diff_cursor);
+}
+
+test "cached preview keeps search input while projection is pending" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 7 },
+        .status_load_generation = 3,
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer app.git_status.deinit();
+    defer app.review_projection.deinit(std.testing.allocator);
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .cached_diff,
+        .unstaged,
+        app.load.generation,
+        app.status_load_generation,
+    );
+    app.review_projection = .{ .pending = request };
+
+    app.enterSearchMode();
+    try std.testing.expect(app.search.mode);
+    setDiffSearchInput(&app, "staged");
+    app.submitSearch();
+    try std.testing.expect(!app.search.mode);
+    try std.testing.expect(app.search.match == null);
+    try std.testing.expectEqualStrings("staged", app.search.query.slice());
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    const ready_request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .cached_diff,
+        .unstaged,
+        app.load.generation,
+        app.status_load_generation,
+    );
+    try app.finishReviewProjectionLoad(&ctx, .{
+        .request = ready_request,
+        .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) } },
+    });
+
+    try std.testing.expect(app.search.match != null);
+    try std.testing.expectEqual(@as(?usize, 2), app.search.match_offset);
 }
 
 test "generated preview uses metadata cursor rows and ignores hunk movement" {
