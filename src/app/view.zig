@@ -900,7 +900,11 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
     if (size.height <= 3) return;
     const layout = repoPickerLayout(size.height, has_path_status);
     const list_title = try app_repo_picker.listTitle(content.frameAllocator(), app.repo_picker_discovery, app.repo_state.discovery, &app.recent_repos);
-    try draw.copyClippedTextAt(&content, 0, layout.list_title_row, list_title, .{ .fg = color_accent, .bold = true });
+    const list_title_style: chasen.TextStyle = if (app.repo_picker.input_mode == .path_input)
+        .{ .fg = .gray, .dim = true }
+    else
+        .{ .fg = color_accent, .bold = true };
+    try draw.copyClippedTextAt(&content, 0, layout.list_title_row, list_title, list_title_style);
 
     defer {
         if (layout.footer_rows > 0) {

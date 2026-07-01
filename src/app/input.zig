@@ -190,12 +190,19 @@ fn repoPickerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) 
             if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .repo_picker_move_previous);
             if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .repo_picker_move_next);
         },
-        .filter, .path_input => {
+        .filter => {
             if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .repo_picker_backspace);
             if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .repo_picker_move_left);
             if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .repo_picker_move_right);
             if (key.matches(chasen.Key.up, .{})) return actionToMsg(Msg, .repo_picker_move_previous);
             if (key.matches(chasen.Key.down, .{})) return actionToMsg(Msg, .repo_picker_move_next);
+            if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
+        },
+        .path_input => {
+            if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .repo_picker_backspace);
+            if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .repo_picker_move_left);
+            if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .repo_picker_move_right);
+            if (key.matches(chasen.Key.up, .{}) or key.matches(chasen.Key.down, .{})) return null;
             if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
         },
     }
@@ -891,6 +898,11 @@ test "keyToMsg maps repo picker cursor movement" {
     const input_context: KeyContext = .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input };
     try std.testing.expectEqual(TestMsg.repo_picker_move_left, keyToMsg(TestMsg, input_context, .{ .codepoint = chasen.Key.left }).?);
     try std.testing.expectEqual(TestMsg.repo_picker_move_right, keyToMsg(TestMsg, input_context, .{ .codepoint = chasen.Key.right }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, input_context, .{ .codepoint = chasen.Key.up }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, input_context, .{ .codepoint = chasen.Key.down }));
+    const filter_context: KeyContext = .{ .repo_picker_mode = true, .repo_picker_input_mode = .filter };
+    try std.testing.expectEqual(TestMsg.repo_picker_move_previous, keyToMsg(TestMsg, filter_context, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(TestMsg.repo_picker_move_next, keyToMsg(TestMsg, filter_context, .{ .codepoint = chasen.Key.down }).?);
     try std.testing.expectEqual(TestMsg.repo_picker_move_previous, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.up }).?);
     try std.testing.expectEqual(TestMsg.repo_picker_move_next, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.down }).?);
     try std.testing.expectEqual(TestMsg.repo_picker_move_previous, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = 'k' }).?);
