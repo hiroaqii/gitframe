@@ -2826,7 +2826,7 @@ pub const App = struct {
             self.applyDiffCursorScrolloff();
             return;
         };
-        const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
+        const line_count = self.displayedDiffLineCount();
         if (line_count == 0) return;
         const target = switch (direction) {
             .up => current -| 1,
@@ -2842,7 +2842,7 @@ pub const App = struct {
             self.applyDiffCursorScrolloff();
             return;
         };
-        const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
+        const line_count = self.displayedDiffLineCount();
         if (line_count == 0) return;
         const step = @max(self.diffVisibleRows(), 1);
         const target = switch (direction) {
@@ -2854,7 +2854,7 @@ pub const App = struct {
     }
 
     fn selectHunkDelta(self: *App, delta: i2) void {
-        const file = self.selectedFile() orelse return;
+        const file = self.displayedDiffFile() orelse return;
         if (file.hunks.len == 0) return;
 
         const current = self.selectedHunkIndex();
@@ -3897,6 +3897,29 @@ pub const App = struct {
         return loaded.document.files[file_index];
     }
 
+    fn displayedDiffFile(self: *const App) ?diff_parser.FileDiff {
+        if (self.activeCombinedProjection()) |bundle| return bundle.projection.file;
+        if (self.activeCachedDiffProjection()) |bundle| {
+            if (bundle.loaded.document.files.len == 0) return null;
+            return bundle.loaded.document.files[0];
+        }
+        return self.selectedFile();
+    }
+
+    fn displayedGeneratedLineCount(self: *const App) ?usize {
+        const bundle = self.activeGeneratedFileProjection() orelse return null;
+        return bundle.file.lines.len + @as(usize, if (bundle.file.truncated) 1 else 0);
+    }
+
+    fn displayedDiffLineIndex(self: *const App, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
+        if (self.activeCombinedProjection()) |bundle| return bundle.projection.lineIndex(mode);
+        if (self.activeCachedDiffProjection()) |bundle| {
+            if (bundle.loaded.document.files.len == 0) return null;
+            return bundle.loaded.cachedRenderedLineIndex(0, mode);
+        }
+        return null;
+    }
+
     pub fn activeDiffDisplay(self: *const App, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?ActiveDiffDisplay {
         if (self.activeCombinedProjection()) |bundle| {
             const states = bundle.projection.hunk_states;
@@ -3919,6 +3942,52 @@ pub const App = struct {
             .folded_hunks = loaded.foldedHunksForFile(file_index),
             .staged_flags = try self.stagedHunkFlagsForFile(allocator, file),
         } };
+    }
+
+    pub fn activeGeneratedFileProjection(self: *const App) ?*const app_review_projection.GeneratedFileBundle {
+        const target = self.reviewProjectionTarget() orelse return null;
+        if (target.kind != .generated_added_file) return null;
+
+        return switch (self.review_projection) {
+            .ready => |*ready| blk: {
+                if (!ready.request.matchesBorrowed(
+                    target.repo_root,
+                    target.path_key,
+                    target.kind,
+                    target.source_kind,
+                    self.load.generation,
+                    self.status_load_generation,
+                )) break :blk null;
+                break :blk switch (ready.value) {
+                    .generated_added_file => |*bundle| bundle,
+                    else => null,
+                };
+            },
+            else => null,
+        };
+    }
+
+    pub fn activeCachedDiffProjection(self: *const App) ?*const app_load.LoadedDiffBundle {
+        const target = self.reviewProjectionTarget() orelse return null;
+        if (target.kind != .cached_diff) return null;
+
+        return switch (self.review_projection) {
+            .ready => |*ready| blk: {
+                if (!ready.request.matchesBorrowed(
+                    target.repo_root,
+                    target.path_key,
+                    target.kind,
+                    target.source_kind,
+                    self.load.generation,
+                    self.status_load_generation,
+                )) break :blk null;
+                break :blk switch (ready.value) {
+                    .cached_diff => |*bundle| bundle,
+                    else => null,
+                };
+            },
+            else => null,
+        };
     }
 
     fn activeCombinedProjection(self: *const App) ?*const app_review_projection.CombinedHunkBundle {
@@ -3947,10 +4016,15 @@ pub const App = struct {
     }
 
     fn selectedFileLineIndex(self: *const App, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {
-        if (self.activeCombinedProjection()) |bundle| return bundle.projection.lineIndex(mode);
+        if (self.displayedDiffLineIndex(mode)) |index| return index;
         const loaded = self.activeLoadedDiffConst() orelse return .{ .mode = mode };
         const file_index = self.selectedFileIndex(loaded) orelse return .{ .mode = mode };
         return loaded.renderedLineIndex(file_index, mode);
+    }
+
+    fn displayedDiffLineCount(self: *const App) usize {
+        if (self.displayedGeneratedLineCount()) |line_count| return line_count;
+        return self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
     }
 
     fn selectedFileCachedLineIndex(self: *const App, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
@@ -3960,7 +4034,7 @@ pub const App = struct {
     }
 
     fn selectedFoldedHunks(self: *const App) []const bool {
-        if (self.activeCombinedProjection() != null) return &.{};
+        if (self.activeCombinedProjection() != null or self.activeCachedDiffProjection() != null) return &.{};
         const loaded = self.activeLoadedDiffConst() orelse return &.{};
         const file_index = self.selectedFileIndex(loaded) orelse return &.{};
         return loaded.foldedHunksForFile(file_index);
@@ -4004,16 +4078,28 @@ pub const App = struct {
     }
 
     fn selectedDiffCursorOffset(self: *const App) ?usize {
+        if (self.displayedGeneratedLineCount()) |line_count| {
+            return switch (self.viewer.diff_cursor) {
+                .metadata => |offset| if (offset < line_count) offset else null,
+                else => null,
+            };
+        }
+
         const mode = self.effectiveDisplayMode();
-        const file = if (self.activeCombinedProjection()) |bundle| bundle.projection.file else self.selectedFile() orelse return null;
-        const index = if (self.activeCombinedProjection()) |bundle| bundle.projection.lineIndex(mode) else self.selectedFileCachedLineIndex(mode);
+        const file = self.displayedDiffFile() orelse return null;
+        const index = self.displayedDiffLineIndex(mode) orelse self.selectedFileCachedLineIndex(mode);
         return diff_view_model.renderedOffsetForCoordinate(file, mode, self.viewer.diff_cursor, index);
     }
 
     fn selectedCoordinateAtOffset(self: *const App, offset: usize) ?diff_view_model.BodyCoordinate {
+        if (self.displayedGeneratedLineCount()) |line_count| {
+            if (offset >= line_count) return null;
+            return .{ .metadata = offset };
+        }
+
         const mode = self.effectiveDisplayMode();
-        const file = if (self.activeCombinedProjection()) |bundle| bundle.projection.file else self.selectedFile() orelse return null;
-        const index = if (self.activeCombinedProjection()) |bundle| bundle.projection.lineIndex(mode) else self.selectedFileCachedLineIndex(mode);
+        const file = self.displayedDiffFile() orelse return null;
+        const index = self.displayedDiffLineIndex(mode) orelse self.selectedFileCachedLineIndex(mode);
         return diff_view_model.coordinateAtOffset(file, mode, offset, self.selectedFoldedHunks(), index);
     }
 
@@ -5852,6 +5938,7 @@ test "selectedEditorTarget rejects deleted status-only file rows from fresh stat
         },
     };
     var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
@@ -5890,6 +5977,7 @@ test "selectedEditorTarget rejects live sources without active repo" {
 
 test "selectedEditorTarget rejects directory rows" {
     var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
@@ -6298,6 +6386,89 @@ test "active diff display uses ready combined projection by identity" {
     try std.testing.expectEqual(@as(usize, 2), display.combined_projection.staged_flags.len);
     try std.testing.expect(display.combined_projection.staged_flags[0]);
     try std.testing.expect(!display.combined_projection.staged_flags[1]);
+}
+
+test "cached preview uses displayed diff for cursor movement" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 7 },
+        .status_load_generation = 3,
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer app.git_status.deinit();
+    defer app.review_projection.deinit(std.testing.allocator);
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .cached_diff,
+        .unstaged,
+        app.load.generation,
+        app.status_load_generation,
+    );
+    app.review_projection = .{ .ready = .{
+        .request = request,
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
+    } };
+
+    try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
+    app.moveDiffCursorRows(.down);
+    try std.testing.expectEqual(@as(?usize, 1), app.visibleDiffCursorOffset());
+    app.selectHunkDelta(1);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 0 }, app.viewer.diff_cursor);
+}
+
+test "generated preview uses metadata cursor rows and ignores hunk movement" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 7 },
+        .status_load_generation = 3,
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
+    };
+    defer app.git_status.deinit();
+    defer app.review_projection.deinit(std.testing.allocator);
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "src/new.zig",
+        .generated_added_file,
+        .unstaged,
+        app.load.generation,
+        app.status_load_generation,
+    );
+    app.review_projection = .{ .ready = .{
+        .request = request,
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n", false) },
+    } };
+
+    try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
+    app.moveDiffCursorRows(.down);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(?usize, 1), app.visibleDiffCursorOffset());
+    app.selectHunkDelta(1);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.viewer.diff_cursor);
 }
 
 test "projected hunk actions route through original cached and unstaged origins" {

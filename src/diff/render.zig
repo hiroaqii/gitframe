@@ -147,13 +147,19 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, line
     };
 
     if (truncated) {
+        const body_offset = cursor.bodyOffset();
         const row = cursor.nextRow();
-        if (row) |visible_row| try draw.copyClippedTextAt(&body_surface, 0, visible_row, "File preview truncated", styles.warning);
+        if (row) |visible_row| {
+            drawCursorMarker(surface, visible_row, body_offset, options.cursor_offset, styles);
+            try draw.copyClippedTextAt(&body_surface, 0, visible_row, "File preview truncated", styles.warning);
+        }
     }
 
     for (lines, 0..) |line_text, index| {
         if (cursor.done()) return;
+        const body_offset = cursor.bodyOffset();
         const row = cursor.nextRow() orelse continue;
+        drawCursorMarker(surface, row, body_offset, options.cursor_offset, styles);
         const line: diff_parser.DiffLine = .{
             .kind = .added,
             .text = line_text,
@@ -720,6 +726,21 @@ test "renderGeneratedAddedFile draws content on new side in side-by-side mode" {
     try ts.expectCellText(46, 3, "│");
     try ts.expectCellText(52, 3, "+");
     try ts.expectCellText(54, 3, "c");
+}
+
+test "renderGeneratedAddedFile draws cursor marker" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 6);
+    defer ts.deinit();
+
+    try renderGeneratedAddedFile(&ts.surface, "src/new.zig", &.{ "one", "two" }, false, .{
+        .requested_mode = .unified,
+        .cursor_offset = 1,
+    });
+
+    try ts.expectCellText(0, 3, " ");
+    try ts.expectCellText(0, 4, "▌");
+    try ts.expectCellText(14, 4, "t");
 }
 
 test "narrow side-by-side request labels file header as automatic unified fallback" {

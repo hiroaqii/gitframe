@@ -441,38 +441,44 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
     var content = diffContentSurface(surface);
     const path = entry.canonicalPathKey() orelse entry.path;
 
+    if (app.activeCachedDiffProjection()) |bundle| {
+        if (bundle.loaded.document.files.len > 0) {
+            try diff_render.renderFile(&content, bundle.loaded.document.files[0], .{
+                .requested_mode = app.viewer.display_mode,
+                .scroll = app.viewer.diff_scroll,
+                .horizontal_scroll = app.viewer.diff_horizontal_scroll,
+                .pane_active = active,
+                .title_prefix = repoHeaderLabel(app),
+                .line_numbers = app.viewer.view_options.line_numbers,
+                .highlighted_hunk = app.selectedHunkIndex(),
+                .cursor_offset = app.visibleDiffCursorOffset(),
+                .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.viewer.display_mode)),
+                .palette = app.theme,
+            });
+            drawPaneHeaderRule(surface);
+            return;
+        }
+    }
+
+    if (app.activeGeneratedFileProjection()) |bundle| {
+        try diff_render.renderGeneratedAddedFile(&content, bundle.file.path, bundle.file.lines, bundle.file.truncated, .{
+            .requested_mode = app.viewer.display_mode,
+            .scroll = app.viewer.diff_scroll,
+            .horizontal_scroll = app.viewer.diff_horizontal_scroll,
+            .pane_active = active,
+            .title_prefix = repoHeaderLabel(app),
+            .line_numbers = app.viewer.view_options.line_numbers,
+            .cursor_offset = app.visibleDiffCursorOffset(),
+            .palette = app.theme,
+        });
+        drawPaneHeaderRule(surface);
+        return;
+    }
+
     switch (app.review_projection) {
         .ready => |ready| {
             switch (ready.value) {
-                .cached_diff => |bundle| {
-                    if (bundle.loaded.document.files.len > 0) {
-                        try diff_render.renderFile(&content, bundle.loaded.document.files[0], .{
-                            .requested_mode = app.viewer.display_mode,
-                            .scroll = app.viewer.diff_scroll,
-                            .horizontal_scroll = app.viewer.diff_horizontal_scroll,
-                            .pane_active = active,
-                            .title_prefix = repoHeaderLabel(app),
-                            .line_numbers = app.viewer.view_options.line_numbers,
-                            .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.viewer.display_mode)),
-                            .palette = app.theme,
-                        });
-                        drawPaneHeaderRule(surface);
-                        return;
-                    }
-                },
-                .generated_added_file => |bundle| {
-                    try diff_render.renderGeneratedAddedFile(&content, bundle.file.path, bundle.file.lines, bundle.file.truncated, .{
-                        .requested_mode = app.viewer.display_mode,
-                        .scroll = app.viewer.diff_scroll,
-                        .horizontal_scroll = app.viewer.diff_horizontal_scroll,
-                        .pane_active = active,
-                        .title_prefix = repoHeaderLabel(app),
-                        .line_numbers = app.viewer.view_options.line_numbers,
-                        .palette = app.theme,
-                    });
-                    drawPaneHeaderRule(surface);
-                    return;
-                },
+                .cached_diff, .generated_added_file => {},
                 .combined_hunks => {},
                 .status_body => |body| {
                     try drawStatusBody(&content, repoHeaderLabel(app), body.path, body.message, active);
