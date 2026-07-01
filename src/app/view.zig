@@ -341,8 +341,8 @@ fn sidebarTreeContent(allocator: std.mem.Allocator, row: sidebar_view_model.Row)
     const indent = @as(usize, row.depth) * 2;
     const fold_marker = switch (row.fold) {
         .none => "",
-        .expanded => "▼ ",
-        .collapsed => "▶ ",
+        .expanded => "▾ ",
+        .collapsed => "▸ ",
     };
     const len = indent + fold_marker.len + row.name.len;
     const buf = try allocator.alloc(u8, len);

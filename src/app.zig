@@ -8085,7 +8085,7 @@ test "search marker gutter does not overwrite diff content" {
 
     try ts.expectCellText(0, diff_body_start_row, "»");
     try ts.expectCellText(1, diff_body_start_row, "▌");
-    try ts.expectCellText(2, diff_body_start_row, "│");
+    try ts.expectCellText(2, diff_body_start_row, "╭");
     try ts.expectCellText(3, diff_body_start_row, "▾");
 }
 

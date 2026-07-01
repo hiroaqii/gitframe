@@ -150,7 +150,7 @@ pub fn treeContentDisplayWidth(row: Row) usize {
     const indent: usize = @as(usize, row.depth) * 2;
     const fold_width: usize = switch (row.fold) {
         .none => 0,
-        .expanded, .collapsed => chasen.text.displayWidth("▼ "),
+        .expanded, .collapsed => chasen.text.displayWidth("▾ "),
     };
     return indent + fold_width + chasen.text.displayWidth(row.name);
 }

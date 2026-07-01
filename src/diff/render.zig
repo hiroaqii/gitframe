@@ -79,6 +79,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
         if (lineIndexMatchesFile(file, index, mode)) index else null
     else
         null;
+    const guide_index = line_index orelse diff_view_model.RenderedLineIndex.buildFolded(surface.frameAllocator(), file, mode, options.folded_hunks) catch null;
     var cursor: BodyCursor = .{
         // initAt has already consumed the virtual rows before options.scroll.
         .scroll = if (line_index != null) 0 else options.scroll,
@@ -107,15 +108,19 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
             .metadata => |line| try draw.copyClippedTextAt(&body_surface, 0, row, line, styles.metadata),
             .binary_marker => _ = body_surface.borrowTextAt(0, row, "Binary file", styles.warning),
             .hunk_header => |hunk| {
-                if (current_hunk_highlighted) drawHunkGuide(surface, row, styles);
+                if (current_hunk_highlighted and !hunk.folded) drawHunkGuide(surface, row, guideGlyph(guide_index, hunk.hunk_index, body_offset), styles);
                 try drawHunkHeaderRow(&body_surface, row, hunk, options.highlighted_hunk, mode, current_hunk_staged, styles);
             },
             .unified_line => |line| {
-                if (current_hunk_highlighted) drawHunkGuide(surface, row, styles);
+                if (current_hunk_highlighted) {
+                    if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), styles);
+                }
                 try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles);
             },
             .side_by_side => |side_row| {
-                if (current_hunk_highlighted) drawHunkGuide(surface, row, styles);
+                if (current_hunk_highlighted) {
+                    if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), styles);
+                }
                 const gutter_col = body_surface.size().width / 2;
                 switch (side_row) {
                     .single => |line| try drawSideBySideSingle(&body_surface, row, line, gutter_col, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles),
@@ -296,9 +301,18 @@ fn drawCursorMarker(surface: *chasen.Surface, row: u16, body_offset: usize, curs
     _ = surface.borrowTextAt(0, row, "▌", styles.cursor);
 }
 
-fn drawHunkGuide(surface: *chasen.Surface, row: u16, styles: RenderStyles) void {
+fn guideGlyph(index_opt: ?diff_view_model.RenderedLineIndex, hunk_index: usize, body_offset: usize) []const u8 {
+    const index = index_opt orelse return "│";
+    const hunk_offset = index.hunkOffset(hunk_index);
+    const line_count = index.hunkLineCount(hunk_index);
+    if (body_offset == hunk_offset) return "╭";
+    if (line_count > 1 and body_offset + 1 == hunk_offset + line_count) return "╰";
+    return "│";
+}
+
+fn drawHunkGuide(surface: *chasen.Surface, row: u16, glyph: []const u8, styles: RenderStyles) void {
     if (surface.size().width < 2) return;
-    _ = surface.borrowTextAt(1, row, "│", styles.hunk_guide);
+    _ = surface.borrowTextAt(1, row, glyph, styles.hunk_guide);
 }
 
 const BodyCursor = struct {
@@ -654,8 +668,8 @@ test "selected hunk guide is drawn only for highlighted hunk" {
 
     try ts.expectCellText(1, 3, " ");
     try ts.expectCellText(1, 4, " ");
-    try ts.expectCellText(1, 5, "│");
-    try ts.expectCellText(1, 6, "│");
+    try ts.expectCellText(1, 5, "╭");
+    try ts.expectCellText(1, 6, "╰");
 
     const guide_cell = ts.surface.readCell(1, 5).?;
     try std.testing.expect(guide_cell.style.fg.eql(RenderStyles.fromPalette(.default()).hunk_guide.fg));
@@ -701,6 +715,39 @@ test "selected hunk guide continues when hunk header is scrolled above viewport"
     try ts.expectCellText(1, 4, "│");
     try ts.expectCellText(14, 3, "o");
     try ts.expectCellText(14, 4, "t");
+}
+
+test "selected hunk guide is suppressed for folded highlighted hunk" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 5);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 2,
+            .new_start = 1,
+            .new_count = 2,
+            .section = "folded",
+            .lines = &.{
+                .{ .kind = .context, .text = "one", .old_line = 1, .new_line = 1 },
+                .{ .kind = .context, .text = "two", .old_line = 2, .new_line = 2 },
+            },
+        }},
+    };
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .highlighted_hunk = 0,
+        .folded_hunks = &.{true},
+    });
+
+    try ts.expectCellText(1, 3, " ");
+    try ts.expectCellText(2, 3, "▸");
 }
 
 test "displayPath prefers new path and strips git prefixes" {

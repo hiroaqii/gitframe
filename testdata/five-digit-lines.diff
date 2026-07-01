@@ -1,0 +1,20 @@
+diff --git a/src/five_digit_lines.zig b/src/five_digit_lines.zig
+index 1111111..2222222 100644
+--- a/src/five_digit_lines.zig
++++ b/src/five_digit_lines.zig
+@@ -12345,7 +12345,8 @@ pub fn renderVeryLargeFile() void {
+ const line_12345 = "context before the change";
+ const line_12346 = "another context line";
+-const line_12347 = "old value at a five digit line number";
++const line_12347 = "new value at a five digit line number";
++const line_12348 = "inserted line near a five digit line number";
+ const line_12349 = "context after the change";
+ const line_12350 = "more context after the change";
+ const line_12351 = "final context line";
+@@ -23456,6 +23457,7 @@ pub fn anotherLargeHunk() void {
+ const line_23456 = "context before second hunk";
+-const line_23457 = "old second hunk value";
++const line_23457 = "new second hunk value";
++const line_23458 = "inserted second hunk line";
+ const line_23459 = "context after second hunk";
+ const line_23460 = "final second hunk context";
