@@ -3073,11 +3073,7 @@ pub const App = struct {
     }
 
     fn enterSearchMode(self: *App) void {
-        if (self.activeCombinedProjection() != null) {
-            self.clearSearchMatch();
-            self.setStatus("search is unavailable for mixed staged/unstaged view", .{});
-            return;
-        }
+        if (self.blockUnsupportedSearchTarget()) return;
         self.search.input = self.search.query;
         self.search.mode = true;
     }
@@ -3587,11 +3583,7 @@ pub const App = struct {
 
     fn submitSearch(self: *App) void {
         self.search.mode = false;
-        if (self.activeCombinedProjection() != null) {
-            self.clearSearchMatch();
-            self.setStatus("search is unavailable for mixed staged/unstaged view", .{});
-            return;
-        }
+        if (self.blockUnsupportedSearchTarget()) return;
         self.search.query = self.search.input;
         self.clearSearchMatch();
         if (self.search.query.len == 0) {
@@ -3601,11 +3593,7 @@ pub const App = struct {
     }
 
     fn selectSearchMatch(self: *App, direction: diff_search.Direction) void {
-        if (self.activeCombinedProjection() != null) {
-            self.clearSearchMatch();
-            self.setStatus("search is unavailable for mixed staged/unstaged view", .{});
-            return;
-        }
+        if (self.blockUnsupportedSearchTarget()) return;
         const file = self.selectedFile() orelse return;
         if (self.search.query.len == 0) return;
 
@@ -3627,7 +3615,7 @@ pub const App = struct {
     fn refreshSearchForSelectedFile(self: *App) void {
         self.clearSearchMatch();
         if (self.search.query.len == 0) return;
-        if (self.activeCombinedProjection() != null) return;
+        if (self.activeCombinedProjection() != null or self.activeGeneratedFileProjection() != null) return;
         const file = self.selectedFile() orelse return;
         const next = diff_search.findMatch(file, self.effectiveDisplayMode(), self.search.query.slice(), null, .forward) orelse return;
         self.unfoldSearchMatchIfNeeded(next);
@@ -3649,7 +3637,7 @@ pub const App = struct {
     fn updateSearchMatchOffset(self: *App) void {
         self.search.match_offset = null;
         const match = self.search.match orelse return;
-        if (self.activeCombinedProjection() != null) {
+        if (self.activeCombinedProjection() != null or self.activeGeneratedFileProjection() != null) {
             self.clearSearchMatch();
             return;
         }
@@ -3660,6 +3648,20 @@ pub const App = struct {
             return;
         };
         self.search.match_offset = offset;
+    }
+
+    fn blockUnsupportedSearchTarget(self: *App) bool {
+        if (self.activeCombinedProjection() != null) {
+            self.clearSearchMatch();
+            self.setStatus("search is unavailable for mixed staged/unstaged view", .{});
+            return true;
+        }
+        if (self.activeGeneratedFileProjection() != null) {
+            self.clearSearchMatch();
+            self.setStatus("search is unavailable for generated file preview", .{});
+            return true;
+        }
+        return false;
     }
 
     fn unfoldSearchMatchIfNeeded(self: *App, match: diff_search.Match) void {
@@ -6572,6 +6574,51 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
     try std.testing.expectEqual(@as(?usize, 1), app.visibleDiffCursorOffset());
     app.selectHunkDelta(1);
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.viewer.diff_cursor);
+}
+
+test "generated preview blocks diff search" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 7 },
+        .status_load_generation = 3,
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
+    };
+    defer app.git_status.deinit();
+    defer app.review_projection.deinit(std.testing.allocator);
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "src/new.zig",
+        .generated_added_file,
+        .unstaged,
+        app.load.generation,
+        app.status_load_generation,
+    );
+    app.review_projection = .{ .ready = .{
+        .request = request,
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n", false) },
+    } };
+
+    app.enterSearchMode();
+    try std.testing.expect(!app.search.mode);
+    try std.testing.expectEqualStrings("search is unavailable for generated file preview", app.status.text());
+
+    setDiffSearchInput(&app, "two");
+    app.submitSearch();
+    try std.testing.expect(app.search.match == null);
+    try std.testing.expect(app.search.match_offset == null);
+    try std.testing.expectEqualStrings("search is unavailable for generated file preview", app.status.text());
 }
 
 test "projected hunk actions route through original cached and unstaged origins" {
