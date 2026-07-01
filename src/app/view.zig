@@ -5,6 +5,7 @@ const app_commit_panel = @import("commit_panel.zig");
 const app_repo_picker = @import("repo_picker.zig");
 const draw = @import("draw");
 const diff_render = @import("../diff/render.zig");
+const git_branch_status = @import("../git/branch_status.zig");
 const git_status = @import("../git/status.zig");
 const keymap = @import("keymap");
 const loaded_diff = @import("../loaded_diff.zig");
@@ -432,6 +433,11 @@ fn drawDiffHeaderDetailRow(app: anytype, surface: *chasen.Surface, active: bool)
         return;
     }
 
+    if (branchStatusHeaderText(app, surface.frameAllocator())) |text| {
+        draw.copyClippedTextAt(surface, 1, 1, text, paneBranchStyle(active)) catch {};
+        return;
+    }
+
     drawPaneHeaderRule(surface);
 }
 
@@ -808,6 +814,30 @@ fn repoHeaderLabel(app: anytype) ?[]const u8 {
     const base = std.fs.path.basename(root);
     if (base.len == 0) return root;
     return base;
+}
+
+fn branchStatusHeaderText(app: anytype, allocator: std.mem.Allocator) ?[]const u8 {
+    const root = app.repo_state.activeRoot() orelse return null;
+    if (app.branch_status_load_pending != null) return "branch: loading";
+
+    const snapshot_root = app.branch_status.repo_root orelse return null;
+    if (!std.mem.eql(u8, root, snapshot_root)) return null;
+
+    return formatBranchStatus(allocator, app.branch_status.status) catch "branch";
+}
+
+fn formatBranchStatus(allocator: std.mem.Allocator, status: git_branch_status.BranchStatus) ![]const u8 {
+    const branch = switch (status.head) {
+        .branch => |name| name,
+        .detached => return "branch: detached",
+        .unknown => return "branch: unknown",
+    };
+    const ahead = if (status.ahead_behind) |ab| ab.ahead else 0;
+    const behind = if (status.ahead_behind) |ab| ab.behind else 0;
+    if (status.upstream) |upstream| {
+        return std.fmt.allocPrint(allocator, "branch: {s} -> {s} ↑{d} ↓{d}", .{ branch, upstream.name, ahead, behind });
+    }
+    return std.fmt.allocPrint(allocator, "branch: {s} (no upstream)", .{branch});
 }
 
 fn sourceFooterLabel(config: anytype) ?[]const u8 {
@@ -1646,6 +1676,13 @@ fn paneSearchStyle(active: bool) chasen.TextStyle {
         .{ .bold = true, .fg = color_prompt }
     else
         .{ .fg = color_prompt };
+}
+
+fn paneBranchStyle(active: bool) chasen.TextStyle {
+    return if (active)
+        .{ .fg = color_info }
+    else
+        .{ .fg = color_info, .dim = true };
 }
 
 fn paneHeaderRuleStyle() chasen.TextStyle {

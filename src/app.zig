@@ -29,6 +29,7 @@ const diff_view_model = @import("diff/view_model.zig");
 const editor = @import("editor.zig");
 const file_tree = @import("file_tree.zig");
 const git_ops = @import("app/git_ops.zig");
+const git_branch_status = @import("git/branch_status.zig");
 const git_status = @import("git/status.zig");
 const keymap = @import("keymap");
 const loaded_diff = @import("loaded_diff.zig");
@@ -70,6 +71,8 @@ const RepoDiscoveryFinished = app_load.RepoDiscoveryFinished;
 const RepoDiscoveryTask = app_load.RepoDiscoveryTask(App.Msg);
 const RepoPathDiscoveryFinished = app_load.RepoPathDiscoveryFinished;
 const RepoPathDiscoveryTask = app_load.RepoPathDiscoveryTask(App.Msg);
+const BranchStatusLoadFinished = app_load.BranchStatusLoadFinished;
+const BranchStatusLoadTask = app_load.BranchStatusLoadTask(App.Msg);
 const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
 const PathTarget = git_ops.PathTarget;
@@ -153,6 +156,7 @@ const LoadFinishedMsg = union(enum) {
     repo_path_discovered: RepoPathDiscoveryFinished,
     diff_loaded: DiffLoadFinished,
     status_loaded: StatusLoadFinished,
+    branch_status_loaded: BranchStatusLoadFinished,
     review_projection_loaded: ReviewProjectionFinished,
 };
 
@@ -257,6 +261,9 @@ pub const App = struct {
     git_status: git_status.GitStatusState = .{},
     status_load_generation: u64 = 0,
     status_load_pending: ?u64 = null,
+    branch_status: git_branch_status.State = .{},
+    branch_status_load_generation: u64 = 0,
+    branch_status_load_pending: ?u64 = null,
     /// One-shot startup selection intent used when diff finishes before status.
     pending_initial_first_visible_selection: bool = false,
     tree_order: file_tree.StableOrder = .{},
@@ -409,6 +416,7 @@ pub const App = struct {
         self.clearLoadedDiff();
         self.repo_state.deinit(deinit_ctx.allocator);
         self.git_status.deinit();
+        self.branch_status.deinit();
         self.file_search.deinit(deinit_ctx.allocator);
         self.commit_panel.deinit();
         self.repo_picker.deinit(deinit_ctx.allocator);
@@ -623,6 +631,7 @@ pub const App = struct {
             .repo_path_discovered => |result| try self.finishRepoPathDiscovery(ctx, result),
             .diff_loaded => |result| try self.finishDiffLoad(ctx, result),
             .status_loaded => |result| try self.finishStatusLoad(ctx, result),
+            .branch_status_loaded => |result| self.finishBranchStatusLoad(ctx, result),
             .review_projection_loaded => |result| try self.finishReviewProjectionLoad(ctx, result),
         }
     }
@@ -870,8 +879,10 @@ pub const App = struct {
     fn startDiffLoadWithRepoRoot(self: *App, ctx: *chasen.Ctx(Msg), repo_root: ?[]const u8, clear_visible_state: bool) !void {
         if (repo_root) |root| {
             self.startStatusLoad(ctx, root);
+            self.startBranchStatusLoad(ctx, root);
         } else {
             self.invalidateStatusSnapshot();
+            self.invalidateBranchStatusSnapshot();
         }
 
         const task = try ctx.allocator().create(DiffLoadTask);
@@ -937,11 +948,46 @@ pub const App = struct {
         };
     }
 
+    fn startBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), repo_root: []const u8) void {
+        self.invalidateBranchStatusSnapshot();
+
+        const task = ctx.allocator().create(BranchStatusLoadTask) catch {
+            self.setStatus("could not allocate branch status load task", .{});
+            return;
+        };
+
+        const owned_root = ctx.allocator().dupe(u8, repo_root) catch {
+            ctx.allocator().destroy(task);
+            self.setStatus("could not allocate branch status repo root", .{});
+            return;
+        };
+
+        task.* = .{
+            .repo_root = owned_root,
+            .generation = self.branch_status_load_generation,
+        };
+        self.branch_status_load_pending = self.branch_status_load_generation;
+
+        ctx.task().spawnWith(task, BranchStatusLoadTask.run) catch {
+            ctx.allocator().free(owned_root);
+            ctx.allocator().destroy(task);
+            self.branch_status_load_pending = null;
+            self.setStatus("could not start branch status load task", .{});
+            return;
+        };
+    }
+
     fn invalidateStatusSnapshot(self: *App) void {
         self.status_load_generation +%= 1;
         self.status_load_pending = null;
         self.pending_initial_first_visible_selection = false;
         self.git_status.clear();
+    }
+
+    fn invalidateBranchStatusSnapshot(self: *App) void {
+        self.branch_status_load_generation +%= 1;
+        self.branch_status_load_pending = null;
+        self.branch_status.clear();
     }
 
     fn ensureReviewProjection(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -2016,6 +2062,8 @@ pub const App = struct {
             try self.startRepoDiscovery(ctx);
             return;
         }
+        // Commit/amend can change HEAD and ahead/behind counts; this reload
+        // path must continue to refresh branch status for remote workflow gates.
         try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
             ctx.redraw().skip();
             return;
@@ -2430,6 +2478,34 @@ pub const App = struct {
                 self.pending_initial_first_visible_selection = false;
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{message});
+            },
+        }
+    }
+
+    fn finishBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: BranchStatusLoadFinished) void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (result.generation != self.branch_status_load_generation) return;
+        if (self.branch_status_load_pending == result.generation) self.branch_status_load_pending = null;
+
+        switch (result.result) {
+            .empty => self.branch_status.clear(),
+            .loaded => |*bundle| {
+                self.branch_status.replace(result.repo_root, bundle) catch {
+                    self.branch_status.clear();
+                    self.setStatus("branch status parse failed", .{});
+                    return;
+                };
+                result.result = .empty;
+            },
+            .failed => |message| {
+                self.branch_status.clear();
+                self.setStatus("branch status load failed: {s}", .{git_ops.trimGitOutput(message)});
+            },
+            .failed_static => |message| {
+                self.branch_status.clear();
+                self.setStatus("branch status load failed: {s}", .{message});
             },
         }
     }
@@ -5572,6 +5648,33 @@ test "pending selection restore clears when status finishes empty after reload" 
     try std.testing.expect(app.pending_selection_restore == null);
 }
 
+test "stale branch status result is ignored" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .branch_status_load_generation = 2,
+        .branch_status_load_pending = 2,
+    };
+    defer app.branch_status.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    const bundle = try git_branch_status.BranchStatusBundle.parseOwned(
+        std.testing.allocator,
+        "# branch.head stale\n" ++
+            "# branch.upstream origin/main\n" ++
+            "# branch.ab +1 -0\n",
+    );
+
+    app.finishBranchStatusLoad(&ctx, .{
+        .generation = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = bundle },
+    });
+
+    try std.testing.expect(app.branch_status.repo_root == null);
+    try std.testing.expect(std.meta.eql(git_branch_status.Head.unknown, app.branch_status.status.head));
+    try std.testing.expectEqual(@as(?u64, 2), app.branch_status_load_pending);
+}
+
 test "manual reload clears action selection restore" {
     var app: App = .{
         .allocator = std.testing.allocator,
@@ -6771,7 +6874,7 @@ test "cached source hunk unstage reload decision travels with task result" {
         .diff_load => {},
         .repo_discovery => return error.ExpectedReloadAfterCachedHunkUnstage,
     }
-    try std.testing.expectEqual(@as(usize, 2), ctx.pendingTaskWithSlice().len);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskWithSlice().len);
 }
 
 test "clearLoadedDiff clears session staged hunk marks" {
@@ -8249,7 +8352,12 @@ fn clearPendingStatusAndDiffTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.
         allocator.destroy(task);
     }
     if (entries.len >= 2) {
-        const task: *DiffLoadTask = @ptrCast(@alignCast(entries[1].ctx));
+        const task: *BranchStatusLoadTask = @ptrCast(@alignCast(entries[1].ctx));
+        allocator.free(task.repo_root);
+        allocator.destroy(task);
+    }
+    if (entries.len >= 3) {
+        const task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
         diff_source.freeLoadRequest(allocator, task.request);
         allocator.destroy(task);
     }
