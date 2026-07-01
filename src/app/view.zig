@@ -381,7 +381,7 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     }
 
     var diff_content = diffContentSurface(surface);
-    const mode = diff_render.effectiveMode(diff_content.size().width, app.viewer.display_mode);
+    const mode = diff_render.effectiveMode(diff_render.bodyWidth(diff_content.size().width), app.viewer.display_mode);
     const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
     const display = (try app.activeDiffDisplay(surface.frameAllocator(), mode)) orelse return;
     const display_file = display.file();
@@ -453,7 +453,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                             .pane_active = active,
                             .title_prefix = repoHeaderLabel(app),
                             .line_numbers = app.viewer.view_options.line_numbers,
-                            .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(content.size().width, app.viewer.display_mode)),
+                            .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.viewer.display_mode)),
                             .palette = app.theme,
                         });
                         drawPaneHeaderRule(surface);

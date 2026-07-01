@@ -221,6 +221,13 @@ pub const BodyRowIterator = struct {
         }
     }
 
+    pub fn currentHunkIndex(self: BodyRowIterator) ?usize {
+        return switch (self.phase) {
+            .hunk_header, .hunk_lines => if (self.hunk_index < self.file.hunks.len) self.hunk_index else null,
+            else => null,
+        };
+    }
+
     fn isFolded(self: BodyRowIterator, hunk_index: usize) bool {
         return hunk_index < self.folded_hunks.len and self.folded_hunks[hunk_index];
     }

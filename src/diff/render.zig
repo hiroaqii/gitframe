@@ -56,17 +56,22 @@ pub fn visibleBodyRows(surface_height: u16) usize {
     return if (surface_height > body_start_row) surface_height - body_start_row else 0;
 }
 
+pub fn bodyWidth(render_surface_width: u16) u16 {
+    return render_surface_width -| cursor_gutter_width;
+}
+
 pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options: RenderOptions) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
     const styles = RenderStyles.fromPalette(options.palette);
-    const mode = effectiveMode(size.width, options.requested_mode);
-    try renderFileHeader(surface, file, options.requested_mode, options.pane_active, options.title_prefix, styles);
+    const content_width = bodyWidth(size.width);
+    const mode = effectiveMode(content_width, options.requested_mode);
+    try renderFileHeader(surface, file, options.requested_mode, content_width, options.pane_active, options.title_prefix, styles);
     var body_surface = surface.child(.{
         .col = cursor_gutter_width,
         .row = 0,
-        .width = size.width -| cursor_gutter_width,
+        .width = content_width,
         .height = size.height,
     });
 
@@ -85,8 +90,16 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     else
         diff_view_model.BodyRowIterator.initWithFolded(file, mode, options.folded_hunks);
     var current_hunk_staged = false;
+    var current_hunk_highlighted = false;
     while (rows.next()) |body_row| {
         if (cursor.done()) return;
+        if (rows.currentHunkIndex()) |hunk_index| {
+            current_hunk_staged = hunk_index < options.staged_hunks.len and options.staged_hunks[hunk_index];
+            current_hunk_highlighted = options.highlighted_hunk != null and options.highlighted_hunk.? == hunk_index;
+        } else {
+            current_hunk_staged = false;
+            current_hunk_highlighted = false;
+        }
         const body_offset = cursor.bodyOffset();
         const row = cursor.nextRow() orelse continue;
         drawCursorMarker(surface, row, body_offset, options.cursor_offset, styles);
@@ -94,11 +107,15 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
             .metadata => |line| try draw.copyClippedTextAt(&body_surface, 0, row, line, styles.metadata),
             .binary_marker => _ = body_surface.borrowTextAt(0, row, "Binary file", styles.warning),
             .hunk_header => |hunk| {
-                current_hunk_staged = hunk.hunk_index < options.staged_hunks.len and options.staged_hunks[hunk.hunk_index];
+                if (current_hunk_highlighted) drawHunkGuide(surface, row, styles);
                 try drawHunkHeaderRow(&body_surface, row, hunk, options.highlighted_hunk, mode, current_hunk_staged, styles);
             },
-            .unified_line => |line| try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles),
+            .unified_line => |line| {
+                if (current_hunk_highlighted) drawHunkGuide(surface, row, styles);
+                try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles);
+            },
             .side_by_side => |side_row| {
+                if (current_hunk_highlighted) drawHunkGuide(surface, row, styles);
                 const gutter_col = body_surface.size().width / 2;
                 switch (side_row) {
                     .single => |line| try drawSideBySideSingle(&body_surface, row, line, gutter_col, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles),
@@ -114,8 +131,15 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, line
     if (size.width == 0 or size.height == 0) return;
 
     const styles = RenderStyles.fromPalette(options.palette);
-    const mode = effectiveMode(size.width, options.requested_mode);
-    try renderGeneratedFileHeader(surface, path, lines.len, truncated, options.requested_mode, options.pane_active, options.title_prefix, styles);
+    const content_width = bodyWidth(size.width);
+    const mode = effectiveMode(content_width, options.requested_mode);
+    try renderGeneratedFileHeader(surface, path, lines.len, truncated, options.requested_mode, content_width, options.pane_active, options.title_prefix, styles);
+    var body_surface = surface.child(.{
+        .col = cursor_gutter_width,
+        .row = 0,
+        .width = content_width,
+        .height = size.height,
+    });
 
     var cursor: BodyCursor = .{
         .scroll = options.scroll,
@@ -124,7 +148,7 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, line
 
     if (truncated) {
         const row = cursor.nextRow();
-        if (row) |visible_row| try draw.copyClippedTextAt(surface, 0, visible_row, "File preview truncated", styles.warning);
+        if (row) |visible_row| try draw.copyClippedTextAt(&body_surface, 0, visible_row, "File preview truncated", styles.warning);
     }
 
     for (lines, 0..) |line_text, index| {
@@ -135,11 +159,11 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, line
             .text = line_text,
             .new_line = @intCast(index + 1),
         };
-        if (mode == .side_by_side and size.width >= side_by_side_min_width) {
-            const gutter_col = size.width / 2;
-            try drawSideBySidePair(surface, row, null, line, gutter_col, options.horizontal_scroll, options.line_numbers, false, styles);
+        if (mode == .side_by_side) {
+            const gutter_col = body_surface.size().width / 2;
+            try drawSideBySidePair(&body_surface, row, null, line, gutter_col, options.horizontal_scroll, options.line_numbers, false, styles);
         } else {
-            try drawUnifiedLine(surface, row, line, options.horizontal_scroll, options.line_numbers, false, styles);
+            try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, false, styles);
         }
     }
 }
@@ -152,13 +176,14 @@ fn renderFileHeader(
     surface: *chasen.Surface,
     file: diff_parser.FileDiff,
     requested_mode: DisplayMode,
+    mode_width: u16,
     pane_active: bool,
     title_prefix: ?[]const u8,
     styles: RenderStyles,
 ) !void {
     const stats = fileStats(file);
     const summary = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  +{d} -{d}  {d} hunks", .{
-        modeLabel(surface.size().width, requested_mode),
+        modeLabel(mode_width, requested_mode),
         stats.added,
         stats.removed,
         file.hunks.len,
@@ -172,13 +197,14 @@ fn renderGeneratedFileHeader(
     added_lines: usize,
     truncated: bool,
     requested_mode: DisplayMode,
+    mode_width: u16,
     pane_active: bool,
     title_prefix: ?[]const u8,
     styles: RenderStyles,
 ) !void {
     const suffix = if (truncated) "  truncated" else "";
     const summary = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  +{d} -0  generated{s}", .{
-        modeLabel(surface.size().width, requested_mode),
+        modeLabel(mode_width, requested_mode),
         added_lines,
         suffix,
     });
@@ -248,9 +274,7 @@ fn drawHunkHeaderRow(
 }
 
 fn hunkHeaderStyle(highlighted: bool, staged: bool, styles: RenderStyles) chasen.TextStyle {
-    if (highlighted) return styles.selected_hunk;
-
-    var style = styles.hunk;
+    var style = if (highlighted) styles.selected_hunk else styles.hunk;
     if (staged) {
         style.dim = true;
         style.bg = .{ .index = 8 };
@@ -259,11 +283,16 @@ fn hunkHeaderStyle(highlighted: bool, staged: bool, styles: RenderStyles) chasen
 }
 
 pub const body_start_row: u16 = 3;
-const cursor_gutter_width: u16 = 1;
+const cursor_gutter_width: u16 = 2;
 
 fn drawCursorMarker(surface: *chasen.Surface, row: u16, body_offset: usize, cursor_offset: ?usize, styles: RenderStyles) void {
     if (cursor_offset == null or cursor_offset.? != body_offset) return;
     _ = surface.borrowTextAt(0, row, "▌", styles.cursor);
+}
+
+fn drawHunkGuide(surface: *chasen.Surface, row: u16, styles: RenderStyles) void {
+    if (surface.size().width < 2) return;
+    _ = surface.borrowTextAt(1, row, "│", styles.hunk_guide);
 }
 
 const BodyCursor = struct {
@@ -466,6 +495,7 @@ const RenderStyles = struct {
     file_header: chasen.TextStyle,
     hunk: chasen.TextStyle,
     selected_hunk: chasen.TextStyle,
+    hunk_guide: chasen.TextStyle,
     cursor: chasen.TextStyle,
     added: chasen.TextStyle,
     removed: chasen.TextStyle,
@@ -477,8 +507,9 @@ const RenderStyles = struct {
     fn fromPalette(palette: theme.Palette) RenderStyles {
         return .{
             .file_header = .{ .bold = true, .fg = palette.color(.accent) },
-            .hunk = .{ .bold = true, .fg = palette.color(.diff_hunk) },
-            .selected_hunk = .{ .bold = true, .reverse = true, .fg = palette.color(.diff_hunk) },
+            .hunk = .{ .dim = true, .fg = palette.color(.diff_metadata) },
+            .selected_hunk = .{ .bold = true, .fg = palette.color(.diff_hunk) },
+            .hunk_guide = .{ .bold = true, .fg = palette.color(.diff_hunk) },
             .cursor = .{ .bold = true, .fg = palette.color(.diff_cursor) },
             .added = palette.style(.diff_added),
             .removed = palette.style(.diff_removed),
@@ -552,22 +583,118 @@ test "renderFile dims staged hunk body without removing it" {
         .staged_hunks = &.{true},
     });
 
-    const header_cell = ts.surface.readCell(1, 3).?;
+    const header_cell = ts.surface.readCell(2, 3).?;
     try std.testing.expect(header_cell.style.bg.eql(.{ .index = 8 }));
-    try ts.expectCellText(13, 4, "o");
-    const old_cell = ts.surface.readCell(13, 4).?;
+    try ts.expectCellText(14, 4, "o");
+    const old_cell = ts.surface.readCell(14, 4).?;
     try std.testing.expect(old_cell.style.dim);
-    try ts.expectCellText(13, 5, "n");
-    const new_cell = ts.surface.readCell(13, 5).?;
+    try ts.expectCellText(14, 5, "n");
+    const new_cell = ts.surface.readCell(14, 5).?;
     try std.testing.expect(new_cell.style.dim);
 }
 
-test "hunkHeaderStyle lets highlighted state win over staged background" {
-    const style = hunkHeaderStyle(true, true, RenderStyles.fromPalette(.default()));
+test "hunkHeaderStyle composes highlighted and staged state" {
+    const styles = RenderStyles.fromPalette(.default());
+    const style = hunkHeaderStyle(true, true, styles);
 
-    try std.testing.expect(style.reverse);
-    try std.testing.expect(!style.dim);
-    try std.testing.expect(style.bg.eql(.default));
+    try std.testing.expect(style.fg.eql(styles.selected_hunk.fg));
+    try std.testing.expect(!style.reverse);
+    try std.testing.expect(style.dim);
+    try std.testing.expect(style.bg.eql(.{ .index = 8 }));
+}
+
+test "hunkHeaderStyle dims unselected hunk header" {
+    const styles = RenderStyles.fromPalette(.default());
+    const style = hunkHeaderStyle(false, false, styles);
+
+    try std.testing.expect(style.dim);
+    try std.testing.expect(style.fg.eql(styles.hunk.fg));
+}
+
+test "selected hunk guide is drawn only for highlighted hunk" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 7);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 1,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "first",
+                .lines = &.{.{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 }},
+            },
+            .{
+                .old_start = 9,
+                .old_count = 1,
+                .new_start = 9,
+                .new_count = 1,
+                .section = "second",
+                .lines = &.{.{ .kind = .context, .text = "later", .old_line = 9, .new_line = 9 }},
+            },
+        },
+    };
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .highlighted_hunk = 1,
+    });
+
+    try ts.expectCellText(1, 3, " ");
+    try ts.expectCellText(1, 4, " ");
+    try ts.expectCellText(1, 5, "│");
+    try ts.expectCellText(1, 6, "│");
+
+    const guide_cell = ts.surface.readCell(1, 5).?;
+    try std.testing.expect(guide_cell.style.fg.eql(RenderStyles.fromPalette(.default()).hunk_guide.fg));
+}
+
+test "selected hunk guide continues when hunk header is scrolled above viewport" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 5);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 3,
+                .new_start = 1,
+                .new_count = 3,
+                .section = "large",
+                .lines = &.{
+                    .{ .kind = .context, .text = "one", .old_line = 1, .new_line = 1 },
+                    .{ .kind = .context, .text = "two", .old_line = 2, .new_line = 2 },
+                    .{ .kind = .context, .text = "three", .old_line = 3, .new_line = 3 },
+                },
+            },
+        },
+    };
+
+    var index = try diff_view_model.RenderedLineIndex.build(std.testing.allocator, file, .unified);
+    defer index.deinit(std.testing.allocator);
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .scroll = index.hunkOffset(0) + 1,
+        .line_index = index,
+        .highlighted_hunk = 0,
+    });
+
+    try ts.expectCellText(1, 3, "│");
+    try ts.expectCellText(1, 4, "│");
+    try ts.expectCellText(14, 3, "o");
+    try ts.expectCellText(14, 4, "t");
 }
 
 test "displayPath prefers new path and strips git prefixes" {
@@ -590,9 +717,9 @@ test "renderGeneratedAddedFile draws content on new side in side-by-side mode" {
     try renderGeneratedAddedFile(&ts.surface, "src/new.zig", &.{ "const value = 1;", "pub fn main() void {}" }, false, .{ .requested_mode = .side_by_side });
 
     try ts.expectCellText(0, 0, "s");
-    try ts.expectCellText(45, 3, "│");
-    try ts.expectCellText(51, 3, "+");
-    try ts.expectCellText(53, 3, "c");
+    try ts.expectCellText(46, 3, "│");
+    try ts.expectCellText(52, 3, "+");
+    try ts.expectCellText(54, 3, "c");
 }
 
 test "narrow side-by-side request labels file header as automatic unified fallback" {
@@ -662,7 +789,7 @@ test "side-by-side clips old column before new column" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side });
 
-    const gutter_col: u16 = 40;
+    const gutter_col: u16 = 41;
     try ts.expectCellText(gutter_col, 4, "│");
     try ts.expectCellText(gutter_col + 8, 4, "n");
     try ts.expectCellText(gutter_col + 9, 4, "e");
@@ -694,9 +821,9 @@ test "side-by-side hunk header is clipped before the new column" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side });
 
-    const gutter_col: u16 = 40;
-    try ts.expectCellText(3, 3, "@");
+    const gutter_col: u16 = 41;
     try ts.expectCellText(4, 3, "@");
+    try ts.expectCellText(5, 3, "@");
     try ts.expectCellText(gutter_col, 3, "│");
     try ts.expectCellText(gutter_col + 1, 3, " ");
     try ts.expectCellText(gutter_col + 8, 3, " ");
@@ -772,12 +899,12 @@ test "unified horizontal scroll keeps line numbers and prefix fixed" {
     try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .horizontal_scroll = 4 });
 
     try ts.expectCellText(0, 4, " ");
-    try ts.expectCellText(4, 4, "1");
-    try ts.expectCellText(9, 4, "1");
-    try ts.expectCellText(11, 4, " ");
-    try ts.expectCellText(13, 4, "4");
-    try ts.expectCellText(14, 4, "5");
-    try ts.expectCellText(31, 4, "m");
+    try ts.expectCellText(5, 4, "1");
+    try ts.expectCellText(10, 4, "1");
+    try ts.expectCellText(12, 4, " ");
+    try ts.expectCellText(14, 4, "4");
+    try ts.expectCellText(15, 4, "5");
+    try ts.expectCellText(31, 4, "l");
 }
 
 test "unified line numbers can be hidden while keeping prefix" {
@@ -806,10 +933,10 @@ test "unified line numbers can be hidden while keeping prefix" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .line_numbers = false });
 
-    try ts.expectCellText(1, 4, "+");
-    try ts.expectCellText(3, 4, "n");
-    try ts.expectCellText(4, 4, "e");
-    try ts.expectCellText(5, 4, "w");
+    try ts.expectCellText(2, 4, "+");
+    try ts.expectCellText(4, 4, "n");
+    try ts.expectCellText(5, 4, "e");
+    try ts.expectCellText(6, 4, "w");
 }
 
 test "inactive pane dims file header only" {
@@ -860,9 +987,9 @@ test "side-by-side horizontal scroll keeps gutter fixed" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side, .horizontal_scroll = 4 });
 
-    try ts.expectCellText(8, 4, "0");
-    try ts.expectCellText(40, 4, "│");
-    try ts.expectCellText(48, 4, "a");
+    try ts.expectCellText(9, 4, "0");
+    try ts.expectCellText(41, 4, "│");
+    try ts.expectCellText(49, 4, "a");
 }
 
 test "side-by-side line numbers can be hidden while keeping prefixes" {
@@ -892,11 +1019,11 @@ test "side-by-side line numbers can be hidden while keeping prefixes" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .side_by_side, .line_numbers = false });
 
-    try ts.expectCellText(1, 4, "-");
-    try ts.expectCellText(3, 4, "o");
-    try ts.expectCellText(40, 4, "│");
-    try ts.expectCellText(41, 4, "+");
-    try ts.expectCellText(43, 4, "n");
+    try ts.expectCellText(2, 4, "-");
+    try ts.expectCellText(4, 4, "o");
+    try ts.expectCellText(41, 4, "│");
+    try ts.expectCellText(42, 4, "+");
+    try ts.expectCellText(44, 4, "n");
 }
 
 test "renderFile can start from cached viewport offset" {
@@ -943,12 +1070,12 @@ test "renderFile can start from cached viewport offset" {
         .line_index = index,
     });
 
-    try ts.expectCellText(3, 3, "@");
     try ts.expectCellText(4, 3, "@");
-    try ts.expectCellText(13, 4, "s");
-    try ts.expectCellText(14, 4, "a");
-    try ts.expectCellText(15, 4, "m");
-    try ts.expectCellText(16, 4, "e");
+    try ts.expectCellText(5, 3, "@");
+    try ts.expectCellText(14, 4, "s");
+    try ts.expectCellText(15, 4, "a");
+    try ts.expectCellText(16, 4, "m");
+    try ts.expectCellText(17, 4, "e");
 }
 
 test "renderFile cursor marker uses absolute body offset with cached viewport" {
@@ -1031,11 +1158,11 @@ test "renderFile can start from cached side-by-side viewport offset" {
         .line_index = index,
     });
 
-    try ts.expectCellText(8, 3, "o");
-    try ts.expectCellText(9, 3, "l");
-    try ts.expectCellText(10, 3, "d");
-    try ts.expectCellText(40, 3, "│");
-    try ts.expectCellText(48, 3, "n");
-    try ts.expectCellText(49, 3, "e");
-    try ts.expectCellText(50, 3, "w");
+    try ts.expectCellText(9, 3, "o");
+    try ts.expectCellText(10, 3, "l");
+    try ts.expectCellText(11, 3, "d");
+    try ts.expectCellText(41, 3, "│");
+    try ts.expectCellText(49, 3, "n");
+    try ts.expectCellText(50, 3, "e");
+    try ts.expectCellText(51, 3, "w");
 }

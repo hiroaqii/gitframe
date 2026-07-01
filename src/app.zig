@@ -4089,7 +4089,7 @@ pub const App = struct {
     }
 
     fn effectiveDisplayMode(self: *const App) diff_render.DisplayMode {
-        return diff_render.effectiveMode(self.diffPaneWidth(), self.viewer.display_mode);
+        return diff_render.effectiveMode(diff_render.bodyWidth(self.diffPaneWidth()), self.viewer.display_mode);
     }
 
     fn layoutSize(self: *const App) chasen.Size {
@@ -4446,7 +4446,7 @@ test "sidebar visibility toggle uses full diff width and keeps selection" {
 
 test "sidebar width adjustment clamps and affects effective mode" {
     var app: App = .{
-        .terminal_size = .{ .width = 102, .height = 8 },
+        .terminal_size = .{ .width = 104, .height = 8 },
         .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         .viewer = .{ .display_mode = .side_by_side },
     };
@@ -4468,7 +4468,7 @@ test "sidebar width adjustment clamps and affects effective mode" {
 
 test "sidebar width remains stored while sidebar is hidden" {
     var app: App = .{
-        .terminal_size = .{ .width = 102, .height = 8 },
+        .terminal_size = .{ .width = 104, .height = 8 },
         .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         .viewer = .{ .display_mode = .side_by_side },
     };
@@ -7628,7 +7628,8 @@ test "search marker gutter does not overwrite diff content" {
 
     try ts.expectCellText(0, diff_body_start_row, "»");
     try ts.expectCellText(1, diff_body_start_row, "▌");
-    try ts.expectCellText(2, diff_body_start_row, "▾");
+    try ts.expectCellText(2, diff_body_start_row, "│");
+    try ts.expectCellText(3, diff_body_start_row, "▾");
 }
 
 test "status mode label uses diff content width after marker gutter" {
