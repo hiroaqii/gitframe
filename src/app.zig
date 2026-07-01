@@ -3617,6 +3617,7 @@ pub const App = struct {
     fn refreshSearchForSelectedFile(self: *App) void {
         self.clearSearchMatch();
         if (self.search.query.len == 0) return;
+        if (self.unsupportedSearchMessage() != null) return;
         const mode = self.effectiveDisplayMode();
         const target = self.displayedSearchTarget(mode) orelse return;
         const next = diff_search.findMatch(target.file, mode, self.search.query.slice(), null, .forward) orelse return;
@@ -3638,6 +3639,10 @@ pub const App = struct {
 
     fn updateSearchMatchOffset(self: *App) void {
         self.search.match_offset = null;
+        if (self.unsupportedSearchMessage() != null) {
+            self.clearSearchMatch();
+            return;
+        }
         const match = self.search.match orelse return;
         const mode = self.effectiveDisplayMode();
         const target = self.displayedSearchTarget(mode) orelse {
@@ -3652,17 +3657,29 @@ pub const App = struct {
     }
 
     fn blockUnsupportedSearchTarget(self: *App) bool {
-        if (self.activeCombinedProjection() != null) {
+        if (self.unsupportedSearchMessage()) |message| {
             self.clearSearchMatch();
-            self.setStatus("search is unavailable for mixed staged/unstaged view", .{});
-            return true;
-        }
-        if (self.activeGeneratedFileProjection() != null) {
-            self.clearSearchMatch();
-            self.setStatus("search is unavailable for generated file preview", .{});
+            self.setStatus("{s}", .{message});
             return true;
         }
         return false;
+    }
+
+    fn unsupportedSearchMessage(self: *const App) ?[]const u8 {
+        if (self.activeCombinedProjection() != null) {
+            return "search is unavailable for mixed staged/unstaged view";
+        }
+        if (self.activeGeneratedFileProjection() != null) {
+            return "search is unavailable for generated file preview";
+        }
+        if (self.activeCachedDiffProjection() != null) {
+            if (self.selectedStatusEntry()) |entry| {
+                if (entry.index == .added and !entry.isUnstaged()) {
+                    return "search is unavailable for staged new file preview";
+                }
+            }
+        }
+        return null;
     }
 
     fn unfoldSearchMatchIfNeeded(self: *App, match: diff_search.Match) void {
@@ -6755,6 +6772,92 @@ test "generated preview blocks diff search" {
     try std.testing.expect(app.search.match == null);
     try std.testing.expect(app.search.match_offset == null);
     try std.testing.expectEqualStrings("search is unavailable for generated file preview", app.status.text());
+}
+
+test "staged new file preview blocks diff search" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 7 },
+        .status_load_generation = 3,
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer app.git_status.deinit();
+    defer app.review_projection.deinit(std.testing.allocator);
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/new.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "src/new.zig",
+        .cached_diff,
+        .unstaged,
+        app.load.generation,
+        app.status_load_generation,
+    );
+    app.review_projection = .{ .ready = .{
+        .request = request,
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
+    } };
+
+    app.enterSearchMode();
+    try std.testing.expect(!app.search.mode);
+    try std.testing.expectEqualStrings("search is unavailable for staged new file preview", app.status.text());
+
+    setDiffSearchInput(&app, "staged");
+    app.submitSearch();
+    try std.testing.expect(app.search.match == null);
+    try std.testing.expect(app.search.match_offset == null);
+    try std.testing.expectEqualStrings("search is unavailable for staged new file preview", app.status.text());
+}
+
+test "staged new file preview does not refresh existing search query" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 7 },
+        .status_load_generation = 3,
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer app.git_status.deinit();
+    defer app.review_projection.deinit(std.testing.allocator);
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/new.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "src/new.zig",
+        .cached_diff,
+        .unstaged,
+        app.load.generation,
+        app.status_load_generation,
+    );
+    app.review_projection = .{ .ready = .{
+        .request = request,
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
+    } };
+
+    app.search.query.insertSlice("staged") catch unreachable;
+    app.refreshSearchForSelectedFile();
+
+    try std.testing.expect(app.search.match == null);
+    try std.testing.expect(app.search.match_offset == null);
 }
 
 test "projected hunk actions route through original cached and unstaged origins" {
