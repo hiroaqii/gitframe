@@ -119,6 +119,9 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
     if (app.overlay.isAmendCommit()) {
         try viewAmendConfirmation(app, surface);
     }
+    if (app.overlay.isPushBranch()) {
+        try viewPushConfirmation(app, surface);
+    }
 }
 
 fn shellFrameOptions() ui.Panel.ViewOptions {
@@ -1328,6 +1331,39 @@ fn viewAmendConfirmation(app: anytype, surface: *chasen.Surface) !void {
     }
 }
 
+fn viewPushConfirmation(app: anytype, surface: *chasen.Surface) !void {
+    const confirmation = app.push_confirmation orelse return;
+    const modal = ui.Modal.init(.{});
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, confirmation_dialog_width),
+        .dialog_height = @min(surface.size().height, confirmation_dialog_height),
+        .title = "Push current branch?",
+        .backdrop = false,
+        .border = .rounded,
+        .title_style = .{ .bold = true, .fg = color_accent },
+        .border_style = .{ .fg = color_accent },
+    };
+    fillModalDialog(surface, opts);
+    modal.view(surface, opts);
+
+    const content_rect = ui.Modal.contentRect(surface, opts);
+    if (content_rect.width == 0 or content_rect.height == 0) return;
+    var content = surface.child(content_rect);
+    const size = content.size();
+
+    const target = try std.fmt.allocPrint(content.frameAllocator(), "{s} -> {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
+    const counts = try std.fmt.allocPrint(content.frameAllocator(), "ahead {d} / behind {d}", .{ confirmation.ahead, confirmation.behind });
+    const line_count: u16 = 5;
+    const start_row: u16 = if (size.height > line_count) (size.height - line_count) / 2 else 0;
+    try drawCenteredText(&content, start_row, target, .{ .bold = true, .fg = color_accent });
+    if (start_row + 2 < size.height) {
+        try drawCenteredText(&content, start_row + 2, counts, .{ .fg = .gray });
+    }
+    if (start_row + 4 < size.height) {
+        try drawCenteredText(&content, start_row + 4, "Enter: push    Esc/q: cancel", .{ .fg = color_accent });
+    }
+}
+
 fn drawCenteredText(surface: *chasen.Surface, row: u16, text: []const u8, style: chasen.TextStyle) !void {
     const size = surface.size();
     if (row >= size.height or size.width == 0) return;
@@ -1897,6 +1933,7 @@ const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .repo_picker }, .description = "switch repository" },
     .{ .key = .{ .action = .commit }, .description = "open commit panel" },
     .{ .key = .{ .action = .amend }, .description = "amend last commit" },
+    .{ .key = .{ .action = .push }, .description = "push current branch" },
     .{ .key = .{ .action = .discard }, .description = "discard selected file changes" },
     .{ .key = .{ .action = .open_editor }, .description = "open selected file in editor" },
     .{ .key = .{ .text = "a / N" }, .description = "approve / needs changes in review mode" },

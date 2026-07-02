@@ -804,7 +804,7 @@ test "loadConfig accepts keymap overrides" {
         \\schema_version = 1
         \\[keymap]
         \\commit = "m"
-        \\repo_picker = "P"
+        \\repo_picker = "O"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
@@ -813,7 +813,7 @@ test "loadConfig accepts keymap overrides" {
     defer result.deinit();
     try std.testing.expect(result.warning == null);
     try std.testing.expect(result.config.value.keymap.get(.commit).?.eql(.{ .plain_codepoint = 'm' }));
-    try std.testing.expect(result.config.value.keymap.get(.repo_picker).?.eql(.{ .shifted_ascii = .{ .lower = 'p', .upper = 'P' } }));
+    try std.testing.expect(result.config.value.keymap.get(.repo_picker).?.eql(.{ .shifted_ascii = .{ .lower = 'o', .upper = 'O' } }));
 }
 
 test "loadConfig accepts external action definitions" {

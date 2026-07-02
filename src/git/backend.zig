@@ -128,6 +128,7 @@ pub const OperationKind = union(enum) {
     unstage_patch: StagePatchRequest,
     commit: CommitRequest,
     amend: CommitRequest,
+    push: PushRequest,
 };
 
 pub const StagePatchRequest = struct {
@@ -139,6 +140,15 @@ pub const CommitRequest = struct {
     body: ?[]const u8 = null,
 };
 
+pub const PushRequest = struct {
+    branch: []const u8,
+    remote: []const u8,
+    remote_branch: []const u8,
+    /// Commit snapshot used by the pre-push safety check. The push argv uses
+    /// the branch refspec; this OID only proves the branch has not moved.
+    oid: []const u8,
+};
+
 /// Request for a write operation executed in a concrete repository.
 ///
 /// The app snapshots `repo_root` and paths before spawning the task so a later
@@ -146,6 +156,7 @@ pub const CommitRequest = struct {
 pub const OperationRequest = struct {
     repo_root: []const u8,
     kind: OperationKind,
+    env_map: ?*const std.process.Environ.Map = null,
 };
 
 /// Minimal Git command backend boundary.
@@ -218,6 +229,7 @@ pub const LocalCommandBackend = struct {
             .unstage_patch => |patch| runGitApplyCachedReverse(allocator, io, request.repo_root, patch.patch),
             .commit => |commit| runGitCommit(allocator, io, request.repo_root, commit),
             .amend => |commit| runGitAmend(allocator, io, request.repo_root, commit),
+            .push => |push| runGitPush(allocator, io, request.repo_root, request.env_map, push),
         };
     }
 
@@ -581,6 +593,123 @@ fn runGitAmend(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, 
     return runGitCommitLike(allocator, io, repo_root, request, true);
 }
 
+fn runGitPush(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, parent_env: ?*const std.process.Environ.Map, request: PushRequest) LoadError!OperationResult {
+    if (!try verifyPushSnapshot(allocator, io, repo_root, request)) {
+        return .{ .failed_static = "Branch changed before push; reload and try again" };
+    }
+    if (parent_env) |env| {
+        if (env.get("GIT_SSH_COMMAND")) |ssh_command| {
+            if (sshBatchModeState(ssh_command) == .interactive) {
+                return .{ .failed_static = "Push requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND" };
+            }
+        }
+    }
+
+    var env = try pushEnvironment(allocator, parent_env);
+    defer env.deinit();
+
+    const refspec = std.fmt.allocPrint(allocator, "refs/heads/{s}:refs/heads/{s}", .{ request.branch, request.remote_branch }) catch return error.OutOfMemory;
+    defer allocator.free(refspec);
+
+    const argv = [_][]const u8{ "git", "push", request.remote, refspec };
+    const result = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .cwd = .{ .path = repo_root },
+        .environ_map = &env,
+        .stdout_limit = .limited(128 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.StreamTooLong,
+        else => error.SpawnFailed,
+    };
+
+    allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .ok;
+        },
+        else => {},
+    }
+
+    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    allocator.free(result.stderr);
+
+    return .{ .failed = std.fmt.allocPrint(allocator, "git push failed: {any}", .{result.term}) catch return error.OutOfMemory };
+}
+
+fn verifyPushSnapshot(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: PushRequest) LoadError!bool {
+    const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
+    const branch_result = try runGitBranchStatusCommand(allocator, io, repo_root, &branch_argv);
+    defer freeRunResult(allocator, branch_result);
+    switch (branch_result.term) {
+        .exited => |code| if (code != 0) return false,
+        else => return false,
+    }
+    if (!std.mem.eql(u8, trimLineEnd(branch_result.stdout), request.branch)) return false;
+
+    const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
+    const oid_result = try runGitBranchStatusCommand(allocator, io, repo_root, &oid_argv);
+    defer freeRunResult(allocator, oid_result);
+    switch (oid_result.term) {
+        .exited => |code| if (code != 0) return false,
+        else => return false,
+    }
+    return std.mem.eql(u8, trimLineEnd(oid_result.stdout), request.oid);
+}
+
+fn pushEnvironment(allocator: std.mem.Allocator, parent_env: ?*const std.process.Environ.Map) LoadError!std.process.Environ.Map {
+    var env = if (parent_env) |map|
+        map.clone(allocator) catch return error.OutOfMemory
+    else
+        std.process.Environ.Map.init(allocator);
+    errdefer env.deinit();
+
+    env.put("GIT_TERMINAL_PROMPT", "0") catch return error.OutOfMemory;
+
+    const existing_ssh = env.get("GIT_SSH_COMMAND");
+    const ssh_command = if (existing_ssh) |value|
+        switch (sshBatchModeState(value)) {
+            .batch => allocator.dupe(u8, value) catch return error.OutOfMemory,
+            .interactive => return error.SpawnFailed,
+            .unspecified => std.fmt.allocPrint(allocator, "{s} -o BatchMode=yes", .{value}) catch return error.OutOfMemory,
+        }
+    else
+        allocator.dupe(u8, "ssh -o BatchMode=yes") catch return error.OutOfMemory;
+    defer allocator.free(ssh_command);
+    env.put("GIT_SSH_COMMAND", ssh_command) catch return error.OutOfMemory;
+
+    return env;
+}
+
+const SshBatchModeState = enum {
+    unspecified,
+    batch,
+    interactive,
+};
+
+fn sshBatchModeState(command: []const u8) SshBatchModeState {
+    if (indexOfIgnoreCase(command, "batchmode=no") != null) return .interactive;
+    if (indexOfIgnoreCase(command, "batchmode no") != null) return .interactive;
+    if (indexOfIgnoreCase(command, "batchmode=yes") != null) return .batch;
+    if (indexOfIgnoreCase(command, "batchmode yes") != null) return .batch;
+    // A bare/unknown BatchMode spelling is ambiguous, so keep push fail-fast
+    // instead of trying to override a user-provided SSH command.
+    if (indexOfIgnoreCase(command, "batchmode") != null) return .interactive;
+    return .unspecified;
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
 fn runGitCommitLike(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest, amend: bool) LoadError!OperationResult {
     const argv_subject = [_][]const u8{ "git", "commit", "-m", request.subject };
     const argv_with_body = [_][]const u8{ "git", "commit", "-m", request.subject, "-m", request.body orelse "" };
@@ -708,6 +837,168 @@ test "Backend exposes operation interface" {
         .kind = .{ .amend = .{ .subject = "subject", .body = null } },
     };
     try std.testing.expectEqualStrings("subject", amend_request.kind.amend.subject);
+
+    const push_request: OperationRequest = .{
+        .repo_root = "/repo",
+        .kind = .{ .push = .{
+            .branch = "feature",
+            .remote = "origin",
+            .remote_branch = "main",
+            .oid = "abc123",
+        } },
+    };
+    try std.testing.expectEqualStrings("feature", push_request.kind.push.branch);
+    try std.testing.expectEqualStrings("origin", push_request.kind.push.remote);
+    try std.testing.expectEqualStrings("main", push_request.kind.push.remote_branch);
+    try std.testing.expectEqualStrings("abc123", push_request.kind.push.oid);
+}
+
+test "pushEnvironment disables interactive credential prompts" {
+    var env = try pushEnvironment(std.testing.allocator, null);
+    defer env.deinit();
+
+    try std.testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
+    try std.testing.expectEqualStrings("ssh -o BatchMode=yes", env.get("GIT_SSH_COMMAND").?);
+}
+
+test "pushEnvironment preserves existing ssh command while adding BatchMode" {
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("GIT_SSH_COMMAND", "ssh -i /tmp/key");
+    try parent.put("HOME", "/home/test");
+
+    var env = try pushEnvironment(std.testing.allocator, &parent);
+    defer env.deinit();
+
+    try std.testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
+    try std.testing.expectEqualStrings("ssh -i /tmp/key -o BatchMode=yes", env.get("GIT_SSH_COMMAND").?);
+    try std.testing.expectEqualStrings("/home/test", env.get("HOME").?);
+}
+
+test "pushEnvironment preserves existing BatchMode yes and rejects BatchMode no" {
+    var parent_yes = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent_yes.deinit();
+    try parent_yes.put("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -i /tmp/key");
+
+    var env = try pushEnvironment(std.testing.allocator, &parent_yes);
+    defer env.deinit();
+    try std.testing.expectEqualStrings("ssh -o BatchMode=yes -i /tmp/key", env.get("GIT_SSH_COMMAND").?);
+
+    var parent_no = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent_no.deinit();
+    try parent_no.put("GIT_SSH_COMMAND", "ssh -o BatchMode=no -i /tmp/key");
+    try std.testing.expectError(error.SpawnFailed, pushEnvironment(std.testing.allocator, &parent_no));
+}
+
+test "LocalCommandBackend push rejects stale oid before contacting remote" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
+
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = repo_root,
+        .kind = .{ .push = .{
+            .branch = "main",
+            .remote = "missing",
+            .remote_branch = "main",
+            .oid = "not-the-current-oid",
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed_static => |message| try std.testing.expectEqualStrings("Branch changed before push; reload and try again", message),
+        else => return error.ExpectedStalePushFailure,
+    }
+}
+
+test "LocalCommandBackend push reports remote failure after snapshot check passes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
+
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+    const oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    defer std.testing.allocator.free(oid);
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = repo_root,
+        .kind = .{ .push = .{
+            .branch = "main",
+            .remote = "missing",
+            .remote_branch = "main",
+            .oid = trimLineEnd(oid),
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed => |message| try std.testing.expect(message.len > 0),
+        else => return error.ExpectedRemotePushFailure,
+    }
+}
+
+test "LocalCommandBackend push succeeds to a local bare remote" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+
+    const remote_root = try tmp.dir.realPathFileAlloc(io, "remote.git", std.testing.allocator);
+    defer std.testing.allocator.free(remote_root);
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, work);
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
+
+    const oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    defer std.testing.allocator.free(oid);
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = repo_root,
+        .kind = .{ .push = .{
+            .branch = "main",
+            .remote = "origin",
+            .remote_branch = "main",
+            .oid = trimLineEnd(oid),
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(OperationResult.ok, result);
 }
 
 test "LocalCommandBackend loads branch status without upstream" {
@@ -750,6 +1041,25 @@ fn runTestGit(io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !void {
         .exited => |code| if (code == 0) return,
         else => {},
     }
+    return error.GitCommandFailed;
+}
+
+fn gitOutputAlloc(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) ![]u8 {
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = argv,
+        .cwd = .{ .dir = cwd },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    errdefer freeRunResult(std.testing.allocator, result);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            std.testing.allocator.free(result.stderr);
+            return result.stdout;
+        },
+        else => {},
+    }
+    freeRunResult(std.testing.allocator, result);
     return error.GitCommandFailed;
 }
 

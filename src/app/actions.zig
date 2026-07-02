@@ -190,6 +190,31 @@ pub const AmendFinished = struct {
     }
 };
 
+pub const PushFinished = struct {
+    pending: PendingAction,
+    repo_root: []u8,
+    branch: []u8,
+    remote: []u8,
+    remote_branch: []u8,
+    result: FileActionTaskResult,
+
+    pub fn deinit(self: *PushFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.branch);
+        allocator.free(self.remote);
+        allocator.free(self.remote_branch);
+        self.result.deinit(allocator);
+        self.* = .{
+            .pending = .{ .generation = 0, .kind = .push },
+            .repo_root = &.{},
+            .branch = &.{},
+            .remote = &.{},
+            .remote_branch = &.{},
+            .result = .ok,
+        };
+    }
+};
+
 pub const FileActionTaskResult = union(enum) {
     ok,
     failed: []u8,
@@ -443,6 +468,53 @@ pub fn AmendTask(comptime Msg: type) type {
     };
 }
 
+/// Async task for non-interactive `git push`.
+///
+/// The branch/upstream/oid snapshot is captured before confirmation and
+/// rechecked by the backend immediately before pushing.
+pub fn PushTask(comptime Msg: type) type {
+    return struct {
+        pending: PendingAction,
+        repo_root: []u8,
+        branch: []u8,
+        remote: []u8,
+        remote_branch: []u8,
+        oid: []u8,
+        env_map: ?*const std.process.Environ.Map = null,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                if (task.branch.len > 0) allocator.free(task.branch);
+                if (task.remote.len > 0) allocator.free(task.remote);
+                if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
+                allocator.free(task.oid);
+                allocator.destroy(task);
+            }
+
+            const result = runPush(task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, allocator, io);
+            const repo_root = task.repo_root;
+            const branch = task.branch;
+            const remote = task.remote;
+            const remote_branch = task.remote_branch;
+            task.repo_root = &.{};
+            task.branch = &.{};
+            task.remote = &.{};
+            task.remote_branch = &.{};
+
+            return Msg.actionFinished(.{ .push = PushFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .branch = branch,
+                .remote = remote,
+                .remote_branch = remote_branch,
+                .result = result,
+            } });
+        }
+    };
+}
+
 pub fn runStageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     var local_backend: git_backend.LocalCommandBackend = .{};
     const raw_result = local_backend.backend().runOperation(allocator, io, .{
@@ -566,6 +638,31 @@ pub fn runAmend(repo_root: []const u8, subject: []const u8, body: ?[]const u8, a
         return .{
             .failed = std.fmt.allocPrint(allocator, "Amend failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Amend failed: OutOfMemory" },
+        };
+    };
+
+    return switch (raw_result) {
+        .ok => .ok,
+        .failed => |message| .{ .failed = message },
+        .failed_static => |message| .{ .failed_static = message },
+    };
+}
+
+pub fn runPush(repo_root: []const u8, branch: []const u8, remote: []const u8, remote_branch: []const u8, oid: []const u8, env_map: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+    var local_backend: git_backend.LocalCommandBackend = .{};
+    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+        .repo_root = repo_root,
+        .kind = .{ .push = .{
+            .branch = branch,
+            .remote = remote,
+            .remote_branch = remote_branch,
+            .oid = oid,
+        } },
+        .env_map = env_map,
+    }) catch |err| {
+        return .{
+            .failed = std.fmt.allocPrint(allocator, "Push failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Push failed: OutOfMemory" },
         };
     };
 

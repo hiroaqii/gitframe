@@ -1,6 +1,7 @@
 const std = @import("std");
 const diff_source = @import("../diff/source.zig");
 const file_tree = @import("../file_tree.zig");
+const git_branch_status = @import("../git/branch_status.zig");
 const git_status = @import("../git/status.zig");
 
 /// App-local Git operation target classification.
@@ -146,6 +147,30 @@ pub const DiscardTargetResult = union(enum) {
     no_unstaged_content,
 };
 
+pub const PushTarget = struct {
+    repo_root: []const u8,
+    branch: []const u8,
+    remote: []const u8,
+    remote_branch: []const u8,
+    oid: []const u8,
+    ahead: u32,
+    behind: u32,
+};
+
+pub const PushTargetResult = union(enum) {
+    ready: PushTarget,
+    unavailable_source,
+    no_repo,
+    loading_branch_status,
+    detached_head,
+    branch_unavailable,
+    no_upstream,
+    upstream_not_remote_branch,
+    branch_status_unavailable,
+    pull_first,
+    nothing_to_push,
+};
+
 pub const StatusSnapshot = struct {
     /// Repo root used by the most recent status load.
     repo_root: ?[]const u8,
@@ -181,6 +206,53 @@ pub const TargetContext = struct {
     action_target: ?PathTarget,
     status: StatusSnapshot,
 };
+
+pub const BranchStatusSnapshot = struct {
+    repo_root: ?[]const u8,
+    loading: bool,
+    status: git_branch_status.BranchStatus,
+
+    fn freshFor(self: BranchStatusSnapshot, active_repo_root: []const u8) bool {
+        if (self.loading) return false;
+        const snapshot_root = self.repo_root orelse return false;
+        return std.mem.eql(u8, snapshot_root, active_repo_root);
+    }
+};
+
+pub const RemoteActionContext = struct {
+    source: diff_source.SourceMode,
+    repo_root: ?[]const u8,
+    branch_status: BranchStatusSnapshot,
+};
+
+pub fn pushTarget(ctx: RemoteActionContext) PushTargetResult {
+    if (!diff_source.sourceAllowsStageProjection(ctx.source)) return .unavailable_source;
+    const repo_root = ctx.repo_root orelse return .no_repo;
+    if (!ctx.branch_status.freshFor(repo_root)) return .loading_branch_status;
+
+    const status = ctx.branch_status.status;
+    const branch = switch (status.head) {
+        .branch => |name| name,
+        .detached => return .detached_head,
+        .unknown => return .branch_unavailable,
+    };
+    const upstream = status.upstream orelse return .no_upstream;
+    if (upstream.remote_branch.len == 0) return .upstream_not_remote_branch;
+    const oid = status.oid orelse return .branch_status_unavailable;
+    const ahead_behind = status.ahead_behind orelse return .branch_status_unavailable;
+    if (ahead_behind.behind > 0) return .pull_first;
+    if (ahead_behind.ahead == 0) return .nothing_to_push;
+
+    return .{ .ready = .{
+        .repo_root = repo_root,
+        .branch = branch,
+        .remote = upstream.remote,
+        .remote_branch = upstream.remote_branch,
+        .oid = oid,
+        .ahead = ahead_behind.ahead,
+        .behind = ahead_behind.behind,
+    } };
+}
 
 pub fn stageTarget(ctx: TargetContext) StageTargetResult {
     if (!diff_source.sourceAllowsStageAction(ctx.source)) return .unavailable_source;
@@ -386,4 +458,117 @@ test "directory stage and unstage use descendant status entries" {
         .ready => |ready| try std.testing.expectEqual(TargetKind.directory, ready.kind),
         else => return error.ExpectedDirectoryUnstageReady,
     }
+}
+
+test "pushTarget requires a fresh upstream branch with outgoing commits" {
+    const status: git_branch_status.BranchStatus = .{
+        .oid = "abc123",
+        .head = .{ .branch = "feature" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{ .ahead = 2, .behind = 0 },
+    };
+
+    switch (pushTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = status },
+    })) {
+        .ready => |target| {
+            try std.testing.expectEqualStrings("/repo", target.repo_root);
+            try std.testing.expectEqualStrings("feature", target.branch);
+            try std.testing.expectEqualStrings("origin", target.remote);
+            try std.testing.expectEqualStrings("main", target.remote_branch);
+            try std.testing.expectEqualStrings("abc123", target.oid);
+            try std.testing.expectEqual(@as(u32, 2), target.ahead);
+            try std.testing.expectEqual(@as(u32, 0), target.behind);
+        },
+        else => return error.ExpectedPushTargetReady,
+    }
+}
+
+test "pushTarget rejects unsafe or incomplete branch states" {
+    const ready_status: git_branch_status.BranchStatus = .{
+        .oid = "abc123",
+        .head = .{ .branch = "feature" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{ .ahead = 1, .behind = 0 },
+    };
+
+    try std.testing.expectEqual(PushTargetResult.unavailable_source, pushTarget(.{
+        .source = .stdin,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
+    }));
+    try std.testing.expectEqual(PushTargetResult.loading_branch_status, pushTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/other", .loading = false, .status = ready_status },
+    }));
+    try std.testing.expectEqual(PushTargetResult.detached_head, pushTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
+            .oid = "abc123",
+            .head = .detached,
+            .upstream = ready_status.upstream,
+            .ahead_behind = ready_status.ahead_behind,
+        } },
+    }));
+    try std.testing.expectEqual(PushTargetResult.no_upstream, pushTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
+            .oid = "abc123",
+            .head = .{ .branch = "feature" },
+            .ahead_behind = .{ .ahead = 1, .behind = 0 },
+        } },
+    }));
+    try std.testing.expectEqual(PushTargetResult.upstream_not_remote_branch, pushTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
+            .oid = "abc123",
+            .head = .{ .branch = "feature" },
+            .upstream = .{ .name = "origin", .remote = "origin", .remote_branch = "" },
+            .ahead_behind = .{ .ahead = 1, .behind = 0 },
+        } },
+    }));
+    try std.testing.expectEqual(PushTargetResult.branch_status_unavailable, pushTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
+            .head = .{ .branch = "feature" },
+            .upstream = ready_status.upstream,
+            .ahead_behind = .{ .ahead = 1, .behind = 0 },
+        } },
+    }));
+    try std.testing.expectEqual(PushTargetResult.branch_status_unavailable, pushTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
+            .oid = "abc123",
+            .head = .{ .branch = "feature" },
+            .upstream = ready_status.upstream,
+        } },
+    }));
+    try std.testing.expectEqual(PushTargetResult.pull_first, pushTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
+            .oid = "abc123",
+            .head = .{ .branch = "feature" },
+            .upstream = ready_status.upstream,
+            .ahead_behind = .{ .ahead = 1, .behind = 1 },
+        } },
+    }));
+    try std.testing.expectEqual(PushTargetResult.nothing_to_push, pushTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
+            .oid = "abc123",
+            .head = .{ .branch = "feature" },
+            .upstream = ready_status.upstream,
+            .ahead_behind = .{ .ahead = 0, .behind = 0 },
+        } },
+    }));
 }

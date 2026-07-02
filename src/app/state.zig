@@ -6,6 +6,7 @@ pub const OverlayKind = enum {
     help,
     discard_file,
     amend_commit,
+    push_branch,
 };
 
 /// App-owned modal/overlay state.
@@ -28,6 +29,10 @@ pub const OverlayState = struct {
         return self.kind == .amend_commit;
     }
 
+    pub fn isPushBranch(self: OverlayState) bool {
+        return self.kind == .push_branch;
+    }
+
     pub fn openHelp(self: *OverlayState) void {
         self.kind = .help;
         self.help_scroll = 0;
@@ -39,6 +44,10 @@ pub const OverlayState = struct {
 
     pub fn openAmendCommit(self: *OverlayState) void {
         self.kind = .amend_commit;
+    }
+
+    pub fn openPushBranch(self: *OverlayState) void {
+        self.kind = .push_branch;
     }
 
     pub fn close(self: *OverlayState) void {
@@ -74,6 +83,29 @@ pub const AmendConfirmation = struct {
         allocator.free(self.repo_root);
         allocator.free(self.subject);
         if (self.body) |body| allocator.free(body);
+        self.* = undefined;
+    }
+};
+
+/// Owned snapshot for push confirmation.
+///
+/// Branch status can reload while the popup is open, so the displayed and
+/// executed remote target must be copied when the prompt is created.
+pub const PushConfirmation = struct {
+    repo_root: []u8,
+    branch: []u8,
+    remote: []u8,
+    remote_branch: []u8,
+    oid: []u8,
+    ahead: u32,
+    behind: u32,
+
+    pub fn deinit(self: *PushConfirmation, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.branch);
+        allocator.free(self.remote);
+        allocator.free(self.remote_branch);
+        allocator.free(self.oid);
         self.* = undefined;
     }
 };

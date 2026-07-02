@@ -28,6 +28,7 @@ pub const KeyContext = struct {
     help_mode: bool = false,
     discard_confirmation_mode: bool = false,
     amend_confirmation_mode: bool = false,
+    push_confirmation_mode: bool = false,
     search_query_len: usize = 0,
     focus: Focus = .sidebar,
     sidebar_hidden: bool = false,
@@ -115,6 +116,9 @@ const Action = enum {
     cancel_discard_file,
     confirm_amend,
     cancel_amend,
+    request_push,
+    confirm_push,
+    cancel_push,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
@@ -142,7 +146,7 @@ fn pasteToMsg(comptime Msg: type, context: KeyContext, text: []const u8) ?Msg {
     if (context.search_mode) return payloadMsg(Msg, "search_paste", text);
     if (context.file_search_mode) return payloadMsg(Msg, "file_search_paste", text);
     if (context.repo_picker_mode) return payloadMsg(Msg, "repo_picker_paste", text);
-    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode) return null;
+    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode) return null;
     if (context.commit_panel_mode) return payloadMsg(Msg, "commit_panel_paste", text);
     return null;
 }
@@ -154,6 +158,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.help_mode) return helpKeyToMsg(Msg, context, key);
     if (context.discard_confirmation_mode) return discardConfirmationKeyToMsg(Msg, key);
     if (context.amend_confirmation_mode) return amendConfirmationKeyToMsg(Msg, key);
+    if (context.push_confirmation_mode) return pushConfirmationKeyToMsg(Msg, key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(Msg, key);
     return viewerKeyToMsg(Msg, context, key);
 }
@@ -225,6 +230,12 @@ fn discardConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
 fn amendConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_amend);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_amend);
+    return null;
+}
+
+fn pushConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
+    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_push);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_push);
     return null;
 }
 
@@ -345,6 +356,7 @@ fn publicActionToAction(action: keymap.PublicAction) Action {
         .open_editor => .open_selected_file_in_editor,
         .commit => .enter_commit_panel,
         .amend => .enter_amend_panel,
+        .push => .request_push,
         .discard => .request_discard_selected_file,
         .toggle_display_mode => .toggle_display_mode,
         .toggle_line_numbers => .toggle_line_numbers,
@@ -490,6 +502,9 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .cancel_discard_file => voidMsg(Msg, "cancel_discard_file"),
         .confirm_amend => voidMsg(Msg, "confirm_amend"),
         .cancel_amend => voidMsg(Msg, "cancel_amend"),
+        .request_push => voidMsg(Msg, "request_push"),
+        .confirm_push => voidMsg(Msg, "confirm_push"),
+        .cancel_push => voidMsg(Msg, "cancel_push"),
         .open_selected_file_in_editor => voidMsg(Msg, "open_selected_file_in_editor"),
         .toggle_display_mode => voidMsg(Msg, "toggle_display_mode"),
         .toggle_line_numbers => voidMsg(Msg, "toggle_line_numbers"),
@@ -598,6 +613,9 @@ const TestMsg = union(enum) {
     cancel_discard_file,
     confirm_amend,
     cancel_amend,
+    request_push,
+    confirm_push,
+    cancel_push,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
@@ -1038,8 +1056,23 @@ test "keyToMsg maps shifted letter commands consistently" {
     try std.testing.expectEqual(TestMsg.toggle_hide_reviewed_files, keyToMsg(TestMsg, .{}, .{ .codepoint = 'H' }).?);
     try std.testing.expectEqual(TestMsg.toggle_hide_reviewed_files, keyToMsg(TestMsg, .{}, shiftedAscii('h', 'H')).?);
     try std.testing.expectEqual(TestMsg.toggle_hide_reviewed_files, keyToMsg(TestMsg, .{}, shiftedLowerOnly('h')).?);
+    try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{}, .{ .codepoint = 'P' }).?);
+    try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{}, shiftedAscii('p', 'P')).?);
+    try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{}, shiftedLowerOnly('p')).?);
     try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, shiftedLowerOnly('b')).?);
     try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, shiftedLowerOnly('l')).?);
+}
+
+test "keyToMsg keeps lowercase p as previous hunk while uppercase P pushes" {
+    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{}, .{ .codepoint = 'p' }).?);
+    try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{}, .{ .codepoint = 'P' }).?);
+}
+
+test "keyToMsg maps push confirmation keys" {
+    try std.testing.expectEqual(TestMsg.confirm_push, keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(TestMsg.cancel_push, keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(TestMsg.cancel_push, keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = 'P' }));
 }
 
 test "keyToMsg opens and closes help outside prompt modes" {

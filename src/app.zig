@@ -83,6 +83,9 @@ const AmendTask = app_actions.AmendTask(App.Msg);
 const CommitFinished = app_actions.CommitFinished;
 const CommitTask = app_actions.CommitTask(App.Msg);
 const DiscardFileFinished = app_actions.DiscardFileFinished;
+const PushFinished = app_actions.PushFinished;
+const PushTask = app_actions.PushTask(App.Msg);
+const PushTargetResult = git_ops.PushTargetResult;
 const StageHunkFinished = app_actions.StageHunkFinished;
 const StageHunkTask = app_actions.StageHunkTask(App.Msg);
 const StageFileFinished = app_actions.StageFileFinished;
@@ -168,6 +171,7 @@ const ActionFinishedMsg = union(enum) {
     discard_file: DiscardFileFinished,
     commit: CommitFinished,
     amend: AmendFinished,
+    push: PushFinished,
     editor: chasen.ForegroundCommandResult,
 };
 
@@ -274,6 +278,7 @@ pub const App = struct {
     reviewed_store: review_state.Store = .{},
     discard_confirmation: ?app_state.DiscardFileConfirmation = null,
     amend_confirmation: ?app_state.AmendConfirmation = null,
+    push_confirmation: ?app_state.PushConfirmation = null,
 
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
@@ -381,6 +386,9 @@ pub const App = struct {
         cancel_discard_file,
         confirm_amend,
         cancel_amend,
+        request_push,
+        confirm_push,
+        cancel_push,
         open_selected_file_in_editor,
         finish_review_approved,
         finish_review_needs_changes,
@@ -428,6 +436,7 @@ pub const App = struct {
         self.review_projection.deinit(deinit_ctx.allocator);
         self.cancelDiscardConfirmation(deinit_ctx.allocator);
         self.cancelAmendConfirmation(deinit_ctx.allocator);
+        self.cancelPushConfirmation(deinit_ctx.allocator);
         self.tree_order.deinit(deinit_ctx.allocator);
         if (self.tree_order_scope) |scope| deinit_ctx.allocator.free(scope);
         if (self.pending_selection_restore) |*restore| restore.deinit(deinit_ctx.allocator);
@@ -605,6 +614,9 @@ pub const App = struct {
             .cancel_discard_file => self.cancelDiscardConfirmation(ctx.allocator()),
             .confirm_amend => try self.confirmAmend(ctx),
             .cancel_amend => self.cancelAmendConfirmation(ctx.allocator()),
+            .request_push => try self.requestPush(ctx.allocator()),
+            .confirm_push => try self.confirmPush(ctx),
+            .cancel_push => self.cancelPushConfirmation(ctx.allocator()),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .finish_review_approved => try self.finishReview(ctx, .approved),
             .finish_review_needs_changes => try self.finishReview(ctx, .needs_changes),
@@ -645,6 +657,7 @@ pub const App = struct {
             .discard_file => |result| try self.finishDiscardFile(ctx, result),
             .commit => |result| try self.finishCommit(ctx, result),
             .amend => |result| try self.finishAmend(ctx, result),
+            .push => |result| try self.finishPush(ctx, result),
             .editor => |result| try self.finishEditorCommand(ctx, result),
         }
     }
@@ -775,6 +788,7 @@ pub const App = struct {
             .help_mode = self.overlay.isHelp(),
             .discard_confirmation_mode = self.overlay.isDiscardFile(),
             .amend_confirmation_mode = self.overlay.isAmendCommit(),
+            .push_confirmation_mode = self.overlay.isPushBranch(),
             .search_query_len = self.search.query.len,
             .focus = self.viewer.focus,
             .sidebar_hidden = self.viewer.sidebar_hidden,
@@ -1648,6 +1662,7 @@ pub const App = struct {
 
         self.cancelDiscardConfirmation(allocator);
         self.cancelAmendConfirmation(allocator);
+        self.cancelPushConfirmation(allocator);
         const owned_repo_root = try allocator.dupe(u8, target.repo_root);
         errdefer allocator.free(owned_repo_root);
         const owned_path = try allocator.dupe(u8, target.path);
@@ -1701,6 +1716,7 @@ pub const App = struct {
 
         self.cancelDiscardConfirmation(self.allocator.?);
         self.cancelAmendConfirmation(self.allocator.?);
+        self.cancelPushConfirmation(self.allocator.?);
         self.overlay.close();
         self.commit_panel.open(mode);
     }
@@ -1778,6 +1794,7 @@ pub const App = struct {
 
         self.cancelDiscardConfirmation(allocator);
         self.cancelAmendConfirmation(allocator);
+        self.cancelPushConfirmation(allocator);
         self.amend_confirmation = .{
             .repo_root = owned_root,
             .subject = parts.subject,
@@ -1828,6 +1845,147 @@ pub const App = struct {
         if (self.amend_confirmation) |*confirmation| confirmation.deinit(allocator);
         self.amend_confirmation = null;
         if (self.overlay.isAmendCommit()) self.overlay.close();
+    }
+
+    fn requestPush(self: *App, allocator: std.mem.Allocator) !void {
+        const target = switch (self.selectedPushTarget()) {
+            .ready => |target| target,
+            .unavailable_source => {
+                self.setStatus("push unavailable for this source", .{});
+                return;
+            },
+            .no_repo => {
+                self.setStatus("push unavailable: no repository", .{});
+                return;
+            },
+            .loading_branch_status => {
+                self.setStatus("branch status is still loading", .{});
+                return;
+            },
+            .detached_head => {
+                self.setStatus("push unavailable on detached HEAD", .{});
+                return;
+            },
+            .branch_unavailable => {
+                self.setStatus("push unavailable: branch is unknown", .{});
+                return;
+            },
+            .no_upstream => {
+                self.setStatus("push unavailable: no upstream branch", .{});
+                return;
+            },
+            .upstream_not_remote_branch => {
+                self.setStatus("push unavailable: unsupported upstream", .{});
+                return;
+            },
+            .branch_status_unavailable => {
+                self.setStatus("push unavailable: branch status is incomplete", .{});
+                return;
+            },
+            .pull_first => {
+                self.setStatus("push blocked: pull/rebase remote changes first", .{});
+                return;
+            },
+            .nothing_to_push => {
+                self.setStatus("nothing to push", .{});
+                return;
+            },
+        };
+
+        self.cancelDiscardConfirmation(allocator);
+        self.cancelAmendConfirmation(allocator);
+        self.cancelPushConfirmation(allocator);
+
+        const owned_repo_root = try allocator.dupe(u8, target.repo_root);
+        errdefer allocator.free(owned_repo_root);
+        const owned_branch = try allocator.dupe(u8, target.branch);
+        errdefer allocator.free(owned_branch);
+        const owned_remote = try allocator.dupe(u8, target.remote);
+        errdefer allocator.free(owned_remote);
+        const owned_remote_branch = try allocator.dupe(u8, target.remote_branch);
+        errdefer allocator.free(owned_remote_branch);
+        const owned_oid = try allocator.dupe(u8, target.oid);
+        errdefer allocator.free(owned_oid);
+
+        self.push_confirmation = .{
+            .repo_root = owned_repo_root,
+            .branch = owned_branch,
+            .remote = owned_remote,
+            .remote_branch = owned_remote_branch,
+            .oid = owned_oid,
+            .ahead = target.ahead,
+            .behind = target.behind,
+        };
+        self.overlay.openPushBranch();
+    }
+
+    fn confirmPush(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.actions.pending != null) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+
+        var confirmation = self.push_confirmation orelse return;
+        self.push_confirmation = null;
+        errdefer confirmation.deinit(ctx.allocator());
+
+        const task = try ctx.allocator().create(PushTask);
+        errdefer ctx.allocator().destroy(task);
+
+        const pending = self.actions.begin(.push);
+        errdefer _ = self.actions.finish(pending);
+
+        task.* = .{
+            .pending = pending,
+            .repo_root = confirmation.repo_root,
+            .branch = confirmation.branch,
+            .remote = confirmation.remote,
+            .remote_branch = confirmation.remote_branch,
+            .oid = confirmation.oid,
+            .env_map = self.env_map,
+        };
+        confirmation = .{
+            .repo_root = &.{},
+            .branch = &.{},
+            .remote = &.{},
+            .remote_branch = &.{},
+            .oid = &.{},
+            .ahead = 0,
+            .behind = 0,
+        };
+
+        self.setStatus("pushing: {s} -> {s}/{s}", .{ task.branch, task.remote, task.remote_branch });
+
+        ctx.task().spawnWith(task, PushTask.run) catch |err| {
+            ctx.allocator().free(task.repo_root);
+            ctx.allocator().free(task.branch);
+            ctx.allocator().free(task.remote);
+            ctx.allocator().free(task.remote_branch);
+            ctx.allocator().free(task.oid);
+            self.setStatus("could not start push task", .{});
+            if (self.overlay.isPushBranch()) self.overlay.close();
+            return err;
+        };
+
+        self.overlay.close();
+    }
+
+    fn cancelPushConfirmation(self: *App, allocator: std.mem.Allocator) void {
+        if (self.push_confirmation) |*confirmation| confirmation.deinit(allocator);
+        self.push_confirmation = null;
+        if (self.overlay.isPushBranch()) self.overlay.close();
+    }
+
+    fn selectedPushTarget(self: *const App) PushTargetResult {
+        return git_ops.pushTarget(.{
+            .source = self.config.source,
+            .repo_root = self.activeRepoRoot(),
+            .branch_status = .{
+                .repo_root = self.branch_status.repo_root,
+                .loading = self.branch_status_load_pending != null,
+                .status = self.branch_status.status,
+            },
+        });
     }
 
     pub fn stagedSummaryForActiveRepo(self: *const App) app_commit_panel.StagedSummary {
@@ -2049,6 +2207,33 @@ pub const App = struct {
             .failed_static => |message| {
                 self.commit_panel.commit_error = .amend_failed;
                 self.setStatus("amend failed: {s}", .{message});
+            },
+        }
+    }
+
+    fn finishPush(self: *App, ctx: *chasen.Ctx(Msg), finished: PushFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (!self.actions.finish(result.pending)) return;
+
+        const active_root = self.activeRepoRoot();
+        const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+
+        switch (result.result) {
+            .ok => {
+                if (active_matches) {
+                    self.setStatus("pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
+                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, false);
+                } else {
+                    self.setStatus("pushed: {s}", .{result.repo_root});
+                }
+            },
+            .failed => |message| {
+                self.setStatus("push failed: {s}", .{git_ops.trimGitOutput(message)});
+            },
+            .failed_static => |message| {
+                self.setStatus("push failed: {s}", .{message});
             },
         }
     }
@@ -5724,6 +5909,92 @@ test "stale branch status result is ignored" {
     try std.testing.expect(app.branch_status.repo_root == null);
     try std.testing.expect(std.meta.eql(git_branch_status.Head.unknown, app.branch_status.status.head));
     try std.testing.expectEqual(@as(?u64, 2), app.branch_status_load_pending);
+}
+
+test "requestPush snapshots the active branch target" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.branch_status.deinit();
+    defer app.cancelPushConfirmation(std.testing.allocator);
+
+    var bundle = try git_branch_status.BranchStatusBundle.parseOwned(
+        std.testing.allocator,
+        "# branch.oid abc123\n" ++
+            "# branch.head feature\n" ++
+            "# branch.upstream origin/main\n" ++
+            "# branch.ab +2 -0\n",
+    );
+    try app.branch_status.replace("/repo", &bundle);
+
+    try app.requestPush(std.testing.allocator);
+
+    try std.testing.expect(app.overlay.isPushBranch());
+    const confirmation = app.push_confirmation orelse return error.ExpectedPushConfirmation;
+    try std.testing.expectEqualStrings("/repo", confirmation.repo_root);
+    try std.testing.expectEqualStrings("feature", confirmation.branch);
+    try std.testing.expectEqualStrings("origin", confirmation.remote);
+    try std.testing.expectEqualStrings("main", confirmation.remote_branch);
+    try std.testing.expectEqualStrings("abc123", confirmation.oid);
+    try std.testing.expectEqual(@as(u32, 2), confirmation.ahead);
+}
+
+test "confirmPush keeps confirmation when another action is pending" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .push_confirmation = .{
+            .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+            .branch = try std.testing.allocator.dupe(u8, "feature"),
+            .remote = try std.testing.allocator.dupe(u8, "origin"),
+            .remote_branch = try std.testing.allocator.dupe(u8, "main"),
+            .oid = try std.testing.allocator.dupe(u8, "abc123"),
+            .ahead = 1,
+            .behind = 0,
+        },
+        .overlay = .{ .kind = .push_branch },
+    };
+    defer app.cancelPushConfirmation(std.testing.allocator);
+    app.actions.pending = .{ .generation = 1, .kind = .stage_file };
+    defer app.actions.clear();
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.confirmPush(&ctx);
+
+    try std.testing.expect(app.push_confirmation != null);
+    try std.testing.expect(app.overlay.isPushBranch());
+    try std.testing.expect(app.actions.pending != null);
+    try std.testing.expectEqualStrings("another git action is running", app.status.text());
+}
+
+test "finishPush does not reload a stale active repository" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "other",
+            .display_path = "/other",
+            .canonical_root = "/other",
+        } } },
+    };
+    const pending = app.actions.begin(.push);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishPush(&ctx, .{
+        .pending = pending,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .branch = try std.testing.allocator.dupe(u8, "feature"),
+        .remote = try std.testing.allocator.dupe(u8, "origin"),
+        .remote_branch = try std.testing.allocator.dupe(u8, "main"),
+        .result = .ok,
+    });
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.load.pending == null);
+    try std.testing.expectEqualStrings("pushed: /repo", app.status.text());
 }
 
 test "manual reload clears action selection restore" {
