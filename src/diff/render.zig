@@ -64,7 +64,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    const styles = RenderStyles.fromPalette(options.palette);
+    const styles = stylesForOptions(options);
     const content_width = bodyWidth(size.width);
     const mode = effectiveMode(content_width, options.requested_mode);
     try renderFileHeader(surface, file, options.requested_mode, content_width, options.pane_active, options.title_prefix, styles);
@@ -135,7 +135,7 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, line
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    const styles = RenderStyles.fromPalette(options.palette);
+    const styles = stylesForOptions(options);
     const content_width = bodyWidth(size.width);
     const mode = effectiveMode(content_width, options.requested_mode);
     try renderGeneratedFileHeader(surface, path, lines.len, truncated, options.requested_mode, content_width, options.pane_active, options.title_prefix, styles);
@@ -541,6 +541,15 @@ const RenderStyles = struct {
     }
 };
 
+fn stylesForOptions(options: RenderOptions) RenderStyles {
+    var styles = RenderStyles.fromPalette(options.palette);
+    if (!options.pane_active) {
+        styles.hunk_guide.dim = true;
+        styles.cursor.dim = true;
+    }
+    return styles;
+}
+
 test "display mode falls back to unified on narrow panes" {
     try std.testing.expectEqual(DisplayMode.unified, effectiveMode(40, .side_by_side));
     try std.testing.expectEqual(DisplayMode.side_by_side, effectiveMode(90, .side_by_side));
@@ -672,6 +681,48 @@ test "selected hunk guide is drawn only for highlighted hunk" {
     try ts.expectCellText(1, 6, "╰");
 
     const guide_cell = ts.surface.readCell(1, 5).?;
+    try std.testing.expect(guide_cell.style.fg.eql(RenderStyles.fromPalette(.default()).hunk_guide.fg));
+}
+
+test "selected hunk guide is dim when pane is inactive" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 7);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 1,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "first",
+                .lines = &.{.{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 }},
+            },
+            .{
+                .old_start = 9,
+                .old_count = 1,
+                .new_start = 9,
+                .new_count = 1,
+                .section = "second",
+                .lines = &.{.{ .kind = .context, .text = "later", .old_line = 9, .new_line = 9 }},
+            },
+        },
+    };
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .highlighted_hunk = 1,
+        .pane_active = false,
+    });
+
+    const guide_cell = ts.surface.readCell(1, 5).?;
+    try ts.expectCellText(1, 5, "╭");
+    try std.testing.expect(guide_cell.style.dim);
     try std.testing.expect(guide_cell.style.fg.eql(RenderStyles.fromPalette(.default()).hunk_guide.fg));
 }
 
@@ -1146,7 +1197,7 @@ test "renderFile can start from cached viewport offset" {
     try ts.expectCellText(17, 4, "e");
 }
 
-test "renderFile cursor marker uses absolute body offset with cached viewport" {
+test "renderFile cursor marker uses absolute body offset and dims when pane is inactive" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 5);
     defer ts.deinit();
@@ -1183,11 +1234,13 @@ test "renderFile cursor marker uses absolute body offset with cached viewport" {
         .requested_mode = .unified,
         .scroll = index.hunkOffset(1),
         .cursor_offset = index.hunkOffset(1) + 1,
+        .pane_active = false,
         .line_index = index,
     });
 
     try ts.expectCellText(0, 3, " ");
     try ts.expectCellText(0, 4, "▌");
+    try std.testing.expect(ts.surface.readCell(0, 4).?.style.dim);
 }
 
 test "renderFile can start from cached side-by-side viewport offset" {

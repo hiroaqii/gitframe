@@ -231,16 +231,18 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
     if (size.width == 0 or size.height == 0) return;
 
     const active = app.viewer.focus == .sidebar;
-    _ = surface.borrowTextAt(0, 0, paneTitleText("Files", active), paneTitleStyle(active));
+    try drawSidebarDetailRow(app, surface, 0, active);
+
+    if (size.height <= 2) return;
+    _ = surface.borrowTextAt(0, 2, paneTitleText("Files", active), paneTitleStyle(active));
     const title_width = chasen.text.displayWidth(paneTitleText("Files", active));
     const stats_col = title_width + 1;
     if (stats_col < size.width) {
-        _ = try surface.printAt(stats_col, 0, .{ .fg = .gray }, "{d} files / {d} hunks", .{
+        _ = try surface.printAt(stats_col, 2, .{ .fg = .gray }, "{d} files / {d} hunks", .{
             loaded.document.files.len,
             loaded.document.totalHunks(),
         });
     }
-    try drawSidebarDetailRow(app, surface, active);
 
     if (size.height <= sidebar_header_rows) return;
 
@@ -264,26 +266,26 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
     }
 }
 
-fn drawSidebarDetailRow(app: anytype, surface: *chasen.Surface, active: bool) !void {
+fn drawSidebarDetailRow(app: anytype, surface: *chasen.Surface, row: u16, active: bool) !void {
     const size = surface.size();
-    if (size.width <= 2 or size.height <= 1) return;
+    if (size.width <= 2 or row >= size.height) return;
 
     if (app.review_display.hide_reviewed_files and app.review_display.changed_file_filter != .all) {
         const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{app.review_display.changed_file_filter.label()});
-        try draw.copyClippedTextAt(surface, 1, 1, text, .{ .fg = color_prompt });
+        try draw.copyClippedTextAt(surface, 1, row, text, .{ .fg = color_prompt });
         return;
     }
     if (app.review_display.hide_reviewed_files) {
-        try draw.copyClippedTextAt(surface, 1, 1, "hiding reviewed", .{ .fg = color_prompt });
+        try draw.copyClippedTextAt(surface, 1, row, "hiding reviewed", .{ .fg = color_prompt });
         return;
     }
     if (app.review_display.changed_file_filter != .all) {
-        try draw.copyClippedTextAt(surface, 1, 1, app.review_display.changed_file_filter.label(), .{ .fg = color_prompt });
+        try draw.copyClippedTextAt(surface, 1, row, app.review_display.changed_file_filter.label(), .{ .fg = color_prompt });
         return;
     }
 
     if (branchStatusSidebarText(app, surface.frameAllocator(), size.width - 1)) |text| {
-        try draw.copyClippedTextAt(surface, 1, 1, text, paneBranchStyle(active));
+        try draw.copyClippedTextAt(surface, 1, row, text, paneBranchStyle(active));
     }
 }
 
@@ -300,20 +302,20 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
     if (row_model.status) |status| {
         if (row_layout.badge_col) |badge_col| {
             if (width > badge_col) {
-                _ = surface.borrowTextAt(badge_col, row, status.badge(), statusStyle(row_model, status));
+                _ = surface.borrowTextAt(badge_col, row, status.badge(), statusStyle(row_model, status, pane_active));
             }
         }
     }
 
     if (row_layout.mode_col) |mode_col| {
         if (width > mode_col) {
-            _ = surface.borrowTextAt(mode_col, row, "m", modeBadgeStyle(row_model.selected));
+            _ = surface.borrowTextAt(mode_col, row, "m", modeBadgeStyle(row_model.selected, pane_active));
         }
     }
 
     if (row_layout.reviewed_col) |reviewed_col| {
         if (width > reviewed_col) {
-            _ = surface.borrowTextAt(reviewed_col, row, "✓", reviewedStyle(row_model.selected));
+            _ = surface.borrowTextAt(reviewed_col, row, "✓", reviewedStyle(row_model.selected, pane_active));
         }
     }
 
@@ -358,8 +360,8 @@ fn sidebarStatStyle(row: sidebar_view_model.Row, pane_active: bool, fg: chasen.C
     return .{
         .fg = fg,
         .bold = true,
-        .dim = !pane_active and !row.selected,
-        .reverse = row.selected,
+        .dim = !pane_active,
+        .reverse = pane_active and row.selected,
     };
 }
 
@@ -379,7 +381,7 @@ fn sidebarTreeContent(allocator: std.mem.Allocator, row: sidebar_view_model.Row)
 }
 
 fn sidebarRowStyle(row: sidebar_view_model.Row, pane_active: bool) chasen.TextStyle {
-    if (row.selected) return .{ .reverse = true, .bold = true };
+    if (row.selected) return .{ .reverse = pane_active, .bold = true, .dim = !pane_active };
     if (row.kind == .directory) return .{ .bold = true, .dim = !pane_active };
     return switch (row.stage_presence) {
         .staged_only => .{ .fg = color_staged, .dim = !pane_active },
@@ -459,7 +461,7 @@ fn drawDiffHeaderDetailRow(app: anytype, surface: *chasen.Surface, active: bool)
         return;
     }
 
-    drawPaneHeaderRule(surface);
+    drawPaneHeaderRule(surface, active);
 }
 
 fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.StatusEntry) !void {
@@ -482,7 +484,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                 .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.viewer.display_mode)),
                 .palette = app.theme,
             });
-            drawPaneHeaderRule(surface);
+            drawPaneHeaderRule(surface, active);
             return;
         }
     }
@@ -498,7 +500,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
             .cursor_offset = app.visibleDiffCursorOffset(),
             .palette = app.theme,
         });
-        drawPaneHeaderRule(surface);
+        drawPaneHeaderRule(surface, active);
         return;
     }
 
@@ -509,19 +511,19 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                 .combined_hunks => {},
                 .status_body => |body| {
                     try drawStatusBody(&content, repoHeaderLabel(app), body.path, body.message, active);
-                    drawPaneHeaderRule(surface);
+                    drawPaneHeaderRule(surface, active);
                     return;
                 },
             }
         },
         .failed => |failed| {
             try drawStatusBody(&content, repoHeaderLabel(app), failed.body.path, failed.body.message, active);
-            drawPaneHeaderRule(surface);
+            drawPaneHeaderRule(surface, active);
             return;
         },
         .pending => {
             try drawStatusBody(&content, repoHeaderLabel(app), path, "Loading review projection...", active);
-            drawPaneHeaderRule(surface);
+            drawPaneHeaderRule(surface, active);
             return;
         },
         .idle => {},
@@ -542,12 +544,12 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
     }
 }
 
-fn drawPaneHeaderRule(surface: *chasen.Surface) void {
+fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool) void {
     const size = surface.size();
     if (size.width == 0 or size.height <= 1) return;
 
     for (0..size.width) |col| {
-        _ = surface.borrowTextAt(@intCast(col), 1, "─", paneHeaderRuleStyle());
+        _ = surface.borrowTextAt(@intCast(col), 1, "─", paneHeaderRuleStyle(active));
     }
 }
 
@@ -1895,7 +1897,7 @@ pub fn contentWidth(width: u16) u16 {
     return if (width > search_marker_gutter_width) width - search_marker_gutter_width else width;
 }
 
-fn statusStyle(row: sidebar_view_model.Row, status: file_tree.Status) chasen.TextStyle {
+fn statusStyle(row: sidebar_view_model.Row, status: file_tree.Status, pane_active: bool) chasen.TextStyle {
     const fg: chasen.Color = switch (row.stage_presence) {
         .staged_only => color_staged,
         .mixed => color_prompt,
@@ -1908,15 +1910,15 @@ fn statusStyle(row: sidebar_view_model.Row, status: file_tree.Status) chasen.Tex
             .binary => color_binary,
         },
     };
-    return .{ .fg = fg, .bold = true, .reverse = row.selected };
+    return .{ .fg = fg, .bold = true, .dim = !pane_active, .reverse = pane_active and row.selected };
 }
 
-fn reviewedStyle(selected: bool) chasen.TextStyle {
-    return .{ .fg = color_success, .bold = true, .reverse = selected };
+fn reviewedStyle(selected: bool, pane_active: bool) chasen.TextStyle {
+    return .{ .fg = color_success, .bold = true, .dim = !pane_active, .reverse = pane_active and selected };
 }
 
-fn modeBadgeStyle(selected: bool) chasen.TextStyle {
-    return .{ .fg = color_info, .bold = true, .reverse = selected };
+fn modeBadgeStyle(selected: bool, pane_active: bool) chasen.TextStyle {
+    return .{ .fg = color_info, .bold = true, .dim = !pane_active, .reverse = pane_active and selected };
 }
 
 fn paneTitleStyle(active: bool) chasen.TextStyle {
@@ -1940,8 +1942,11 @@ fn paneBranchStyle(active: bool) chasen.TextStyle {
         .{ .fg = color_info, .dim = true };
 }
 
-fn paneHeaderRuleStyle() chasen.TextStyle {
-    return .{ .fg = .gray, .dim = true };
+fn paneHeaderRuleStyle(active: bool) chasen.TextStyle {
+    return if (active)
+        .{ .dim = true }
+    else
+        .{ .fg = .gray, .dim = true };
 }
 
 fn shellSeparatorStyle() chasen.TextStyle {

@@ -6373,13 +6373,51 @@ test "sidebar title indicates active focus" {
 
     try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
 
-    try ts.expectCellText(0, 0, " ");
-    try ts.expectCellText(1, 0, "F");
-    try std.testing.expect(ts.surface.readCell(1, 0).?.style.fg.eql(.{ .index = 14 }));
-    try std.testing.expect(!ts.surface.readCell(1, 0).?.style.reverse);
+    try ts.expectCellText(0, 2, " ");
+    try ts.expectCellText(1, 2, "F");
+    try std.testing.expect(ts.surface.readCell(1, 2).?.style.fg.eql(.{ .index = 14 }));
+    try std.testing.expect(!ts.surface.readCell(1, 2).?.style.reverse);
 }
 
-test "diff header detail row draws neutral separator" {
+test "inactive sidebar selected row is dim without reverse background" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(34, 8);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 80, .height = 9 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .viewer = .{ .focus = .diff },
+    };
+
+    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+
+    const cell = ts.surface.readCell(0, sidebar_header_rows).?;
+    try ts.expectCellText(0, sidebar_header_rows, "▌");
+    try std.testing.expect(cell.style.dim);
+    try std.testing.expect(!cell.style.reverse);
+}
+
+test "active sidebar selected row keeps reverse background" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(34, 8);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 80, .height = 9 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .viewer = .{ .focus = .sidebar },
+    };
+
+    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+
+    const cell = ts.surface.readCell(0, sidebar_header_rows).?;
+    try ts.expectCellText(0, sidebar_header_rows, "▌");
+    try std.testing.expect(!cell.style.dim);
+    try std.testing.expect(cell.style.reverse);
+}
+
+test "diff header detail row uses frame separator style when active" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(90, 10);
     defer ts.deinit();
@@ -6388,6 +6426,24 @@ test "diff header detail row draws neutral separator" {
         .terminal_size = .{ .width = 90, .height = 11 },
         .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         .viewer = .{ .focus = .diff },
+    };
+
+    try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
+
+    try ts.expectCellText(0, 1, "─");
+    try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.default));
+    try std.testing.expect(ts.surface.readCell(0, 1).?.style.dim);
+}
+
+test "diff header detail row dims separator when inactive" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(90, 10);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 90, .height = 11 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .viewer = .{ .focus = .sidebar },
     };
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
