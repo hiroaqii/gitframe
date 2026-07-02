@@ -224,20 +224,15 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
 
     const active = app.viewer.focus == .sidebar;
     _ = surface.borrowTextAt(0, 0, paneTitleText("Files", active), paneTitleStyle(active));
-    _ = try surface.printAt(1, 1, .{ .fg = .gray }, "{d} files / {d} hunks", .{
-        loaded.document.files.len,
-        loaded.document.totalHunks(),
-    });
-    if (size.width > 2) {
-        if (app.review_display.hide_reviewed_files and app.review_display.changed_file_filter != .all) {
-            const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{app.review_display.changed_file_filter.label()});
-            try draw.copyClippedTextAt(surface, 1, 2, text, .{ .fg = color_prompt });
-        } else if (app.review_display.hide_reviewed_files) {
-            try draw.copyClippedTextAt(surface, 1, 2, "hiding reviewed", .{ .fg = color_prompt });
-        } else if (app.review_display.changed_file_filter != .all) {
-            try draw.copyClippedTextAt(surface, 1, 2, app.review_display.changed_file_filter.label(), .{ .fg = color_prompt });
-        }
+    const title_width = chasen.text.displayWidth(paneTitleText("Files", active));
+    const stats_col = title_width + 1;
+    if (stats_col < size.width) {
+        _ = try surface.printAt(stats_col, 0, .{ .fg = .gray }, "{d} files / {d} hunks", .{
+            loaded.document.files.len,
+            loaded.document.totalHunks(),
+        });
     }
+    try drawSidebarDetailRow(app, surface, active);
 
     if (size.height <= sidebar_header_rows) return;
 
@@ -258,6 +253,29 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
             .visible_nodes = loaded.materializedVisibleNodes(),
         }, visible_index, app.viewer.selected_node) orelse continue;
         try drawSidebarRow(surface, row, row_model, app.viewer.focus == .sidebar, app.viewer.sidebar_horizontal_scroll);
+    }
+}
+
+fn drawSidebarDetailRow(app: anytype, surface: *chasen.Surface, active: bool) !void {
+    const size = surface.size();
+    if (size.width <= 2 or size.height <= 1) return;
+
+    if (app.review_display.hide_reviewed_files and app.review_display.changed_file_filter != .all) {
+        const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{app.review_display.changed_file_filter.label()});
+        try draw.copyClippedTextAt(surface, 1, 1, text, .{ .fg = color_prompt });
+        return;
+    }
+    if (app.review_display.hide_reviewed_files) {
+        try draw.copyClippedTextAt(surface, 1, 1, "hiding reviewed", .{ .fg = color_prompt });
+        return;
+    }
+    if (app.review_display.changed_file_filter != .all) {
+        try draw.copyClippedTextAt(surface, 1, 1, app.review_display.changed_file_filter.label(), .{ .fg = color_prompt });
+        return;
+    }
+
+    if (branchStatusSidebarText(app, surface.frameAllocator(), size.width - 1)) |text| {
+        try draw.copyClippedTextAt(surface, 1, 1, text, paneBranchStyle(active));
     }
 }
 
@@ -430,11 +448,6 @@ fn drawDiffHeaderDetailRow(app: anytype, surface: *chasen.Surface, active: bool)
             drawCommitInputLine(surface, input_col, 1, app.search.input.slice(), app.search.input.cursor, style) catch {};
             showInputCursor(surface, input_col, 1, app.search.input.slice(), app.search.input.cursor);
         }
-        return;
-    }
-
-    if (branchStatusHeaderText(app, surface.frameAllocator())) |text| {
-        draw.copyClippedTextAt(surface, 1, 1, text, paneBranchStyle(active)) catch {};
         return;
     }
 
@@ -816,28 +829,89 @@ fn repoHeaderLabel(app: anytype) ?[]const u8 {
     return base;
 }
 
-fn branchStatusHeaderText(app: anytype, allocator: std.mem.Allocator) ?[]const u8 {
+fn branchStatusSidebarText(app: anytype, allocator: std.mem.Allocator, available_width: u16) ?[]const u8 {
     const root = app.repo_state.activeRoot() orelse return null;
-    if (app.branch_status_load_pending != null) return "branch: loading";
+    if (app.branch_status_load_pending != null) return "loading branch";
 
     const snapshot_root = app.branch_status.repo_root orelse return null;
     if (!std.mem.eql(u8, root, snapshot_root)) return null;
 
-    return formatBranchStatus(allocator, app.branch_status.status) catch "branch";
+    return formatSidebarBranchStatus(allocator, app.branch_status.status, available_width) catch "branch";
 }
 
-fn formatBranchStatus(allocator: std.mem.Allocator, status: git_branch_status.BranchStatus) ![]const u8 {
+fn formatSidebarBranchStatus(allocator: std.mem.Allocator, status: git_branch_status.BranchStatus, available_width: u16) ![]const u8 {
     const branch = switch (status.head) {
         .branch => |name| name,
-        .detached => return "branch: detached",
-        .unknown => return "branch: unknown",
+        .detached => return "detached",
+        .unknown => return "unknown branch",
     };
-    const ahead = if (status.ahead_behind) |ab| ab.ahead else 0;
-    const behind = if (status.ahead_behind) |ab| ab.behind else 0;
-    if (status.upstream) |upstream| {
-        return std.fmt.allocPrint(allocator, "branch: {s} -> {s} ↑{d} ↓{d}", .{ branch, upstream.name, ahead, behind });
-    }
-    return std.fmt.allocPrint(allocator, "branch: {s} (no upstream)", .{branch});
+    var allocated_suffix: ?[]const u8 = null;
+    defer if (allocated_suffix) |suffix| allocator.free(suffix);
+    const suffix = if (status.upstream == null)
+        " no upstream"
+    else blk: {
+        const ahead = if (status.ahead_behind) |ab| ab.ahead else 0;
+        const behind = if (status.ahead_behind) |ab| ab.behind else 0;
+        allocated_suffix = try std.fmt.allocPrint(allocator, " ↑{d} ↓{d}", .{ ahead, behind });
+        break :blk allocated_suffix.?;
+    };
+    const reserved = chasen.text.displayWidth(suffix);
+    const branch_width = if (available_width > reserved) available_width - reserved else 0;
+    const display_branch = try branchPrefixTail(allocator, branch, branch_width);
+    defer allocator.free(display_branch);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ display_branch, suffix });
+}
+
+fn branchPrefixTail(allocator: std.mem.Allocator, branch: []const u8, width: u16) ![]const u8 {
+    if (width == 0) return allocator.dupe(u8, "");
+    if (chasen.text.displayWidth(branch) <= width) return allocator.dupe(u8, branch);
+    const slash = std.mem.indexOfScalar(u8, branch, '/') orelse return markedClipToOwned(allocator, branch, width);
+    const prefix = branch[0 .. slash + 1];
+    const marker = "…";
+    const prefix_width = chasen.text.displayWidth(prefix);
+    const marker_width = chasen.text.displayWidth(marker);
+    if (width <= prefix_width + marker_width) return markedClipToOwned(allocator, branch, width);
+    // Keep branch class prefixes such as "feature/" while preserving the
+    // ticket/topic tail that usually disambiguates long branch names.
+    const tail_width = width - prefix_width - marker_width;
+    const tail_source = branch[slash + 1 ..];
+    const tail_source_width = chasen.text.displayWidth(tail_source);
+    const tail = chasen.text.dropToWidth(tail_source, tail_source_width - tail_width);
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, marker, tail });
+}
+
+fn markedClipToOwned(allocator: std.mem.Allocator, text: []const u8, width: u16) ![]const u8 {
+    const clipped = chasen.text.clipToWidthWithMarker(text, width, "…");
+    if (clipped.marker.len == 0) return allocator.dupe(u8, clipped.prefix);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ clipped.prefix, clipped.marker });
+}
+
+test "formatSidebarBranchStatus distinguishes upstream state" {
+    const with_upstream = try formatSidebarBranchStatus(std.testing.allocator, .{
+        .head = .{ .branch = "feature/topic" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{ .ahead = 2, .behind = 1 },
+    }, 80);
+    defer std.testing.allocator.free(with_upstream);
+    try std.testing.expectEqualStrings("feature/topic ↑2 ↓1", with_upstream);
+
+    const without_upstream = try formatSidebarBranchStatus(std.testing.allocator, .{
+        .head = .{ .branch = "feature/topic" },
+    }, 80);
+    defer std.testing.allocator.free(without_upstream);
+    try std.testing.expectEqualStrings("feature/topic no upstream", without_upstream);
+}
+
+test "formatSidebarBranchStatus keeps branch prefix and tail when clipped" {
+    const text = try formatSidebarBranchStatus(std.testing.allocator, .{
+        .head = .{ .branch = "feature/very-long-ticket-name" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{ .ahead = 0, .behind = 0 },
+    }, 22);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.startsWith(u8, text, "feature/…"));
+    try std.testing.expect(std.mem.endsWith(u8, text, " ↑0 ↓0"));
 }
 
 fn sourceFooterLabel(config: anytype) ?[]const u8 {
