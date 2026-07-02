@@ -19,6 +19,13 @@ pub fn trimGitOutput(message: []const u8) []const u8 {
     return std.mem.trim(u8, message, " \t\r\n");
 }
 
+pub fn pushFailureHint(message: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, message, "Permission denied (publickey)") != null) {
+        return "SSH publickey authentication failed; check ssh-agent and repository access";
+    }
+    return null;
+}
+
 pub const PathTarget = struct {
     path: []const u8,
     kind: TargetKind,
@@ -484,6 +491,18 @@ test "pushTarget requires a fresh upstream branch with outgoing commits" {
         },
         else => return error.ExpectedPushTargetReady,
     }
+}
+
+test "pushFailureHint identifies SSH publickey failures" {
+    const message =
+        "git@github.com: Permission denied (publickey).\n" ++
+        "fatal: Could not read from remote repository.\n";
+
+    try std.testing.expectEqualStrings(
+        "SSH publickey authentication failed; check ssh-agent and repository access",
+        pushFailureHint(message).?,
+    );
+    try std.testing.expect(pushFailureHint("fatal: other push failure") == null);
 }
 
 test "pushTarget rejects unsafe or incomplete branch states" {

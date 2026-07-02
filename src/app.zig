@@ -279,6 +279,7 @@ pub const App = struct {
     discard_confirmation: ?app_state.DiscardFileConfirmation = null,
     amend_confirmation: ?app_state.AmendConfirmation = null,
     push_confirmation: ?app_state.PushConfirmation = null,
+    push_error_message: ?[]u8 = null,
 
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
@@ -372,6 +373,10 @@ pub const App = struct {
         help_scroll_down,
         help_page_up,
         help_page_down,
+        push_error_scroll_up,
+        push_error_scroll_down,
+        push_error_page_up,
+        push_error_page_down,
         toggle_reviewed_file,
         toggle_hide_reviewed_files,
         cycle_changed_file_filter,
@@ -389,6 +394,7 @@ pub const App = struct {
         request_push,
         confirm_push,
         cancel_push,
+        close_push_error,
         open_selected_file_in_editor,
         finish_review_approved,
         finish_review_needs_changes,
@@ -437,6 +443,7 @@ pub const App = struct {
         self.cancelDiscardConfirmation(deinit_ctx.allocator);
         self.cancelAmendConfirmation(deinit_ctx.allocator);
         self.cancelPushConfirmation(deinit_ctx.allocator);
+        self.clearPushError(deinit_ctx.allocator);
         self.tree_order.deinit(deinit_ctx.allocator);
         if (self.tree_order_scope) |scope| deinit_ctx.allocator.free(scope);
         if (self.pending_selection_restore) |*restore| restore.deinit(deinit_ctx.allocator);
@@ -456,6 +463,7 @@ pub const App = struct {
                 self.scrollSearchMatchIntoView();
                 self.clampDiffNavigation();
                 self.clampHelpScroll();
+                self.clampPushErrorScroll();
             },
             .load_finished => |finished| try self.finishLoadResult(ctx, finished),
             .action_finished => |finished| try self.finishActionResult(ctx, finished),
@@ -600,6 +608,10 @@ pub const App = struct {
             .help_scroll_down => self.scrollHelp(1),
             .help_page_up => self.pageHelp(-1),
             .help_page_down => self.pageHelp(1),
+            .push_error_scroll_up => self.scrollPushError(-1),
+            .push_error_scroll_down => self.scrollPushError(1),
+            .push_error_page_up => self.pagePushError(-1),
+            .push_error_page_down => self.pagePushError(1),
             .toggle_reviewed_file => try self.toggleReviewedFile(ctx.allocator()),
             .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
@@ -617,6 +629,7 @@ pub const App = struct {
             .request_push => try self.requestPush(ctx.allocator()),
             .confirm_push => try self.confirmPush(ctx),
             .cancel_push => self.cancelPushConfirmation(ctx.allocator()),
+            .close_push_error => self.clearPushError(ctx.allocator()),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .finish_review_approved => try self.finishReview(ctx, .approved),
             .finish_review_needs_changes => try self.finishReview(ctx, .needs_changes),
@@ -697,6 +710,13 @@ pub const App = struct {
             return switch (mouse.button) {
                 .wheel_up => .help_scroll_up,
                 .wheel_down => .help_scroll_down,
+                else => null,
+            };
+        }
+        if (self.overlay.isPushError()) {
+            return switch (mouse.button) {
+                .wheel_up => .push_error_scroll_up,
+                .wheel_down => .push_error_scroll_down,
                 else => null,
             };
         }
@@ -789,6 +809,7 @@ pub const App = struct {
             .discard_confirmation_mode = self.overlay.isDiscardFile(),
             .amend_confirmation_mode = self.overlay.isAmendCommit(),
             .push_confirmation_mode = self.overlay.isPushBranch(),
+            .push_error_mode = self.overlay.isPushError(),
             .search_query_len = self.search.query.len,
             .focus = self.viewer.focus,
             .sidebar_hidden = self.viewer.sidebar_hidden,
@@ -818,6 +839,29 @@ pub const App = struct {
 
     fn clampHelpScroll(self: *App) void {
         self.overlay.help_scroll = @min(self.overlay.help_scroll, app_view.helpMaxScroll(self.layoutSize()));
+    }
+
+    fn scrollPushError(self: *App, delta: isize) void {
+        if (delta < 0) {
+            const amount: usize = @intCast(-(delta + 1));
+            self.overlay.push_error_scroll -|= amount + 1;
+        } else {
+            self.overlay.push_error_scroll +|= @intCast(delta);
+        }
+        self.clampPushErrorScroll();
+    }
+
+    fn pagePushError(self: *App, pages: isize) void {
+        const rows = @max(@as(usize, app_view.pushErrorVisibleRows(self.layoutSize(), self.push_error_message)), 1);
+        const delta: isize = if (pages < 0)
+            -@as(isize, @intCast(rows))
+        else
+            @as(isize, @intCast(rows));
+        self.scrollPushError(delta);
+    }
+
+    fn clampPushErrorScroll(self: *App) void {
+        self.overlay.push_error_scroll = @min(self.overlay.push_error_scroll, app_view.pushErrorMaxScroll(self.layoutSize(), self.push_error_message));
     }
 
     fn viewSidebar(self: *const App, surface: *chasen.Surface, loaded: LoadedDiff) !void {
@@ -1895,6 +1939,7 @@ pub const App = struct {
         self.cancelDiscardConfirmation(allocator);
         self.cancelAmendConfirmation(allocator);
         self.cancelPushConfirmation(allocator);
+        self.clearPushError(allocator);
 
         const owned_repo_root = try allocator.dupe(u8, target.repo_root);
         errdefer allocator.free(owned_repo_root);
@@ -1974,6 +2019,18 @@ pub const App = struct {
         if (self.push_confirmation) |*confirmation| confirmation.deinit(allocator);
         self.push_confirmation = null;
         if (self.overlay.isPushBranch()) self.overlay.close();
+    }
+
+    fn setPushError(self: *App, allocator: std.mem.Allocator, message: []const u8) !void {
+        self.clearPushError(allocator);
+        self.push_error_message = try allocator.dupe(u8, message);
+        self.overlay.openPushError();
+    }
+
+    fn clearPushError(self: *App, allocator: std.mem.Allocator) void {
+        if (self.push_error_message) |message| allocator.free(message);
+        self.push_error_message = null;
+        if (self.overlay.isPushError()) self.overlay.close();
     }
 
     fn selectedPushTarget(self: *const App) PushTargetResult {
@@ -2230,10 +2287,14 @@ pub const App = struct {
                 }
             },
             .failed => |message| {
-                self.setStatus("push failed: {s}", .{git_ops.trimGitOutput(message)});
+                const detail = git_ops.trimGitOutput(message);
+                const status_message = git_ops.pushFailureHint(detail) orelse detail;
+                self.setStatus("push failed: {s}", .{status_message});
+                try self.setPushError(ctx.allocator(), detail);
             },
             .failed_static => |message| {
                 self.setStatus("push failed: {s}", .{message});
+                try self.setPushError(ctx.allocator(), message);
             },
         }
     }
@@ -5505,6 +5566,43 @@ test "help overlay wheel scrolls help and ignores clicks" {
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
 }
 
+test "push error overlay wheel scrolls details and ignores clicks" {
+    const long_message =
+        "line 1\nline 2\nline 3\nline 4\nline 5\n" ++
+        "line 6\nline 7\nline 8\nline 9\nline 10\n";
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .push_error_message = try std.testing.allocator.dupe(u8, long_message),
+    };
+    defer app.clearPushError(std.testing.allocator);
+    app.overlay.openPushError();
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedPushErrorWheelMessage;
+    try std.testing.expectEqual(App.Msg.push_error_scroll_down, msg);
+    try app.update(msg, undefined);
+    try std.testing.expect(app.overlay.push_error_scroll > 0);
+
+    try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
+}
+
+test "terminal resize clamps push error scroll" {
+    const long_message =
+        "line 1\nline 2\nline 3\nline 4\nline 5\n" ++
+        "line 6\nline 7\nline 8\nline 9\nline 10\n";
+    var app: App = .{
+        .terminal_size = .{ .width = 40, .height = 8 },
+        .push_error_message = try std.testing.allocator.dupe(u8, long_message),
+        .overlay = .{ .kind = .push_error, .push_error_scroll = 99 },
+    };
+    defer app.clearPushError(std.testing.allocator);
+
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 30 } }, undefined);
+
+    try std.testing.expect(app.overlay.push_error_scroll <= app_view.pushErrorMaxScroll(app.layoutSize(), app.push_error_message));
+}
+
 test "mouse horizontal wheel scrolls diff pane horizontally" {
     var app: App = .{
         .terminal_size = .{ .width = 80, .height = 12 },
@@ -5942,6 +6040,36 @@ test "requestPush snapshots the active branch target" {
     try std.testing.expectEqualStrings("main", confirmation.remote_branch);
     try std.testing.expectEqualStrings("abc123", confirmation.oid);
     try std.testing.expectEqual(@as(u32, 2), confirmation.ahead);
+}
+
+test "requestPush clears previous push error details" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.branch_status.deinit();
+    defer app.cancelPushConfirmation(std.testing.allocator);
+    defer app.clearPushError(std.testing.allocator);
+
+    var bundle = try git_branch_status.BranchStatusBundle.parseOwned(
+        std.testing.allocator,
+        "# branch.oid abc123\n" ++
+            "# branch.head feature\n" ++
+            "# branch.upstream origin/main\n" ++
+            "# branch.ab +2 -0\n",
+    );
+    try app.branch_status.replace("/repo", &bundle);
+    try app.setPushError(std.testing.allocator, "old push failure");
+
+    try app.requestPush(std.testing.allocator);
+
+    try std.testing.expect(app.push_error_message == null);
+    try std.testing.expect(app.overlay.isPushBranch());
+    try std.testing.expect(app.push_confirmation != null);
 }
 
 test "confirmPush keeps confirmation when another action is pending" {

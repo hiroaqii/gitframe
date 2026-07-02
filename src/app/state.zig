@@ -7,6 +7,7 @@ pub const OverlayKind = enum {
     discard_file,
     amend_commit,
     push_branch,
+    push_error,
 };
 
 /// App-owned modal/overlay state.
@@ -16,6 +17,7 @@ pub const OverlayKind = enum {
 pub const OverlayState = struct {
     kind: OverlayKind = .none,
     help_scroll: usize = 0,
+    push_error_scroll: usize = 0,
 
     pub fn isHelp(self: OverlayState) bool {
         return self.kind == .help;
@@ -33,6 +35,10 @@ pub const OverlayState = struct {
         return self.kind == .push_branch;
     }
 
+    pub fn isPushError(self: OverlayState) bool {
+        return self.kind == .push_error;
+    }
+
     pub fn openHelp(self: *OverlayState) void {
         self.kind = .help;
         self.help_scroll = 0;
@@ -48,6 +54,11 @@ pub const OverlayState = struct {
 
     pub fn openPushBranch(self: *OverlayState) void {
         self.kind = .push_branch;
+    }
+
+    pub fn openPushError(self: *OverlayState) void {
+        self.kind = .push_error;
+        self.push_error_scroll = 0;
     }
 
     pub fn close(self: *OverlayState) void {

@@ -29,6 +29,7 @@ pub const KeyContext = struct {
     discard_confirmation_mode: bool = false,
     amend_confirmation_mode: bool = false,
     push_confirmation_mode: bool = false,
+    push_error_mode: bool = false,
     search_query_len: usize = 0,
     focus: Focus = .sidebar,
     sidebar_hidden: bool = false,
@@ -97,6 +98,10 @@ const Action = enum {
     help_scroll_down,
     help_page_up,
     help_page_down,
+    push_error_scroll_up,
+    push_error_scroll_down,
+    push_error_page_up,
+    push_error_page_down,
     cycle_changed_file_filter,
     toggle_reviewed_file,
     toggle_hide_reviewed_files,
@@ -119,6 +124,7 @@ const Action = enum {
     request_push,
     confirm_push,
     cancel_push,
+    close_push_error,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
@@ -146,7 +152,7 @@ fn pasteToMsg(comptime Msg: type, context: KeyContext, text: []const u8) ?Msg {
     if (context.search_mode) return payloadMsg(Msg, "search_paste", text);
     if (context.file_search_mode) return payloadMsg(Msg, "file_search_paste", text);
     if (context.repo_picker_mode) return payloadMsg(Msg, "repo_picker_paste", text);
-    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode) return null;
+    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.push_error_mode) return null;
     if (context.commit_panel_mode) return payloadMsg(Msg, "commit_panel_paste", text);
     return null;
 }
@@ -159,6 +165,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.discard_confirmation_mode) return discardConfirmationKeyToMsg(Msg, key);
     if (context.amend_confirmation_mode) return amendConfirmationKeyToMsg(Msg, key);
     if (context.push_confirmation_mode) return pushConfirmationKeyToMsg(Msg, key);
+    if (context.push_error_mode) return pushErrorKeyToMsg(Msg, key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(Msg, key);
     return viewerKeyToMsg(Msg, context, key);
 }
@@ -236,6 +243,15 @@ fn amendConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
 fn pushConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_push);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_push);
+    return null;
+}
+
+fn pushErrorKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
+    if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .close_push_error);
+    if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .push_error_scroll_up);
+    if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .push_error_scroll_down);
+    if (key.matches(chasen.Key.page_up, .{})) return actionToMsg(Msg, .push_error_page_up);
+    if (key.matches(chasen.Key.page_down, .{})) return actionToMsg(Msg, .push_error_page_down);
     return null;
 }
 
@@ -483,6 +499,10 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .help_scroll_down => voidMsg(Msg, "help_scroll_down"),
         .help_page_up => voidMsg(Msg, "help_page_up"),
         .help_page_down => voidMsg(Msg, "help_page_down"),
+        .push_error_scroll_up => voidMsg(Msg, "push_error_scroll_up"),
+        .push_error_scroll_down => voidMsg(Msg, "push_error_scroll_down"),
+        .push_error_page_up => voidMsg(Msg, "push_error_page_up"),
+        .push_error_page_down => voidMsg(Msg, "push_error_page_down"),
         .cycle_changed_file_filter => voidMsg(Msg, "cycle_changed_file_filter"),
         .toggle_reviewed_file => voidMsg(Msg, "toggle_reviewed_file"),
         .toggle_hide_reviewed_files => voidMsg(Msg, "toggle_hide_reviewed_files"),
@@ -505,6 +525,7 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .request_push => voidMsg(Msg, "request_push"),
         .confirm_push => voidMsg(Msg, "confirm_push"),
         .cancel_push => voidMsg(Msg, "cancel_push"),
+        .close_push_error => voidMsg(Msg, "close_push_error"),
         .open_selected_file_in_editor => voidMsg(Msg, "open_selected_file_in_editor"),
         .toggle_display_mode => voidMsg(Msg, "toggle_display_mode"),
         .toggle_line_numbers => voidMsg(Msg, "toggle_line_numbers"),
@@ -594,6 +615,10 @@ const TestMsg = union(enum) {
     help_scroll_down,
     help_page_up,
     help_page_down,
+    push_error_scroll_up,
+    push_error_scroll_down,
+    push_error_page_up,
+    push_error_page_down,
     cycle_changed_file_filter,
     toggle_reviewed_file,
     toggle_hide_reviewed_files,
@@ -616,6 +641,7 @@ const TestMsg = union(enum) {
     request_push,
     confirm_push,
     cancel_push,
+    close_push_error,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
@@ -1073,6 +1099,19 @@ test "keyToMsg maps push confirmation keys" {
     try std.testing.expectEqual(TestMsg.cancel_push, keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(TestMsg.cancel_push, keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = 'P' }));
+}
+
+test "keyToMsg maps push error modal keys" {
+    try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(TestMsg.push_error_scroll_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'k' }).?);
+    try std.testing.expectEqual(TestMsg.push_error_scroll_down, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(TestMsg.push_error_scroll_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(TestMsg.push_error_scroll_down, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.down }).?);
+    try std.testing.expectEqual(TestMsg.push_error_page_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.page_up }).?);
+    try std.testing.expectEqual(TestMsg.push_error_page_down, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.page_down }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'P' }));
 }
 
 test "keyToMsg opens and closes help outside prompt modes" {

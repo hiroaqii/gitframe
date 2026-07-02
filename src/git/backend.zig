@@ -633,10 +633,219 @@ fn runGitPush(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, p
         else => {},
     }
 
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    if (result.stderr.len > 0) {
+        const message = try pushFailureWithDiagnostics(allocator, io, &env, result.stderr);
+        return .{ .failed = message };
+    }
     allocator.free(result.stderr);
 
     return .{ .failed = std.fmt.allocPrint(allocator, "git push failed: {any}", .{result.term}) catch return error.OutOfMemory };
+}
+
+fn pushFailureWithDiagnostics(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, stderr: []u8) LoadError![]u8 {
+    if (!isSshPublicKeyFailure(stderr)) return stderr;
+    errdefer allocator.free(stderr);
+
+    const normalized = try normalizeSshPublicKeyFailureForDisplay(allocator, stderr);
+    defer allocator.free(normalized);
+
+    const diagnosis = try sshPublicKeyFailureDiagnosis(allocator, io, env);
+    const combined = std.fmt.allocPrint(
+        allocator,
+        "{s}\n\nGitFrame diagnosis:\n  {s}\n\nSuggested fix:\n{s}",
+        .{ trimLineEnd(normalized), diagnosis.message, diagnosis.suggestion },
+    ) catch return error.OutOfMemory;
+    allocator.free(stderr);
+    return combined;
+}
+
+fn isSshPublicKeyFailure(message: []const u8) bool {
+    return std.mem.indexOf(u8, message, "Permission denied (publickey)") != null;
+}
+
+fn normalizeSshPublicKeyFailureForDisplay(allocator: std.mem.Allocator, stderr: []const u8) LoadError![]u8 {
+    const line_normalized = try normalizeLineEndings(allocator, stderr);
+    defer allocator.free(line_normalized);
+
+    const fatal_separated = try insertLineBeforeToken(allocator, line_normalized, "fatal:");
+    defer allocator.free(fatal_separated);
+
+    return replaceAll(
+        allocator,
+        fatal_separated,
+        "Please make sure you have the correct access rights\nand the repository exists.",
+        "Please make sure you have the correct access rights and the repository exists.",
+    );
+}
+
+fn normalizeLineEndings(allocator: std.mem.Allocator, text: []const u8) LoadError![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '\r') {
+            try out.append(allocator, '\n');
+            i += 1;
+            if (i < text.len and text[i] == '\n') i += 1;
+            continue;
+        }
+        try out.append(allocator, text[i]);
+        i += 1;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn insertLineBeforeToken(allocator: std.mem.Allocator, text: []const u8, token: []const u8) LoadError![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, text, index, token)) |token_index| {
+        try out.appendSlice(allocator, text[index..token_index]);
+        if (token_index > 0 and text[token_index - 1] != '\n') {
+            try out.append(allocator, '\n');
+        }
+        try out.appendSlice(allocator, token);
+        index = token_index + token.len;
+    }
+    try out.appendSlice(allocator, text[index..]);
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn replaceAll(allocator: std.mem.Allocator, text: []const u8, needle: []const u8, replacement: []const u8) LoadError![]u8 {
+    if (needle.len == 0) return allocator.dupe(u8, text) catch return error.OutOfMemory;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, text, index, needle)) |match_index| {
+        try out.appendSlice(allocator, text[index..match_index]);
+        try out.appendSlice(allocator, replacement);
+        index = match_index + needle.len;
+    }
+    try out.appendSlice(allocator, text[index..]);
+
+    return out.toOwnedSlice(allocator);
+}
+
+const SshPublicKeyDiagnostic = struct {
+    message: []const u8,
+    suggestion: []const u8,
+};
+
+const ssh_agent_not_visible_suggestion =
+    \\  1. Check whether ssh-agent is visible:
+    \\     echo $SSH_AUTH_SOCK
+    \\  2. If it is empty, start ssh-agent:
+    \\     eval "$(ssh-agent -s)"
+    \\  3. Add the key used for this repository:
+    \\     ssh-add <path-to-your-git-ssh-key>
+    \\     Example: ssh-add ~/.ssh/id_ed25519
+    \\  4. Start GitFrame again from the same shell.
+;
+
+fn sshPublicKeyFailureDiagnosis(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) LoadError!SshPublicKeyDiagnostic {
+    // `env` is the effective push environment: pushEnvironment mutates Git
+    // prompt settings, but preserves SSH_AUTH_SOCK for this diagnostic.
+    const auth_sock = env.get("SSH_AUTH_SOCK") orelse return .{
+        .message = "SSH_AUTH_SOCK is not set; ssh-agent is not visible to GitFrame",
+        .suggestion = ssh_agent_not_visible_suggestion,
+    };
+    if (auth_sock.len == 0) return .{
+        .message = "SSH_AUTH_SOCK is empty; ssh-agent is not visible to GitFrame",
+        .suggestion = ssh_agent_not_visible_suggestion,
+    };
+
+    const argv = [_][]const u8{ "ssh-add", "-l" };
+    const result = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .environ_map = env,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => .{
+            .message = "could not inspect ssh-agent with ssh-add -l",
+            .suggestion =
+            \\  1. Check whether ssh-agent is visible:
+            \\     echo $SSH_AUTH_SOCK
+            \\  2. Check whether it is usable:
+            \\     ssh-add -l
+            \\  3. Start GitFrame again from the same shell after ssh-add succeeds.
+            ,
+        },
+    };
+    defer freeRunResult(allocator, result);
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code == 0) {
+                return .{
+                    .message = "ssh-agent is reachable and has identities",
+                    .suggestion =
+                    \\  1. Check the loaded SSH keys:
+                    \\     ssh-add -l
+                    \\  2. Confirm the key is registered with GitHub.
+                    \\  3. Confirm this account can push to the repository.
+                    \\  4. Check ~/.ssh/config if this host uses a custom key.
+                    ,
+                };
+            }
+            if (std.mem.indexOf(u8, result.stdout, "The agent has no identities") != null or
+                std.mem.indexOf(u8, result.stderr, "The agent has no identities") != null)
+            {
+                return .{
+                    .message = "ssh-agent is reachable but has no identities loaded",
+                    .suggestion =
+                    \\  1. Check loaded keys:
+                    \\     ssh-add -l
+                    \\  2. Add the key used for this repository:
+                    \\     ssh-add <path-to-your-git-ssh-key>
+                    \\     Example: ssh-add ~/.ssh/id_ed25519
+                    \\  3. Start GitFrame again from the same shell.
+                    ,
+                };
+            }
+            if (std.mem.indexOf(u8, result.stderr, "Could not open a connection to your authentication agent") != null) {
+                return .{
+                    .message = "SSH_AUTH_SOCK is set, but ssh-add cannot connect to the agent",
+                    .suggestion =
+                    \\  1. Check whether ssh-agent is usable:
+                    \\     ssh-add -l
+                    \\  2. If it cannot connect, restart ssh-agent:
+                    \\     eval "$(ssh-agent -s)"
+                    \\  3. Add the key used for this repository:
+                    \\     ssh-add <path-to-your-git-ssh-key>
+                    \\     Example: ssh-add ~/.ssh/id_ed25519
+                    \\  4. Start GitFrame again from the same shell.
+                    ,
+                };
+            }
+            return .{
+                .message = "ssh-add -l could not confirm a usable key",
+                .suggestion =
+                \\  1. Check whether ssh-agent is usable:
+                \\     ssh-add -l
+                \\  2. Check GitHub key registration and repository access.
+                \\  3. Check ~/.ssh/config if this host uses a custom key.
+                ,
+            };
+        },
+        else => return .{
+            .message = "ssh-add -l did not exit normally",
+            .suggestion =
+            \\  1. Check whether ssh-agent is visible:
+            \\     echo $SSH_AUTH_SOCK
+            \\  2. Check whether it is usable:
+            \\     ssh-add -l
+            \\  3. Start GitFrame again from the same shell after ssh-add succeeds.
+            ,
+        },
+    }
 }
 
 fn verifyPushSnapshot(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: PushRequest) LoadError!bool {
@@ -888,6 +1097,52 @@ test "pushEnvironment preserves existing BatchMode yes and rejects BatchMode no"
     defer parent_no.deinit();
     try parent_no.put("GIT_SSH_COMMAND", "ssh -o BatchMode=no -i /tmp/key");
     try std.testing.expectError(error.SpawnFailed, pushEnvironment(std.testing.allocator, &parent_no));
+}
+
+test "pushFailureWithDiagnostics explains missing ssh-agent socket" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    const stderr = try std.testing.allocator.dupe(
+        u8,
+        "git@github.com: Permission denied (publickey).fatal: Could not read from remote repository.\r\n\r\n" ++
+            "Please make sure you have the correct access rights\nand the repository exists.\n",
+    );
+    const message = try pushFailureWithDiagnostics(std.testing.allocator, std.testing.io, &env, stderr);
+    defer std.testing.allocator.free(message);
+
+    try std.testing.expect(std.mem.indexOf(u8, message, "Permission denied (publickey).\nfatal:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "Please make sure you have the correct access rights and the repository exists.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "GitFrame diagnosis:\n  SSH_AUTH_SOCK is not set") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "Suggested fix:\n  1. Check whether ssh-agent is visible:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "  3. Add the key used for this repository:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "     ssh-add <path-to-your-git-ssh-key>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "     Example: ssh-add ~/.ssh/id_ed25519") != null);
+}
+
+test "pushFailureWithDiagnostics explains empty ssh-agent socket" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("SSH_AUTH_SOCK", "");
+
+    const stderr = try std.testing.allocator.dupe(u8, "git@github.com: Permission denied (publickey).\n");
+    const message = try pushFailureWithDiagnostics(std.testing.allocator, std.testing.io, &env, stderr);
+    defer std.testing.allocator.free(message);
+
+    try std.testing.expect(std.mem.indexOf(u8, message, "GitFrame diagnosis:\n  SSH_AUTH_SOCK is empty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "Suggested fix:\n  1. Check whether ssh-agent is visible:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "  4. Start GitFrame again from the same shell.") != null);
+}
+
+test "pushFailureWithDiagnostics leaves non-publickey failures unchanged" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    const stderr = try std.testing.allocator.dupe(u8, "fatal: non-fast-forward\n");
+    const message = try pushFailureWithDiagnostics(std.testing.allocator, std.testing.io, &env, stderr);
+    defer std.testing.allocator.free(message);
+
+    try std.testing.expectEqualStrings("fatal: non-fast-forward\n", message);
 }
 
 test "LocalCommandBackend push rejects stale oid before contacting remote" {

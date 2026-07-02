@@ -34,6 +34,8 @@ const help_header_rows: u16 = 2;
 const help_scroll_indicator_rows: u16 = 1;
 const commit_dialog_width: u16 = 80;
 const repo_picker_dialog_width: u16 = 80;
+const push_error_dialog_max_width: u16 = 90;
+const push_error_dialog_min_height: u16 = 16;
 const repo_picker_filter_input_col: u16 = 8;
 const repo_picker_path_input_col: u16 = 11;
 const repo_picker_list_label_col: u16 = 4;
@@ -121,6 +123,9 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
     }
     if (app.overlay.isPushBranch()) {
         try viewPushConfirmation(app, surface);
+    }
+    if (app.overlay.isPushError()) {
+        try viewPushError(app, surface);
     }
 }
 
@@ -1362,6 +1367,146 @@ fn viewPushConfirmation(app: anytype, surface: *chasen.Surface) !void {
     if (start_row + 4 < size.height) {
         try drawCenteredText(&content, start_row + 4, "Enter: push    Esc/q: cancel", .{ .fg = color_accent });
     }
+}
+
+fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
+    const message = app.push_error_message orelse return;
+    const modal = ui.Modal.init(.{});
+    const opts = pushErrorModalOptions(surface.size(), message);
+
+    const opts_with_title: ui.Modal.ViewOptions = .{
+        .dialog_width = opts.dialog_width,
+        .dialog_height = opts.dialog_height,
+        .title = "Push failed",
+        .backdrop = false,
+        .border = .rounded,
+        .title_style = .{ .bold = true, .fg = color_danger },
+        .border_style = .{ .fg = color_danger },
+    };
+    fillModalDialog(surface, opts_with_title);
+    modal.view(surface, opts_with_title);
+
+    const content_rect = ui.Modal.contentRect(surface, opts_with_title);
+    if (content_rect.width == 0 or content_rect.height == 0) return;
+    var content = surface.child(content_rect);
+    const size = content.size();
+
+    if (size.height > 0) {
+        try draw.copyClippedTextAt(&content, 0, 0, "Git push failed. Details:", .{ .bold = true, .fg = color_danger });
+    }
+
+    if (size.height > 4) {
+        var body = content.child(.{
+            .col = 0,
+            .row = 2,
+            .width = size.width,
+            .height = size.height - 4,
+        });
+        drawWrappedTextScrolled(&body, message, app.overlay.push_error_scroll, .{});
+    }
+
+    if (size.height > 0) {
+        try draw.copyClippedTextAt(&content, 0, size.height - 1, "Enter/Esc/q: close", .{ .fg = color_danger });
+    }
+}
+
+fn pushErrorModalOptions(size: chasen.Size, message: []const u8) struct { dialog_width: u16, dialog_height: u16 } {
+    const dialog_width = @min(size.width, push_error_dialog_max_width);
+    const content_width = if (dialog_width > 4) dialog_width - 4 else 0;
+    const paragraph = ui.Paragraph.init(.{ .text = message });
+    const body_rows = paragraph.lineCount(content_width);
+    // Content rows outside the wrapped body: title, body gap, footer gap, footer.
+    const desired_content_height = body_rows + 4;
+    const desired_height = modalHeightForContent(size, dialog_width, desired_content_height);
+    return .{
+        .dialog_width = dialog_width,
+        .dialog_height = @min(size.height, desired_height),
+    };
+}
+
+pub fn pushErrorVisibleRows(size: chasen.Size, message: ?[]const u8) u16 {
+    const content_size = pushErrorContentSize(size, message orelse "");
+    if (content_size.height <= 4) return 0;
+    return content_size.height - 4;
+}
+
+pub fn pushErrorMaxScroll(size: chasen.Size, message: ?[]const u8) usize {
+    const text = message orelse "";
+    const content_size = pushErrorContentSize(size, text);
+    if (content_size.width == 0) return 0;
+    const paragraph = ui.Paragraph.init(.{ .text = text });
+    const rows = paragraph.lineCount(content_size.width);
+    const visible_rows: usize = pushErrorVisibleRows(size, message);
+    if (rows <= visible_rows) return 0;
+    return rows - visible_rows;
+}
+
+fn pushErrorContentSize(size: chasen.Size, message: []const u8) chasen.Size {
+    const opts = pushErrorModalOptions(size, message);
+    return ui.Modal.contentSizeForOverlay(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, .{
+        .dialog_width = opts.dialog_width,
+        .dialog_height = opts.dialog_height,
+    });
+}
+
+fn modalHeightForContent(size: chasen.Size, dialog_width: u16, desired_content_height: usize) u16 {
+    var candidate = @min(size.height, push_error_dialog_min_height);
+    const overlay: chasen.Rect = .{ .col = 0, .row = 0, .width = size.width, .height = size.height };
+    while (candidate < size.height) : (candidate += 1) {
+        const content_size = ui.Modal.contentSizeForOverlay(overlay, .{
+            .dialog_width = dialog_width,
+            .dialog_height = candidate,
+        });
+        if (content_size.height >= desired_content_height) return candidate;
+    }
+    return size.height;
+}
+
+fn drawWrappedTextScrolled(surface: *chasen.Surface, text: []const u8, scroll: usize, style: chasen.TextStyle) void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    var logical_row: usize = 0;
+    var drawn_rows: u16 = 0;
+    var line_start: usize = 0;
+    var line_end: usize = 0;
+    var line_width: u32 = 0;
+
+    var iter = chasen.text.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        if (bytes.len == 1 and bytes[0] == '\n') {
+            if (drawWrappedLine(surface, text[line_start..line_end], logical_row, scroll, &drawn_rows, style)) return;
+            logical_row += 1;
+            line_start = grapheme.start + grapheme.len;
+            line_end = line_start;
+            line_width = 0;
+            continue;
+        }
+
+        const grapheme_width = chasen.text.displayWidth(bytes);
+        if (line_width > 0 and line_width + grapheme_width > size.width) {
+            if (drawWrappedLine(surface, text[line_start..line_end], logical_row, scroll, &drawn_rows, style)) return;
+            logical_row += 1;
+            line_start = grapheme.start;
+            line_end = grapheme.start;
+            line_width = 0;
+        }
+
+        line_end = grapheme.start + grapheme.len;
+        line_width += grapheme_width;
+    }
+
+    _ = drawWrappedLine(surface, text[line_start..line_end], logical_row, scroll, &drawn_rows, style);
+}
+
+fn drawWrappedLine(surface: *chasen.Surface, line: []const u8, logical_row: usize, scroll: usize, drawn_rows: *u16, style: chasen.TextStyle) bool {
+    const size = surface.size();
+    if (logical_row < scroll) return false;
+    if (drawn_rows.* >= size.height) return true;
+    _ = surface.borrowTextAt(0, drawn_rows.*, line, style);
+    drawn_rows.* += 1;
+    return drawn_rows.* >= size.height;
 }
 
 fn drawCenteredText(surface: *chasen.Surface, row: u16, text: []const u8, style: chasen.TextStyle) !void {
