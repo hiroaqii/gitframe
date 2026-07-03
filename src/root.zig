@@ -36,12 +36,15 @@ test {
     _ = @import("context.zig");
     _ = @import("context_export.zig");
     _ = @import("draw");
+    _ = @import("diff/file.zig");
     _ = @import("diff/hunk_projection.zig");
+    _ = @import("diff/render.zig");
     _ = @import("editor.zig");
     _ = @import("external/action.zig");
     _ = @import("git/backend.zig");
     _ = @import("git/status.zig");
     _ = @import("keymap");
+    _ = @import("path_key.zig");
     _ = @import("process/runner.zig");
     _ = @import("repo/state.zig");
     _ = @import("review/session.zig");

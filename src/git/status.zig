@@ -1,4 +1,5 @@
 const std = @import("std");
+const path_key = @import("../path_key.zig");
 
 pub const ParseError = error{
     InvalidRecord,
@@ -64,7 +65,7 @@ pub const StatusEntry = struct {
     /// Porcelain paths are normally repo-relative already, but keep the same
     /// defensive normalization rules as diff file keys.
     pub fn canonicalPathKey(self: StatusEntry) ?[]const u8 {
-        return canonicalRepoPath(self.path);
+        return path_key.canonicalRepoPath(self.path);
     }
 };
 
@@ -231,25 +232,6 @@ fn statusCode(byte: u8) StatusCode {
         'U' => .unmerged,
         else => .unknown,
     };
-}
-
-// Keep in sync with diff/file.zig's canonical path normalization. These
-// modules are tested as standalone roots, so the normalization is duplicated
-// until a lower shared module can be introduced without breaking module tests.
-fn canonicalRepoPath(path: []const u8) ?[]const u8 {
-    if (isDevNull(path)) return null;
-    const stripped = stripGitSidePrefix(path);
-    if (isDevNull(stripped) or stripped.len == 0) return null;
-    return stripped;
-}
-
-fn stripGitSidePrefix(path: []const u8) []const u8 {
-    if (path.len >= 2 and (path[0] == 'a' or path[0] == 'b') and path[1] == '/') return path[2..];
-    return path;
-}
-
-fn isDevNull(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/dev/null");
 }
 
 test "parse porcelain v1 z modified entries" {

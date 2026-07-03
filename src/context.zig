@@ -1,4 +1,5 @@
 const std = @import("std");
+const path_key = @import("path_key.zig");
 
 /// Diff source class exposed to external integrations.
 ///
@@ -32,7 +33,7 @@ pub const SourceContext = struct {
 ///
 /// The slice is borrowed from the source document. Async payloads or persistent
 /// stores must duplicate the key before keeping it beyond the active load.
-pub const PathKey = []const u8;
+pub const PathKey = path_key.PathKey;
 
 /// Sidebar row identity.
 ///
@@ -109,27 +110,8 @@ pub const SelectionContext = struct {
     selected: ?Selection,
 };
 
-/// Normalize a git path to a repo-relative key.
-///
-/// Removes `a/` and `b/` side prefixes and excludes `/dev/null`, which is a
-/// diff endpoint rather than a repository path.
-/// `diff/file.zig` and `git/status.zig` intentionally duplicate this rule today
-/// because they are tested as standalone roots.
-pub fn canonicalRepoPath(path: []const u8) ?PathKey {
-    if (isDevNull(path)) return null;
-    const stripped = stripGitSidePrefix(path);
-    if (isDevNull(stripped) or stripped.len == 0) return null;
-    return stripped;
-}
-
-pub fn stripGitSidePrefix(path: []const u8) []const u8 {
-    if (path.len >= 2 and (path[0] == 'a' or path[0] == 'b') and path[1] == '/') return path[2..];
-    return path;
-}
-
-fn isDevNull(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/dev/null");
-}
+pub const canonicalRepoPath = path_key.canonicalRepoPath;
+pub const stripGitSidePrefix = path_key.stripGitSidePrefix;
 
 test "canonical repo path strips git side prefixes" {
     try std.testing.expectEqualStrings("src/main.zig", canonicalRepoPath("a/src/main.zig").?);

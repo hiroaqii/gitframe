@@ -1,4 +1,5 @@
 const std = @import("std");
+const path_key = @import("../path_key.zig");
 const diff_parser = @import("parser.zig");
 const diff_view_model = @import("view_model.zig");
 
@@ -181,12 +182,7 @@ fn lessThanCandidate(_: void, lhs: Candidate, rhs: Candidate) bool {
 fn sameRepoPath(old_path: ?[]const u8, new_path: ?[]const u8) bool {
     const old = old_path orelse return false;
     const new = new_path orelse return false;
-    return std.mem.eql(u8, stripGitSidePrefix(old), stripGitSidePrefix(new));
-}
-
-fn stripGitSidePrefix(path: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, path, "a/") or std.mem.startsWith(u8, path, "b/")) return path[2..];
-    return path;
+    return std.mem.eql(u8, path_key.stripGitSidePrefix(old), path_key.stripGitSidePrefix(new));
 }
 
 fn parseOneFile(arena: *std.heap.ArenaAllocator, text: []const u8) !diff_parser.FileDiff {

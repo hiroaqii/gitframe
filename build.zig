@@ -106,30 +106,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_diff_parser_tests = b.addRunArtifact(diff_parser_tests);
 
-    const diff_file_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/diff/file.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_diff_file_tests = b.addRunArtifact(diff_file_tests);
-
-    const diff_render_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/diff/render.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "chasen", .module = chasen_dep.module("chasen") },
-                .{ .name = "draw", .module = draw_mod },
-                .{ .name = "theme", .module = theme_mod },
-                .{ .name = "keymap", .module = keymap_mod },
-            },
-        }),
-    });
-    const run_diff_render_tests = b.addRunArtifact(diff_render_tests);
-
     const diff_view_model_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/diff/view_model.zig"),
@@ -219,8 +195,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_draw_tests.step);
     test_step.dependOn(&run_diff_source_tests.step);
     test_step.dependOn(&run_diff_parser_tests.step);
-    test_step.dependOn(&run_diff_file_tests.step);
-    test_step.dependOn(&run_diff_render_tests.step);
     test_step.dependOn(&run_diff_view_model_tests.step);
     test_step.dependOn(&run_diff_search_tests.step);
     test_step.dependOn(&run_file_tree_tests.step);

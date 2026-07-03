@@ -1,4 +1,5 @@
 const std = @import("std");
+const path_key = @import("../path_key.zig");
 const diff_parser = @import("parser.zig");
 
 pub const Stats = struct {
@@ -42,17 +43,17 @@ pub fn displayPath(file: diff_parser.FileDiff) []const u8 {
 /// headers are present.
 pub fn canonicalPathKey(file: diff_parser.FileDiff) ?[]const u8 {
     if (file.new_path) |path| {
-        if (canonicalRepoPath(path)) |key| return key;
+        if (path_key.canonicalRepoPath(path)) |key| return key;
     }
-    if (metadataPath(file, "rename to ")) |path| return canonicalRepoPath(path);
-    if (metadataPath(file, "copy to ")) |path| return canonicalRepoPath(path);
-    if (file.old_path) |path| return canonicalRepoPath(path);
+    if (metadataPath(file, "rename to ")) |path| return path_key.canonicalRepoPath(path);
+    if (metadataPath(file, "copy to ")) |path| return path_key.canonicalRepoPath(path);
+    if (file.old_path) |path| return path_key.canonicalRepoPath(path);
     return null;
 }
 
 pub fn editorPath(file: diff_parser.FileDiff) ?[]const u8 {
     const path = file.new_path orelse return null;
-    if (isDevNull(path)) return null;
+    if (path_key.isDevNull(path)) return null;
     return stripGitPathPrefix(path);
 }
 
@@ -111,27 +112,8 @@ fn hasNonRegularFileMode(line: []const u8, prefix: []const u8) bool {
 }
 
 pub fn stripGitPathPrefix(path: []const u8) []const u8 {
-    if (isDevNull(path)) return path;
-    return stripGitSidePrefix(path);
-}
-
-fn canonicalRepoPath(path: []const u8) ?[]const u8 {
-    if (isDevNull(path)) return null;
-    const stripped = stripGitSidePrefix(path);
-    if (isDevNull(stripped) or stripped.len == 0) return null;
-    return stripped;
-}
-
-// Keep in sync with git/status.zig's status key normalization. These modules
-// are tested as standalone roots, so the normalization is duplicated until a
-// lower shared module can be introduced without breaking module tests.
-fn stripGitSidePrefix(path: []const u8) []const u8 {
-    if (path.len >= 2 and (path[0] == 'a' or path[0] == 'b') and path[1] == '/') return path[2..];
-    return path;
-}
-
-fn isDevNull(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/dev/null");
+    if (path_key.isDevNull(path)) return path;
+    return path_key.stripGitSidePrefix(path);
 }
 
 fn metadataPath(file: diff_parser.FileDiff, prefix: []const u8) ?[]const u8 {
