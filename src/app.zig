@@ -2657,9 +2657,20 @@ pub const App = struct {
         var load_result = app_load.runLoad(.{ .source = config.source, .repo_root = repo_root }, allocator, io);
         defer load_result.deinit(allocator);
 
+        var status_result: ?app_load.StatusLoadTaskResult = null;
+        defer if (status_result) |*result| result.deinit(allocator);
+
         const selection = switch (load_result) {
-            .empty => initialSelectionContext(config.source, repo_root, null),
-            .loaded => |*bundle| initialSelectionContext(config.source, repo_root, &bundle.loaded),
+            .empty => blk: {
+                status_result = initialStatusLoadResultIfNeeded(config.source, repo_root, allocator, io);
+                break :blk initialSelectionContext(config.source, repo_root, null, initialStatusDocument(optionalStatusResultPtr(&status_result)));
+            },
+            .loaded => |*bundle| blk: {
+                const loaded_selection = initialSelection(&bundle.loaded);
+                if (loaded_selection != null) break :blk initialSelectionContextWithSelection(config.source, repo_root, loaded_selection);
+                status_result = initialStatusLoadResultIfNeeded(config.source, repo_root, allocator, io);
+                break :blk initialSelectionContext(config.source, repo_root, &bundle.loaded, initialStatusDocument(optionalStatusResultPtr(&status_result)));
+            },
             .failed, .failed_static => return error.ExportContextLoadFailed,
         };
 
@@ -2674,11 +2685,34 @@ pub const App = struct {
         };
     }
 
-    fn initialSelectionContext(source: SourceMode, repo_root: ?[]const u8, loaded: ?*const LoadedDiff) context.SelectionContext {
+    fn initialStatusLoadResultIfNeeded(source: SourceMode, repo_root: ?[]const u8, allocator: std.mem.Allocator, io: std.Io) ?app_load.StatusLoadTaskResult {
+        if (!diff_source.sourceRequiresRepo(source)) return null;
+        const root = repo_root orelse return null;
+        return app_load.runStatusLoad(root, allocator, io);
+    }
+
+    fn optionalStatusResultPtr(result: *?app_load.StatusLoadTaskResult) ?*app_load.StatusLoadTaskResult {
+        if (result.*) |*value| return value;
+        return null;
+    }
+
+    fn initialStatusDocument(result: ?*app_load.StatusLoadTaskResult) ?git_status.StatusDocument {
+        const status = result orelse return null;
+        return switch (status.*) {
+            .loaded => |bundle| bundle.document,
+            .empty, .failed, .failed_static => null,
+        };
+    }
+
+    fn initialSelectionContext(source: SourceMode, repo_root: ?[]const u8, loaded: ?*const LoadedDiff, status: ?git_status.StatusDocument) context.SelectionContext {
+        return initialSelectionContextWithSelection(source, repo_root, if (loaded) |active_loaded| initialSelection(active_loaded) orelse initialStatusOnlySelection(status) else initialStatusOnlySelection(status));
+    }
+
+    fn initialSelectionContextWithSelection(source: SourceMode, repo_root: ?[]const u8, selected: ?context.Selection) context.SelectionContext {
         return .{
             .repo_root = repo_root,
             .source = sourceContext(source),
-            .selected = if (loaded) |active_loaded| initialSelection(active_loaded) else null,
+            .selected = selected,
         };
     }
 
@@ -2691,6 +2725,20 @@ pub const App = struct {
             .path_key = diff_file.canonicalPathKey(file),
             .hunk_index = if (file.hunks.len > 0) 0 else null,
         } };
+    }
+
+    fn initialStatusOnlySelection(status: ?git_status.StatusDocument) ?context.Selection {
+        const document = status orelse return null;
+        for (document.entries, 0..) |entry, status_index| {
+            if (entry.isIgnored()) continue;
+            const path_key = entry.canonicalPathKey() orelse continue;
+            // status_index is advisory for consumers; path_key is the stable identity.
+            return .{ .status_only = .{
+                .status_index = status_index,
+                .path_key = path_key,
+            } };
+        }
+        return null;
     }
 
     fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -4164,14 +4212,10 @@ pub const App = struct {
     }
 
     pub fn selectionContext(self: *const App) context.SelectionContext {
-        const loaded = self.activeLoadedDiffConst();
         return .{
             .repo_root = self.activeRepoRoot(),
             .source = sourceContext(self.config.source),
-            // Status-only rows currently live behind the loaded-diff gate.
-            // When GitStatusState can exist without a diff document, widen this
-            // branch to validate status-only targets against that model.
-            .selected = if (loaded) |active_loaded| self.selectionForLoaded(active_loaded) else null,
+            .selected = self.currentSelection(),
         };
     }
 
@@ -4194,10 +4238,13 @@ pub const App = struct {
         };
     }
 
-    fn selectionForLoaded(self: *const App, loaded: *const LoadedDiff) ?context.Selection {
+    fn currentSelection(self: *const App) ?context.Selection {
         const target = self.viewer.selected_target orelse return null;
         return switch (target) {
-            .diff_file => |file_index| self.diffFileSelection(loaded, file_index),
+            .diff_file => |file_index| if (self.activeLoadedDiffConst()) |loaded|
+                self.diffFileSelection(loaded, file_index)
+            else
+                null,
             .status_only => |status_index| self.statusOnlySelection(status_index),
         };
     }
@@ -4433,13 +4480,15 @@ pub const App = struct {
     }
 
     fn statusOnlySelection(self: *const App, status_index: usize) ?context.Selection {
-        if (status_index >= self.git_status.document.entries.len) {
-            return .{ .status_only = .{ .status_index = status_index } };
-        }
+        const repo_root = self.activeRepoRoot() orelse return null;
+        const status_root = self.git_status.repo_root orelse return null;
+        if (!std.mem.eql(u8, repo_root, status_root)) return null;
+        if (status_index >= self.git_status.document.entries.len) return null;
         const entry = self.git_status.document.entries[status_index];
+        const path_key = entry.canonicalPathKey() orelse return null;
         return .{ .status_only = .{
             .status_index = status_index,
-            .path_key = entry.canonicalPathKey(),
+            .path_key = path_key,
         } };
     }
 
@@ -6722,9 +6771,15 @@ test "diff header detail row dims separator when inactive" {
 
 test "selectedStagePathKey accepts diff and status-only selections" {
     var app: App = .{
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
         .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
+    defer app.clearLoadedDiff();
 
     try std.testing.expectEqualStrings("src/added.zig", app.selectedStagePathKey().?);
 
@@ -6734,6 +6789,68 @@ test "selectedStagePathKey accepts diff and status-only selections" {
     app.viewer.selected_target = .{ .status_only = 0 };
 
     try std.testing.expectEqualStrings("src/new.zig", app.selectedStagePathKey().?);
+}
+
+test "selectionContext keeps status-only selection while status load is pending" {
+    var app: App = .{
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+        .status_load_pending = 9,
+    };
+    defer app.git_status.deinit();
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    const selection = app.selectionContext();
+    const status = selection.selected.?.status_only;
+    try std.testing.expectEqual(@as(usize, 0), status.status_index);
+    try std.testing.expectEqualStrings("src/new.zig", status.path_key.?);
+}
+
+test "selectionContext rejects stale status-only identities" {
+    var app: App = .{
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer app.git_status.deinit();
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.git_status.replace("/other", &status_bundle);
+    try std.testing.expect(app.selectionContext().selected == null);
+
+    app.git_status.deinit();
+    var matching = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.git_status.replace("/repo", &matching);
+    app.viewer.selected_target = .{ .status_only = 1 };
+    try std.testing.expect(app.selectionContext().selected == null);
+}
+
+test "selectedSidebarActionTarget resolves status-only path without loaded diff" {
+    var app: App = .{
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer app.git_status.deinit();
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    const target = app.selectedSidebarActionTarget() orelse return error.ExpectedActionTarget;
+    try std.testing.expectEqual(git_ops.TargetKind.file, target.kind);
+    try std.testing.expectEqualStrings("src/new.zig", target.path);
 }
 
 test "selectedEditorTarget accepts status-only file rows" {
@@ -8020,7 +8137,7 @@ test "pending selection restore can restore directory nodes" {
 
 test "initialSelectionContext selects first diff file and hunk" {
     const loaded = app_test_support.loadedDiffTwo();
-    const selection = App.initialSelectionContext(.{ .patch_file = "changes.diff" }, null, &loaded);
+    const selection = App.initialSelectionContext(.{ .patch_file = "changes.diff" }, null, &loaded, null);
 
     try std.testing.expect(selection.repo_root == null);
     try std.testing.expectEqual(context.SourceKind.patch_file, selection.source.kind);
@@ -8030,6 +8147,54 @@ test "initialSelectionContext selects first diff file and hunk" {
     try std.testing.expectEqual(@as(usize, 0), file.file_index);
     try std.testing.expectEqualStrings("a", file.path_key.?);
     try std.testing.expectEqual(@as(?usize, 0), file.hunk_index);
+}
+
+test "initialSelectionContext prefers diff file before status-only selection" {
+    const loaded = app_test_support.loadedDiffTwo();
+    const doc = try git_status.parse(std.testing.allocator, "?? src/status-only.zig\x00");
+    defer std.testing.allocator.free(doc.entries);
+
+    const selection = App.initialSelectionContext(.unstaged, "/repo", &loaded, doc);
+
+    const file = selection.selected.?.diff_file;
+    try std.testing.expectEqual(@as(usize, 0), file.file_index);
+    try std.testing.expectEqualStrings("a", file.path_key.?);
+}
+
+test "initialSelectionContext falls back to first selectable status entry" {
+    const empty_loaded: LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &.{} },
+        .tree = .{ .nodes = &.{} },
+        .collapsed_dirs = .{},
+        .bytes = 0,
+        .lines = 0,
+    };
+    const doc = try git_status.parse(std.testing.allocator, "!! ignored.tmp\x00?? src/new.zig\x00 M src/changed.zig\x00");
+    defer std.testing.allocator.free(doc.entries);
+
+    const selection = App.initialSelectionContext(.unstaged, "/repo", &empty_loaded, doc);
+
+    const status = selection.selected.?.status_only;
+    try std.testing.expectEqual(@as(usize, 1), status.status_index);
+    try std.testing.expectEqualStrings("src/new.zig", status.path_key.?);
+}
+
+test "initialSelectionContext returns null when diff and status have no selectable entry" {
+    const empty_loaded: LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &.{} },
+        .tree = .{ .nodes = &.{} },
+        .collapsed_dirs = .{},
+        .bytes = 0,
+        .lines = 0,
+    };
+    const doc = try git_status.parse(std.testing.allocator, "!! ignored.tmp\x00");
+    defer std.testing.allocator.free(doc.entries);
+
+    const selection = App.initialSelectionContext(.unstaged, "/repo", &empty_loaded, doc);
+
+    try std.testing.expect(selection.selected == null);
 }
 
 test "activeRootFromDiscovery rejects ambiguous workspace export" {

@@ -2,6 +2,7 @@ const std = @import("std");
 
 const app_module = @import("app.zig");
 const context = @import("context.zig");
+const git_status = @import("git/status.zig");
 const test_support = @import("app/test_support.zig");
 
 const App = app_module.App;
@@ -34,7 +35,7 @@ test "selectionContext exposes selected diff file model coordinate" {
     try std.testing.expectEqual(@as(?usize, 1), diff_selection.hunk_index);
 }
 
-test "selectionContext accepts status-only target shape" {
+test "selectionContext returns null for unresolved status-only target" {
     const app: App = .{
         .config = .{ .source = .stdin },
         .load = test_support.loadState(test_support.loadedDiffOne()),
@@ -44,10 +45,31 @@ test "selectionContext accepts status-only target shape" {
     const selection = app.selectionContext();
     try std.testing.expect(selection.repo_root == null);
     try std.testing.expectEqual(context.SourceKind.stdin, selection.source.kind);
+    try std.testing.expect(selection.selected == null);
+}
+
+test "selectionContext resolves status-only target without loaded diff" {
+    var app: App = .{
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer app.git_status.deinit();
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    const selection = app.selectionContext();
+    try std.testing.expectEqualStrings("/repo", selection.repo_root.?);
+    try std.testing.expectEqual(context.SourceKind.unstaged, selection.source.kind);
 
     const status_selection = selection.selected.?.status_only;
-    try std.testing.expectEqual(@as(usize, 2), status_selection.status_index);
-    try std.testing.expect(status_selection.path_key == null);
+    try std.testing.expectEqual(@as(usize, 0), status_selection.status_index);
+    try std.testing.expectEqualStrings("src/new.zig", status_selection.path_key.?);
 }
 
 test "selectionContext keeps no-index source paths" {
