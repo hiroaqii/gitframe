@@ -884,7 +884,7 @@ pub const App = struct {
         task.* = .{ .generation = generation };
         self.clearLoadedDiff();
         self.load.state = .loading;
-        ctx.task().spawnWith(task, RepoDiscoveryTask.run) catch |err| {
+        ctx.task().spawnWith(.{ .ctx = task, .run = RepoDiscoveryTask.run, .failed = RepoDiscoveryTask.failed }) catch |err| {
             _ = self.load.clearPendingIfCurrent(.{ .repo_discovery = generation });
             try self.storeFailedMessage(ctx.allocator(), "Could not start repo discovery task");
             return err;
@@ -964,7 +964,7 @@ pub const App = struct {
             self.clearLoadedDiff();
             self.load.state = .loading;
         }
-        ctx.task().spawnWith(task, DiffLoadTask.run) catch |err| {
+        ctx.task().spawnWith(.{ .ctx = task, .run = DiffLoadTask.run, .failed = DiffLoadTask.failed }) catch |err| {
             _ = self.load.clearPendingIfCurrent(.{ .diff_load = generation });
             try self.storeFailedMessage(ctx.allocator(), "Could not start diff load task");
             return err;
@@ -993,7 +993,7 @@ pub const App = struct {
         };
         self.status_load_pending = self.status_load_generation;
 
-        ctx.task().spawnWith(task, StatusLoadTask.run) catch {
+        ctx.task().spawnWith(.{ .ctx = task, .run = StatusLoadTask.run, .failed = StatusLoadTask.failed }) catch {
             // Status is auxiliary data. Keep the diff load going even if this
             // task cannot start; the invalidated generation prevents any older
             // in-flight status result from restoring a stale snapshot.
@@ -1026,7 +1026,7 @@ pub const App = struct {
         };
         self.branch_status_load_pending = self.branch_status_load_generation;
 
-        ctx.task().spawnWith(task, BranchStatusLoadTask.run) catch {
+        ctx.task().spawnWith(.{ .ctx = task, .run = BranchStatusLoadTask.run, .failed = BranchStatusLoadTask.failed }) catch {
             ctx.allocator().free(owned_root);
             ctx.allocator().destroy(task);
             self.branch_status_load_pending = null;
@@ -1097,7 +1097,7 @@ pub const App = struct {
         task.* = .{ .request = task_request };
         task_request_moved = true;
 
-        ctx.task().spawnWith(task, ReviewProjectionTask.run) catch |err| {
+        ctx.task().spawnWith(.{ .ctx = task, .run = ReviewProjectionTask.run, .failed = ReviewProjectionTask.failed }) catch |err| {
             task.request.deinit(ctx.allocator());
             ctx.allocator().destroy(task);
             return err;
@@ -1329,7 +1329,7 @@ pub const App = struct {
         task.patch = owned_patch;
         owned_patch = &.{};
 
-        ctx.task().spawnWith(task, StageHunkTask.run) catch |err| {
+        ctx.task().spawnWith(.{ .ctx = task, .run = StageHunkTask.run, .failed = StageHunkTask.failed }) catch |err| {
             self.setStatus("could not start hunk stage task", .{});
             return err;
         };
@@ -1428,7 +1428,7 @@ pub const App = struct {
         task.patch = owned_patch;
         owned_patch = &.{};
 
-        ctx.task().spawnWith(task, UnstageHunkTask.run) catch |err| {
+        ctx.task().spawnWith(.{ .ctx = task, .run = UnstageHunkTask.run, .failed = UnstageHunkTask.failed }) catch |err| {
             self.setStatus("could not start hunk unstage task", .{});
             return err;
         };
@@ -1815,7 +1815,7 @@ pub const App = struct {
         };
         parts = .{ .subject = &.{}, .body = null };
 
-        ctx.task().spawnWith(task, CommitTask.run) catch |err| {
+        ctx.task().spawnWith(.{ .ctx = task, .run = CommitTask.run, .failed = CommitTask.failed }) catch |err| {
             ctx.allocator().free(task.subject);
             if (task.body) |body| ctx.allocator().free(body);
             self.commit_panel.commit_error = .commit_failed;
@@ -1871,7 +1871,7 @@ pub const App = struct {
         };
         confirmation = .{ .repo_root = &.{}, .subject = &.{}, .body = null };
 
-        ctx.task().spawnWith(task, AmendTask.run) catch |err| {
+        ctx.task().spawnWith(.{ .ctx = task, .run = AmendTask.run, .failed = AmendTask.failed }) catch |err| {
             ctx.allocator().free(task.repo_root);
             ctx.allocator().free(task.subject);
             if (task.body) |body| ctx.allocator().free(body);
@@ -2001,7 +2001,7 @@ pub const App = struct {
 
         self.setStatus("pushing: {s} -> {s}/{s}", .{ task.branch, task.remote, task.remote_branch });
 
-        ctx.task().spawnWith(task, PushTask.run) catch |err| {
+        ctx.task().spawnWith(.{ .ctx = task, .run = PushTask.run, .failed = PushTask.failed }) catch |err| {
             ctx.allocator().free(task.repo_root);
             ctx.allocator().free(task.branch);
             ctx.allocator().free(task.remote);
@@ -3600,7 +3600,7 @@ pub const App = struct {
         };
         self.pending_repo_path_recent_source = recent_source;
 
-        ctx.task().spawnWith(task, RepoPathDiscoveryTask.run) catch |err| {
+        ctx.task().spawnWith(.{ .ctx = task, .run = RepoPathDiscoveryTask.run, .failed = RepoPathDiscoveryTask.failed }) catch |err| {
             _ = self.repo_picker.finishPathDiscovery(task.generation);
             self.pending_repo_path_recent_source = null;
             self.setStatus("could not start repo path discovery task", .{});

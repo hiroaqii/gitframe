@@ -1,4 +1,5 @@
 const std = @import("std");
+const chasen = @import("chasen");
 const git_backend = @import("../git/backend.zig");
 const git_ops = @import("git_ops.zig");
 
@@ -257,6 +258,24 @@ pub fn StageFileTask(comptime Msg: type) type {
                 .result = result,
             } });
         }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                allocator.free(task.repo_root);
+                if (task.path.len > 0) allocator.free(task.path);
+                allocator.destroy(task);
+            }
+
+            const path = task.path;
+            task.path = &.{};
+
+            return Msg.actionFinished(.{ .stage_file = StageFileFinished{
+                .pending = task.pending,
+                .path = path,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            } });
+        }
     };
 }
 
@@ -287,6 +306,24 @@ pub fn UnstageFileTask(comptime Msg: type) type {
                 .pending = task.pending,
                 .path = path,
                 .result = result,
+            } });
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                allocator.free(task.repo_root);
+                if (task.path.len > 0) allocator.free(task.path);
+                allocator.destroy(task);
+            }
+
+            const path = task.path;
+            task.path = &.{};
+
+            return Msg.actionFinished(.{ .unstage_file = UnstageFileFinished{
+                .pending = task.pending,
+                .path = path,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -329,6 +366,30 @@ pub fn StageHunkTask(comptime Msg: type) type {
                 .result = result,
             } });
         }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                if (task.path.len > 0) allocator.free(task.path);
+                allocator.free(task.patch);
+                allocator.destroy(task);
+            }
+
+            const repo_root = task.repo_root;
+            const path = task.path;
+            task.repo_root = &.{};
+            task.path = &.{};
+
+            return Msg.actionFinished(.{ .stage_hunk = StageHunkFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .path = path,
+                .hunk_index = task.hunk_index,
+                .mark_source = task.mark_source,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            } });
+        }
     };
 }
 
@@ -368,6 +429,31 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
                 .result = result,
             } });
         }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                if (task.path.len > 0) allocator.free(task.path);
+                allocator.free(task.patch);
+                allocator.destroy(task);
+            }
+
+            const repo_root = task.repo_root;
+            const path = task.path;
+            task.repo_root = &.{};
+            task.path = &.{};
+
+            return Msg.actionFinished(.{ .unstage_hunk = UnstageHunkFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .path = path,
+                .hunk_index = task.hunk_index,
+                .mark_source = task.mark_source,
+                .reload_after_success = task.reload_after_success,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            } });
+        }
     };
 }
 
@@ -400,6 +486,27 @@ pub fn DiscardFileTask(comptime Msg: type) type {
                 .repo_root = repo_root,
                 .path = path,
                 .result = result,
+            } });
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                allocator.free(task.repo_root);
+                if (task.path.len > 0) allocator.free(task.path);
+                allocator.destroy(task);
+            }
+
+            const repo_root = task.repo_root;
+            const path = task.path;
+            task.repo_root = &.{};
+            task.path = &.{};
+
+            return Msg.actionFinished(.{ .discard_file = DiscardFileFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .path = path,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -435,6 +542,25 @@ pub fn CommitTask(comptime Msg: type) type {
                 .result = result,
             } });
         }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                allocator.free(task.subject);
+                if (task.body) |body| allocator.free(body);
+                allocator.destroy(task);
+            }
+
+            const repo_root = task.repo_root;
+            task.repo_root = &.{};
+
+            return Msg.actionFinished(.{ .commit = CommitFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            } });
+        }
     };
 }
 
@@ -463,6 +589,25 @@ pub fn AmendTask(comptime Msg: type) type {
                 .pending = task.pending,
                 .repo_root = repo_root,
                 .result = result,
+            } });
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                allocator.free(task.subject);
+                if (task.body) |body| allocator.free(body);
+                allocator.destroy(task);
+            }
+
+            const repo_root = task.repo_root;
+            task.repo_root = &.{};
+
+            return Msg.actionFinished(.{ .amend = AmendFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -512,6 +657,42 @@ pub fn PushTask(comptime Msg: type) type {
                 .result = result,
             } });
         }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                if (task.branch.len > 0) allocator.free(task.branch);
+                if (task.remote.len > 0) allocator.free(task.remote);
+                if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
+                allocator.free(task.oid);
+                allocator.destroy(task);
+            }
+
+            const repo_root = task.repo_root;
+            const branch = task.branch;
+            const remote = task.remote;
+            const remote_branch = task.remote_branch;
+            task.repo_root = &.{};
+            task.branch = &.{};
+            task.remote = &.{};
+            task.remote_branch = &.{};
+
+            return Msg.actionFinished(.{ .push = PushFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .branch = branch,
+                .remote = remote,
+                .remote_branch = remote_branch,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            } });
+        }
+    };
+}
+
+fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
+    return switch (failure) {
+        .start_failed => |message| message,
     };
 }
 
@@ -686,4 +867,47 @@ test "ActionState tracks current pending action" {
     try std.testing.expect(!state.finish(first));
     try std.testing.expect(state.finish(second));
     try std.testing.expect(state.pending == null);
+}
+
+test "StageHunkTask failed preserves identity and transfers moved fields" {
+    const TestActionMsg = union(enum) {
+        stage_hunk: StageHunkFinished,
+    };
+    const TestMsg = union(enum) {
+        action: TestActionMsg,
+
+        pub fn actionFinished(msg: TestActionMsg) @This() {
+            return .{ .action = msg };
+        }
+    };
+    const Task = StageHunkTask(TestMsg);
+    const allocator = std.testing.allocator;
+
+    const task = try allocator.create(Task);
+    task.* = .{
+        .pending = .{ .generation = 7, .kind = .stage_hunk },
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .path = try allocator.dupe(u8, "src/main.zig"),
+        .patch = try allocator.dupe(u8, "patch"),
+        .hunk_index = 3,
+        .mark_source = .session,
+    };
+
+    const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
+    var finished = switch (msg) {
+        .action => |action| switch (action) {
+            .stage_hunk => |payload| payload,
+        },
+    };
+    defer finished.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 7), finished.pending.generation);
+    try std.testing.expectEqual(ActionKind.stage_hunk, finished.pending.kind);
+    try std.testing.expectEqual(@as(usize, 3), finished.hunk_index);
+    try std.testing.expectEqualStrings("/repo", finished.repo_root);
+    try std.testing.expectEqualStrings("src/main.zig", finished.path);
+    try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
+        .failed_static => |message| message,
+        else => return error.UnexpectedResult,
+    });
 }

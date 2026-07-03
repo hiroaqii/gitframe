@@ -1,4 +1,5 @@
 const std = @import("std");
+const chasen = @import("chasen");
 const diff_parser = @import("../diff/parser.zig");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
 const diff_source = @import("../diff/source.zig");
@@ -185,6 +186,16 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
                 .result = runDiscovery(allocator, io),
             } });
         }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+
+            return Msg.loadFinished(.{ .repos_discovered = RepoDiscoveryFinished{
+                .generation = task.generation,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            } });
+        }
     };
 }
 
@@ -214,6 +225,20 @@ pub fn RepoPathDiscoveryTask(comptime Msg: type) type {
                 .generation = task.generation,
                 .submitted_path = submitted_path,
                 .result = runPathDiscovery(submitted_path, allocator, io),
+            } });
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+
+            const submitted_path = task.path;
+            task.path = &.{};
+
+            return Msg.loadFinished(.{ .repo_path_discovered = RepoPathDiscoveryFinished{
+                .generation = task.generation,
+                .submitted_path = submitted_path,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -253,6 +278,19 @@ pub fn DiffLoadTask(comptime Msg: type) type {
                 .result = runLoad(task.request, allocator, io),
             } });
         }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                diff_source.freeLoadRequest(allocator, task.request);
+                allocator.destroy(task);
+            }
+
+            return Msg.loadFinished(.{ .diff_loaded = DiffLoadFinished{
+                .generation = task.generation,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            } });
+        }
     };
 }
 
@@ -269,6 +307,20 @@ pub fn StatusLoadTask(comptime Msg: type) type {
                 .generation = task.generation,
                 .repo_root = task.repo_root,
                 .result = runStatusLoad(task.repo_root, allocator, io),
+            };
+            task.repo_root = &.{};
+
+            return Msg.loadFinished(.{ .status_loaded = result });
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+
+            const result = StatusLoadFinished{
+                .generation = task.generation,
+                .repo_root = task.repo_root,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
             };
             task.repo_root = &.{};
 
@@ -295,6 +347,20 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
 
             return Msg.loadFinished(.{ .branch_status_loaded = result });
         }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+
+            const result = BranchStatusLoadFinished{
+                .generation = task.generation,
+                .repo_root = task.repo_root,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            };
+            task.repo_root = &.{};
+
+            return Msg.loadFinished(.{ .branch_status_loaded = result });
+        }
     };
 }
 
@@ -314,6 +380,25 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
                 .result = runReviewProjectionLoad(request, allocator, io),
             } });
         }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+
+            const request = task.request;
+            task.request = undefined;
+
+            return Msg.loadFinished(.{ .review_projection_loaded = ReviewProjectionFinished{
+                .request = request,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            } });
+        }
+    };
+}
+
+fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
+    return switch (failure) {
+        .start_failed => |message| message,
     };
 }
 
@@ -591,4 +676,122 @@ test "readRepoFile rejects symlink components" {
 
     try std.testing.expectError(error.InvalidPath, readRepoFile(std.testing.allocator, io, repo_root, "linked.txt"));
     try std.testing.expectError(error.InvalidPath, readRepoFile(std.testing.allocator, io, repo_root, "linked-dir/inside.txt"));
+}
+
+test "StatusLoadTask failed preserves generation and moves repo root" {
+    const TestLoadMsg = union(enum) {
+        status_loaded: StatusLoadFinished,
+    };
+    const TestMsg = union(enum) {
+        load: TestLoadMsg,
+
+        pub fn loadFinished(msg: TestLoadMsg) @This() {
+            return .{ .load = msg };
+        }
+    };
+    const Task = StatusLoadTask(TestMsg);
+    const allocator = std.testing.allocator;
+
+    const task = try allocator.create(Task);
+    task.* = .{
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .generation = 42,
+    };
+
+    const msg = Task.failed(task, .{ .start_failed = "SystemResources" }, allocator);
+    var finished = switch (msg) {
+        .load => |load| switch (load) {
+            .status_loaded => |payload| payload,
+        },
+    };
+    defer finished.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 42), finished.generation);
+    try std.testing.expectEqualStrings("/repo", finished.repo_root);
+    try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
+        .failed_static => |message| message,
+        else => return error.UnexpectedResult,
+    });
+}
+
+test "DiffLoadTask failed frees request and preserves generation" {
+    const TestLoadMsg = union(enum) {
+        diff_loaded: DiffLoadFinished,
+    };
+    const TestMsg = union(enum) {
+        load: TestLoadMsg,
+
+        pub fn loadFinished(msg: TestLoadMsg) @This() {
+            return .{ .load = msg };
+        }
+    };
+    const Task = DiffLoadTask(TestMsg);
+    const allocator = std.testing.allocator;
+
+    const task = try allocator.create(Task);
+    task.* = .{
+        .request = .{
+            .source = .{ .range = try allocator.dupe(u8, "HEAD~1..HEAD") },
+            .repo_root = try allocator.dupe(u8, "/repo"),
+        },
+        .generation = 9,
+    };
+
+    const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
+    var finished = switch (msg) {
+        .load => |load| switch (load) {
+            .diff_loaded => |payload| payload,
+        },
+    };
+    defer finished.result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 9), finished.generation);
+    try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
+        .failed_static => |message| message,
+        else => return error.UnexpectedResult,
+    });
+}
+
+test "ReviewProjectionTask failed preserves request identity" {
+    const TestLoadMsg = union(enum) {
+        review_projection_loaded: ReviewProjectionFinished,
+    };
+    const TestMsg = union(enum) {
+        load: TestLoadMsg,
+
+        pub fn loadFinished(msg: TestLoadMsg) @This() {
+            return .{ .load = msg };
+        }
+    };
+    const Task = ReviewProjectionTask(TestMsg);
+    const allocator = std.testing.allocator;
+
+    const task = try allocator.create(Task);
+    task.* = .{ .request = .{
+        .id = 11,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .path_key = try allocator.dupe(u8, "src/main.zig"),
+        .kind = .cached_diff,
+        .source_kind = .unstaged,
+        .load_generation = 2,
+        .status_generation = 3,
+    } };
+
+    const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
+    var finished = switch (msg) {
+        .load => |load| switch (load) {
+            .review_projection_loaded => |payload| payload,
+        },
+    };
+    defer finished.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 11), finished.request.id);
+    try std.testing.expectEqual(@as(u64, 2), finished.request.load_generation);
+    try std.testing.expectEqual(@as(u64, 3), finished.request.status_generation);
+    try std.testing.expectEqualStrings("/repo", finished.request.repo_root);
+    try std.testing.expectEqualStrings("src/main.zig", finished.request.path_key);
+    try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
+        .failed_static => |message| message,
+        else => return error.UnexpectedResult,
+    });
 }

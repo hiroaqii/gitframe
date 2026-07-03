@@ -25,7 +25,7 @@ pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
     task.path = try ctx.allocator().dupe(u8, target.path);
 
-    try ctx.task().spawnWith(task, Task.run);
+    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
 pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: git_ops.UnstageTarget) !void {
@@ -44,7 +44,7 @@ pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
     task.path = try ctx.allocator().dupe(u8, target.path);
 
-    try ctx.task().spawnWith(task, Task.run);
+    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
 pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, repo_root: []const u8, path: []const u8) !void {
@@ -63,7 +63,7 @@ pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
     task.repo_root = try ctx.allocator().dupe(u8, repo_root);
     task.path = try ctx.allocator().dupe(u8, path);
 
-    try ctx.task().spawnWith(task, Task.run);
+    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
 fn destroyFileTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
