@@ -2317,6 +2317,11 @@ pub const App = struct {
     }
 
     fn openSelectedFileInEditor(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.actions.pending != null) {
+            self.setStatus("finish current git action before opening editor", .{});
+            return;
+        }
+
         const target = switch (self.selectedEditorTarget()) {
             .ready => |target| target,
             .unavailable_source, .no_repo => {
@@ -6097,6 +6102,23 @@ test "confirmPush keeps confirmation when another action is pending" {
     try std.testing.expect(app.overlay.isPushBranch());
     try std.testing.expect(app.actions.pending != null);
     try std.testing.expectEqualStrings("another git action is running", app.status.text());
+}
+
+test "openSelectedFileInEditor blocks while git action is pending" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+    };
+    app.actions.pending = .{ .generation = 7, .kind = .stage_file };
+    defer app.actions.clear();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.openSelectedFileInEditor(&ctx);
+
+    try std.testing.expectEqualStrings("finish current git action before opening editor", app.status.text());
+    try std.testing.expectEqual(@as(u8, 0), ctx.pending_foreground_commands_len);
+    const pending = app.actions.pending orelse return error.ExpectedPendingAction;
+    try std.testing.expectEqual(@as(u64, 7), pending.generation);
+    try std.testing.expectEqual(app_actions.ActionKind.stage_file, pending.kind);
 }
 
 test "finishPush does not reload a stale active repository" {
