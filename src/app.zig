@@ -199,6 +199,47 @@ const ViewerState = struct {
     view_options: ViewOptions = .{},
 };
 
+const ReloadKind = enum {
+    initial,
+    manual,
+    watch,
+    action_result,
+    repo_switch,
+};
+
+const DiffLoadStartOptions = struct {
+    clear_visible_state: bool,
+    kind: ReloadKind,
+};
+
+const ReloadAnchor = struct {
+    path_key: []u8,
+    selected_target_tag: std.meta.Tag(context.SelectedTarget),
+    visible_sidebar_row: usize,
+    diff_cursor: diff_view_model.BodyCoordinate,
+    diff_cursor_offset: ?usize,
+    diff_scroll: usize,
+    diff_horizontal_scroll: usize,
+    sidebar_horizontal_scroll: usize,
+    search_coordinate: ?diff_view_model.BodyCoordinate,
+
+    fn deinit(self: *ReloadAnchor, allocator: std.mem.Allocator) void {
+        allocator.free(self.path_key);
+        self.* = undefined;
+    }
+};
+
+const PendingReload = struct {
+    generation: u64,
+    kind: ReloadKind,
+    anchor: ?ReloadAnchor = null,
+
+    fn deinit(self: *PendingReload, allocator: std.mem.Allocator) void {
+        if (self.anchor) |*anchor| anchor.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const ViewOptions = struct {
     line_numbers: bool = true,
 
@@ -265,6 +306,7 @@ pub const App = struct {
     git_status: git_status.GitStatusState = .{},
     status_load_generation: u64 = 0,
     status_load_pending: ?u64 = null,
+    pending_reload: ?PendingReload = null,
     branch_status: git_branch_status.State = .{},
     branch_status_load_generation: u64 = 0,
     branch_status_load_pending: ?u64 = null,
@@ -421,7 +463,7 @@ pub const App = struct {
         if (diff_source.sourceRequiresRepo(self.config.source)) {
             try self.startRepoDiscovery(ctx);
         } else {
-            try self.startDiffLoad(ctx);
+            try self.startDiffLoad(ctx, .initial);
         }
     }
 
@@ -447,6 +489,7 @@ pub const App = struct {
         self.tree_order.deinit(deinit_ctx.allocator);
         if (self.tree_order_scope) |scope| deinit_ctx.allocator.free(scope);
         if (self.pending_selection_restore) |*restore| restore.deinit(deinit_ctx.allocator);
+        self.clearPendingReload(deinit_ctx.allocator);
     }
 
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
@@ -641,7 +684,7 @@ pub const App = struct {
                 } else if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
                     try self.startRepoDiscovery(ctx);
                 } else {
-                    try self.startDiffLoad(ctx);
+                    try self.startDiffLoad(ctx, .manual);
                 }
             },
             .auto_reload_tick => try self.autoReloadTick(ctx),
@@ -882,6 +925,7 @@ pub const App = struct {
 
         const generation = self.load.beginRepoDiscovery();
         task.* = .{ .generation = generation };
+        self.clearPendingReload(ctx.allocator());
         self.clearLoadedDiff();
         self.load.state = .loading;
         ctx.task().spawnWith(.{ .ctx = task, .run = RepoDiscoveryTask.run, .failed = RepoDiscoveryTask.failed }) catch |err| {
@@ -912,7 +956,7 @@ pub const App = struct {
                     return;
                 }
 
-                try self.startDiffLoad(ctx);
+                try self.startDiffLoad(ctx, .initial);
             },
             .failed => |message| {
                 try self.storeFailedMessage(ctx.allocator(), git_ops.trimGitOutput(message));
@@ -923,7 +967,7 @@ pub const App = struct {
         }
     }
 
-    fn startDiffLoad(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+    fn startDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), kind: ReloadKind) !void {
         const repo_root = self.repoRootForCurrentSource() catch |err| {
             self.load.replaceEmpty(ctx.allocator(), switch (err) {
                 error.MissingRepoRoot => .no_repository,
@@ -931,15 +975,15 @@ pub const App = struct {
             return;
         };
 
-        try self.startDiffLoadWithRepoRoot(ctx, repo_root, true);
+        try self.startDiffLoadWithRepoRoot(ctx, repo_root, .{ .clear_visible_state = true, .kind = kind });
     }
 
-    fn startDiffLoadWithRepoRoot(self: *App, ctx: *chasen.Ctx(Msg), repo_root: ?[]const u8, clear_visible_state: bool) !void {
+    fn startDiffLoadWithRepoRoot(self: *App, ctx: *chasen.Ctx(Msg), repo_root: ?[]const u8, options: DiffLoadStartOptions) !void {
         if (repo_root) |root| {
             self.startStatusLoad(ctx, root);
             self.startBranchStatusLoad(ctx, root);
         } else {
-            self.invalidateStatusSnapshot();
+            self.dropStatusSnapshot();
             self.invalidateBranchStatusSnapshot();
         }
 
@@ -953,6 +997,8 @@ pub const App = struct {
         errdefer diff_source.freeLoadRequest(ctx.allocator(), request);
 
         const generation = self.load.beginDiffLoad();
+        errdefer _ = self.load.clearPendingIfCurrent(.{ .diff_load = generation });
+        try self.beginPendingReload(ctx.allocator(), generation, options.kind);
         task.* = .{
             // Source payloads come from process args, so clone the request
             // before the async task crosses the update boundary.
@@ -960,19 +1006,28 @@ pub const App = struct {
             .generation = generation,
         };
 
-        if (clear_visible_state) {
+        if (options.clear_visible_state) {
             self.clearLoadedDiff();
             self.load.state = .loading;
         }
         ctx.task().spawnWith(.{ .ctx = task, .run = DiffLoadTask.run, .failed = DiffLoadTask.failed }) catch |err| {
             _ = self.load.clearPendingIfCurrent(.{ .diff_load = generation });
+            self.clearPendingReloadIfGeneration(ctx.allocator(), generation);
             try self.storeFailedMessage(ctx.allocator(), "Could not start diff load task");
             return err;
         };
     }
 
     fn startStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), repo_root: []const u8) void {
-        self.invalidateStatusSnapshot();
+        if (self.git_status.repo_root) |current_root| {
+            if (std.mem.eql(u8, current_root, repo_root)) {
+                self.invalidateStatusSnapshot();
+            } else {
+                self.dropStatusSnapshot();
+            }
+        } else {
+            self.dropStatusSnapshot();
+        }
 
         const task = ctx.allocator().create(StatusLoadTask) catch {
             self.clearPendingSelectionRestore(ctx.allocator());
@@ -1039,6 +1094,10 @@ pub const App = struct {
         self.status_load_generation +%= 1;
         self.status_load_pending = null;
         self.pending_initial_first_visible_selection = false;
+    }
+
+    fn dropStatusSnapshot(self: *App) void {
+        self.invalidateStatusSnapshot();
         self.git_status.clear();
     }
 
@@ -1046,6 +1105,56 @@ pub const App = struct {
         self.branch_status_load_generation +%= 1;
         self.branch_status_load_pending = null;
         self.branch_status.clear();
+    }
+
+    fn beginPendingReload(self: *App, allocator: std.mem.Allocator, generation: u64, kind: ReloadKind) !void {
+        self.clearPendingReload(allocator);
+        const anchor = switch (kind) {
+            .manual, .watch => try self.captureReloadAnchor(allocator),
+            .initial, .action_result, .repo_switch => null,
+        };
+        errdefer if (anchor) |*captured| captured.deinit(allocator);
+        self.pending_reload = .{
+            .generation = generation,
+            .kind = kind,
+            .anchor = anchor,
+        };
+    }
+
+    fn captureReloadAnchor(self: *const App, allocator: std.mem.Allocator) !?ReloadAnchor {
+        const loaded = self.activeLoadedDiffConst() orelse return null;
+        const path_key = self.selectedStagePathKey() orelse return null;
+        const selected_target = self.viewer.selected_target orelse return null;
+
+        const visible_row = loaded.visibleRowOfNode(self.viewer.selected_node) orelse 0;
+        return .{
+            .path_key = try allocator.dupe(u8, path_key),
+            .selected_target_tag = std.meta.activeTag(selected_target),
+            .visible_sidebar_row = visible_row,
+            .diff_cursor = self.viewer.diff_cursor,
+            .diff_cursor_offset = self.selectedDiffCursorOffset(),
+            .diff_scroll = self.viewer.diff_scroll,
+            .diff_horizontal_scroll = self.viewer.diff_horizontal_scroll,
+            .sidebar_horizontal_scroll = self.viewer.sidebar_horizontal_scroll,
+            .search_coordinate = if (self.search.match) |match| match.coordinate else null,
+        };
+    }
+
+    fn takePendingReloadIfGeneration(self: *App, generation: u64) ?PendingReload {
+        const pending = self.pending_reload orelse return null;
+        if (pending.generation != generation) return null;
+        self.pending_reload = null;
+        return pending;
+    }
+
+    fn clearPendingReloadIfGeneration(self: *App, allocator: std.mem.Allocator, generation: u64) void {
+        var pending = self.takePendingReloadIfGeneration(generation) orelse return;
+        pending.deinit(allocator);
+    }
+
+    fn clearPendingReload(self: *App, allocator: std.mem.Allocator) void {
+        if (self.pending_reload) |*pending| pending.deinit(allocator);
+        self.pending_reload = null;
     }
 
     fn ensureReviewProjection(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -2208,7 +2317,7 @@ pub const App = struct {
                     } else {
                         self.setStatus("committed", .{});
                     }
-                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, false);
+                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
                 } else {
                     if (reviewed_clear_failed) {
                         self.setStatus("committed: {s}; could not clear reviewed marks", .{result.repo_root});
@@ -2248,7 +2357,7 @@ pub const App = struct {
                     } else {
                         self.setStatus("amended", .{});
                     }
-                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, false);
+                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
                 } else {
                     if (reviewed_clear_failed) {
                         self.setStatus("amended: {s}; could not clear reviewed marks", .{result.repo_root});
@@ -2281,7 +2390,7 @@ pub const App = struct {
             .ok => {
                 if (active_matches) {
                     self.setStatus("pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
-                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, false);
+                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
                 } else {
                     self.setStatus("pushed: {s}", .{result.repo_root});
                 }
@@ -2313,7 +2422,7 @@ pub const App = struct {
         try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
             ctx.redraw().skip();
             return;
-        }, false);
+        }, .{ .clear_visible_state = false, .kind = .action_result });
     }
 
     fn openSelectedFileInEditor(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -2481,7 +2590,7 @@ pub const App = struct {
             try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
                 ctx.redraw().skip();
                 return;
-            }, self.load.state == .idle);
+            }, .{ .clear_visible_state = self.load.state == .idle, .kind = .action_result });
         }
     }
 
@@ -2602,7 +2711,7 @@ pub const App = struct {
             try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
                 ctx.redraw().skip();
                 return;
-            }, self.load.state == .idle);
+            }, .{ .clear_visible_state = self.load.state == .idle, .kind = .watch });
         }
     }
 
@@ -2630,19 +2739,37 @@ pub const App = struct {
         // allowed to update visible state.
         _ = self.load.finishPending(.{ .diff_load = finished.generation });
         if (!self.load.isCurrent(finished.generation)) return;
+        var pending_reload = self.takePendingReloadIfGeneration(finished.generation);
+        defer if (pending_reload) |*pending| pending.deinit(ctx.allocator());
 
         // Capture this before clearLoadedDiff(): the previous loaded session is
         // what distinguishes first load from reload/restore paths.
         const had_loaded_before = self.activeLoadedDiffConst() != null;
         const had_pending_restore = self.pending_selection_restore != null;
-        self.clearLoadedDiff();
 
         switch (result) {
             .empty => {
+                self.clearLoadedDiff();
                 self.load.replaceEmpty(ctx.allocator(), .no_changes);
                 can_project_status = true;
             },
             .loaded => |*bundle| {
+                if (pending_reload) |*pending| {
+                    if (pending.kind == .watch) {
+                        if (self.activeLoadedDiffConst()) |current_loaded| {
+                            if (std.mem.eql(u8, current_loaded.text, bundle.loaded.text)) {
+                                const prefer_first_visible_file = !had_loaded_before and !had_pending_restore;
+                                if (prefer_first_visible_file and self.status_load_pending != null) {
+                                    self.pending_initial_first_visible_selection = true;
+                                }
+                                try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                self.clearLoadedDiff();
                 var loaded = bundle.loaded;
                 var arena = bundle.takeArena();
                 errdefer arena.deinit();
@@ -2664,24 +2791,35 @@ pub const App = struct {
                 });
 
                 const active_loaded = self.activeLoadedDiff().?;
-                if (!had_loaded_before and !had_pending_restore) {
-                    self.selectFirstVisibleFile(active_loaded);
+                const restored_from_anchor = if (pending_reload) |*pending|
+                    if (pending.anchor) |*anchor| self.restoreReloadAnchor(active_loaded, anchor) else false
+                else
+                    false;
+                if (restored_from_anchor) {
+                    self.clampSelection(active_loaded.document.files.len);
+                    self.clampDiffNavigation();
                 } else {
-                    self.syncSidebarNodeToSelectedFile(active_loaded);
+                    if (!had_loaded_before and !had_pending_restore) {
+                        self.selectFirstVisibleFile(active_loaded);
+                    } else {
+                        self.syncSidebarNodeToSelectedFile(active_loaded);
+                    }
+                    self.clampSelection(active_loaded.document.files.len);
+                    if (self.review_display.hide_reviewed_files) {
+                        self.reconcileSelectionAfterVisibleNodeChange(active_loaded);
+                    }
+                    self.clampDiffNavigation();
+                    self.refreshSearchForSelectedFile();
                 }
-                self.clampSelection(active_loaded.document.files.len);
-                if (self.review_display.hide_reviewed_files) {
-                    self.reconcileSelectionAfterVisibleNodeChange(active_loaded);
-                }
-                self.clampDiffNavigation();
-                self.refreshSearchForSelectedFile();
                 can_project_status = true;
             },
             .failed => |message| {
+                self.clearLoadedDiff();
                 self.clearPendingSelectionRestore(ctx.allocator());
                 try self.storeFailedMessage(ctx.allocator(), git_ops.trimGitOutput(message));
             },
             .failed_static => |message| {
+                self.clearLoadedDiff();
                 self.clearPendingSelectionRestore(ctx.allocator());
                 try self.storeFailedMessage(ctx.allocator(), message);
             },
@@ -2712,6 +2850,7 @@ pub const App = struct {
                 try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
             },
             .loaded => |*bundle| {
+                if (self.canSkipStatusSnapshotReplace(result.repo_root, bundle.document)) return;
                 try self.git_status.replace(result.repo_root, bundle);
                 result.result = .empty;
                 const prefer_first_visible_file = self.pending_initial_first_visible_selection;
@@ -2731,6 +2870,33 @@ pub const App = struct {
                 self.setStatus("status load failed: {s}", .{message});
             },
         }
+    }
+
+    fn canSkipStatusSnapshotReplace(self: *const App, repo_root: []const u8, document: git_status.StatusDocument) bool {
+        if (self.pending_selection_restore != null) return false;
+        if (self.pending_initial_first_visible_selection) return false;
+        const current_root = self.git_status.repo_root orelse return false;
+        if (!std.mem.eql(u8, current_root, repo_root)) return false;
+        return statusDocumentsEqual(self.git_status.document, document);
+    }
+
+    fn statusDocumentsEqual(a: git_status.StatusDocument, b: git_status.StatusDocument) bool {
+        if (a.entries.len != b.entries.len) return false;
+        for (a.entries, b.entries) |left, right| {
+            if (!statusEntriesEqual(left, right)) return false;
+        }
+        return true;
+    }
+
+    fn statusEntriesEqual(a: git_status.StatusEntry, b: git_status.StatusEntry) bool {
+        if (a.raw[0] != b.raw[0] or a.raw[1] != b.raw[1]) return false;
+        if (!std.mem.eql(u8, a.path, b.path)) return false;
+        return optionalStringsEqual(a.old_path, b.old_path);
+    }
+
+    fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return std.mem.eql(u8, a.?, b.?);
     }
 
     fn finishBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: BranchStatusLoadFinished) void {
@@ -2854,6 +3020,7 @@ pub const App = struct {
 
     fn rebuildLoadedTreeWithStatus(self: *App, app_allocator: std.mem.Allocator, loaded: *LoadedDiff, prefer_first_visible_file: bool) !void {
         const allocator = self.loadArenaAllocator() orelse return;
+        const previous_path_key = self.selectedStagePathKey();
         try self.ensureTreeOrderScope(app_allocator);
         loaded.tree = try file_tree.buildWithStatusStable(allocator, loaded.document, self.git_status.document, self.stableOrderOptions(app_allocator));
         try loaded.rebuildVisibleNodes(allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
@@ -2864,6 +3031,12 @@ pub const App = struct {
         if (prefer_first_visible_file) {
             self.selectFirstVisibleFile(loaded);
         } else if (!self.restorePendingSelectionOrFallback(app_allocator, loaded)) {
+            if (previous_path_key) |path_key| {
+                if (findNodeByPathKey(loaded, path_key)) |node_index| {
+                    self.selectSidebarNode(loaded, node_index);
+                    return;
+                }
+            }
             self.reconcileSelectionAfterVisibleNodeChange(loaded);
         }
     }
@@ -3436,7 +3609,7 @@ pub const App = struct {
                 self.persistRecentRepositories(ctx);
                 if (repo_index == self.repo_state.active_index) return;
 
-                try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root, true);
+                try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root, .{ .clear_visible_state = true, .kind = .repo_switch });
                 self.repo_state.active_index = repo_index;
                 self.resetViewAfterRepoSwitch();
             },
@@ -3570,6 +3743,7 @@ pub const App = struct {
         self.pending_repo_path_recent_source = null;
         self.clearRepoPickerItems(allocator);
         self.clearPendingSelectionRestore(allocator);
+        self.clearPendingReload(allocator);
     }
 
     fn resetViewAfterRepoSwitch(self: *App) void {
@@ -3700,7 +3874,7 @@ pub const App = struct {
                 self.repo_state.replace(ctx.allocator(), owned_discovery);
                 owned_discovery = .{ .none = .{ .current_root = "" } };
                 self.repo_state.active_index = 0;
-                try self.startDiffLoad(ctx);
+                try self.startDiffLoad(ctx, .repo_switch);
                 self.resetViewAfterRepoSwitch();
             },
             .workspace => |workspace| {
@@ -3743,7 +3917,7 @@ pub const App = struct {
         self.repo_state.replace(ctx.allocator(), discovery);
         discovery = .{ .none = .{ .current_root = "" } };
         self.repo_state.active_index = repo_index;
-        try self.startDiffLoad(ctx);
+        try self.startDiffLoad(ctx, .repo_switch);
         self.resetViewAfterRepoSwitch();
     }
 
@@ -4137,6 +4311,77 @@ pub const App = struct {
             return true;
         }
         return false;
+    }
+
+    fn restoreReloadAnchor(self: *App, loaded: *LoadedDiff, anchor: *const ReloadAnchor) bool {
+        const selected_same_path = if (findNodeByPathKey(loaded, anchor.path_key)) |node_index| blk: {
+            self.selectSidebarNode(loaded, node_index);
+            break :blk true;
+        } else blk: {
+            if (loaded.visibleNodeCount() == 0) {
+                self.viewer.selected_target = null;
+                self.viewer.selected_node = 0;
+                self.resetDiffPosition();
+                self.clearSearchMatch();
+                return true;
+            }
+            const row = @min(anchor.visible_sidebar_row, loaded.visibleNodeCount() - 1);
+            if (nearestVisibleFileNode(loaded, row)) |node_index| {
+                self.selectSidebarNode(loaded, node_index);
+                break :blk false;
+            }
+            return false;
+        };
+
+        self.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
+        self.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
+
+        if (selected_same_path and std.meta.activeTag(self.viewer.selected_target.?) == anchor.selected_target_tag) {
+            self.viewer.diff_cursor = anchor.diff_cursor;
+            if (self.selectedDiffCursorOffset() == null) {
+                if (anchor.diff_cursor_offset) |offset| {
+                    self.viewer.diff_cursor = self.selectedCoordinateAtOffset(offset) orelse self.viewer.diff_cursor;
+                }
+            }
+        } else if (anchor.diff_cursor_offset) |offset| {
+            self.viewer.diff_cursor = self.selectedCoordinateAtOffset(offset) orelse self.viewer.diff_cursor;
+        }
+
+        if (self.selectedDiffCursorOffset() == null) {
+            self.initializeDiffCursorForSelectedFile();
+        }
+
+        self.viewer.diff_scroll = anchor.diff_scroll;
+        self.clampDiffNavigation();
+        self.keepDiffCursorVisible();
+        self.restoreSearchFromReloadAnchor(anchor);
+        self.clampSidebarHorizontalScroll();
+        self.clampDiffHorizontalScrollToVisibleRows();
+        return true;
+    }
+
+    fn keepDiffCursorVisible(self: *App) void {
+        const offset = self.selectedDiffCursorOffset() orelse return;
+        const visible_rows = self.diffVisibleRows();
+        if (offset < self.viewer.diff_scroll) {
+            self.viewer.diff_scroll = offset;
+        } else if (visible_rows > 0 and offset >= self.viewer.diff_scroll + visible_rows) {
+            self.viewer.diff_scroll = offset + 1 - visible_rows;
+        }
+        self.clampDiffNavigation();
+    }
+
+    fn restoreSearchFromReloadAnchor(self: *App, anchor: *const ReloadAnchor) void {
+        self.clearSearchMatch();
+        if (self.search.query.len == 0) return;
+
+        if (anchor.search_coordinate) |coordinate| {
+            self.search.match = .{ .coordinate = coordinate };
+            self.updateSearchMatchOffset();
+            if (self.search.match != null) return;
+        }
+
+        self.refreshSearchForSelectedFile();
     }
 
     fn findNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
@@ -8947,6 +9192,106 @@ test "finishDiffLoad keeps initial visible selection intent for later status pro
     try std.testing.expectEqual(expected_target, app.viewer.selected_target.?);
 }
 
+test "status projection rebuild keeps selected node on same path key" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 1 },
+            .selected_file = 1,
+            .selected_node = 1,
+        },
+        .status_load_generation = 1,
+        .status_load_pending = 1,
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    const before_path = app.selectedStagePathKey() orelse return error.ExpectedSelectedPath;
+    try std.testing.expectEqualStrings("b", before_path);
+
+    const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = status_bundle },
+    });
+
+    const after_path = app.selectedStagePathKey() orelse return error.ExpectedSelectedPath;
+    try std.testing.expectEqualStrings("b", after_path);
+}
+
+test "status load skips identical snapshot without rebuilding active tree" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+        .status_load_generation = 1,
+        .status_load_pending = 1,
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
+    try app.git_status.replace("/repo", &current);
+    const tree_ptr = app.activeLoadedDiffConst().?.tree.nodes.ptr;
+
+    const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = same },
+    });
+
+    try std.testing.expectEqual(tree_ptr, app.activeLoadedDiffConst().?.tree.nodes.ptr);
+}
+
+test "status refresh path skips identical snapshot without rebuilding active tree" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
+    try app.git_status.replace("/repo", &current);
+    const tree_ptr = app.activeLoadedDiffConst().?.tree.nodes.ptr;
+
+    app.startStatusLoad(&ctx, "/repo");
+    try std.testing.expect(app.git_status.repo_root != null);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskWithSlice().len);
+    clearPendingStatusTasks(&ctx, std.testing.allocator);
+
+    const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = app.status_load_generation,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = same },
+    });
+
+    try std.testing.expectEqual(tree_ptr, app.activeLoadedDiffConst().?.tree.nodes.ptr);
+}
+
+test "status refresh drops snapshot when repo root changes" {
+    var app: App = .{};
+    defer app.git_status.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? old.zig\x00");
+    try app.git_status.replace("/old", &current);
+
+    app.startStatusLoad(&ctx, "/new");
+    defer clearPendingStatusTasks(&ctx, std.testing.allocator);
+
+    try std.testing.expect(app.git_status.repo_root == null);
+    try std.testing.expectEqual(@as(usize, 0), app.git_status.document.entries.len);
+}
+
 test "finishDiffLoad frees stale loaded bundle" {
     var app: App = .{ .load = .{ .generation = 2 } };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -8958,6 +9303,262 @@ test "finishDiffLoad frees stale loaded bundle" {
     });
 
     try std.testing.expect(app.load.state == .idle);
+}
+
+test "stale diff result does not clear newer pending reload metadata" {
+    var app: App = .{ .load = .{ .generation = 2 } };
+    defer app.clearPendingReload(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    app.pending_reload = .{
+        .generation = 2,
+        .kind = .watch,
+        .anchor = .{
+            .path_key = try std.testing.allocator.dupe(u8, "a"),
+            .selected_target_tag = .diff_file,
+            .visible_sidebar_row = 0,
+            .diff_cursor = .{ .hunk_header = 0 },
+            .diff_cursor_offset = 0,
+            .diff_scroll = 0,
+            .diff_horizontal_scroll = 0,
+            .sidebar_horizontal_scroll = 0,
+            .search_coordinate = null,
+        },
+    };
+
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 1,
+        .result = .{ .loaded = bundle },
+    });
+
+    try std.testing.expect(app.pending_reload != null);
+    try std.testing.expectEqual(@as(u64, 2), app.pending_reload.?.generation);
+}
+
+test "watch no-op diff load preserves session view state and staged hunk marks" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = app_test_support.diff_one;
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .selected_file = 0,
+            .selected_node = 0,
+            .diff_cursor = .{ .hunk_header = 1 },
+            .diff_scroll = 3,
+            .diff_horizontal_scroll = 4,
+            .sidebar_horizontal_scroll = 2,
+        },
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.staged_hunks.deinit(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    app.load.generation = 2;
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .loaded = bundle },
+    });
+
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 1 }, app.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 3), app.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 4), app.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 2), app.viewer.sidebar_horizontal_scroll);
+    try std.testing.expect(app.staged_hunks.contains("/repo", "a", 0));
+    try std.testing.expect(app.pending_reload == null);
+}
+
+test "anchored reload keeps cursor when search query is present" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = "old";
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .selected_file = 0,
+            .selected_node = 0,
+            .diff_cursor = .{ .hunk_header = 1 },
+            .diff_scroll = 2,
+        },
+    };
+    defer app.clearLoadedDiff();
+    defer app.clearPendingReload(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    setDiffSearchQuery(&app, "new");
+    app.search.match = .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } };
+    app.search.match_offset = 4;
+    app.load.generation = 2;
+    try app.beginPendingReload(std.testing.allocator, 2, .manual);
+
+    var changed = app_test_support.loadedDiffOne();
+    changed.text = "changed";
+    const bundle = app_load.LoadedDiffBundle{
+        .arena = .init(std.testing.allocator),
+        .loaded = changed,
+    };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .loaded = bundle },
+    });
+
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 1 }, app.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 2), app.viewer.diff_scroll);
+    try std.testing.expect(app.search.match != null);
+}
+
+test "manual reload restores anchor after visible state is cleared" {
+    var current = app_test_support.loadedDiffTwo();
+    current.text = "old";
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 1 },
+            .selected_file = 1,
+            .selected_node = 1,
+            .diff_cursor = .{ .metadata = 0 },
+            .diff_scroll = 2,
+        },
+    };
+    defer app.clearLoadedDiff();
+    defer app.clearPendingReload(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    app.load.generation = 2;
+    try app.beginPendingReload(std.testing.allocator, 2, .manual);
+    app.clearLoadedDiff();
+    app.load.state = .loading;
+
+    var changed = app_test_support.loadedDiffTwo();
+    changed.text = "changed";
+    const bundle = app_load.LoadedDiffBundle{
+        .arena = .init(std.testing.allocator),
+        .loaded = changed,
+    };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .loaded = bundle },
+    });
+
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, app.viewer.diff_cursor);
+}
+
+test "watch no-op preserves selected path when status finishes before diff" {
+    var current = app_test_support.loadedDiffTwo();
+    current.text = app_test_support.diff_one;
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 1 },
+            .selected_file = 1,
+            .selected_node = 1,
+        },
+        .status_load_generation = 1,
+        .status_load_pending = 1,
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.clearPendingReload(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = status_bundle },
+    });
+
+    app.load.generation = 2;
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .loaded = bundle },
+    });
+
+    const selected_path = app.selectedStagePathKey() orelse return error.ExpectedSelectedPath;
+    try std.testing.expectEqualStrings("b", selected_path);
+}
+
+test "watch no-op preserves selected path when status finishes after diff" {
+    var current = app_test_support.loadedDiffTwo();
+    current.text = app_test_support.diff_one;
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 1 },
+            .selected_file = 1,
+            .selected_node = 1,
+        },
+        .status_load_generation = 1,
+        .status_load_pending = 1,
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.clearPendingReload(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    app.load.generation = 2;
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .loaded = bundle },
+    });
+
+    const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = status_bundle },
+    });
+
+    const selected_path = app.selectedStagePathKey() orelse return error.ExpectedSelectedPath;
+    try std.testing.expectEqualStrings("b", selected_path);
+}
+
+test "repo switch clears pending reload anchor" {
+    var app: App = .{
+        .pending_reload = .{
+            .generation = 9,
+            .kind = .manual,
+            .anchor = .{
+                .path_key = try std.testing.allocator.dupe(u8, "a"),
+                .selected_target_tag = .diff_file,
+                .visible_sidebar_row = 0,
+                .diff_cursor = .{ .metadata = 0 },
+                .diff_cursor_offset = 0,
+                .diff_scroll = 0,
+                .diff_horizontal_scroll = 0,
+                .sidebar_horizontal_scroll = 0,
+                .search_coordinate = null,
+            },
+        },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+
+    app.closeRepoPickerForSwitch(std.testing.allocator);
+
+    try std.testing.expect(app.pending_reload == null);
 }
 
 test "finishDiffLoad records empty diff as no changes" {
