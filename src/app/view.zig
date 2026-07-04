@@ -170,6 +170,7 @@ pub fn shellContentRect(terminal_size: chasen.Size) chasen.Rect {
 fn viewBody(app: anytype, surface: *chasen.Surface) !void {
     switch (app.load.state) {
         .loaded => |session| return viewLoadedDiff(app, surface, session.loaded),
+        .empty => |reason| if (reason == .no_changes) return viewNoChanges(app, surface),
         else => {},
     }
 
@@ -188,6 +189,58 @@ fn viewBody(app: anytype, surface: *chasen.Surface) !void {
     col.borrowText(subtitle, roleStyle(app.theme, .muted));
     try col.print("Source: {s}", .{app.config.sourceLabel()});
     viewLoadState(app, &col);
+}
+
+fn viewNoChanges(app: anytype, surface: *chasen.Surface) !void {
+    const message = noChangesMessage(app, surface.frameAllocator());
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    if (app.viewer.sidebar_hidden) {
+        drawStateMessage(surface, message, app.theme);
+        return;
+    }
+
+    const sidebar_width = sidebarWidth(size.width, app.viewer.sidebar_width);
+    var sidebar = surface.child(.{
+        .col = 0,
+        .row = 0,
+        .width = sidebar_width,
+        .height = size.height,
+    });
+    try viewEmptySidebarChrome(app, &sidebar);
+
+    if (size.width > sidebar_width) {
+        var row: u16 = 0;
+        while (row < size.height) : (row += 1) {
+            _ = surface.borrowTextAt(sidebar_width, row, "│", shellSeparatorStyle());
+        }
+    }
+
+    if (size.width <= sidebar_width + 1) return;
+    var diff_pane = surface.child(.{
+        .col = sidebar_width + 1,
+        .row = 0,
+        .width = size.width - sidebar_width - 1,
+        .height = size.height,
+    });
+    drawStateMessage(&diff_pane, message, app.theme);
+}
+
+fn viewEmptySidebarChrome(app: anytype, surface: *chasen.Surface) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    const active = app.viewer.focus == .sidebar;
+    try drawSidebarDetailRow(app, surface, 0, active);
+
+    if (size.height <= 2) return;
+    _ = surface.borrowTextAt(0, 2, paneTitleText("Files", active), paneTitleStyle(active, app.theme));
+    const title_width = chasen.text.displayWidth(paneTitleText("Files", active));
+    const stats_col = title_width + 1;
+    if (stats_col < size.width) {
+        _ = try surface.printAt(stats_col, 2, roleStyle(app.theme, .muted), "0 files / 0 hunks", .{});
+    }
 }
 
 fn viewLoadedDiff(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
@@ -603,7 +656,7 @@ fn viewLoadState(app: anytype, col: *chasen.Column) void {
             .hint = "Press q to quit.",
             .tone = .loading,
         }, app.theme),
-        .empty => |reason| drawStateMessageColumn(col, emptyLoadMessage(app, reason), app.theme),
+        .empty => |reason| drawStateMessageColumn(col, emptyLoadMessage(reason), app.theme),
         .failed => |failed| drawStateMessageColumn(col, .{
             .title = "Could not load diff",
             .body = firstLine(failed.message),
@@ -614,12 +667,15 @@ fn viewLoadState(app: anytype, col: *chasen.Column) void {
     }
 }
 
-fn emptyLoadMessage(app: anytype, reason: anytype) StateMessage {
+fn emptyLoadMessage(reason: anytype) StateMessage {
     return switch (reason) {
         .no_changes => .{
+            // Normal no-changes rendering is intercepted by `viewNoChanges` so
+            // clean repos can keep branch chrome. Keep this fallback for any
+            // future generic empty-state path.
             .title = "No changes",
             .body = "Working tree has no diff for the current source.",
-            .hint = noChangesHint(app),
+            .hint = "Press r to reload or q to quit.",
         },
         .no_repository => .{
             .title = "No Git repository",
@@ -630,9 +686,42 @@ fn emptyLoadMessage(app: anytype, reason: anytype) StateMessage {
     };
 }
 
-fn noChangesHint(app: anytype) []const u8 {
-    if (app.repo_state.workspaceRepos() != null) {
+fn noChangesMessage(app: anytype, allocator: std.mem.Allocator) StateMessage {
+    return .{
+        .title = "No changes",
+        .body = "Working tree has no diff for the current source.",
+        .hint = noChangesHint(app, allocator),
+    };
+}
+
+fn noChangesHint(app: anytype, allocator: std.mem.Allocator) []const u8 {
+    var fetch_key_buffer: [16]u8 = undefined;
+    const hints = app.emptyRemoteActionHints(fetch_key_buffer[0..]);
+    const fetch_key = hints.fetch_key;
+
+    // The hint is capability-oriented: `U` refreshes first and may legitimately
+    // finish as "nothing to pull", so the text advertises the workflow rather
+    // than predicting remote state from a possibly stale ahead/behind count.
+    if (hints.show_repo_picker and hints.show_pull and fetch_key != null) {
+        return std.fmt.allocPrint(allocator, "Press R to switch repository, U to fetch + fast-forward, {s} to fetch, r to reload, or q to quit.", .{fetch_key.?}) catch "Press R to switch repository, U to fetch + fast-forward, r to reload, or q to quit.";
+    }
+    if (hints.show_repo_picker and hints.show_pull) {
+        return "Press R to switch repository, U to fetch + fast-forward, r to reload, or q to quit.";
+    }
+    if (hints.show_repo_picker and fetch_key != null) {
+        return std.fmt.allocPrint(allocator, "Press R to switch repository, {s} to fetch, r to reload, or q to quit.", .{fetch_key.?}) catch "Press R to switch repository, r to reload, or q to quit.";
+    }
+    if (hints.show_repo_picker) {
         return "Press R to switch repository, r to reload, or q to quit.";
+    }
+    if (hints.show_pull and fetch_key != null) {
+        return std.fmt.allocPrint(allocator, "Press U to fetch + fast-forward, {s} to fetch, r to reload, or q to quit.", .{fetch_key.?}) catch "Press U to fetch + fast-forward, r to reload, or q to quit.";
+    }
+    if (hints.show_pull) {
+        return "Press U to fetch + fast-forward, r to reload, or q to quit.";
+    }
+    if (fetch_key != null) {
+        return std.fmt.allocPrint(allocator, "Press {s} to fetch, r to reload, or q to quit.", .{fetch_key.?}) catch "Press r to reload or q to quit.";
     }
     return "Press r to reload or q to quit.";
 }

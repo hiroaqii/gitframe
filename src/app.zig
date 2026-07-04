@@ -100,6 +100,12 @@ const UnstageHunkFinished = app_actions.UnstageHunkFinished;
 const UnstageTargetResult = git_ops.UnstageTargetResult;
 const VerticalDirection = app_direction.Vertical;
 
+pub const EmptyRemoteActionHints = struct {
+    show_repo_picker: bool = false,
+    show_pull: bool = false,
+    fetch_key: ?[]const u8 = null,
+};
+
 const MousePane = enum {
     sidebar,
     diff,
@@ -792,6 +798,21 @@ pub const App = struct {
 
     pub fn view(self: *const App, surface: *chasen.Surface) !void {
         return app_view.view(self, surface);
+    }
+
+    pub fn emptyRemoteActionHints(self: *const App, fetch_key_buffer: []u8) EmptyRemoteActionHints {
+        var hints: EmptyRemoteActionHints = .{
+            .show_repo_picker = self.repo_state.workspaceRepos() != null,
+        };
+        // The empty-state hint is only a display projection, but `U` is still a
+        // mutating operation. Keep it tied to the same target gate as the real
+        // request path so stale or missing clean-status snapshots cannot be
+        // advertised as safe pull capability.
+        if (self.selectedPullTarget() == .ready) hints.show_pull = true;
+        if (self.selectedFetchTarget() == .ready) {
+            hints.fetch_key = self.keymap.display(.fetch, fetch_key_buffer);
+        }
+        return hints;
     }
 
     pub fn handleEvent(self: *const App, event: chasen.Event) ?Msg {
@@ -10542,6 +10563,219 @@ test "load empty state shows actionable no changes message" {
 
     try app_test_support.expectSnapshotContains(&ts, "No changes");
     try app_test_support.expectSnapshotContains(&ts, "Press r to reload or q to quit.");
+}
+
+test "clean empty state shows branch status chrome" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 18);
+    defer ts.deinit();
+
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 18 },
+        .load = .{ .state = .{ .empty = .no_changes } },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.branch_status.deinit();
+
+    var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc123",
+        .branch = "feature/topic",
+        .upstream = "origin/main",
+        .ahead = 0,
+        .behind = 0,
+    });
+    try app.branch_status.replace("/repo", &bundle);
+
+    try app.view(&ts.surface);
+
+    try app_test_support.expectSnapshotContains(&ts, "feature/topic");
+    try app_test_support.expectSnapshotContains(&ts, "0 files / 0 hunks");
+}
+
+test "clean empty state hides stale branch status chrome" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 18);
+    defer ts.deinit();
+
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 18 },
+        .load = .{ .state = .{ .empty = .no_changes } },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.branch_status.deinit();
+
+    var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc123",
+        .branch = "feature/topic",
+        .upstream = "origin/main",
+        .ahead = 0,
+        .behind = 0,
+    });
+    try app.branch_status.replace("/other", &bundle);
+
+    try app.view(&ts.surface);
+
+    try app_test_support.expectSnapshotNotContains(&ts, "feature/topic");
+    try app_test_support.expectSnapshotContains(&ts, "0 files / 0 hunks");
+}
+
+test "clean empty state advertises pull only when clean status snapshot is fresh" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(110, 18);
+    defer ts.deinit();
+
+    var app: App = .{
+        .terminal_size = .{ .width = 110, .height = 18 },
+        .load = .{ .state = .{ .empty = .no_changes } },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.branch_status.deinit();
+    defer app.git_status.deinit();
+
+    var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc123",
+        .branch = "main",
+        .upstream = "origin/main",
+        .ahead = 0,
+        .behind = 0,
+    });
+    try app.branch_status.replace("/repo", &bundle);
+
+    try app.view(&ts.surface);
+    try app_test_support.expectSnapshotNotContains(&ts, "U to fetch + fast-forward");
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    var ts_ready: chasen.testing.TestSurface = undefined;
+    try ts_ready.init(110, 18);
+    defer ts_ready.deinit();
+    try app.view(&ts_ready.surface);
+    try app_test_support.expectSnapshotContains(&ts_ready, "U to fetch + fast-forward");
+}
+
+test "clean empty state shows bound fetch key from effective keymap" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(120, 18);
+    defer ts.deinit();
+
+    var fetch_config: keymap.Config = .{};
+    fetch_config.set(.fetch, .{ .ctrl = .s });
+    var app: App = .{
+        .terminal_size = .{ .width = 120, .height = 18 },
+        .load = .{ .state = .{ .empty = .no_changes } },
+        .keymap = keymap.Effective.fromConfig(fetch_config),
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.branch_status.deinit();
+
+    var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc123",
+        .branch = "main",
+        .upstream = "origin/main",
+        .ahead = 0,
+        .behind = 0,
+    });
+    try app.branch_status.replace("/repo", &bundle);
+
+    try app.view(&ts.surface);
+
+    try app_test_support.expectSnapshotContains(&ts, "Ctrl+s to fetch");
+}
+
+test "clean empty state omits fetch hint when unbound or target is not ready" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(120, 18);
+    defer ts.deinit();
+
+    var app: App = .{
+        .terminal_size = .{ .width = 120, .height = 18 },
+        .load = .{ .state = .{ .empty = .no_changes } },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.branch_status.deinit();
+
+    var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc123",
+        .branch = "main",
+        .upstream = "origin/main",
+        .ahead = 0,
+        .behind = 0,
+    });
+    try app.branch_status.replace("/repo", &bundle);
+
+    try app.view(&ts.surface);
+    try app_test_support.expectSnapshotNotContains(&ts, "Ctrl+s to fetch");
+
+    app.branch_status.clear();
+    var fetch_config: keymap.Config = .{};
+    fetch_config.set(.fetch, .{ .ctrl = .s });
+    app.keymap = keymap.Effective.fromConfig(fetch_config);
+
+    var ts_not_ready: chasen.testing.TestSurface = undefined;
+    try ts_not_ready.init(120, 18);
+    defer ts_not_ready.deinit();
+    try app.view(&ts_not_ready.surface);
+    try app_test_support.expectSnapshotNotContains(&ts_not_ready, "Ctrl+s to fetch");
+}
+
+test "clean empty stdin source does not advertise remote actions" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(120, 18);
+    defer ts.deinit();
+
+    var fetch_config: keymap.Config = .{};
+    fetch_config.set(.fetch, .{ .ctrl = .s });
+    var app: App = .{
+        .terminal_size = .{ .width = 120, .height = 18 },
+        .config = .{ .source = .stdin },
+        .load = .{ .state = .{ .empty = .no_changes } },
+        .keymap = keymap.Effective.fromConfig(fetch_config),
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.branch_status.deinit();
+    defer app.git_status.deinit();
+
+    var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc123",
+        .branch = "main",
+        .upstream = "origin/main",
+        .ahead = 0,
+        .behind = 0,
+    });
+    try app.branch_status.replace("/repo", &bundle);
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    try app.view(&ts.surface);
+
+    try app_test_support.expectSnapshotContains(&ts, "main");
+    try app_test_support.expectSnapshotNotContains(&ts, "U to fetch + fast-forward");
+    try app_test_support.expectSnapshotNotContains(&ts, "Ctrl+s to fetch");
 }
 
 test "load empty state distinguishes missing repository" {
