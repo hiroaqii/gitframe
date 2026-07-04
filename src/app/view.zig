@@ -1413,8 +1413,10 @@ fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
     }
 
     if (size.height > 0) {
-        const footer = if (app.push_retry_credentials_available)
-            "c: credentials    Enter/Esc/q: close"
+        const footer = if (app.push_retry_target != null and app.push_retry_credentials_available)
+            "i: interactive    c: credentials    Enter/Esc/q: close"
+        else if (app.push_retry_target != null)
+            "i: interactive    Enter/Esc/q: close"
         else
             "Enter/Esc/q: close";
         try draw.copyClippedTextAt(&content, 0, size.height - 1, footer, roleStyle(app.theme, .danger));

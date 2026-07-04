@@ -133,6 +133,7 @@ const Action = enum {
     cancel_push,
     close_push_error,
     open_push_credentials,
+    run_interactive_push,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
@@ -259,6 +260,7 @@ fn pushConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
 fn pushErrorKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .close_push_error);
     if (key.codepoint == 'c' and !hasCommandModifier(key)) return actionToMsg(Msg, .open_push_credentials);
+    if (key.codepoint == 'i' and !hasCommandModifier(key)) return actionToMsg(Msg, .run_interactive_push);
     if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .push_error_scroll_up);
     if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .push_error_scroll_down);
     if (key.matches(chasen.Key.page_up, .{})) return actionToMsg(Msg, .push_error_page_up);
@@ -555,6 +557,7 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .cancel_push => voidMsg(Msg, "cancel_push"),
         .close_push_error => voidMsg(Msg, "close_push_error"),
         .open_push_credentials => voidMsg(Msg, "open_push_credentials"),
+        .run_interactive_push => voidMsg(Msg, "run_interactive_push"),
         .open_selected_file_in_editor => voidMsg(Msg, "open_selected_file_in_editor"),
         .toggle_display_mode => voidMsg(Msg, "toggle_display_mode"),
         .toggle_line_numbers => voidMsg(Msg, "toggle_line_numbers"),
@@ -680,6 +683,7 @@ const TestMsg = union(enum) {
     cancel_push,
     close_push_error,
     open_push_credentials,
+    run_interactive_push,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
@@ -1148,6 +1152,7 @@ test "keyToMsg maps push error modal keys" {
     try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
     try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(TestMsg.run_interactive_push, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'i' }).?);
     try std.testing.expectEqual(TestMsg.push_error_scroll_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'k' }).?);
     try std.testing.expectEqual(TestMsg.push_error_scroll_down, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'j' }).?);
     try std.testing.expectEqual(TestMsg.push_error_scroll_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.up }).?);
