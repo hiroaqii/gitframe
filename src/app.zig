@@ -79,15 +79,11 @@ const PathTarget = git_ops.PathTarget;
 const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
 const AmendFinished = app_actions.AmendFinished;
-const AmendTask = app_actions.AmendTask(App.Msg);
 const CommitFinished = app_actions.CommitFinished;
-const CommitTask = app_actions.CommitTask(App.Msg);
 const DiscardFileFinished = app_actions.DiscardFileFinished;
 const PushFinished = app_actions.PushFinished;
-const PushTask = app_actions.PushTask(App.Msg);
 const PushTargetResult = git_ops.PushTargetResult;
 const StageHunkFinished = app_actions.StageHunkFinished;
-const StageHunkTask = app_actions.StageHunkTask(App.Msg);
 const StageFileFinished = app_actions.StageFileFinished;
 const StageTargetResult = git_ops.StageTargetResult;
 const SizeDirection = app_direction.Size;
@@ -97,7 +93,6 @@ const ToggleStageTargetResult = git_ops.ToggleStageTargetResult;
 const ToggleStageOperation = git_ops.ToggleStageOperation;
 const UnstageFileFinished = app_actions.UnstageFileFinished;
 const UnstageHunkFinished = app_actions.UnstageHunkFinished;
-const UnstageHunkTask = app_actions.UnstageHunkTask(App.Msg);
 const UnstageTargetResult = git_ops.UnstageTargetResult;
 const VerticalDirection = app_direction.Vertical;
 
@@ -1286,7 +1281,7 @@ pub const App = struct {
     }
 
     fn stageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("another git action is running", .{});
             return;
         }
@@ -1328,7 +1323,7 @@ pub const App = struct {
     }
 
     fn toggleSelectedFileStage(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("another git action is running", .{});
             return;
         }
@@ -1359,11 +1354,11 @@ pub const App = struct {
     }
 
     fn stageSelectedHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("another git action is running", .{});
             return;
         }
-        const target = switch (self.selectedHunkStageTarget(ctx.allocator())) {
+        var target = switch (self.selectedHunkStageTarget(ctx.allocator())) {
             .ready => |target| target,
             .unavailable_source, .no_repo => {
                 self.setStatus("hunk stage unavailable for this source", .{});
@@ -1411,34 +1406,7 @@ pub const App = struct {
             },
         };
 
-        var owned_patch = target.patch;
-        errdefer if (owned_patch.len > 0) ctx.allocator().free(owned_patch);
-
-        const pending = self.actions.begin(.stage_hunk);
-        errdefer _ = self.actions.finish(pending);
-
-        const task = try ctx.allocator().create(StageHunkTask);
-        task.* = .{
-            .pending = pending,
-            .repo_root = &.{},
-            .path = &.{},
-            .patch = &.{},
-            .hunk_index = target.hunk_index,
-            .mark_source = target.mark_source,
-        };
-        errdefer {
-            if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
-            if (task.path.len > 0) ctx.allocator().free(task.path);
-            if (task.patch.len > 0) ctx.allocator().free(task.patch);
-            ctx.allocator().destroy(task);
-        }
-
-        task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
-        task.path = try ctx.allocator().dupe(u8, target.path);
-        task.patch = owned_patch;
-        owned_patch = &.{};
-
-        ctx.task().spawnWith(.{ .ctx = task, .run = StageHunkTask.run, .failed = StageHunkTask.failed }) catch |err| {
+        app_git_requests.startStageHunk(Msg, ctx, &self.actions, &target) catch |err| {
             self.setStatus("could not start hunk stage task", .{});
             return err;
         };
@@ -1446,7 +1414,7 @@ pub const App = struct {
     }
 
     fn toggleSelectedHunkStage(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("another git action is running", .{});
             return;
         }
@@ -1465,11 +1433,11 @@ pub const App = struct {
     }
 
     fn unstageSelectedHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("another git action is running", .{});
             return;
         }
-        const target = switch (self.selectedHunkUnstageTarget(ctx.allocator())) {
+        var target = switch (self.selectedHunkUnstageTarget(ctx.allocator())) {
             .ready => |target| target,
             .unavailable_source, .no_repo => {
                 self.setStatus("hunk unstage unavailable for this source", .{});
@@ -1509,35 +1477,7 @@ pub const App = struct {
             },
         };
 
-        var owned_patch = target.patch;
-        errdefer if (owned_patch.len > 0) ctx.allocator().free(owned_patch);
-
-        const pending = self.actions.begin(.unstage_hunk);
-        errdefer _ = self.actions.finish(pending);
-
-        const task = try ctx.allocator().create(UnstageHunkTask);
-        task.* = .{
-            .pending = pending,
-            .repo_root = &.{},
-            .path = &.{},
-            .patch = &.{},
-            .hunk_index = target.hunk_index,
-            .mark_source = target.mark_source,
-            .reload_after_success = target.reload_after_success,
-        };
-        errdefer {
-            if (task.repo_root.len > 0) ctx.allocator().free(task.repo_root);
-            if (task.path.len > 0) ctx.allocator().free(task.path);
-            if (task.patch.len > 0) ctx.allocator().free(task.patch);
-            ctx.allocator().destroy(task);
-        }
-
-        task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
-        task.path = try ctx.allocator().dupe(u8, target.path);
-        task.patch = owned_patch;
-        owned_patch = &.{};
-
-        ctx.task().spawnWith(.{ .ctx = task, .run = UnstageHunkTask.run, .failed = UnstageHunkTask.failed }) catch |err| {
+        app_git_requests.startUnstageHunk(Msg, ctx, &self.actions, &target) catch |err| {
             self.setStatus("could not start hunk unstage task", .{});
             return err;
         };
@@ -1725,7 +1665,7 @@ pub const App = struct {
     }
 
     fn unstageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("another git action is running", .{});
             return;
         }
@@ -1776,7 +1716,7 @@ pub const App = struct {
     }
 
     fn requestDiscardSelectedFile(self: *App, allocator: std.mem.Allocator) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("another git action is running", .{});
             return;
         }
@@ -1830,7 +1770,7 @@ pub const App = struct {
 
     fn confirmDiscardFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         const confirmation = self.discard_confirmation orelse return;
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("another git action is running", .{});
             return;
         }
@@ -1858,7 +1798,7 @@ pub const App = struct {
     }
 
     fn enterCommitPanelMode(self: *App, mode: app_commit_panel.Mode) void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("finish current git action before committing", .{});
             return;
         }
@@ -1875,7 +1815,7 @@ pub const App = struct {
     }
 
     fn submitCommitPanel(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.commit_panel.commit_error = .action_pending;
             self.setStatus("finish current git action before committing", .{});
             return;
@@ -1908,25 +1848,15 @@ pub const App = struct {
         errdefer parts.deinit(ctx.allocator());
 
         const owned_root = try ctx.allocator().dupe(u8, repo_root);
-        errdefer ctx.allocator().free(owned_root);
 
-        const pending = self.actions.begin(.commit);
-        errdefer _ = self.actions.finish(pending);
-
-        const task = try ctx.allocator().create(CommitTask);
-        errdefer ctx.allocator().destroy(task);
-
-        task.* = .{
-            .pending = pending,
+        var request: app_git_requests.CommitRequest = .{
             .repo_root = owned_root,
             .subject = parts.subject,
             .body = parts.body,
         };
         parts = .{ .subject = &.{}, .body = null };
 
-        ctx.task().spawnWith(.{ .ctx = task, .run = CommitTask.run, .failed = CommitTask.failed }) catch |err| {
-            ctx.allocator().free(task.subject);
-            if (task.body) |body| ctx.allocator().free(body);
+        app_git_requests.startCommit(Msg, ctx, &self.actions, &request) catch |err| {
             self.commit_panel.commit_error = .commit_failed;
             self.setStatus("could not start commit task", .{});
             return err;
@@ -1958,32 +1888,14 @@ pub const App = struct {
     }
 
     fn confirmAmend(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("another git action is running", .{});
             return;
         }
         var confirmation = self.amend_confirmation orelse return;
         self.amend_confirmation = null;
-        errdefer confirmation.deinit(ctx.allocator());
 
-        const task = try ctx.allocator().create(AmendTask);
-        errdefer ctx.allocator().destroy(task);
-
-        const pending = self.actions.begin(.amend);
-        errdefer _ = self.actions.finish(pending);
-
-        task.* = .{
-            .pending = pending,
-            .repo_root = confirmation.repo_root,
-            .subject = confirmation.subject,
-            .body = confirmation.body,
-        };
-        confirmation = .{ .repo_root = &.{}, .subject = &.{}, .body = null };
-
-        ctx.task().spawnWith(.{ .ctx = task, .run = AmendTask.run, .failed = AmendTask.failed }) catch |err| {
-            ctx.allocator().free(task.repo_root);
-            ctx.allocator().free(task.subject);
-            if (task.body) |body| ctx.allocator().free(body);
+        app_git_requests.startAmend(Msg, ctx, &self.actions, &confirmation) catch |err| {
             if (self.overlay.isAmendCommit()) self.overlay.close();
             self.commit_panel.commit_error = .amend_failed;
             self.setStatus("could not start amend task", .{});
@@ -2001,6 +1913,11 @@ pub const App = struct {
     }
 
     fn requestPush(self: *App, allocator: std.mem.Allocator) !void {
+        if (app_git_requests.hasPendingAction(self.actions)) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+
         const target = switch (self.selectedPushTarget()) {
             .ready => |target| target,
             .unavailable_source => {
@@ -2074,48 +1991,17 @@ pub const App = struct {
     }
 
     fn confirmPush(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("another git action is running", .{});
             return;
         }
 
         var confirmation = self.push_confirmation orelse return;
         self.push_confirmation = null;
-        errdefer confirmation.deinit(ctx.allocator());
 
-        const task = try ctx.allocator().create(PushTask);
-        errdefer ctx.allocator().destroy(task);
+        self.setStatus("pushing: {s} -> {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
 
-        const pending = self.actions.begin(.push);
-        errdefer _ = self.actions.finish(pending);
-
-        task.* = .{
-            .pending = pending,
-            .repo_root = confirmation.repo_root,
-            .branch = confirmation.branch,
-            .remote = confirmation.remote,
-            .remote_branch = confirmation.remote_branch,
-            .oid = confirmation.oid,
-            .env_map = self.env_map,
-        };
-        confirmation = .{
-            .repo_root = &.{},
-            .branch = &.{},
-            .remote = &.{},
-            .remote_branch = &.{},
-            .oid = &.{},
-            .ahead = 0,
-            .behind = 0,
-        };
-
-        self.setStatus("pushing: {s} -> {s}/{s}", .{ task.branch, task.remote, task.remote_branch });
-
-        ctx.task().spawnWith(.{ .ctx = task, .run = PushTask.run, .failed = PushTask.failed }) catch |err| {
-            ctx.allocator().free(task.repo_root);
-            ctx.allocator().free(task.branch);
-            ctx.allocator().free(task.remote);
-            ctx.allocator().free(task.remote_branch);
-            ctx.allocator().free(task.oid);
+        app_git_requests.startPush(Msg, ctx, &self.actions, self.env_map, &confirmation) catch |err| {
             self.setStatus("could not start push task", .{});
             if (self.overlay.isPushBranch()) self.overlay.close();
             return err;
@@ -2390,7 +2276,7 @@ pub const App = struct {
     }
 
     fn openSelectedFileInEditor(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("finish current git action before opening editor", .{});
             return;
         }
@@ -3541,7 +3427,7 @@ pub const App = struct {
     }
 
     fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("finish current git action before switching repos", .{});
             return;
         }
@@ -3774,7 +3660,7 @@ pub const App = struct {
     }
 
     fn startRepoPathDiscovery(self: *App, ctx: *chasen.Ctx(Msg), path: []const u8, recent_source: ?PendingRecentPathDiscovery) !void {
-        if (self.actions.pending != null) {
+        if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("finish current git action before switching repos", .{});
             return;
         }
@@ -6357,6 +6243,34 @@ test "requestPush clears previous push error details" {
     try std.testing.expect(app.push_error_message == null);
     try std.testing.expect(app.overlay.isPushBranch());
     try std.testing.expect(app.push_confirmation != null);
+}
+
+test "requestPush rejects while another action is pending" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .push_confirmation = .{
+            .repo_root = try std.testing.allocator.dupe(u8, "/old"),
+            .branch = try std.testing.allocator.dupe(u8, "old-feature"),
+            .remote = try std.testing.allocator.dupe(u8, "origin"),
+            .remote_branch = try std.testing.allocator.dupe(u8, "old-main"),
+            .oid = try std.testing.allocator.dupe(u8, "old123"),
+            .ahead = 1,
+            .behind = 0,
+        },
+        .overlay = .{ .kind = .push_branch },
+    };
+    defer app.cancelPushConfirmation(std.testing.allocator);
+    app.actions.pending = .{ .generation = 1, .kind = .stage_file };
+    defer app.actions.clear();
+
+    try app.requestPush(std.testing.allocator);
+
+    const confirmation = app.push_confirmation orelse return error.ExpectedPushConfirmation;
+    try std.testing.expectEqualStrings("/old", confirmation.repo_root);
+    try std.testing.expectEqualStrings("old-feature", confirmation.branch);
+    try std.testing.expect(app.overlay.isPushBranch());
+    try std.testing.expect(app.actions.pending != null);
+    try std.testing.expectEqualStrings("another git action is running", app.status.text());
 }
 
 test "confirmPush keeps confirmation when another action is pending" {
