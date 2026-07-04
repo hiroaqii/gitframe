@@ -1,119 +1,20 @@
 const std = @import("std");
 const ui = @import("chasen_ui");
 const repo_discovery = @import("../repo/discovery.zig");
+const text_edit = @import("text_edit.zig");
 
 /// Fixed-capacity UTF-8 text input used by prompt-like modes.
 ///
 /// The app owns mode-specific behavior such as submit/cancel. This type only
 /// owns the byte buffer and keeps insertion/backspace UTF-8 aware.
-pub const TextInput = struct {
-    pub const InsertError = error{BufferFull};
-
-    buffer: [512]u8 = undefined,
-    len: usize = 0,
-    cursor: usize = 0,
-
-    pub fn slice(self: *const TextInput) []const u8 {
-        return self.buffer[0..self.len];
-    }
-
-    pub fn insert(self: *TextInput, codepoint: u21) InsertError!void {
-        var bytes: [4]u8 = undefined;
-        const written = std.unicode.utf8Encode(codepoint, &bytes) catch unreachable;
-        if (self.len + written > self.buffer.len) return error.BufferFull;
-        std.mem.copyBackwards(u8, self.buffer[self.cursor + written .. self.len + written], self.buffer[self.cursor..self.len]);
-        @memcpy(self.buffer[self.cursor .. self.cursor + written], bytes[0..written]);
-        self.len += written;
-        self.cursor += written;
-    }
-
-    pub fn insertSlice(self: *TextInput, text: []const u8) InsertError!void {
-        if (text.len == 0) return;
-        std.debug.assert(std.unicode.utf8ValidateSlice(text));
-        if (self.len + text.len > self.buffer.len) return error.BufferFull;
-        std.mem.copyBackwards(u8, self.buffer[self.cursor + text.len .. self.len + text.len], self.buffer[self.cursor..self.len]);
-        @memcpy(self.buffer[self.cursor .. self.cursor + text.len], text);
-        self.len += text.len;
-        self.cursor += text.len;
-    }
-
-    pub fn backspace(self: *TextInput) void {
-        if (self.cursor == 0) return;
-        const previous = previousBoundary(self.slice(), self.cursor);
-        std.mem.copyForwards(u8, self.buffer[previous .. self.len - (self.cursor - previous)], self.buffer[self.cursor..self.len]);
-        self.len -= self.cursor - previous;
-        self.cursor = previous;
-    }
-
-    pub fn moveLeft(self: *TextInput) void {
-        self.cursor = previousBoundary(self.slice(), self.cursor);
-    }
-
-    pub fn moveRight(self: *TextInput) void {
-        self.cursor = nextBoundary(self.slice(), self.cursor);
-    }
-
-    pub fn clear(self: *TextInput) void {
-        self.* = .{};
-    }
-};
+pub const TextInput = text_edit.BoundedTextInput(512);
 
 /// Larger fixed-capacity input for filesystem paths.
 ///
 /// Repository paths can easily exceed the short prompt buffer used for search
 /// queries. Keep this fixed-capacity for now so prompt state stays self-owned
 /// and simple to reset, while still reporting overflow explicitly.
-pub const PathInput = struct {
-    pub const InsertError = error{BufferFull};
-
-    buffer: [1024]u8 = undefined,
-    len: usize = 0,
-    cursor: usize = 0,
-
-    pub fn slice(self: *const PathInput) []const u8 {
-        return self.buffer[0..self.len];
-    }
-
-    pub fn insert(self: *PathInput, codepoint: u21) InsertError!void {
-        var bytes: [4]u8 = undefined;
-        const written = std.unicode.utf8Encode(codepoint, &bytes) catch unreachable;
-        if (self.len + written > self.buffer.len) return error.BufferFull;
-        std.mem.copyBackwards(u8, self.buffer[self.cursor + written .. self.len + written], self.buffer[self.cursor..self.len]);
-        @memcpy(self.buffer[self.cursor .. self.cursor + written], bytes[0..written]);
-        self.len += written;
-        self.cursor += written;
-    }
-
-    pub fn insertSlice(self: *PathInput, text: []const u8) InsertError!void {
-        if (text.len == 0) return;
-        std.debug.assert(std.unicode.utf8ValidateSlice(text));
-        if (self.len + text.len > self.buffer.len) return error.BufferFull;
-        std.mem.copyBackwards(u8, self.buffer[self.cursor + text.len .. self.len + text.len], self.buffer[self.cursor..self.len]);
-        @memcpy(self.buffer[self.cursor .. self.cursor + text.len], text);
-        self.len += text.len;
-        self.cursor += text.len;
-    }
-
-    pub fn backspace(self: *PathInput) void {
-        if (self.cursor == 0) return;
-        const previous = previousBoundary(self.slice(), self.cursor);
-        std.mem.copyForwards(u8, self.buffer[previous .. self.len - (self.cursor - previous)], self.buffer[self.cursor..self.len]);
-        self.len -= self.cursor - previous;
-        self.cursor = previous;
-    }
-
-    pub fn moveLeft(self: *PathInput) void {
-        self.cursor = previousBoundary(self.slice(), self.cursor);
-    }
-
-    pub fn moveRight(self: *PathInput) void {
-        self.cursor = nextBoundary(self.slice(), self.cursor);
-    }
-
-    pub fn clear(self: *PathInput) void {
-        self.* = .{};
-    }
-};
+pub const PathInput = text_edit.BoundedTextInput(1024);
 
 /// List-filter prompt state shared by file search and repository picker.
 ///
@@ -219,71 +120,6 @@ pub const RepoPickerInputMode = enum {
     path_input,
 };
 
-test "TextInput inserts UTF-8 codepoints and backspaces by codepoint" {
-    var input: TextInput = .{};
-
-    try input.insert('a');
-    try input.insert(0x1F408);
-    try std.testing.expectEqualStrings("a🐈", input.slice());
-
-    input.backspace();
-    try std.testing.expectEqualStrings("a", input.slice());
-
-    input.backspace();
-    try std.testing.expectEqualStrings("", input.slice());
-}
-
-test "TextInput edits at the cursor" {
-    var input: TextInput = .{};
-
-    try input.insert('a');
-    try input.insert('c');
-    input.moveLeft();
-    try input.insert('b');
-
-    try std.testing.expectEqualStrings("abc", input.slice());
-    try std.testing.expectEqual(@as(usize, 2), input.cursor);
-
-    input.backspace();
-    try std.testing.expectEqualStrings("ac", input.slice());
-    try std.testing.expectEqual(@as(usize, 1), input.cursor);
-}
-
-test "TextInput inserts slices at the cursor" {
-    var input: TextInput = .{};
-
-    try input.insertSlice("ac");
-    input.moveLeft();
-    try input.insertSlice("🐈b");
-
-    try std.testing.expectEqualStrings("a🐈bc", input.slice());
-    try std.testing.expectEqual(@as(usize, "a🐈b".len), input.cursor);
-}
-
-test "TextInput reports BufferFull without changing existing bytes" {
-    var input: TextInput = .{};
-    @memset(input.buffer[0..], 'x');
-    input.len = input.buffer.len;
-    input.cursor = input.len;
-
-    try std.testing.expectError(error.BufferFull, input.insert('y'));
-    try std.testing.expectEqual(@as(usize, input.buffer.len), input.len);
-    try std.testing.expectEqual(@as(u8, 'x'), input.buffer[0]);
-}
-
-test "TextInput reports BufferFull for slices without changing state" {
-    var input: TextInput = .{};
-    @memset(input.buffer[0..], 'x');
-    input.len = input.buffer.len - 1;
-    input.cursor = 1;
-    const before = input;
-
-    try std.testing.expectError(error.BufferFull, input.insertSlice("yy"));
-    try std.testing.expectEqual(before.len, input.len);
-    try std.testing.expectEqual(before.cursor, input.cursor);
-    try std.testing.expectEqualSlices(u8, before.buffer[0..before.len], input.buffer[0..input.len]);
-}
-
 test "PathInput accepts longer paths than TextInput" {
     var input: PathInput = .{};
 
@@ -353,29 +189,4 @@ test "RepoPickerState tracks path discovery generation" {
     try std.testing.expect(state.isCurrentPathDiscovery(generation));
     try std.testing.expect(state.finishPathDiscovery(generation));
     try std.testing.expect(!state.path_pending);
-}
-
-fn previousBoundary(bytes: []const u8, cursor: usize) usize {
-    if (cursor == 0) return 0;
-
-    var previous: usize = 0;
-    var iter = std.unicode.Utf8View.initUnchecked(bytes).iterator();
-    while (iter.nextCodepointSlice()) |codepoint| {
-        const end = @intFromPtr(codepoint.ptr) - @intFromPtr(bytes.ptr) + codepoint.len;
-        if (end >= cursor) return previous;
-        previous = end;
-    }
-    return previous;
-}
-
-fn nextBoundary(bytes: []const u8, cursor: usize) usize {
-    if (cursor >= bytes.len) return bytes.len;
-
-    var iter = std.unicode.Utf8View.initUnchecked(bytes).iterator();
-    while (iter.nextCodepointSlice()) |codepoint| {
-        const start = @intFromPtr(codepoint.ptr) - @intFromPtr(bytes.ptr);
-        const end = start + codepoint.len;
-        if (start >= cursor or cursor < end) return end;
-    }
-    return bytes.len;
 }

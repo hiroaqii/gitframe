@@ -1,6 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const text_buffer = @import("text_buffer.zig");
+const text_edit = @import("text_edit.zig");
 
 pub const CommitError = enum {
     subject_empty,
@@ -272,7 +273,7 @@ pub const State = struct {
             self.commit_error = .input_allocation_failed;
             return;
         };
-        if (self.totalRawBytes() + utf8Len(codepoint) > max_message_bytes) {
+        if (self.totalRawBytes() + text_edit.utf8Len(codepoint) > max_message_bytes) {
             self.commit_error = .message_too_large;
             return;
         }
@@ -501,11 +502,6 @@ pub const State = struct {
         return std.mem.trim(u8, self.body.slice(), " \t\r\n");
     }
 };
-
-fn utf8Len(codepoint: u21) usize {
-    var bytes: [4]u8 = undefined;
-    return std.unicode.utf8Encode(codepoint, &bytes) catch unreachable;
-}
 
 fn offsetForDisplayColumn(bytes: []const u8, target_column: u16) usize {
     var used: u16 = 0;

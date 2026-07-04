@@ -31,6 +31,7 @@ test {
     _ = @import("app/prompt.zig");
     _ = @import("app/repo_picker.zig");
     _ = @import("app/state.zig");
+    _ = @import("app/text_edit.zig");
     _ = @import("app/view.zig");
     _ = @import("config.zig");
     _ = @import("context.zig");

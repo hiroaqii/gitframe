@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_edit = @import("text_edit.zig");
 
 /// App-local UTF-8 text storage for editable fields.
 ///
@@ -42,18 +43,18 @@ pub const TextBuffer = struct {
     pub fn backspace(self: *TextBuffer) void {
         if (self.cursor == 0) return;
 
-        const previous = previousBoundary(self.slice(), self.cursor);
+        const previous = text_edit.previousBoundary(self.slice(), self.cursor);
         std.mem.copyForwards(u8, self.bytes.items[previous .. self.bytes.items.len - (self.cursor - previous)], self.bytes.items[self.cursor..]);
         self.bytes.items.len -= self.cursor - previous;
         self.cursor = previous;
     }
 
     pub fn moveLeft(self: *TextBuffer) void {
-        self.cursor = previousBoundary(self.slice(), self.cursor);
+        self.cursor = text_edit.previousBoundary(self.slice(), self.cursor);
     }
 
     pub fn moveRight(self: *TextBuffer) void {
-        self.cursor = nextBoundary(self.slice(), self.cursor);
+        self.cursor = text_edit.nextBoundary(self.slice(), self.cursor);
     }
 
     pub fn clearRetainingCapacity(self: *TextBuffer) void {
@@ -66,31 +67,6 @@ pub const TextBuffer = struct {
         self.* = .{};
     }
 };
-
-pub fn previousBoundary(bytes: []const u8, cursor: usize) usize {
-    if (cursor == 0) return 0;
-
-    var previous: usize = 0;
-    var iter = std.unicode.Utf8View.initUnchecked(bytes).iterator();
-    while (iter.nextCodepointSlice()) |codepoint| {
-        const end = @intFromPtr(codepoint.ptr) - @intFromPtr(bytes.ptr) + codepoint.len;
-        if (end >= cursor) return previous;
-        previous = end;
-    }
-    return previous;
-}
-
-pub fn nextBoundary(bytes: []const u8, cursor: usize) usize {
-    if (cursor >= bytes.len) return bytes.len;
-
-    var iter = std.unicode.Utf8View.initUnchecked(bytes).iterator();
-    while (iter.nextCodepointSlice()) |codepoint| {
-        const start = @intFromPtr(codepoint.ptr) - @intFromPtr(bytes.ptr);
-        const end = start + codepoint.len;
-        if (start >= cursor or cursor < end) return end;
-    }
-    return bytes.len;
-}
 
 test "TextBuffer edits at the cursor and preserves UTF-8 boundaries" {
     var buffer: TextBuffer = .{};
