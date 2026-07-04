@@ -8,6 +8,7 @@ pub const OverlayKind = enum {
     discard_file,
     amend_commit,
     push_branch,
+    pull_branch,
     push_error,
     push_credentials,
 };
@@ -44,6 +45,10 @@ pub const OverlayState = struct {
         return self.kind == .push_branch;
     }
 
+    pub fn isPullBranch(self: OverlayState) bool {
+        return self.kind == .pull_branch;
+    }
+
     pub fn isPushError(self: OverlayState) bool {
         return self.kind == .push_error;
     }
@@ -57,7 +62,7 @@ pub const OverlayState = struct {
             .none => .passthrough,
             .help => .scroll_help,
             .push_error => .scroll_push_error,
-            .discard_file, .amend_commit, .push_branch, .push_credentials => .block,
+            .discard_file, .amend_commit, .push_branch, .pull_branch, .push_credentials => .block,
         };
     }
 
@@ -76,6 +81,10 @@ pub const OverlayState = struct {
 
     pub fn openPushBranch(self: *OverlayState) void {
         self.kind = .push_branch;
+    }
+
+    pub fn openPullBranch(self: *OverlayState) void {
+        self.kind = .pull_branch;
     }
 
     pub fn openPushError(self: *OverlayState) void {
@@ -138,6 +147,30 @@ pub const PushConfirmation = struct {
     behind: u32,
 
     pub fn deinit(self: *PushConfirmation, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.branch);
+        allocator.free(self.remote);
+        allocator.free(self.remote_branch);
+        allocator.free(self.oid);
+        self.* = undefined;
+    }
+};
+
+/// Owned snapshot for pull confirmation.
+///
+/// Branch status and file status can reload while the popup is open, so the
+/// displayed target is copied and the backend re-checks branch/clean state
+/// immediately before running `git pull --ff-only`.
+pub const PullConfirmation = struct {
+    repo_root: []u8,
+    branch: []u8,
+    remote: []u8,
+    remote_branch: []u8,
+    oid: []u8,
+    ahead: u32,
+    behind: u32,
+
+    pub fn deinit(self: *PullConfirmation, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_root);
         allocator.free(self.branch);
         allocator.free(self.remote);

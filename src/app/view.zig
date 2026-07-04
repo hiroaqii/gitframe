@@ -114,6 +114,9 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
     if (app.overlay.isPushBranch()) {
         try viewPushConfirmation(app, surface);
     }
+    if (app.overlay.isPullBranch()) {
+        try viewPullConfirmation(app, surface);
+    }
     if (app.overlay.isPushError()) {
         try viewPushError(app, surface);
     }
@@ -1376,6 +1379,39 @@ fn viewPushConfirmation(app: anytype, surface: *chasen.Surface) !void {
     }
 }
 
+fn viewPullConfirmation(app: anytype, surface: *chasen.Surface) !void {
+    const confirmation = app.pull_confirmation orelse return;
+    const modal = ui.Modal.init(.{});
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, confirmation_dialog_width),
+        .dialog_height = @min(surface.size().height, confirmation_dialog_height),
+        .title = "Pull current branch?",
+        .backdrop = false,
+        .border = .rounded,
+        .title_style = boldRoleStyle(app.theme, .accent),
+        .border_style = roleStyle(app.theme, .accent),
+    };
+    fillModalDialog(surface, opts);
+    modal.view(surface, opts);
+
+    const content_rect = ui.Modal.contentRect(surface, opts);
+    if (content_rect.width == 0 or content_rect.height == 0) return;
+    var content = surface.child(content_rect);
+    const size = content.size();
+
+    const target = try std.fmt.allocPrint(content.frameAllocator(), "{s} <- {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
+    const counts = try std.fmt.allocPrint(content.frameAllocator(), "ahead {d} / behind {d}", .{ confirmation.ahead, confirmation.behind });
+    const line_count: u16 = 5;
+    const start_row: u16 = if (size.height > line_count) (size.height - line_count) / 2 else 0;
+    try drawCenteredText(&content, start_row, target, boldRoleStyle(app.theme, .accent));
+    if (start_row + 2 < size.height) {
+        try drawCenteredText(&content, start_row + 2, counts, roleStyle(app.theme, .muted));
+    }
+    if (start_row + 4 < size.height) {
+        try drawCenteredText(&content, start_row + 4, "Enter: pull --ff-only    Esc/q: cancel", roleStyle(app.theme, .accent));
+    }
+}
+
 fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
     const message = app.push_error_message orelse return;
     const modal = ui.Modal.init(.{});
@@ -2206,6 +2242,7 @@ const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .commit }, .description = "open commit panel" },
     .{ .key = .{ .action = .amend }, .description = "amend last commit" },
     .{ .key = .{ .action = .push }, .description = "push current branch" },
+    .{ .key = .{ .action = .pull }, .description = "pull current branch" },
     .{ .key = .{ .action = .discard }, .description = "discard selected file changes" },
     .{ .key = .{ .action = .open_editor }, .description = "open selected file in editor" },
     .{ .key = .{ .text = "a / N" }, .description = "approve / needs changes in review mode" },

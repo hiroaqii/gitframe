@@ -164,6 +164,16 @@ pub const PushTarget = struct {
     behind: u32,
 };
 
+pub const PullTarget = struct {
+    repo_root: []const u8,
+    branch: []const u8,
+    remote: []const u8,
+    remote_branch: []const u8,
+    oid: []const u8,
+    ahead: u32,
+    behind: u32,
+};
+
 pub const PushTargetResult = union(enum) {
     ready: PushTarget,
     unavailable_source,
@@ -176,6 +186,24 @@ pub const PushTargetResult = union(enum) {
     branch_status_unavailable,
     pull_first,
     nothing_to_push,
+};
+
+pub const PullTargetResult = union(enum) {
+    ready: PullTarget,
+    unavailable_source,
+    no_repo,
+    loading_branch_status,
+    detached_head,
+    branch_unavailable,
+    no_upstream,
+    upstream_not_remote_branch,
+    branch_status_unavailable,
+    nothing_to_pull,
+    local_commits_ahead,
+    status_loading,
+    status_stale,
+    dirty_worktree,
+    untracked_files_present,
 };
 
 pub const StatusSnapshot = struct {
@@ -232,6 +260,13 @@ pub const RemoteActionContext = struct {
     branch_status: BranchStatusSnapshot,
 };
 
+pub const PullActionContext = struct {
+    source: diff_source.SourceMode,
+    repo_root: ?[]const u8,
+    branch_status: BranchStatusSnapshot,
+    status: StatusSnapshot,
+};
+
 pub fn pushTarget(ctx: RemoteActionContext) PushTargetResult {
     if (!diff_source.sourceAllowsStageProjection(ctx.source)) return .unavailable_source;
     const repo_root = ctx.repo_root orelse return .no_repo;
@@ -259,6 +294,69 @@ pub fn pushTarget(ctx: RemoteActionContext) PushTargetResult {
         .ahead = ahead_behind.ahead,
         .behind = ahead_behind.behind,
     } };
+}
+
+pub fn pullTarget(ctx: PullActionContext) PullTargetResult {
+    if (!diff_source.sourceAllowsStageProjection(ctx.source)) return .unavailable_source;
+    const repo_root = ctx.repo_root orelse return .no_repo;
+    if (!ctx.branch_status.freshFor(repo_root)) return .loading_branch_status;
+
+    const branch_status = ctx.branch_status.status;
+    const branch = switch (branch_status.head) {
+        .branch => |name| name,
+        .detached => return .detached_head,
+        .unknown => return .branch_unavailable,
+    };
+    const upstream = branch_status.upstream orelse return .no_upstream;
+    if (upstream.remote_branch.len == 0) return .upstream_not_remote_branch;
+    const oid = branch_status.oid orelse return .branch_status_unavailable;
+    const ahead_behind = branch_status.ahead_behind orelse return .branch_status_unavailable;
+    // Diverged history needs a user choice between push/rebase/merge. The first
+    // pull slice only offers a fast-forward remote update, so fail before
+    // spawning git even though `pull --ff-only` would also reject it.
+    if (ahead_behind.ahead > 0) return .local_commits_ahead;
+    if (ahead_behind.behind == 0) return .nothing_to_pull;
+
+    // This App-side clean-worktree gate is for immediate feedback. The backend
+    // repeats the check right before `git pull` to close the confirmation/task
+    // race where files can change after this snapshot.
+    if (ctx.status.loading) return .status_loading;
+    if (!ctx.status.isFreshFor(repo_root)) return .status_stale;
+    switch (pullWorktreeState(ctx.status.entries)) {
+        .clean => {},
+        .untracked_only => return .untracked_files_present,
+        .dirty => return .dirty_worktree,
+    }
+
+    return .{ .ready = .{
+        .repo_root = repo_root,
+        .branch = branch,
+        .remote = upstream.remote,
+        .remote_branch = upstream.remote_branch,
+        .oid = oid,
+        .ahead = ahead_behind.ahead,
+        .behind = ahead_behind.behind,
+    } };
+}
+
+const PullWorktreeState = enum {
+    clean,
+    untracked_only,
+    dirty,
+};
+
+fn pullWorktreeState(entries: []const git_status.StatusEntry) PullWorktreeState {
+    var saw_untracked = false;
+    for (entries) |entry| {
+        if (entry.isIgnored()) continue;
+        if (entry.isConflict() or entry.isStaged()) return .dirty;
+        if (entry.isUntracked()) {
+            saw_untracked = true;
+            continue;
+        }
+        if (entry.isUnstaged()) return .dirty;
+    }
+    return if (saw_untracked) .untracked_only else .clean;
 }
 
 pub fn stageTarget(ctx: TargetContext) StageTargetResult {
@@ -493,6 +591,33 @@ test "pushTarget requires a fresh upstream branch with outgoing commits" {
     }
 }
 
+test "pullTarget requires behind-only branch and clean status" {
+    const status: git_branch_status.BranchStatus = .{
+        .oid = "abc123",
+        .head = .{ .branch = "feature" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{ .ahead = 0, .behind = 2 },
+    };
+
+    switch (pullTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = status },
+        .status = .{ .repo_root = "/repo", .loading = false, .entries = &.{} },
+    })) {
+        .ready => |target| {
+            try std.testing.expectEqualStrings("/repo", target.repo_root);
+            try std.testing.expectEqualStrings("feature", target.branch);
+            try std.testing.expectEqualStrings("origin", target.remote);
+            try std.testing.expectEqualStrings("main", target.remote_branch);
+            try std.testing.expectEqualStrings("abc123", target.oid);
+            try std.testing.expectEqual(@as(u32, 0), target.ahead);
+            try std.testing.expectEqual(@as(u32, 2), target.behind);
+        },
+        else => return error.ExpectedPullTargetReady,
+    }
+}
+
 test "pushFailureHint identifies SSH publickey failures" {
     const message =
         "git@github.com: Permission denied (publickey).\n" ++
@@ -589,5 +714,73 @@ test "pushTarget rejects unsafe or incomplete branch states" {
             .upstream = ready_status.upstream,
             .ahead_behind = .{ .ahead = 0, .behind = 0 },
         } },
+    }));
+}
+
+test "pullTarget rejects unsafe branch and worktree states" {
+    const ready_status: git_branch_status.BranchStatus = .{
+        .oid = "abc123",
+        .head = .{ .branch = "feature" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{ .ahead = 0, .behind = 1 },
+    };
+
+    const clean_status: StatusSnapshot = .{ .repo_root = "/repo", .loading = false, .entries = &.{} };
+
+    try std.testing.expectEqual(PullTargetResult.unavailable_source, pullTarget(.{
+        .source = .stdin,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
+        .status = clean_status,
+    }));
+    try std.testing.expectEqual(PullTargetResult.local_commits_ahead, pullTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
+            .oid = "abc123",
+            .head = .{ .branch = "feature" },
+            .upstream = ready_status.upstream,
+            .ahead_behind = .{ .ahead = 1, .behind = 1 },
+        } },
+        .status = clean_status,
+    }));
+    try std.testing.expectEqual(PullTargetResult.nothing_to_pull, pullTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
+            .oid = "abc123",
+            .head = .{ .branch = "feature" },
+            .upstream = ready_status.upstream,
+            .ahead_behind = .{ .ahead = 0, .behind = 0 },
+        } },
+        .status = clean_status,
+    }));
+    try std.testing.expectEqual(PullTargetResult.status_loading, pullTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
+        .status = .{ .repo_root = "/repo", .loading = true, .entries = &.{} },
+    }));
+    try std.testing.expectEqual(PullTargetResult.status_stale, pullTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
+        .status = .{ .repo_root = "/other", .loading = false, .entries = &.{} },
+    }));
+
+    const staged = [_]git_status.StatusEntry{.{ .path = "src/app.zig", .raw = .{ 'M', ' ' }, .index = .modified, .worktree = .unmodified }};
+    try std.testing.expectEqual(PullTargetResult.dirty_worktree, pullTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
+        .status = .{ .repo_root = "/repo", .loading = false, .entries = &staged },
+    }));
+
+    const untracked = [_]git_status.StatusEntry{.{ .path = "new.txt", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked }};
+    try std.testing.expectEqual(PullTargetResult.untracked_files_present, pullTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
+        .status = .{ .repo_root = "/repo", .loading = false, .entries = &untracked },
     }));
 }

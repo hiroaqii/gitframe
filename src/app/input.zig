@@ -29,6 +29,7 @@ pub const KeyContext = struct {
     discard_confirmation_mode: bool = false,
     amend_confirmation_mode: bool = false,
     push_confirmation_mode: bool = false,
+    pull_confirmation_mode: bool = false,
     push_error_mode: bool = false,
     push_credential_mode: bool = false,
     search_query_len: usize = 0,
@@ -131,6 +132,9 @@ const Action = enum {
     request_push,
     confirm_push,
     cancel_push,
+    request_pull,
+    confirm_pull,
+    cancel_pull,
     close_push_error,
     open_push_credentials,
     run_interactive_push,
@@ -162,7 +166,7 @@ fn pasteToMsg(comptime Msg: type, context: KeyContext, text: []const u8) ?Msg {
     if (context.file_search_mode) return payloadMsg(Msg, "file_search_paste", text);
     if (context.repo_picker_mode) return payloadMsg(Msg, "repo_picker_paste", text);
     if (context.push_credential_mode) return payloadMsg(Msg, "push_credential_paste", text);
-    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.push_error_mode) return null;
+    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.push_error_mode) return null;
     if (context.commit_panel_mode) return payloadMsg(Msg, "commit_panel_paste", text);
     return null;
 }
@@ -175,6 +179,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.discard_confirmation_mode) return discardConfirmationKeyToMsg(Msg, key);
     if (context.amend_confirmation_mode) return amendConfirmationKeyToMsg(Msg, key);
     if (context.push_confirmation_mode) return pushConfirmationKeyToMsg(Msg, key);
+    if (context.pull_confirmation_mode) return pullConfirmationKeyToMsg(Msg, key);
     if (context.push_error_mode) return pushErrorKeyToMsg(Msg, key);
     if (context.push_credential_mode) return pushCredentialKeyToMsg(Msg, key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(Msg, key);
@@ -254,6 +259,12 @@ fn amendConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
 fn pushConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_push);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_push);
+    return null;
+}
+
+fn pullConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
+    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_pull);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_pull);
     return null;
 }
 
@@ -397,6 +408,7 @@ fn publicActionToAction(action: keymap.PublicAction) Action {
         .commit => .enter_commit_panel,
         .amend => .enter_amend_panel,
         .push => .request_push,
+        .pull => .request_pull,
         .discard => .request_discard_selected_file,
         .toggle_display_mode => .toggle_display_mode,
         .toggle_line_numbers => .toggle_line_numbers,
@@ -555,6 +567,9 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .request_push => voidMsg(Msg, "request_push"),
         .confirm_push => voidMsg(Msg, "confirm_push"),
         .cancel_push => voidMsg(Msg, "cancel_push"),
+        .request_pull => voidMsg(Msg, "request_pull"),
+        .confirm_pull => voidMsg(Msg, "confirm_pull"),
+        .cancel_pull => voidMsg(Msg, "cancel_pull"),
         .close_push_error => voidMsg(Msg, "close_push_error"),
         .open_push_credentials => voidMsg(Msg, "open_push_credentials"),
         .run_interactive_push => voidMsg(Msg, "run_interactive_push"),
@@ -681,6 +696,9 @@ const TestMsg = union(enum) {
     request_push,
     confirm_push,
     cancel_push,
+    request_pull,
+    confirm_pull,
+    cancel_pull,
     close_push_error,
     open_push_credentials,
     run_interactive_push,
@@ -1132,6 +1150,9 @@ test "keyToMsg maps shifted letter commands consistently" {
     try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{}, .{ .codepoint = 'P' }).?);
     try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{}, shiftedAscii('p', 'P')).?);
     try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{}, shiftedLowerOnly('p')).?);
+    try std.testing.expectEqual(TestMsg.request_pull, keyToMsg(TestMsg, .{}, .{ .codepoint = 'U' }).?);
+    try std.testing.expectEqual(TestMsg.request_pull, keyToMsg(TestMsg, .{}, shiftedAscii('u', 'U')).?);
+    try std.testing.expectEqual(TestMsg.request_pull, keyToMsg(TestMsg, .{}, shiftedLowerOnly('u')).?);
     try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, shiftedLowerOnly('b')).?);
     try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, shiftedLowerOnly('l')).?);
 }
@@ -1141,11 +1162,23 @@ test "keyToMsg keeps lowercase p as previous hunk while uppercase P pushes" {
     try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{}, .{ .codepoint = 'P' }).?);
 }
 
+test "keyToMsg keeps lowercase u as display mode while uppercase U pulls" {
+    try std.testing.expectEqual(TestMsg.toggle_display_mode, keyToMsg(TestMsg, .{}, .{ .codepoint = 'u' }).?);
+    try std.testing.expectEqual(TestMsg.request_pull, keyToMsg(TestMsg, .{}, .{ .codepoint = 'U' }).?);
+}
+
 test "keyToMsg maps push confirmation keys" {
     try std.testing.expectEqual(TestMsg.confirm_push, keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
     try std.testing.expectEqual(TestMsg.cancel_push, keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(TestMsg.cancel_push, keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = 'P' }));
+}
+
+test "keyToMsg maps pull confirmation keys" {
+    try std.testing.expectEqual(TestMsg.confirm_pull, keyToMsg(TestMsg, .{ .pull_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(TestMsg.cancel_pull, keyToMsg(TestMsg, .{ .pull_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(TestMsg.cancel_pull, keyToMsg(TestMsg, .{ .pull_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .pull_confirmation_mode = true }, .{ .codepoint = 'U' }));
 }
 
 test "keyToMsg maps push error modal keys" {

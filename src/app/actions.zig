@@ -219,6 +219,34 @@ pub const PushFinished = struct {
     }
 };
 
+pub const PullFinished = struct {
+    pending: PendingAction,
+    repo_root: []u8,
+    branch: []u8,
+    remote: []u8,
+    remote_branch: []u8,
+    oid: []u8,
+    result: FileActionTaskResult,
+
+    pub fn deinit(self: *PullFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.branch);
+        allocator.free(self.remote);
+        allocator.free(self.remote_branch);
+        allocator.free(self.oid);
+        self.result.deinit(allocator);
+        self.* = .{
+            .pending = .{ .generation = 0, .kind = .pull },
+            .repo_root = &.{},
+            .branch = &.{},
+            .remote = &.{},
+            .remote_branch = &.{},
+            .oid = &.{},
+            .result = .ok,
+        };
+    }
+};
+
 pub const FileActionTaskResult = union(enum) {
     ok,
     failed: []u8,
@@ -721,6 +749,85 @@ pub fn PushTask(comptime Msg: type) type {
     };
 }
 
+pub fn PullTask(comptime Msg: type) type {
+    return struct {
+        pending: PendingAction,
+        repo_root: []u8,
+        branch: []u8,
+        remote: []u8,
+        remote_branch: []u8,
+        oid: []u8,
+        env_map: ?*const std.process.Environ.Map = null,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                if (task.branch.len > 0) allocator.free(task.branch);
+                if (task.remote.len > 0) allocator.free(task.remote);
+                if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
+                allocator.free(task.oid);
+                allocator.destroy(task);
+            }
+
+            const result = runPull(task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, allocator, io);
+            const repo_root = task.repo_root;
+            const branch = task.branch;
+            const remote = task.remote;
+            const remote_branch = task.remote_branch;
+            const oid = task.oid;
+            task.repo_root = &.{};
+            task.branch = &.{};
+            task.remote = &.{};
+            task.remote_branch = &.{};
+            task.oid = &.{};
+
+            return Msg.actionFinished(.{ .pull = PullFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .branch = branch,
+                .remote = remote,
+                .remote_branch = remote_branch,
+                .oid = oid,
+                .result = result,
+            } });
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                if (task.branch.len > 0) allocator.free(task.branch);
+                if (task.remote.len > 0) allocator.free(task.remote);
+                if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
+                allocator.free(task.oid);
+                allocator.destroy(task);
+            }
+
+            const repo_root = task.repo_root;
+            const branch = task.branch;
+            const remote = task.remote;
+            const remote_branch = task.remote_branch;
+            const oid = task.oid;
+            task.repo_root = &.{};
+            task.branch = &.{};
+            task.remote = &.{};
+            task.remote_branch = &.{};
+            task.oid = &.{};
+
+            return Msg.actionFinished(.{ .pull = PullFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .branch = branch,
+                .remote = remote,
+                .remote_branch = remote_branch,
+                .oid = oid,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            } });
+        }
+    };
+}
+
 fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
     return switch (failure) {
         .start_failed => |message| message,
@@ -788,6 +895,19 @@ pub fn runPush(repo_root: []const u8, branch: []const u8, remote: []const u8, re
                 .username = credential.username,
                 .password = credential.password,
             } else null,
+        } },
+        .env_map = env_map,
+    }, allocator, io);
+}
+
+pub fn runPull(repo_root: []const u8, branch: []const u8, remote: []const u8, remote_branch: []const u8, oid: []const u8, env_map: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+    return runOperationMapped("Pull", .{
+        .repo_root = repo_root,
+        .kind = .{ .pull_ff_only = .{
+            .branch = branch,
+            .remote = remote,
+            .remote_branch = remote_branch,
+            .oid = oid,
         } },
         .env_map = env_map,
     }, allocator, io);

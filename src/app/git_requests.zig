@@ -215,6 +215,43 @@ pub fn startPush(
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
+pub fn startPull(
+    comptime Msg: type,
+    ctx: *chasen.Ctx(Msg),
+    action_state: *actions.ActionState,
+    env_map: ?*const std.process.Environ.Map,
+    confirmation: *app_state.PullConfirmation,
+) !void {
+    defer consumePullConfirmation(ctx.allocator(), confirmation);
+
+    const pending = action_state.begin(.pull);
+    errdefer _ = action_state.finish(pending);
+
+    const Task = actions.PullTask(Msg);
+    const task = try ctx.allocator().create(Task);
+    task.* = .{
+        .pending = pending,
+        .repo_root = confirmation.repo_root,
+        .branch = confirmation.branch,
+        .remote = confirmation.remote,
+        .remote_branch = confirmation.remote_branch,
+        .oid = confirmation.oid,
+        .env_map = env_map,
+    };
+    confirmation.* = .{
+        .repo_root = &.{},
+        .branch = &.{},
+        .remote = &.{},
+        .remote_branch = &.{},
+        .oid = &.{},
+        .ahead = 0,
+        .behind = 0,
+    };
+    errdefer destroyPullTask(Task, ctx.allocator(), task);
+
+    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+}
+
 pub fn startCredentialedPush(
     comptime Msg: type,
     ctx: *chasen.Ctx(Msg),
@@ -302,6 +339,32 @@ fn consumePushConfirmation(allocator: std.mem.Allocator, confirmation: *app_stat
         .ahead = 0,
         .behind = 0,
     };
+}
+
+fn consumePullConfirmation(allocator: std.mem.Allocator, confirmation: *app_state.PullConfirmation) void {
+    if (confirmation.repo_root.len > 0) allocator.free(confirmation.repo_root);
+    if (confirmation.branch.len > 0) allocator.free(confirmation.branch);
+    if (confirmation.remote.len > 0) allocator.free(confirmation.remote);
+    if (confirmation.remote_branch.len > 0) allocator.free(confirmation.remote_branch);
+    if (confirmation.oid.len > 0) allocator.free(confirmation.oid);
+    confirmation.* = .{
+        .repo_root = &.{},
+        .branch = &.{},
+        .remote = &.{},
+        .remote_branch = &.{},
+        .oid = &.{},
+        .ahead = 0,
+        .behind = 0,
+    };
+}
+
+fn destroyPullTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
+    if (task.repo_root.len > 0) allocator.free(task.repo_root);
+    if (task.branch.len > 0) allocator.free(task.branch);
+    if (task.remote.len > 0) allocator.free(task.remote);
+    if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
+    if (task.oid.len > 0) allocator.free(task.oid);
+    allocator.destroy(task);
 }
 
 fn destroyHunkTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
