@@ -252,6 +252,37 @@ pub fn startPull(
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
+pub const FetchRequest = struct {
+    repo_root: []u8,
+    remote: []u8,
+};
+
+pub fn startFetch(
+    comptime Msg: type,
+    ctx: *chasen.Ctx(Msg),
+    action_state: *actions.ActionState,
+    env_map: ?*const std.process.Environ.Map,
+    request: *FetchRequest,
+) !void {
+    defer consumeFetchRequest(ctx.allocator(), request);
+
+    const pending = action_state.begin(.fetch);
+    errdefer _ = action_state.finish(pending);
+
+    const Task = actions.FetchTask(Msg);
+    const task = try ctx.allocator().create(Task);
+    task.* = .{
+        .pending = pending,
+        .repo_root = request.repo_root,
+        .remote = request.remote,
+        .env_map = env_map,
+    };
+    request.* = .{ .repo_root = &.{}, .remote = &.{} };
+    errdefer destroyFetchTask(Task, ctx.allocator(), task);
+
+    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+}
+
 pub fn startCredentialedPush(
     comptime Msg: type,
     ctx: *chasen.Ctx(Msg),
@@ -364,6 +395,18 @@ fn destroyPullTask(comptime Task: type, allocator: std.mem.Allocator, task: *Tas
     if (task.remote.len > 0) allocator.free(task.remote);
     if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
     if (task.oid.len > 0) allocator.free(task.oid);
+    allocator.destroy(task);
+}
+
+fn consumeFetchRequest(allocator: std.mem.Allocator, request: *FetchRequest) void {
+    if (request.repo_root.len > 0) allocator.free(request.repo_root);
+    if (request.remote.len > 0) allocator.free(request.remote);
+    request.* = .{ .repo_root = &.{}, .remote = &.{} };
+}
+
+fn destroyFetchTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
+    if (task.repo_root.len > 0) allocator.free(task.repo_root);
+    if (task.remote.len > 0) allocator.free(task.remote);
     allocator.destroy(task);
 }
 

@@ -12,6 +12,7 @@ pub const PublicAction = enum {
     amend,
     push,
     pull,
+    fetch,
     discard,
     toggle_display_mode,
     toggle_line_numbers,
@@ -95,7 +96,10 @@ pub const Config = struct {
 };
 
 pub const Effective = struct {
-    bindings: [action_count]KeySpec = default_specs,
+    // `null` means a public action is intentionally available for config but
+    // does not claim a default key. Fetch uses this to avoid stealing another
+    // global key while still allowing users to opt in.
+    bindings: [action_count]?KeySpec = default_specs,
 
     pub fn fromConfig(config: Config) Effective {
         var result: Effective = .{};
@@ -106,20 +110,27 @@ pub const Effective = struct {
         return result;
     }
 
-    pub fn spec(self: Effective, action: PublicAction) KeySpec {
+    pub fn spec(self: Effective, action: PublicAction) ?KeySpec {
         return self.bindings[@intFromEnum(action)];
+    }
+
+    pub fn isBound(self: Effective, action: PublicAction) bool {
+        return self.spec(action) != null;
     }
 
     pub fn actionForKey(self: Effective, key: chasen.Key) ?PublicAction {
         inline for (@typeInfo(PublicAction).@"enum".fields) |field| {
             const action: PublicAction = @enumFromInt(field.value);
-            if (self.spec(action).matches(key)) return action;
+            if (self.spec(action)) |binding| {
+                if (binding.matches(key)) return action;
+            }
         }
         return null;
     }
 
-    pub fn display(self: Effective, action: PublicAction, buffer: []u8) []const u8 {
-        return formatKeySpec(buffer, self.spec(action));
+    pub fn display(self: Effective, action: PublicAction, buffer: []u8) ?[]const u8 {
+        const binding = self.spec(action) orelse return null;
+        return formatKeySpec(buffer, binding);
     }
 };
 
@@ -161,11 +172,15 @@ pub fn validateConfig(config: Config) bool {
 
     inline for (@typeInfo(PublicAction).@"enum".fields, 0..) |left_field, left_index| {
         const left_action: PublicAction = @enumFromInt(left_field.value);
-        if (isReserved(effective.spec(left_action))) return false;
+        if (effective.spec(left_action)) |left_spec| {
+            if (isReserved(left_spec)) return false;
 
-        inline for (@typeInfo(PublicAction).@"enum".fields[(left_index + 1)..]) |right_field| {
-            const right_action: PublicAction = @enumFromInt(right_field.value);
-            if (effective.spec(left_action).eql(effective.spec(right_action))) return false;
+            inline for (@typeInfo(PublicAction).@"enum".fields[(left_index + 1)..]) |right_field| {
+                const right_action: PublicAction = @enumFromInt(right_field.value);
+                if (effective.spec(right_action)) |right_spec| {
+                    if (left_spec.eql(right_spec)) return false;
+                }
+            }
         }
     }
 
@@ -184,8 +199,8 @@ pub fn formatKeySpec(buffer: []u8, spec: KeySpec) []const u8 {
 
 const default_specs = buildDefaultSpecs();
 
-fn buildDefaultSpecs() [action_count]KeySpec {
-    var specs: [action_count]KeySpec = undefined;
+fn buildDefaultSpecs() [action_count]?KeySpec {
+    var specs: [action_count]?KeySpec = undefined;
     inline for (@typeInfo(PublicAction).@"enum".fields) |field| {
         const action: PublicAction = @enumFromInt(field.value);
         specs[@intFromEnum(action)] = defaultSpec(action);
@@ -193,7 +208,7 @@ fn buildDefaultSpecs() [action_count]KeySpec {
     return specs;
 }
 
-fn defaultSpec(action: PublicAction) KeySpec {
+fn defaultSpec(action: PublicAction) ?KeySpec {
     return switch (action) {
         .help => .{ .exact = '?' },
         .reload => .{ .plain_codepoint = 'r' },
@@ -205,6 +220,7 @@ fn defaultSpec(action: PublicAction) KeySpec {
         .amend => shiftedAscii('a', 'A'),
         .push => shiftedAscii('p', 'P'),
         .pull => shiftedAscii('u', 'U'),
+        .fetch => null,
         .discard => shiftedAscii('d', 'D'),
         .toggle_display_mode => .{ .plain_codepoint = 'u' },
         .toggle_line_numbers => shiftedAscii('l', 'L'),
@@ -371,6 +387,22 @@ test "effective keymap matches overridden actions" {
     try std.testing.expect(effective.actionForKey(.{ .codepoint = 'c' }) == null);
 }
 
+test "fetch is unbound by default and configurable" {
+    const defaults: Effective = .{};
+    try std.testing.expect(!defaults.isBound(.fetch));
+    try std.testing.expect(defaults.actionForKey(.{ .codepoint = 'F' }) != PublicAction.fetch);
+    try std.testing.expect(defaults.display(.fetch, &.{}) == null);
+
+    var config: Config = .{};
+    config.set(.fetch, .{ .ctrl = .s });
+    const effective = Effective.fromConfig(config);
+    try std.testing.expect(effective.isBound(.fetch));
+    try std.testing.expectEqual(PublicAction.fetch, effective.actionForKey(.{ .codepoint = 's', .mods = .{ .ctrl = true } }).?);
+
+    var buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("Ctrl+s", effective.display(.fetch, buffer[0..]).?);
+}
+
 test "validateConfig rejects reserved and duplicate effective bindings" {
     var reserved: Config = .{};
     reserved.set(.commit, .{ .plain_codepoint = 's' });
@@ -384,4 +416,10 @@ test "validateConfig rejects reserved and duplicate effective bindings" {
     duplicate_space.set(.commit, .{ .named = .space });
     duplicate_space.set(.help, .{ .named = .space });
     try std.testing.expect(!validateConfig(duplicate_space));
+
+    var fetch_duplicate: Config = .{};
+    fetch_duplicate.set(.fetch, .{ .plain_codepoint = 'r' });
+    try std.testing.expect(!validateConfig(fetch_duplicate));
+
+    try std.testing.expect(validateConfig(.{}));
 }

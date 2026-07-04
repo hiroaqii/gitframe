@@ -1759,7 +1759,7 @@ fn appendFooterItem(
     action: keymap.PublicAction,
     description: []const u8,
 ) void {
-    const key = app.keymap.display(action, key_buffers[len.*][0..]);
+    const key = app.keymap.display(action, key_buffers[len.*][0..]) orelse return;
     storage[len.*] = ui.key_hint.item(key, description);
     len.* += 1;
 }
@@ -1967,10 +1967,10 @@ fn drawHelpItem(app: anytype, surface: *chasen.Surface, row: u16, item: HelpItem
     var pair_buffer: [40]u8 = undefined;
     const key = switch (item.key) {
         .text => |text| text,
-        .action => |action| app.keymap.display(action, key_buffer[0..]),
+        .action => |action| app.keymap.display(action, key_buffer[0..]) orelse return,
         .pair => |pair| blk: {
-            const left = app.keymap.display(pair.left, left_buffer[0..]);
-            const right = app.keymap.display(pair.right, right_buffer[0..]);
+            const left = app.keymap.display(pair.left, left_buffer[0..]) orelse return;
+            const right = app.keymap.display(pair.right, right_buffer[0..]) orelse return;
             break :blk std.fmt.bufPrint(pair_buffer[0..], "{s} / {s}", .{ left, right }) catch left;
         },
     };

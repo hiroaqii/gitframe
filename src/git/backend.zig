@@ -134,6 +134,7 @@ pub const OperationKind = union(enum) {
     amend: CommitRequest,
     push: PushRequest,
     pull_ff_only: PullRequest,
+    fetch: FetchRequest,
 };
 
 pub const StagePatchRequest = struct {
@@ -163,6 +164,10 @@ pub const PullRequest = struct {
     /// current branch, so the backend must fail closed if the confirmation was
     /// approved for an older HEAD.
     oid: []const u8,
+};
+
+pub const FetchRequest = struct {
+    remote: []const u8,
 };
 
 pub const PushCredentials = struct {
@@ -252,6 +257,7 @@ pub const LocalCommandBackend = struct {
             .amend => |commit| runGitAmend(allocator, io, request.repo_root, commit),
             .push => |push| runGitPush(allocator, io, request.repo_root, request.env_map, push),
             .pull_ff_only => |pull| runGitPull(allocator, io, request.repo_root, request.env_map, pull),
+            .fetch => |fetch| runGitFetch(allocator, io, request.repo_root, request.env_map, fetch),
         };
     }
 
@@ -728,6 +734,49 @@ fn runGitPull(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, p
     if (result.stderr.len > 0) return .{ .failed = result.stderr };
     allocator.free(result.stderr);
     return .{ .failed = std.fmt.allocPrint(allocator, "git pull --ff-only failed: {any}", .{result.term}) catch return error.OutOfMemory };
+}
+
+fn runGitFetch(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, parent_env: ?*const std.process.Environ.Map, request: FetchRequest) LoadError!OperationResult {
+    // Background fetch must never take over the terminal for credentials. Keep
+    // it on the same non-interactive remote path as pull/push, and reject an
+    // explicit BatchMode=no override before spawning git.
+    if (remoteEnvironmentRejectedInteractiveSsh(parent_env)) {
+        return .{ .failed_static = "Fetch requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND" };
+    }
+
+    var env = remoteOperationEnvironment(allocator, parent_env) catch |err| switch (err) {
+        error.InteractiveSshCommand => return .{ .failed_static = "Fetch requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND" },
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SpawnFailed => return error.SpawnFailed,
+        error.StreamTooLong => return error.StreamTooLong,
+    };
+    defer env.deinit();
+
+    const argv = [_][]const u8{ "git", "fetch", request.remote };
+    const result = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .cwd = .{ .path = repo_root },
+        .environ_map = &env,
+        .stdout_limit = .limited(128 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.StreamTooLong,
+        else => error.SpawnFailed,
+    };
+
+    allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .ok;
+        },
+        else => {},
+    }
+
+    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    allocator.free(result.stderr);
+    return .{ .failed = std.fmt.allocPrint(allocator, "git fetch failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
 fn pushFailureWithDiagnostics(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, stderr: []u8) LoadError![]u8 {
@@ -1565,6 +1614,86 @@ test "LocalCommandBackend pull rejects interactive ssh command" {
         .failed_static => |message| try std.testing.expectEqualStrings("Pull requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND", message),
         else => return error.ExpectedInteractiveSshPullFailure,
     }
+}
+
+test "LocalCommandBackend fetch rejects interactive ssh command" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const repo = try setupPullWorkRepoForTest(io, &tmp);
+    defer std.testing.allocator.free(repo.repo_root);
+    defer std.testing.allocator.free(repo.oid);
+
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("GIT_SSH_COMMAND", "ssh -o BatchMode=no -i /tmp/key");
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = repo.repo_root,
+        .kind = .{ .fetch = .{ .remote = "missing" } },
+        .env_map = &parent,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed_static => |message| try std.testing.expectEqualStrings("Fetch requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND", message),
+        else => return error.ExpectedInteractiveSshFetchFailure,
+    }
+}
+
+test "LocalCommandBackend fetch updates remote tracking refs from local bare remote" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    try tmp.dir.createDir(io, "updater", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    var updater = try tmp.dir.openDir(io, "updater", .{});
+    defer updater.close(io);
+
+    const remote_root = try tmp.dir.realPathFileAlloc(io, "remote.git", std.testing.allocator);
+    defer std.testing.allocator.free(remote_root);
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, work);
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "initial\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
+    try runTestGit(io, &.{ "git", "push", "origin", "main" }, work);
+    try runTestGit(io, &.{ "git", "fetch", "origin" }, work);
+    const before = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "refs/remotes/origin/main" });
+    defer std.testing.allocator.free(before);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, updater);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, updater);
+    try runTestGit(io, &.{ "git", "pull", "--ff-only", "origin", "main" }, updater);
+    try updater.writeFile(io, .{ .sub_path = "README.md", .data = "updated\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, updater);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "update" }, updater);
+    try runTestGit(io, &.{ "git", "push", "origin", "main" }, updater);
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = repo_root,
+        .kind = .{ .fetch = .{ .remote = "origin" } },
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(OperationResult.ok, result);
+
+    const after = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "refs/remotes/origin/main" });
+    defer std.testing.allocator.free(after);
+    const remote = try gitOutputAlloc(io, work, &.{ "git", "ls-remote", "origin", "refs/heads/main" });
+    defer std.testing.allocator.free(remote);
+
+    try std.testing.expect(!std.mem.eql(u8, trimLineEnd(before), trimLineEnd(after)));
+    try std.testing.expect(std.mem.indexOf(u8, remote, trimLineEnd(after)) != null);
 }
 
 test "LocalCommandBackend loads branch status without upstream" {

@@ -174,6 +174,11 @@ pub const PullTarget = struct {
     behind: u32,
 };
 
+pub const FetchTarget = struct {
+    repo_root: []const u8,
+    remote: []const u8,
+};
+
 pub const PushTargetResult = union(enum) {
     ready: PushTarget,
     unavailable_source,
@@ -204,6 +209,17 @@ pub const PullTargetResult = union(enum) {
     status_stale,
     dirty_worktree,
     untracked_files_present,
+};
+
+pub const FetchTargetResult = union(enum) {
+    ready: FetchTarget,
+    unavailable_source,
+    no_repo,
+    loading_branch_status,
+    detached_head,
+    branch_unavailable,
+    no_upstream,
+    upstream_not_remote,
 };
 
 pub const StatusSnapshot = struct {
@@ -336,6 +352,29 @@ pub fn pullTarget(ctx: PullActionContext) PullTargetResult {
         .oid = oid,
         .ahead = ahead_behind.ahead,
         .behind = ahead_behind.behind,
+    } };
+}
+
+pub fn fetchTarget(ctx: RemoteActionContext) FetchTargetResult {
+    // Fetch only needs a repository and branch status. Unlike pull, it does not
+    // depend on file status projection or a clean-worktree decision, so range
+    // views remain eligible here.
+    if (!diff_source.sourceRequiresRepo(ctx.source)) return .unavailable_source;
+    const repo_root = ctx.repo_root orelse return .no_repo;
+    if (!ctx.branch_status.freshFor(repo_root)) return .loading_branch_status;
+
+    const branch_status = ctx.branch_status.status;
+    switch (branch_status.head) {
+        .branch => {},
+        .detached => return .detached_head,
+        .unknown => return .branch_unavailable,
+    }
+    const upstream = branch_status.upstream orelse return .no_upstream;
+    if (upstream.remote_branch.len == 0) return .upstream_not_remote;
+
+    return .{ .ready = .{
+        .repo_root = repo_root,
+        .remote = upstream.remote,
     } };
 }
 
@@ -618,6 +657,35 @@ test "pullTarget requires behind-only branch and clean status" {
     }
 }
 
+test "fetchTarget requires a fresh remote upstream branch" {
+    const status: git_branch_status.BranchStatus = .{
+        .oid = "abc123",
+        .head = .{ .branch = "feature" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+    };
+
+    switch (fetchTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = status },
+    })) {
+        .ready => |target| {
+            try std.testing.expectEqualStrings("/repo", target.repo_root);
+            try std.testing.expectEqualStrings("origin", target.remote);
+        },
+        else => return error.ExpectedFetchTargetReady,
+    }
+
+    switch (fetchTarget(.{
+        .source = .{ .range = "main..HEAD" },
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = status },
+    })) {
+        .ready => |target| try std.testing.expectEqualStrings("origin", target.remote),
+        else => return error.ExpectedRangeFetchTargetReady,
+    }
+}
+
 test "pushFailureHint identifies SSH publickey failures" {
     const message =
         "git@github.com: Permission denied (publickey).\n" ++
@@ -782,5 +850,50 @@ test "pullTarget rejects unsafe branch and worktree states" {
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
         .status = .{ .repo_root = "/repo", .loading = false, .entries = &untracked },
+    }));
+}
+
+test "fetchTarget rejects unsafe or unsupported branch states" {
+    const ready_status: git_branch_status.BranchStatus = .{
+        .oid = "abc123",
+        .head = .{ .branch = "feature" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+    };
+
+    try std.testing.expectEqual(FetchTargetResult.unavailable_source, fetchTarget(.{
+        .source = .stdin,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
+    }));
+    try std.testing.expectEqual(FetchTargetResult.loading_branch_status, fetchTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/other", .loading = false, .status = ready_status },
+    }));
+    try std.testing.expectEqual(FetchTargetResult.detached_head, fetchTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
+            .oid = "abc123",
+            .head = .detached,
+            .upstream = ready_status.upstream,
+        } },
+    }));
+    try std.testing.expectEqual(FetchTargetResult.no_upstream, fetchTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
+            .oid = "abc123",
+            .head = .{ .branch = "feature" },
+        } },
+    }));
+    try std.testing.expectEqual(FetchTargetResult.upstream_not_remote, fetchTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
+            .oid = "abc123",
+            .head = .{ .branch = "feature" },
+            .upstream = .{ .name = "origin", .remote = "origin", .remote_branch = "" },
+        } },
     }));
 }

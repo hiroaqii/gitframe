@@ -18,6 +18,7 @@ pub const ActionKind = enum {
     amend,
     push,
     pull,
+    fetch,
     switch_branch,
 };
 
@@ -242,6 +243,25 @@ pub const PullFinished = struct {
             .remote = &.{},
             .remote_branch = &.{},
             .oid = &.{},
+            .result = .ok,
+        };
+    }
+};
+
+pub const FetchFinished = struct {
+    pending: PendingAction,
+    repo_root: []u8,
+    remote: []u8,
+    result: FileActionTaskResult,
+
+    pub fn deinit(self: *FetchFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.remote);
+        self.result.deinit(allocator);
+        self.* = .{
+            .pending = .{ .generation = 0, .kind = .fetch },
+            .repo_root = &.{},
+            .remote = &.{},
             .result = .ok,
         };
     }
@@ -828,6 +848,58 @@ pub fn PullTask(comptime Msg: type) type {
     };
 }
 
+pub fn FetchTask(comptime Msg: type) type {
+    return struct {
+        pending: PendingAction,
+        repo_root: []u8,
+        remote: []u8,
+        env_map: ?*const std.process.Environ.Map = null,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                allocator.free(task.remote);
+                allocator.destroy(task);
+            }
+
+            const result = runFetch(task.repo_root, task.remote, task.env_map, allocator, io);
+            const repo_root = task.repo_root;
+            const remote = task.remote;
+            task.repo_root = &.{};
+            task.remote = &.{};
+
+            return Msg.actionFinished(.{ .fetch = FetchFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .remote = remote,
+                .result = result,
+            } });
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                allocator.free(task.remote);
+                allocator.destroy(task);
+            }
+
+            const repo_root = task.repo_root;
+            const remote = task.remote;
+            task.repo_root = &.{};
+            task.remote = &.{};
+
+            return Msg.actionFinished(.{ .fetch = FetchFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .remote = remote,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            } });
+        }
+    };
+}
+
 fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
     return switch (failure) {
         .start_failed => |message| message,
@@ -909,6 +981,14 @@ pub fn runPull(repo_root: []const u8, branch: []const u8, remote: []const u8, re
             .remote_branch = remote_branch,
             .oid = oid,
         } },
+        .env_map = env_map,
+    }, allocator, io);
+}
+
+pub fn runFetch(repo_root: []const u8, remote: []const u8, env_map: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+    return runOperationMapped("Fetch", .{
+        .repo_root = repo_root,
+        .kind = .{ .fetch = .{ .remote = remote } },
         .env_map = env_map,
     }, allocator, io);
 }

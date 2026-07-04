@@ -135,6 +135,7 @@ const Action = enum {
     request_pull,
     confirm_pull,
     cancel_pull,
+    request_fetch,
     close_push_error,
     open_push_credentials,
     run_interactive_push,
@@ -238,8 +239,12 @@ fn repoPickerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) 
 }
 
 fn helpKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
-    if (context.keymap.spec(.help).matches(key)) return actionToMsg(Msg, .close_help);
-    if (context.keymap.spec(.commit).matches(key)) return actionToMsg(Msg, .enter_commit_panel);
+    if (context.keymap.spec(.help)) |spec| {
+        if (spec.matches(key)) return actionToMsg(Msg, .close_help);
+    }
+    if (context.keymap.spec(.commit)) |spec| {
+        if (spec.matches(key)) return actionToMsg(Msg, .enter_commit_panel);
+    }
     if (helpActionForKey(key)) |action| return actionToMsg(Msg, action);
     return null;
 }
@@ -409,6 +414,7 @@ fn publicActionToAction(action: keymap.PublicAction) Action {
         .amend => .enter_amend_panel,
         .push => .request_push,
         .pull => .request_pull,
+        .fetch => .request_fetch,
         .discard => .request_discard_selected_file,
         .toggle_display_mode => .toggle_display_mode,
         .toggle_line_numbers => .toggle_line_numbers,
@@ -570,6 +576,7 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .request_pull => voidMsg(Msg, "request_pull"),
         .confirm_pull => voidMsg(Msg, "confirm_pull"),
         .cancel_pull => voidMsg(Msg, "cancel_pull"),
+        .request_fetch => voidMsg(Msg, "request_fetch"),
         .close_push_error => voidMsg(Msg, "close_push_error"),
         .open_push_credentials => voidMsg(Msg, "open_push_credentials"),
         .run_interactive_push => voidMsg(Msg, "run_interactive_push"),
@@ -699,6 +706,7 @@ const TestMsg = union(enum) {
     request_pull,
     confirm_pull,
     cancel_pull,
+    request_fetch,
     close_push_error,
     open_push_credentials,
     run_interactive_push,
@@ -837,12 +845,14 @@ test "keyToMsg uses configurable viewer bindings" {
     var config: keymap.Config = .{};
     config.set(.commit, .{ .plain_codepoint = 'm' });
     config.set(.help, .{ .plain_codepoint = 'z' });
+    config.set(.fetch, .{ .ctrl = .s });
     const effective = keymap.Effective.fromConfig(config);
 
     try std.testing.expectEqual(TestMsg.enter_commit_panel, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'm' }).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'c' }));
     try std.testing.expectEqual(TestMsg.open_help, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'z' }).?);
     try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true, .keymap = effective }, .{ .codepoint = 'z' }).?);
+    try std.testing.expectEqual(TestMsg.request_fetch, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 's', .mods = .{ .ctrl = true } }).?);
 }
 
 test "keyToMsg uses configured keys inside help mode" {

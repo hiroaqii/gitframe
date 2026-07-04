@@ -81,6 +81,8 @@ const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
 const AmendFinished = app_actions.AmendFinished;
 const CommitFinished = app_actions.CommitFinished;
 const DiscardFileFinished = app_actions.DiscardFileFinished;
+const FetchFinished = app_actions.FetchFinished;
+const FetchTargetResult = git_ops.FetchTargetResult;
 const PullFinished = app_actions.PullFinished;
 const PullTargetResult = git_ops.PullTargetResult;
 const PushFinished = app_actions.PushFinished;
@@ -170,6 +172,7 @@ const ActionFinishedMsg = union(enum) {
     amend: AmendFinished,
     push: PushFinished,
     pull: PullFinished,
+    fetch: FetchFinished,
     push_foreground: chasen.ForegroundCommandResult,
     editor: chasen.ForegroundCommandResult,
 };
@@ -462,6 +465,7 @@ pub const App = struct {
         request_pull,
         confirm_pull,
         cancel_pull,
+        request_fetch,
         close_push_error,
         open_push_credentials,
         run_interactive_push,
@@ -718,6 +722,7 @@ pub const App = struct {
             .request_pull => try self.requestPull(ctx.allocator()),
             .confirm_pull => try self.confirmPull(ctx),
             .cancel_pull => self.cancelPullConfirmation(ctx.allocator()),
+            .request_fetch => try self.requestFetch(ctx),
             .close_push_error => self.clearPushError(ctx.allocator()),
             .open_push_credentials => try self.openPushCredentialPrompt(ctx),
             .run_interactive_push => try self.runInteractivePush(ctx),
@@ -763,6 +768,7 @@ pub const App = struct {
             .amend => |result| try self.finishAmend(ctx, result),
             .push => |result| try self.finishPush(ctx, result),
             .pull => |result| try self.finishPull(ctx, result),
+            .fetch => |result| try self.finishFetch(ctx, result),
             .push_foreground => |result| try self.finishPushForeground(ctx, result),
             .editor => |result| try self.finishEditorCommand(ctx, result),
         }
@@ -2188,6 +2194,61 @@ pub const App = struct {
         if (self.overlay.isPullBranch()) self.overlay.close();
     }
 
+    fn requestFetch(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (app_git_requests.hasPendingAction(self.actions)) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+
+        const target = switch (self.selectedFetchTarget()) {
+            .ready => |target| target,
+            .unavailable_source => {
+                self.setStatus("fetch unavailable for this source", .{});
+                return;
+            },
+            .no_repo => {
+                self.setStatus("fetch unavailable: no repository", .{});
+                return;
+            },
+            .loading_branch_status => {
+                self.setStatus("branch status is still loading", .{});
+                return;
+            },
+            .detached_head => {
+                self.setStatus("fetch unavailable on detached HEAD", .{});
+                return;
+            },
+            .branch_unavailable => {
+                self.setStatus("fetch unavailable: branch is unknown", .{});
+                return;
+            },
+            .no_upstream => {
+                self.setStatus("fetch unavailable: no upstream remote", .{});
+                return;
+            },
+            .upstream_not_remote => {
+                self.setStatus("fetch unavailable: unsupported upstream", .{});
+                return;
+            },
+        };
+
+        const owned_repo_root = try ctx.allocator().dupe(u8, target.repo_root);
+        errdefer ctx.allocator().free(owned_repo_root);
+        const owned_remote = try ctx.allocator().dupe(u8, target.remote);
+        errdefer ctx.allocator().free(owned_remote);
+
+        var request: app_git_requests.FetchRequest = .{
+            .repo_root = owned_repo_root,
+            .remote = owned_remote,
+        };
+
+        self.setStatus("fetching: {s}", .{target.remote});
+        app_git_requests.startFetch(Msg, ctx, &self.actions, self.env_map, &request) catch |err| {
+            self.setStatus("could not start fetch task", .{});
+            return err;
+        };
+    }
+
     fn setPushError(self: *App, allocator: std.mem.Allocator, message: []const u8) !void {
         try self.setPushErrorWithRetry(allocator, message, null, false);
     }
@@ -2471,6 +2532,18 @@ pub const App = struct {
                 .repo_root = self.git_status.repo_root,
                 .loading = self.status_load_pending != null,
                 .entries = self.git_status.document.entries,
+            },
+        });
+    }
+
+    fn selectedFetchTarget(self: *const App) FetchTargetResult {
+        return git_ops.fetchTarget(.{
+            .source = self.config.source,
+            .repo_root = self.activeRepoRoot(),
+            .branch_status = .{
+                .repo_root = self.branch_status.repo_root,
+                .loading = self.branch_status_load_pending != null,
+                .status = self.branch_status.status,
             },
         });
     }
@@ -2783,6 +2856,38 @@ pub const App = struct {
             },
             .failed, .failed_static => {
                 _ = self.setActionFailureStatus("pull", result.result);
+                // A failed pull may still have fetched remote-tracking refs
+                // before `--ff-only` or another later step failed, so refresh
+                // the active repo when it still matches the completed task.
+                if (active_matches) try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+            },
+        }
+    }
+
+    fn finishFetch(self: *App, ctx: *chasen.Ctx(Msg), finished: FetchFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (!self.actions.finish(result.pending)) return;
+
+        const active_root = self.activeRepoRoot();
+        const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+
+        switch (result.result) {
+            .ok => {
+                if (active_matches) {
+                    self.setStatus("fetched: {s}", .{result.remote});
+                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+                } else {
+                    self.setStatus("fetched: {s}", .{result.repo_root});
+                }
+            },
+            .failed, .failed_static => {
+                _ = self.setActionFailureStatus("fetch", result.result);
+                // Git can update some refs before reporting an overall fetch
+                // failure. Reload only the still-active matching repo so the UI
+                // sees those side effects without disturbing a repo switch.
+                if (active_matches) try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
             },
         }
     }
@@ -7087,6 +7192,18 @@ test "requestPull rejects while another action is pending" {
     try std.testing.expectEqualStrings("another git action is running", app.status.text());
 }
 
+test "requestFetch rejects while another action is pending" {
+    var app: App = .{ .allocator = std.testing.allocator };
+    app.actions.pending = .{ .generation = 1, .kind = .stage_file };
+    defer app.actions.clear();
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.requestFetch(&ctx);
+
+    try std.testing.expect(app.actions.pending != null);
+    try std.testing.expectEqualStrings("another git action is running", app.status.text());
+}
+
 test "confirmPush keeps confirmation when another action is pending" {
     var app: App = .{
         .allocator = std.testing.allocator,
@@ -7210,6 +7327,83 @@ test "finishPull does not reload a stale active repository" {
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.load.pending == null);
     try std.testing.expectEqualStrings("pulled: /repo", app.status.text());
+}
+
+test "finishPull reloads matching active repo after failure" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    const pending = app.actions.begin(.pull);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
+
+    try app.finishPull(&ctx, .{
+        .pending = pending,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .branch = try std.testing.allocator.dupe(u8, "feature"),
+        .remote = try std.testing.allocator.dupe(u8, "origin"),
+        .remote_branch = try std.testing.allocator.dupe(u8, "main"),
+        .oid = try std.testing.allocator.dupe(u8, "abc123"),
+        .result = .{ .failed_static = "remote unavailable" },
+    });
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.load.pending != null);
+    try std.testing.expectEqualStrings("pull failed: remote unavailable", app.status.text());
+}
+
+test "finishFetch does not reload a stale active repository" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "other",
+            .display_path = "/other",
+            .canonical_root = "/other",
+        } } },
+    };
+    const pending = app.actions.begin(.fetch);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishFetch(&ctx, .{
+        .pending = pending,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .remote = try std.testing.allocator.dupe(u8, "origin"),
+        .result = .ok,
+    });
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.load.pending == null);
+    try std.testing.expectEqualStrings("fetched: /repo", app.status.text());
+}
+
+test "finishFetch reloads matching active repo after failure" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    const pending = app.actions.begin(.fetch);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
+
+    try app.finishFetch(&ctx, .{
+        .pending = pending,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .remote = try std.testing.allocator.dupe(u8, "origin"),
+        .result = .{ .failed_static = "remote unavailable" },
+    });
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.load.pending != null);
+    try std.testing.expectEqualStrings("fetch failed: remote unavailable", app.status.text());
 }
 
 test "finishPush failed preserves retry target oid for credential prompt" {
