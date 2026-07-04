@@ -151,6 +151,12 @@ pub const PushRequest = struct {
     /// Commit snapshot used by the pre-push safety check. The push argv uses
     /// the branch refspec; this OID only proves the branch has not moved.
     oid: []const u8,
+    credentials: ?PushCredentials = null,
+};
+
+pub const PushCredentials = struct {
+    username: []const u8,
+    password: []const u8,
 };
 
 /// Request for a write operation executed in a concrete repository.
@@ -515,6 +521,93 @@ fn runGitAmend(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, 
     return runGitCommitLike(allocator, io, repo_root, request, true);
 }
 
+const AskpassSetup = struct {
+    base_dir: std.Io.Dir,
+    base_dir_owned: bool = false,
+    dir_name: []u8,
+    helper_path: []u8,
+    username_path: []u8,
+    password_path: []u8,
+
+    fn deinit(self: *AskpassSetup, allocator: std.mem.Allocator, io: std.Io) void {
+        self.base_dir.deleteTree(io, self.dir_name) catch {};
+        if (self.base_dir_owned) self.base_dir.close(io);
+        allocator.free(self.dir_name);
+        allocator.free(self.helper_path);
+        allocator.free(self.username_path);
+        allocator.free(self.password_path);
+        self.* = undefined;
+    }
+};
+
+// Keep the helper fail-closed: unknown prompt strings must not receive the
+// password/token. Prefix matching also avoids treating "Password for
+// 'https://myusername@host'" as a username prompt.
+const askpass_helper_script =
+    \\#!/bin/sh
+    \\case "$1" in
+    \\  Username*|username*) cat "$GITFRAME_ASKPASS_USERNAME_FILE" ;;
+    \\  Password*|password*) cat "$GITFRAME_ASKPASS_PASSWORD_FILE" ;;
+    \\  *) exit 1 ;;
+    \\esac
+    \\
+;
+
+fn setupAskpass(allocator: std.mem.Allocator, io: std.Io, parent_env: ?*const std.process.Environ.Map, credentials: PushCredentials) LoadError!AskpassSetup {
+    // Prefer XDG_RUNTIME_DIR because it is normally user-private and often
+    // tmpfs-backed. Fall back to /tmp for non-conforming or unavailable values,
+    // but still create a 0700 per-attempt directory before writing secrets.
+    const configured_base_path = if (parent_env) |env| env.get("XDG_RUNTIME_DIR") orelse "/tmp" else "/tmp";
+    const base_path = if (std.fs.path.isAbsolute(configured_base_path)) configured_base_path else "/tmp";
+    var actual_base_path = base_path;
+    var base_dir = std.Io.Dir.openDirAbsolute(io, base_path, .{}) catch blk: {
+        actual_base_path = "/tmp";
+        break :blk std.Io.Dir.openDirAbsolute(io, "/tmp", .{}) catch return error.SpawnFailed;
+    };
+    var base_dir_owned = true;
+    errdefer if (base_dir_owned) base_dir.close(io);
+
+    const now = std.Io.Clock.now(.awake, io).nanoseconds;
+    const dir_name = std.fmt.allocPrint(allocator, "gitframe-askpass-{d}", .{now}) catch return error.OutOfMemory;
+    errdefer allocator.free(dir_name);
+
+    base_dir.createDir(io, dir_name, .fromMode(0o700)) catch return error.SpawnFailed;
+    errdefer base_dir.deleteTree(io, dir_name) catch {};
+
+    var temp_dir = base_dir.openDir(io, dir_name, .{}) catch return error.SpawnFailed;
+    defer temp_dir.close(io);
+
+    // Git askpass takes credentials via a program callback. Store the actual
+    // secret bytes in 0600 files and pass only paths through the environment so
+    // the token does not appear in argv, remote URLs, or environment values.
+    try writeAskpassFile(io, temp_dir, "username", credentials.username, .fromMode(0o600));
+    try writeAskpassFile(io, temp_dir, "password", credentials.password, .fromMode(0o600));
+    try writeAskpassFile(io, temp_dir, "askpass.sh", askpass_helper_script, .fromMode(0o700));
+
+    const helper_path = std.fmt.allocPrint(allocator, "{s}/{s}/askpass.sh", .{ actual_base_path, dir_name }) catch return error.OutOfMemory;
+    errdefer allocator.free(helper_path);
+    const username_path = std.fmt.allocPrint(allocator, "{s}/{s}/username", .{ actual_base_path, dir_name }) catch return error.OutOfMemory;
+    errdefer allocator.free(username_path);
+    const password_path = std.fmt.allocPrint(allocator, "{s}/{s}/password", .{ actual_base_path, dir_name }) catch return error.OutOfMemory;
+    errdefer allocator.free(password_path);
+
+    base_dir_owned = false;
+    return .{
+        .base_dir = base_dir,
+        .base_dir_owned = true,
+        .dir_name = dir_name,
+        .helper_path = helper_path,
+        .username_path = username_path,
+        .password_path = password_path,
+    };
+}
+
+fn writeAskpassFile(io: std.Io, dir: std.Io.Dir, name: []const u8, contents: []const u8, permissions: std.Io.File.Permissions) LoadError!void {
+    var file = dir.createFile(io, name, .{ .exclusive = true, .permissions = permissions }) catch return error.SpawnFailed;
+    defer file.close(io);
+    file.writeStreamingAll(io, contents) catch return error.SpawnFailed;
+}
+
 fn runGitPush(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, parent_env: ?*const std.process.Environ.Map, request: PushRequest) LoadError!OperationResult {
     if (!try verifyPushSnapshot(allocator, io, repo_root, request)) {
         return .{ .failed_static = "Branch changed before push; reload and try again" };
@@ -534,6 +627,14 @@ fn runGitPush(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, p
         error.StreamTooLong => return error.StreamTooLong,
     };
     defer env.deinit();
+
+    var askpass = if (request.credentials) |credentials| try setupAskpass(allocator, io, parent_env, credentials) else null;
+    defer if (askpass) |*setup| setup.deinit(allocator, io);
+    if (askpass) |setup| {
+        env.put("GIT_ASKPASS", setup.helper_path) catch return error.OutOfMemory;
+        env.put("GITFRAME_ASKPASS_USERNAME_FILE", setup.username_path) catch return error.OutOfMemory;
+        env.put("GITFRAME_ASKPASS_PASSWORD_FILE", setup.password_path) catch return error.OutOfMemory;
+    }
 
     const refspec = std.fmt.allocPrint(allocator, "refs/heads/{s}:refs/heads/{s}", .{ request.branch, request.remote_branch }) catch return error.OutOfMemory;
     defer allocator.free(refspec);
@@ -975,6 +1076,73 @@ test "pushEnvironment disables interactive credential prompts" {
 
     try std.testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
     try std.testing.expectEqualStrings("ssh -o BatchMode=yes", env.get("GIT_SSH_COMMAND").?);
+}
+
+test "askpass helper returns only recognized prompts" {
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("XDG_RUNTIME_DIR", "/tmp");
+
+    var setup = try setupAskpass(std.testing.allocator, std.testing.io, &parent, .{
+        .username = "user",
+        .password = "token",
+    });
+    defer setup.deinit(std.testing.allocator, std.testing.io);
+
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GITFRAME_ASKPASS_USERNAME_FILE", setup.username_path);
+    try env.put("GITFRAME_ASKPASS_PASSWORD_FILE", setup.password_path);
+    try std.testing.expect(!std.mem.eql(u8, env.get("GITFRAME_ASKPASS_PASSWORD_FILE").?, "token"));
+
+    const username_result = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &[_][]const u8{ setup.helper_path, "Username for 'https://host':" },
+        .environ_map = &env,
+    });
+    defer std.testing.allocator.free(username_result.stdout);
+    defer std.testing.allocator.free(username_result.stderr);
+    try std.testing.expectEqualStrings("user", username_result.stdout);
+
+    const password_result = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &[_][]const u8{ setup.helper_path, "Password for 'https://host':" },
+        .environ_map = &env,
+    });
+    defer std.testing.allocator.free(password_result.stdout);
+    defer std.testing.allocator.free(password_result.stderr);
+    try std.testing.expectEqualStrings("token", password_result.stdout);
+
+    const password_with_username_result = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &[_][]const u8{ setup.helper_path, "Password for 'https://myusername@host':" },
+        .environ_map = &env,
+    });
+    defer std.testing.allocator.free(password_with_username_result.stdout);
+    defer std.testing.allocator.free(password_with_username_result.stderr);
+    try std.testing.expectEqualStrings("token", password_with_username_result.stdout);
+
+    const unknown_result = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &[_][]const u8{ setup.helper_path, "Proxy prompt:" },
+        .environ_map = &env,
+    });
+    defer std.testing.allocator.free(unknown_result.stdout);
+    defer std.testing.allocator.free(unknown_result.stderr);
+    try std.testing.expectEqualStrings("", unknown_result.stdout);
+    try std.testing.expect(unknown_result.term != .exited or unknown_result.term.exited != 0);
+}
+
+test "askpass setup falls back when XDG_RUNTIME_DIR is relative" {
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("XDG_RUNTIME_DIR", "relative-runtime");
+
+    var setup = try setupAskpass(std.testing.allocator, std.testing.io, &parent, .{
+        .username = "user",
+        .password = "token",
+    });
+    defer setup.deinit(std.testing.allocator, std.testing.io);
+
+    try std.testing.expect(std.mem.startsWith(u8, setup.helper_path, "/tmp/"));
+    try std.testing.expect(std.mem.startsWith(u8, setup.username_path, "/tmp/"));
+    try std.testing.expect(std.mem.startsWith(u8, setup.password_path, "/tmp/"));
 }
 
 test "pushEnvironment preserves existing ssh command while adding BatchMode" {

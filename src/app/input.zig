@@ -30,6 +30,7 @@ pub const KeyContext = struct {
     amend_confirmation_mode: bool = false,
     push_confirmation_mode: bool = false,
     push_error_mode: bool = false,
+    push_credential_mode: bool = false,
     search_query_len: usize = 0,
     focus: Focus = .sidebar,
     sidebar_hidden: bool = false,
@@ -102,6 +103,12 @@ const Action = enum {
     push_error_scroll_down,
     push_error_page_up,
     push_error_page_down,
+    push_credential_tab,
+    push_credential_submit,
+    push_credential_cancel,
+    push_credential_backspace,
+    push_credential_move_left,
+    push_credential_move_right,
     cycle_changed_file_filter,
     toggle_reviewed_file,
     toggle_hide_reviewed_files,
@@ -125,6 +132,7 @@ const Action = enum {
     confirm_push,
     cancel_push,
     close_push_error,
+    open_push_credentials,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
@@ -152,6 +160,7 @@ fn pasteToMsg(comptime Msg: type, context: KeyContext, text: []const u8) ?Msg {
     if (context.search_mode) return payloadMsg(Msg, "search_paste", text);
     if (context.file_search_mode) return payloadMsg(Msg, "file_search_paste", text);
     if (context.repo_picker_mode) return payloadMsg(Msg, "repo_picker_paste", text);
+    if (context.push_credential_mode) return payloadMsg(Msg, "push_credential_paste", text);
     if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.push_error_mode) return null;
     if (context.commit_panel_mode) return payloadMsg(Msg, "commit_panel_paste", text);
     return null;
@@ -166,6 +175,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.amend_confirmation_mode) return amendConfirmationKeyToMsg(Msg, key);
     if (context.push_confirmation_mode) return pushConfirmationKeyToMsg(Msg, key);
     if (context.push_error_mode) return pushErrorKeyToMsg(Msg, key);
+    if (context.push_credential_mode) return pushCredentialKeyToMsg(Msg, key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(Msg, key);
     return viewerKeyToMsg(Msg, context, key);
 }
@@ -248,10 +258,22 @@ fn pushConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
 
 fn pushErrorKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .close_push_error);
+    if (key.codepoint == 'c' and !hasCommandModifier(key)) return actionToMsg(Msg, .open_push_credentials);
     if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .push_error_scroll_up);
     if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .push_error_scroll_down);
     if (key.matches(chasen.Key.page_up, .{})) return actionToMsg(Msg, .push_error_page_up);
     if (key.matches(chasen.Key.page_down, .{})) return actionToMsg(Msg, .push_error_page_down);
+    return null;
+}
+
+fn pushCredentialKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
+    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .push_credential_cancel);
+    if (key.matches(chasen.Key.tab, .{})) return actionToMsg(Msg, .push_credential_tab);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .push_credential_submit);
+    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .push_credential_backspace);
+    if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .push_credential_move_left);
+    if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .push_credential_move_right);
+    if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "push_credential_insert", codepoint);
     return null;
 }
 
@@ -503,6 +525,12 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .push_error_scroll_down => voidMsg(Msg, "push_error_scroll_down"),
         .push_error_page_up => voidMsg(Msg, "push_error_page_up"),
         .push_error_page_down => voidMsg(Msg, "push_error_page_down"),
+        .push_credential_tab => voidMsg(Msg, "push_credential_tab"),
+        .push_credential_submit => voidMsg(Msg, "push_credential_submit"),
+        .push_credential_cancel => voidMsg(Msg, "push_credential_cancel"),
+        .push_credential_backspace => voidMsg(Msg, "push_credential_backspace"),
+        .push_credential_move_left => voidMsg(Msg, "push_credential_move_left"),
+        .push_credential_move_right => voidMsg(Msg, "push_credential_move_right"),
         .cycle_changed_file_filter => voidMsg(Msg, "cycle_changed_file_filter"),
         .toggle_reviewed_file => voidMsg(Msg, "toggle_reviewed_file"),
         .toggle_hide_reviewed_files => voidMsg(Msg, "toggle_hide_reviewed_files"),
@@ -526,6 +554,7 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .confirm_push => voidMsg(Msg, "confirm_push"),
         .cancel_push => voidMsg(Msg, "cancel_push"),
         .close_push_error => voidMsg(Msg, "close_push_error"),
+        .open_push_credentials => voidMsg(Msg, "open_push_credentials"),
         .open_selected_file_in_editor => voidMsg(Msg, "open_selected_file_in_editor"),
         .toggle_display_mode => voidMsg(Msg, "toggle_display_mode"),
         .toggle_line_numbers => voidMsg(Msg, "toggle_line_numbers"),
@@ -619,6 +648,14 @@ const TestMsg = union(enum) {
     push_error_scroll_down,
     push_error_page_up,
     push_error_page_down,
+    push_credential_tab,
+    push_credential_submit,
+    push_credential_cancel,
+    push_credential_insert: u21,
+    push_credential_paste: []const u8,
+    push_credential_backspace,
+    push_credential_move_left,
+    push_credential_move_right,
     cycle_changed_file_filter,
     toggle_reviewed_file,
     toggle_hide_reviewed_files,
@@ -642,6 +679,7 @@ const TestMsg = union(enum) {
     confirm_push,
     cancel_push,
     close_push_error,
+    open_push_credentials,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
@@ -1065,6 +1103,11 @@ test "keyToMsg keeps dedicated hunk jumps independent from search query" {
     try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, shiftedAscii('k', 'K')).?);
     try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, shiftedLowerOnly('j')).?);
     try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, shiftedLowerOnly('k')).?);
+}
+
+test "push credential prompt accepts q as text and uses escape to cancel" {
+    try std.testing.expectEqual(TestMsg{ .push_credential_insert = 'q' }, keyToMsg(TestMsg, .{ .push_credential_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(TestMsg.push_credential_cancel, keyToMsg(TestMsg, .{ .push_credential_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
 }
 
 test "keyToMsg maps shifted letter commands consistently" {

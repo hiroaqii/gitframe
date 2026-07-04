@@ -117,6 +117,9 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
     if (app.overlay.isPushError()) {
         try viewPushError(app, surface);
     }
+    if (app.overlay.isPushCredentials()) {
+        try viewPushCredentials(app, surface);
+    }
 }
 
 fn roleColor(palette: theme.Palette, role: theme.Role) chasen.Color {
@@ -1410,8 +1413,57 @@ fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
     }
 
     if (size.height > 0) {
-        try draw.copyClippedTextAt(&content, 0, size.height - 1, "Enter/Esc/q: close", roleStyle(app.theme, .danger));
+        const footer = if (app.push_retry_credentials_available)
+            "c: credentials    Enter/Esc/q: close"
+        else
+            "Enter/Esc/q: close";
+        try draw.copyClippedTextAt(&content, 0, size.height - 1, footer, roleStyle(app.theme, .danger));
     }
+}
+
+fn viewPushCredentials(app: anytype, surface: *chasen.Surface) !void {
+    const prompt = app.push_credential_prompt orelse return;
+    const modal = ui.Modal.init(.{});
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, confirmation_dialog_width),
+        .dialog_height = @min(surface.size().height, 13),
+        .title = "Push credentials",
+        .backdrop = false,
+        .border = .rounded,
+        .title_style = boldRoleStyle(app.theme, .accent),
+        .border_style = roleStyle(app.theme, .accent),
+    };
+    fillModalDialog(surface, opts);
+    modal.view(surface, opts);
+
+    const content_rect = ui.Modal.contentRect(surface, opts);
+    if (content_rect.width == 0 or content_rect.height == 0) return;
+    var content = surface.child(content_rect);
+    const size = content.size();
+
+    const target = try std.fmt.allocPrint(content.frameAllocator(), "{s} -> {s}/{s}", .{ prompt.target.branch, prompt.target.remote, prompt.target.remote_branch });
+    if (size.height > 0) try draw.copyClippedTextAt(&content, 0, 0, target, boldRoleStyle(app.theme, .accent));
+
+    const username_style = if (prompt.active_field == .username) boldRoleStyle(app.theme, .accent) else roleStyle(app.theme, .prompt);
+    const password_style = if (prompt.active_field == .password) boldRoleStyle(app.theme, .accent) else roleStyle(app.theme, .prompt);
+    if (size.height > 3) {
+        try draw.copyClippedTextAt(&content, 0, 3, "Username:", roleStyle(app.theme, .muted));
+        try draw.copyClippedTextAt(&content, 11, 3, prompt.username.secret(), username_style);
+    }
+    if (size.height > 5) {
+        const masked = try maskedSecret(content.frameAllocator(), prompt.password.len);
+        try draw.copyClippedTextAt(&content, 0, 5, "Token:", roleStyle(app.theme, .muted));
+        try draw.copyClippedTextAt(&content, 11, 5, masked, password_style);
+    }
+    if (size.height > 0) {
+        try draw.copyClippedTextAt(&content, 0, size.height - 1, "Tab: field    Enter: submit    Esc: cancel", roleStyle(app.theme, .accent));
+    }
+}
+
+fn maskedSecret(allocator: std.mem.Allocator, len: usize) ![]u8 {
+    const masked = try allocator.alloc(u8, len);
+    @memset(masked, '*');
+    return masked;
 }
 
 fn pushErrorModalOptions(size: chasen.Size, message: []const u8) struct { dialog_width: u16, dialog_height: u16 } {

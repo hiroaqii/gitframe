@@ -317,6 +317,9 @@ pub const App = struct {
     amend_confirmation: ?app_state.AmendConfirmation = null,
     push_confirmation: ?app_state.PushConfirmation = null,
     push_error_message: ?[]u8 = null,
+    push_retry_target: ?app_state.PushRetryTarget = null,
+    push_retry_credentials_available: bool = false,
+    push_credential_prompt: ?*app_state.PushCredentialPrompt = null,
 
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
@@ -414,6 +417,14 @@ pub const App = struct {
         push_error_scroll_down,
         push_error_page_up,
         push_error_page_down,
+        push_credential_tab,
+        push_credential_submit,
+        push_credential_cancel,
+        push_credential_insert: u21,
+        push_credential_paste: []const u8,
+        push_credential_backspace,
+        push_credential_move_left,
+        push_credential_move_right,
         toggle_reviewed_file,
         toggle_hide_reviewed_files,
         cycle_changed_file_filter,
@@ -432,6 +443,7 @@ pub const App = struct {
         confirm_push,
         cancel_push,
         close_push_error,
+        open_push_credentials,
         open_selected_file_in_editor,
         finish_review_approved,
         finish_review_needs_changes,
@@ -480,6 +492,7 @@ pub const App = struct {
         self.cancelDiscardConfirmation(deinit_ctx.allocator);
         self.cancelAmendConfirmation(deinit_ctx.allocator);
         self.cancelPushConfirmation(deinit_ctx.allocator);
+        self.cancelPushCredentialPrompt(deinit_ctx.allocator);
         self.clearPushError(deinit_ctx.allocator);
         self.tree_order.deinit(deinit_ctx.allocator);
         if (self.tree_order_scope) |scope| deinit_ctx.allocator.free(scope);
@@ -654,6 +667,14 @@ pub const App = struct {
             .push_error_scroll_down => self.scrollPushError(1),
             .push_error_page_up => self.pagePushError(-1),
             .push_error_page_down => self.pagePushError(1),
+            .push_credential_tab => self.togglePushCredentialField(),
+            .push_credential_submit => try self.submitPushCredentials(ctx),
+            .push_credential_cancel => self.cancelPushCredentialPrompt(ctx.allocator()),
+            .push_credential_insert => |codepoint| self.insertPushCredential(codepoint),
+            .push_credential_paste => |text| self.pastePushCredential(text),
+            .push_credential_backspace => self.backspacePushCredential(),
+            .push_credential_move_left => self.movePushCredentialLeft(),
+            .push_credential_move_right => self.movePushCredentialRight(),
             .toggle_reviewed_file => try self.toggleReviewedFile(ctx.allocator()),
             .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
             .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
@@ -672,6 +693,7 @@ pub const App = struct {
             .confirm_push => try self.confirmPush(ctx),
             .cancel_push => self.cancelPushConfirmation(ctx.allocator()),
             .close_push_error => self.clearPushError(ctx.allocator()),
+            .open_push_credentials => try self.openPushCredentialPrompt(ctx),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .finish_review_approved => try self.finishReview(ctx, .approved),
             .finish_review_needs_changes => try self.finishReview(ctx, .needs_changes),
@@ -852,6 +874,7 @@ pub const App = struct {
             .amend_confirmation_mode = self.overlay.isAmendCommit(),
             .push_confirmation_mode = self.overlay.isPushBranch(),
             .push_error_mode = self.overlay.isPushError(),
+            .push_credential_mode = self.overlay.isPushCredentials(),
             .search_query_len = self.search.query.len,
             .focus = self.viewer.focus,
             .sidebar_hidden = self.viewer.sidebar_hidden,
@@ -2011,15 +2034,180 @@ pub const App = struct {
     }
 
     fn setPushError(self: *App, allocator: std.mem.Allocator, message: []const u8) !void {
+        try self.setPushErrorWithRetry(allocator, message, null, false);
+    }
+
+    fn setPushErrorWithRetry(self: *App, allocator: std.mem.Allocator, message: []const u8, retry_target: ?app_state.PushRetryTarget, credentials_available: bool) !void {
         self.clearPushError(allocator);
         self.push_error_message = try allocator.dupe(u8, message);
+        self.push_retry_target = retry_target;
+        self.push_retry_credentials_available = retry_target != null and credentials_available;
         self.overlay.openPushError();
     }
 
     fn clearPushError(self: *App, allocator: std.mem.Allocator) void {
         if (self.push_error_message) |message| allocator.free(message);
         self.push_error_message = null;
+        if (self.push_retry_target) |*target| target.deinit(allocator);
+        self.push_retry_target = null;
+        self.push_retry_credentials_available = false;
         if (self.overlay.isPushError()) self.overlay.close();
+    }
+
+    fn takePushRetryTarget(self: *App) ?app_state.PushRetryTarget {
+        // Once the credential prompt owns the retry target, the push-error
+        // popup must stop owning it; otherwise close/cancel paths can double
+        // free the same snapshot.
+        const target = self.push_retry_target orelse return null;
+        self.push_retry_target = null;
+        self.push_retry_credentials_available = false;
+        return target;
+    }
+
+    fn openPushCredentialPrompt(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (!self.push_retry_credentials_available) {
+            self.setStatus("credential retry is not available for this push failure", .{});
+            return;
+        }
+
+        var target = self.takePushRetryTarget() orelse {
+            self.setStatus("credential retry target is no longer available", .{});
+            return;
+        };
+        errdefer target.deinit(ctx.allocator());
+
+        const remote_url = getRemoteUrl(ctx.allocator(), ctx.io(), target.repo_root, target.remote) catch {
+            self.setStatus("could not read push remote URL", .{});
+            target.deinit(ctx.allocator());
+            return;
+        };
+        errdefer ctx.allocator().free(remote_url);
+
+        if (!isHttpRemoteUrl(remote_url)) {
+            self.setStatus("credential prompt is only available for HTTPS remotes", .{});
+            ctx.allocator().free(remote_url);
+            target.deinit(ctx.allocator());
+            return;
+        }
+
+        // Prompt state owns the original push snapshot so retry does not depend
+        // on whatever repository or branch is active by the time the user types
+        // credentials. The backend rechecks this oid immediately before push.
+        target.remote_url = remote_url;
+        const prompt = try ctx.allocator().create(app_state.PushCredentialPrompt);
+        prompt.* = .{ .target = target };
+        self.cancelPushCredentialPrompt(ctx.allocator());
+        self.push_credential_prompt = prompt;
+        self.overlay.openPushCredentials();
+    }
+
+    fn cancelPushCredentialPrompt(self: *App, allocator: std.mem.Allocator) void {
+        if (self.push_credential_prompt) |prompt| {
+            prompt.deinit(allocator);
+            allocator.destroy(prompt);
+        }
+        self.push_credential_prompt = null;
+        if (self.overlay.isPushCredentials()) self.overlay.close();
+    }
+
+    fn activePushCredentialInput(self: *App) ?*app_state.SecretInput {
+        const prompt = self.push_credential_prompt orelse return null;
+        return switch (prompt.active_field) {
+            .username => &prompt.username,
+            .password => &prompt.password,
+        };
+    }
+
+    fn togglePushCredentialField(self: *App) void {
+        const prompt = self.push_credential_prompt orelse return;
+        prompt.active_field = switch (prompt.active_field) {
+            .username => .password,
+            .password => .username,
+        };
+    }
+
+    fn insertPushCredential(self: *App, codepoint: u21) void {
+        const input = self.activePushCredentialInput() orelse return;
+        input.insert(codepoint) catch {
+            self.setStatus("credential field is too long", .{});
+        };
+    }
+
+    fn pastePushCredential(self: *App, text: []const u8) void {
+        const input = self.activePushCredentialInput() orelse return;
+        input.insertSlice(text) catch {
+            self.setStatus("credential field is too long", .{});
+        };
+    }
+
+    fn backspacePushCredential(self: *App) void {
+        const input = self.activePushCredentialInput() orelse return;
+        input.backspace();
+    }
+
+    fn movePushCredentialLeft(self: *App) void {
+        const input = self.activePushCredentialInput() orelse return;
+        input.moveLeft();
+    }
+
+    fn movePushCredentialRight(self: *App) void {
+        const input = self.activePushCredentialInput() orelse return;
+        input.moveRight();
+    }
+
+    fn submitPushCredentials(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const prompt = self.push_credential_prompt orelse return;
+        if (prompt.active_field == .username) {
+            prompt.active_field = .password;
+            return;
+        }
+        if (prompt.username.len == 0) {
+            self.setStatus("Username is required", .{});
+            prompt.active_field = .username;
+            return;
+        }
+        if (prompt.password.len == 0) {
+            self.setStatus("Password or token is required", .{});
+            prompt.active_field = .password;
+            return;
+        }
+        if (app_git_requests.hasPendingAction(self.actions)) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+
+        var username = try ctx.allocator().dupe(u8, prompt.username.secret());
+        errdefer app_actions.secureFree(ctx.allocator(), username);
+        var password = try ctx.allocator().dupe(u8, prompt.password.secret());
+        errdefer app_actions.secureFree(ctx.allocator(), password);
+        var credentials: app_actions.PushCredentials = .{
+            .username = username,
+            .password = password,
+        };
+        // Ownership moves into `credentials`; clear the local slices so their
+        // errdefer cleanup cannot wipe/free the same buffers after the task
+        // launcher has consumed them.
+        username = &.{};
+        password = &.{};
+
+        var target = prompt.target;
+        prompt.target = .{
+            .repo_root = &.{},
+            .branch = &.{},
+            .remote = &.{},
+            .remote_branch = &.{},
+            .oid = &.{},
+            .remote_url = prompt.target.remote_url,
+        };
+        prompt.target.remote_url = null;
+        self.setStatus("retrying push with credentials: {s} -> {s}/{s}", .{ target.branch, target.remote, target.remote_branch });
+        self.cancelPushCredentialPrompt(ctx.allocator());
+        self.clearPushError(ctx.allocator());
+
+        app_git_requests.startCredentialedPush(Msg, ctx, &self.actions, self.env_map, &target, &credentials) catch |err| {
+            target.deinit(ctx.allocator());
+            return err;
+        };
     }
 
     fn selectedPushTarget(self: *const App) PushTargetResult {
@@ -2032,6 +2220,33 @@ pub const App = struct {
                 .status = self.branch_status.status,
             },
         });
+    }
+
+    fn getRemoteUrl(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, remote: []const u8) ![]u8 {
+        const argv = [_][]const u8{ "git", "remote", "get-url", remote };
+        const result = try std.process.run(allocator, io, .{
+            .argv = &argv,
+            .cwd = .{ .path = repo_root },
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+        });
+        defer allocator.free(result.stderr);
+
+        switch (result.term) {
+            .exited => |code| if (code == 0) {
+                const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+                const remote_url = try allocator.dupe(u8, trimmed);
+                allocator.free(result.stdout);
+                return remote_url;
+            },
+            else => {},
+        }
+        allocator.free(result.stdout);
+        return error.RemoteUrlUnavailable;
+    }
+
+    fn isHttpRemoteUrl(remote_url: []const u8) bool {
+        return std.mem.startsWith(u8, remote_url, "https://") or std.mem.startsWith(u8, remote_url, "http://");
     }
 
     pub fn stagedSummaryForActiveRepo(self: *const App) app_commit_panel.StagedSummary {
@@ -2243,13 +2458,50 @@ pub const App = struct {
                 const detail = git_ops.trimGitOutput(message);
                 const status_message = git_ops.pushFailureHint(detail) orelse detail;
                 self.setStatus("push failed: {s}", .{status_message});
-                try self.setPushError(ctx.allocator(), detail);
+                const retry_target = try pushRetryTargetFromFinished(ctx.allocator(), result);
+                errdefer {
+                    var target = retry_target;
+                    target.deinit(ctx.allocator());
+                }
+                try self.setPushErrorWithRetry(ctx.allocator(), detail, retry_target, pushCredentialFailureLikely(detail));
             },
             .failed_static => |message| {
                 self.setStatus("push failed: {s}", .{message});
                 try self.setPushError(ctx.allocator(), message);
             },
         }
+    }
+
+    fn pushRetryTargetFromFinished(allocator: std.mem.Allocator, finished: PushFinished) !app_state.PushRetryTarget {
+        var target: app_state.PushRetryTarget = .{
+            .repo_root = try allocator.dupe(u8, finished.repo_root),
+            .branch = &.{},
+            .remote = &.{},
+            .remote_branch = &.{},
+            .oid = &.{},
+        };
+        errdefer target.deinit(allocator);
+        target.branch = try allocator.dupe(u8, finished.branch);
+        target.remote = try allocator.dupe(u8, finished.remote);
+        target.remote_branch = try allocator.dupe(u8, finished.remote_branch);
+        target.oid = try allocator.dupe(u8, finished.oid);
+        return target;
+    }
+
+    fn pushCredentialFailureLikely(detail: []const u8) bool {
+        const needles = [_][]const u8{
+            "could not read Username",
+            "could not read Password",
+            "Authentication failed",
+            "terminal prompts disabled",
+            "HTTP Basic: Access denied",
+            "Support for password authentication was removed",
+            "The requested URL returned error: 403",
+        };
+        for (needles) |needle| {
+            if (std.mem.indexOf(u8, detail, needle) != null) return true;
+        }
+        return false;
     }
 
     fn reloadAfterGitAction(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -6403,12 +6655,92 @@ test "finishPush does not reload a stale active repository" {
         .branch = try std.testing.allocator.dupe(u8, "feature"),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
+        .oid = try std.testing.allocator.dupe(u8, "abc123"),
         .result = .ok,
     });
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.load.pending == null);
     try std.testing.expectEqualStrings("pushed: /repo", app.status.text());
+}
+
+test "finishPush failed preserves retry target oid for credential prompt" {
+    var app: App = .{ .allocator = std.testing.allocator };
+    defer app.clearPushError(std.testing.allocator);
+    const pending = app.actions.begin(.push);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishPush(&ctx, .{
+        .pending = pending,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .branch = try std.testing.allocator.dupe(u8, "feature"),
+        .remote = try std.testing.allocator.dupe(u8, "origin"),
+        .remote_branch = try std.testing.allocator.dupe(u8, "main"),
+        .oid = try std.testing.allocator.dupe(u8, "abc123"),
+        .result = .{ .failed = try std.testing.allocator.dupe(u8, "fatal: could not read Username for 'https://host': terminal prompts disabled") },
+    });
+
+    const target = app.push_retry_target orelse return error.ExpectedPushRetryTarget;
+    try std.testing.expectEqualStrings("abc123", target.oid);
+    try std.testing.expect(app.push_retry_credentials_available);
+}
+
+test "clearPushError frees retained retry target" {
+    var app: App = .{ .allocator = std.testing.allocator };
+    try app.setPushErrorWithRetry(std.testing.allocator, "failed", .{
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .branch = try std.testing.allocator.dupe(u8, "feature"),
+        .remote = try std.testing.allocator.dupe(u8, "origin"),
+        .remote_branch = try std.testing.allocator.dupe(u8, "main"),
+        .oid = try std.testing.allocator.dupe(u8, "abc123"),
+    }, true);
+
+    app.clearPushError(std.testing.allocator);
+
+    try std.testing.expect(app.push_error_message == null);
+    try std.testing.expect(app.push_retry_target == null);
+    try std.testing.expect(!app.push_retry_credentials_available);
+}
+
+test "openPushCredentialPrompt rejects non-HTTPS remote and frees retry target" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(io, "work", .default_dir);
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", allocator);
+    defer allocator.free(repo_root);
+
+    const init_result = try std.process.run(allocator, io, .{
+        .argv = &[_][]const u8{ "git", "init", "--initial-branch=main" },
+        .cwd = .{ .path = repo_root },
+    });
+    allocator.free(init_result.stdout);
+    allocator.free(init_result.stderr);
+    const remote_result = try std.process.run(allocator, io, .{
+        .argv = &[_][]const u8{ "git", "remote", "add", "origin", "git@github.com:owner/repo.git" },
+        .cwd = .{ .path = repo_root },
+    });
+    allocator.free(remote_result.stdout);
+    allocator.free(remote_result.stderr);
+
+    var app: App = .{ .allocator = allocator };
+    defer app.clearPushError(allocator);
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .repo_root = try allocator.dupe(u8, repo_root),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+    }, true);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+
+    try app.openPushCredentialPrompt(&ctx);
+
+    try std.testing.expect(app.push_retry_target == null);
+    try std.testing.expect(app.push_credential_prompt == null);
+    try std.testing.expectEqualStrings("credential prompt is only available for HTTPS remotes", app.status.text());
 }
 
 test "manual reload clears action selection restore" {

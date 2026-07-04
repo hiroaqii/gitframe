@@ -215,6 +215,60 @@ pub fn startPush(
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
+pub fn startCredentialedPush(
+    comptime Msg: type,
+    ctx: *chasen.Ctx(Msg),
+    action_state: *actions.ActionState,
+    env_map: ?*const std.process.Environ.Map,
+    target: *app_state.PushRetryTarget,
+    credentials: *actions.PushCredentials,
+) !void {
+    // This function consumes credentials on every return path. Keeping cleanup
+    // here prevents caller/task rollback paths from both freeing the same
+    // secret buffers if spawning fails after task construction.
+    defer credentials.deinit(ctx.allocator());
+
+    const pending = action_state.begin(.push);
+    errdefer _ = action_state.finish(pending);
+
+    const Task = actions.PushTask(Msg);
+    const task = try ctx.allocator().create(Task);
+    task.* = .{
+        .pending = pending,
+        .repo_root = target.repo_root,
+        .branch = target.branch,
+        .remote = target.remote,
+        .remote_branch = target.remote_branch,
+        .oid = target.oid,
+        .env_map = env_map,
+        .credentials = credentials.*,
+    };
+    // The task now owns the secret buffers; empty the caller-visible struct so
+    // the function-level defer becomes a no-op for credentials on success or
+    // spawn rollback.
+    credentials.* = .{ .username = &.{}, .password = &.{} };
+    target.* = .{
+        .repo_root = &.{},
+        .branch = &.{},
+        .remote = &.{},
+        .remote_branch = &.{},
+        .oid = &.{},
+        .remote_url = target.remote_url,
+    };
+    errdefer destroyPushTask(Task, ctx.allocator(), task);
+
+    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    if (target.remote_url) |remote_url| ctx.allocator().free(remote_url);
+    target.* = .{
+        .repo_root = &.{},
+        .branch = &.{},
+        .remote = &.{},
+        .remote_branch = &.{},
+        .oid = &.{},
+        .remote_url = null,
+    };
+}
+
 fn destroyFileTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
     if (task.repo_root.len > 0) allocator.free(task.repo_root);
     if (task.path.len > 0) allocator.free(task.path);
@@ -270,5 +324,6 @@ fn destroyPushTask(comptime Task: type, allocator: std.mem.Allocator, task: *Tas
     if (task.remote.len > 0) allocator.free(task.remote);
     if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
     if (task.oid.len > 0) allocator.free(task.oid);
+    if (task.credentials) |*credentials| credentials.deinit(allocator);
     allocator.destroy(task);
 }

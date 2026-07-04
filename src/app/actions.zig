@@ -197,6 +197,7 @@ pub const PushFinished = struct {
     branch: []u8,
     remote: []u8,
     remote_branch: []u8,
+    oid: []u8,
     result: FileActionTaskResult,
 
     pub fn deinit(self: *PushFinished, allocator: std.mem.Allocator) void {
@@ -204,6 +205,7 @@ pub const PushFinished = struct {
         allocator.free(self.branch);
         allocator.free(self.remote);
         allocator.free(self.remote_branch);
+        allocator.free(self.oid);
         self.result.deinit(allocator);
         self.* = .{
             .pending = .{ .generation = 0, .kind = .push },
@@ -211,6 +213,7 @@ pub const PushFinished = struct {
             .branch = &.{},
             .remote = &.{},
             .remote_branch = &.{},
+            .oid = &.{},
             .result = .ok,
         };
     }
@@ -228,6 +231,25 @@ pub const FileActionTaskResult = union(enum) {
         }
     }
 };
+
+pub const PushCredentials = struct {
+    username: []u8,
+    password: []u8,
+
+    pub fn deinit(self: *PushCredentials, allocator: std.mem.Allocator) void {
+        secureFree(allocator, self.username);
+        secureFree(allocator, self.password);
+        self.* = .{ .username = &.{}, .password = &.{} };
+    }
+};
+
+/// Wipe before free because these buffers may contain one-shot HTTPS tokens.
+/// A normal `@memset` before free can be optimized away in release builds.
+pub fn secureFree(allocator: std.mem.Allocator, bytes: []u8) void {
+    if (bytes.len == 0) return;
+    std.crypto.secureZero(u8, bytes);
+    allocator.free(bytes);
+}
 
 /// Async task for `git add -- <path>`.
 ///
@@ -626,6 +648,7 @@ pub fn PushTask(comptime Msg: type) type {
         remote_branch: []u8,
         oid: []u8,
         env_map: ?*const std.process.Environ.Map = null,
+        credentials: ?PushCredentials = null,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
@@ -635,18 +658,21 @@ pub fn PushTask(comptime Msg: type) type {
                 if (task.remote.len > 0) allocator.free(task.remote);
                 if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
                 allocator.free(task.oid);
+                if (task.credentials) |*credentials| credentials.deinit(allocator);
                 allocator.destroy(task);
             }
 
-            const result = runPush(task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, allocator, io);
+            const result = runPush(task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, if (task.credentials) |credentials| credentials else null, allocator, io);
             const repo_root = task.repo_root;
             const branch = task.branch;
             const remote = task.remote;
             const remote_branch = task.remote_branch;
+            const oid = task.oid;
             task.repo_root = &.{};
             task.branch = &.{};
             task.remote = &.{};
             task.remote_branch = &.{};
+            task.oid = &.{};
 
             return Msg.actionFinished(.{ .push = PushFinished{
                 .pending = task.pending,
@@ -654,6 +680,7 @@ pub fn PushTask(comptime Msg: type) type {
                 .branch = branch,
                 .remote = remote,
                 .remote_branch = remote_branch,
+                .oid = oid,
                 .result = result,
             } });
         }
@@ -666,6 +693,7 @@ pub fn PushTask(comptime Msg: type) type {
                 if (task.remote.len > 0) allocator.free(task.remote);
                 if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
                 allocator.free(task.oid);
+                if (task.credentials) |*credentials| credentials.deinit(allocator);
                 allocator.destroy(task);
             }
 
@@ -673,10 +701,12 @@ pub fn PushTask(comptime Msg: type) type {
             const branch = task.branch;
             const remote = task.remote;
             const remote_branch = task.remote_branch;
+            const oid = task.oid;
             task.repo_root = &.{};
             task.branch = &.{};
             task.remote = &.{};
             task.remote_branch = &.{};
+            task.oid = &.{};
 
             return Msg.actionFinished(.{ .push = PushFinished{
                 .pending = task.pending,
@@ -684,6 +714,7 @@ pub fn PushTask(comptime Msg: type) type {
                 .branch = branch,
                 .remote = remote,
                 .remote_branch = remote_branch,
+                .oid = oid,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
@@ -745,7 +776,7 @@ pub fn runAmend(repo_root: []const u8, subject: []const u8, body: ?[]const u8, a
     }, allocator, io);
 }
 
-pub fn runPush(repo_root: []const u8, branch: []const u8, remote: []const u8, remote_branch: []const u8, oid: []const u8, env_map: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runPush(repo_root: []const u8, branch: []const u8, remote: []const u8, remote_branch: []const u8, oid: []const u8, env_map: ?*const std.process.Environ.Map, credentials: ?PushCredentials, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Push", .{
         .repo_root = repo_root,
         .kind = .{ .push = .{
@@ -753,6 +784,10 @@ pub fn runPush(repo_root: []const u8, branch: []const u8, remote: []const u8, re
             .remote = remote,
             .remote_branch = remote_branch,
             .oid = oid,
+            .credentials = if (credentials) |credential| .{
+                .username = credential.username,
+                .password = credential.password,
+            } else null,
         } },
         .env_map = env_map,
     }, allocator, io);
