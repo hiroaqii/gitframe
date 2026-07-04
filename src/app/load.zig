@@ -414,7 +414,10 @@ pub fn runStatusLoad(repo_root: []const u8, allocator: std.mem.Allocator, io: st
     switch (raw_result) {
         .ok => |bytes| {
             defer allocator.free(bytes);
-            if (bytes.len == 0) return .empty;
+            // Empty porcelain output is a valid clean-worktree snapshot. Keep it
+            // as a loaded document so App can remember which repo was proven
+            // clean; otherwise pull's clean-worktree gate sees the status as
+            // stale forever on clean repositories.
             const bundle = git_status.StatusBundle.parseOwned(allocator, bytes) catch |err| {
                 return .{ .failed = std.fmt.allocPrint(allocator, "Status parse failed: {s}", .{@errorName(err)}) catch
                     return .{ .failed_static = "Status parse failed: OutOfMemory" } };
@@ -668,6 +671,43 @@ test "readRepoFile rejects symlink components" {
 
     try std.testing.expectError(error.InvalidPath, readRepoFile(std.testing.allocator, io, repo_root, "linked.txt"));
     try std.testing.expectError(error.InvalidPath, readRepoFile(std.testing.allocator, io, repo_root, "linked-dir/inside.txt"));
+}
+
+test "runStatusLoad preserves clean repository snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+    const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+
+    var result = runStatusLoad(repo_root, std.testing.allocator, io);
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .loaded => |bundle| try std.testing.expectEqual(@as(usize, 0), bundle.document.entries.len),
+        else => return error.ExpectedCleanStatusSnapshot,
+    }
+}
+
+fn runTestGit(io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !void {
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = argv,
+        .cwd = .{ .dir = cwd },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer {
+        std.testing.allocator.free(result.stdout);
+        std.testing.allocator.free(result.stderr);
+    }
+
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    return error.GitCommandFailed;
 }
 
 test "StatusLoadTask failed preserves generation and moves repo root" {

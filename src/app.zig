@@ -10784,6 +10784,26 @@ test "status refresh drops snapshot when repo root changes" {
     try std.testing.expectEqual(@as(usize, 0), app.git_status.document.entries.len);
 }
 
+test "finishStatusLoad keeps clean repository snapshot fresh" {
+    var app: App = .{
+        .status_load_generation = 1,
+        .status_load_pending = 1,
+    };
+    defer app.git_status.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    const clean = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = clean },
+    });
+
+    try std.testing.expect(app.status_load_pending == null);
+    try std.testing.expectEqualStrings("/repo", app.git_status.repo_root.?);
+    try std.testing.expectEqual(@as(usize, 0), app.git_status.document.entries.len);
+}
+
 test "finishDiffLoad frees stale loaded bundle" {
     var app: App = .{ .load = .{ .generation = 2 } };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
