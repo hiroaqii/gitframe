@@ -67,6 +67,10 @@ pub const BranchStatusLoadResult = union(enum) {
 
 pub const OperationResult = union(enum) {
     ok,
+    /// Non-owned success message for operations that completed without a
+    /// content-changing action, for example fetch-first pull finding the branch
+    /// already up to date.
+    ok_static: []const u8,
     /// Allocated error message from Git. Caller owns and must call `deinit`.
     failed: []u8,
     /// Non-owned fallback error message, used when allocation itself fails.
@@ -74,7 +78,7 @@ pub const OperationResult = union(enum) {
 
     pub fn deinit(self: OperationResult, allocator: std.mem.Allocator) void {
         switch (self) {
-            .ok, .failed_static => {},
+            .ok, .ok_static, .failed_static => {},
             .failed => |message| allocator.free(message),
         }
     }
@@ -133,7 +137,7 @@ pub const OperationKind = union(enum) {
     commit: CommitRequest,
     amend: CommitRequest,
     push: PushRequest,
-    pull_ff_only: PullRequest,
+    pull_refresh_ff_only: PullRequest,
     fetch: FetchRequest,
 };
 
@@ -256,7 +260,7 @@ pub const LocalCommandBackend = struct {
             .commit => |commit| runGitCommit(allocator, io, request.repo_root, commit),
             .amend => |commit| runGitAmend(allocator, io, request.repo_root, commit),
             .push => |push| runGitPush(allocator, io, request.repo_root, request.env_map, push),
-            .pull_ff_only => |pull| runGitPull(allocator, io, request.repo_root, request.env_map, pull),
+            .pull_refresh_ff_only => |pull| runGitPullRefresh(allocator, io, request.repo_root, request.env_map, pull),
             .fetch => |fetch| runGitFetch(allocator, io, request.repo_root, request.env_map, fetch),
         };
     }
@@ -684,16 +688,13 @@ fn runGitPush(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, p
     return .{ .failed = std.fmt.allocPrint(allocator, "git push failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
-fn runGitPull(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, parent_env: ?*const std.process.Environ.Map, request: PullRequest) LoadError!OperationResult {
-    // Pull mutates the current branch, so do not trust the earlier UI target
-    // resolution alone. The user may have changed branch or committed while
-    // the confirmation/task was pending.
+fn runGitPullRefresh(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, parent_env: ?*const std.process.Environ.Map, request: PullRequest) LoadError!OperationResult {
     if (!try verifyRemoteBranchSnapshot(allocator, io, repo_root, request.branch, request.oid)) {
         return .{ .failed_static = "Branch changed before pull; reload and try again" };
     }
-    // `pull --ff-only` can still update tracked files. Re-check immediately
-    // before spawning git so local edits created after confirmation do not get
-    // mixed with remote updates.
+    if (!try verifyConfirmedUpstream(allocator, io, repo_root, request.remote, request.remote_branch)) {
+        return .{ .failed_static = "Upstream changed before pull; reload and try again" };
+    }
     if (!try verifyCleanWorktree(allocator, io, repo_root)) {
         return .{ .failed_static = "Worktree changed before pull; reload and resolve local changes first" };
     }
@@ -709,9 +710,9 @@ fn runGitPull(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, p
     };
     defer env.deinit();
 
-    const argv = [_][]const u8{ "git", "pull", "--ff-only", request.remote, request.remote_branch };
-    const result = std.process.run(allocator, io, .{
-        .argv = &argv,
+    const fetch_argv = [_][]const u8{ "git", "fetch", request.remote };
+    const fetch_result = std.process.run(allocator, io, .{
+        .argv = &fetch_argv,
         .cwd = .{ .path = repo_root },
         .environ_map = &env,
         .stdout_limit = .limited(128 * 1024),
@@ -722,18 +723,70 @@ fn runGitPull(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, p
         else => error.SpawnFailed,
     };
 
-    allocator.free(result.stdout);
-    switch (result.term) {
+    allocator.free(fetch_result.stdout);
+    switch (fetch_result.term) {
         .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
+            allocator.free(fetch_result.stderr);
+        } else {
+            if (fetch_result.stderr.len > 0) return .{ .failed = fetch_result.stderr };
+            allocator.free(fetch_result.stderr);
+            return .{ .failed = std.fmt.allocPrint(allocator, "git fetch failed: {any}", .{fetch_result.term}) catch return error.OutOfMemory };
+        },
+        else => {
+            if (fetch_result.stderr.len > 0) return .{ .failed = fetch_result.stderr };
+            allocator.free(fetch_result.stderr);
+            return .{ .failed = std.fmt.allocPrint(allocator, "git fetch failed: {any}", .{fetch_result.term}) catch return error.OutOfMemory };
+        },
+    }
+
+    // Fetch can take long enough for local state or branch config to change.
+    // Re-check the confirmed identity before deciding whether to fast-forward.
+    if (!try verifyRemoteBranchSnapshot(allocator, io, repo_root, request.branch, request.oid)) {
+        return .{ .failed_static = "Branch changed before pull; reload and try again" };
+    }
+    if (!try verifyConfirmedUpstream(allocator, io, repo_root, request.remote, request.remote_branch)) {
+        return .{ .failed_static = "Upstream changed before pull; reload and try again" };
+    }
+    if (!try verifyCleanWorktree(allocator, io, repo_root)) {
+        return .{ .failed_static = "Worktree changed before pull; reload and resolve local changes first" };
+    }
+
+    const remote_ref = try confirmedRemoteTrackingRef(allocator, request.remote, request.remote_branch);
+    defer allocator.free(remote_ref);
+    const ahead_behind = try explicitAheadBehind(allocator, io, repo_root, remote_ref);
+    if (ahead_behind.ahead == 0 and ahead_behind.behind == 0) return .{ .ok_static = "nothing to pull" };
+    if (ahead_behind.ahead > 0 and ahead_behind.behind == 0) {
+        return .{ .failed_static = "local commits are ahead; push or resolve outside GitFrame" };
+    }
+    if (ahead_behind.ahead > 0 and ahead_behind.behind > 0) {
+        return .{ .failed_static = "branch has diverged; merge or rebase outside GitFrame" };
+    }
+
+    const merge_argv = [_][]const u8{ "git", "merge", "--ff-only", remote_ref };
+    const merge_result = std.process.run(allocator, io, .{
+        .argv = &merge_argv,
+        .cwd = .{ .path = repo_root },
+        .environ_map = &env,
+        .stdout_limit = .limited(128 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.StreamTooLong,
+        else => error.SpawnFailed,
+    };
+
+    allocator.free(merge_result.stdout);
+    switch (merge_result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(merge_result.stderr);
             return .ok;
         },
         else => {},
     }
 
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-    return .{ .failed = std.fmt.allocPrint(allocator, "git pull --ff-only failed: {any}", .{result.term}) catch return error.OutOfMemory };
+    if (merge_result.stderr.len > 0) return .{ .failed = merge_result.stderr };
+    allocator.free(merge_result.stderr);
+    return .{ .failed = std.fmt.allocPrint(allocator, "git merge --ff-only failed: {any}", .{merge_result.term}) catch return error.OutOfMemory };
 }
 
 fn runGitFetch(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, parent_env: ?*const std.process.Environ.Map, request: FetchRequest) LoadError!OperationResult {
@@ -1003,6 +1056,40 @@ fn verifyRemoteBranchSnapshot(allocator: std.mem.Allocator, io: std.Io, repo_roo
         else => return false,
     }
     return std.mem.eql(u8, trimLineEnd(oid_result.stdout), oid);
+}
+
+fn verifyConfirmedUpstream(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, remote: []const u8, remote_branch: []const u8) LoadError!bool {
+    const upstream_argv = [_][]const u8{ "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}" };
+    const upstream_result = try runGitBranchStatusCommand(allocator, io, repo_root, &upstream_argv);
+    defer upstream_result.deinit(allocator);
+    switch (upstream_result.term) {
+        .exited => |code| if (code != 0) return false,
+        else => return false,
+    }
+    var builder = git_branch_status.Builder.init(allocator);
+    defer builder.deinit();
+    builder.setUpstream(trimLineEnd(upstream_result.stdout)) catch return error.OutOfMemory;
+    var bundle = builder.finish();
+    defer bundle.deinit();
+    const upstream = bundle.status.upstream orelse return false;
+    return std.mem.eql(u8, upstream.remote, remote) and std.mem.eql(u8, upstream.remote_branch, remote_branch);
+}
+
+fn confirmedRemoteTrackingRef(allocator: std.mem.Allocator, remote: []const u8, remote_branch: []const u8) LoadError![]u8 {
+    return std.fmt.allocPrint(allocator, "refs/remotes/{s}/{s}", .{ remote, remote_branch }) catch return error.OutOfMemory;
+}
+
+fn explicitAheadBehind(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, remote_ref: []const u8) LoadError!RevListAheadBehind {
+    const spec = std.fmt.allocPrint(allocator, "HEAD...{s}", .{remote_ref}) catch return error.OutOfMemory;
+    defer allocator.free(spec);
+    const argv = [_][]const u8{ "git", "rev-list", "--left-right", "--count", spec };
+    const result = try runGitBranchStatusCommand(allocator, io, repo_root, &argv);
+    defer result.deinit(allocator);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return parseRevListAheadBehind(result.stdout),
+        else => {},
+    }
+    return error.SpawnFailed;
 }
 
 fn verifyCleanWorktree(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!bool {
@@ -1468,21 +1555,83 @@ test "LocalCommandBackend push succeeds to a local bare remote" {
     try std.testing.expectEqual(OperationResult.ok, result);
 }
 
-test "LocalCommandBackend pull rejects stale oid before checking worktree" {
+test "LocalCommandBackend pull refresh fetches and fast-forwards from local bare remote" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const io = std.testing.io;
-    const repo = try setupPullWorkRepoForTest(io, &tmp);
-    defer std.testing.allocator.free(repo.repo_root);
-    defer std.testing.allocator.free(repo.oid);
+    const fixture = try setupPullRefreshFixture(io, &tmp);
+    defer fixture.deinit();
+
+    var updater = try tmp.dir.openDir(io, "updater", .{});
+    defer updater.close(io);
+    try updater.writeFile(io, .{ .sub_path = "README.md", .data = "updated\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, updater);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "update" }, updater);
+    try runTestGit(io, &.{ "git", "push", "origin", "main" }, updater);
 
     var local_backend: LocalCommandBackend = .{};
     const result = try local_backend.runOperation(std.testing.allocator, io, .{
-        .repo_root = repo.repo_root,
-        .kind = .{ .pull_ff_only = .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
-            .remote = "missing",
+            .remote = "origin",
+            .remote_branch = "main",
+            .oid = fixture.oid,
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(OperationResult.ok, result);
+
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    const head = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "HEAD" });
+    defer std.testing.allocator.free(head);
+    const remote = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "refs/remotes/origin/main" });
+    defer std.testing.allocator.free(remote);
+    try std.testing.expectEqualStrings(trimLineEnd(remote), trimLineEnd(head));
+}
+
+test "LocalCommandBackend pull refresh reports nothing to pull as success" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupPullRefreshFixture(io, &tmp);
+    defer fixture.deinit();
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .pull_refresh_ff_only = .{
+            .branch = "main",
+            .remote = "origin",
+            .remote_branch = "main",
+            .oid = fixture.oid,
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .ok_static => |message| try std.testing.expectEqualStrings("nothing to pull", message),
+        else => return error.ExpectedPullRefreshNoop,
+    }
+}
+
+test "LocalCommandBackend pull refresh rejects stale oid before fetch" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupPullRefreshFixture(io, &tmp);
+    defer fixture.deinit();
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .pull_refresh_ff_only = .{
+            .branch = "main",
+            .remote = "origin",
             .remote_branch = "main",
             .oid = "not-the-current-oid",
         } },
@@ -1491,45 +1640,130 @@ test "LocalCommandBackend pull rejects stale oid before checking worktree" {
 
     switch (result) {
         .failed_static => |message| try std.testing.expectEqualStrings("Branch changed before pull; reload and try again", message),
-        else => return error.ExpectedStalePullFailure,
+        else => return error.ExpectedPullRefreshStaleOidFailure,
     }
 }
 
-test "LocalCommandBackend pull reaches remote command when worktree is clean" {
+test "LocalCommandBackend pull refresh rejects local commits ahead" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const io = std.testing.io;
-    const repo = try setupPullWorkRepoForTest(io, &tmp);
-    defer std.testing.allocator.free(repo.repo_root);
-    defer std.testing.allocator.free(repo.oid);
+    var fixture = try setupPullRefreshFixture(io, &tmp);
+    defer fixture.deinit();
+
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try work.writeFile(io, .{ .sub_path = "LOCAL.md", .data = "local\n" });
+    try runTestGit(io, &.{ "git", "add", "LOCAL.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "local" }, work);
+    std.testing.allocator.free(fixture.oid);
+    const local_oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    fixture.oid = try std.testing.allocator.dupe(u8, trimLineEnd(local_oid));
+    std.testing.allocator.free(local_oid);
 
     var local_backend: LocalCommandBackend = .{};
     const result = try local_backend.runOperation(std.testing.allocator, io, .{
-        .repo_root = repo.repo_root,
-        .kind = .{ .pull_ff_only = .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
-            .remote = "missing",
+            .remote = "origin",
             .remote_branch = "main",
-            .oid = repo.oid,
+            .oid = fixture.oid,
         } },
     });
     defer result.deinit(std.testing.allocator);
 
     switch (result) {
-        .failed => |message| try std.testing.expect(message.len > 0),
-        else => return error.ExpectedRemotePullFailure,
+        .failed_static => |message| try std.testing.expectEqualStrings("local commits are ahead; push or resolve outside GitFrame", message),
+        else => return error.ExpectedPullRefreshAheadFailure,
     }
 }
 
-test "LocalCommandBackend pull rejects dirty worktree before contacting remote" {
+test "LocalCommandBackend pull refresh rejects diverged branch" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const io = std.testing.io;
-    const repo = try setupPullWorkRepoForTest(io, &tmp);
-    defer std.testing.allocator.free(repo.repo_root);
-    defer std.testing.allocator.free(repo.oid);
+    var fixture = try setupPullRefreshFixture(io, &tmp);
+    defer fixture.deinit();
+
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try work.writeFile(io, .{ .sub_path = "LOCAL.md", .data = "local\n" });
+    try runTestGit(io, &.{ "git", "add", "LOCAL.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "local" }, work);
+    std.testing.allocator.free(fixture.oid);
+    const local_oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    fixture.oid = try std.testing.allocator.dupe(u8, trimLineEnd(local_oid));
+    std.testing.allocator.free(local_oid);
+
+    var updater = try tmp.dir.openDir(io, "updater", .{});
+    defer updater.close(io);
+    try updater.writeFile(io, .{ .sub_path = "REMOTE.md", .data = "remote\n" });
+    try runTestGit(io, &.{ "git", "add", "REMOTE.md" }, updater);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "remote" }, updater);
+    try runTestGit(io, &.{ "git", "push", "origin", "main" }, updater);
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .pull_refresh_ff_only = .{
+            .branch = "main",
+            .remote = "origin",
+            .remote_branch = "main",
+            .oid = fixture.oid,
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed_static => |message| try std.testing.expectEqualStrings("branch has diverged; merge or rebase outside GitFrame", message),
+        else => return error.ExpectedPullRefreshDivergedFailure,
+    }
+}
+
+test "LocalCommandBackend pull refresh rejects changed upstream" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupPullRefreshFixture(io, &tmp);
+    defer fixture.deinit();
+
+    try runTestGit(io, &.{ "git", "init", "--bare", "other.git" }, tmp.dir);
+    const other_root = try tmp.dir.realPathFileAlloc(io, "other.git", std.testing.allocator);
+    defer std.testing.allocator.free(other_root);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try runTestGit(io, &.{ "git", "remote", "add", "other", other_root }, work);
+    try runTestGit(io, &.{ "git", "push", "-u", "other", "main" }, work);
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .pull_refresh_ff_only = .{
+            .branch = "main",
+            .remote = "origin",
+            .remote_branch = "main",
+            .oid = fixture.oid,
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed_static => |message| try std.testing.expectEqualStrings("Upstream changed before pull; reload and try again", message),
+        else => return error.ExpectedPullRefreshUpstreamChangedFailure,
+    }
+}
+
+test "LocalCommandBackend pull refresh rejects dirty worktree before fetch" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupPullRefreshFixture(io, &tmp);
+    defer fixture.deinit();
 
     var work = try tmp.dir.openDir(io, "work", .{});
     defer work.close(io);
@@ -1537,30 +1771,29 @@ test "LocalCommandBackend pull rejects dirty worktree before contacting remote" 
 
     var local_backend: LocalCommandBackend = .{};
     const result = try local_backend.runOperation(std.testing.allocator, io, .{
-        .repo_root = repo.repo_root,
-        .kind = .{ .pull_ff_only = .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
-            .remote = "missing",
+            .remote = "origin",
             .remote_branch = "main",
-            .oid = repo.oid,
+            .oid = fixture.oid,
         } },
     });
     defer result.deinit(std.testing.allocator);
 
     switch (result) {
         .failed_static => |message| try std.testing.expectEqualStrings("Worktree changed before pull; reload and resolve local changes first", message),
-        else => return error.ExpectedDirtyPullFailure,
+        else => return error.ExpectedPullRefreshDirtyFailure,
     }
 }
 
-test "LocalCommandBackend pull rejects untracked worktree before contacting remote" {
+test "LocalCommandBackend pull refresh rejects untracked worktree before fetch" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const io = std.testing.io;
-    const repo = try setupPullWorkRepoForTest(io, &tmp);
-    defer std.testing.allocator.free(repo.repo_root);
-    defer std.testing.allocator.free(repo.oid);
+    const fixture = try setupPullRefreshFixture(io, &tmp);
+    defer fixture.deinit();
 
     var work = try tmp.dir.openDir(io, "work", .{});
     defer work.close(io);
@@ -1568,30 +1801,29 @@ test "LocalCommandBackend pull rejects untracked worktree before contacting remo
 
     var local_backend: LocalCommandBackend = .{};
     const result = try local_backend.runOperation(std.testing.allocator, io, .{
-        .repo_root = repo.repo_root,
-        .kind = .{ .pull_ff_only = .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
-            .remote = "missing",
+            .remote = "origin",
             .remote_branch = "main",
-            .oid = repo.oid,
+            .oid = fixture.oid,
         } },
     });
     defer result.deinit(std.testing.allocator);
 
     switch (result) {
         .failed_static => |message| try std.testing.expectEqualStrings("Worktree changed before pull; reload and resolve local changes first", message),
-        else => return error.ExpectedUntrackedPullFailure,
+        else => return error.ExpectedPullRefreshUntrackedFailure,
     }
 }
 
-test "LocalCommandBackend pull rejects interactive ssh command" {
+test "LocalCommandBackend pull refresh rejects interactive ssh command" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const io = std.testing.io;
-    const repo = try setupPullWorkRepoForTest(io, &tmp);
-    defer std.testing.allocator.free(repo.repo_root);
-    defer std.testing.allocator.free(repo.oid);
+    const fixture = try setupPullRefreshFixture(io, &tmp);
+    defer fixture.deinit();
 
     var parent = std.process.Environ.Map.init(std.testing.allocator);
     defer parent.deinit();
@@ -1599,12 +1831,12 @@ test "LocalCommandBackend pull rejects interactive ssh command" {
 
     var local_backend: LocalCommandBackend = .{};
     const result = try local_backend.runOperation(std.testing.allocator, io, .{
-        .repo_root = repo.repo_root,
-        .kind = .{ .pull_ff_only = .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
-            .remote = "missing",
+            .remote = "origin",
             .remote_branch = "main",
-            .oid = repo.oid,
+            .oid = fixture.oid,
         } },
         .env_map = &parent,
     });
@@ -1612,7 +1844,7 @@ test "LocalCommandBackend pull rejects interactive ssh command" {
 
     switch (result) {
         .failed_static => |message| try std.testing.expectEqualStrings("Pull requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND", message),
-        else => return error.ExpectedInteractiveSshPullFailure,
+        else => return error.ExpectedInteractiveSshPullRefreshFailure,
     }
 }
 
@@ -1788,6 +2020,51 @@ fn setupPullWorkRepoForTest(io: std.Io, tmp: *std.testing.TmpDir) !struct { repo
     try work.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
     try runTestGit(io, &.{ "git", "add", "README.md" }, work);
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
+
+    const repo_root_z = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root_z);
+    const repo_root = try std.testing.allocator.dupe(u8, repo_root_z);
+    errdefer std.testing.allocator.free(repo_root);
+    const oid_output = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    errdefer std.testing.allocator.free(oid_output);
+    const oid = try std.testing.allocator.dupe(u8, trimLineEnd(oid_output));
+    std.testing.allocator.free(oid_output);
+
+    return .{ .repo_root = repo_root, .oid = oid };
+}
+
+const PullRefreshFixture = struct {
+    repo_root: []u8,
+    oid: []u8,
+
+    fn deinit(self: PullRefreshFixture) void {
+        std.testing.allocator.free(self.repo_root);
+        std.testing.allocator.free(self.oid);
+    }
+};
+
+fn setupPullRefreshFixture(io: std.Io, tmp: *std.testing.TmpDir) !PullRefreshFixture {
+    try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    try tmp.dir.createDir(io, "updater", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    var updater = try tmp.dir.openDir(io, "updater", .{});
+    defer updater.close(io);
+
+    const remote_root = try tmp.dir.realPathFileAlloc(io, "remote.git", std.testing.allocator);
+    defer std.testing.allocator.free(remote_root);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, work);
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "initial\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
+    try runTestGit(io, &.{ "git", "push", "-u", "origin", "main" }, work);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, updater);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, updater);
+    try runTestGit(io, &.{ "git", "pull", "--ff-only", "origin", "main" }, updater);
 
     const repo_root_z = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
     defer std.testing.allocator.free(repo_root_z);

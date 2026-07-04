@@ -269,12 +269,13 @@ pub const FetchFinished = struct {
 
 pub const FileActionTaskResult = union(enum) {
     ok,
+    ok_static: []const u8,
     failed: []u8,
     failed_static: []const u8,
 
     pub fn deinit(self: FileActionTaskResult, allocator: std.mem.Allocator) void {
         switch (self) {
-            .ok, .failed_static => {},
+            .ok, .ok_static, .failed_static => {},
             .failed => |message| allocator.free(message),
         }
     }
@@ -790,7 +791,7 @@ pub fn PullTask(comptime Msg: type) type {
                 allocator.destroy(task);
             }
 
-            const result = runPull(task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, allocator, io);
+            const result = runPullRefresh(task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, allocator, io);
             const repo_root = task.repo_root;
             const branch = task.branch;
             const remote = task.remote;
@@ -972,10 +973,10 @@ pub fn runPush(repo_root: []const u8, branch: []const u8, remote: []const u8, re
     }, allocator, io);
 }
 
-pub fn runPull(repo_root: []const u8, branch: []const u8, remote: []const u8, remote_branch: []const u8, oid: []const u8, env_map: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runPullRefresh(repo_root: []const u8, branch: []const u8, remote: []const u8, remote_branch: []const u8, oid: []const u8, env_map: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Pull", .{
         .repo_root = repo_root,
-        .kind = .{ .pull_ff_only = .{
+        .kind = .{ .pull_refresh_ff_only = .{
             .branch = branch,
             .remote = remote,
             .remote_branch = remote_branch,
@@ -1003,6 +1004,7 @@ fn runOperationMapped(comptime prefix: []const u8, request: git_backend.Operatio
     };
     return switch (raw_result) {
         .ok => .ok,
+        .ok_static => |message| .{ .ok_static = message },
         .failed => |message| .{ .failed = message },
         .failed_static => |message| .{ .failed_static = message },
     };

@@ -2113,14 +2113,6 @@ pub const App = struct {
                 self.setStatus("pull unavailable: branch status is incomplete", .{});
                 return;
             },
-            .nothing_to_pull => {
-                self.setStatus("nothing to pull", .{});
-                return;
-            },
-            .local_commits_ahead => {
-                self.setStatus("pull blocked: local commits are ahead; push or rebase first", .{});
-                return;
-            },
             .status_loading => {
                 self.setStatus("status is still loading", .{});
                 return;
@@ -2722,7 +2714,7 @@ pub const App = struct {
 
     fn setActionFailureStatus(self: *App, comptime prefix: []const u8, result: app_actions.FileActionTaskResult) bool {
         switch (result) {
-            .ok => return false,
+            .ok, .ok_static => return false,
             .failed => |message| self.setStatus(prefix ++ " failed: {s}", .{git_ops.trimGitOutput(message)}),
             .failed_static => |message| self.setStatus(prefix ++ " failed: {s}", .{message}),
         }
@@ -2736,7 +2728,7 @@ pub const App = struct {
         if (!self.actions.finish(result.pending)) return;
 
         switch (result.result) {
-            .ok => {
+            .ok, .ok_static => {
                 const reviewed_clear_failed = if (self.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
                 const active_root = self.activeRepoRoot();
                 const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
@@ -2771,7 +2763,7 @@ pub const App = struct {
         if (!self.actions.finish(result.pending)) return;
 
         switch (result.result) {
-            .ok => {
+            .ok, .ok_static => {
                 const reviewed_clear_failed = if (self.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
                 const active_root = self.activeRepoRoot();
                 const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
@@ -2810,7 +2802,7 @@ pub const App = struct {
         const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
 
         switch (result.result) {
-            .ok => {
+            .ok, .ok_static => {
                 if (active_matches) {
                     self.setStatus("pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
                     try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
@@ -2854,6 +2846,14 @@ pub const App = struct {
                     self.setStatus("pulled: {s}", .{result.repo_root});
                 }
             },
+            .ok_static => |message| {
+                if (active_matches) {
+                    self.setStatus("{s}", .{message});
+                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+                } else {
+                    self.setStatus("{s}: {s}", .{ message, result.repo_root });
+                }
+            },
             .failed, .failed_static => {
                 _ = self.setActionFailureStatus("pull", result.result);
                 // A failed pull may still have fetched remote-tracking refs
@@ -2874,7 +2874,7 @@ pub const App = struct {
         const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
 
         switch (result.result) {
-            .ok => {
+            .ok, .ok_static => {
                 if (active_matches) {
                     self.setStatus("fetched: {s}", .{result.remote});
                     try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
@@ -7106,6 +7106,39 @@ test "requestPull snapshots the active branch target" {
     try std.testing.expectEqual(@as(u32, 2), confirmation.behind);
 }
 
+test "requestPull opens confirmation before remote refresh regardless of stale ahead behind" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.branch_status.deinit();
+    defer app.git_status.deinit();
+    defer app.cancelPullConfirmation(std.testing.allocator);
+
+    var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc123",
+        .branch = "feature",
+        .upstream = "origin/main",
+        .ahead = 1,
+        .behind = 0,
+    });
+    try app.branch_status.replace("/repo", &bundle);
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    try app.requestPull(std.testing.allocator);
+
+    const confirmation = app.pull_confirmation orelse return error.ExpectedPullConfirmation;
+    try std.testing.expect(app.overlay.isPullBranch());
+    try std.testing.expectEqualStrings("feature", confirmation.branch);
+    try std.testing.expectEqual(@as(u32, 1), confirmation.ahead);
+    try std.testing.expectEqual(@as(u32, 0), confirmation.behind);
+}
+
 test "requestPush clears previous push error details" {
     var app: App = .{
         .allocator = std.testing.allocator,
@@ -7327,6 +7360,34 @@ test "finishPull does not reload a stale active repository" {
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.load.pending == null);
     try std.testing.expectEqualStrings("pulled: /repo", app.status.text());
+}
+
+test "finishPull reloads matching active repo after up-to-date success" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    const pending = app.actions.begin(.pull);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
+
+    try app.finishPull(&ctx, .{
+        .pending = pending,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .branch = try std.testing.allocator.dupe(u8, "feature"),
+        .remote = try std.testing.allocator.dupe(u8, "origin"),
+        .remote_branch = try std.testing.allocator.dupe(u8, "main"),
+        .oid = try std.testing.allocator.dupe(u8, "abc123"),
+        .result = .{ .ok_static = "nothing to pull" },
+    });
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.load.pending != null);
+    try std.testing.expectEqualStrings("nothing to pull", app.status.text());
 }
 
 test "finishPull reloads matching active repo after failure" {

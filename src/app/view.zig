@@ -1385,7 +1385,7 @@ fn viewPullConfirmation(app: anytype, surface: *chasen.Surface) !void {
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, confirmation_dialog_width),
         .dialog_height = @min(surface.size().height, confirmation_dialog_height),
-        .title = "Pull current branch?",
+        .title = "Fetch, then fast-forward?",
         .backdrop = false,
         .border = .rounded,
         .title_style = boldRoleStyle(app.theme, .accent),
@@ -1399,7 +1399,7 @@ fn viewPullConfirmation(app: anytype, surface: *chasen.Surface) !void {
     var content = surface.child(content_rect);
     const size = content.size();
 
-    const target = try std.fmt.allocPrint(content.frameAllocator(), "{s} <- {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
+    const target = try std.fmt.allocPrint(content.frameAllocator(), "Fetch {s}, then fast-forward {s} if behind?", .{ confirmation.remote, confirmation.branch });
     const counts = try std.fmt.allocPrint(content.frameAllocator(), "ahead {d} / behind {d}", .{ confirmation.ahead, confirmation.behind });
     const line_count: u16 = 5;
     const start_row: u16 = if (size.height > line_count) (size.height - line_count) / 2 else 0;
@@ -1408,7 +1408,7 @@ fn viewPullConfirmation(app: anytype, surface: *chasen.Surface) !void {
         try drawCenteredText(&content, start_row + 2, counts, roleStyle(app.theme, .muted));
     }
     if (start_row + 4 < size.height) {
-        try drawCenteredText(&content, start_row + 4, "Enter: pull --ff-only    Esc/q: cancel", roleStyle(app.theme, .accent));
+        try drawCenteredText(&content, start_row + 4, "Enter: fetch + ff-only    Esc/q: cancel", roleStyle(app.theme, .accent));
     }
 }
 

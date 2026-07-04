@@ -159,8 +159,9 @@ pub const PushConfirmation = struct {
 /// Owned snapshot for pull confirmation.
 ///
 /// Branch status and file status can reload while the popup is open, so the
-/// displayed target is copied and the backend re-checks branch/clean state
-/// immediately before running `git pull --ff-only`.
+/// displayed target is copied. The backend then fetches the confirmed remote
+/// and re-checks branch/upstream/clean state before deciding whether to
+/// fast-forward.
 pub const PullConfirmation = struct {
     repo_root: []u8,
     branch: []u8,

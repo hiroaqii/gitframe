@@ -203,8 +203,6 @@ pub const PullTargetResult = union(enum) {
     no_upstream,
     upstream_not_remote_branch,
     branch_status_unavailable,
-    nothing_to_pull,
-    local_commits_ahead,
     status_loading,
     status_stale,
     dirty_worktree,
@@ -327,15 +325,10 @@ pub fn pullTarget(ctx: PullActionContext) PullTargetResult {
     if (upstream.remote_branch.len == 0) return .upstream_not_remote_branch;
     const oid = branch_status.oid orelse return .branch_status_unavailable;
     const ahead_behind = branch_status.ahead_behind orelse return .branch_status_unavailable;
-    // Diverged history needs a user choice between push/rebase/merge. The first
-    // pull slice only offers a fast-forward remote update, so fail before
-    // spawning git even though `pull --ff-only` would also reject it.
-    if (ahead_behind.ahead > 0) return .local_commits_ahead;
-    if (ahead_behind.behind == 0) return .nothing_to_pull;
 
     // This App-side clean-worktree gate is for immediate feedback. The backend
-    // repeats the check right before `git pull` to close the confirmation/task
-    // race where files can change after this snapshot.
+    // repeats the check before and after fetch to close confirmation/task and
+    // network-time races where files can change after this snapshot.
     if (ctx.status.loading) return .status_loading;
     if (!ctx.status.isFreshFor(repo_root)) return .status_stale;
     switch (pullWorktreeState(ctx.status.entries)) {
@@ -801,7 +794,7 @@ test "pullTarget rejects unsafe branch and worktree states" {
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
         .status = clean_status,
     }));
-    try std.testing.expectEqual(PullTargetResult.local_commits_ahead, pullTarget(.{
+    switch (pullTarget(.{
         .source = .unstaged,
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
@@ -811,8 +804,11 @@ test "pullTarget rejects unsafe branch and worktree states" {
             .ahead_behind = .{ .ahead = 1, .behind = 1 },
         } },
         .status = clean_status,
-    }));
-    try std.testing.expectEqual(PullTargetResult.nothing_to_pull, pullTarget(.{
+    })) {
+        .ready => {},
+        else => return error.ExpectedAheadPullTargetReady,
+    }
+    switch (pullTarget(.{
         .source = .unstaged,
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
@@ -822,7 +818,10 @@ test "pullTarget rejects unsafe branch and worktree states" {
             .ahead_behind = .{ .ahead = 0, .behind = 0 },
         } },
         .status = clean_status,
-    }));
+    })) {
+        .ready => {},
+        else => return error.ExpectedUpToDatePullTargetReady,
+    }
     try std.testing.expectEqual(PullTargetResult.status_loading, pullTarget(.{
         .source = .unstaged,
         .repo_root = "/repo",
