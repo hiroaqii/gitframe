@@ -1404,7 +1404,7 @@ fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
             .width = size.width,
             .height = size.height - 4,
         });
-        drawWrappedTextScrolled(&body, message, app.overlay.push_error_scroll, .{});
+        _ = drawWrappedTextScrolled(&body, message, app.overlay.push_error_scroll, .{});
     }
 
     if (size.height > 0) {
@@ -1436,11 +1436,7 @@ pub fn pushErrorMaxScroll(size: chasen.Size, message: ?[]const u8) usize {
     const text = message orelse "";
     const content_size = pushErrorContentSize(size, text);
     if (content_size.width == 0) return 0;
-    const paragraph = ui.Paragraph.init(.{ .text = text });
-    const rows = paragraph.lineCount(content_size.width);
-    const visible_rows: usize = pushErrorVisibleRows(size, message);
-    if (rows <= visible_rows) return 0;
-    return rows - visible_rows;
+    return paragraphMaxScroll(text, content_size.width, pushErrorVisibleRows(size, message));
 }
 
 fn pushErrorContentSize(size: chasen.Size, message: []const u8) chasen.Size {
@@ -1464,12 +1460,46 @@ fn modalHeightForContent(size: chasen.Size, dialog_width: u16, desired_content_h
     return size.height;
 }
 
-fn drawWrappedTextScrolled(surface: *chasen.Surface, text: []const u8, scroll: usize, style: chasen.TextStyle) void {
+const ParagraphViewport = struct {
+    visible_rows: usize,
+    wrapped_rows: usize,
+    scroll: usize,
+};
+
+fn paragraphViewport(text: []const u8, width: u16, visible_rows: u16, scroll: usize) ParagraphViewport {
+    const paragraph = ui.Paragraph.init(.{ .text = text });
+    const wrapped_rows = paragraph.lineCount(width);
+    const height: usize = visible_rows;
+    const viewport = ui.Viewport.init(.{
+        .total = wrapped_rows,
+        .height = height,
+        .offset = scroll,
+    }).withClampedOffset();
+    return .{
+        .visible_rows = height,
+        .wrapped_rows = wrapped_rows,
+        .scroll = viewport.offset,
+    };
+}
+
+fn paragraphMaxScroll(text: []const u8, width: u16, visible_rows: u16) usize {
+    const viewport = paragraphViewport(text, width, visible_rows, 0);
+    if (viewport.visible_rows == 0) return viewport.wrapped_rows;
+    return ui.Viewport.init(.{
+        .total = viewport.wrapped_rows,
+        .height = viewport.visible_rows,
+        .offset = viewport.scroll,
+    }).maxOffset();
+}
+
+fn drawWrappedTextScrolled(surface: *chasen.Surface, text: []const u8, scroll: usize, style: chasen.TextStyle) usize {
     const size = surface.size();
-    if (size.width == 0 or size.height == 0) return;
+    if (size.width == 0 or size.height == 0) return 0;
+
+    const viewport = paragraphViewport(text, size.width, size.height, scroll);
 
     var logical_row: usize = 0;
-    var drawn_rows: u16 = 0;
+    var drawn_rows: usize = 0;
     var line_start: usize = 0;
     var line_end: usize = 0;
     var line_width: u32 = 0;
@@ -1478,7 +1508,7 @@ fn drawWrappedTextScrolled(surface: *chasen.Surface, text: []const u8, scroll: u
     while (iter.next()) |grapheme| {
         const bytes = grapheme.bytes(text);
         if (bytes.len == 1 and bytes[0] == '\n') {
-            if (drawWrappedLine(surface, text[line_start..line_end], logical_row, scroll, &drawn_rows, style)) return;
+            if (drawWrappedLine(surface, text[line_start..line_end], logical_row, viewport.scroll, &drawn_rows, style)) return drawn_rows;
             logical_row += 1;
             line_start = grapheme.start + grapheme.len;
             line_end = line_start;
@@ -1488,7 +1518,7 @@ fn drawWrappedTextScrolled(surface: *chasen.Surface, text: []const u8, scroll: u
 
         const grapheme_width = chasen.text.displayWidth(bytes);
         if (line_width > 0 and line_width + grapheme_width > size.width) {
-            if (drawWrappedLine(surface, text[line_start..line_end], logical_row, scroll, &drawn_rows, style)) return;
+            if (drawWrappedLine(surface, text[line_start..line_end], logical_row, viewport.scroll, &drawn_rows, style)) return drawn_rows;
             logical_row += 1;
             line_start = grapheme.start;
             line_end = grapheme.start;
@@ -1499,16 +1529,17 @@ fn drawWrappedTextScrolled(surface: *chasen.Surface, text: []const u8, scroll: u
         line_width += grapheme_width;
     }
 
-    _ = drawWrappedLine(surface, text[line_start..line_end], logical_row, scroll, &drawn_rows, style);
+    _ = drawWrappedLine(surface, text[line_start..line_end], logical_row, viewport.scroll, &drawn_rows, style);
+    return drawn_rows;
 }
 
-fn drawWrappedLine(surface: *chasen.Surface, line: []const u8, logical_row: usize, scroll: usize, drawn_rows: *u16, style: chasen.TextStyle) bool {
+fn drawWrappedLine(surface: *chasen.Surface, line: []const u8, logical_row: usize, scroll: usize, drawn_rows: *usize, style: chasen.TextStyle) bool {
     const size = surface.size();
     if (logical_row < scroll) return false;
-    if (drawn_rows.* >= size.height) return true;
-    _ = surface.borrowTextAt(0, drawn_rows.*, line, style);
+    if (drawn_rows.* >= @as(usize, size.height)) return true;
+    _ = surface.borrowTextAt(0, @intCast(drawn_rows.*), line, style);
     drawn_rows.* += 1;
-    return drawn_rows.* >= size.height;
+    return drawn_rows.* >= @as(usize, size.height);
 }
 
 fn drawCenteredText(surface: *chasen.Surface, row: u16, text: []const u8, style: chasen.TextStyle) !void {
@@ -2053,6 +2084,41 @@ test "help popup max scroll helper separates outer and content sizes" {
     const content = helpContentSize(outer);
 
     try std.testing.expectEqual(helpMaxScrollForContentSize(content), helpMaxScroll(outer));
+}
+
+test "push error paragraph viewport max scroll follows wrapped line count" {
+    const text = "ab\n\nあいz\nabcdef";
+    const width: u16 = 4;
+    const visible_rows: u16 = 2;
+    const paragraph = ui.Paragraph.init(.{ .text = text });
+    const expected_rows = paragraph.lineCount(width);
+
+    try std.testing.expectEqual(expected_rows - visible_rows, paragraphMaxScroll(text, width, visible_rows));
+}
+
+test "push error paragraph renderer stays in parity with Paragraph lineCount" {
+    const text = "ab\n\nあいz\nabcdef";
+    const width: u16 = 4;
+    const paragraph = ui.Paragraph.init(.{ .text = text });
+    const expected_rows = paragraph.lineCount(width);
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(width, @intCast(expected_rows + 1));
+    defer ts.deinit();
+
+    try std.testing.expectEqual(expected_rows, drawWrappedTextScrolled(&ts.surface, text, 0, .{}));
+}
+
+test "push error paragraph renderer applies scroll offset" {
+    const text = "one\ntwo\nthree\nfour";
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(8, 3);
+    defer ts.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), drawWrappedTextScrolled(&ts.surface, text, 1, .{}));
+    try ts.expectCellText(0, 0, "t");
+    try ts.expectCellText(0, 1, "t");
+    try ts.expectCellText(0, 2, "f");
 }
 
 const HelpItem = struct {
