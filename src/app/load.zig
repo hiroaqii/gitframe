@@ -436,15 +436,7 @@ pub fn runBranchStatusLoad(repo_root: []const u8, allocator: std.mem.Allocator, 
     };
 
     switch (raw_result) {
-        .ok => |bytes| {
-            defer allocator.free(bytes);
-            if (bytes.len == 0) return .empty;
-            const bundle = git_branch_status.BranchStatusBundle.parseOwned(allocator, bytes) catch |err| {
-                return .{ .failed = std.fmt.allocPrint(allocator, "Branch status parse failed: {s}", .{@errorName(err)}) catch
-                    return .{ .failed_static = "Branch status parse failed: OutOfMemory" } };
-            };
-            return .{ .loaded = bundle };
-        },
+        .ok => |bundle| return .{ .loaded = bundle },
         .failed => |message| return .{ .failed = message },
         .failed_static => |message| return .{ .failed_static = message },
     }

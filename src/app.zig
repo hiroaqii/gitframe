@@ -6245,6 +6245,30 @@ test "pending selection restore clears when status finishes empty after reload" 
     try std.testing.expect(app.pending_selection_restore == null);
 }
 
+const BranchStatusBundleSpec = struct {
+    oid: ?[]const u8 = null,
+    branch: ?[]const u8 = null,
+    upstream: ?[]const u8 = null,
+    ahead: ?u32 = null,
+    behind: ?u32 = null,
+};
+
+fn branchStatusBundleForTest(allocator: std.mem.Allocator, spec: BranchStatusBundleSpec) !git_branch_status.BranchStatusBundle {
+    var builder = git_branch_status.Builder.init(allocator);
+    errdefer builder.deinit();
+
+    if (spec.oid) |oid| try builder.setOid(oid);
+    if (spec.branch) |branch| {
+        try builder.setBranchHead(branch);
+    } else {
+        builder.setDetached();
+    }
+    if (spec.upstream) |upstream| try builder.setUpstream(upstream);
+    if (spec.ahead) |ahead| builder.setAheadBehind(ahead, spec.behind orelse 0);
+
+    return builder.finish();
+}
+
 test "stale branch status result is ignored" {
     var app: App = .{
         .allocator = std.testing.allocator,
@@ -6254,12 +6278,12 @@ test "stale branch status result is ignored" {
     defer app.branch_status.deinit();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    const bundle = try git_branch_status.BranchStatusBundle.parseOwned(
-        std.testing.allocator,
-        "# branch.head stale\n" ++
-            "# branch.upstream origin/main\n" ++
-            "# branch.ab +1 -0\n",
-    );
+    const bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .branch = "stale",
+        .upstream = "origin/main",
+        .ahead = 1,
+        .behind = 0,
+    });
 
     app.finishBranchStatusLoad(&ctx, .{
         .generation = 1,
@@ -6284,13 +6308,13 @@ test "requestPush snapshots the active branch target" {
     defer app.branch_status.deinit();
     defer app.cancelPushConfirmation(std.testing.allocator);
 
-    var bundle = try git_branch_status.BranchStatusBundle.parseOwned(
-        std.testing.allocator,
-        "# branch.oid abc123\n" ++
-            "# branch.head feature\n" ++
-            "# branch.upstream origin/main\n" ++
-            "# branch.ab +2 -0\n",
-    );
+    var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc123",
+        .branch = "feature",
+        .upstream = "origin/main",
+        .ahead = 2,
+        .behind = 0,
+    });
     try app.branch_status.replace("/repo", &bundle);
 
     try app.requestPush(std.testing.allocator);
@@ -6318,13 +6342,13 @@ test "requestPush clears previous push error details" {
     defer app.cancelPushConfirmation(std.testing.allocator);
     defer app.clearPushError(std.testing.allocator);
 
-    var bundle = try git_branch_status.BranchStatusBundle.parseOwned(
-        std.testing.allocator,
-        "# branch.oid abc123\n" ++
-            "# branch.head feature\n" ++
-            "# branch.upstream origin/main\n" ++
-            "# branch.ab +2 -0\n",
-    );
+    var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc123",
+        .branch = "feature",
+        .upstream = "origin/main",
+        .ahead = 2,
+        .behind = 0,
+    });
     try app.branch_status.replace("/repo", &bundle);
     try app.setPushError(std.testing.allocator, "old push failure");
 

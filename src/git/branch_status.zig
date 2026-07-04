@@ -2,7 +2,6 @@ const std = @import("std");
 
 pub const ParseError = error{
     OutOfMemory,
-    InvalidAheadBehind,
 };
 
 pub const Head = union(enum) {
@@ -44,16 +43,6 @@ pub const BranchStatusBundle = struct {
     arena: ?std.heap.ArenaAllocator,
     status: BranchStatus,
 
-    pub fn parseOwned(allocator: std.mem.Allocator, text: []const u8) ParseError!BranchStatusBundle {
-        var arena: std.heap.ArenaAllocator = .init(allocator);
-        errdefer arena.deinit();
-        const copied = try arena.allocator().dupe(u8, text);
-        return .{
-            .arena = arena,
-            .status = try parse(copied),
-        };
-    }
-
     pub fn deinit(self: *BranchStatusBundle) void {
         if (self.arena) |*arena| arena.deinit();
         self.* = .{ .arena = null, .status = .{} };
@@ -63,6 +52,52 @@ pub const BranchStatusBundle = struct {
         const arena = self.arena.?;
         self.arena = null;
         return arena;
+    }
+};
+
+pub const Builder = struct {
+    arena: ?std.heap.ArenaAllocator,
+    status: BranchStatus = .{},
+
+    pub fn init(parent_allocator: std.mem.Allocator) Builder {
+        return .{ .arena = .init(parent_allocator) };
+    }
+
+    pub fn deinit(self: *Builder) void {
+        if (self.arena) |*arena| arena.deinit();
+        self.* = .{ .arena = null, .status = .{} };
+    }
+
+    pub fn setOid(self: *Builder, oid: []const u8) std.mem.Allocator.Error!void {
+        self.status.oid = try self.allocator().dupe(u8, oid);
+    }
+
+    pub fn setBranchHead(self: *Builder, name: []const u8) std.mem.Allocator.Error!void {
+        self.status.head = .{ .branch = try self.allocator().dupe(u8, name) };
+    }
+
+    pub fn setDetached(self: *Builder) void {
+        self.status.head = .detached;
+    }
+
+    pub fn setUpstream(self: *Builder, name: []const u8) std.mem.Allocator.Error!void {
+        const copied = try self.allocator().dupe(u8, name);
+        self.status.upstream = upstreamFromOwnedName(copied);
+    }
+
+    pub fn setAheadBehind(self: *Builder, ahead: u32, behind: u32) void {
+        self.status.ahead_behind = .{ .ahead = ahead, .behind = behind };
+    }
+
+    pub fn finish(self: *Builder) BranchStatusBundle {
+        const arena = self.arena.?;
+        const status = self.status;
+        self.* = .{ .arena = null, .status = .{} };
+        return .{ .arena = arena, .status = status };
+    }
+
+    fn allocator(self: *Builder) std.mem.Allocator {
+        return self.arena.?.allocator();
     }
 };
 
@@ -92,26 +127,7 @@ pub const State = struct {
     }
 };
 
-pub fn parse(text: []const u8) ParseError!BranchStatus {
-    var status: BranchStatus = .{};
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "# branch.")) continue;
-        if (std.mem.startsWith(u8, line, "# branch.oid ")) {
-            status.oid = line["# branch.oid ".len..];
-        } else if (std.mem.startsWith(u8, line, "# branch.head ")) {
-            const head = line["# branch.head ".len..];
-            status.head = if (std.mem.eql(u8, head, "(detached)")) .detached else .{ .branch = head };
-        } else if (std.mem.startsWith(u8, line, "# branch.upstream ")) {
-            status.upstream = parseUpstream(line["# branch.upstream ".len..]);
-        } else if (std.mem.startsWith(u8, line, "# branch.ab ")) {
-            status.ahead_behind = try parseAheadBehind(line["# branch.ab ".len..]);
-        }
-    }
-    return status;
-}
-
-fn parseUpstream(name: []const u8) Upstream {
+fn upstreamFromOwnedName(name: []const u8) Upstream {
     if (std.mem.indexOfScalar(u8, name, '/')) |slash| {
         return .{
             .name = name,
@@ -126,25 +142,17 @@ fn parseUpstream(name: []const u8) Upstream {
     };
 }
 
-fn parseAheadBehind(text: []const u8) ParseError!AheadBehind {
-    var iter = std.mem.tokenizeScalar(u8, text, ' ');
-    const ahead_text = iter.next() orelse return error.InvalidAheadBehind;
-    const behind_text = iter.next() orelse return error.InvalidAheadBehind;
-    if (ahead_text.len < 2 or ahead_text[0] != '+') return error.InvalidAheadBehind;
-    if (behind_text.len < 2 or behind_text[0] != '-') return error.InvalidAheadBehind;
-    return .{
-        .ahead = std.fmt.parseInt(u32, ahead_text[1..], 10) catch return error.InvalidAheadBehind,
-        .behind = std.fmt.parseInt(u32, behind_text[1..], 10) catch return error.InvalidAheadBehind,
-    };
-}
+test "builder creates branch status with upstream and ahead behind" {
+    var builder = Builder.init(std.testing.allocator);
+    errdefer builder.deinit();
+    try builder.setOid("abc");
+    try builder.setBranchHead("feature");
+    try builder.setUpstream("origin/main");
+    builder.setAheadBehind(2, 3);
 
-test "parse branch status with upstream and ahead behind" {
-    const status = try parse(
-        "# branch.oid abc\n" ++
-            "# branch.head feature\n" ++
-            "# branch.upstream origin/main\n" ++
-            "# branch.ab +2 -3\n",
-    );
+    var bundle = builder.finish();
+    defer bundle.deinit();
+    const status = bundle.status;
 
     try std.testing.expectEqualStrings("abc", status.oid.?);
     try std.testing.expectEqualStrings("feature", status.branchName().?);
@@ -155,22 +163,30 @@ test "parse branch status with upstream and ahead behind" {
     try std.testing.expectEqual(@as(u32, 3), status.ahead_behind.?.behind);
 }
 
-test "parse detached branch status" {
-    const status = try parse(
-        "# branch.oid abc\n" ++
-            "# branch.head (detached)\n",
-    );
+test "builder creates detached branch status" {
+    var builder = Builder.init(std.testing.allocator);
+    errdefer builder.deinit();
+    try builder.setOid("abc");
+    builder.setDetached();
+
+    var bundle = builder.finish();
+    defer bundle.deinit();
+    const status = bundle.status;
 
     try std.testing.expect(status.branchName() == null);
     try std.testing.expect(std.meta.eql(Head.detached, status.head));
     try std.testing.expect(status.upstream == null);
 }
 
-test "parse branch status without upstream" {
-    const status = try parse(
-        "# branch.oid abc\n" ++
-            "# branch.head local-only\n",
-    );
+test "builder creates branch status without upstream" {
+    var builder = Builder.init(std.testing.allocator);
+    errdefer builder.deinit();
+    try builder.setOid("abc");
+    try builder.setBranchHead("local-only");
+
+    var bundle = builder.finish();
+    defer bundle.deinit();
+    const status = bundle.status;
 
     try std.testing.expectEqualStrings("abc", status.oid.?);
     try std.testing.expectEqualStrings("local-only", status.branchName().?);
@@ -178,20 +194,32 @@ test "parse branch status without upstream" {
     try std.testing.expect(status.ahead_behind == null);
 }
 
-test "parse zero ahead behind" {
-    const status = try parse(
-        "# branch.head main\n" ++
-            "# branch.upstream origin/main\n" ++
-            "# branch.ab +0 -0\n",
-    );
+test "builder creates zero ahead behind" {
+    var builder = Builder.init(std.testing.allocator);
+    errdefer builder.deinit();
+    try builder.setBranchHead("main");
+    try builder.setUpstream("origin/main");
+    builder.setAheadBehind(0, 0);
+
+    var bundle = builder.finish();
+    defer bundle.deinit();
+    const status = bundle.status;
 
     try std.testing.expectEqual(@as(u32, 0), status.ahead_behind.?.ahead);
     try std.testing.expectEqual(@as(u32, 0), status.ahead_behind.?.behind);
 }
 
-test "reject malformed ahead behind" {
-    try std.testing.expectError(error.InvalidAheadBehind, parse(
-        "# branch.head main\n" ++
-            "# branch.ab +abc -xyz\n",
-    ));
+test "builder preserves upstream without remote branch" {
+    var builder = Builder.init(std.testing.allocator);
+    errdefer builder.deinit();
+    try builder.setBranchHead("main");
+    try builder.setUpstream("origin");
+
+    var bundle = builder.finish();
+    defer bundle.deinit();
+    const upstream = bundle.status.upstream.?;
+
+    try std.testing.expectEqualStrings("origin", upstream.name);
+    try std.testing.expectEqualStrings("origin", upstream.remote);
+    try std.testing.expectEqualStrings("", upstream.remote_branch);
 }

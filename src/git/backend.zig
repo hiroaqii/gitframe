@@ -1,4 +1,5 @@
 const std = @import("std");
+const git_branch_status = @import("branch_status.zig");
 const process_runner = @import("../process/runner.zig");
 
 pub const max_diff_bytes = 16 * 1024 * 1024;
@@ -45,8 +46,8 @@ pub const StatusLoadResult = union(enum) {
 };
 
 pub const BranchStatusLoadResult = union(enum) {
-    /// Allocated raw branch status text. Caller owns and must call `deinit`.
-    ok: []u8,
+    /// Owned branch status snapshot. Caller owns and must call `deinit`.
+    ok: git_branch_status.BranchStatusBundle,
     /// Allocated error message from the backend. Caller owns and must call `deinit`.
     failed: []u8,
     /// Non-owned fallback error message, used when allocation itself fails.
@@ -54,7 +55,10 @@ pub const BranchStatusLoadResult = union(enum) {
 
     pub fn deinit(self: BranchStatusLoadResult, allocator: std.mem.Allocator) void {
         switch (self) {
-            .ok => |bytes| allocator.free(bytes),
+            .ok => |bundle| {
+                var owned = bundle;
+                owned.deinit();
+            },
             .failed => |message| allocator.free(message),
             .failed_static => {},
         }
@@ -362,40 +366,40 @@ fn loadGitStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8
 }
 
 fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!BranchStatusLoadResult {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
+    var builder = git_branch_status.Builder.init(allocator);
+    defer builder.deinit();
 
     const head_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
     const head_result = try runGitBranchStatusCommand(allocator, io, repo_root, &head_argv);
-    defer freeRunResult(allocator, head_result);
+    defer head_result.deinit(allocator);
 
     switch (head_result.term) {
         .exited => |code| if (code == 0) {
-            try appendBranchStatusLine(&out, allocator, "# branch.head {s}\n", .{trimLineEnd(head_result.stdout)});
+            try builder.setBranchHead(trimLineEnd(head_result.stdout));
         } else {
-            try out.appendSlice(allocator, "# branch.head (detached)\n");
+            builder.setDetached();
         },
         else => return branchStatusCommandFailure(allocator, "git symbolic-ref", head_result),
     }
 
     const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
     const oid_result = try runGitBranchStatusCommand(allocator, io, repo_root, &oid_argv);
-    defer freeRunResult(allocator, oid_result);
+    defer oid_result.deinit(allocator);
     switch (oid_result.term) {
         .exited => |code| if (code == 0) {
-            try appendBranchStatusLine(&out, allocator, "# branch.oid {s}\n", .{trimLineEnd(oid_result.stdout)});
+            try builder.setOid(trimLineEnd(oid_result.stdout));
         },
         else => return branchStatusCommandFailure(allocator, "git rev-parse HEAD", oid_result),
     }
 
     const upstream_argv = [_][]const u8{ "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}" };
     const upstream_result = try runGitBranchStatusCommand(allocator, io, repo_root, &upstream_argv);
-    defer freeRunResult(allocator, upstream_result);
-    var upstream: ?[]const u8 = null;
+    defer upstream_result.deinit(allocator);
+    var has_upstream = false;
     switch (upstream_result.term) {
         .exited => |code| if (code == 0) {
-            upstream = trimLineEnd(upstream_result.stdout);
-            try appendBranchStatusLine(&out, allocator, "# branch.upstream {s}\n", .{upstream.?});
+            has_upstream = true;
+            try builder.setUpstream(trimLineEnd(upstream_result.stdout));
         } else {
             // No upstream is a normal local-branch/detached state; push/pull
             // gates need to distinguish it from an actual status load failure.
@@ -403,14 +407,14 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []co
         else => return branchStatusCommandFailure(allocator, "git rev-parse upstream", upstream_result),
     }
 
-    if (upstream) |_| {
+    if (has_upstream) {
         const ab_argv = [_][]const u8{ "git", "rev-list", "--left-right", "--count", "HEAD...@{upstream}" };
         const ab_result = try runGitBranchStatusCommand(allocator, io, repo_root, &ab_argv);
-        defer freeRunResult(allocator, ab_result);
+        defer ab_result.deinit(allocator);
         switch (ab_result.term) {
             .exited => |code| if (code == 0) {
                 const counts = try parseRevListAheadBehind(ab_result.stdout);
-                try appendBranchStatusLine(&out, allocator, "# branch.ab +{d} -{d}\n", .{ counts.ahead, counts.behind });
+                builder.setAheadBehind(counts.ahead, counts.behind);
             } else {
                 return branchStatusCommandFailure(allocator, "git rev-list ahead/behind", ab_result);
             },
@@ -418,20 +422,16 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []co
         }
     }
 
-    return .{ .ok = try out.toOwnedSlice(allocator) };
+    return .{ .ok = builder.finish() };
 }
 
-fn runGitBranchStatusCommand(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!std.process.RunResult {
-    return std.process.run(allocator, io, .{
+fn runGitBranchStatusCommand(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!process_runner.Result {
+    return process_runner.runCaptured(allocator, io, .{
         .argv = argv,
         .cwd = .{ .path = repo_root },
         .stdout_limit = .limited(4 * 1024),
         .stderr_limit = .limited(16 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
+    }) catch |err| return runnerErrorToLoadError(err);
 }
 
 fn freeRunResult(allocator: std.mem.Allocator, result: std.process.RunResult) void {
@@ -439,15 +439,9 @@ fn freeRunResult(allocator: std.mem.Allocator, result: std.process.RunResult) vo
     allocator.free(result.stderr);
 }
 
-fn branchStatusCommandFailure(allocator: std.mem.Allocator, label: []const u8, result: std.process.RunResult) LoadError!BranchStatusLoadResult {
+fn branchStatusCommandFailure(allocator: std.mem.Allocator, label: []const u8, result: process_runner.Result) LoadError!BranchStatusLoadResult {
     if (result.stderr.len > 0) return .{ .failed = try std.fmt.allocPrint(allocator, "{s} failed: {s}", .{ label, trimLineEnd(result.stderr) }) };
     return .{ .failed = try std.fmt.allocPrint(allocator, "{s} failed: {any}", .{ label, result.term }) };
-}
-
-fn appendBranchStatusLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) LoadError!void {
-    const text = std.fmt.allocPrint(allocator, fmt, args) catch return error.OutOfMemory;
-    defer allocator.free(text);
-    out.appendSlice(allocator, text) catch return error.OutOfMemory;
 }
 
 fn trimLineEnd(text: []const u8) []const u8 {
@@ -779,7 +773,7 @@ fn sshPublicKeyFailureDiagnosis(allocator: std.mem.Allocator, io: std.Io, env: *
 fn verifyPushSnapshot(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: PushRequest) LoadError!bool {
     const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
     const branch_result = try runGitBranchStatusCommand(allocator, io, repo_root, &branch_argv);
-    defer freeRunResult(allocator, branch_result);
+    defer branch_result.deinit(allocator);
     switch (branch_result.term) {
         .exited => |code| if (code != 0) return false,
         else => return false,
@@ -788,7 +782,7 @@ fn verifyPushSnapshot(allocator: std.mem.Allocator, io: std.Io, repo_root: []con
 
     const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
     const oid_result = try runGitBranchStatusCommand(allocator, io, repo_root, &oid_argv);
-    defer freeRunResult(allocator, oid_result);
+    defer oid_result.deinit(allocator);
     switch (oid_result.term) {
         .exited => |code| if (code != 0) return false,
         else => return false,
@@ -1179,14 +1173,54 @@ test "LocalCommandBackend loads branch status without upstream" {
     const result = try local_backend.loadBranchStatus(std.testing.allocator, io, .{ .repo_root = repo_root });
     defer result.deinit(std.testing.allocator);
 
-    const text = switch (result) {
-        .ok => |bytes| bytes,
+    const status = switch (result) {
+        .ok => |bundle| bundle.status,
         .failed, .failed_static => return error.UnexpectedBranchStatusFailure,
     };
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "# branch.head main\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "# branch.upstream ") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "# branch.ab ") == null);
+    try std.testing.expectEqualStrings("main", status.branchName().?);
+    try std.testing.expect(status.oid != null);
+    try std.testing.expect(status.upstream == null);
+    try std.testing.expect(status.ahead_behind == null);
+}
+
+test "LocalCommandBackend loads branch status with upstream" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+
+    const remote_root = try tmp.dir.realPathFileAlloc(io, "remote.git", std.testing.allocator);
+    defer std.testing.allocator.free(remote_root);
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, work);
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
+    try runTestGit(io, &.{ "git", "push", "-u", "origin", "main" }, work);
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.loadBranchStatus(std.testing.allocator, io, .{ .repo_root = repo_root });
+    defer result.deinit(std.testing.allocator);
+
+    const status = switch (result) {
+        .ok => |bundle| bundle.status,
+        .failed, .failed_static => return error.UnexpectedBranchStatusFailure,
+    };
+
+    try std.testing.expectEqualStrings("main", status.branchName().?);
+    try std.testing.expectEqualStrings("origin/main", status.upstream.?.name);
+    try std.testing.expectEqualStrings("origin", status.upstream.?.remote);
+    try std.testing.expectEqualStrings("main", status.upstream.?.remote_branch);
+    try std.testing.expectEqual(@as(u32, 0), status.ahead_behind.?.ahead);
+    try std.testing.expectEqual(@as(u32, 0), status.ahead_behind.?.behind);
 }
 
 fn runTestGit(io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !void {
