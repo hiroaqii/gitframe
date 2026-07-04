@@ -6562,6 +6562,20 @@ test "file search keeps diff focus while sidebar is hidden" {
     try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
 }
 
+fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette {
+    const FakeConfig = struct {
+        role: theme.Role,
+        color: theme.ColorValue,
+
+        pub fn get(self: @This(), requested: theme.Role) ?theme.ColorValue {
+            if (requested == self.role) return self.color;
+            return null;
+        }
+    };
+
+    return theme.Palette.fromConfig(FakeConfig{ .role = role, .color = color });
+}
+
 test "sidebar renders file status badges" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(34, 8);
@@ -6576,6 +6590,23 @@ test "sidebar renders file status badges" {
 
     try ts.expectCellText(2, sidebar_header_rows, "A");
     try ts.expectCellText(2, sidebar_header_rows + 1, "D");
+}
+
+test "sidebar added status badge follows success role override" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(34, 8);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 80, .height = 9 },
+        .theme = paletteWithOverride(.success, .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } }),
+        .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+    };
+
+    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+
+    try ts.expectCellText(2, sidebar_header_rows, "A");
+    try std.testing.expect(ts.surface.readCell(2, sidebar_header_rows).?.style.fg.eql(.{ .rgb = .{ 1, 2, 3 } }));
 }
 
 test "sidebar renders mode change badge next to file status" {
@@ -6663,6 +6694,54 @@ test "sidebar title indicates active focus" {
     try ts.expectCellText(1, 2, "F");
     try std.testing.expect(ts.surface.readCell(1, 2).?.style.fg.eql(.{ .index = 14 }));
     try std.testing.expect(!ts.surface.readCell(1, 2).?.style.reverse);
+}
+
+test "sidebar title follows accent role override" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(34, 8);
+    defer ts.deinit();
+
+    const app: App = .{
+        .terminal_size = .{ .width = 80, .height = 9 },
+        .theme = paletteWithOverride(.accent, .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } }),
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .viewer = .{ .focus = .sidebar },
+    };
+
+    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+
+    try ts.expectCellText(1, 2, "F");
+    try std.testing.expect(ts.surface.readCell(1, 2).?.style.fg.eql(.{ .rgb = .{ 4, 5, 6 } }));
+}
+
+test "amend confirmation chrome follows amend role override" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 30);
+    defer ts.deinit();
+
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 30 },
+        .theme = paletteWithOverride(.amend, .{ .rgb = .{ .r = 7, .g = 8, .b = 9 } }),
+        .commit_panel = app_commit_panel.State.init(std.testing.allocator),
+    };
+    defer app.commit_panel.deinit();
+    defer app.cancelAmendConfirmation(std.testing.allocator);
+
+    app.commit_panel.open(.amend);
+    app.commit_panel.insert('x');
+    try app.openAmendConfirmation(std.testing.allocator, "/repo");
+
+    try app.view(&ts.surface);
+
+    const content_rect = app_view.shellContentRect(ts.surface.size());
+    const dialog_rect = ui.Modal.dialogRectFor(content_rect, .{
+        .dialog_width = @min(content_rect.width, @as(u16, 72)),
+        .dialog_height = @min(content_rect.height, @as(u16, 9)),
+    });
+
+    try ts.expectCellText(dialog_rect.col, dialog_rect.row, "╭");
+    try std.testing.expect(ts.surface.readCell(dialog_rect.col, dialog_rect.row).?.style.fg.eql(.{ .rgb = .{ 7, 8, 9 } }));
 }
 
 test "inactive sidebar selected row is dim without reverse background" {
