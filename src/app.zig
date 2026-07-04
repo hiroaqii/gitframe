@@ -578,9 +578,11 @@ pub const App = struct {
             .cancel_search => self.cancelSearchMode(),
             .clear_search => self.clearSearch(),
             .submit_search => self.submitSearch(),
-            .search_insert => |codepoint| self.search.input.insert(codepoint) catch {},
+            .search_insert => |codepoint| self.search.input.insert(codepoint) catch {
+                self.setStatus("search query is too long", .{});
+            },
             .search_paste => |text| self.search.input.insertSlice(text) catch {
-                self.setStatus("search paste is too long", .{});
+                self.setStatus("search query is too long", .{});
             },
             .search_backspace => self.search.input.backspace(),
             .search_move_left => self.search.input.moveLeft(),
@@ -592,12 +594,14 @@ pub const App = struct {
             .submit_file_search => try self.submitFileSearch(ctx.allocator()),
             .file_search_insert => |codepoint| {
                 self.file_search.resetNoMatch();
-                self.file_search.input.insert(codepoint) catch {};
+                self.file_search.input.insert(codepoint) catch {
+                    self.setStatus("file search query is too long", .{});
+                };
             },
             .file_search_paste => |text| {
                 self.file_search.resetNoMatch();
                 self.file_search.input.insertSlice(text) catch {
-                    self.setStatus("file search paste is too long", .{});
+                    self.setStatus("file search query is too long", .{});
                 };
             },
             .file_search_backspace => {
@@ -744,19 +748,19 @@ pub const App = struct {
         if (self.search.mode or self.file_search.mode or self.commit_panel.is_open or self.repo_picker.mode) return null;
         if (mouse.type != .press) return null;
 
-        if (self.overlay.isHelp()) {
-            return switch (mouse.button) {
+        switch (self.overlay.mouseMode()) {
+            .passthrough => {},
+            .block => return null,
+            .scroll_help => return switch (mouse.button) {
                 .wheel_up => .help_scroll_up,
                 .wheel_down => .help_scroll_down,
                 else => null,
-            };
-        }
-        if (self.overlay.isPushError()) {
-            return switch (mouse.button) {
+            },
+            .scroll_push_error => return switch (mouse.button) {
                 .wheel_up => .push_error_scroll_up,
                 .wheel_down => .push_error_scroll_down,
                 else => null,
-            };
+            },
         }
 
         const pane = self.mousePane(mouse) orelse return null;
@@ -857,12 +861,7 @@ pub const App = struct {
     }
 
     fn scrollHelp(self: *App, delta: isize) void {
-        if (delta < 0) {
-            const amount: usize = @intCast(-(delta + 1));
-            self.overlay.help_scroll -|= amount + 1;
-        } else {
-            self.overlay.help_scroll +|= @intCast(delta);
-        }
+        self.overlay.help_scroll = applySignedScroll(self.overlay.help_scroll, delta);
         self.clampHelpScroll();
     }
 
@@ -880,12 +879,7 @@ pub const App = struct {
     }
 
     fn scrollPushError(self: *App, delta: isize) void {
-        if (delta < 0) {
-            const amount: usize = @intCast(-(delta + 1));
-            self.overlay.push_error_scroll -|= amount + 1;
-        } else {
-            self.overlay.push_error_scroll +|= @intCast(delta);
-        }
+        self.overlay.push_error_scroll = applySignedScroll(self.overlay.push_error_scroll, delta);
         self.clampPushErrorScroll();
     }
 
@@ -3625,7 +3619,7 @@ pub const App = struct {
         switch (result) {
             .none => {},
             .refresh_filter => try self.refreshRepoPickerFilter(allocator),
-            .filter_too_long => self.setStatus("repository filter paste is too long", .{}),
+            .filter_too_long => self.setStatus("repository filter is too long", .{}),
             .path_changed => {
                 if (self.repo_picker_discovery != null) {
                     self.clearRepoPickerDiscovery(allocator);
@@ -4920,6 +4914,14 @@ fn terminalBodyHeight(terminal_height: u16) u16 {
     return app_view.terminalBodyHeight(terminal_height);
 }
 
+fn applySignedScroll(current: usize, delta: isize) usize {
+    if (delta < 0) {
+        const amount: usize = @intCast(-(delta + 1));
+        return current -| (amount + 1);
+    }
+    return current +| @as(usize, @intCast(delta));
+}
+
 fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
     return app_view.sidebarWidth(total_width, preferred_width);
 }
@@ -5736,6 +5738,24 @@ test "push error overlay wheel scrolls details and ignores clicks" {
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
 }
 
+test "confirmation overlay blocks mouse clicks and wheels" {
+    var app: App = .{
+        .terminal_size = .{ .width = 100, .height = 8 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+        .viewer = .{
+            .focus = .diff,
+            .selected_file = 0,
+        },
+        .overlay = .{ .kind = .push_branch },
+    };
+
+    const content = app_view.shellContentRect(app.terminal_size);
+    try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
+    try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) == null);
+    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
+}
+
 test "terminal resize clamps push error scroll" {
     const long_message =
         "line 1\nline 2\nline 3\nline 4\nline 5\n" ++
@@ -5796,6 +5816,54 @@ test "mouse release and motion events are ignored" {
     const content = app_view.shellContentRect(app.terminal_size);
     try std.testing.expect(app.handleEvent(app_test_support.mouseEventTyped(content.col + 1, content.row + 1, .left, .release)) == null);
     try std.testing.expect(app.handleEvent(app_test_support.mouseEventTyped(content.col + 1, content.row + 1, .left, .motion)) == null);
+}
+
+test "search overflow reports query status for insert and paste" {
+    var app: App = .{ .search = .{ .mode = true } };
+    @memset(&app.search.input.buffer, 'x');
+    app.search.input.len = app.search.input.buffer.len;
+    app.search.input.cursor = app.search.input.buffer.len;
+
+    try app.update(.{ .search_insert = 'y' }, undefined);
+    try std.testing.expectEqualStrings("search query is too long", app.status.text());
+
+    app.status.clear();
+    try app.update(.{ .search_paste = "y" }, undefined);
+    try std.testing.expectEqualStrings("search query is too long", app.status.text());
+}
+
+test "file search overflow reports query status for insert and paste" {
+    var app: App = .{ .file_search = .{ .mode = true } };
+    @memset(&app.file_search.input.buffer, 'x');
+    app.file_search.input.len = app.file_search.input.buffer.len;
+    app.file_search.input.cursor = app.file_search.input.buffer.len;
+
+    try app.update(.{ .file_search_insert = 'y' }, undefined);
+    try std.testing.expectEqualStrings("file search query is too long", app.status.text());
+
+    app.status.clear();
+    try app.update(.{ .file_search_paste = "y" }, undefined);
+    try std.testing.expectEqualStrings("file search query is too long", app.status.text());
+}
+
+test "repo picker filter overflow reports status for insert and paste" {
+    var app: App = .{
+        .repo_picker = .{
+            .mode = true,
+            .input_mode = .filter,
+        },
+    };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    @memset(&app.repo_picker.list.input.buffer, 'x');
+    app.repo_picker.list.input.len = app.repo_picker.list.input.buffer.len;
+    app.repo_picker.list.input.cursor = app.repo_picker.list.input.buffer.len;
+
+    try app.update(.{ .repo_picker_insert = 'y' }, &ctx);
+    try std.testing.expectEqualStrings("repository filter is too long", app.status.text());
+
+    app.status.clear();
+    try app.update(.{ .repo_picker_paste = "y" }, &ctx);
+    try std.testing.expectEqualStrings("repository filter is too long", app.status.text());
 }
 
 test "mode change resyncs search match to rendered body offsets" {

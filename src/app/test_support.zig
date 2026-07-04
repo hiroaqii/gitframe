@@ -314,17 +314,17 @@ pub const file_with_hunks = diff_parser.FileDiff{
 pub const hunks = [_]diff_parser.Hunk{
     .{
         .old_start = 1,
-        .old_count = 5,
+        .old_count = 4,
         .new_start = 1,
-        .new_count = 5,
+        .new_count = 4,
         .section = "first",
         .lines = &hunk_first_lines,
     },
     .{
         .old_start = 20,
-        .old_count = 3,
+        .old_count = 2,
         .new_start = 20,
-        .new_count = 3,
+        .new_count = 2,
         .section = "second",
         .lines = &hunk_second_lines,
     },

@@ -381,7 +381,7 @@ fn directoryUnstageTarget(repo_root: []const u8, directory: []const u8, status: 
 }
 
 pub fn discardTarget(ctx: TargetContext) DiscardTargetResult {
-    if (!diff_source.sourceAllowsStageAction(ctx.source)) return .unavailable_source;
+    if (!diff_source.sourceAllowsDiscardAction(ctx.source)) return .unavailable_source;
     const repo_root = ctx.repo_root orelse return .no_repo;
     const action_target = ctx.action_target orelse return .no_path;
     if (action_target.kind == .directory) return .directory_unsupported;

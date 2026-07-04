@@ -527,7 +527,12 @@ fn runGitPush(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, p
         }
     }
 
-    var env = try pushEnvironment(allocator, parent_env);
+    var env = pushEnvironment(allocator, parent_env) catch |err| switch (err) {
+        error.InteractiveSshCommand => return .{ .failed_static = "Push requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND" },
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SpawnFailed => return error.SpawnFailed,
+        error.StreamTooLong => return error.StreamTooLong,
+    };
     defer env.deinit();
 
     const refspec = std.fmt.allocPrint(allocator, "refs/heads/{s}:refs/heads/{s}", .{ request.branch, request.remote_branch }) catch return error.OutOfMemory;
@@ -790,7 +795,9 @@ fn verifyPushSnapshot(allocator: std.mem.Allocator, io: std.Io, repo_root: []con
     return std.mem.eql(u8, trimLineEnd(oid_result.stdout), request.oid);
 }
 
-fn pushEnvironment(allocator: std.mem.Allocator, parent_env: ?*const std.process.Environ.Map) LoadError!std.process.Environ.Map {
+const PushEnvironmentError = LoadError || error{InteractiveSshCommand};
+
+fn pushEnvironment(allocator: std.mem.Allocator, parent_env: ?*const std.process.Environ.Map) PushEnvironmentError!std.process.Environ.Map {
     var env = if (parent_env) |map|
         map.clone(allocator) catch return error.OutOfMemory
     else
@@ -803,7 +810,7 @@ fn pushEnvironment(allocator: std.mem.Allocator, parent_env: ?*const std.process
     const ssh_command = if (existing_ssh) |value|
         switch (sshBatchModeState(value)) {
             .batch => allocator.dupe(u8, value) catch return error.OutOfMemory,
-            .interactive => return error.SpawnFailed,
+            .interactive => return error.InteractiveSshCommand,
             .unspecified => std.fmt.allocPrint(allocator, "{s} -o BatchMode=yes", .{value}) catch return error.OutOfMemory,
         }
     else
@@ -996,7 +1003,7 @@ test "pushEnvironment preserves existing BatchMode yes and rejects BatchMode no"
     var parent_no = std.process.Environ.Map.init(std.testing.allocator);
     defer parent_no.deinit();
     try parent_no.put("GIT_SSH_COMMAND", "ssh -o BatchMode=no -i /tmp/key");
-    try std.testing.expectError(error.SpawnFailed, pushEnvironment(std.testing.allocator, &parent_no));
+    try std.testing.expectError(error.InteractiveSshCommand, pushEnvironment(std.testing.allocator, &parent_no));
 }
 
 test "pushFailureWithDiagnostics explains missing ssh-agent socket" {

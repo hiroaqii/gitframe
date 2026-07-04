@@ -10,6 +10,13 @@ pub const OverlayKind = enum {
     push_error,
 };
 
+pub const OverlayMouseMode = enum {
+    passthrough,
+    block,
+    scroll_help,
+    scroll_push_error,
+};
+
 /// App-owned modal/overlay state.
 ///
 /// Overlay-specific viewport state lives with the overlay selector so opening,
@@ -37,6 +44,15 @@ pub const OverlayState = struct {
 
     pub fn isPushError(self: OverlayState) bool {
         return self.kind == .push_error;
+    }
+
+    pub fn mouseMode(self: OverlayState) OverlayMouseMode {
+        return switch (self.kind) {
+            .none => .passthrough,
+            .help => .scroll_help,
+            .push_error => .scroll_push_error,
+            .discard_file, .amend_commit, .push_branch => .block,
+        };
     }
 
     pub fn openHelp(self: *OverlayState) void {
@@ -131,7 +147,11 @@ pub const StatusMessage = struct {
     clear_on_next_input: bool = false,
 
     pub fn set(self: *StatusMessage, comptime fmt: []const u8, args: anytype) void {
-        const formatted = std.fmt.bufPrint(&self.buf, fmt, args) catch "status formatting failed";
+        const formatted = std.fmt.bufPrint(&self.buf, fmt, args) catch {
+            self.len = validUtf8PrefixLen(&self.buf);
+            self.clear_on_next_input = true;
+            return;
+        };
         self.len = formatted.len;
         self.clear_on_next_input = true;
     }
@@ -149,6 +169,12 @@ pub const StatusMessage = struct {
         return self.buf[0..self.len];
     }
 };
+
+fn validUtf8PrefixLen(bytes: []const u8) usize {
+    var len = bytes.len;
+    while (len > 0 and !std.unicode.utf8ValidateSlice(bytes[0..len])) : (len -= 1) {}
+    return len;
+}
 
 /// Display-only review filters applied to the active loaded diff.
 ///
@@ -265,6 +291,23 @@ test "StatusMessage owns its formatted text buffer" {
 
     try std.testing.expectEqualStrings("loaded 3", status.text());
     try std.testing.expect(status.clear_on_next_input);
+}
+
+test "StatusMessage truncates overflow instead of replacing text" {
+    var status: StatusMessage = .{};
+    status.set("prefix {s}", .{"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"});
+
+    try std.testing.expect(std.mem.startsWith(u8, status.text(), "prefix abc"));
+    try std.testing.expect(!std.mem.eql(u8, status.text(), "status formatting failed"));
+    try std.testing.expect(status.text().len <= status.buf.len);
+}
+
+test "StatusMessage truncates on UTF-8 boundary" {
+    var status: StatusMessage = .{};
+    status.set("{s}", .{"あいうえおかきくけこさしすせそたちつてとあいうえおかきくけこさしすせそたちつてと"});
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(status.text()));
+    try std.testing.expect(status.text().len <= status.buf.len);
 }
 
 test "StatusMessage remains self-contained after value copy" {

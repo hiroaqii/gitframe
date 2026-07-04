@@ -17,6 +17,7 @@ pub fn formatSingleHunkPatch(
 ) HunkPatchError![]u8 {
     try validateSupportedFile(file);
     if (hunk_index >= file.hunks.len) return error.InvalidHunk;
+    if (!hunkIsComplete(file.hunks[hunk_index])) return error.InvalidHunk;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -27,6 +28,23 @@ pub fn formatSingleHunkPatch(
     for (file.hunks[hunk_index].lines) |line| try appendHunkLine(&out, allocator, line);
 
     return out.toOwnedSlice(allocator);
+}
+
+fn hunkIsComplete(hunk: diff_parser.Hunk) bool {
+    var old_seen: u32 = 0;
+    var new_seen: u32 = 0;
+    for (hunk.lines) |line| {
+        switch (line.kind) {
+            .context => {
+                old_seen += 1;
+                new_seen += 1;
+            },
+            .removed => old_seen += 1,
+            .added => new_seen += 1,
+            .metadata => {},
+        }
+    }
+    return old_seen == hunk.old_count and new_seen == hunk.new_count;
 }
 
 fn validateSupportedFile(file: diff_parser.FileDiff) HunkPatchError!void {
@@ -138,6 +156,25 @@ test "formatSingleHunkPatch preserves hunk metadata lines" {
 
     try std.testing.expect(std.mem.endsWith(u8, patch, "\\ No newline at end of file\n"));
     try std.testing.expect(std.mem.indexOf(u8, patch, "-old\n\\ No newline at end of file\n+new\n") != null);
+}
+
+test "formatSingleHunkPatch rejects incomplete hunks accepted by parser" {
+    const text =
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\index 1111111..2222222 100644
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -1,2 +1,2 @@
+        \\ line one
+        \\-old
+        \\
+    ;
+
+    const document = try diff_parser.parse(std.testing.allocator, text);
+    defer document.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), document.files[0].hunks.len);
+    try std.testing.expectError(error.InvalidHunk, formatSingleHunkPatch(std.testing.allocator, document.files[0], 0));
 }
 
 test "formatSingleHunkPatch rejects unsupported files" {

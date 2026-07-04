@@ -129,7 +129,7 @@ pub fn insertCodepoint(picker: *app_prompt.RepoPickerState, codepoint: u21) Edit
         .list => return .none,
         .filter => {
             picker.list.resetNoMatch();
-            picker.list.input.insert(codepoint) catch {};
+            picker.list.input.insert(codepoint) catch return .filter_too_long;
             return .refresh_filter;
         },
         .path_input => {
