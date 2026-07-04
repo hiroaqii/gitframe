@@ -52,6 +52,13 @@ pub const DetailedResult = union(enum) {
     failed: Failure,
 };
 
+/// Run a child process with structured argv and captured stdout/stderr, without stdin.
+pub fn runCaptured(allocator: std.mem.Allocator, io: std.Io, options: Options) Error!Result {
+    var captured_options = options;
+    captured_options.stdin = &.{};
+    return runWithStdin(allocator, io, captured_options);
+}
+
 /// Run a child process with structured argv and captured stdout/stderr.
 ///
 /// This is shared by Git commands and ExternalAction so process ownership,
@@ -115,6 +122,35 @@ pub fn runWithStdinDetailed(allocator: std.mem.Allocator, io: std.Io, options: O
     errdefer allocator.free(stdout);
     const stderr = try multi_reader.toOwnedSlice(1);
     return .{ .ok = .{ .term = term, .stdout = stdout, .stderr = stderr } };
+}
+
+test "runCaptured captures stdout and stderr" {
+    const argv = [_][]const u8{ "sh", "-c", "printf out; printf err >&2" };
+    const result = try runCaptured(std.testing.allocator, std.testing.io, .{
+        .argv = &argv,
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(64),
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("out", result.stdout);
+    try std.testing.expectEqualStrings("err", result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+}
+
+test "runCaptured enforces output caps" {
+    const argv = [_][]const u8{ "sh", "-c", "printf abcdef" };
+    try std.testing.expectError(error.StreamTooLong, runCaptured(std.testing.allocator, std.testing.io, .{
+        .argv = &argv,
+        .stdout_limit = .limited(3),
+        .stderr_limit = .limited(64),
+    }));
+}
+
+test "runCaptured rejects empty argv" {
+    try std.testing.expectError(error.EmptyArgv, runCaptured(std.testing.allocator, std.testing.io, .{
+        .argv = &.{},
+    }));
 }
 
 test "runWithStdin captures stdout and stderr" {

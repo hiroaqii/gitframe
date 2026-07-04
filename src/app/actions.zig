@@ -697,141 +697,56 @@ fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
 }
 
 pub fn runStageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+    return runOperationMapped("Stage", .{
         .repo_root = repo_root,
         .kind = .{ .stage_file = path },
-    }) catch |err| {
-        return .{
-            .failed = std.fmt.allocPrint(allocator, "Stage failed: {s}", .{@errorName(err)}) catch
-                return .{ .failed_static = "Stage failed: OutOfMemory" },
-        };
-    };
-
-    return switch (raw_result) {
-        .ok => .ok,
-        .failed => |message| .{ .failed = message },
-        .failed_static => |message| .{ .failed_static = message },
-    };
+    }, allocator, io);
 }
 
 pub fn runUnstageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+    return runOperationMapped("Unstage", .{
         .repo_root = repo_root,
         .kind = .{ .unstage_file = path },
-    }) catch |err| {
-        return .{
-            .failed = std.fmt.allocPrint(allocator, "Unstage failed: {s}", .{@errorName(err)}) catch
-                return .{ .failed_static = "Unstage failed: OutOfMemory" },
-        };
-    };
-
-    return switch (raw_result) {
-        .ok => .ok,
-        .failed => |message| .{ .failed = message },
-        .failed_static => |message| .{ .failed_static = message },
-    };
+    }, allocator, io);
 }
 
 pub fn runStageHunk(repo_root: []const u8, patch: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+    return runOperationMapped("Stage hunk", .{
         .repo_root = repo_root,
         .kind = .{ .stage_patch = .{ .patch = patch } },
-    }) catch |err| {
-        return .{
-            .failed = std.fmt.allocPrint(allocator, "Stage hunk failed: {s}", .{@errorName(err)}) catch
-                return .{ .failed_static = "Stage hunk failed: OutOfMemory" },
-        };
-    };
-
-    return switch (raw_result) {
-        .ok => .ok,
-        .failed => |message| .{ .failed = message },
-        .failed_static => |message| .{ .failed_static = message },
-    };
+    }, allocator, io);
 }
 
 pub fn runUnstageHunk(repo_root: []const u8, patch: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+    return runOperationMapped("Unstage hunk", .{
         .repo_root = repo_root,
         .kind = .{ .unstage_patch = .{ .patch = patch } },
-    }) catch |err| {
-        return .{
-            .failed = std.fmt.allocPrint(allocator, "Unstage hunk failed: {s}", .{@errorName(err)}) catch
-                return .{ .failed_static = "Unstage hunk failed: OutOfMemory" },
-        };
-    };
-
-    return switch (raw_result) {
-        .ok => .ok,
-        .failed => |message| .{ .failed = message },
-        .failed_static => |message| .{ .failed_static = message },
-    };
+    }, allocator, io);
 }
 
 pub fn runDiscardFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+    return runOperationMapped("Discard", .{
         .repo_root = repo_root,
         .kind = .{ .discard_file = path },
-    }) catch |err| {
-        return .{
-            .failed = std.fmt.allocPrint(allocator, "Discard failed: {s}", .{@errorName(err)}) catch
-                return .{ .failed_static = "Discard failed: OutOfMemory" },
-        };
-    };
-
-    return switch (raw_result) {
-        .ok => .ok,
-        .failed => |message| .{ .failed = message },
-        .failed_static => |message| .{ .failed_static = message },
-    };
+    }, allocator, io);
 }
 
 pub fn runCommit(repo_root: []const u8, subject: []const u8, body: ?[]const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+    return runOperationMapped("Commit", .{
         .repo_root = repo_root,
         .kind = .{ .commit = .{ .subject = subject, .body = body } },
-    }) catch |err| {
-        return .{
-            .failed = std.fmt.allocPrint(allocator, "Commit failed: {s}", .{@errorName(err)}) catch
-                return .{ .failed_static = "Commit failed: OutOfMemory" },
-        };
-    };
-
-    return switch (raw_result) {
-        .ok => .ok,
-        .failed => |message| .{ .failed = message },
-        .failed_static => |message| .{ .failed_static = message },
-    };
+    }, allocator, io);
 }
 
 pub fn runAmend(repo_root: []const u8, subject: []const u8, body: ?[]const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+    return runOperationMapped("Amend", .{
         .repo_root = repo_root,
         .kind = .{ .amend = .{ .subject = subject, .body = body } },
-    }) catch |err| {
-        return .{
-            .failed = std.fmt.allocPrint(allocator, "Amend failed: {s}", .{@errorName(err)}) catch
-                return .{ .failed_static = "Amend failed: OutOfMemory" },
-        };
-    };
-
-    return switch (raw_result) {
-        .ok => .ok,
-        .failed => |message| .{ .failed = message },
-        .failed_static => |message| .{ .failed_static = message },
-    };
+    }, allocator, io);
 }
 
 pub fn runPush(repo_root: []const u8, branch: []const u8, remote: []const u8, remote_branch: []const u8, oid: []const u8, env_map: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().runOperation(allocator, io, .{
+    return runOperationMapped("Push", .{
         .repo_root = repo_root,
         .kind = .{ .push = .{
             .branch = branch,
@@ -840,13 +755,17 @@ pub fn runPush(repo_root: []const u8, branch: []const u8, remote: []const u8, re
             .oid = oid,
         } },
         .env_map = env_map,
-    }) catch |err| {
+    }, allocator, io);
+}
+
+fn runOperationMapped(comptime prefix: []const u8, request: git_backend.OperationRequest, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+    var local_backend: git_backend.LocalCommandBackend = .{};
+    const raw_result = local_backend.backend().runOperation(allocator, io, request) catch |err| {
         return .{
-            .failed = std.fmt.allocPrint(allocator, "Push failed: {s}", .{@errorName(err)}) catch
-                return .{ .failed_static = "Push failed: OutOfMemory" },
+            .failed = std.fmt.allocPrint(allocator, prefix ++ " failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = prefix ++ " failed: OutOfMemory" },
         };
     };
-
     return switch (raw_result) {
         .ok => .ok,
         .failed => |message| .{ .failed = message },
@@ -910,4 +829,24 @@ test "StageHunkTask failed preserves identity and transfers moved fields" {
         .failed_static => |message| message,
         else => return error.UnexpectedResult,
     });
+}
+
+test "runOperationMapped preserves action failure prefixes" {
+    var result = runStageFile("/__gitframe_missing_repo__", "src/main.zig", std.testing.allocator, std.testing.io);
+    defer result.deinit(std.testing.allocator);
+
+    const message = switch (result) {
+        .failed => |text| text,
+        else => return error.UnexpectedResult,
+    };
+    try std.testing.expect(std.mem.startsWith(u8, message, "Stage failed: "));
+
+    var commit_result = runCommit("/__gitframe_missing_repo__", "subject", null, std.testing.allocator, std.testing.io);
+    defer commit_result.deinit(std.testing.allocator);
+
+    const commit_message = switch (commit_result) {
+        .failed => |text| text,
+        else => return error.UnexpectedResult,
+    };
+    try std.testing.expect(std.mem.startsWith(u8, commit_message, "Commit failed: "));
 }

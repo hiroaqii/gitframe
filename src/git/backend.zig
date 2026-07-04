@@ -258,20 +258,31 @@ fn repoRoot(request: GitDiffRequest) []const u8 {
     return request.repo_root.?;
 }
 
-fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!LoadResult {
-    // Use structured argv and force stable path prefixes so display/editor
-    // paths do not depend on user diff.mnemonicPrefix/diff.noprefix config.
-    const result = std.process.run(allocator, io, .{
+fn runCapturedCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repo_root: ?[]const u8,
+    argv: []const []const u8,
+    stdout_limit: std.Io.Limit,
+    stderr_limit: std.Io.Limit,
+) LoadError!process_runner.Result {
+    return process_runner.runCaptured(allocator, io, .{
         .argv = argv,
-        .cwd = .{ .path = repo_root },
-        .stdout_limit = .limited(max_diff_bytes),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
+        .cwd = if (repo_root) |root| .{ .path = root } else .inherit,
+        .stdout_limit = stdout_limit,
+        .stderr_limit = stderr_limit,
+    }) catch |err| return runnerErrorToLoadError(err);
+}
+
+fn runnerErrorToLoadError(err: process_runner.Error) LoadError {
+    return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.StreamTooLong => error.StreamTooLong,
         else => error.SpawnFailed,
     };
+}
 
+fn loadResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) LoadError!LoadResult {
     switch (result.term) {
         .exited => |code| if (code == 0) {
             allocator.free(result.stderr);
@@ -281,12 +292,49 @@ fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, 
     }
 
     allocator.free(result.stdout);
-    // Prefer Git's stderr when available; it usually contains the actionable
-    // reason, for example "not a git repository".
     if (result.stderr.len > 0) return .{ .failed = result.stderr };
     allocator.free(result.stderr);
 
-    return .{ .failed = std.fmt.allocPrint(allocator, "git diff failed: {any}", .{result.term}) catch return error.OutOfMemory };
+    return .{ .failed = std.fmt.allocPrint(allocator, "{s} failed: {any}", .{ fallback_label, result.term }) catch return error.OutOfMemory };
+}
+
+fn statusResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) LoadError!StatusLoadResult {
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .{ .ok = result.stdout };
+        },
+        else => {},
+    }
+
+    allocator.free(result.stdout);
+    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    allocator.free(result.stderr);
+
+    return .{ .failed = std.fmt.allocPrint(allocator, "{s} failed: {any}", .{ fallback_label, result.term }) catch return error.OutOfMemory };
+}
+
+fn operationResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) LoadError!OperationResult {
+    allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .ok;
+        },
+        else => {},
+    }
+
+    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    allocator.free(result.stderr);
+
+    return .{ .failed = std.fmt.allocPrint(allocator, "{s} failed: {any}", .{ fallback_label, result.term }) catch return error.OutOfMemory };
+}
+
+fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!LoadResult {
+    // Use structured argv and force stable path prefixes so display/editor
+    // paths do not depend on user diff.mnemonicPrefix/diff.noprefix config.
+    const result = try runCapturedCommand(allocator, io, repo_root, argv, .limited(max_diff_bytes), .limited(256 * 1024));
+    return loadResultFromGitCommand(allocator, result, "git diff");
 }
 
 fn loadGitDiffRange(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, range: []const u8) LoadError!LoadResult {
@@ -309,30 +357,8 @@ fn loadGitFileDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const 
 
 fn loadGitStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!StatusLoadResult {
     const argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
-    const result = std.process.run(allocator, io, .{
-        .argv = &argv,
-        .cwd = .{ .path = repo_root },
-        .stdout_limit = .limited(max_status_bytes),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
-
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .{ .ok = result.stdout };
-        },
-        else => {},
-    }
-
-    allocator.free(result.stdout);
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-
-    return .{ .failed = std.fmt.allocPrint(allocator, "git status failed: {any}", .{result.term}) catch return error.OutOfMemory };
+    const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(max_status_bytes), .limited(256 * 1024));
+    return statusResultFromGitCommand(allocator, result, "git status");
 }
 
 fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!BranchStatusLoadResult {
@@ -445,86 +471,20 @@ fn parseRevListAheadBehind(text: []const u8) LoadError!RevListAheadBehind {
 
 fn runGitAdd(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) LoadError!OperationResult {
     const argv = [_][]const u8{ "git", "add", "--", path };
-    const result = std.process.run(allocator, io, .{
-        .argv = &argv,
-        .cwd = .{ .path = repo_root },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
-
-    allocator.free(result.stdout);
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .ok;
-        },
-        else => {},
-    }
-
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-
-    return .{ .failed = std.fmt.allocPrint(allocator, "git add failed: {any}", .{result.term}) catch return error.OutOfMemory };
+    const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(64 * 1024), .limited(256 * 1024));
+    return operationResultFromGitCommand(allocator, result, "git add");
 }
 
 fn runGitUnstage(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) LoadError!OperationResult {
     const argv = [_][]const u8{ "git", "restore", "--staged", "--", path };
-    const result = std.process.run(allocator, io, .{
-        .argv = &argv,
-        .cwd = .{ .path = repo_root },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
-
-    allocator.free(result.stdout);
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .ok;
-        },
-        else => {},
-    }
-
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-
-    return .{ .failed = std.fmt.allocPrint(allocator, "git restore --staged failed: {any}", .{result.term}) catch return error.OutOfMemory };
+    const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(64 * 1024), .limited(256 * 1024));
+    return operationResultFromGitCommand(allocator, result, "git restore --staged");
 }
 
 fn runGitDiscard(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) LoadError!OperationResult {
     const argv = [_][]const u8{ "git", "restore", "--", path };
-    const result = std.process.run(allocator, io, .{
-        .argv = &argv,
-        .cwd = .{ .path = repo_root },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
-
-    allocator.free(result.stdout);
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .ok;
-        },
-        else => {},
-    }
-
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-
-    return .{ .failed = std.fmt.allocPrint(allocator, "git restore failed: {any}", .{result.term}) catch return error.OutOfMemory };
+    const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(64 * 1024), .limited(256 * 1024));
+    return operationResultFromGitCommand(allocator, result, "git restore");
 }
 
 fn runGitApplyCached(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, patch: []const u8) LoadError!OperationResult {
@@ -535,25 +495,9 @@ fn runGitApplyCached(allocator: std.mem.Allocator, io: std.Io, repo_root: []cons
         .stdin = patch,
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
+    }) catch |err| return runnerErrorToLoadError(err);
 
-    allocator.free(result.stdout);
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .ok;
-        },
-        else => {},
-    }
-
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-
-    return .{ .failed = std.fmt.allocPrint(allocator, "git apply --cached failed: {any}", .{result.term}) catch return error.OutOfMemory };
+    return operationResultFromGitCommand(allocator, result, "git apply --cached");
 }
 
 fn runGitApplyCachedReverse(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, patch: []const u8) LoadError!OperationResult {
@@ -564,25 +508,9 @@ fn runGitApplyCachedReverse(allocator: std.mem.Allocator, io: std.Io, repo_root:
         .stdin = patch,
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
+    }) catch |err| return runnerErrorToLoadError(err);
 
-    allocator.free(result.stdout);
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .ok;
-        },
-        else => {},
-    }
-
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-
-    return .{ .failed = std.fmt.allocPrint(allocator, "git apply --cached --reverse failed: {any}", .{result.term}) catch return error.OutOfMemory };
+    return operationResultFromGitCommand(allocator, result, "git apply --cached --reverse");
 }
 
 fn runGitCommit(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest) LoadError!OperationResult {
@@ -928,30 +856,8 @@ fn runGitCommitLike(allocator: std.mem.Allocator, io: std.Io, repo_root: []const
         if (request.body == null) amend_argv_subject[0..] else amend_argv_with_body[0..]
     else if (request.body == null) argv_subject[0..] else argv_with_body[0..];
 
-    const result = std.process.run(allocator, io, .{
-        .argv = argv,
-        .cwd = .{ .path = repo_root },
-        .stdout_limit = .limited(256 * 1024),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
-
-    allocator.free(result.stdout);
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .ok;
-        },
-        else => {},
-    }
-
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-
-    return .{ .failed = std.fmt.allocPrint(allocator, "git commit failed: {any}", .{result.term}) catch return error.OutOfMemory };
+    const result = try runCapturedCommand(allocator, io, repo_root, argv, .limited(256 * 1024), .limited(256 * 1024));
+    return operationResultFromGitCommand(allocator, result, "git commit");
 }
 
 fn loadNoIndexDiff(allocator: std.mem.Allocator, io: std.Io, paths: PathPair) LoadError!LoadResult {

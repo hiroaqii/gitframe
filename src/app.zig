@@ -2175,20 +2175,13 @@ pub const App = struct {
 
         if (!self.actions.finish(result.pending)) return;
 
-        switch (result.result) {
-            .ok => {
-                self.setStatus("staged: {s}", .{result.path});
-                try self.reloadAfterGitAction(ctx);
-            },
-            .failed => |message| {
-                self.clearPendingSelectionRestore(ctx.allocator());
-                self.setStatus("stage failed: {s}", .{git_ops.trimGitOutput(message)});
-            },
-            .failed_static => |message| {
-                self.clearPendingSelectionRestore(ctx.allocator());
-                self.setStatus("stage failed: {s}", .{message});
-            },
+        if (self.setActionFailureStatus("stage", result.result)) {
+            self.clearPendingSelectionRestore(ctx.allocator());
+            return;
         }
+
+        self.setStatus("staged: {s}", .{result.path});
+        try self.reloadAfterGitAction(ctx);
     }
 
     fn finishStageHunk(self: *App, ctx: *chasen.Ctx(Msg), finished: StageHunkFinished) !void {
@@ -2197,24 +2190,16 @@ pub const App = struct {
 
         if (!self.actions.finish(result.pending)) return;
 
-        switch (result.result) {
-            .ok => {
-                const active_root = self.activeRepoRoot();
-                const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
-                self.setStatus("staged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
-                if (active_matches) {
-                    if (result.mark_source == .session) {
-                        try self.staged_hunks.add(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
-                    }
-                    self.startStatusLoad(ctx, result.repo_root);
-                }
-            },
-            .failed => |message| {
-                self.setStatus("hunk stage failed: {s}", .{git_ops.trimGitOutput(message)});
-            },
-            .failed_static => |message| {
-                self.setStatus("hunk stage failed: {s}", .{message});
-            },
+        if (self.setActionFailureStatus("hunk stage", result.result)) return;
+
+        const active_root = self.activeRepoRoot();
+        const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+        self.setStatus("staged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
+        if (active_matches) {
+            if (result.mark_source == .session) {
+                try self.staged_hunks.add(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
+            }
+            self.startStatusLoad(ctx, result.repo_root);
         }
     }
 
@@ -2224,20 +2209,13 @@ pub const App = struct {
 
         if (!self.actions.finish(result.pending)) return;
 
-        switch (result.result) {
-            .ok => {
-                self.setStatus("unstaged: {s}", .{result.path});
-                try self.reloadAfterGitAction(ctx);
-            },
-            .failed => |message| {
-                self.clearPendingSelectionRestore(ctx.allocator());
-                self.setStatus("unstage failed: {s}", .{git_ops.trimGitOutput(message)});
-            },
-            .failed_static => |message| {
-                self.clearPendingSelectionRestore(ctx.allocator());
-                self.setStatus("unstage failed: {s}", .{message});
-            },
+        if (self.setActionFailureStatus("unstage", result.result)) {
+            self.clearPendingSelectionRestore(ctx.allocator());
+            return;
         }
+
+        self.setStatus("unstaged: {s}", .{result.path});
+        try self.reloadAfterGitAction(ctx);
     }
 
     fn finishUnstageHunk(self: *App, ctx: *chasen.Ctx(Msg), finished: UnstageHunkFinished) !void {
@@ -2246,28 +2224,20 @@ pub const App = struct {
 
         if (!self.actions.finish(result.pending)) return;
 
-        switch (result.result) {
-            .ok => {
-                const active_root = self.activeRepoRoot();
-                const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
-                self.setStatus("unstaged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
-                if (active_matches) {
-                    if (result.reload_after_success) {
-                        try self.reloadAfterGitAction(ctx);
-                        return;
-                    }
-                    if (result.mark_source == .session) {
-                        _ = self.staged_hunks.remove(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
-                    }
-                    self.startStatusLoad(ctx, result.repo_root);
-                }
-            },
-            .failed => |message| {
-                self.setStatus("hunk unstage failed: {s}", .{git_ops.trimGitOutput(message)});
-            },
-            .failed_static => |message| {
-                self.setStatus("hunk unstage failed: {s}", .{message});
-            },
+        if (self.setActionFailureStatus("hunk unstage", result.result)) return;
+
+        const active_root = self.activeRepoRoot();
+        const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+        self.setStatus("unstaged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
+        if (active_matches) {
+            if (result.reload_after_success) {
+                try self.reloadAfterGitAction(ctx);
+                return;
+            }
+            if (result.mark_source == .session) {
+                _ = self.staged_hunks.remove(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
+            }
+            self.startStatusLoad(ctx, result.repo_root);
         }
     }
 
@@ -2277,25 +2247,27 @@ pub const App = struct {
 
         if (!self.actions.finish(result.pending)) return;
 
-        switch (result.result) {
-            .ok => {
-                self.reviewed_store.clearPathKey(ctx.allocator(), result.repo_root, result.path) catch {
-                    self.setStatus("discarded: {s}; could not clear reviewed mark", .{result.path});
-                    try self.reloadAfterGitAction(ctx);
-                    return;
-                };
-                self.setStatus("discarded: {s}", .{result.path});
-                try self.reloadAfterGitAction(ctx);
-            },
-            .failed => |message| {
-                self.clearPendingSelectionRestore(ctx.allocator());
-                self.setStatus("discard failed: {s}", .{git_ops.trimGitOutput(message)});
-            },
-            .failed_static => |message| {
-                self.clearPendingSelectionRestore(ctx.allocator());
-                self.setStatus("discard failed: {s}", .{message});
-            },
+        if (self.setActionFailureStatus("discard", result.result)) {
+            self.clearPendingSelectionRestore(ctx.allocator());
+            return;
         }
+
+        self.reviewed_store.clearPathKey(ctx.allocator(), result.repo_root, result.path) catch {
+            self.setStatus("discarded: {s}; could not clear reviewed mark", .{result.path});
+            try self.reloadAfterGitAction(ctx);
+            return;
+        };
+        self.setStatus("discarded: {s}", .{result.path});
+        try self.reloadAfterGitAction(ctx);
+    }
+
+    fn setActionFailureStatus(self: *App, comptime prefix: []const u8, result: app_actions.FileActionTaskResult) bool {
+        switch (result) {
+            .ok => return false,
+            .failed => |message| self.setStatus(prefix ++ " failed: {s}", .{git_ops.trimGitOutput(message)}),
+            .failed_static => |message| self.setStatus(prefix ++ " failed: {s}", .{message}),
+        }
+        return true;
     }
 
     fn finishCommit(self: *App, ctx: *chasen.Ctx(Msg), finished: CommitFinished) !void {
@@ -2326,13 +2298,9 @@ pub const App = struct {
                     }
                 }
             },
-            .failed => |message| {
+            .failed, .failed_static => {
                 self.commit_panel.commit_error = .commit_failed;
-                self.setStatus("commit failed: {s}", .{git_ops.trimGitOutput(message)});
-            },
-            .failed_static => |message| {
-                self.commit_panel.commit_error = .commit_failed;
-                self.setStatus("commit failed: {s}", .{message});
+                _ = self.setActionFailureStatus("commit", result.result);
             },
         }
     }
@@ -2366,13 +2334,9 @@ pub const App = struct {
                     }
                 }
             },
-            .failed => |message| {
+            .failed, .failed_static => {
                 self.commit_panel.commit_error = .amend_failed;
-                self.setStatus("amend failed: {s}", .{git_ops.trimGitOutput(message)});
-            },
-            .failed_static => |message| {
-                self.commit_panel.commit_error = .amend_failed;
-                self.setStatus("amend failed: {s}", .{message});
+                _ = self.setActionFailureStatus("amend", result.result);
             },
         }
     }
