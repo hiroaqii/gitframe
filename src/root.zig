@@ -41,6 +41,7 @@ test {
     _ = @import("diff/file.zig");
     _ = @import("diff/hunk_projection.zig");
     _ = @import("diff/render.zig");
+    _ = @import("diff/syntax.zig");
     _ = @import("editor.zig");
     _ = @import("external/action.zig");
     _ = @import("git/backend.zig");
@@ -51,5 +52,8 @@ test {
     _ = @import("repo/state.zig");
     _ = @import("review/session.zig");
     _ = @import("review/state.zig");
+    _ = @import("syntax/provider.zig");
+    _ = @import("syntax/provider_none.zig");
+    _ = @import("syntax/provider_runtime.zig");
     _ = @import("theme");
 }

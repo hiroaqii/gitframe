@@ -4,6 +4,7 @@ const diff_parser = @import("diff/parser.zig");
 const diff_render = @import("diff/render.zig");
 const diff_view_model = @import("diff/view_model.zig");
 const file_tree = @import("file_tree.zig");
+const syntax_provider = @import("syntax/provider.zig");
 
 pub const ChangedFileFilter = enum {
     all,
@@ -54,6 +55,7 @@ pub const ChangedFileFilter = enum {
 pub const LoadedDiff = struct {
     text: []const u8,
     document: diff_parser.DiffDocument,
+    syntax_spans: syntax_provider.DocumentSpans = .empty(),
     tree: file_tree.FileTree,
     /// Rendered row prefix cache for O(1) counts and viewport start lookup.
     rendered_line_cache: diff_view_model.RenderedLineCache = .{},

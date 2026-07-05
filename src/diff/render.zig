@@ -4,6 +4,7 @@ const draw = @import("draw");
 const diff_file = @import("file.zig");
 const diff_parser = @import("parser.zig");
 const diff_view_model = @import("view_model.zig");
+const syntax_provider = @import("../syntax/provider.zig");
 const theme = @import("theme");
 
 pub const DisplayMode = diff_view_model.DisplayMode;
@@ -21,6 +22,8 @@ pub const RenderOptions = struct {
     line_index: ?diff_view_model.RenderedLineIndex = null,
     folded_hunks: []const bool = &.{},
     palette: theme.Palette = .default(),
+    file_index: usize = 0,
+    syntax_spans: syntax_provider.DocumentSpans = .empty(),
 };
 
 pub const FileStats = diff_file.Stats;
@@ -115,7 +118,8 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
                 if (current_hunk_highlighted) {
                     if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), styles);
                 }
-                try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles);
+                const syntax_ctx = unifiedSyntaxContext(options, rows, line);
+                try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles, syntax_ctx.line_spans, syntax_ctx.hunk_side_has_visible_syntax);
             },
             .side_by_side => |side_row| {
                 if (current_hunk_highlighted) {
@@ -123,8 +127,8 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
                 }
                 const gutter_col = body_surface.size().width / 2;
                 switch (side_row) {
-                    .single => |line| try drawSideBySideSingle(&body_surface, row, line, gutter_col, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles),
-                    .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, gutter_col, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles),
+                    .single => |line| try drawSideBySideSingle(&body_surface, row, line, gutter_col, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles, sideBySideSingleSyntaxSpans(options, rows, line)),
+                    .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, gutter_col, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles, sideBySidePairSyntaxSpans(options, rows)),
                 }
             },
         }
@@ -172,9 +176,9 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, line
         };
         if (mode == .side_by_side) {
             const gutter_col = body_surface.size().width / 2;
-            try drawSideBySidePair(&body_surface, row, null, line, gutter_col, options.horizontal_scroll, options.line_numbers, false, styles);
+            try drawSideBySidePair(&body_surface, row, null, line, gutter_col, options.horizontal_scroll, options.line_numbers, false, styles, .{});
         } else {
-            try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, false, styles);
+            try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, false, styles, .empty(), false);
         }
     }
 }
@@ -315,6 +319,88 @@ fn drawHunkGuide(surface: *chasen.Surface, row: u16, glyph: []const u8, styles: 
     _ = surface.borrowTextAt(1, row, glyph, styles.hunk_guide);
 }
 
+const UnifiedSyntaxContext = struct {
+    line_spans: syntax_provider.LineSpans = .empty(),
+    hunk_side_has_visible_syntax: bool = false,
+};
+
+fn unifiedSyntaxContext(options: RenderOptions, rows: diff_view_model.BodyRowIterator, line: diff_parser.DiffLine) UnifiedSyntaxContext {
+    const hunk_index = rows.currentHunkIndex() orelse return .{};
+    const line_index = rows.currentUnifiedLineIndex() orelse return .{};
+    const side: syntax_provider.Side = switch (line.kind) {
+        .removed => .old,
+        .added, .context => .new,
+        .metadata => return .{},
+    };
+    return .{
+        .line_spans = options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line_index, side)),
+        .hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, side),
+    };
+}
+
+fn sideBySideSingleSyntaxSpans(options: RenderOptions, rows: diff_view_model.BodyRowIterator, line: diff_parser.DiffLine) SideBySideSyntaxSpans {
+    const hunk_index = rows.currentHunkIndex() orelse return .{};
+    const indexed = rows.currentSideBySideRow() orelse return .{};
+    const line_index = switch (indexed) {
+        .single => |single| single.line_index,
+        .paired => return .{},
+    };
+    return switch (line.kind) {
+        .removed => .{
+            .old = options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line_index, .old)),
+            .old_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, .old),
+        },
+        .added => .{
+            .new = options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line_index, .new)),
+            .new_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, .new),
+        },
+        .context => .{
+            .old = options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line_index, .old)),
+            .new = options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line_index, .new)),
+            .old_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, .old),
+            .new_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, .new),
+        },
+        .metadata => .{},
+    };
+}
+
+fn sideBySidePairSyntaxSpans(options: RenderOptions, rows: diff_view_model.BodyRowIterator) SideBySideSyntaxSpans {
+    const hunk_index = rows.currentHunkIndex() orelse return .{};
+    const indexed = rows.currentSideBySideRow() orelse return .{};
+    return switch (indexed) {
+        .single => .{},
+        .paired => |pair| .{
+            .old = if (pair.removed) |line| options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line.line_index, .old)) else .empty(),
+            .new = if (pair.added) |line| options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line.line_index, .new)) else .empty(),
+            .old_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, .old),
+            .new_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, .new),
+        },
+    };
+}
+
+fn hunkSideHasVisibleSyntaxSignal(document_spans: syntax_provider.DocumentSpans, file_index: usize, hunk_index: usize, side: syntax_provider.Side) bool {
+    if (file_index >= document_spans.files.len) return false;
+    const file = document_spans.files[file_index];
+    if (hunk_index >= file.hunks.len) return false;
+    const hunk = file.hunks[hunk_index];
+    for (hunk.lines) |line| {
+        const spans = line.forSide(side);
+        for (spans.spans) |span| {
+            if (roleChangesForeground(span.role)) return true;
+        }
+    }
+    return false;
+}
+
+fn lineKey(file_index: usize, hunk_index: usize, line_index: usize, side: syntax_provider.Side) syntax_provider.LineKey {
+    return .{
+        .file_index = file_index,
+        .hunk_index = hunk_index,
+        .line_index = line_index,
+        .side = side,
+    };
+}
+
 const BodyCursor = struct {
     scroll: usize,
     base_offset: usize = 0,
@@ -340,40 +426,49 @@ const BodyCursor = struct {
     }
 };
 
-fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles) !void {
-    const style = styleForLine(line.kind, staged, styles);
-    const prefix = prefixForLine(line.kind);
+fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_provider.LineSpans, hunk_side_has_visible_syntax: bool) !void {
+    const text_style = bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax);
+    const marker_style = markerStyleForLine(line.kind, staged, styles);
+    const prefix = prefixForLine(line.kind, hunk_side_has_visible_syntax);
     const layout = lineLayout(line_numbers, .unified);
+    drawGutterLeadInBackground(surface, row, layout, gutterLeadInStyle(line.kind, staged, styles));
 
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(staged, styles));
-        _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), lineNumberStyle(staged, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(line.kind, staged, styles));
+        _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), lineNumberStyle(line.kind, staged, styles));
     }
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, style);
-    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, style);
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, marker_style);
+    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, text_style, syntax_spans, styles);
 }
 
-fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, gutter_col: u16, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles) !void {
+const SideBySideSyntaxSpans = struct {
+    old: syntax_provider.LineSpans = .empty(),
+    new: syntax_provider.LineSpans = .empty(),
+    old_hunk_side_has_visible_syntax: bool = false,
+    new_hunk_side_has_visible_syntax: bool = false,
+};
+
+fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, gutter_col: u16, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans) !void {
     var columns = sideBySideRowColumns(surface, row, gutter_col);
-    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles);
-    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles);
+    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax);
+    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax);
     drawSideBySideGutter(surface, row, gutter_col, styles);
 }
 
-fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, gutter_col: u16, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles) !void {
+fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, gutter_col: u16, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans) !void {
     var columns = sideBySideRowColumns(surface, row, gutter_col);
     switch (line.kind) {
         .removed => {
-            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles);
+            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax);
             drawSideBySideGutter(surface, row, gutter_col, styles);
         },
         .added => {
-            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles);
+            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax);
             drawSideBySideGutter(surface, row, gutter_col, styles);
         },
         .context => {
-            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles);
-            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles);
+            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax);
+            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax);
             drawSideBySideGutter(surface, row, gutter_col, styles);
         },
         .metadata => {
@@ -410,26 +505,26 @@ fn sideBySideRowColumns(surface: *chasen.Surface, row: u16, gutter_col: u16) Sid
     };
 }
 
-fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles) !void {
+fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_provider.LineSpans, hunk_side_has_visible_syntax: bool) !void {
     const layout = lineLayout(line_numbers, .side_by_side);
+    drawGutterLeadInBackground(surface, row, layout, gutterLeadInStyle(line.kind, staged, styles));
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(staged, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(line.kind, staged, styles));
     }
-    const prefix = if (line.kind == .removed) "-" else " ";
-    const style = styleForLine(line.kind, staged, styles);
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, style);
-    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, style);
+    const prefix = if (line.kind == .removed and !hunk_side_has_visible_syntax) "-" else " ";
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, markerStyleForLine(line.kind, staged, styles));
+    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), syntax_spans, styles);
 }
 
-fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles) !void {
+fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_provider.LineSpans, hunk_side_has_visible_syntax: bool) !void {
     const layout = lineLayout(line_numbers, .side_by_side);
+    drawGutterLeadInBackground(surface, row, layout, gutterLeadInStyle(line.kind, staged, styles));
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), lineNumberStyle(staged, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), lineNumberStyle(line.kind, staged, styles));
     }
-    const prefix = if (line.kind == .added) "+" else " ";
-    const style = styleForLine(line.kind, staged, styles);
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, style);
-    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, style);
+    const prefix = if (line.kind == .added and !hunk_side_has_visible_syntax) "+" else " ";
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, markerStyleForLine(line.kind, staged, styles));
+    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), syntax_spans, styles);
 }
 
 pub const LineLayoutMode = enum {
@@ -454,9 +549,81 @@ fn lineLayout(line_numbers: bool, mode: LineLayoutMode) LineLayout {
     };
 }
 
+fn drawGutterLeadInBackground(surface: *chasen.Surface, row: u16, layout: LineLayout, style: chasen.TextStyle) void {
+    const end_col = @min(layout.text_col, surface.size().width);
+    var col: u16 = 0;
+    while (col < end_col) : (col += 1) {
+        _ = surface.borrowTextAt(col, row, " ", style);
+    }
+}
+
 fn copyScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, horizontal_scroll: usize, style: chasen.TextStyle) !void {
     const scrolled = chasen.text.dropToWidth(text, horizontal_scroll);
     try copyPlainClippedTextAt(surface, col, row, scrolled, style);
+}
+
+fn copyStyledScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, horizontal_scroll: usize, base_style: chasen.TextStyle, spans: syntax_provider.LineSpans, styles: RenderStyles) !void {
+    try copyScrolledTextAt(surface, col, row, text, horizontal_scroll, base_style);
+    if (spans.spans.len == 0) return;
+    if (col >= surface.size().width) return;
+
+    const scrolled = chasen.text.dropToWidth(text, horizontal_scroll);
+    const visible_start = @intFromPtr(scrolled.ptr) - @intFromPtr(text.ptr);
+    const visible_end = visible_start + chasen.text.clipToWidth(scrolled, surface.size().width - col).len;
+    for (spans.spans) |span| {
+        if (span.end <= visible_start or span.start >= visible_end) continue;
+        const start = @max(span.start, visible_start);
+        const end = @min(span.end, visible_end);
+        if (end <= start) continue;
+        const prefix_width = chasen.text.displayWidth(text[visible_start..start]);
+        const span_col: u16 = col + prefix_width;
+        if (span_col >= surface.size().width) continue;
+        const token = chasen.text.clipToWidth(text[start..end], surface.size().width - span_col);
+        if (token.len == 0) continue;
+        _ = try surface.copyTextAt(span_col, row, token, syntaxStyle(base_style, span.role, styles));
+    }
+}
+
+fn syntaxStyle(base: chasen.TextStyle, role: syntax_provider.TokenRole, styles: RenderStyles) chasen.TextStyle {
+    var style = base;
+    if (syntaxForegroundForRole(role, styles)) |fg| style.fg = fg;
+    return style;
+}
+
+fn roleChangesForeground(role: syntax_provider.TokenRole) bool {
+    return syntaxForegroundRole(role) != null;
+}
+
+fn syntaxForegroundForRole(role: syntax_provider.TokenRole, styles: RenderStyles) ?chasen.Color {
+    return switch (syntaxForegroundRole(role) orelse return null) {
+        .accent => styles.palette.color(.accent),
+        .info => styles.palette.color(.info),
+        .prompt => styles.palette.color(.prompt),
+        .success => styles.palette.color(.success),
+        .warning => styles.palette.color(.warning),
+        .muted => styles.palette.color(.muted),
+    };
+}
+
+const SyntaxForegroundRole = enum {
+    accent,
+    info,
+    prompt,
+    success,
+    warning,
+    muted,
+};
+
+fn syntaxForegroundRole(role: syntax_provider.TokenRole) ?SyntaxForegroundRole {
+    return switch (role) {
+        .keyword, .operator => .accent,
+        .function, .property => .info,
+        .type, .constant => .prompt,
+        .string => .success,
+        .number => .warning,
+        .comment => .muted,
+        .variable, .punctuation, .plain => null,
+    };
 }
 
 // Scrollable diff body text should not draw an artificial ellipsis; users can
@@ -477,10 +644,10 @@ fn lineNumberText(surface: *chasen.Surface, line: ?u32) ![]const u8 {
         surface.copyText("    ");
 }
 
-fn styleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
+fn textStyleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
     var style = switch (kind) {
-        .added => styles.added,
-        .removed => styles.removed,
+        .added => styles.added_text,
+        .removed => styles.removed_text,
         .context => styles.context,
         .metadata => styles.metadata,
     };
@@ -488,8 +655,45 @@ fn styleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderSty
     return style;
 }
 
-fn lineNumberStyle(staged: bool, styles: RenderStyles) chasen.TextStyle {
-    var style = styles.line_number;
+fn bodyTextStyleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles, hunk_side_has_visible_syntax: bool) chasen.TextStyle {
+    var style = textStyleForLine(kind, staged, styles);
+    if (hunk_side_has_visible_syntax) switch (kind) {
+        .added, .removed => style.fg = styles.context.fg,
+        .context, .metadata => {},
+    };
+    return style;
+}
+
+fn markerStyleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
+    var style = switch (kind) {
+        .added => styles.added_marker,
+        .removed => styles.removed_marker,
+        .context => styles.context_marker,
+        .metadata => styles.metadata,
+    };
+    if (staged) style.dim = true;
+    return style;
+}
+
+fn gutterLeadInStyle(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
+    var style: chasen.TextStyle = switch (kind) {
+        .added => .{ .bg = styles.added_text.bg },
+        .removed => .{ .bg = styles.removed_text.bg },
+        .context => .{ .bg = styles.context.bg },
+        .metadata => .{},
+    };
+    if (staged) style.dim = true;
+    return style;
+}
+
+fn lineNumberStyle(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
+    var style = switch (kind) {
+        .added => styles.added_line_number,
+        .removed => styles.removed_line_number,
+        .context => styles.line_number,
+        .metadata => styles.metadata,
+    };
+    if (kind == .context) style.bg = styles.context.bg;
     if (staged) style.dim = true;
     return style;
 }
@@ -500,10 +704,10 @@ fn fileHeaderStyle(pane_active: bool, styles: RenderStyles) chasen.TextStyle {
     return style;
 }
 
-fn prefixForLine(kind: diff_parser.DiffLine.Kind) []const u8 {
+fn prefixForLine(kind: diff_parser.DiffLine.Kind, hunk_side_has_visible_syntax: bool) []const u8 {
     return switch (kind) {
-        .added => "+",
-        .removed => "-",
+        .added => if (hunk_side_has_visible_syntax) " " else "+",
+        .removed => if (hunk_side_has_visible_syntax) " " else "-",
         .context => " ",
         .metadata => "\\",
     };
@@ -512,13 +716,19 @@ fn prefixForLine(kind: diff_parser.DiffLine.Kind) []const u8 {
 const side_by_side_min_width: u16 = 72;
 
 const RenderStyles = struct {
+    palette: theme.Palette,
     file_header: chasen.TextStyle,
     hunk: chasen.TextStyle,
     selected_hunk: chasen.TextStyle,
     hunk_guide: chasen.TextStyle,
     cursor: chasen.TextStyle,
-    added: chasen.TextStyle,
-    removed: chasen.TextStyle,
+    added_text: chasen.TextStyle,
+    removed_text: chasen.TextStyle,
+    added_marker: chasen.TextStyle,
+    removed_marker: chasen.TextStyle,
+    context_marker: chasen.TextStyle,
+    added_line_number: chasen.TextStyle,
+    removed_line_number: chasen.TextStyle,
     context: chasen.TextStyle,
     metadata: chasen.TextStyle,
     line_number: chasen.TextStyle,
@@ -526,14 +736,22 @@ const RenderStyles = struct {
 
     fn fromPalette(palette: theme.Palette) RenderStyles {
         return .{
+            .palette = palette,
             .file_header = .{ .bold = true, .fg = palette.color(.accent) },
             .hunk = .{ .dim = true, .fg = palette.color(.diff_metadata) },
             .selected_hunk = .{ .bold = true, .fg = palette.color(.diff_hunk) },
             .hunk_guide = .{ .bold = true, .fg = palette.color(.diff_hunk) },
             .cursor = .{ .bold = true, .fg = palette.color(.diff_cursor) },
-            .added = palette.style(.diff_added),
-            .removed = palette.style(.diff_removed),
-            .context = .{},
+            // Keep diff state on backgrounds so body foreground is available
+            // for syntax token colors once a provider is enabled.
+            .added_text = .{ .fg = palette.color(.diff_added), .bg = palette.color(.diff_added_bg) },
+            .removed_text = .{ .fg = palette.color(.diff_removed), .bg = palette.color(.diff_removed_bg) },
+            .added_marker = .{ .bold = true, .fg = palette.color(.diff_added), .bg = palette.color(.diff_added_bg) },
+            .removed_marker = .{ .bold = true, .fg = palette.color(.diff_removed), .bg = palette.color(.diff_removed_bg) },
+            .context_marker = .{ .bg = palette.color(.diff_context_bg) },
+            .added_line_number = .{ .fg = palette.color(.diff_line_number), .bg = palette.color(.diff_added_bg) },
+            .removed_line_number = .{ .fg = palette.color(.diff_line_number), .bg = palette.color(.diff_removed_bg) },
+            .context = .{ .bg = palette.color(.diff_context_bg) },
             .metadata = palette.style(.diff_metadata),
             .line_number = palette.style(.diff_line_number),
             .warning = palette.style(.warning),
@@ -582,6 +800,140 @@ test "fileStats counts added and removed hunk lines" {
     try std.testing.expectEqual(FileStats{ .added = 1, .removed = 1 }, fileStats(file));
 }
 
+fn expectBgRange(surface: *chasen.Surface, row: u16, start_col: u16, end_col: u16, bg: chasen.Color) !void {
+    var col = start_col;
+    while (col < end_col) : (col += 1) {
+        const cell = surface.readCell(col, row) orelse return error.MissingCell;
+        try std.testing.expect(cell.style.bg.eql(bg));
+    }
+}
+
+fn expectBodyGutterLeadInBg(surface: *chasen.Surface, row: u16, text_col: u16, bg: chasen.Color) !void {
+    try expectBgRange(surface, row, cursor_gutter_width, cursor_gutter_width + text_col, bg);
+}
+
+test "renderFile composes diff state as body background and marker foreground" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 6);
+    defer ts.deinit();
+
+    const palette = theme.Palette.default();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 1,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old", .old_line = 1 },
+                    .{ .kind = .added, .text = "new", .new_line = 1 },
+                },
+            },
+        },
+    };
+
+    try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .palette = palette });
+
+    try expectBodyGutterLeadInBg(&ts.surface, 4, lineTextStart(true, .unified), palette.color(.diff_removed_bg));
+    try expectBodyGutterLeadInBg(&ts.surface, 5, lineTextStart(true, .unified), palette.color(.diff_added_bg));
+
+    const removed_old_line_number = ts.surface.readCell(3, 4).?;
+    try std.testing.expect(removed_old_line_number.style.fg.eql(palette.color(.diff_line_number)));
+    try std.testing.expect(removed_old_line_number.style.bg.eql(palette.color(.diff_removed_bg)));
+
+    const removed_prefix = ts.surface.readCell(12, 4).?;
+    try std.testing.expect(removed_prefix.style.fg.eql(palette.color(.diff_removed)));
+    try std.testing.expect(removed_prefix.style.bg.eql(palette.color(.diff_removed_bg)));
+
+    const removed_body = ts.surface.readCell(14, 4).?;
+    try std.testing.expect(removed_body.style.fg.eql(palette.color(.diff_removed)));
+    try std.testing.expect(removed_body.style.bg.eql(palette.color(.diff_removed_bg)));
+
+    const added_line_number = ts.surface.readCell(7, 5).?;
+    try std.testing.expect(added_line_number.style.bg.eql(palette.color(.diff_added_bg)));
+
+    const added_prefix = ts.surface.readCell(12, 5).?;
+    try std.testing.expect(added_prefix.style.fg.eql(palette.color(.diff_added)));
+    try std.testing.expect(added_prefix.style.bg.eql(palette.color(.diff_added_bg)));
+
+    const added_body = ts.surface.readCell(14, 5).?;
+    try std.testing.expect(added_body.style.fg.eql(palette.color(.diff_added)));
+    try std.testing.expect(added_body.style.bg.eql(palette.color(.diff_added_bg)));
+}
+
+test "renderFile fills unified gutter lead-in when line numbers are hidden" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(40, 5);
+    defer ts.deinit();
+
+    const palette = theme.Palette.default();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 0,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{.{ .kind = .added, .text = "new", .new_line = 1 }},
+        }},
+    };
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .line_numbers = false,
+        .palette = palette,
+    });
+
+    try expectBodyGutterLeadInBg(&ts.surface, 4, lineTextStart(false, .unified), palette.color(.diff_added_bg));
+    try ts.expectCellText(2, 4, "+");
+    try ts.expectCellText(4, 4, "n");
+}
+
+test "renderFile fills context gutter lead-in and line numbers with context background" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 5);
+    defer ts.deinit();
+
+    var palette = theme.Palette.default();
+    palette.colors[@intFromEnum(theme.Role.diff_context_bg)] = .{ .index = 8 };
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{.{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 }},
+        }},
+    };
+
+    try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .palette = palette });
+
+    try expectBodyGutterLeadInBg(&ts.surface, 4, lineTextStart(true, .unified), palette.color(.diff_context_bg));
+
+    const old_line_number = ts.surface.readCell(5, 4).?;
+    try std.testing.expect(old_line_number.style.fg.eql(palette.color(.diff_line_number)));
+    try std.testing.expect(old_line_number.style.bg.eql(palette.color(.diff_context_bg)));
+
+    const new_line_number = ts.surface.readCell(10, 4).?;
+    try std.testing.expect(new_line_number.style.fg.eql(palette.color(.diff_line_number)));
+    try std.testing.expect(new_line_number.style.bg.eql(palette.color(.diff_context_bg)));
+}
+
 test "renderFile dims staged hunk body without removing it" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 6);
@@ -614,12 +966,363 @@ test "renderFile dims staged hunk body without removing it" {
 
     const header_cell = ts.surface.readCell(2, 3).?;
     try std.testing.expect(header_cell.style.bg.eql(.{ .index = 8 }));
+    const gutter_cell = ts.surface.readCell(3, 4).?;
+    try std.testing.expect(gutter_cell.style.bg.eql(theme.Palette.default().color(.diff_removed_bg)));
+    try std.testing.expect(gutter_cell.style.dim);
     try ts.expectCellText(14, 4, "o");
     const old_cell = ts.surface.readCell(14, 4).?;
     try std.testing.expect(old_cell.style.dim);
     try ts.expectCellText(14, 5, "n");
     const new_cell = ts.surface.readCell(14, 5).?;
     try std.testing.expect(new_cell.style.dim);
+}
+
+test "renderFile applies unified syntax spans without removing diff background" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 6);
+    defer ts.deinit();
+
+    const palette = theme.Palette.default();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{
+                .{ .kind = .removed, .text = "old", .old_line = 1 },
+                .{ .kind = .added, .text = "new", .new_line = 1 },
+            },
+        }},
+    };
+    const hunk_line_counts = [_]usize{2};
+    const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
+    var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
+    defer spans.deinit(std.testing.allocator);
+    const old_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
+    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .string }});
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }, .{ .spans = old_spans });
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .new }, .{ .spans = new_spans });
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .palette = palette,
+        .syntax_spans = spans,
+    });
+
+    const removed_cell = ts.surface.readCell(14, 4).?;
+    try std.testing.expect(removed_cell.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(removed_cell.style.bg.eql(palette.color(.diff_removed_bg)));
+
+    const added_cell = ts.surface.readCell(14, 5).?;
+    try std.testing.expect(added_cell.style.fg.eql(palette.color(.success)));
+    try std.testing.expect(added_cell.style.bg.eql(palette.color(.diff_added_bg)));
+}
+
+test "renderFile hides unified diff prefix for highlighted hunk side and keeps fallback side" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 7);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 2,
+            .section = "",
+            .lines = &.{
+                .{ .kind = .removed, .text = "old", .old_line = 1 },
+                .{ .kind = .added, .text = "", .new_line = 1 },
+                .{ .kind = .added, .text = "new", .new_line = 2 },
+            },
+        }},
+    };
+    const hunk_line_counts = [_]usize{3};
+    const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
+    var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
+    defer spans.deinit(std.testing.allocator);
+    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .string }});
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 2, .side = .new }, .{ .spans = new_spans });
+
+    try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .syntax_spans = spans });
+
+    try ts.expectCellText(12, 4, "-");
+    try ts.expectCellText(12, 5, " ");
+    try ts.expectCellText(12, 6, " ");
+    try ts.expectCellText(14, 6, "n");
+}
+
+test "renderFile normalizes highlighted unified body base foreground" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 8);
+    defer ts.deinit();
+
+    const palette = theme.Palette.default();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 2,
+            .new_start = 1,
+            .new_count = 3,
+            .section = "",
+            .lines = &.{
+                .{ .kind = .context, .text = "same item", .old_line = 1, .new_line = 1 },
+                .{ .kind = .removed, .text = "var old_item", .old_line = 2 },
+                .{ .kind = .added, .text = "var new_item", .new_line = 2 },
+                .{ .kind = .added, .text = "plain fallback", .new_line = 3 },
+            },
+        }},
+    };
+    const hunk_line_counts = [_]usize{4};
+    const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
+    var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
+    defer spans.deinit(std.testing.allocator);
+    const old_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
+    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .old }, .{ .spans = old_spans });
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 2, .side = .new }, .{ .spans = new_spans });
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .palette = palette,
+        .syntax_spans = spans,
+        .staged_hunks = &.{true},
+    });
+
+    const context_cell = ts.surface.readCell(14, 4).?;
+    try std.testing.expect(context_cell.style.fg.eql(.default));
+    try std.testing.expect(context_cell.style.bg.eql(palette.color(.diff_context_bg)));
+    try std.testing.expect(context_cell.style.dim);
+
+    const removed_keyword = ts.surface.readCell(14, 5).?;
+    try std.testing.expect(removed_keyword.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(removed_keyword.style.bg.eql(palette.color(.diff_removed_bg)));
+    try std.testing.expect(removed_keyword.style.dim);
+
+    const removed_identifier = ts.surface.readCell(18, 5).?;
+    try std.testing.expect(removed_identifier.style.fg.eql(.default));
+    try std.testing.expect(removed_identifier.style.bg.eql(palette.color(.diff_removed_bg)));
+    try std.testing.expect(removed_identifier.style.dim);
+
+    const added_identifier = ts.surface.readCell(18, 6).?;
+    try std.testing.expect(added_identifier.style.fg.eql(.default));
+    try std.testing.expect(added_identifier.style.bg.eql(palette.color(.diff_added_bg)));
+    try std.testing.expect(added_identifier.style.dim);
+
+    const unspanned_added = ts.surface.readCell(14, 7).?;
+    try std.testing.expect(unspanned_added.style.fg.eql(.default));
+    try std.testing.expect(unspanned_added.style.bg.eql(palette.color(.diff_added_bg)));
+    try std.testing.expect(unspanned_added.style.dim);
+}
+
+test "renderFile keeps unified diff prefix when spans do not change foreground" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 6);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 0,
+            .new_start = 1,
+            .new_count = 2,
+            .section = "",
+            .lines = &.{
+                .{ .kind = .added, .text = "plain", .new_line = 1 },
+                .{ .kind = .added, .text = "value()", .new_line = 2 },
+            },
+        }},
+    };
+    const hunk_line_counts = [_]usize{2};
+    const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
+    var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
+    defer spans.deinit(std.testing.allocator);
+    const plain_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 5, .role = .plain }});
+    const fallback_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{
+        .{ .start = 0, .end = 5, .role = .variable },
+        .{ .start = 5, .end = 7, .role = .punctuation },
+    });
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .new }, .{ .spans = plain_spans });
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .new }, .{ .spans = fallback_spans });
+
+    try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .syntax_spans = spans });
+
+    try ts.expectCellText(12, 4, "+");
+    try ts.expectCellText(12, 5, "+");
+
+    const plain_cell = ts.surface.readCell(14, 4).?;
+    try std.testing.expect(plain_cell.style.fg.eql(theme.Palette.default().color(.diff_added)));
+    try std.testing.expect(plain_cell.style.bg.eql(theme.Palette.default().color(.diff_added_bg)));
+    const fallback_cell = ts.surface.readCell(14, 5).?;
+    try std.testing.expect(fallback_cell.style.fg.eql(theme.Palette.default().color(.diff_added)));
+    try std.testing.expect(fallback_cell.style.bg.eql(theme.Palette.default().color(.diff_added_bg)));
+}
+
+test "renderFile applies side-by-side context syntax spans per side" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 6);
+    defer ts.deinit();
+
+    const palette = theme.Palette.default();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .section = "", .lines = &.{
+            .{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 },
+        } }},
+    };
+    const hunk_line_counts = [_]usize{1};
+    const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
+    var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
+    defer spans.deinit(std.testing.allocator);
+    const old_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 4, .role = .keyword }});
+    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 4, .role = .string }});
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }, .{ .spans = old_spans });
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .new }, .{ .spans = new_spans });
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .side_by_side,
+        .palette = palette,
+        .syntax_spans = spans,
+    });
+
+    const old_cell = ts.surface.readCell(9, 4).?;
+    try std.testing.expect(old_cell.style.fg.eql(palette.color(.accent)));
+    const new_cell = ts.surface.readCell(59, 4).?;
+    try std.testing.expect(new_cell.style.fg.eql(palette.color(.success)));
+}
+
+test "renderFile hides side-by-side diff prefixes by highlighted hunk side" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 6);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .section = "", .lines = &.{
+            .{ .kind = .removed, .text = "old", .old_line = 1 },
+            .{ .kind = .added, .text = "new", .new_line = 1 },
+        } }},
+    };
+    const hunk_line_counts = [_]usize{2};
+    const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
+    var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
+    defer spans.deinit(std.testing.allocator);
+    const old_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
+    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .string }});
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }, .{ .spans = old_spans });
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .new }, .{ .spans = new_spans });
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .side_by_side,
+        .syntax_spans = spans,
+    });
+
+    const old_start = cursor_gutter_width;
+    const new_start = cursor_gutter_width + (bodyWidth(100) / 2) + 1;
+    try expectBgRange(&ts.surface, 4, old_start, old_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_removed_bg));
+    try expectBgRange(&ts.surface, 4, new_start, new_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_added_bg));
+    try ts.expectCellText(7, 4, " ");
+    try ts.expectCellText(57, 4, " ");
+    try ts.expectCellText(9, 4, "o");
+    try ts.expectCellText(59, 4, "n");
+}
+
+test "renderFile normalizes highlighted side-by-side body base foreground" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 6);
+    defer ts.deinit();
+
+    const palette = theme.Palette.default();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .section = "", .lines = &.{
+            .{ .kind = .removed, .text = "var old_item", .old_line = 1 },
+            .{ .kind = .added, .text = "var new_item", .new_line = 1 },
+        } }},
+    };
+    const hunk_line_counts = [_]usize{2};
+    const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
+    var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
+    defer spans.deinit(std.testing.allocator);
+    const old_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
+    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }, .{ .spans = old_spans });
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .new }, .{ .spans = new_spans });
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .side_by_side,
+        .palette = palette,
+        .syntax_spans = spans,
+    });
+
+    const old_identifier = ts.surface.readCell(13, 4).?;
+    try std.testing.expect(old_identifier.style.fg.eql(.default));
+    try std.testing.expect(old_identifier.style.bg.eql(palette.color(.diff_removed_bg)));
+    const new_identifier = ts.surface.readCell(63, 4).?;
+    try std.testing.expect(new_identifier.style.fg.eql(.default));
+    try std.testing.expect(new_identifier.style.bg.eql(palette.color(.diff_added_bg)));
+}
+
+test "renderFile clips syntax spans through horizontal scroll without splitting UTF-8" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 5);
+    defer ts.deinit();
+
+    const palette = theme.Palette.default();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{ .old_start = 1, .old_count = 0, .new_start = 1, .new_count = 1, .section = "", .lines = &.{
+            .{ .kind = .added, .text = "aあbc", .new_line = 1 },
+        } }},
+    };
+    const hunk_line_counts = [_]usize{1};
+    const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
+    var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
+    defer spans.deinit(std.testing.allocator);
+    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 1, .end = 4, .role = .string }});
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .new }, .{ .spans = new_spans });
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .horizontal_scroll = 1,
+        .palette = palette,
+        .syntax_spans = spans,
+    });
+
+    try ts.expectCellText(14, 4, "あ");
+    const cell = ts.surface.readCell(14, 4).?;
+    try std.testing.expect(cell.style.fg.eql(palette.color(.success)));
+    try std.testing.expect(cell.style.bg.eql(palette.color(.diff_added_bg)));
 }
 
 test "hunkHeaderStyle composes highlighted and staged state" {
@@ -820,6 +1523,8 @@ test "renderGeneratedAddedFile draws content on new side in side-by-side mode" {
 
     try renderGeneratedAddedFile(&ts.surface, "src/new.zig", &.{ "const value = 1;", "pub fn main() void {}" }, false, .{ .requested_mode = .side_by_side });
 
+    const new_start = cursor_gutter_width + (bodyWidth(90) / 2) + 1;
+    try expectBgRange(&ts.surface, 3, new_start, new_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_added_bg));
     try ts.expectCellText(0, 0, "s");
     try ts.expectCellText(46, 3, "│");
     try ts.expectCellText(52, 3, "+");

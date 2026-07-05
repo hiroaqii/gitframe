@@ -11,6 +11,7 @@ const git_status = @import("../git/status.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const review_projection = @import("review_projection.zig");
 const repo_discovery = @import("../repo/discovery.zig");
+const syntax_provider = @import("../syntax/provider_runtime.zig");
 
 const LoadRequest = diff_source.LoadRequest;
 const LoadedDiff = loaded_diff.LoadedDiff;
@@ -535,7 +536,7 @@ pub fn runLoad(request: LoadRequest, allocator: std.mem.Allocator, io: std.Io) D
         .ok => |bytes| {
             defer allocator.free(bytes);
             if (bytes.len == 0) return .empty;
-            const bundle = buildLoadedBundle(allocator, bytes) catch |err| {
+            const bundle = buildLoadedBundleWithIo(allocator, io, bytes) catch |err| {
                 return .{ .failed = std.fmt.allocPrint(allocator, "Diff parse failed: {s}", .{@errorName(err)}) catch
                     return .{ .failed_static = "Diff parse failed: OutOfMemory" } };
             };
@@ -582,7 +583,7 @@ fn loadFileDiffBundle(
         .ok => |bytes| {
             defer allocator.free(bytes);
             if (bytes.len == 0) return null;
-            return try buildLoadedBundle(allocator, bytes);
+            return try buildLoadedBundleWithIo(allocator, io, bytes);
         },
         .failed => |message| {
             defer allocator.free(message);
@@ -688,7 +689,13 @@ fn validateRepoRelativePath(path: []const u8) !void {
     }
 }
 
+/// Test helper for callers that only have diff bytes. Production load paths
+/// must call buildLoadedBundleWithIo so optional providers receive task I/O.
 pub fn buildLoadedBundle(allocator: std.mem.Allocator, bytes: []const u8) !LoadedDiffBundle {
+    return buildLoadedBundleWithIo(allocator, std.testing.io, bytes);
+}
+
+pub fn buildLoadedBundleWithIo(allocator: std.mem.Allocator, io: std.Io, bytes: []const u8) !LoadedDiffBundle {
     var arena: std.heap.ArenaAllocator = .init(allocator);
     errdefer arena.deinit();
     const arena_allocator = arena.allocator();
@@ -697,6 +704,7 @@ pub fn buildLoadedBundle(allocator: std.mem.Allocator, bytes: []const u8) !Loade
     // diff text and parser-allocated arrays in the same arena.
     const copied = try arena_allocator.dupe(u8, bytes);
     const document = try diff_parser.parse(arena_allocator, copied);
+    const syntax_spans = try syntax_provider.buildDocumentSpans(arena_allocator, io, document);
     const tree = try file_tree.build(arena_allocator, document);
     const rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document);
     const collapsed_hunks = try arena_allocator.alloc(bool, document.totalHunks());
@@ -706,6 +714,7 @@ pub fn buildLoadedBundle(allocator: std.mem.Allocator, bytes: []const u8) !Loade
         .lines = countLines(copied),
         .text = copied,
         .document = document,
+        .syntax_spans = syntax_spans,
         .tree = tree,
         .rendered_line_cache = rendered_line_cache,
         .collapsed_hunks = collapsed_hunks,

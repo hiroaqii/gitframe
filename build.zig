@@ -1,8 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const SyntaxProvider = enum {
+    none,
+    flow_syntax,
+};
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const syntax_provider = b.option(SyntaxProvider, "syntax-provider", "Syntax provider: none or flow_syntax") orelse .none;
 
     const chasen_dep = b.dependency("chasen", .{
         .target = target,
@@ -12,7 +19,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-
     const draw_mod = b.createModule(.{
         .root_source_file = b.path("src/draw.zig"),
         .target = target,
@@ -37,18 +43,46 @@ pub fn build(b: *std.Build) void {
             .{ .name = "chasen", .module = chasen_dep.module("chasen") },
         },
     });
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "syntax_provider_flow_syntax", syntax_provider == .flow_syntax);
 
-    const mod = b.addModule("gitframe", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .imports = &.{
+    const mod = mod: {
+        const base_imports: [6]std.Build.Module.Import = .{
             .{ .name = "chasen", .module = chasen_dep.module("chasen") },
             .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
             .{ .name = "draw", .module = draw_mod },
             .{ .name = "theme", .module = theme_mod },
             .{ .name = "keymap", .module = keymap_mod },
-        },
-    });
+            .{ .name = "build_options", .module = build_options.createModule() },
+        };
+        switch (syntax_provider) {
+            .none => break :mod b.addModule("gitframe", .{
+                .root_source_file = b.path("src/root.zig"),
+                .target = target,
+                .imports = &base_imports,
+            }),
+            .flow_syntax => {
+                if (target.result.os.tag != .macos) {
+                    std.process.fatal("-Dsyntax-provider=flow_syntax is currently supported only for macOS targets", .{});
+                }
+                // Calling lazyDependency marks the dependency as needed, so keep
+                // it inside the provider-enabled macOS branch. Default Linux
+                // builds must not fetch or resolve flow-syntax.
+                const flow_syntax_dep = b.lazyDependency("flow_syntax", .{
+                    .target = target,
+                    .optimize = optimize,
+                }) orelse return;
+                const flow_imports: [7]std.Build.Module.Import = base_imports ++ .{
+                    std.Build.Module.Import{ .name = "flow_syntax", .module = flow_syntax_dep.module("syntax") },
+                };
+                break :mod b.addModule("gitframe", .{
+                    .root_source_file = b.path("src/root.zig"),
+                    .target = target,
+                    .imports = &flow_imports,
+                });
+            },
+        }
+    };
 
     const exe = b.addExecutable(.{
         .name = "gitframe",
@@ -153,6 +187,53 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_repo_discovery_tests = b.addRunArtifact(repo_discovery_tests);
+
+    const check_flow_syntax_step = b.step("check-flow-syntax", "Compile the pinned flow-syntax provider API check");
+    const flow_syntax_check = b.option(
+        bool,
+        "flow-syntax-check",
+        "Fetch and compile the pinned flow-syntax API canary",
+    ) orelse false;
+    if (flow_syntax_check) {
+        // lazyDependency marks the package as needed when called. Keep the call
+        // behind an option so default build/test paths do not fetch it.
+        const flow_syntax_dep = b.lazyDependency("flow_syntax", .{
+            .target = target,
+            .optimize = optimize,
+            .@"use-llvm" = true,
+        }) orelse return;
+        const flow_syntax_check_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/flow_syntax_check.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "flow_syntax", .module = flow_syntax_dep.module("syntax") },
+                },
+            }),
+        });
+        flow_syntax_check_tests.use_llvm = true;
+        flow_syntax_check_tests.use_lld = if (builtin.os.tag.isDarwin()) null else true;
+        const run_flow_syntax_check_tests = b.addRunArtifact(flow_syntax_check_tests);
+        check_flow_syntax_step.dependOn(&run_flow_syntax_check_tests.step);
+    } else {
+        check_flow_syntax_step.dependOn(&b.addFail(
+            "run `zig build check-flow-syntax -Dflow-syntax-check=true` to fetch and compile the pinned flow-syntax API canary",
+        ).step);
+    }
+
+    const test_syntax_provider_step = b.step("test-syntax-provider", "Run syntax provider integration tests");
+    if (syntax_provider == .flow_syntax) {
+        const syntax_provider_tests = b.addTest(.{
+            .root_module = mod,
+        });
+        const run_syntax_provider_tests = b.addRunArtifact(syntax_provider_tests);
+        test_syntax_provider_step.dependOn(&run_syntax_provider_tests.step);
+    } else {
+        test_syntax_provider_step.dependOn(&b.addFail(
+            "run `zig build test-syntax-provider -Dsyntax-provider=flow_syntax` on macOS",
+        ).step);
+    }
 
     const perf_baseline_exe = b.addExecutable(.{
         .name = "gitframe-perf-baseline",

@@ -10,6 +10,11 @@
         .chasen_ui = .{
             .path = "../chasen-ui",
         },
+        .flow_syntax = .{
+            .url = "git+https://github.com/neurocyte/flow-syntax?ref=zig-0.16#6d1772a8d51729ad0488fc4d556ec7f87168bfdb",
+            .hash = "flow_syntax-0.7.2-X8jOoYiMAQAaepRcrHQMb57tdPzzGt14ydaJbSNuWYTn",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
