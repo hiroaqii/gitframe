@@ -18,6 +18,15 @@ pub const BranchListAcceptance = enum {
     repo_mismatch,
 };
 
+pub const StatusSnapshotReplaceDecision = enum {
+    replace_pending_selection_restore,
+    replace_pending_initial_selection,
+    replace_no_snapshot,
+    replace_root_mismatch,
+    replace_changed,
+    skip_identical,
+};
+
 pub const PendingLoad = union(enum) {
     repo_discovery: u64,
     diff_load: u64,
@@ -62,6 +71,26 @@ pub fn acceptBranchListResult(
     if (state_generation != result_generation) return .stale_state_generation;
     if (!std.mem.eql(u8, state_repo_root, result_repo_root)) return .repo_mismatch;
     return .accepted;
+}
+
+/// Decide whether a freshly loaded status snapshot may skip replacement.
+///
+/// App still owns when this check runs and the mutation that follows. This
+/// helper only names the reasons so status refresh behavior is auditable without
+/// importing the Git status model into load_state.zig.
+pub fn statusSnapshotReplaceDecision(
+    has_pending_selection_restore: bool,
+    pending_initial_first_visible_selection: bool,
+    current_repo_root: ?[]const u8,
+    result_repo_root: []const u8,
+    documents_equal: bool,
+) StatusSnapshotReplaceDecision {
+    if (has_pending_selection_restore) return .replace_pending_selection_restore;
+    if (pending_initial_first_visible_selection) return .replace_pending_initial_selection;
+    const root = current_repo_root orelse return .replace_no_snapshot;
+    if (!std.mem.eql(u8, root, result_repo_root)) return .replace_root_mismatch;
+    if (!documents_equal) return .replace_changed;
+    return .skip_identical;
 }
 
 /// Runtime-owned load state for the active diff source.
@@ -238,4 +267,31 @@ test "acceptBranchListResult requires pending state generation and repo match" {
         acceptBranchListResult(&pending, true, 8, "/repo", 8, "/repo"),
     );
     try std.testing.expectEqual(@as(?u64, null), pending);
+}
+
+test "statusSnapshotReplaceDecision names every replace and skip reason" {
+    try std.testing.expectEqual(
+        StatusSnapshotReplaceDecision.replace_pending_selection_restore,
+        statusSnapshotReplaceDecision(true, false, "/repo", "/repo", true),
+    );
+    try std.testing.expectEqual(
+        StatusSnapshotReplaceDecision.replace_pending_initial_selection,
+        statusSnapshotReplaceDecision(false, true, "/repo", "/repo", true),
+    );
+    try std.testing.expectEqual(
+        StatusSnapshotReplaceDecision.replace_no_snapshot,
+        statusSnapshotReplaceDecision(false, false, null, "/repo", true),
+    );
+    try std.testing.expectEqual(
+        StatusSnapshotReplaceDecision.replace_root_mismatch,
+        statusSnapshotReplaceDecision(false, false, "/other", "/repo", true),
+    );
+    try std.testing.expectEqual(
+        StatusSnapshotReplaceDecision.replace_changed,
+        statusSnapshotReplaceDecision(false, false, "/repo", "/repo", false),
+    );
+    try std.testing.expectEqual(
+        StatusSnapshotReplaceDecision.skip_identical,
+        statusSnapshotReplaceDecision(false, false, "/repo", "/repo", true),
+    );
 }

@@ -3758,7 +3758,15 @@ pub const App = struct {
                 try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
             },
             .loaded => |*bundle| {
-                if (self.canSkipStatusSnapshotReplace(result.repo_root, bundle.document)) return;
+                switch (self.canSkipStatusSnapshotReplace(result.repo_root, bundle.document)) {
+                    .skip_identical => return,
+                    .replace_pending_selection_restore,
+                    .replace_pending_initial_selection,
+                    .replace_no_snapshot,
+                    .replace_root_mismatch,
+                    .replace_changed,
+                    => {},
+                }
                 try self.git_status.replace(result.repo_root, bundle);
                 result.result = .empty;
                 const prefer_first_visible_file = self.pending_initial_first_visible_selection;
@@ -3780,31 +3788,14 @@ pub const App = struct {
         }
     }
 
-    fn canSkipStatusSnapshotReplace(self: *const App, repo_root: []const u8, document: git_status.StatusDocument) bool {
-        if (self.pending_selection_restore != null) return false;
-        if (self.pending_initial_first_visible_selection) return false;
-        const current_root = self.git_status.repo_root orelse return false;
-        if (!std.mem.eql(u8, current_root, repo_root)) return false;
-        return statusDocumentsEqual(self.git_status.document, document);
-    }
-
-    fn statusDocumentsEqual(a: git_status.StatusDocument, b: git_status.StatusDocument) bool {
-        if (a.entries.len != b.entries.len) return false;
-        for (a.entries, b.entries) |left, right| {
-            if (!statusEntriesEqual(left, right)) return false;
-        }
-        return true;
-    }
-
-    fn statusEntriesEqual(a: git_status.StatusEntry, b: git_status.StatusEntry) bool {
-        if (a.raw[0] != b.raw[0] or a.raw[1] != b.raw[1]) return false;
-        if (!std.mem.eql(u8, a.path, b.path)) return false;
-        return optionalStringsEqual(a.old_path, b.old_path);
-    }
-
-    fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
-        if (a == null or b == null) return a == null and b == null;
-        return std.mem.eql(u8, a.?, b.?);
+    fn canSkipStatusSnapshotReplace(self: *const App, repo_root: []const u8, document: git_status.StatusDocument) app_load_state.StatusSnapshotReplaceDecision {
+        return app_load_state.statusSnapshotReplaceDecision(
+            self.pending_selection_restore != null,
+            self.pending_initial_first_visible_selection,
+            self.git_status.repo_root,
+            repo_root,
+            self.git_status.document.eql(document),
+        );
     }
 
     fn finishBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: BranchStatusLoadFinished) void {

@@ -27,6 +27,14 @@ pub const StatusCode = enum {
 /// input buffer, such as async task results stored in app state.
 pub const StatusDocument = struct {
     entries: []const StatusEntry,
+
+    pub fn eql(self: StatusDocument, other: StatusDocument) bool {
+        if (self.entries.len != other.entries.len) return false;
+        for (self.entries, other.entries) |left, right| {
+            if (!left.eql(right)) return false;
+        }
+        return true;
+    }
 };
 
 pub const StatusEntry = struct {
@@ -67,7 +75,18 @@ pub const StatusEntry = struct {
     pub fn canonicalPathKey(self: StatusEntry) ?[]const u8 {
         return path_key.canonicalRepoPath(self.path);
     }
+
+    pub fn eql(self: StatusEntry, other: StatusEntry) bool {
+        if (self.raw[0] != other.raw[0] or self.raw[1] != other.raw[1]) return false;
+        if (!std.mem.eql(u8, self.path, other.path)) return false;
+        return optionalStringsEqual(self.old_path, other.old_path);
+    }
 };
+
+fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
 
 /// Owns a status document and the arena backing its copied input and entries.
 pub const StatusBundle = struct {
@@ -273,6 +292,68 @@ test "status entry canonical key normalizes defensive path shapes" {
         .worktree = .modified,
     };
     try std.testing.expect(empty.canonicalPathKey() == null);
+}
+
+test "status entry equality includes raw path and old path" {
+    const base: StatusEntry = .{
+        .path = "src/new.zig",
+        .old_path = "src/old.zig",
+        .raw = .{ 'R', ' ' },
+        .index = .renamed,
+        .worktree = .unmodified,
+    };
+
+    try std.testing.expect(base.eql(.{
+        .path = "src/new.zig",
+        .old_path = "src/old.zig",
+        .raw = .{ 'R', ' ' },
+        .index = .renamed,
+        .worktree = .unmodified,
+    }));
+    try std.testing.expect(!base.eql(.{
+        .path = "src/changed.zig",
+        .old_path = "src/old.zig",
+        .raw = .{ 'R', ' ' },
+        .index = .renamed,
+        .worktree = .unmodified,
+    }));
+    try std.testing.expect(!base.eql(.{
+        .path = "src/new.zig",
+        .old_path = "src/previous.zig",
+        .raw = .{ 'R', ' ' },
+        .index = .renamed,
+        .worktree = .unmodified,
+    }));
+    try std.testing.expect(!base.eql(.{
+        .path = "src/new.zig",
+        .old_path = "src/old.zig",
+        .raw = .{ ' ', 'M' },
+        .index = .unmodified,
+        .worktree = .modified,
+    }));
+}
+
+test "status document equality includes length and entry equality" {
+    const entries = [_]StatusEntry{
+        .{ .path = "a.zig", .raw = .{ ' ', 'M' }, .index = .unmodified, .worktree = .modified },
+        .{ .path = "b.zig", .raw = .{ 'M', ' ' }, .index = .modified, .worktree = .unmodified },
+    };
+    const same_entries = [_]StatusEntry{
+        .{ .path = "a.zig", .raw = .{ ' ', 'M' }, .index = .unmodified, .worktree = .modified },
+        .{ .path = "b.zig", .raw = .{ 'M', ' ' }, .index = .modified, .worktree = .unmodified },
+    };
+    const changed_entries = [_]StatusEntry{
+        .{ .path = "a.zig", .raw = .{ ' ', 'M' }, .index = .unmodified, .worktree = .modified },
+        .{ .path = "c.zig", .raw = .{ 'M', ' ' }, .index = .modified, .worktree = .unmodified },
+    };
+    const shorter_entries = [_]StatusEntry{
+        .{ .path = "a.zig", .raw = .{ ' ', 'M' }, .index = .unmodified, .worktree = .modified },
+    };
+
+    const document: StatusDocument = .{ .entries = &entries };
+    try std.testing.expect(document.eql(.{ .entries = &same_entries }));
+    try std.testing.expect(!document.eql(.{ .entries = &changed_entries }));
+    try std.testing.expect(!document.eql(.{ .entries = &shorter_entries }));
 }
 
 test "parse untracked and ignored entries as worktree status" {
