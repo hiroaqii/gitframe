@@ -1,5 +1,6 @@
 const std = @import("std");
 const git_branch_status = @import("branch_status.zig");
+const git_push = @import("push.zig");
 const process_runner = @import("../process/runner.zig");
 
 pub const max_diff_bytes = 16 * 1024 * 1024;
@@ -194,6 +195,7 @@ pub const CommitRequest = struct {
 };
 
 pub const PushRequest = struct {
+    mode: git_push.Mode = .upstream,
     branch: []const u8,
     remote: []const u8,
     remote_branch: []const u8,
@@ -807,9 +809,14 @@ fn runGitPush(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, p
     const refspec = std.fmt.allocPrint(allocator, "refs/heads/{s}:refs/heads/{s}", .{ request.branch, request.remote_branch }) catch return error.OutOfMemory;
     defer allocator.free(refspec);
 
-    const argv = [_][]const u8{ "git", "push", request.remote, refspec };
+    const argv_upstream = [_][]const u8{ "git", "push", request.remote, refspec };
+    const argv_set_upstream = [_][]const u8{ "git", "push", "--set-upstream", request.remote, refspec };
+    const argv: []const []const u8 = switch (request.mode) {
+        .upstream => &argv_upstream,
+        .set_upstream => &argv_set_upstream,
+    };
     const result = std.process.run(allocator, io, .{
-        .argv = &argv,
+        .argv = argv,
         .cwd = .{ .path = repo_root },
         .environ_map = &env,
         .stdout_limit = .limited(128 * 1024),
@@ -1753,6 +1760,71 @@ test "LocalCommandBackend push succeeds to a local bare remote" {
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(OperationResult.ok, result);
+
+    const config_result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &[_][]const u8{ "git", "config", "--get", "branch.main.remote" },
+        .cwd = .{ .dir = work },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer freeRunResult(std.testing.allocator, config_result);
+    try std.testing.expect(config_result.term == .exited and config_result.term.exited != 0);
+}
+
+test "LocalCommandBackend set-upstream push configures local branch upstream" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+
+    const remote_root = try tmp.dir.realPathFileAlloc(io, "remote.git", std.testing.allocator);
+    defer std.testing.allocator.free(remote_root);
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, work);
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
+    try runTestGit(io, &.{ "git", "switch", "-c", "feature/topic" }, work);
+    try work.writeFile(io, .{ .sub_path = "FEATURE.md", .data = "feature\n" });
+    try runTestGit(io, &.{ "git", "add", "FEATURE.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "feature" }, work);
+
+    const oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    defer std.testing.allocator.free(oid);
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = repo_root,
+        .kind = .{ .push = .{
+            .mode = .set_upstream,
+            .branch = "feature/topic",
+            .remote = "origin",
+            .remote_branch = "feature/topic",
+            .oid = trimLineEnd(oid),
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(OperationResult.ok, result);
+
+    const remote_oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "refs/remotes/origin/feature/topic" });
+    defer std.testing.allocator.free(remote_oid);
+    try std.testing.expectEqualStrings(trimLineEnd(oid), trimLineEnd(remote_oid));
+
+    const upstream_remote = try gitOutputAlloc(io, work, &.{ "git", "config", "--get", "branch.feature/topic.remote" });
+    defer std.testing.allocator.free(upstream_remote);
+    try std.testing.expectEqualStrings("origin", trimLineEnd(upstream_remote));
+
+    const upstream_merge = try gitOutputAlloc(io, work, &.{ "git", "config", "--get", "branch.feature/topic.merge" });
+    defer std.testing.allocator.free(upstream_merge);
+    try std.testing.expectEqualStrings("refs/heads/feature/topic", trimLineEnd(upstream_merge));
 }
 
 test "LocalCommandBackend pull refresh fetches and fast-forwards from local bare remote" {

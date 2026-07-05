@@ -2098,13 +2098,13 @@ pub const App = struct {
         errdefer allocator.free(owned_oid);
 
         self.push_confirmation = .{
+            .mode = target.mode,
             .repo_root = owned_repo_root,
             .branch = owned_branch,
             .remote = owned_remote,
             .remote_branch = owned_remote_branch,
             .oid = owned_oid,
-            .ahead = target.ahead,
-            .behind = target.behind,
+            .ahead_behind = target.ahead_behind,
         };
         self.overlay.openPushBranch();
     }
@@ -2522,7 +2522,9 @@ pub const App = struct {
 
         // Use the snapshotted commit as the refspec source. A branch-name
         // source can be resolved by Git after SSH/credential prompts, which
-        // would let prompt-time commits change what gets pushed.
+        // would let prompt-time commits change what gets pushed. Because
+        // `--set-upstream` only associates local branch sources, foreground
+        // retries intentionally omit it even for set-upstream push targets.
         const refspec = std.fmt.allocPrint(ctx.allocator(), "{s}:refs/heads/{s}", .{ target.oid, target.remote_branch }) catch |err| {
             self.restorePushRetryTarget(ctx.allocator(), target, credentials_available);
             return err;
@@ -2688,6 +2690,7 @@ pub const App = struct {
 
         var target = prompt.target;
         prompt.target = .{
+            .mode = .upstream,
             .repo_root = &.{},
             .branch = &.{},
             .remote = &.{},
@@ -3242,6 +3245,7 @@ pub const App = struct {
 
     fn pushRetryTargetFromFinished(allocator: std.mem.Allocator, finished: PushFinished) !app_state.PushRetryTarget {
         var target: app_state.PushRetryTarget = .{
+            .mode = finished.mode,
             .repo_root = try allocator.dupe(u8, finished.repo_root),
             .branch = &.{},
             .remote = &.{},
@@ -7403,7 +7407,39 @@ test "requestPush snapshots the active branch target" {
     try std.testing.expectEqualStrings("origin", confirmation.remote);
     try std.testing.expectEqualStrings("main", confirmation.remote_branch);
     try std.testing.expectEqualStrings("abc123", confirmation.oid);
-    try std.testing.expectEqual(@as(u32, 2), confirmation.ahead);
+    try std.testing.expectEqual(git_ops.PushMode.upstream, confirmation.mode);
+    try std.testing.expectEqual(@as(u32, 2), confirmation.ahead_behind.?.ahead);
+}
+
+test "requestPush snapshots set-upstream target for branch without upstream" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.branch_status.deinit();
+    defer app.cancelPushConfirmation(std.testing.allocator);
+
+    var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc123",
+        .branch = "feature/topic",
+    });
+    try app.branch_status.replace("/repo", &bundle);
+
+    try app.requestPush(std.testing.allocator);
+
+    try std.testing.expect(app.overlay.isPushBranch());
+    const confirmation = app.push_confirmation orelse return error.ExpectedPushConfirmation;
+    try std.testing.expectEqual(git_ops.PushMode.set_upstream, confirmation.mode);
+    try std.testing.expectEqualStrings("/repo", confirmation.repo_root);
+    try std.testing.expectEqualStrings("feature/topic", confirmation.branch);
+    try std.testing.expectEqualStrings("origin", confirmation.remote);
+    try std.testing.expectEqualStrings("feature/topic", confirmation.remote_branch);
+    try std.testing.expectEqualStrings("abc123", confirmation.oid);
+    try std.testing.expect(confirmation.ahead_behind == null);
 }
 
 test "requestPull snapshots the active branch target" {
@@ -7730,13 +7766,13 @@ test "requestPush rejects while another action is pending" {
     var app: App = .{
         .allocator = std.testing.allocator,
         .push_confirmation = .{
+            .mode = .upstream,
             .repo_root = try std.testing.allocator.dupe(u8, "/old"),
             .branch = try std.testing.allocator.dupe(u8, "old-feature"),
             .remote = try std.testing.allocator.dupe(u8, "origin"),
             .remote_branch = try std.testing.allocator.dupe(u8, "old-main"),
             .oid = try std.testing.allocator.dupe(u8, "old123"),
-            .ahead = 1,
-            .behind = 0,
+            .ahead_behind = .{ .ahead = 1, .behind = 0 },
         },
         .overlay = .{ .kind = .push_branch },
     };
@@ -7798,13 +7834,13 @@ test "confirmPush keeps confirmation when another action is pending" {
     var app: App = .{
         .allocator = std.testing.allocator,
         .push_confirmation = .{
+            .mode = .upstream,
             .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
             .branch = try std.testing.allocator.dupe(u8, "feature"),
             .remote = try std.testing.allocator.dupe(u8, "origin"),
             .remote_branch = try std.testing.allocator.dupe(u8, "main"),
             .oid = try std.testing.allocator.dupe(u8, "abc123"),
-            .ahead = 1,
-            .behind = 0,
+            .ahead_behind = .{ .ahead = 1, .behind = 0 },
         },
         .overlay = .{ .kind = .push_branch },
     };
@@ -7879,6 +7915,7 @@ test "finishPush does not reload a stale active repository" {
 
     try app.finishPush(&ctx, .{
         .pending = pending,
+        .mode = .set_upstream,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .branch = try std.testing.allocator.dupe(u8, "feature"),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
@@ -8032,6 +8069,7 @@ test "finishPush failed preserves retry target oid for credential prompt" {
 
     try app.finishPush(&ctx, .{
         .pending = pending,
+        .mode = .set_upstream,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .branch = try std.testing.allocator.dupe(u8, "feature"),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
@@ -8041,6 +8079,7 @@ test "finishPush failed preserves retry target oid for credential prompt" {
     });
 
     const target = app.push_retry_target orelse return error.ExpectedPushRetryTarget;
+    try std.testing.expectEqual(git_ops.PushMode.set_upstream, target.mode);
     try std.testing.expectEqualStrings("abc123", target.oid);
     try std.testing.expect(app.push_retry_credentials_available);
 }
@@ -8048,6 +8087,7 @@ test "finishPush failed preserves retry target oid for credential prompt" {
 test "clearPushError frees retained retry target" {
     var app: App = .{ .allocator = std.testing.allocator };
     try app.setPushErrorWithRetry(std.testing.allocator, "failed", .{
+        .mode = .upstream,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .branch = try std.testing.allocator.dupe(u8, "feature"),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
@@ -8066,6 +8106,7 @@ test "runInteractivePush rejects while another action is pending" {
     var app: App = .{ .allocator = std.testing.allocator };
     defer app.clearPushError(std.testing.allocator);
     try app.setPushErrorWithRetry(std.testing.allocator, "failed", .{
+        .mode = .upstream,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .branch = try std.testing.allocator.dupe(u8, "main"),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
@@ -8099,6 +8140,7 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
     var app: App = .{ .allocator = allocator };
     defer app.clearPushForeground(allocator);
     try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .set_upstream,
         .repo_root = try allocator.dupe(u8, repo.repo_root),
         .branch = try allocator.dupe(u8, "main"),
         .remote = try allocator.dupe(u8, "origin"),
@@ -8122,6 +8164,7 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
     try std.testing.expectEqualStrings("git", entry.argv[0]);
     try std.testing.expectEqualStrings("push", entry.argv[1]);
     try std.testing.expectEqualStrings("origin", entry.argv[2]);
+    try std.testing.expectEqual(@as(usize, 4), entry.argv.len);
     const expected_refspec = try std.fmt.allocPrint(allocator, "{s}:refs/heads/main", .{repo.oid});
     defer allocator.free(expected_refspec);
     try std.testing.expectEqualStrings(expected_refspec, entry.argv[3]);
@@ -8154,6 +8197,7 @@ test "runInteractivePush keeps retry target when foreground queue is full" {
     });
 
     try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
         .repo_root = try allocator.dupe(u8, repo.repo_root),
         .branch = try allocator.dupe(u8, "main"),
         .remote = try allocator.dupe(u8, "origin"),
@@ -8184,6 +8228,7 @@ test "runInteractivePush stale snapshot does not queue foreground command" {
     var app: App = .{ .allocator = allocator };
     defer app.clearPushError(allocator);
     try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
         .repo_root = try allocator.dupe(u8, repo.repo_root),
         .branch = try allocator.dupe(u8, "main"),
         .remote = try allocator.dupe(u8, "origin"),
@@ -8215,6 +8260,7 @@ test "finishPushForeground reloads matching active repo after failure" {
         .request_id = .{ .id = 9 },
         .pending = pending,
         .target = .{
+            .mode = .upstream,
             .repo_root = try allocator.dupe(u8, "/repo"),
             .branch = try allocator.dupe(u8, "main"),
             .remote = try allocator.dupe(u8, "origin"),
@@ -8247,6 +8293,7 @@ test "finishPushForeground ignores stale request id" {
         .request_id = .{ .id = 2 },
         .pending = pending,
         .target = .{
+            .mode = .upstream,
             .repo_root = try allocator.dupe(u8, "/repo"),
             .branch = try allocator.dupe(u8, "main"),
             .remote = try allocator.dupe(u8, "origin"),
@@ -8292,6 +8339,7 @@ test "openPushCredentialPrompt rejects non-HTTPS remote and frees retry target" 
     var app: App = .{ .allocator = allocator };
     defer app.clearPushError(allocator);
     try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
         .repo_root = try allocator.dupe(u8, repo_root),
         .branch = try allocator.dupe(u8, "main"),
         .remote = try allocator.dupe(u8, "origin"),

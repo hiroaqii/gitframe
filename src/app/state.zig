@@ -1,4 +1,6 @@
 const std = @import("std");
+const git_branch_status = @import("../git/branch_status.zig");
+const git_push = @import("../git/push.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const text_edit = @import("text_edit.zig");
 
@@ -147,13 +149,13 @@ pub const AmendConfirmation = struct {
 /// Branch status can reload while the popup is open, so the displayed and
 /// executed remote target must be copied when the prompt is created.
 pub const PushConfirmation = struct {
+    mode: git_push.Mode,
     repo_root: []u8,
     branch: []u8,
     remote: []u8,
     remote_branch: []u8,
     oid: []u8,
-    ahead: u32,
-    behind: u32,
+    ahead_behind: ?git_branch_status.AheadBehind,
 
     pub fn deinit(self: *PushConfirmation, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_root);
@@ -294,6 +296,7 @@ pub const PushCredentialField = enum {
 };
 
 pub const PushRetryTarget = struct {
+    mode: git_push.Mode,
     repo_root: []u8,
     branch: []u8,
     remote: []u8,

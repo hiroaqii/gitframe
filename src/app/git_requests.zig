@@ -194,6 +194,7 @@ pub fn startPush(
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
+        .mode = confirmation.mode,
         .repo_root = confirmation.repo_root,
         .branch = confirmation.branch,
         .remote = confirmation.remote,
@@ -202,13 +203,13 @@ pub fn startPush(
         .env_map = env_map,
     };
     confirmation.* = .{
+        .mode = .upstream,
         .repo_root = &.{},
         .branch = &.{},
         .remote = &.{},
         .remote_branch = &.{},
         .oid = &.{},
-        .ahead = 0,
-        .behind = 0,
+        .ahead_behind = null,
     };
     errdefer destroyPushTask(Task, ctx.allocator(), task);
 
@@ -348,6 +349,7 @@ pub fn startCredentialedPush(
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
+        .mode = target.mode,
         .repo_root = target.repo_root,
         .branch = target.branch,
         .remote = target.remote,
@@ -366,6 +368,7 @@ pub fn startCredentialedPush(
         .remote = &.{},
         .remote_branch = &.{},
         .oid = &.{},
+        .mode = .upstream,
         .remote_url = target.remote_url,
     };
     errdefer destroyPushTask(Task, ctx.allocator(), task);
@@ -378,6 +381,7 @@ pub fn startCredentialedPush(
         .remote = &.{},
         .remote_branch = &.{},
         .oid = &.{},
+        .mode = .upstream,
         .remote_url = null,
     };
 }
@@ -412,8 +416,8 @@ fn consumePushConfirmation(allocator: std.mem.Allocator, confirmation: *app_stat
         .remote = &.{},
         .remote_branch = &.{},
         .oid = &.{},
-        .ahead = 0,
-        .behind = 0,
+        .mode = .upstream,
+        .ahead_behind = null,
     };
 }
 

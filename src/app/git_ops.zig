@@ -2,6 +2,7 @@ const std = @import("std");
 const diff_source = @import("../diff/source.zig");
 const file_tree = @import("../file_tree.zig");
 const git_branch_status = @import("../git/branch_status.zig");
+const git_push = @import("../git/push.zig");
 const git_status = @import("../git/status.zig");
 
 /// App-local Git operation target classification.
@@ -13,6 +14,8 @@ pub const TargetKind = enum {
     file,
     directory,
 };
+
+pub const PushMode = git_push.Mode;
 
 /// Trim leading/trailing whitespace from command output before showing it in UI.
 pub fn trimGitOutput(message: []const u8) []const u8 {
@@ -155,13 +158,13 @@ pub const DiscardTargetResult = union(enum) {
 };
 
 pub const PushTarget = struct {
+    mode: PushMode,
     repo_root: []const u8,
     branch: []const u8,
     remote: []const u8,
     remote_branch: []const u8,
     oid: []const u8,
-    ahead: u32,
-    behind: u32,
+    ahead_behind: ?git_branch_status.AheadBehind,
 };
 
 pub const PullTarget = struct {
@@ -312,21 +315,29 @@ pub fn pushTarget(ctx: RemoteActionContext) PushTargetResult {
         .detached => return .detached_head,
         .unknown => return .branch_unavailable,
     };
-    const upstream = status.upstream orelse return .no_upstream;
-    if (upstream.remote_branch.len == 0) return .upstream_not_remote_branch;
     const oid = status.oid orelse return .branch_status_unavailable;
+    const upstream = status.upstream orelse return .{ .ready = .{
+        .mode = .set_upstream,
+        .repo_root = repo_root,
+        .branch = branch,
+        .remote = "origin",
+        .remote_branch = branch,
+        .oid = oid,
+        .ahead_behind = null,
+    } };
+    if (upstream.remote_branch.len == 0) return .upstream_not_remote_branch;
     const ahead_behind = status.ahead_behind orelse return .branch_status_unavailable;
     if (ahead_behind.behind > 0) return .pull_first;
     if (ahead_behind.ahead == 0) return .nothing_to_push;
 
     return .{ .ready = .{
+        .mode = .upstream,
         .repo_root = repo_root,
         .branch = branch,
         .remote = upstream.remote,
         .remote_branch = upstream.remote_branch,
         .oid = oid,
-        .ahead = ahead_behind.ahead,
-        .behind = ahead_behind.behind,
+        .ahead_behind = ahead_behind,
     } };
 }
 
@@ -662,13 +673,38 @@ test "pushTarget requires a fresh upstream branch with outgoing commits" {
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = status },
     })) {
         .ready => |target| {
+            try std.testing.expectEqual(PushMode.upstream, target.mode);
             try std.testing.expectEqualStrings("/repo", target.repo_root);
             try std.testing.expectEqualStrings("feature", target.branch);
             try std.testing.expectEqualStrings("origin", target.remote);
             try std.testing.expectEqualStrings("main", target.remote_branch);
             try std.testing.expectEqualStrings("abc123", target.oid);
-            try std.testing.expectEqual(@as(u32, 2), target.ahead);
-            try std.testing.expectEqual(@as(u32, 0), target.behind);
+            try std.testing.expectEqual(@as(u32, 2), target.ahead_behind.?.ahead);
+            try std.testing.expectEqual(@as(u32, 0), target.ahead_behind.?.behind);
+        },
+        else => return error.ExpectedPushTargetReady,
+    }
+}
+
+test "pushTarget proposes set-upstream push for branch without upstream" {
+    const status: git_branch_status.BranchStatus = .{
+        .oid = "abc123",
+        .head = .{ .branch = "feature/topic" },
+    };
+
+    switch (pushTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = status },
+    })) {
+        .ready => |target| {
+            try std.testing.expectEqual(PushMode.set_upstream, target.mode);
+            try std.testing.expectEqualStrings("/repo", target.repo_root);
+            try std.testing.expectEqualStrings("feature/topic", target.branch);
+            try std.testing.expectEqualStrings("origin", target.remote);
+            try std.testing.expectEqualStrings("feature/topic", target.remote_branch);
+            try std.testing.expectEqualStrings("abc123", target.oid);
+            try std.testing.expect(target.ahead_behind == null);
         },
         else => return error.ExpectedPushTargetReady,
     }
@@ -770,7 +806,7 @@ test "pushTarget rejects unsafe or incomplete branch states" {
             .ahead_behind = ready_status.ahead_behind,
         } },
     }));
-    try std.testing.expectEqual(PushTargetResult.no_upstream, pushTarget(.{
+    switch (pushTarget(.{
         .source = .unstaged,
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
@@ -778,7 +814,15 @@ test "pushTarget rejects unsafe or incomplete branch states" {
             .head = .{ .branch = "feature" },
             .ahead_behind = .{ .ahead = 1, .behind = 0 },
         } },
-    }));
+    })) {
+        .ready => |target| {
+            try std.testing.expectEqual(PushMode.set_upstream, target.mode);
+            try std.testing.expectEqualStrings("origin", target.remote);
+            try std.testing.expectEqualStrings("feature", target.remote_branch);
+            try std.testing.expect(target.ahead_behind == null);
+        },
+        else => return error.ExpectedSetUpstreamPushTargetReady,
+    }
     try std.testing.expectEqual(PushTargetResult.upstream_not_remote_branch, pushTarget(.{
         .source = .unstaged,
         .repo_root = "/repo",

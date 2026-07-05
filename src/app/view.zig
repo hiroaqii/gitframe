@@ -3,6 +3,7 @@ const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const app_commit_panel = @import("commit_panel.zig");
 const app_repo_picker = @import("repo_picker.zig");
+const app_state = @import("state.zig");
 const draw = @import("draw");
 const diff_render = @import("../diff/render.zig");
 const git_branch_status = @import("../git/branch_status.zig");
@@ -1465,12 +1466,18 @@ fn viewPushConfirmation(app: anytype, surface: *chasen.Surface) !void {
     const size = content.size();
 
     const target = try std.fmt.allocPrint(content.frameAllocator(), "{s} -> {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
-    const counts = try std.fmt.allocPrint(content.frameAllocator(), "ahead {d} / behind {d}", .{ confirmation.ahead, confirmation.behind });
+    const detail = switch (confirmation.mode) {
+        .upstream => if (confirmation.ahead_behind) |ahead_behind|
+            try std.fmt.allocPrint(content.frameAllocator(), "ahead {d} / behind {d}", .{ ahead_behind.ahead, ahead_behind.behind })
+        else
+            "ahead/behind unavailable",
+        .set_upstream => "will set upstream",
+    };
     const line_count: u16 = 5;
     const start_row: u16 = if (size.height > line_count) (size.height - line_count) / 2 else 0;
     try drawCenteredText(&content, start_row, target, boldRoleStyle(app.theme, .accent));
     if (start_row + 2 < size.height) {
-        try drawCenteredText(&content, start_row + 2, counts, roleStyle(app.theme, .muted));
+        try drawCenteredText(&content, start_row + 2, detail, roleStyle(app.theme, .muted));
     }
     if (start_row + 4 < size.height) {
         try drawCenteredText(&content, start_row + 4, "Enter: push    Esc/q: cancel", roleStyle(app.theme, .accent));
@@ -2373,6 +2380,62 @@ test "push error paragraph renderer applies scroll offset" {
     try ts.expectCellText(0, 0, "t");
     try ts.expectCellText(0, 1, "t");
     try ts.expectCellText(0, 2, "f");
+}
+
+test "push confirmation renders ahead behind for upstream push" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 12);
+    defer ts.deinit();
+
+    var app = .{
+        .theme = theme.Palette.default(),
+        .push_confirmation = @as(?app_state.PushConfirmation, .{
+            .mode = .upstream,
+            .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+            .branch = try std.testing.allocator.dupe(u8, "feature"),
+            .remote = try std.testing.allocator.dupe(u8, "origin"),
+            .remote_branch = try std.testing.allocator.dupe(u8, "feature"),
+            .oid = try std.testing.allocator.dupe(u8, "abc123"),
+            .ahead_behind = .{ .ahead = 2, .behind = 0 },
+        }),
+    };
+    defer app.push_confirmation.?.deinit(std.testing.allocator);
+
+    try viewPushConfirmation(app, &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "feature -> origin/feature") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "ahead 2 / behind 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "will set upstream") == null);
+}
+
+test "push confirmation renders set-upstream detail without fake ahead behind" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 12);
+    defer ts.deinit();
+
+    var app = .{
+        .theme = theme.Palette.default(),
+        .push_confirmation = @as(?app_state.PushConfirmation, .{
+            .mode = .set_upstream,
+            .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+            .branch = try std.testing.allocator.dupe(u8, "feature/topic"),
+            .remote = try std.testing.allocator.dupe(u8, "origin"),
+            .remote_branch = try std.testing.allocator.dupe(u8, "feature/topic"),
+            .oid = try std.testing.allocator.dupe(u8, "abc123"),
+            .ahead_behind = null,
+        }),
+    };
+    defer app.push_confirmation.?.deinit(std.testing.allocator);
+
+    try viewPushConfirmation(app, &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "feature/topic -> origin/feature/topic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "will set upstream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "ahead 0 / behind 0") == null);
 }
 
 const HelpItem = struct {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const git_backend = @import("../git/backend.zig");
+const git_push = @import("../git/push.zig");
 const git_ops = @import("git_ops.zig");
 
 /// Git operation categories that can become App-facing actions.
@@ -194,6 +195,7 @@ pub const AmendFinished = struct {
 
 pub const PushFinished = struct {
     pending: PendingAction,
+    mode: git_push.Mode,
     repo_root: []u8,
     branch: []u8,
     remote: []u8,
@@ -210,6 +212,7 @@ pub const PushFinished = struct {
         self.result.deinit(allocator);
         self.* = .{
             .pending = .{ .generation = 0, .kind = .push },
+            .mode = .upstream,
             .repo_root = &.{},
             .branch = &.{},
             .remote = &.{},
@@ -713,6 +716,7 @@ pub fn AmendTask(comptime Msg: type) type {
 pub fn PushTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
+        mode: git_push.Mode,
         repo_root: []u8,
         branch: []u8,
         remote: []u8,
@@ -733,7 +737,8 @@ pub fn PushTask(comptime Msg: type) type {
                 allocator.destroy(task);
             }
 
-            const result = runPush(task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, if (task.credentials) |credentials| credentials else null, allocator, io);
+            const result = runPush(task.mode, task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, if (task.credentials) |credentials| credentials else null, allocator, io);
+            const mode = task.mode;
             const repo_root = task.repo_root;
             const branch = task.branch;
             const remote = task.remote;
@@ -747,6 +752,7 @@ pub fn PushTask(comptime Msg: type) type {
 
             return Msg.actionFinished(.{ .push = PushFinished{
                 .pending = task.pending,
+                .mode = mode,
                 .repo_root = repo_root,
                 .branch = branch,
                 .remote = remote,
@@ -769,6 +775,7 @@ pub fn PushTask(comptime Msg: type) type {
             }
 
             const repo_root = task.repo_root;
+            const mode = task.mode;
             const branch = task.branch;
             const remote = task.remote;
             const remote_branch = task.remote_branch;
@@ -781,6 +788,7 @@ pub fn PushTask(comptime Msg: type) type {
 
             return Msg.actionFinished(.{ .push = PushFinished{
                 .pending = task.pending,
+                .mode = mode,
                 .repo_root = repo_root,
                 .branch = branch,
                 .remote = remote,
@@ -1044,10 +1052,11 @@ pub fn runAmend(repo_root: []const u8, subject: []const u8, body: ?[]const u8, a
     }, allocator, io);
 }
 
-pub fn runPush(repo_root: []const u8, branch: []const u8, remote: []const u8, remote_branch: []const u8, oid: []const u8, env_map: ?*const std.process.Environ.Map, credentials: ?PushCredentials, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runPush(mode: git_push.Mode, repo_root: []const u8, branch: []const u8, remote: []const u8, remote_branch: []const u8, oid: []const u8, env_map: ?*const std.process.Environ.Map, credentials: ?PushCredentials, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Push", .{
         .repo_root = repo_root,
         .kind = .{ .push = .{
+            .mode = mode,
             .branch = branch,
             .remote = remote,
             .remote_branch = remote_branch,
