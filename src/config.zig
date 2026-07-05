@@ -55,6 +55,17 @@ pub const ExternalActionsConfig = struct {
 pub const ExternalActionInput = enum {
     selection_context,
     review_context,
+    staged_diff,
+};
+
+pub const ExternalActionScope = enum {
+    generic,
+    commit,
+};
+
+pub const ExternalActionOutput = enum {
+    display,
+    commit_message,
 };
 
 pub const ExternalActionConfig = struct {
@@ -63,6 +74,8 @@ pub const ExternalActionConfig = struct {
     argv: [max_external_action_argv][]const u8 = undefined,
     argv_len: u8 = 0,
     stdin: ExternalActionInput = .selection_context,
+    scope: ExternalActionScope = .generic,
+    output: ExternalActionOutput = .display,
 
     pub fn argvSlice(self: *const ExternalActionConfig) []const []const u8 {
         return self.argv[0..self.argv_len];
@@ -261,6 +274,9 @@ const TomlParseError = error{
     InvalidKeyBinding,
     InvalidActionId,
     InvalidActionInput,
+    InvalidActionScope,
+    InvalidActionOutput,
+    InvalidActionContract,
     UnknownSection,
     UnknownKey,
     TooManyArguments,
@@ -403,6 +419,8 @@ const ExternalActionParseState = struct {
     seen_label: bool = false,
     seen_argv: bool = false,
     seen_stdin: bool = false,
+    seen_scope: bool = false,
+    seen_output: bool = false,
 };
 
 fn flushExternalAction(config: *ExternalActionsConfig, state: *?ExternalActionParseState) TomlParseError!void {
@@ -436,6 +454,14 @@ fn parseExternalActionField(state: *ExternalActionParseState, key: []const u8, v
         if (state.seen_stdin) return error.DuplicateKey;
         state.value.stdin = try parseExternalActionInput(value);
         state.seen_stdin = true;
+    } else if (std.mem.eql(u8, key, "scope")) {
+        if (state.seen_scope) return error.DuplicateKey;
+        state.value.scope = try parseExternalActionScope(value);
+        state.seen_scope = true;
+    } else if (std.mem.eql(u8, key, "output")) {
+        if (state.seen_output) return error.DuplicateKey;
+        state.value.output = try parseExternalActionOutput(value);
+        state.seen_output = true;
     } else {
         return error.UnknownKey;
     }
@@ -445,7 +471,21 @@ fn parseExternalActionInput(value: []const u8) TomlParseError!ExternalActionInpu
     const text = try parseTomlString(value);
     if (std.mem.eql(u8, text, "selection_context")) return .selection_context;
     if (std.mem.eql(u8, text, "review_context")) return .review_context;
+    if (std.mem.eql(u8, text, "staged_diff")) return .staged_diff;
     return error.InvalidActionInput;
+}
+
+fn parseExternalActionScope(value: []const u8) TomlParseError!ExternalActionScope {
+    const text = try parseTomlString(value);
+    if (std.mem.eql(u8, text, "commit")) return .commit;
+    return error.InvalidActionScope;
+}
+
+fn parseExternalActionOutput(value: []const u8) TomlParseError!ExternalActionOutput {
+    const text = try parseTomlString(value);
+    if (std.mem.eql(u8, text, "display")) return .display;
+    if (std.mem.eql(u8, text, "commit_message")) return .commit_message;
+    return error.InvalidActionOutput;
 }
 
 fn parseEditorArgv(value: []const u8) TomlParseError!EditorConfig {
@@ -519,8 +559,12 @@ fn validateExternalActionConfig(action: ExternalActionConfig, seen_id: bool, see
 
     for (action.argvSlice()) |arg| {
         if (arg.len == 0) return error.InvalidString;
-        try validatePlaceholders(arg);
+        try validateExternalActionPlaceholders(action.scope, arg);
     }
+
+    if (action.scope == .commit and (action.stdin != .staged_diff or action.output != .commit_message)) return error.InvalidActionContract;
+    if (action.stdin == .staged_diff and action.scope != .commit) return error.InvalidActionContract;
+    if (action.output == .commit_message and action.scope != .commit) return error.InvalidActionContract;
 }
 
 fn validateExternalActionsConfig(actions: ExternalActionsConfig) TomlParseError!void {
@@ -572,6 +616,21 @@ fn validatePlaceholders(arg: []const u8) TomlParseError!void {
         const close = std.mem.indexOfScalarPos(u8, arg, open + 1, '}') orelse return error.UnknownPlaceholder;
         const placeholder = arg[open .. close + 1];
         if (!isKnownPlaceholder(placeholder)) return error.UnknownPlaceholder;
+        cursor = close + 1;
+    }
+    if (std.mem.indexOfScalarPos(u8, arg, cursor, '}') != null) return error.UnknownPlaceholder;
+}
+
+fn validateExternalActionPlaceholders(scope: ExternalActionScope, arg: []const u8) TomlParseError!void {
+    var cursor: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, arg, cursor, '{')) |open| {
+        if (std.mem.indexOfScalarPos(u8, arg, cursor, '}')) |stray| {
+            if (stray < open) return error.UnknownPlaceholder;
+        }
+        const close = std.mem.indexOfScalarPos(u8, arg, open + 1, '}') orelse return error.UnknownPlaceholder;
+        const placeholder = arg[open .. close + 1];
+        if (!isKnownPlaceholder(placeholder)) return error.UnknownPlaceholder;
+        if (scope == .commit and !std.mem.eql(u8, placeholder, "{repo_root}")) return error.UnknownPlaceholder;
         cursor = close + 1;
     }
     if (std.mem.indexOfScalarPos(u8, arg, cursor, '}') != null) return error.UnknownPlaceholder;
@@ -834,6 +893,13 @@ test "loadConfig accepts external action definitions" {
         \\argv = ["cat"]
         \\stdin = "review_context"
         \\
+        \\[[actions]]
+        \\id = "commit-message"
+        \\argv = ["helper", "{repo_root}"]
+        \\stdin = "staged_diff"
+        \\scope = "commit"
+        \\output = "commit_message"
+        \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
@@ -842,7 +908,7 @@ test "loadConfig accepts external action definitions" {
     try std.testing.expect(result.warning == null);
 
     const actions = result.config.value.actions.slice();
-    try std.testing.expectEqual(@as(usize, 2), actions.len);
+    try std.testing.expectEqual(@as(usize, 3), actions.len);
     try std.testing.expectEqualStrings("ai-review-selection", actions[0].id);
     try std.testing.expectEqualStrings("AI review selection", actions[0].label.?);
     try std.testing.expectEqual(@as(u8, 3), actions[0].argv_len);
@@ -852,6 +918,10 @@ test "loadConfig accepts external action definitions" {
     try std.testing.expectEqualStrings("copy_context", actions[1].id);
     try std.testing.expect(actions[1].label == null);
     try std.testing.expectEqual(ExternalActionInput.review_context, actions[1].stdin);
+    try std.testing.expectEqualStrings("commit-message", actions[2].id);
+    try std.testing.expectEqual(ExternalActionInput.staged_diff, actions[2].stdin);
+    try std.testing.expectEqual(ExternalActionScope.commit, actions[2].scope);
+    try std.testing.expectEqual(ExternalActionOutput.commit_message, actions[2].output);
 }
 
 test "loadConfig accepts empty actions section" {
@@ -1077,6 +1147,47 @@ test "loadConfig rejects unknown external action stdin values" {
         \\id = "tool"
         \\argv = ["tool"]
         \\stdin = "everything"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects invalid external action scope and output" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-invalid-scope-output-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\scope = "selection"
+        \\output = "commit_message"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects commit action target placeholders" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-commit-placeholder-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\id = "commit-message"
+        \\argv = ["helper", "{path}"]
+        \\stdin = "staged_diff"
+        \\scope = "commit"
+        \\output = "commit_message"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};

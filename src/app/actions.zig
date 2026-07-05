@@ -3,6 +3,9 @@ const chasen = @import("chasen");
 const git_backend = @import("../git/backend.zig");
 const git_push = @import("../git/push.zig");
 const git_ops = @import("git_ops.zig");
+const external_action = @import("../external/action.zig");
+const process_runner = @import("../process/runner.zig");
+const context_export = @import("../context_export.zig");
 
 /// Git operation categories that can become App-facing actions.
 ///
@@ -16,6 +19,7 @@ pub const ActionKind = enum {
     unstage_hunk,
     discard_file,
     commit,
+    generate_commit_message,
     amend,
     push,
     pull,
@@ -173,6 +177,52 @@ pub const CommitFinished = struct {
             .pending = .{ .generation = 0, .kind = .commit },
             .repo_root = &.{},
             .result = .ok,
+        };
+    }
+};
+
+pub const GeneratedCommitMessage = struct {
+    subject: []u8,
+    body: ?[]u8 = null,
+    truncated: bool = false,
+
+    pub fn deinit(self: *GeneratedCommitMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.subject);
+        if (self.body) |body| allocator.free(body);
+        self.* = .{ .subject = &.{}, .body = null, .truncated = false };
+    }
+};
+
+pub const GenerateCommitMessageResult = union(enum) {
+    ok: GeneratedCommitMessage,
+    failed: []u8,
+    failed_static: []const u8,
+
+    pub fn deinit(self: *GenerateCommitMessageResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .ok => |*message| message.deinit(allocator),
+            .failed => |message| allocator.free(message),
+            .failed_static => {},
+        }
+        self.* = .{ .failed_static = "generate commit message failed" };
+    }
+};
+
+pub const GenerateCommitMessageFinished = struct {
+    pending: PendingAction,
+    repo_root: []u8,
+    action_id: []u8,
+    result: GenerateCommitMessageResult,
+
+    pub fn deinit(self: *GenerateCommitMessageFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.action_id);
+        self.result.deinit(allocator);
+        self.* = .{
+            .pending = .{ .generation = 0, .kind = .generate_commit_message },
+            .repo_root = &.{},
+            .action_id = &.{},
+            .result = .{ .failed_static = "generate commit message failed" },
         };
     }
 };
@@ -660,6 +710,55 @@ pub fn CommitTask(comptime Msg: type) type {
     };
 }
 
+/// Async task for commit-message generation.
+///
+/// The task intentionally collects the staged diff itself before invoking the
+/// user command. Running `git diff --cached` in App update handling would block
+/// the UI and could mix a diff with metadata from another load generation.
+pub fn GenerateCommitMessageTask(comptime Msg: type) type {
+    return struct {
+        pending: PendingAction,
+        repo_root: []u8,
+        action_id: []u8,
+        argv: [][]u8,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer destroyGenerateCommitMessageTask(@This(), allocator, task);
+
+            const result = runGenerateCommitMessage(task.repo_root, task.action_id, task.argv, allocator, io);
+            const repo_root = task.repo_root;
+            const action_id = task.action_id;
+            task.repo_root = &.{};
+            task.action_id = &.{};
+
+            return Msg.actionFinished(.{ .generate_commit_message = GenerateCommitMessageFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .action_id = action_id,
+                .result = result,
+            } });
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer destroyGenerateCommitMessageTask(@This(), allocator, task);
+
+            const repo_root = task.repo_root;
+            const action_id = task.action_id;
+            task.repo_root = &.{};
+            task.action_id = &.{};
+
+            return Msg.actionFinished(.{ .generate_commit_message = GenerateCommitMessageFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .action_id = action_id,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            } });
+        }
+    };
+}
+
 /// Async task for `git commit --amend -m subject [-m body]`.
 pub fn AmendTask(comptime Msg: type) type {
     return struct {
@@ -1045,6 +1144,153 @@ pub fn runCommit(repo_root: []const u8, subject: []const u8, body: ?[]const u8, 
     }, allocator, io);
 }
 
+fn destroyGenerateCommitMessageTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
+    if (task.repo_root.len > 0) allocator.free(task.repo_root);
+    if (task.action_id.len > 0) allocator.free(task.action_id);
+    for (task.argv) |arg| allocator.free(arg);
+    allocator.free(task.argv);
+    allocator.destroy(task);
+}
+
+const staged_diff_json_limit = 256 * 1024;
+// Capture a larger diff before truncating the JSON payload. This lets normal
+// large diffs produce a truncated prompt while still bounding accidental huge
+// stdout from Git before it enters JSON construction.
+const staged_diff_capture_limit = 4 * 1024 * 1024;
+
+pub fn runGenerateCommitMessage(repo_root: []const u8, action_id: []const u8, argv: []const []const u8, allocator: std.mem.Allocator, io: std.Io) GenerateCommitMessageResult {
+    const diff_argv = [_][]const u8{ "git", "diff", "--cached", "--no-ext-diff", "--no-color" };
+    const diff_result = process_runner.runCaptured(allocator, io, .{
+        .argv = &diff_argv,
+        .cwd = .{ .path = repo_root },
+        .stdout_limit = .limited(staged_diff_capture_limit),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch |err| return allocFailure(allocator, "staged diff failed: {s}", .{@errorName(err)});
+    defer diff_result.deinit(allocator);
+
+    switch (diff_result.term) {
+        .exited => |code| if (code != 0) return allocFailure(allocator, "staged diff failed: {any}", .{diff_result.term}),
+        else => return allocFailure(allocator, "staged diff failed: {any}", .{diff_result.term}),
+    }
+
+    if (validateStagedDiffForJson(diff_result.stdout)) |failure| return .{ .failed_static = failure };
+
+    const truncate = truncateDiff(diff_result.stdout, staged_diff_json_limit);
+    const stdin_json = buildStagedDiffJson(allocator, repo_root, truncate.bytes, truncate.truncated) catch |err|
+        return allocFailure(allocator, "staged diff json failed: {s}", .{@errorName(err)});
+    defer allocator.free(stdin_json);
+
+    const action_result = external_action.run(allocator, io, .{
+        .id = .custom,
+        .argv = argv,
+        .stdin_json = stdin_json,
+        .cwd = repo_root,
+    }) catch |err| return allocFailure(allocator, "external action failed: {s}", .{@errorName(err)});
+    var owned_action_result = action_result;
+    defer owned_action_result.deinit(allocator);
+
+    return switch (owned_action_result) {
+        .ok => |*output| parseGeneratedCommitMessage(allocator, output.stdout, truncate.truncated),
+        .failed => |*output| actionOutputFailure(allocator, action_id, output.*),
+        .spawn_failed => |*output| actionOutputFailure(allocator, action_id, output.*),
+        .runner_failed => |*output| actionOutputFailure(allocator, action_id, output.*),
+    };
+}
+
+const TruncatedDiff = struct {
+    bytes: []const u8,
+    truncated: bool,
+};
+
+fn truncateDiff(bytes: []const u8, limit: usize) TruncatedDiff {
+    if (bytes.len <= limit) return .{ .bytes = bytes, .truncated = false };
+
+    var end = limit;
+    while (end > 0 and !std.unicode.utf8ValidateSlice(bytes[0..end])) : (end -= 1) {}
+    if (end == 0) return .{ .bytes = bytes[0..0], .truncated = true };
+    if (std.mem.lastIndexOfScalar(u8, bytes[0..end], '\n')) |newline| {
+        if (newline > 0) end = newline + 1;
+    }
+    return .{ .bytes = bytes[0..end], .truncated = true };
+}
+
+fn validateStagedDiffForJson(diff: []const u8) ?[]const u8 {
+    if (std.mem.trim(u8, diff, " \t\r\n").len == 0) return "no staged changes";
+    if (!std.unicode.utf8ValidateSlice(diff)) return "staged diff is not valid UTF-8";
+    return null;
+}
+
+fn buildStagedDiffJson(allocator: std.mem.Allocator, repo_root: []const u8, diff: []const u8, truncated: bool) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    try out.writer.writeAll("{\"schema_version\":1,\"kind\":\"staged_diff\",\"repo_root\":");
+    try context_export.writeStringValue(&out.writer, repo_root);
+    try out.writer.writeAll(",\"source\":\"worktree\",\"diff_format\":\"git_unified\",\"truncated\":");
+    try out.writer.writeAll(if (truncated) "true" else "false");
+    try out.writer.writeAll(",\"diff\":");
+    try context_export.writeStringValue(&out.writer, diff);
+    try out.writer.writeAll("}\n");
+    return try out.toOwnedSlice();
+}
+
+fn parseGeneratedCommitMessage(allocator: std.mem.Allocator, stdout: []const u8, truncated_input: bool) GenerateCommitMessageResult {
+    const trimmed = trimTrailingNewlines(stdout);
+    if (trimmed.len == 0) return .{ .failed_static = "generated commit message is empty" };
+    if (!std.unicode.utf8ValidateSlice(trimmed)) return .{ .failed_static = "generated commit message is not valid UTF-8" };
+    if (containsDisallowedControl(trimmed)) return .{ .failed_static = "generated commit message contains control characters" };
+
+    const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n');
+    const subject_raw = if (first_newline) |index| trimmed[0..index] else trimmed;
+    const body_raw = if (first_newline) |index| std.mem.trim(u8, trimmed[index + 1 ..], " \t\r\n") else "";
+    const subject = std.mem.trim(u8, subject_raw, " \t\r");
+    if (subject.len == 0) return .{ .failed_static = "generated commit message subject is empty" };
+
+    const subject_owned = allocator.dupe(u8, subject) catch return .{ .failed_static = "generated commit message failed: OutOfMemory" };
+    const body_owned = if (body_raw.len == 0) null else allocator.dupe(u8, body_raw) catch {
+        allocator.free(subject_owned);
+        return .{ .failed_static = "generated commit message failed: OutOfMemory" };
+    };
+
+    return .{ .ok = .{
+        .subject = subject_owned,
+        .body = body_owned,
+        .truncated = truncated_input,
+    } };
+}
+
+fn trimTrailingNewlines(text: []const u8) []const u8 {
+    var end = text.len;
+    while (end > 0 and (text[end - 1] == '\n' or text[end - 1] == '\r')) : (end -= 1) {}
+    return text[0..end];
+}
+
+fn containsDisallowedControl(text: []const u8) bool {
+    var iter = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
+    while (iter.nextCodepoint()) |codepoint| {
+        if (codepoint == '\n') continue;
+        if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint <= 0x9f)) return true;
+    }
+    return false;
+}
+
+fn actionOutputFailure(allocator: std.mem.Allocator, action_id: []const u8, output: external_action.CommandOutput) GenerateCommitMessageResult {
+    if (output.message.len > 0) return allocFailure(allocator, "{s}: {s}", .{ action_id, output.message });
+    if (output.stderr.len > 0) return allocFailure(allocator, "{s}: {s}", .{ action_id, shortLine(output.stderr) });
+    return allocFailure(allocator, "{s} failed", .{action_id});
+}
+
+fn shortLine(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const line = if (std.mem.indexOfScalar(u8, trimmed, '\n')) |index| trimmed[0..index] else trimmed;
+    return if (line.len > 160) line[0..160] else line;
+}
+
+fn allocFailure(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) GenerateCommitMessageResult {
+    const message = std.fmt.allocPrint(allocator, fmt, args) catch return .{ .failed_static = "generate commit message failed: OutOfMemory" };
+    return .{ .failed = message };
+}
+
 pub fn runAmend(repo_root: []const u8, subject: []const u8, body: ?[]const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Amend", .{
         .repo_root = repo_root,
@@ -1132,6 +1378,59 @@ test "ActionState tracks current pending action" {
     try std.testing.expect(!state.finish(first));
     try std.testing.expect(state.finish(second));
     try std.testing.expect(state.pending == null);
+}
+
+test "parseGeneratedCommitMessage splits subject and body" {
+    var result = parseGeneratedCommitMessage(std.testing.allocator, "Add commit generator\n\nUse staged diff input.\n", false);
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .ok => |message| {
+            try std.testing.expectEqualStrings("Add commit generator", message.subject);
+            try std.testing.expectEqualStrings("Use staged diff input.", message.body.?);
+            try std.testing.expect(!message.truncated);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseGeneratedCommitMessage rejects control characters" {
+    var result = parseGeneratedCommitMessage(std.testing.allocator, "Bad \x1b[31mmessage", false);
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed_static => |message| try std.testing.expectEqualStrings("generated commit message contains control characters", message),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "buildStagedDiffJson escapes diff content" {
+    const diff =
+        \\diff --git a/a.zig b/a.zig
+        \\+const text = "quoted\\value";
+        \\
+    ;
+    const json = try buildStagedDiffJson(std.testing.allocator, "/repo", diff, true);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"staged_diff\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"truncated\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\\"quoted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "value\\\"") != null);
+}
+
+test "truncateDiff keeps valid utf8 prefix" {
+    const text = "line1\nline2\n日本語\nline4\n";
+    const truncated = truncateDiff(text, "line1\nline2\n日".len);
+    try std.testing.expect(truncated.truncated);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(truncated.bytes));
+}
+
+test "validateStagedDiffForJson rejects empty and invalid utf8 diffs" {
+    try std.testing.expectEqualStrings("no staged changes", validateStagedDiffForJson("").?);
+    const invalid = [_]u8{ 'd', 'i', 'f', 'f', '\n', 0xff };
+    try std.testing.expectEqualStrings("staged diff is not valid UTF-8", validateStagedDiffForJson(&invalid).?);
+    try std.testing.expect(validateStagedDiffForJson("diff --git a/a b/a\n+ok\n") == null);
 }
 
 test "StageHunkTask failed preserves identity and transfers moved fields" {

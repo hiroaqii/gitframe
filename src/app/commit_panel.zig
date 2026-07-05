@@ -12,6 +12,8 @@ pub const CommitError = enum {
     status_loading,
     status_unavailable,
     action_pending,
+    draft_not_empty,
+    generate_failed,
     commit_failed,
     amend_failed,
 
@@ -25,6 +27,8 @@ pub const CommitError = enum {
             .status_loading => "Status is still loading",
             .status_unavailable => "Status is unavailable",
             .action_pending => "Another git action is running",
+            .draft_not_empty => "Clear the draft before generating a commit message",
+            .generate_failed => "Could not generate commit message",
             .commit_failed => "Commit failed",
             .amend_failed => "Amend failed",
         };
@@ -404,6 +408,45 @@ pub const State = struct {
         };
     }
 
+    pub fn draftIsEmpty(self: *const State) bool {
+        return trimmedSubject(self).len == 0 and trimmedBody(self).len == 0;
+    }
+
+    pub fn replaceDraft(self: *State, subject: []const u8, body: ?[]const u8) void {
+        const allocator = self.allocator orelse {
+            self.commit_error = .input_allocation_failed;
+            return;
+        };
+        if (!std.unicode.utf8ValidateSlice(subject) or (body != null and !std.unicode.utf8ValidateSlice(body.?))) {
+            self.commit_error = .generate_failed;
+            return;
+        }
+        const body_len = if (body) |text| text.len else 0;
+        if (subject.len + body_len > max_message_bytes) {
+            self.commit_error = .message_too_large;
+            return;
+        }
+        if (graphemeCount(std.mem.trim(u8, subject, " \t\r\n")) > max_subject_chars) {
+            self.commit_error = .subject_too_long;
+            return;
+        }
+
+        self.subject.clearRetainingCapacity();
+        self.body.clearRetainingCapacity();
+        self.active_field = .subject;
+        self.subject.insertSlice(allocator, subject) catch {
+            self.commit_error = .input_allocation_failed;
+            return;
+        };
+        if (body) |text| {
+            self.body.insertSlice(allocator, text) catch {
+                self.commit_error = .input_allocation_failed;
+                return;
+            };
+        }
+        self.refreshInputError();
+    }
+
     pub fn subjectCharCount(self: *const State) usize {
         return graphemeCount(trimmedSubject(self));
     }
@@ -488,7 +531,7 @@ pub const State = struct {
         }
         if (self.commit_error) |err| {
             switch (err) {
-                .subject_too_long, .message_too_large, .input_allocation_failed, .commit_failed, .amend_failed => self.commit_error = null,
+                .subject_too_long, .message_too_large, .input_allocation_failed, .draft_not_empty, .generate_failed, .commit_failed, .amend_failed => self.commit_error = null,
                 else => {},
             }
         }

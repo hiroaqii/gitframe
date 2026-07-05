@@ -84,6 +84,7 @@ const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
 const AmendFinished = app_actions.AmendFinished;
 const CommitFinished = app_actions.CommitFinished;
+const GenerateCommitMessageFinished = app_actions.GenerateCommitMessageFinished;
 const DiscardFileFinished = app_actions.DiscardFileFinished;
 const FetchFinished = app_actions.FetchFinished;
 const FetchTargetResult = git_ops.FetchTargetResult;
@@ -190,6 +191,7 @@ const ActionFinishedMsg = union(enum) {
     unstage_hunk: UnstageHunkFinished,
     discard_file: DiscardFileFinished,
     commit: CommitFinished,
+    generate_commit_message: GenerateCommitMessageFinished,
     amend: AmendFinished,
     push: PushFinished,
     pull: PullFinished,
@@ -426,6 +428,7 @@ pub const App = struct {
         enter_amend_panel,
         cancel_commit_panel,
         submit_commit_panel,
+        generate_commit_message,
         commit_panel_tab,
         commit_panel_enter,
         commit_panel_insert: u21,
@@ -681,8 +684,9 @@ pub const App = struct {
             },
             .enter_commit_panel => self.enterCommitPanelMode(.commit),
             .enter_amend_panel => self.enterCommitPanelMode(.amend),
-            .cancel_commit_panel => self.commit_panel.close(),
+            .cancel_commit_panel => self.closeCommitPanel(),
             .submit_commit_panel => try self.submitCommitPanel(ctx),
+            .generate_commit_message => try self.generateCommitMessage(ctx),
             .commit_panel_tab => self.commit_panel.toggleField(),
             .commit_panel_enter => self.commit_panel.enter(),
             .commit_panel_insert => |codepoint| self.commit_panel.insert(codepoint),
@@ -803,6 +807,7 @@ pub const App = struct {
             .unstage_hunk => |result| try self.finishUnstageHunk(ctx, result),
             .discard_file => |result| try self.finishDiscardFile(ctx, result),
             .commit => |result| try self.finishCommit(ctx, result),
+            .generate_commit_message => |result| self.finishGenerateCommitMessage(ctx, result),
             .amend => |result| try self.finishAmend(ctx, result),
             .push => |result| try self.finishPush(ctx, result),
             .pull => |result| try self.finishPull(ctx, result),
@@ -1931,6 +1936,13 @@ pub const App = struct {
         self.commit_panel.open(mode);
     }
 
+    fn closeCommitPanel(self: *App) void {
+        if (self.actions.pending) |pending| {
+            if (pending.kind == .generate_commit_message) self.actions.clear();
+        }
+        self.commit_panel.close();
+    }
+
     fn submitCommitPanel(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
             self.commit_panel.commit_error = .action_pending;
@@ -1955,6 +1967,132 @@ pub const App = struct {
         }
 
         try self.startCommitTask(ctx, repo_root);
+    }
+
+    fn generateCommitMessage(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (app_git_requests.hasPendingAction(self.actions)) {
+            self.commit_panel.commit_error = .action_pending;
+            self.setStatus("finish current git action before generating commit message", .{});
+            return;
+        }
+        if (!self.commit_panel.is_open or self.commit_panel.mode != .commit) {
+            self.setStatus("commit message generation is only available in commit mode", .{});
+            return;
+        }
+        if (!self.commit_panel.draftIsEmpty()) {
+            self.commit_panel.commit_error = .draft_not_empty;
+            return;
+        }
+        switch (self.stagedSummaryForActiveRepo()) {
+            .ready => |ready| if (ready.count == 0) {
+                self.commit_panel.commit_error = .no_staged_changes;
+                return;
+            },
+            .loading_or_stale => {
+                self.commit_panel.commit_error = .status_loading;
+                return;
+            },
+            .unavailable => {
+                self.commit_panel.commit_error = .status_unavailable;
+                return;
+            },
+        }
+
+        const repo_root = self.activeRepoRoot() orelse {
+            self.commit_panel.commit_error = .status_unavailable;
+            return;
+        };
+
+        const action = self.resolveCommitMessageAction() catch |err| {
+            self.setStatus("{s}", .{commitMessageActionResolveMessage(err)});
+            return;
+        };
+
+        var request = self.buildGenerateCommitMessageRequest(ctx.allocator(), repo_root, action) catch |err| {
+            self.commit_panel.commit_error = .input_allocation_failed;
+            self.setStatus("could not prepare commit message action: {s}", .{@errorName(err)});
+            return err;
+        };
+
+        app_git_requests.startGenerateCommitMessage(Msg, ctx, &self.actions, &request) catch |err| {
+            self.commit_panel.commit_error = .generate_failed;
+            self.setStatus("could not start commit message action", .{});
+            return err;
+        };
+
+        self.setStatus("generating commit message...", .{});
+    }
+
+    const CommitMessageActionResolveError = error{
+        Missing,
+        Multiple,
+    };
+
+    fn resolveCommitMessageAction(self: *const App) CommitMessageActionResolveError!config_mod.ExternalActionConfig {
+        var found: ?config_mod.ExternalActionConfig = null;
+        for (self.user_config.actions.slice()) |action| {
+            if (action.scope == .commit and action.stdin == .staged_diff and action.output == .commit_message) {
+                if (found != null) return error.Multiple;
+                found = action;
+            }
+        }
+        return found orelse error.Missing;
+    }
+
+    fn commitMessageActionResolveMessage(err: CommitMessageActionResolveError) []const u8 {
+        return switch (err) {
+            error.Missing => "commit message action is not configured",
+            error.Multiple => "multiple commit message actions configured",
+        };
+    }
+
+    fn buildGenerateCommitMessageRequest(
+        self: *const App,
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        action: config_mod.ExternalActionConfig,
+    ) !app_git_requests.GenerateCommitMessageRequest {
+        _ = self;
+        const owned_root = try allocator.dupe(u8, repo_root);
+        errdefer allocator.free(owned_root);
+        const owned_id = try allocator.dupe(u8, action.id);
+        errdefer allocator.free(owned_id);
+
+        const argv_src = action.argvSlice();
+        var argv = try allocator.alloc([]u8, argv_src.len);
+        errdefer allocator.free(argv);
+        var owned_count: usize = 0;
+        errdefer {
+            for (argv[0..owned_count]) |arg| allocator.free(arg);
+        }
+        for (argv_src, 0..) |arg, index| {
+            argv[index] = try expandCommitActionArgv(allocator, arg, repo_root);
+            owned_count += 1;
+        }
+
+        return .{
+            .repo_root = owned_root,
+            .action_id = owned_id,
+            .argv = argv,
+        };
+    }
+
+    fn expandCommitActionArgv(allocator: std.mem.Allocator, template: []const u8, repo_root: []const u8) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+
+        var cursor: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, template, cursor, '{')) |open| {
+            try out.writer.writeAll(template[cursor..open]);
+            const close = std.mem.indexOfScalarPos(u8, template, open + 1, '}') orelse return error.UnknownPlaceholder;
+            const placeholder = template[open .. close + 1];
+            if (!std.mem.eql(u8, placeholder, "{repo_root}")) return error.UnknownPlaceholder;
+            try out.writer.writeAll(repo_root);
+            cursor = close + 1;
+        }
+        if (std.mem.indexOfScalarPos(u8, template, cursor, '}') != null) return error.UnknownPlaceholder;
+        try out.writer.writeAll(template[cursor..]);
+        return try out.toOwnedSlice();
     }
 
     fn startCommitTask(self: *App, ctx: *chasen.Ctx(Msg), repo_root: []const u8) !void {
@@ -2976,6 +3114,43 @@ pub const App = struct {
             .failed, .failed_static => {
                 self.commit_panel.commit_error = .commit_failed;
                 _ = self.setActionFailureStatus("commit", result.result);
+            },
+        }
+    }
+
+    fn finishGenerateCommitMessage(self: *App, ctx: *chasen.Ctx(Msg), finished: GenerateCommitMessageFinished) void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (!self.actions.finish(result.pending)) return;
+        if (!self.commit_panel.is_open or self.commit_panel.mode != .commit) return;
+        if (!self.activeRepoMatches(result.repo_root)) return;
+        if (!self.commit_panel.draftIsEmpty()) {
+            self.commit_panel.commit_error = .draft_not_empty;
+            self.setStatus("generated commit message ignored; draft is no longer empty", .{});
+            return;
+        }
+
+        switch (result.result) {
+            .ok => |message| {
+                self.commit_panel.replaceDraft(message.subject, message.body);
+                if (self.commit_panel.commit_error) |_| {
+                    self.setStatus("generated commit message could not be inserted", .{});
+                    return;
+                }
+                if (message.truncated) {
+                    self.setStatus("generated commit message from truncated staged diff", .{});
+                } else {
+                    self.setStatus("generated commit message", .{});
+                }
+            },
+            .failed => |message| {
+                self.commit_panel.commit_error = .generate_failed;
+                self.setStatus("{s}", .{message});
+            },
+            .failed_static => |message| {
+                self.commit_panel.commit_error = .generate_failed;
+                self.setStatus("{s}", .{message});
             },
         }
     }
@@ -7217,6 +7392,160 @@ test "staged summary distinguishes pending missing and ready status snapshots" {
     try app.git_status.replace("/repo", &status_bundle);
 
     try std.testing.expectEqual(app_commit_panel.StagedSummary{ .ready = .{ .count = 1 } }, app.stagedSummaryForActiveRepo());
+}
+
+fn testAppWithCommitPanel() App {
+    return .{
+        .commit_panel = app_commit_panel.State.init(std.testing.allocator),
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+}
+
+fn generatedCommitMessageFinished(
+    allocator: std.mem.Allocator,
+    pending: app_actions.PendingAction,
+    result: app_actions.GenerateCommitMessageResult,
+) !GenerateCommitMessageFinished {
+    const repo_root = try allocator.dupe(u8, "/repo");
+    errdefer allocator.free(repo_root);
+    const action_id = try allocator.dupe(u8, "commit-message");
+    return .{
+        .pending = pending,
+        .repo_root = repo_root,
+        .action_id = action_id,
+        .result = result,
+    };
+}
+
+test "finishGenerateCommitMessage inserts editable draft and truncated warning" {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var app = testAppWithCommitPanel();
+    defer app.commit_panel.deinit();
+
+    app.commit_panel.open(.commit);
+    const pending = app.actions.begin(.generate_commit_message);
+    const finished = try generatedCommitMessageFinished(std.testing.allocator, pending, .{ .ok = .{
+        .subject = try std.testing.allocator.dupe(u8, "Generated subject"),
+        .body = try std.testing.allocator.dupe(u8, "Generated body"),
+        .truncated = true,
+    } });
+
+    app.finishGenerateCommitMessage(&ctx, finished);
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expectEqualStrings("Generated subject", app.commit_panel.subject.slice());
+    try std.testing.expectEqualStrings("Generated body", app.commit_panel.body.slice());
+    try std.testing.expectEqualStrings("generated commit message from truncated staged diff", app.status.text());
+}
+
+test "finishGenerateCommitMessage ignores stale result after popup close" {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var app = testAppWithCommitPanel();
+    defer app.commit_panel.deinit();
+
+    app.commit_panel.open(.commit);
+    const pending = app.actions.begin(.generate_commit_message);
+    app.closeCommitPanel();
+    const finished = try generatedCommitMessageFinished(std.testing.allocator, pending, .{ .ok = .{
+        .subject = try std.testing.allocator.dupe(u8, "Generated subject"),
+        .body = null,
+        .truncated = false,
+    } });
+
+    app.finishGenerateCommitMessage(&ctx, finished);
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(!app.commit_panel.is_open);
+    try std.testing.expectEqualStrings("", app.commit_panel.subject.slice());
+}
+
+test "finishGenerateCommitMessage does not overwrite non-empty draft" {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var app = testAppWithCommitPanel();
+    defer app.commit_panel.deinit();
+
+    app.commit_panel.open(.commit);
+    app.commit_panel.insert('x');
+    const pending = app.actions.begin(.generate_commit_message);
+    const finished = try generatedCommitMessageFinished(std.testing.allocator, pending, .{ .ok = .{
+        .subject = try std.testing.allocator.dupe(u8, "Generated subject"),
+        .body = null,
+        .truncated = false,
+    } });
+
+    app.finishGenerateCommitMessage(&ctx, finished);
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expectEqual(app_commit_panel.CommitError.draft_not_empty, app.commit_panel.commit_error.?);
+    try std.testing.expectEqualStrings("x", app.commit_panel.subject.slice());
+}
+
+test "finishGenerateCommitMessage failure keeps draft unchanged" {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var app = testAppWithCommitPanel();
+    defer app.commit_panel.deinit();
+
+    app.commit_panel.open(.commit);
+    const pending = app.actions.begin(.generate_commit_message);
+    const finished = try generatedCommitMessageFinished(std.testing.allocator, pending, .{
+        .failed = try std.testing.allocator.dupe(u8, "commit-message: failed"),
+    });
+
+    app.finishGenerateCommitMessage(&ctx, finished);
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expectEqual(app_commit_panel.CommitError.generate_failed, app.commit_panel.commit_error.?);
+    try std.testing.expectEqualStrings("", app.commit_panel.subject.slice());
+    try std.testing.expectEqualStrings("commit-message: failed", app.status.text());
+}
+
+test "finishGenerateCommitMessage rejects long subject without mutating draft" {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var app = testAppWithCommitPanel();
+    defer app.commit_panel.deinit();
+
+    app.commit_panel.open(.commit);
+    const pending = app.actions.begin(.generate_commit_message);
+    var long_subject: [app_commit_panel.max_subject_chars + 1]u8 = undefined;
+    @memset(&long_subject, 'a');
+    const finished = try generatedCommitMessageFinished(std.testing.allocator, pending, .{ .ok = .{
+        .subject = try std.testing.allocator.dupe(u8, &long_subject),
+        .body = null,
+        .truncated = false,
+    } });
+
+    app.finishGenerateCommitMessage(&ctx, finished);
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expectEqual(app_commit_panel.CommitError.subject_too_long, app.commit_panel.commit_error.?);
+    try std.testing.expectEqualStrings("", app.commit_panel.subject.slice());
+}
+
+test "resolveCommitMessageAction reports missing and multiple configs" {
+    var missing = testAppWithCommitPanel();
+    defer missing.commit_panel.deinit();
+    try std.testing.expectError(error.Missing, missing.resolveCommitMessageAction());
+
+    var multiple = testAppWithCommitPanel();
+    defer multiple.commit_panel.deinit();
+    var action: config_mod.ExternalActionConfig = .{};
+    action.id = "commit-message-a";
+    action.argv[0] = "helper";
+    action.argv_len = 1;
+    action.stdin = .staged_diff;
+    action.scope = .commit;
+    action.output = .commit_message;
+    var other = action;
+    other.id = "commit-message-b";
+    multiple.user_config.actions.items[0] = action;
+    multiple.user_config.actions.items[1] = other;
+    multiple.user_config.actions.len = 2;
+
+    try std.testing.expectError(error.Multiple, multiple.resolveCommitMessageAction());
 }
 
 test "pending selection restore survives status projection while diff reload is pending" {

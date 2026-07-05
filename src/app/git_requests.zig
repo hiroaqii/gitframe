@@ -158,6 +158,40 @@ pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *act
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
+pub const GenerateCommitMessageRequest = struct {
+    repo_root: []u8,
+    action_id: []u8,
+    argv: [][]u8,
+
+    pub fn deinit(self: *GenerateCommitMessageRequest, allocator: std.mem.Allocator) void {
+        if (self.repo_root.len > 0) allocator.free(self.repo_root);
+        if (self.action_id.len > 0) allocator.free(self.action_id);
+        for (self.argv) |arg| allocator.free(arg);
+        if (self.argv.len > 0) allocator.free(self.argv);
+        self.* = .{ .repo_root = &.{}, .action_id = &.{}, .argv = &.{} };
+    }
+};
+
+pub fn startGenerateCommitMessage(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, request: *GenerateCommitMessageRequest) !void {
+    defer request.deinit(ctx.allocator());
+
+    const pending = action_state.begin(.generate_commit_message);
+    errdefer _ = action_state.finish(pending);
+
+    const Task = actions.GenerateCommitMessageTask(Msg);
+    const task = try ctx.allocator().create(Task);
+    task.* = .{
+        .pending = pending,
+        .repo_root = request.repo_root,
+        .action_id = request.action_id,
+        .argv = request.argv,
+    };
+    request.* = .{ .repo_root = &.{}, .action_id = &.{}, .argv = &.{} };
+    errdefer destroyGenerateCommitMessageTask(Task, ctx.allocator(), task);
+
+    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+}
+
 pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, confirmation: *app_state.AmendConfirmation) !void {
     defer consumeAmendConfirmation(ctx.allocator(), confirmation);
 
@@ -494,6 +528,14 @@ fn destroyCommitTask(comptime Task: type, allocator: std.mem.Allocator, task: *T
     if (task.repo_root.len > 0) allocator.free(task.repo_root);
     if (task.subject.len > 0) allocator.free(task.subject);
     if (task.body) |body| allocator.free(body);
+    allocator.destroy(task);
+}
+
+fn destroyGenerateCommitMessageTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
+    if (task.repo_root.len > 0) allocator.free(task.repo_root);
+    if (task.action_id.len > 0) allocator.free(task.action_id);
+    for (task.argv) |arg| allocator.free(arg);
+    if (task.argv.len > 0) allocator.free(task.argv);
     allocator.destroy(task);
 }
 

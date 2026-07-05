@@ -1335,7 +1335,7 @@ fn drawCommitCounter(surface: *chasen.Surface, row: u16, len: usize, max: ?usize
 }
 
 fn commitHelpRows(width: u16) u16 {
-    const single_line = "Tab: field  Enter: newline  Ctrl+s/Ctrl+Enter: validate  Esc: close";
+    const single_line = "Tab: field  Enter: newline  Ctrl+g: generate  Ctrl+s/Ctrl+Enter: validate  Esc: close";
     return if (chasen.text.displayWidth(single_line) <= width) 1 else 2;
 }
 
@@ -1346,15 +1346,14 @@ fn viewCommitHelp(app: anytype, surface: *chasen.Surface, start_row: u16, rows: 
     const style: chasen.TextStyle = roleStyle(app.theme, .muted);
     const submit_label = app.commit_panel.submitLabel();
     if (rows <= 1) {
-        const text = try std.fmt.allocPrint(surface.frameAllocator(), "Tab: field  Enter: newline  Ctrl+s/Ctrl+Enter: {s}  Esc: close", .{submit_label});
+        const text = try std.fmt.allocPrint(surface.frameAllocator(), "Tab: field  Enter: newline  Ctrl+g: generate  Ctrl+s/Ctrl+Enter: {s}  Esc: close", .{submit_label});
         try draw.copyClippedTextAt(surface, 0, start_row, text, style);
         return;
     }
 
-    const line1 = try std.fmt.allocPrint(surface.frameAllocator(), "Tab: field  Enter: newline  Ctrl+s: {s}", .{submit_label});
-    try draw.copyClippedTextAt(surface, 0, start_row, line1, style);
+    try draw.copyClippedTextAt(surface, 0, start_row, "Tab: field  Enter: newline  Ctrl+g: generate", style);
     if (start_row + 1 < size.height) {
-        const line2 = try std.fmt.allocPrint(surface.frameAllocator(), "Ctrl+Enter: {s}  Esc: close", .{submit_label});
+        const line2 = try std.fmt.allocPrint(surface.frameAllocator(), "Ctrl+s/Ctrl+Enter: {s}  Esc: close", .{submit_label});
         try draw.copyClippedTextAt(surface, 0, start_row + 1, line2, style);
     }
 }

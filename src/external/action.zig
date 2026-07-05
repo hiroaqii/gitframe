@@ -41,6 +41,7 @@ pub const ExternalActionRequest = struct {
     id: ExternalActionId,
     argv: []const []const u8,
     stdin_json: []const u8,
+    cwd: ?[]const u8 = null,
 
     pub fn clone(self: ExternalActionRequest, allocator: std.mem.Allocator) std.mem.Allocator.Error!OwnedExternalActionRequest {
         var argv = try allocator.alloc([]u8, self.argv.len);
@@ -57,10 +58,13 @@ pub const ExternalActionRequest = struct {
         }
 
         const stdin_json = try allocator.dupe(u8, self.stdin_json);
+        errdefer allocator.free(stdin_json);
+        const cwd = if (self.cwd) |cwd| try allocator.dupe(u8, cwd) else null;
         return .{
             .id = self.id,
             .argv = argv,
             .stdin_json = stdin_json,
+            .cwd = cwd,
         };
     }
 };
@@ -69,15 +73,18 @@ pub const OwnedExternalActionRequest = struct {
     id: ExternalActionId,
     argv: [][]u8,
     stdin_json: []u8,
+    cwd: ?[]u8 = null,
 
     pub fn deinit(self: *OwnedExternalActionRequest, allocator: std.mem.Allocator) void {
         for (self.argv) |arg| allocator.free(arg);
         allocator.free(self.argv);
         allocator.free(self.stdin_json);
+        if (self.cwd) |cwd| allocator.free(cwd);
         self.* = .{
             .id = .custom,
             .argv = &.{},
             .stdin_json = &.{},
+            .cwd = null,
         };
     }
 
@@ -86,6 +93,7 @@ pub const OwnedExternalActionRequest = struct {
             .id = self.id,
             .argv = self.argv,
             .stdin_json = self.stdin_json,
+            .cwd = self.cwd,
         };
     }
 };
@@ -94,6 +102,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, request: ExternalActionRequ
     const detailed = try process_runner.runWithStdinDetailed(allocator, io, .{
         .argv = request.argv,
         .stdin = request.stdin_json,
+        .cwd = if (request.cwd) |cwd| .{ .path = cwd } else .inherit,
         .stdout_limit = .limited(stdout_limit),
         .stderr_limit = .limited(stderr_limit),
     });
