@@ -15,6 +15,9 @@ pub const Role = enum {
 
     diff_added,
     diff_removed,
+    diff_added_bg,
+    diff_removed_bg,
+    diff_context_bg,
     diff_metadata,
     diff_line_number,
     diff_hunk,
@@ -103,6 +106,9 @@ pub const Palette = struct {
 
         palette.set(.diff_added, palette.color(.success));
         palette.set(.diff_removed, palette.color(.danger));
+        palette.set(.diff_added_bg, .{ .rgb = .{ 18, 54, 35 } });
+        palette.set(.diff_removed_bg, .{ .rgb = .{ 66, 28, 32 } });
+        palette.set(.diff_context_bg, .default);
         palette.set(.diff_metadata, palette.color(.muted));
         palette.set(.diff_line_number, palette.color(.muted));
         palette.set(.diff_hunk, palette.color(.accent));
@@ -158,6 +164,9 @@ fn isDerivedRole(role: Role) bool {
     return switch (role) {
         .diff_added,
         .diff_removed,
+        .diff_added_bg,
+        .diff_removed_bg,
+        .diff_context_bg,
         .diff_metadata,
         .diff_line_number,
         .diff_hunk,
@@ -234,6 +243,7 @@ test "parseColorValue rejects invalid values" {
 test "roleFromKey maps known theme keys" {
     try std.testing.expectEqual(Role.accent, roleFromKey("accent").?);
     try std.testing.expectEqual(Role.diff_added, roleFromKey("diff_added").?);
+    try std.testing.expectEqual(Role.diff_added_bg, roleFromKey("diff_added_bg").?);
     try std.testing.expect(roleFromKey("diff-added") == null);
 }
 
@@ -258,6 +268,7 @@ test "Palette.fromConfig lets explicit diff role overrides win" {
             return switch (role) {
                 .success => .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } },
                 .diff_added => .{ .index = 10 },
+                .diff_added_bg => .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } },
                 else => null,
             };
         }
@@ -266,4 +277,5 @@ test "Palette.fromConfig lets explicit diff role overrides win" {
     const palette = Palette.fromConfig(FakeConfig{});
     try std.testing.expect(palette.color(.success).eql(.{ .rgb = .{ 1, 2, 3 } }));
     try std.testing.expect(palette.color(.diff_added).eql(.{ .index = 10 }));
+    try std.testing.expect(palette.color(.diff_added_bg).eql(.{ .rgb = .{ 4, 5, 6 } }));
 }

@@ -341,16 +341,17 @@ const BodyCursor = struct {
 };
 
 fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles) !void {
-    const style = styleForLine(line.kind, staged, styles);
+    const text_style = textStyleForLine(line.kind, staged, styles);
+    const marker_style = markerStyleForLine(line.kind, staged, styles);
     const prefix = prefixForLine(line.kind);
     const layout = lineLayout(line_numbers, .unified);
 
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(staged, styles));
-        _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), lineNumberStyle(staged, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(line.kind, staged, styles));
+        _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), lineNumberStyle(line.kind, staged, styles));
     }
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, style);
-    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, style);
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, marker_style);
+    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, text_style);
 }
 
 fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, gutter_col: u16, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles) !void {
@@ -413,23 +414,21 @@ fn sideBySideRowColumns(surface: *chasen.Surface, row: u16, gutter_col: u16) Sid
 fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles) !void {
     const layout = lineLayout(line_numbers, .side_by_side);
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(staged, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(line.kind, staged, styles));
     }
     const prefix = if (line.kind == .removed) "-" else " ";
-    const style = styleForLine(line.kind, staged, styles);
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, style);
-    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, style);
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, markerStyleForLine(line.kind, staged, styles));
+    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, textStyleForLine(line.kind, staged, styles));
 }
 
 fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles) !void {
     const layout = lineLayout(line_numbers, .side_by_side);
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), lineNumberStyle(staged, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), lineNumberStyle(line.kind, staged, styles));
     }
     const prefix = if (line.kind == .added) "+" else " ";
-    const style = styleForLine(line.kind, staged, styles);
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, style);
-    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, style);
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, markerStyleForLine(line.kind, staged, styles));
+    try copyScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, textStyleForLine(line.kind, staged, styles));
 }
 
 pub const LineLayoutMode = enum {
@@ -477,10 +476,10 @@ fn lineNumberText(surface: *chasen.Surface, line: ?u32) ![]const u8 {
         surface.copyText("    ");
 }
 
-fn styleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
+fn textStyleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
     var style = switch (kind) {
-        .added => styles.added,
-        .removed => styles.removed,
+        .added => styles.added_text,
+        .removed => styles.removed_text,
         .context => styles.context,
         .metadata => styles.metadata,
     };
@@ -488,8 +487,24 @@ fn styleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderSty
     return style;
 }
 
-fn lineNumberStyle(staged: bool, styles: RenderStyles) chasen.TextStyle {
-    var style = styles.line_number;
+fn markerStyleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
+    var style = switch (kind) {
+        .added => styles.added_marker,
+        .removed => styles.removed_marker,
+        .context => styles.context_marker,
+        .metadata => styles.metadata,
+    };
+    if (staged) style.dim = true;
+    return style;
+}
+
+fn lineNumberStyle(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
+    var style = switch (kind) {
+        .added => styles.added_line_number,
+        .removed => styles.removed_line_number,
+        .context => styles.line_number,
+        .metadata => styles.metadata,
+    };
     if (staged) style.dim = true;
     return style;
 }
@@ -517,8 +532,13 @@ const RenderStyles = struct {
     selected_hunk: chasen.TextStyle,
     hunk_guide: chasen.TextStyle,
     cursor: chasen.TextStyle,
-    added: chasen.TextStyle,
-    removed: chasen.TextStyle,
+    added_text: chasen.TextStyle,
+    removed_text: chasen.TextStyle,
+    added_marker: chasen.TextStyle,
+    removed_marker: chasen.TextStyle,
+    context_marker: chasen.TextStyle,
+    added_line_number: chasen.TextStyle,
+    removed_line_number: chasen.TextStyle,
     context: chasen.TextStyle,
     metadata: chasen.TextStyle,
     line_number: chasen.TextStyle,
@@ -531,9 +551,16 @@ const RenderStyles = struct {
             .selected_hunk = .{ .bold = true, .fg = palette.color(.diff_hunk) },
             .hunk_guide = .{ .bold = true, .fg = palette.color(.diff_hunk) },
             .cursor = .{ .bold = true, .fg = palette.color(.diff_cursor) },
-            .added = palette.style(.diff_added),
-            .removed = palette.style(.diff_removed),
-            .context = .{},
+            // Keep diff state on backgrounds so body foreground is available
+            // for syntax token colors once a provider is enabled.
+            .added_text = .{ .fg = palette.color(.diff_added), .bg = palette.color(.diff_added_bg) },
+            .removed_text = .{ .fg = palette.color(.diff_removed), .bg = palette.color(.diff_removed_bg) },
+            .added_marker = .{ .bold = true, .fg = palette.color(.diff_added), .bg = palette.color(.diff_added_bg) },
+            .removed_marker = .{ .bold = true, .fg = palette.color(.diff_removed), .bg = palette.color(.diff_removed_bg) },
+            .context_marker = .{ .bg = palette.color(.diff_context_bg) },
+            .added_line_number = .{ .fg = palette.color(.diff_line_number), .bg = palette.color(.diff_added_bg) },
+            .removed_line_number = .{ .fg = palette.color(.diff_line_number), .bg = palette.color(.diff_removed_bg) },
+            .context = .{ .bg = palette.color(.diff_context_bg) },
             .metadata = palette.style(.diff_metadata),
             .line_number = palette.style(.diff_line_number),
             .warning = palette.style(.warning),
@@ -580,6 +607,54 @@ test "fileStats counts added and removed hunk lines" {
     };
 
     try std.testing.expectEqual(FileStats{ .added = 1, .removed = 1 }, fileStats(file));
+}
+
+test "renderFile composes diff state as body background and marker foreground" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 6);
+    defer ts.deinit();
+
+    const palette = theme.Palette.default();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 1,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old", .old_line = 1 },
+                    .{ .kind = .added, .text = "new", .new_line = 1 },
+                },
+            },
+        },
+    };
+
+    try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .palette = palette });
+
+    const removed_prefix = ts.surface.readCell(12, 4).?;
+    try std.testing.expect(removed_prefix.style.fg.eql(palette.color(.diff_removed)));
+    try std.testing.expect(removed_prefix.style.bg.eql(palette.color(.diff_removed_bg)));
+
+    const removed_body = ts.surface.readCell(14, 4).?;
+    try std.testing.expect(removed_body.style.fg.eql(palette.color(.diff_removed)));
+    try std.testing.expect(removed_body.style.bg.eql(palette.color(.diff_removed_bg)));
+
+    const added_line_number = ts.surface.readCell(7, 5).?;
+    try std.testing.expect(added_line_number.style.bg.eql(palette.color(.diff_added_bg)));
+
+    const added_prefix = ts.surface.readCell(12, 5).?;
+    try std.testing.expect(added_prefix.style.fg.eql(palette.color(.diff_added)));
+    try std.testing.expect(added_prefix.style.bg.eql(palette.color(.diff_added_bg)));
+
+    const added_body = ts.surface.readCell(14, 5).?;
+    try std.testing.expect(added_body.style.fg.eql(palette.color(.diff_added)));
+    try std.testing.expect(added_body.style.bg.eql(palette.color(.diff_added_bg)));
 }
 
 test "renderFile dims staged hunk body without removing it" {

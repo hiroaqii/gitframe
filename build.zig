@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -12,7 +13,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-
     const draw_mod = b.createModule(.{
         .root_source_file = b.path("src/draw.zig"),
         .target = target,
@@ -153,6 +153,40 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_repo_discovery_tests = b.addRunArtifact(repo_discovery_tests);
+
+    const check_flow_syntax_step = b.step("check-flow-syntax", "Compile the pinned flow-syntax provider API check");
+    const flow_syntax_check = b.option(
+        bool,
+        "flow-syntax-check",
+        "Fetch and compile the pinned flow-syntax API canary",
+    ) orelse false;
+    if (flow_syntax_check) {
+        // lazyDependency marks the package as needed when called. Keep the call
+        // behind an option so default build/test paths do not fetch it.
+        const flow_syntax_dep = b.lazyDependency("flow_syntax", .{
+            .target = target,
+            .optimize = optimize,
+            .@"use-llvm" = true,
+        }) orelse return;
+        const flow_syntax_check_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/flow_syntax_check.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "flow_syntax", .module = flow_syntax_dep.module("syntax") },
+                },
+            }),
+        });
+        flow_syntax_check_tests.use_llvm = true;
+        flow_syntax_check_tests.use_lld = if (builtin.os.tag.isDarwin()) null else true;
+        const run_flow_syntax_check_tests = b.addRunArtifact(flow_syntax_check_tests);
+        check_flow_syntax_step.dependOn(&run_flow_syntax_check_tests.step);
+    } else {
+        check_flow_syntax_step.dependOn(&b.addFail(
+            "run `zig build check-flow-syntax -Dflow-syntax-check=true` to fetch and compile the pinned flow-syntax API canary",
+        ).step);
+    }
 
     const perf_baseline_exe = b.addExecutable(.{
         .name = "gitframe-perf-baseline",
