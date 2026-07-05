@@ -28,6 +28,7 @@ test {
     _ = @import("app/git_requests.zig");
     _ = @import("app/git_ops.zig");
     _ = @import("app/input.zig");
+    _ = @import("app/load_state.zig");
     _ = @import("app/prompt.zig");
     _ = @import("app/repo_picker.zig");
     _ = @import("app/state.zig");

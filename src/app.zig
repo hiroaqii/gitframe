@@ -2852,8 +2852,7 @@ pub const App = struct {
 
         if (self.setActionFailureStatus("hunk stage", result.result)) return;
 
-        const active_root = self.activeRepoRoot();
-        const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+        const active_matches = self.activeRepoMatches(result.repo_root);
         self.setStatus("staged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
         if (active_matches) {
             if (result.mark_source == .session) {
@@ -2886,8 +2885,7 @@ pub const App = struct {
 
         if (self.setActionFailureStatus("hunk unstage", result.result)) return;
 
-        const active_root = self.activeRepoRoot();
-        const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+        const active_matches = self.activeRepoMatches(result.repo_root);
         self.setStatus("unstaged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
         if (active_matches) {
             if (result.reload_after_success) {
@@ -2939,8 +2937,7 @@ pub const App = struct {
         switch (result.result) {
             .ok, .ok_static => {
                 const reviewed_clear_failed = if (self.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
-                const active_root = self.activeRepoRoot();
-                const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+                const active_matches = self.activeRepoMatches(result.repo_root);
                 self.commit_panel.close();
 
                 if (active_matches) {
@@ -2974,8 +2971,7 @@ pub const App = struct {
         switch (result.result) {
             .ok, .ok_static => {
                 const reviewed_clear_failed = if (self.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
-                const active_root = self.activeRepoRoot();
-                const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+                const active_matches = self.activeRepoMatches(result.repo_root);
                 self.commit_panel.close();
                 self.cancelAmendConfirmation(ctx.allocator());
 
@@ -3007,8 +3003,7 @@ pub const App = struct {
 
         if (!self.actions.finish(result.pending)) return;
 
-        const active_root = self.activeRepoRoot();
-        const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+        const active_matches = self.activeRepoMatches(result.repo_root);
 
         switch (result.result) {
             .ok, .ok_static => {
@@ -3043,8 +3038,7 @@ pub const App = struct {
 
         if (!self.actions.finish(result.pending)) return;
 
-        const active_root = self.activeRepoRoot();
-        const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+        const active_matches = self.activeRepoMatches(result.repo_root);
 
         switch (result.result) {
             .ok => {
@@ -3079,8 +3073,7 @@ pub const App = struct {
 
         if (!self.actions.finish(result.pending)) return;
 
-        const active_root = self.activeRepoRoot();
-        const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+        const active_matches = self.activeRepoMatches(result.repo_root);
 
         switch (result.result) {
             .ok, .ok_static => {
@@ -3107,8 +3100,7 @@ pub const App = struct {
 
         if (!self.actions.finish(result.pending)) return;
 
-        const active_root = self.activeRepoRoot();
-        const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+        const active_matches = self.activeRepoMatches(result.repo_root);
 
         switch (result.result) {
             .ok, .ok_static => {
@@ -3135,9 +3127,17 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (self.branch_switch_load_pending == null or self.branch_switch_load_pending.? != result.generation) return;
-        self.branch_switch_load_pending = null;
-        if (!self.branch_switch.hasState() or self.branch_switch.generation != result.generation or !std.mem.eql(u8, self.branch_switch.repo_root, result.repo_root)) return;
+        switch (app_load_state.acceptBranchListResult(
+            &self.branch_switch_load_pending,
+            self.branch_switch.hasState(),
+            self.branch_switch.generation,
+            self.branch_switch.repo_root,
+            result.generation,
+            result.repo_root,
+        )) {
+            .accepted => {},
+            .no_pending, .stale_pending_generation, .missing_state, .stale_state_generation, .repo_mismatch => return,
+        }
 
         switch (result.result) {
             .loaded => |list| {
@@ -3175,8 +3175,7 @@ pub const App = struct {
 
         if (!self.actions.finish(foreground.pending)) return;
 
-        const active_root = self.activeRepoRoot();
-        const active_matches = active_root != null and std.mem.eql(u8, active_root.?, foreground.target.repo_root);
+        const active_matches = self.activeRepoMatches(foreground.target.repo_root);
 
         switch (result.outcome) {
             .exited => |code| {
@@ -3626,6 +3625,11 @@ pub const App = struct {
         return self.repo_state.activeRoot();
     }
 
+    fn activeRepoMatches(self: *const App, repo_root: []const u8) bool {
+        const active_root = self.activeRepoRoot() orelse return false;
+        return std.mem.eql(u8, active_root, repo_root);
+    }
+
     fn needsRepoDiscovery(self: *const App) bool {
         return self.repo_state.needsDiscovery();
     }
@@ -3741,8 +3745,10 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (result.generation != self.status_load_generation) return;
-        if (self.status_load_pending == result.generation) self.status_load_pending = null;
+        switch (app_load_state.acceptAuxiliaryLoadResult(&self.status_load_pending, self.status_load_generation, result.generation)) {
+            .accepted_pending, .accepted_without_pending => {},
+            .stale_generation => return,
+        }
 
         switch (result.result) {
             .empty => {
@@ -3805,8 +3811,10 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (result.generation != self.branch_status_load_generation) return;
-        if (self.branch_status_load_pending == result.generation) self.branch_status_load_pending = null;
+        switch (app_load_state.acceptAuxiliaryLoadResult(&self.branch_status_load_pending, self.branch_status_load_generation, result.generation)) {
+            .accepted_pending, .accepted_without_pending => {},
+            .stale_generation => return,
+        }
 
         switch (result.result) {
             .empty => self.branch_status.clear(),

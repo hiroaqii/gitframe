@@ -3,6 +3,21 @@ const loaded_diff = @import("../loaded_diff.zig");
 
 const LoadedDiff = loaded_diff.LoadedDiff;
 
+pub const AuxiliaryLoadAcceptance = enum {
+    accepted_pending,
+    accepted_without_pending,
+    stale_generation,
+};
+
+pub const BranchListAcceptance = enum {
+    accepted,
+    no_pending,
+    stale_pending_generation,
+    missing_state,
+    stale_state_generation,
+    repo_mismatch,
+};
+
 pub const PendingLoad = union(enum) {
     repo_discovery: u64,
     diff_load: u64,
@@ -14,6 +29,40 @@ pub const PendingLoad = union(enum) {
         };
     }
 };
+
+/// Accept status-like auxiliary loads by generation, and clear the pending
+/// marker only when this result owns it. Some auxiliary snapshots may already
+/// have had their pending marker cleared by a newer UI path; keeping generation
+/// as the authority preserves the existing stale-result contract.
+pub fn acceptAuxiliaryLoadResult(pending: *?u64, current_generation: u64, result_generation: u64) AuxiliaryLoadAcceptance {
+    if (result_generation != current_generation) return .stale_generation;
+    if (pending.* == result_generation) {
+        pending.* = null;
+        return .accepted_pending;
+    }
+    return .accepted_without_pending;
+}
+
+/// Branch-list results are stricter than status snapshots: the popup that
+/// requested the list must still exist, still have the same generation, and
+/// still point at the same repository before App may show the result.
+pub fn acceptBranchListResult(
+    pending: *?u64,
+    state_has_value: bool,
+    state_generation: u64,
+    state_repo_root: []const u8,
+    result_generation: u64,
+    result_repo_root: []const u8,
+) BranchListAcceptance {
+    const pending_generation = pending.* orelse return .no_pending;
+    if (pending_generation != result_generation) return .stale_pending_generation;
+    pending.* = null;
+
+    if (!state_has_value) return .missing_state;
+    if (state_generation != result_generation) return .stale_state_generation;
+    if (!std.mem.eql(u8, state_repo_root, result_repo_root)) return .repo_mismatch;
+    return .accepted;
+}
 
 /// Runtime-owned load state for the active diff source.
 ///
@@ -135,3 +184,58 @@ pub const EmptyReason = enum {
     no_changes,
     no_repository,
 };
+
+test "acceptAuxiliaryLoadResult rejects stale generation and clears matching pending" {
+    var pending: ?u64 = 3;
+
+    try std.testing.expectEqual(AuxiliaryLoadAcceptance.stale_generation, acceptAuxiliaryLoadResult(&pending, 4, 3));
+    try std.testing.expectEqual(@as(?u64, 3), pending);
+
+    try std.testing.expectEqual(AuxiliaryLoadAcceptance.accepted_pending, acceptAuxiliaryLoadResult(&pending, 3, 3));
+    try std.testing.expectEqual(@as(?u64, null), pending);
+
+    try std.testing.expectEqual(AuxiliaryLoadAcceptance.accepted_without_pending, acceptAuxiliaryLoadResult(&pending, 3, 3));
+}
+
+test "acceptBranchListResult requires pending state generation and repo match" {
+    var pending: ?u64 = null;
+    try std.testing.expectEqual(
+        BranchListAcceptance.no_pending,
+        acceptBranchListResult(&pending, true, 1, "/repo", 1, "/repo"),
+    );
+
+    pending = 1;
+    try std.testing.expectEqual(
+        BranchListAcceptance.stale_pending_generation,
+        acceptBranchListResult(&pending, true, 1, "/repo", 2, "/repo"),
+    );
+    try std.testing.expectEqual(@as(?u64, 1), pending);
+
+    pending = 2;
+    try std.testing.expectEqual(
+        BranchListAcceptance.missing_state,
+        acceptBranchListResult(&pending, false, 2, "/repo", 2, "/repo"),
+    );
+    try std.testing.expectEqual(@as(?u64, null), pending);
+
+    pending = 3;
+    try std.testing.expectEqual(
+        BranchListAcceptance.stale_state_generation,
+        acceptBranchListResult(&pending, true, 4, "/repo", 3, "/repo"),
+    );
+    try std.testing.expectEqual(@as(?u64, null), pending);
+
+    pending = 5;
+    try std.testing.expectEqual(
+        BranchListAcceptance.repo_mismatch,
+        acceptBranchListResult(&pending, true, 5, "/repo", 5, "/other"),
+    );
+    try std.testing.expectEqual(@as(?u64, null), pending);
+
+    pending = 8;
+    try std.testing.expectEqual(
+        BranchListAcceptance.accepted,
+        acceptBranchListResult(&pending, true, 8, "/repo", 8, "/repo"),
+    );
+    try std.testing.expectEqual(@as(?u64, null), pending);
+}
