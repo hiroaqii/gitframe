@@ -1,0 +1,276 @@
+diff --git a/src/example.zig b/src/example.zig
+index 1000001..1000002 100644
+--- a/src/example.zig
++++ b/src/example.zig
+@@ -1,9 +1,12 @@
+ const std = @import("std");
+ 
+-pub fn greet(name: []const u8) void {
+-    std.debug.print("hello, {s}\n", .{name});
++pub fn greet(name: []const u8, loud: bool) void {
++    const suffix = if (loud) "!" else ".";
++    std.debug.print("hello, {s}{s}\n", .{ name, suffix });
+ }
+ 
+ test "greet" {
+-    greet("zig");
++    greet("zig", true);
+ }
++
++const Mode = enum { quiet, loud };
+diff --git a/web/app.ts b/web/app.ts
+index 1000003..1000004 100644
+--- a/web/app.ts
++++ b/web/app.ts
+@@ -1,11 +1,15 @@
+-type User = { id: number; name: string };
++type User = { id: number; name: string; active: boolean };
+ 
+-export function label(user: User): string {
+-  return `${user.id}: ${user.name}`;
++export function label(user: User, prefix = "user"): string {
++  if (!user.active) {
++    return `${prefix}:${user.id}: inactive`;
++  }
++  return `${prefix}:${user.id}: ${user.name}`;
+ }
+ 
+ const users: User[] = [
+-  { id: 1, name: "Ada" },
++  { id: 1, name: "Ada", active: true },
++  { id: 2, name: "Grace", active: false },
+ ];
+ 
+-console.log(users.map(label));
++console.log(users.map((user) => label(user, "member")));
+diff --git a/web/component.tsx b/web/component.tsx
+index 1000005..1000006 100644
+--- a/web/component.tsx
++++ b/web/component.tsx
+@@ -1,9 +1,12 @@
+ import * as React from "react";
+ 
+-export function Badge({ label }: { label: string }) {
++export function Badge({ label, tone }: { label: string; tone: "info" | "warn" }) {
++  const className = tone === "warn" ? "badge badge-warn" : "badge";
+   return (
+-    <span className="badge">
++    <span className={className} aria-live="polite">
+       {label}
+     </span>
+   );
+ }
++
++export const Demo = () => <Badge label="Ready" tone="info" />;
+diff --git a/scripts/report.py b/scripts/report.py
+index 1000007..1000008 100644
+--- a/scripts/report.py
++++ b/scripts/report.py
+@@ -1,14 +1,19 @@
+ from dataclasses import dataclass
+ 
+ 
+ @dataclass
+ class Item:
+     name: str
+-    count: int
++    count: int = 0
++    enabled: bool = True
+ 
+ 
+-def total(items: list[Item]) -> int:
+-    return sum(item.count for item in items)
++def total(items: list[Item], *, enabled_only: bool = True) -> int:
++    return sum(
++        item.count
++        for item in items
++        if item.enabled or not enabled_only
++    )
+ 
+ 
+-print(total([Item("apple", 2)]))
++print(total([Item("apple", 2), Item("pear", 4, False)]))
+diff --git a/crates/demo/src/lib.rs b/crates/demo/src/lib.rs
+index 1000009..100000a 100644
+--- a/crates/demo/src/lib.rs
++++ b/crates/demo/src/lib.rs
+@@ -1,14 +1,18 @@
+ pub struct User {
+     pub id: u64,
+     pub name: String,
++    pub active: bool,
+ }
+ 
+ impl User {
+-    pub fn display_name(&self) -> &str {
+-        &self.name
++    pub fn display_name(&self) -> String {
++        match self.active {
++            true => self.name.clone(),
++            false => format!("{} (inactive)", self.name),
++        }
+     }
+ }
+ 
+ pub fn find_user(users: &[User], id: u64) -> Option<&User> {
+-    users.iter().find(|user| user.id == id)
++    users.iter().find(|user| user.id == id && user.active)
+ }
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index 100000b..100000c 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -1,14 +1,19 @@
+ package main
+ 
+ import (
+ 	"fmt"
++	"os"
+ )
+ 
+ type Config struct {
+ 	Port int
++	Debug bool
+ }
+ 
+ func main() {
+-	cfg := Config{Port: 8080}
+-	fmt.Printf("listening on %d\n", cfg.Port)
++	cfg := Config{Port: 8080, Debug: os.Getenv("DEBUG") == "1"}
++	if cfg.Debug {
++		fmt.Println("debug mode enabled")
++	}
++	fmt.Printf("listening on %d\n", cfg.Port)
+ }
+diff --git a/native/example.c b/native/example.c
+index 100000d..100000e 100644
+--- a/native/example.c
++++ b/native/example.c
+@@ -1,15 +1,18 @@
+ #include <stdio.h>
++#include <stdbool.h>
+ 
+ struct Point {
+     int x;
+     int y;
+ };
+ 
+-static int length(struct Point p) {
+-    return p.x + p.y;
++static int score(struct Point p, bool clamp) {
++    int value = p.x + p.y;
++    return clamp && value < 0 ? 0 : value;
+ }
+ 
+ int main(void) {
+-    printf("%d\n", length((struct Point){1, 2}));
++    struct Point point = {1, 2};
++    printf("%d\n", score(point, true));
+     return 0;
+ }
+diff --git a/styles/site.css b/styles/site.css
+index 100000f..1000010 100644
+--- a/styles/site.css
++++ b/styles/site.css
+@@ -1,10 +1,15 @@
+ :root {
+-  --accent: #3578e5;
++  --accent: #2f6fed;
++  --warning: #d97706;
+ }
+ 
+ .button {
+   color: white;
+   background: var(--accent);
+   border: 0;
+   padding: 0.5rem 0.75rem;
+ }
++
++.button[data-tone="warning"] {
++  background: var(--warning);
++}
+diff --git a/public/index.html b/public/index.html
+index 1000011..1000012 100644
+--- a/public/index.html
++++ b/public/index.html
+@@ -1,10 +1,13 @@
+ <!doctype html>
+ <html lang="en">
+   <head>
+     <meta charset="utf-8">
+-    <title>Demo</title>
++    <title>Syntax Demo</title>
++    <meta name="viewport" content="width=device-width, initial-scale=1">
+   </head>
+   <body>
+-    <main id="app"></main>
++    <main id="app" data-ready="false">
++      <h1>Syntax demo</h1>
++    </main>
+   </body>
+ </html>
+diff --git a/config/settings.yaml b/config/settings.yaml
+index 1000013..1000014 100644
+--- a/config/settings.yaml
++++ b/config/settings.yaml
+@@ -1,10 +1,15 @@
+ app:
+   name: demo
+-  retries: 2
++  retries: 3
++  timeout_ms: 1500
+ 
+ features:
+   syntax: true
+-  remote: false
++  remote: true
++  providers:
++    - flow_syntax
++    - none
+ 
+ users:
+-  - name: Ada
++  - name: Ada
++    role: admin
+diff --git a/data/sample.json b/data/sample.json
+index 1000015..1000016 100644
+--- a/data/sample.json
++++ b/data/sample.json
+@@ -1,10 +1,12 @@
+ {
+   "name": "demo",
+-  "enabled": false,
++  "enabled": true,
+   "limits": {
+-    "requests": 10
++    "requests": 25,
++    "burst": 5
+   },
+   "tags": [
+-    "old"
++    "syntax",
++    "diff"
+   ]
+ }
+diff --git a/docs/guide.md b/docs/guide.md
+index 1000017..1000018 100644
+--- a/docs/guide.md
++++ b/docs/guide.md
+@@ -1,9 +1,14 @@
+ # Guide
+ 
+-This page describes the old setup.
++This page describes the syntax highlighting setup.
+ 
+ ```zig
+-const ok = false;
++const ok = true;
++std.debug.print("ready\n", .{});
+ ```
+ 
+-Run the viewer with the default provider.
++Run the viewer with the flow-syntax provider:
++
++```sh
++zig build run -Dsyntax-provider=flow_syntax -- testdata/multi-language-syntax.diff
++```
