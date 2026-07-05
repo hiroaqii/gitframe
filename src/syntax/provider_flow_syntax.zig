@@ -10,10 +10,7 @@ pub fn buildDocumentSpans(allocator: std.mem.Allocator, io: std.Io, document: di
     // Keep flow-syntax state task-local for the first integration. QueryCache
     // construction is not free, but sharing it across chasen tasks would add
     // a lifetime and locking contract before this provider has settled.
-    const query_cache = flow_syntax.QueryCache.create(io, allocator, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return spans,
-    };
+    const query_cache = try flow_syntax.QueryCache.create(io, allocator, .{});
     defer query_cache.deinit();
 
     for (document.files, 0..) |file, file_index| {
