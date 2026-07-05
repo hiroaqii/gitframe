@@ -431,6 +431,7 @@ fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLin
     const marker_style = markerStyleForLine(line.kind, staged, styles);
     const prefix = prefixForLine(line.kind, hunk_side_has_visible_syntax);
     const layout = lineLayout(line_numbers, .unified);
+    drawGutterLeadInBackground(surface, row, layout, gutterLeadInStyle(line.kind, staged, styles));
 
     if (line_numbers) {
         _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(line.kind, staged, styles));
@@ -506,6 +507,7 @@ fn sideBySideRowColumns(surface: *chasen.Surface, row: u16, gutter_col: u16) Sid
 
 fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_provider.LineSpans, hunk_side_has_visible_syntax: bool) !void {
     const layout = lineLayout(line_numbers, .side_by_side);
+    drawGutterLeadInBackground(surface, row, layout, gutterLeadInStyle(line.kind, staged, styles));
     if (line_numbers) {
         _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(line.kind, staged, styles));
     }
@@ -516,6 +518,7 @@ fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffL
 
 fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_provider.LineSpans, hunk_side_has_visible_syntax: bool) !void {
     const layout = lineLayout(line_numbers, .side_by_side);
+    drawGutterLeadInBackground(surface, row, layout, gutterLeadInStyle(line.kind, staged, styles));
     if (line_numbers) {
         _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), lineNumberStyle(line.kind, staged, styles));
     }
@@ -544,6 +547,14 @@ fn lineLayout(line_numbers: bool, mode: LineLayoutMode) LineLayout {
         .unified => .{ .prefix_col = 10, .text_col = 12 },
         .side_by_side => .{ .prefix_col = 5, .text_col = 7 },
     };
+}
+
+fn drawGutterLeadInBackground(surface: *chasen.Surface, row: u16, layout: LineLayout, style: chasen.TextStyle) void {
+    const end_col = @min(layout.text_col, surface.size().width);
+    var col: u16 = 0;
+    while (col < end_col) : (col += 1) {
+        _ = surface.borrowTextAt(col, row, " ", style);
+    }
 }
 
 fn copyScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, horizontal_scroll: usize, style: chasen.TextStyle) !void {
@@ -664,6 +675,17 @@ fn markerStyleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: Ren
     return style;
 }
 
+fn gutterLeadInStyle(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
+    var style: chasen.TextStyle = switch (kind) {
+        .added => .{ .bg = styles.added_text.bg },
+        .removed => .{ .bg = styles.removed_text.bg },
+        .context => .{ .bg = styles.context.bg },
+        .metadata => .{},
+    };
+    if (staged) style.dim = true;
+    return style;
+}
+
 fn lineNumberStyle(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
     var style = switch (kind) {
         .added => styles.added_line_number,
@@ -671,6 +693,7 @@ fn lineNumberStyle(kind: diff_parser.DiffLine.Kind, staged: bool, styles: Render
         .context => styles.line_number,
         .metadata => styles.metadata,
     };
+    if (kind == .context) style.bg = styles.context.bg;
     if (staged) style.dim = true;
     return style;
 }
@@ -777,6 +800,18 @@ test "fileStats counts added and removed hunk lines" {
     try std.testing.expectEqual(FileStats{ .added = 1, .removed = 1 }, fileStats(file));
 }
 
+fn expectBgRange(surface: *chasen.Surface, row: u16, start_col: u16, end_col: u16, bg: chasen.Color) !void {
+    var col = start_col;
+    while (col < end_col) : (col += 1) {
+        const cell = surface.readCell(col, row) orelse return error.MissingCell;
+        try std.testing.expect(cell.style.bg.eql(bg));
+    }
+}
+
+fn expectBodyGutterLeadInBg(surface: *chasen.Surface, row: u16, text_col: u16, bg: chasen.Color) !void {
+    try expectBgRange(surface, row, cursor_gutter_width, cursor_gutter_width + text_col, bg);
+}
+
 test "renderFile composes diff state as body background and marker foreground" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 6);
@@ -805,6 +840,13 @@ test "renderFile composes diff state as body background and marker foreground" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .palette = palette });
 
+    try expectBodyGutterLeadInBg(&ts.surface, 4, lineTextStart(true, .unified), palette.color(.diff_removed_bg));
+    try expectBodyGutterLeadInBg(&ts.surface, 5, lineTextStart(true, .unified), palette.color(.diff_added_bg));
+
+    const removed_old_line_number = ts.surface.readCell(3, 4).?;
+    try std.testing.expect(removed_old_line_number.style.fg.eql(palette.color(.diff_line_number)));
+    try std.testing.expect(removed_old_line_number.style.bg.eql(palette.color(.diff_removed_bg)));
+
     const removed_prefix = ts.surface.readCell(12, 4).?;
     try std.testing.expect(removed_prefix.style.fg.eql(palette.color(.diff_removed)));
     try std.testing.expect(removed_prefix.style.bg.eql(palette.color(.diff_removed_bg)));
@@ -823,6 +865,73 @@ test "renderFile composes diff state as body background and marker foreground" {
     const added_body = ts.surface.readCell(14, 5).?;
     try std.testing.expect(added_body.style.fg.eql(palette.color(.diff_added)));
     try std.testing.expect(added_body.style.bg.eql(palette.color(.diff_added_bg)));
+}
+
+test "renderFile fills unified gutter lead-in when line numbers are hidden" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(40, 5);
+    defer ts.deinit();
+
+    const palette = theme.Palette.default();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 0,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{.{ .kind = .added, .text = "new", .new_line = 1 }},
+        }},
+    };
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .line_numbers = false,
+        .palette = palette,
+    });
+
+    try expectBodyGutterLeadInBg(&ts.surface, 4, lineTextStart(false, .unified), palette.color(.diff_added_bg));
+    try ts.expectCellText(2, 4, "+");
+    try ts.expectCellText(4, 4, "n");
+}
+
+test "renderFile fills context gutter lead-in and line numbers with context background" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 5);
+    defer ts.deinit();
+
+    var palette = theme.Palette.default();
+    palette.colors[@intFromEnum(theme.Role.diff_context_bg)] = .{ .index = 8 };
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{.{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 }},
+        }},
+    };
+
+    try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .palette = palette });
+
+    try expectBodyGutterLeadInBg(&ts.surface, 4, lineTextStart(true, .unified), palette.color(.diff_context_bg));
+
+    const old_line_number = ts.surface.readCell(5, 4).?;
+    try std.testing.expect(old_line_number.style.fg.eql(palette.color(.diff_line_number)));
+    try std.testing.expect(old_line_number.style.bg.eql(palette.color(.diff_context_bg)));
+
+    const new_line_number = ts.surface.readCell(10, 4).?;
+    try std.testing.expect(new_line_number.style.fg.eql(palette.color(.diff_line_number)));
+    try std.testing.expect(new_line_number.style.bg.eql(palette.color(.diff_context_bg)));
 }
 
 test "renderFile dims staged hunk body without removing it" {
@@ -857,6 +966,9 @@ test "renderFile dims staged hunk body without removing it" {
 
     const header_cell = ts.surface.readCell(2, 3).?;
     try std.testing.expect(header_cell.style.bg.eql(.{ .index = 8 }));
+    const gutter_cell = ts.surface.readCell(3, 4).?;
+    try std.testing.expect(gutter_cell.style.bg.eql(theme.Palette.default().color(.diff_removed_bg)));
+    try std.testing.expect(gutter_cell.style.dim);
     try ts.expectCellText(14, 4, "o");
     const old_cell = ts.surface.readCell(14, 4).?;
     try std.testing.expect(old_cell.style.dim);
@@ -1129,6 +1241,10 @@ test "renderFile hides side-by-side diff prefixes by highlighted hunk side" {
         .syntax_spans = spans,
     });
 
+    const old_start = cursor_gutter_width;
+    const new_start = cursor_gutter_width + (bodyWidth(100) / 2) + 1;
+    try expectBgRange(&ts.surface, 4, old_start, old_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_removed_bg));
+    try expectBgRange(&ts.surface, 4, new_start, new_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_added_bg));
     try ts.expectCellText(7, 4, " ");
     try ts.expectCellText(57, 4, " ");
     try ts.expectCellText(9, 4, "o");
@@ -1407,6 +1523,8 @@ test "renderGeneratedAddedFile draws content on new side in side-by-side mode" {
 
     try renderGeneratedAddedFile(&ts.surface, "src/new.zig", &.{ "const value = 1;", "pub fn main() void {}" }, false, .{ .requested_mode = .side_by_side });
 
+    const new_start = cursor_gutter_width + (bodyWidth(90) / 2) + 1;
+    try expectBgRange(&ts.surface, 3, new_start, new_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_added_bg));
     try ts.expectCellText(0, 0, "s");
     try ts.expectCellText(46, 3, "│");
     try ts.expectCellText(52, 3, "+");
