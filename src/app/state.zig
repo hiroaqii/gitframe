@@ -9,6 +9,7 @@ pub const OverlayKind = enum {
     amend_commit,
     push_branch,
     pull_branch,
+    switch_branch,
     push_error,
     push_credentials,
 };
@@ -49,6 +50,10 @@ pub const OverlayState = struct {
         return self.kind == .pull_branch;
     }
 
+    pub fn isSwitchBranch(self: OverlayState) bool {
+        return self.kind == .switch_branch;
+    }
+
     pub fn isPushError(self: OverlayState) bool {
         return self.kind == .push_error;
     }
@@ -62,7 +67,7 @@ pub const OverlayState = struct {
             .none => .passthrough,
             .help => .scroll_help,
             .push_error => .scroll_push_error,
-            .discard_file, .amend_commit, .push_branch, .pull_branch, .push_credentials => .block,
+            .discard_file, .amend_commit, .push_branch, .pull_branch, .switch_branch, .push_credentials => .block,
         };
     }
 
@@ -85,6 +90,10 @@ pub const OverlayState = struct {
 
     pub fn openPullBranch(self: *OverlayState) void {
         self.kind = .pull_branch;
+    }
+
+    pub fn openSwitchBranch(self: *OverlayState) void {
+        self.kind = .switch_branch;
     }
 
     pub fn openPushError(self: *OverlayState) void {
@@ -178,6 +187,41 @@ pub const PullConfirmation = struct {
         allocator.free(self.remote_branch);
         allocator.free(self.oid);
         self.* = undefined;
+    }
+};
+
+pub const BranchSwitchItem = struct {
+    name: []u8,
+    oid: []u8,
+    current: bool,
+
+    pub fn deinit(self: *BranchSwitchItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.oid);
+        self.* = undefined;
+    }
+};
+
+pub const BranchSwitchState = struct {
+    repo_root: []u8 = &.{},
+    current_branch: []u8 = &.{},
+    current_oid: []u8 = &.{},
+    generation: u64 = 0,
+    loading: bool = false,
+    selected_index: usize = 0,
+    branches: []BranchSwitchItem = &.{},
+
+    pub fn deinit(self: *BranchSwitchState, allocator: std.mem.Allocator) void {
+        if (self.repo_root.len > 0) allocator.free(self.repo_root);
+        if (self.current_branch.len > 0) allocator.free(self.current_branch);
+        if (self.current_oid.len > 0) allocator.free(self.current_oid);
+        for (self.branches) |*item| item.deinit(allocator);
+        allocator.free(self.branches);
+        self.* = .{};
+    }
+
+    pub fn hasState(self: BranchSwitchState) bool {
+        return self.repo_root.len > 0;
     }
 };
 
@@ -376,6 +420,18 @@ pub const StagedHunkMarks = struct {
         self.items.clearRetainingCapacity();
     }
 
+    pub fn clearRepo(self: *StagedHunkMarks, allocator: std.mem.Allocator, repo_root: []const u8) void {
+        var index: usize = 0;
+        while (index < self.items.items.len) {
+            if (!std.mem.eql(u8, self.items.items[index].repo_root, repo_root)) {
+                index += 1;
+                continue;
+            }
+            self.items.items[index].deinit(allocator);
+            _ = self.items.swapRemove(index);
+        }
+    }
+
     pub fn add(self: *StagedHunkMarks, allocator: std.mem.Allocator, repo_root: []const u8, path_key: []const u8, hunk_index: usize) !void {
         if (self.contains(repo_root, path_key, hunk_index)) return;
 
@@ -497,6 +553,22 @@ test "StagedHunkMarks owns keys and deduplicates hunk marks" {
     try std.testing.expect(marks.remove(std.testing.allocator, "/repo", "src/app.zig", 2));
     try std.testing.expect(!marks.contains("/repo", "src/app.zig", 2));
     try std.testing.expectEqual(@as(usize, 0), marks.items.items.len);
+}
+
+test "StagedHunkMarks clearRepo removes only matching repository marks" {
+    var marks: StagedHunkMarks = .{};
+    defer marks.deinit(std.testing.allocator);
+
+    try marks.add(std.testing.allocator, "/repo", "src/app.zig", 2);
+    try marks.add(std.testing.allocator, "/other", "src/app.zig", 2);
+    try marks.add(std.testing.allocator, "/repo", "src/other.zig", 1);
+
+    marks.clearRepo(std.testing.allocator, "/repo");
+
+    try std.testing.expect(!marks.contains("/repo", "src/app.zig", 2));
+    try std.testing.expect(!marks.contains("/repo", "src/other.zig", 1));
+    try std.testing.expect(marks.contains("/other", "src/app.zig", 2));
+    try std.testing.expectEqual(@as(usize, 1), marks.items.items.len);
 }
 
 test "SecretInput clear zeroes backing buffer" {

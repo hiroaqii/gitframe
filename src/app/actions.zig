@@ -267,6 +267,28 @@ pub const FetchFinished = struct {
     }
 };
 
+pub const SwitchBranchFinished = struct {
+    pending: PendingAction,
+    repo_root: []u8,
+    old_branch: []u8,
+    new_branch: []u8,
+    result: FileActionTaskResult,
+
+    pub fn deinit(self: *SwitchBranchFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.old_branch);
+        allocator.free(self.new_branch);
+        self.result.deinit(allocator);
+        self.* = .{
+            .pending = .{ .generation = 0, .kind = .switch_branch },
+            .repo_root = &.{},
+            .old_branch = &.{},
+            .new_branch = &.{},
+            .result = .ok,
+        };
+    }
+};
+
 pub const FileActionTaskResult = union(enum) {
     ok,
     ok_static: []const u8,
@@ -901,6 +923,72 @@ pub fn FetchTask(comptime Msg: type) type {
     };
 }
 
+pub fn SwitchBranchTask(comptime Msg: type) type {
+    return struct {
+        pending: PendingAction,
+        repo_root: []u8,
+        expected_branch: []u8,
+        expected_oid: []u8,
+        target_branch: []u8,
+        target_oid: []u8,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                if (task.expected_branch.len > 0) allocator.free(task.expected_branch);
+                allocator.free(task.expected_oid);
+                if (task.target_branch.len > 0) allocator.free(task.target_branch);
+                allocator.free(task.target_oid);
+                allocator.destroy(task);
+            }
+
+            const result = runSwitchBranch(task.repo_root, task.expected_branch, task.expected_oid, task.target_branch, task.target_oid, allocator, io);
+            const repo_root = task.repo_root;
+            const old_branch = task.expected_branch;
+            const new_branch = task.target_branch;
+            task.repo_root = &.{};
+            task.expected_branch = &.{};
+            task.target_branch = &.{};
+
+            return Msg.actionFinished(.{ .switch_branch = SwitchBranchFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .old_branch = old_branch,
+                .new_branch = new_branch,
+                .result = result,
+            } });
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer {
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
+                if (task.expected_branch.len > 0) allocator.free(task.expected_branch);
+                allocator.free(task.expected_oid);
+                if (task.target_branch.len > 0) allocator.free(task.target_branch);
+                allocator.free(task.target_oid);
+                allocator.destroy(task);
+            }
+
+            const repo_root = task.repo_root;
+            const old_branch = task.expected_branch;
+            const new_branch = task.target_branch;
+            task.repo_root = &.{};
+            task.expected_branch = &.{};
+            task.target_branch = &.{};
+
+            return Msg.actionFinished(.{ .switch_branch = SwitchBranchFinished{
+                .pending = task.pending,
+                .repo_root = repo_root,
+                .old_branch = old_branch,
+                .new_branch = new_branch,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            } });
+        }
+    };
+}
+
 fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
     return switch (failure) {
         .start_failed => |message| message,
@@ -991,6 +1079,18 @@ pub fn runFetch(repo_root: []const u8, remote: []const u8, env_map: ?*const std.
         .repo_root = repo_root,
         .kind = .{ .fetch = .{ .remote = remote } },
         .env_map = env_map,
+    }, allocator, io);
+}
+
+pub fn runSwitchBranch(repo_root: []const u8, expected_branch: []const u8, expected_oid: []const u8, target_branch: []const u8, target_oid: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+    return runOperationMapped("Branch switch", .{
+        .repo_root = repo_root,
+        .kind = .{ .switch_branch = .{
+            .expected_branch = expected_branch,
+            .expected_oid = expected_oid,
+            .target_branch = target_branch,
+            .target_oid = target_oid,
+        } },
     }, allocator, io);
 }
 

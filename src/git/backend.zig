@@ -65,6 +65,44 @@ pub const BranchStatusLoadResult = union(enum) {
     }
 };
 
+pub const BranchListItem = struct {
+    name: []u8,
+    oid: []u8,
+    current: bool = false,
+};
+
+pub const BranchList = struct {
+    current: ?[]u8 = null,
+    branches: []BranchListItem = &.{},
+
+    pub fn deinit(self: *BranchList, allocator: std.mem.Allocator) void {
+        if (self.current) |current| allocator.free(current);
+        for (self.branches) |item| {
+            allocator.free(item.name);
+            allocator.free(item.oid);
+        }
+        allocator.free(self.branches);
+        self.* = .{};
+    }
+};
+
+pub const BranchListLoadResult = union(enum) {
+    ok: BranchList,
+    failed: []u8,
+    failed_static: []const u8,
+
+    pub fn deinit(self: BranchListLoadResult, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .ok => |list| {
+                var owned = list;
+                owned.deinit(allocator);
+            },
+            .failed => |message| allocator.free(message),
+            .failed_static => {},
+        }
+    }
+};
+
 pub const OperationResult = union(enum) {
     ok,
     /// Non-owned success message for operations that completed without a
@@ -128,6 +166,10 @@ pub const BranchStatusRequest = struct {
     repo_root: []const u8,
 };
 
+pub const BranchListRequest = struct {
+    repo_root: []const u8,
+};
+
 pub const OperationKind = union(enum) {
     stage_file: []const u8,
     unstage_file: []const u8,
@@ -139,6 +181,7 @@ pub const OperationKind = union(enum) {
     push: PushRequest,
     pull_refresh_ff_only: PullRequest,
     fetch: FetchRequest,
+    switch_branch: SwitchBranchRequest,
 };
 
 pub const StagePatchRequest = struct {
@@ -174,6 +217,13 @@ pub const FetchRequest = struct {
     remote: []const u8,
 };
 
+pub const SwitchBranchRequest = struct {
+    expected_branch: []const u8,
+    expected_oid: []const u8,
+    target_branch: []const u8,
+    target_oid: []const u8,
+};
+
 pub const PushCredentials = struct {
     username: []const u8,
     password: []const u8,
@@ -199,6 +249,7 @@ pub const Backend = struct {
     load_diff_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, GitDiffRequest) LoadError!LoadResult,
     load_status_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, GitStatusRequest) LoadError!StatusLoadResult,
     load_branch_status_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, BranchStatusRequest) LoadError!BranchStatusLoadResult,
+    load_branch_list_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, BranchListRequest) LoadError!BranchListLoadResult,
     run_operation_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, OperationRequest) LoadError!OperationResult,
 
     pub fn loadDiff(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) LoadError!LoadResult {
@@ -211,6 +262,10 @@ pub const Backend = struct {
 
     pub fn loadBranchStatus(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
         return self.load_branch_status_fn(self.ptr, allocator, io, request);
+    }
+
+    pub fn loadBranchList(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
+        return self.load_branch_list_fn(self.ptr, allocator, io, request);
     }
 
     pub fn runOperation(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
@@ -228,6 +283,7 @@ pub const LocalCommandBackend = struct {
             .load_diff_fn = loadDiffErased,
             .load_status_fn = loadStatusErased,
             .load_branch_status_fn = loadBranchStatusErased,
+            .load_branch_list_fn = loadBranchListErased,
             .run_operation_fn = runOperationErased,
         };
     }
@@ -250,6 +306,10 @@ pub const LocalCommandBackend = struct {
         return loadGitBranchStatus(allocator, io, request.repo_root);
     }
 
+    pub fn loadBranchList(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
+        return loadGitBranchList(allocator, io, request.repo_root);
+    }
+
     pub fn runOperation(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
         return switch (request.kind) {
             .stage_file => |path| runGitAdd(allocator, io, request.repo_root, path),
@@ -262,6 +322,7 @@ pub const LocalCommandBackend = struct {
             .push => |push| runGitPush(allocator, io, request.repo_root, request.env_map, push),
             .pull_refresh_ff_only => |pull| runGitPullRefresh(allocator, io, request.repo_root, request.env_map, pull),
             .fetch => |fetch| runGitFetch(allocator, io, request.repo_root, request.env_map, fetch),
+            .switch_branch => |switch_branch| runGitSwitchBranch(allocator, io, request.repo_root, switch_branch),
         };
     }
 
@@ -278,6 +339,11 @@ pub const LocalCommandBackend = struct {
     fn loadBranchStatusErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
         const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
         return self.loadBranchStatus(allocator, io, request);
+    }
+
+    fn loadBranchListErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
+        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
+        return self.loadBranchList(allocator, io, request);
     }
 
     fn runOperationErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
@@ -451,6 +517,90 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []co
     }
 
     return .{ .ok = builder.finish() };
+}
+
+fn loadGitBranchList(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!BranchListLoadResult {
+    const current_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
+    const current_result = try runGitBranchStatusCommand(allocator, io, repo_root, &current_argv);
+    defer current_result.deinit(allocator);
+    var current: ?[]u8 = null;
+    switch (current_result.term) {
+        .exited => |code| if (code == 0) {
+            current = allocator.dupe(u8, trimLineEnd(current_result.stdout)) catch return error.OutOfMemory;
+        },
+        else => {},
+    }
+    errdefer if (current) |owned| allocator.free(owned);
+
+    const list_argv = [_][]const u8{ "git", "for-each-ref", "--format=%(refname:short)%00%(objectname)%00", "refs/heads" };
+    const list_result = try runGitBranchStatusCommand(allocator, io, repo_root, &list_argv);
+    defer list_result.deinit(allocator);
+    switch (list_result.term) {
+        .exited => |code| if (code != 0) return branchListCommandFailure(allocator, list_result),
+        else => return branchListCommandFailure(allocator, list_result),
+    }
+
+    var items: std.ArrayList(BranchListItem) = .empty;
+    errdefer {
+        for (items.items) |item| {
+            allocator.free(item.name);
+            allocator.free(item.oid);
+        }
+        items.deinit(allocator);
+    }
+
+    var index: usize = 0;
+    while (index < list_result.stdout.len) {
+        skipBranchListRecordSeparators(list_result.stdout, &index);
+        if (index >= list_result.stdout.len) break;
+        const name_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
+        const name = list_result.stdout[index..name_end];
+        index = name_end + 1;
+        const oid_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
+        const oid = list_result.stdout[index..oid_end];
+        index = oid_end + 1;
+        if (name.len == 0 or oid.len == 0) continue;
+
+        const owned_name = allocator.dupe(u8, name) catch return error.OutOfMemory;
+        const owned_oid = allocator.dupe(u8, oid) catch {
+            allocator.free(owned_name);
+            return error.OutOfMemory;
+        };
+        items.append(allocator, .{
+            .name = owned_name,
+            .oid = owned_oid,
+            .current = current != null and std.mem.eql(u8, current.?, name),
+        }) catch {
+            allocator.free(owned_name);
+            allocator.free(owned_oid);
+            return error.OutOfMemory;
+        };
+    }
+
+    return .{ .ok = .{
+        .current = current,
+        .branches = items.toOwnedSlice(allocator) catch return error.OutOfMemory,
+    } };
+}
+
+fn skipBranchListRecordSeparators(output: []const u8, index: *usize) void {
+    // `git for-each-ref --format=...%00...%00` still writes its normal record
+    // newline after each formatted ref. Branch names are NUL fields, so consume
+    // only those record separators before reading the next branch name.
+    while (index.* < output.len and (output[index.*] == '\n' or output[index.*] == '\r')) : (index.* += 1) {}
+}
+
+test "skipBranchListRecordSeparators preserves branch name after for-each-ref newline" {
+    const output = "\nzig-port\x00abc\x00";
+    var index: usize = 0;
+    skipBranchListRecordSeparators(output, &index);
+    try std.testing.expectEqual(@as(usize, 1), index);
+    try std.testing.expectEqualStrings("zig-port", output[index .. index + "zig-port".len]);
+}
+
+fn branchListCommandFailure(allocator: std.mem.Allocator, result: process_runner.Result) LoadError!BranchListLoadResult {
+    if (result.stderr.len > 0) return .{ .failed = allocator.dupe(u8, result.stderr) catch return error.OutOfMemory };
+    return .{ .failed = std.fmt.allocPrint(allocator, "git branch list failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
 fn runGitBranchStatusCommand(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!process_runner.Result {
@@ -832,6 +982,43 @@ fn runGitFetch(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, 
     return .{ .failed = std.fmt.allocPrint(allocator, "git fetch failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
+fn runGitSwitchBranch(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: SwitchBranchRequest) LoadError!OperationResult {
+    if (!try verifyRemoteBranchSnapshot(allocator, io, repo_root, request.expected_branch, request.expected_oid)) {
+        return .{ .failed_static = "Branch changed before switch; reload and try again" };
+    }
+    if (!try verifyBranchOid(allocator, io, repo_root, request.target_branch, request.target_oid)) {
+        return .{ .failed_static = "branch list changed; reopen branch switch and try again" };
+    }
+    if (!try verifyCleanWorktree(allocator, io, repo_root)) {
+        return .{ .failed_static = "Worktree changed before branch switch; reload and resolve local changes first" };
+    }
+
+    const argv = [_][]const u8{ "git", "switch", "--no-guess", request.target_branch };
+    const result = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .cwd = .{ .path = repo_root },
+        .stdout_limit = .limited(128 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.StreamTooLong,
+        else => error.SpawnFailed,
+    };
+
+    allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .ok;
+        },
+        else => {},
+    }
+
+    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    allocator.free(result.stderr);
+    return .{ .failed = std.fmt.allocPrint(allocator, "git switch failed: {any}", .{result.term}) catch return error.OutOfMemory };
+}
+
 fn pushFailureWithDiagnostics(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, stderr: []u8) LoadError![]u8 {
     if (!isSshPublicKeyFailure(stderr)) return stderr;
     errdefer allocator.free(stderr);
@@ -1056,6 +1243,19 @@ fn verifyRemoteBranchSnapshot(allocator: std.mem.Allocator, io: std.Io, repo_roo
         else => return false,
     }
     return std.mem.eql(u8, trimLineEnd(oid_result.stdout), oid);
+}
+
+fn verifyBranchOid(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, branch: []const u8, oid: []const u8) LoadError!bool {
+    const ref = std.fmt.allocPrint(allocator, "refs/heads/{s}", .{branch}) catch return error.OutOfMemory;
+    defer allocator.free(ref);
+    const argv = [_][]const u8{ "git", "rev-parse", "--verify", ref };
+    const result = try runGitBranchStatusCommand(allocator, io, repo_root, &argv);
+    defer result.deinit(allocator);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return false,
+        else => return false,
+    }
+    return std.mem.eql(u8, trimLineEnd(result.stdout), oid);
 }
 
 fn verifyConfirmedUpstream(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, remote: []const u8, remote_branch: []const u8) LoadError!bool {
@@ -1928,6 +2128,190 @@ test "LocalCommandBackend fetch updates remote tracking refs from local bare rem
     try std.testing.expect(std.mem.indexOf(u8, remote, trimLineEnd(after)) != null);
 }
 
+test "LocalCommandBackend loads local branch list without record separator newlines" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupBranchSwitchFixture(io, &tmp);
+    defer fixture.deinit();
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.loadBranchList(std.testing.allocator, io, .{ .repo_root = fixture.repo_root });
+    defer result.deinit(std.testing.allocator);
+
+    const list = switch (result) {
+        .ok => |list| list,
+        .failed, .failed_static => return error.ExpectedBranchList,
+    };
+    try std.testing.expectEqualStrings("main", list.current.?);
+    try expectBranchListed(list.branches, "main");
+    try expectBranchListed(list.branches, "feature/topic");
+    try expectBranchNotListed(list.branches, "origin/remote-only");
+    for (list.branches) |branch| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, branch.name, '\n') == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, branch.name, '\r') == null);
+    }
+}
+
+test "LocalCommandBackend switch branch succeeds between local branches" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupBranchSwitchFixture(io, &tmp);
+    defer fixture.deinit();
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .switch_branch = .{
+            .expected_branch = "main",
+            .expected_oid = fixture.main_oid,
+            .target_branch = "feature/topic",
+            .target_oid = fixture.feature_oid,
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(OperationResult.ok, result);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    const current = try gitOutputAlloc(io, work, &.{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" });
+    defer std.testing.allocator.free(current);
+    try std.testing.expectEqualStrings("feature/topic", trimLineEnd(current));
+}
+
+test "LocalCommandBackend switch branch rejects stale current branch or oid" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupBranchSwitchFixture(io, &tmp);
+    defer fixture.deinit();
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .switch_branch = .{
+            .expected_branch = "main",
+            .expected_oid = "not-the-current-oid",
+            .target_branch = "feature/topic",
+            .target_oid = fixture.feature_oid,
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed_static => |message| try std.testing.expectEqualStrings("Branch changed before switch; reload and try again", message),
+        else => return error.ExpectedStaleSwitchCurrentFailure,
+    }
+}
+
+test "LocalCommandBackend switch branch rejects changed target oid" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupBranchSwitchFixture(io, &tmp);
+    defer fixture.deinit();
+
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try runTestGit(io, &.{ "git", "switch", "feature/topic" }, work);
+    try work.writeFile(io, .{ .sub_path = "FEATURE.md", .data = "changed\n" });
+    try runTestGit(io, &.{ "git", "add", "FEATURE.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "move feature" }, work);
+    try runTestGit(io, &.{ "git", "switch", "main" }, work);
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .switch_branch = .{
+            .expected_branch = "main",
+            .expected_oid = fixture.main_oid,
+            .target_branch = "feature/topic",
+            .target_oid = fixture.feature_oid,
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed_static => |message| try std.testing.expectEqualStrings("branch list changed; reopen branch switch and try again", message),
+        else => return error.ExpectedSwitchTargetChangedFailure,
+    }
+}
+
+test "LocalCommandBackend switch branch rejects dirty worktree" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupBranchSwitchFixture(io, &tmp);
+    defer fixture.deinit();
+
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "dirty\n" });
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .switch_branch = .{
+            .expected_branch = "main",
+            .expected_oid = fixture.main_oid,
+            .target_branch = "feature/topic",
+            .target_oid = fixture.feature_oid,
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed_static => |message| try std.testing.expectEqualStrings("Worktree changed before branch switch; reload and resolve local changes first", message),
+        else => return error.ExpectedSwitchDirtyFailure,
+    }
+}
+
+test "LocalCommandBackend switch branch does not guess remote-only targets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupBranchSwitchFixture(io, &tmp);
+    defer fixture.deinit();
+
+    var local_backend: LocalCommandBackend = .{};
+    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+        .repo_root = fixture.repo_root,
+        .kind = .{ .switch_branch = .{
+            .expected_branch = "main",
+            .expected_oid = fixture.main_oid,
+            .target_branch = "remote-only",
+            .target_oid = fixture.remote_only_oid,
+        } },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed_static => |message| try std.testing.expectEqualStrings("branch list changed; reopen branch switch and try again", message),
+        else => return error.ExpectedSwitchNoGuessFailure,
+    }
+
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    const branch_check = try std.process.run(std.testing.allocator, io, .{
+        .argv = &[_][]const u8{ "git", "rev-parse", "--verify", "refs/heads/remote-only" },
+        .cwd = .{ .dir = work },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer freeRunResult(std.testing.allocator, branch_check);
+    switch (branch_check.term) {
+        .exited => |code| try std.testing.expect(code != 0),
+        else => {},
+    }
+}
+
 test "LocalCommandBackend loads branch status without upstream" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2031,6 +2415,95 @@ fn setupPullWorkRepoForTest(io: std.Io, tmp: *std.testing.TmpDir) !struct { repo
     std.testing.allocator.free(oid_output);
 
     return .{ .repo_root = repo_root, .oid = oid };
+}
+
+const BranchSwitchFixture = struct {
+    repo_root: []u8,
+    main_oid: []u8,
+    feature_oid: []u8,
+    remote_only_oid: []u8,
+
+    fn deinit(self: BranchSwitchFixture) void {
+        std.testing.allocator.free(self.repo_root);
+        std.testing.allocator.free(self.main_oid);
+        std.testing.allocator.free(self.feature_oid);
+        std.testing.allocator.free(self.remote_only_oid);
+    }
+};
+
+fn setupBranchSwitchFixture(io: std.Io, tmp: *std.testing.TmpDir) !BranchSwitchFixture {
+    try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    try tmp.dir.createDir(io, "updater", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    var updater = try tmp.dir.openDir(io, "updater", .{});
+    defer updater.close(io);
+
+    const remote_root = try tmp.dir.realPathFileAlloc(io, "remote.git", std.testing.allocator);
+    defer std.testing.allocator.free(remote_root);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, work);
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "main\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
+    try runTestGit(io, &.{ "git", "push", "-u", "origin", "main" }, work);
+
+    const main_output = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    defer std.testing.allocator.free(main_output);
+    const main_oid = try std.testing.allocator.dupe(u8, trimLineEnd(main_output));
+    errdefer std.testing.allocator.free(main_oid);
+
+    try runTestGit(io, &.{ "git", "switch", "-c", "feature/topic" }, work);
+    try work.writeFile(io, .{ .sub_path = "FEATURE.md", .data = "feature\n" });
+    try runTestGit(io, &.{ "git", "add", "FEATURE.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "feature" }, work);
+    const feature_output = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    defer std.testing.allocator.free(feature_output);
+    const feature_oid = try std.testing.allocator.dupe(u8, trimLineEnd(feature_output));
+    errdefer std.testing.allocator.free(feature_oid);
+    try runTestGit(io, &.{ "git", "switch", "main" }, work);
+    try runTestGit(io, &.{ "git", "push", "origin", "feature/topic" }, work);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, updater);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, updater);
+    try runTestGit(io, &.{ "git", "pull", "--ff-only", "origin", "main" }, updater);
+    try runTestGit(io, &.{ "git", "switch", "-c", "remote-only" }, updater);
+    try updater.writeFile(io, .{ .sub_path = "REMOTE.md", .data = "remote\n" });
+    try runTestGit(io, &.{ "git", "add", "REMOTE.md" }, updater);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "remote only" }, updater);
+    try runTestGit(io, &.{ "git", "push", "origin", "remote-only" }, updater);
+    try runTestGit(io, &.{ "git", "fetch", "origin" }, work);
+    const remote_only_output = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "refs/remotes/origin/remote-only" });
+    defer std.testing.allocator.free(remote_only_output);
+    const remote_only_oid = try std.testing.allocator.dupe(u8, trimLineEnd(remote_only_output));
+    errdefer std.testing.allocator.free(remote_only_oid);
+
+    const repo_root_z = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root_z);
+    const repo_root = try std.testing.allocator.dupe(u8, repo_root_z);
+    errdefer std.testing.allocator.free(repo_root);
+
+    return .{
+        .repo_root = repo_root,
+        .main_oid = main_oid,
+        .feature_oid = feature_oid,
+        .remote_only_oid = remote_only_oid,
+    };
+}
+
+fn expectBranchListed(branches: []const BranchListItem, name: []const u8) !void {
+    for (branches) |branch| {
+        if (std.mem.eql(u8, branch.name, name)) return;
+    }
+    return error.ExpectedBranchListed;
+}
+
+fn expectBranchNotListed(branches: []const BranchListItem, name: []const u8) !void {
+    for (branches) |branch| {
+        if (std.mem.eql(u8, branch.name, name)) return error.ExpectedBranchNotListed;
+    }
 }
 
 const PullRefreshFixture = struct {

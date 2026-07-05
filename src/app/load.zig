@@ -64,6 +64,17 @@ pub const BranchStatusLoadFinished = struct {
     }
 };
 
+pub const BranchListLoadFinished = struct {
+    generation: u64,
+    repo_root: []u8,
+    result: BranchListLoadTaskResult,
+
+    pub fn deinit(self: *BranchListLoadFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        self.result.deinit(allocator);
+    }
+};
+
 pub const ReviewProjectionFinished = review_projection.Finished;
 
 pub const RepoDiscoveryTaskResult = union(enum) {
@@ -141,6 +152,22 @@ pub const BranchStatusLoadTaskResult = union(enum) {
         switch (self.*) {
             .empty, .failed_static => {},
             .loaded => |*bundle| bundle.deinit(),
+            .failed => |message| allocator.free(message),
+        }
+        self.* = .empty;
+    }
+};
+
+pub const BranchListLoadTaskResult = union(enum) {
+    empty,
+    loaded: git_backend.BranchList,
+    failed: []u8,
+    failed_static: []const u8,
+
+    pub fn deinit(self: *BranchListLoadTaskResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .empty, .failed_static => {},
+            .loaded => |*list| list.deinit(allocator),
             .failed => |message| allocator.free(message),
         }
         self.* = .empty;
@@ -364,6 +391,41 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
     };
 }
 
+pub fn BranchListLoadTask(comptime Msg: type) type {
+    return struct {
+        repo_root: []u8,
+        generation: u64,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+
+            const result = BranchListLoadFinished{
+                .generation = task.generation,
+                .repo_root = task.repo_root,
+                .result = runBranchListLoad(task.repo_root, allocator, io),
+            };
+            task.repo_root = &.{};
+
+            return Msg.loadFinished(.{ .branch_list_loaded = result });
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+
+            const result = BranchListLoadFinished{
+                .generation = task.generation,
+                .repo_root = task.repo_root,
+                .result = .{ .failed_static = taskFailureMessage(failure) },
+            };
+            task.repo_root = &.{};
+
+            return Msg.loadFinished(.{ .branch_list_loaded = result });
+        }
+    };
+}
+
 pub fn ReviewProjectionTask(comptime Msg: type) type {
     return struct {
         request: review_projection.Request,
@@ -440,6 +502,22 @@ pub fn runBranchStatusLoad(repo_root: []const u8, allocator: std.mem.Allocator, 
 
     switch (raw_result) {
         .ok => |bundle| return .{ .loaded = bundle },
+        .failed => |message| return .{ .failed = message },
+        .failed_static => |message| return .{ .failed_static = message },
+    }
+}
+
+pub fn runBranchListLoad(repo_root: []const u8, allocator: std.mem.Allocator, io: std.Io) BranchListLoadTaskResult {
+    var local_backend: git_backend.LocalCommandBackend = .{};
+    const raw_result = local_backend.backend().loadBranchList(allocator, io, .{ .repo_root = repo_root }) catch |err| {
+        return .{
+            .failed = std.fmt.allocPrint(allocator, "Branch list load failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Branch list load failed: OutOfMemory" },
+        };
+    };
+
+    switch (raw_result) {
+        .ok => |list| return .{ .loaded = list },
         .failed => |message| return .{ .failed = message },
         .failed_static => |message| return .{ .failed_static = message },
     }

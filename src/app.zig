@@ -29,6 +29,7 @@ const diff_view_model = @import("diff/view_model.zig");
 const editor = @import("editor.zig");
 const file_tree = @import("file_tree.zig");
 const git_ops = @import("app/git_ops.zig");
+const git_backend = @import("git/backend.zig");
 const git_branch_status = @import("git/branch_status.zig");
 const git_status = @import("git/status.zig");
 const keymap = @import("keymap");
@@ -73,6 +74,9 @@ const RepoPathDiscoveryFinished = app_load.RepoPathDiscoveryFinished;
 const RepoPathDiscoveryTask = app_load.RepoPathDiscoveryTask(App.Msg);
 const BranchStatusLoadFinished = app_load.BranchStatusLoadFinished;
 const BranchStatusLoadTask = app_load.BranchStatusLoadTask(App.Msg);
+const BranchListLoadFinished = app_load.BranchListLoadFinished;
+const BranchListLoadTask = app_load.BranchListLoadTask(App.Msg);
+const BranchSwitchTargetResult = git_ops.BranchSwitchTargetResult;
 const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
 const PathTarget = git_ops.PathTarget;
@@ -87,6 +91,8 @@ const PullFinished = app_actions.PullFinished;
 const PullTargetResult = git_ops.PullTargetResult;
 const PushFinished = app_actions.PushFinished;
 const PushTargetResult = git_ops.PushTargetResult;
+const SwitchBranchFinished = app_actions.SwitchBranchFinished;
+const SwitchBranchTask = app_actions.SwitchBranchTask(App.Msg);
 const StageHunkFinished = app_actions.StageHunkFinished;
 const StageFileFinished = app_actions.StageFileFinished;
 const StageTargetResult = git_ops.StageTargetResult;
@@ -165,6 +171,7 @@ const LoadFinishedMsg = union(enum) {
     diff_loaded: DiffLoadFinished,
     status_loaded: StatusLoadFinished,
     branch_status_loaded: BranchStatusLoadFinished,
+    branch_list_loaded: BranchListLoadFinished,
     review_projection_loaded: ReviewProjectionFinished,
 };
 
@@ -179,6 +186,7 @@ const ActionFinishedMsg = union(enum) {
     push: PushFinished,
     pull: PullFinished,
     fetch: FetchFinished,
+    switch_branch: SwitchBranchFinished,
     push_foreground: chasen.ForegroundCommandResult,
     editor: chasen.ForegroundCommandResult,
 };
@@ -346,6 +354,9 @@ pub const App = struct {
     push_retry_credentials_available: bool = false,
     push_credential_prompt: ?*app_state.PushCredentialPrompt = null,
     push_foreground: ?PushForegroundState = null,
+    branch_switch: app_state.BranchSwitchState = .{},
+    branch_switch_load_generation: u64 = 0,
+    branch_switch_load_pending: ?u64 = null,
 
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
@@ -472,6 +483,11 @@ pub const App = struct {
         confirm_pull,
         cancel_pull,
         request_fetch,
+        request_branch_switch,
+        branch_switch_move_previous,
+        branch_switch_move_next,
+        confirm_branch_switch,
+        cancel_branch_switch,
         close_push_error,
         open_push_credentials,
         run_interactive_push,
@@ -527,6 +543,7 @@ pub const App = struct {
         self.cancelPushCredentialPrompt(deinit_ctx.allocator);
         self.clearPushForeground(deinit_ctx.allocator);
         self.clearPushError(deinit_ctx.allocator);
+        self.clearBranchSwitch(deinit_ctx.allocator);
         self.tree_order.deinit(deinit_ctx.allocator);
         if (self.tree_order_scope) |scope| deinit_ctx.allocator.free(scope);
         if (self.pending_selection_restore) |*restore| restore.deinit(deinit_ctx.allocator);
@@ -729,6 +746,11 @@ pub const App = struct {
             .confirm_pull => try self.confirmPull(ctx),
             .cancel_pull => self.cancelPullConfirmation(ctx.allocator()),
             .request_fetch => try self.requestFetch(ctx),
+            .request_branch_switch => try self.requestBranchSwitch(ctx),
+            .branch_switch_move_previous => self.moveBranchSwitchSelection(-1),
+            .branch_switch_move_next => self.moveBranchSwitchSelection(1),
+            .confirm_branch_switch => try self.confirmBranchSwitch(ctx),
+            .cancel_branch_switch => self.clearBranchSwitch(ctx.allocator()),
             .close_push_error => self.clearPushError(ctx.allocator()),
             .open_push_credentials => try self.openPushCredentialPrompt(ctx),
             .run_interactive_push => try self.runInteractivePush(ctx),
@@ -738,6 +760,7 @@ pub const App = struct {
             .finish_review_canceled => try self.finishReview(ctx, .canceled),
             .reload => {
                 self.clearPendingSelectionRestore(ctx.allocator());
+                self.clearBranchSwitch(ctx.allocator());
                 if (diff_source.sourceIsOneShotInput(self.config.source)) {
                     ctx.redraw().skip();
                 } else if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
@@ -759,6 +782,7 @@ pub const App = struct {
             .diff_loaded => |result| try self.finishDiffLoad(ctx, result),
             .status_loaded => |result| try self.finishStatusLoad(ctx, result),
             .branch_status_loaded => |result| self.finishBranchStatusLoad(ctx, result),
+            .branch_list_loaded => |result| try self.finishBranchListLoad(ctx, result),
             .review_projection_loaded => |result| try self.finishReviewProjectionLoad(ctx, result),
         }
     }
@@ -775,6 +799,7 @@ pub const App = struct {
             .push => |result| try self.finishPush(ctx, result),
             .pull => |result| try self.finishPull(ctx, result),
             .fetch => |result| try self.finishFetch(ctx, result),
+            .switch_branch => |result| try self.finishSwitchBranch(ctx, result),
             .push_foreground => |result| try self.finishPushForeground(ctx, result),
             .editor => |result| try self.finishEditorCommand(ctx, result),
         }
@@ -930,6 +955,7 @@ pub const App = struct {
             .amend_confirmation_mode = self.overlay.isAmendCommit(),
             .push_confirmation_mode = self.overlay.isPushBranch(),
             .pull_confirmation_mode = self.overlay.isPullBranch(),
+            .branch_switch_mode = self.overlay.isSwitchBranch(),
             .push_error_mode = self.overlay.isPushError(),
             .push_credential_mode = self.overlay.isPushCredentials(),
             .search_query_len = self.search.query.len,
@@ -2262,6 +2288,145 @@ pub const App = struct {
         };
     }
 
+    fn requestBranchSwitch(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (app_git_requests.hasPendingAction(self.actions)) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+
+        const target = switch (self.selectedBranchSwitchTarget()) {
+            .ready => |target| target,
+            .unavailable_source => {
+                self.setStatus("branch switch unavailable for this source", .{});
+                return;
+            },
+            .no_repo => {
+                self.setStatus("branch switch unavailable: no repository", .{});
+                return;
+            },
+            .loading_branch_status => {
+                self.setStatus("branch status is still loading", .{});
+                return;
+            },
+            .detached_head => {
+                self.setStatus("branch switch unavailable on detached HEAD", .{});
+                return;
+            },
+            .branch_unavailable => {
+                self.setStatus("branch switch unavailable: branch is unknown", .{});
+                return;
+            },
+            .branch_status_unavailable => {
+                self.setStatus("branch switch unavailable: branch status is incomplete", .{});
+                return;
+            },
+            .status_loading => {
+                self.setStatus("status is still loading", .{});
+                return;
+            },
+            .status_stale => {
+                self.setStatus("branch switch unavailable: status is stale", .{});
+                return;
+            },
+            .dirty_worktree => {
+                self.setStatus("branch switch blocked: commit, stage, or discard local changes first", .{});
+                return;
+            },
+            .untracked_files_present => {
+                self.setStatus("branch switch blocked: untracked files present", .{});
+                return;
+            },
+        };
+
+        self.cancelDiscardConfirmation(ctx.allocator());
+        self.cancelAmendConfirmation(ctx.allocator());
+        self.cancelPushConfirmation(ctx.allocator());
+        self.cancelPullConfirmation(ctx.allocator());
+        self.clearPushError(ctx.allocator());
+        self.clearBranchSwitch(ctx.allocator());
+
+        self.branch_switch_load_generation +%= 1;
+        const generation = self.branch_switch_load_generation;
+
+        var owned_repo_root = try ctx.allocator().dupe(u8, target.repo_root);
+        errdefer if (owned_repo_root.len > 0) ctx.allocator().free(owned_repo_root);
+        var owned_current_branch = try ctx.allocator().dupe(u8, target.branch);
+        errdefer if (owned_current_branch.len > 0) ctx.allocator().free(owned_current_branch);
+        var owned_current_oid = try ctx.allocator().dupe(u8, target.oid);
+        errdefer if (owned_current_oid.len > 0) ctx.allocator().free(owned_current_oid);
+
+        self.branch_switch = .{
+            .repo_root = owned_repo_root,
+            .current_branch = owned_current_branch,
+            .current_oid = owned_current_oid,
+            .generation = generation,
+            .loading = true,
+        };
+        owned_repo_root = &.{};
+        owned_current_branch = &.{};
+        owned_current_oid = &.{};
+        self.branch_switch_load_pending = generation;
+        self.overlay.openSwitchBranch();
+        errdefer self.clearBranchSwitch(ctx.allocator());
+
+        const task = try ctx.allocator().create(BranchListLoadTask);
+        task.* = .{ .repo_root = &.{}, .generation = generation };
+        errdefer ctx.allocator().destroy(task);
+        task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
+        errdefer ctx.allocator().free(task.repo_root);
+        try ctx.task().spawnWith(.{ .ctx = task, .run = BranchListLoadTask.run, .failed = BranchListLoadTask.failed });
+    }
+
+    fn moveBranchSwitchSelection(self: *App, delta: isize) void {
+        if (!self.branch_switch.hasState() or self.branch_switch.loading or self.branch_switch.branches.len == 0) return;
+        self.branch_switch.selected_index = wrapIndex(self.branch_switch.selected_index, self.branch_switch.branches.len, delta);
+    }
+
+    fn confirmBranchSwitch(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (!self.branch_switch.hasState()) return;
+        if (self.branch_switch.loading) {
+            self.setStatus("branch list is still loading", .{});
+            return;
+        }
+        if (self.branch_switch.branches.len == 0) {
+            self.setStatus("branch switch unavailable: no local branches", .{});
+            return;
+        }
+        if (app_git_requests.hasPendingAction(self.actions)) {
+            self.setStatus("another git action is running", .{});
+            return;
+        }
+
+        const selected = self.branch_switch.branches[self.branch_switch.selected_index];
+        if (selected.current or std.mem.eql(u8, selected.name, self.branch_switch.current_branch)) {
+            self.setStatus("already on branch: {s}", .{self.branch_switch.current_branch});
+            self.clearBranchSwitch(ctx.allocator());
+            return;
+        }
+
+        var request: app_git_requests.SwitchBranchRequest = .{
+            .repo_root = &.{},
+            .expected_branch = &.{},
+            .expected_oid = &.{},
+            .target_branch = &.{},
+            .target_oid = &.{},
+        };
+        errdefer request.deinit(ctx.allocator());
+        request.repo_root = try ctx.allocator().dupe(u8, self.branch_switch.repo_root);
+        request.expected_branch = try ctx.allocator().dupe(u8, self.branch_switch.current_branch);
+        request.expected_oid = try ctx.allocator().dupe(u8, self.branch_switch.current_oid);
+        request.target_branch = try ctx.allocator().dupe(u8, selected.name);
+        request.target_oid = try ctx.allocator().dupe(u8, selected.oid);
+
+        self.setStatus("switching branch: {s} -> {s}", .{ self.branch_switch.current_branch, selected.name });
+        app_git_requests.startSwitchBranch(Msg, ctx, &self.actions, &request) catch |err| {
+            self.setStatus("could not start branch switch task", .{});
+            return err;
+        };
+
+        self.clearBranchSwitch(ctx.allocator());
+    }
+
     fn setPushError(self: *App, allocator: std.mem.Allocator, message: []const u8) !void {
         try self.setPushErrorWithRetry(allocator, message, null, false);
     }
@@ -2281,6 +2446,12 @@ pub const App = struct {
         self.push_retry_target = null;
         self.push_retry_credentials_available = false;
         if (self.overlay.isPushError()) self.overlay.close();
+    }
+
+    fn clearBranchSwitch(self: *App, allocator: std.mem.Allocator) void {
+        if (self.branch_switch.hasState()) self.branch_switch.deinit(allocator);
+        self.branch_switch_load_pending = null;
+        if (self.overlay.isSwitchBranch()) self.overlay.close();
     }
 
     fn takePushRetryTarget(self: *App) ?app_state.PushRetryTarget {
@@ -2557,6 +2728,23 @@ pub const App = struct {
                 .repo_root = self.branch_status.repo_root,
                 .loading = self.branch_status_load_pending != null,
                 .status = self.branch_status.status,
+            },
+        });
+    }
+
+    fn selectedBranchSwitchTarget(self: *const App) BranchSwitchTargetResult {
+        return git_ops.branchSwitchTarget(.{
+            .source = self.config.source,
+            .repo_root = self.activeRepoRoot(),
+            .branch_status = .{
+                .repo_root = self.branch_status.repo_root,
+                .loading = self.branch_status_load_pending != null,
+                .status = self.branch_status.status,
+            },
+            .status = .{
+                .repo_root = self.git_status.repo_root,
+                .loading = self.status_load_pending != null,
+                .entries = self.git_status.document.entries,
             },
         });
     }
@@ -2909,6 +3097,72 @@ pub const App = struct {
                 // failure. Reload only the still-active matching repo so the UI
                 // sees those side effects without disturbing a repo switch.
                 if (active_matches) try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+            },
+        }
+    }
+
+    fn finishSwitchBranch(self: *App, ctx: *chasen.Ctx(Msg), finished: SwitchBranchFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (!self.actions.finish(result.pending)) return;
+
+        const active_root = self.activeRepoRoot();
+        const active_matches = active_root != null and std.mem.eql(u8, active_root.?, result.repo_root);
+
+        switch (result.result) {
+            .ok, .ok_static => {
+                const reviewed_clear_failed = if (self.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
+                self.staged_hunks.clearRepo(ctx.allocator(), result.repo_root);
+                if (active_matches) {
+                    self.clearPendingSelectionRestore(ctx.allocator());
+                    self.clearSearch();
+                    self.setStatus("switched branch: {s} -> {s}", .{ result.old_branch, result.new_branch });
+                    if (reviewed_clear_failed) self.setStatus("switched branch: {s} -> {s}; could not clear reviewed marks", .{ result.old_branch, result.new_branch });
+                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = true, .kind = .action_result });
+                } else {
+                    self.setStatus("switched branch: {s}", .{result.repo_root});
+                }
+            },
+            .failed, .failed_static => {
+                _ = self.setActionFailureStatus("branch switch", result.result);
+                if (active_matches) try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+            },
+        }
+    }
+
+    fn finishBranchListLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: BranchListLoadFinished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        if (self.branch_switch_load_pending == null or self.branch_switch_load_pending.? != result.generation) return;
+        self.branch_switch_load_pending = null;
+        if (!self.branch_switch.hasState() or self.branch_switch.generation != result.generation or !std.mem.eql(u8, self.branch_switch.repo_root, result.repo_root)) return;
+
+        switch (result.result) {
+            .loaded => |list| {
+                const branches = try copyBranchSwitchItems(ctx.allocator(), list.branches);
+                errdefer {
+                    for (branches) |*item| item.deinit(ctx.allocator());
+                    ctx.allocator().free(branches);
+                }
+                for (self.branch_switch.branches) |*item| item.deinit(ctx.allocator());
+                ctx.allocator().free(self.branch_switch.branches);
+                self.branch_switch.branches = branches;
+                self.branch_switch.loading = false;
+                self.branch_switch.selected_index = branchSwitchInitialSelection(branches);
+            },
+            .failed => |message| {
+                self.setStatus("branch list load failed: {s}", .{git_ops.trimGitOutput(message)});
+                self.clearBranchSwitch(ctx.allocator());
+            },
+            .failed_static => |message| {
+                self.setStatus("branch list load failed: {s}", .{message});
+                self.clearBranchSwitch(ctx.allocator());
+            },
+            .empty => {
+                self.setStatus("branch list load failed", .{});
+                self.clearBranchSwitch(ctx.allocator());
             },
         }
     }
@@ -4182,6 +4436,7 @@ pub const App = struct {
             return;
         }
 
+        self.clearBranchSwitch(allocator);
         self.repo_picker.mode = true;
         self.repo_picker.input_mode = .list;
         self.repo_picker.list.mode = true;
@@ -4392,6 +4647,7 @@ pub const App = struct {
         self.clearRepoPickerItems(allocator);
         self.clearPendingSelectionRestore(allocator);
         self.clearPendingReload(allocator);
+        self.clearBranchSwitch(allocator);
     }
 
     fn resetViewAfterRepoSwitch(self: *App) void {
@@ -5676,6 +5932,41 @@ fn applySignedScroll(current: usize, delta: isize) usize {
         return current -| (amount + 1);
     }
     return current +| @as(usize, @intCast(delta));
+}
+
+fn wrapIndex(current: usize, len: usize, delta: isize) usize {
+    if (len == 0) return 0;
+    const len_signed: isize = @intCast(len);
+    var next = @as(isize, @intCast(current)) + delta;
+    next = @mod(next, len_signed);
+    return @intCast(next);
+}
+
+fn copyBranchSwitchItems(allocator: std.mem.Allocator, source: []const git_backend.BranchListItem) ![]app_state.BranchSwitchItem {
+    const items = try allocator.alloc(app_state.BranchSwitchItem, source.len);
+    errdefer allocator.free(items);
+
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*item| item.deinit(allocator);
+    }
+
+    for (source, 0..) |branch, index| {
+        items[index] = .{
+            .name = try allocator.dupe(u8, branch.name),
+            .oid = try allocator.dupe(u8, branch.oid),
+            .current = branch.current,
+        };
+        initialized += 1;
+    }
+    return items;
+}
+
+fn branchSwitchInitialSelection(branches: []const app_state.BranchSwitchItem) usize {
+    for (branches, 0..) |branch, index| {
+        if (!branch.current) return index;
+    }
+    return 0;
 }
 
 fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
@@ -7158,6 +7449,226 @@ test "requestPull opens confirmation before remote refresh regardless of stale a
     try std.testing.expectEqualStrings("feature", confirmation.branch);
     try std.testing.expectEqual(@as(u32, 1), confirmation.ahead);
     try std.testing.expectEqual(@as(u32, 0), confirmation.behind);
+}
+
+test "requestBranchSwitch opens loading popup and starts identity scoped list task" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.branch_status.deinit();
+    defer app.git_status.deinit();
+    defer app.clearBranchSwitch(std.testing.allocator);
+
+    var branch_bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc123",
+        .branch = "main",
+    });
+    try app.branch_status.replace("/repo", &branch_bundle);
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer clearPendingBranchListTasks(&ctx, std.testing.allocator);
+
+    try app.requestBranchSwitch(&ctx);
+
+    try std.testing.expect(app.overlay.isSwitchBranch());
+    try std.testing.expect(app.branch_switch.loading);
+    try std.testing.expectEqual(@as(u8, 1), ctx.pending_tasks_with_len);
+    const task: *BranchListLoadTask = @ptrCast(@alignCast(ctx.pendingTaskWithSlice()[0].ctx));
+    try std.testing.expectEqualStrings("/repo", task.repo_root);
+    try std.testing.expectEqual(app.branch_switch.generation, task.generation);
+}
+
+test "requestBranchSwitch rejects untracked-only status distinctly" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.branch_status.deinit();
+    defer app.git_status.deinit();
+
+    var branch_bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc123",
+        .branch = "main",
+    });
+    try app.branch_status.replace("/repo", &branch_bundle);
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? new.txt\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.requestBranchSwitch(&ctx);
+
+    try std.testing.expect(!app.overlay.isSwitchBranch());
+    try std.testing.expectEqualStrings("branch switch blocked: untracked files present", app.status.text());
+    try std.testing.expectEqual(@as(u8, 0), ctx.pending_tasks_with_len);
+}
+
+test "finishBranchListLoad ignores stale result and accepts matching generation" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .branch_switch = .{
+            .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+            .current_branch = try std.testing.allocator.dupe(u8, "main"),
+            .current_oid = try std.testing.allocator.dupe(u8, "abc123"),
+            .generation = 3,
+            .loading = true,
+        },
+        .branch_switch_load_pending = 3,
+        .overlay = .{ .kind = .switch_branch },
+    };
+    defer app.clearBranchSwitch(std.testing.allocator);
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishBranchListLoad(&ctx, .{
+        .generation = 2,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = try branchListForTest(std.testing.allocator, &.{
+            .{ .name = "main", .oid = "abc123", .current = true },
+        }),
+    });
+    try std.testing.expect(app.branch_switch.loading);
+    try std.testing.expectEqual(@as(usize, 0), app.branch_switch.branches.len);
+
+    try app.finishBranchListLoad(&ctx, .{
+        .generation = 3,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = try branchListForTest(std.testing.allocator, &.{
+            .{ .name = "main", .oid = "abc123", .current = true },
+            .{ .name = "feature/topic", .oid = "def456", .current = false },
+        }),
+    });
+
+    try std.testing.expect(!app.branch_switch.loading);
+    try std.testing.expectEqual(@as(usize, 2), app.branch_switch.branches.len);
+    try std.testing.expectEqual(@as(usize, 1), app.branch_switch.selected_index);
+    try std.testing.expectEqualStrings("feature/topic", app.branch_switch.branches[1].name);
+}
+
+test "confirmBranchSwitch treats current branch as no-op without clearing state" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .branch_switch = .{
+            .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+            .current_branch = try std.testing.allocator.dupe(u8, "main"),
+            .current_oid = try std.testing.allocator.dupe(u8, "abc123"),
+            .generation = 3,
+            .loading = false,
+            .branches = try branchSwitchItemsForTest(std.testing.allocator, &.{
+                .{ .name = "main", .oid = "abc123", .current = true },
+                .{ .name = "feature", .oid = "def456", .current = false },
+            }),
+        },
+        .overlay = .{ .kind = .switch_branch },
+    };
+    defer app.clearBranchSwitch(std.testing.allocator);
+    defer app.staged_hunks.deinit(std.testing.allocator);
+
+    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.confirmBranchSwitch(&ctx);
+
+    try std.testing.expect(!app.overlay.isSwitchBranch());
+    try std.testing.expect(app.branch_switch.branches.len == 0);
+    try std.testing.expect(app.staged_hunks.contains("/repo", "a", 0));
+    try std.testing.expectEqualStrings("already on branch: main", app.status.text());
+    try std.testing.expectEqual(@as(u8, 0), ctx.pending_tasks_with_len);
+    try std.testing.expect(app.actions.pending == null);
+}
+
+test "finishSwitchBranch success clears repo-local review state and reloads matching repo" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .terminal_size = .{ .width = 100, .height = 12 },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.reviewed_store.deinit(allocator);
+    defer app.staged_hunks.deinit(allocator);
+    defer app.clearPendingSelectionRestore(allocator);
+    defer app.tree_order.deinit(allocator);
+    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+
+    try app.reviewed_store.set(allocator, app.activeRepoRoot(), app_test_support.files_two[0], true);
+    try app.staged_hunks.add(allocator, "/repo", "a", 0);
+    try app.setPendingSelectionRestore(allocator, "a");
+    setDiffSearchQuery(&app, "needle");
+
+    const pending = app.actions.begin(.switch_branch);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+
+    try app.finishSwitchBranch(&ctx, .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .old_branch = try allocator.dupe(u8, "main"),
+        .new_branch = try allocator.dupe(u8, "feature"),
+        .result = .ok,
+    });
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(!try app.reviewed_store.containsFile(allocator, app.activeRepoRoot(), app_test_support.files_two[0]));
+    try std.testing.expectEqual(@as(usize, 0), app.staged_hunks.items.items.len);
+    try std.testing.expect(app.pending_selection_restore == null);
+    try std.testing.expectEqual(@as(usize, 0), app.search.query.len);
+    try std.testing.expectEqualStrings("switched branch: main -> feature", app.status.text());
+    try std.testing.expectEqual(@as(u8, 3), ctx.pending_tasks_with_len);
+}
+
+test "finishSwitchBranch success clears completed repo marks when active repo changed" {
+    const allocator = std.testing.allocator;
+    var repos = [_]repo_discovery.RepoEntry{
+        .{ .label = "old", .display_path = "/repo", .canonical_root = "/repo" },
+        .{ .label = "new", .display_path = "/other", .canonical_root = "/other" },
+    };
+    var app: App = .{
+        .allocator = allocator,
+        .repo_state = .{ .discovery = .{ .workspace = .{
+            .current_root = "/workspace",
+            .repos = &repos,
+        } }, .active_index = 1 },
+    };
+    defer app.reviewed_store.deinit(allocator);
+    defer app.staged_hunks.deinit(allocator);
+
+    try app.reviewed_store.set(allocator, "/repo", app_test_support.files_two[0], true);
+    try app.reviewed_store.set(allocator, "/other", app_test_support.files_two[1], true);
+    try app.staged_hunks.add(allocator, "/repo", "a", 0);
+    try app.staged_hunks.add(allocator, "/other", "b", 1);
+
+    const pending = app.actions.begin(.switch_branch);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.finishSwitchBranch(&ctx, .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .old_branch = try allocator.dupe(u8, "main"),
+        .new_branch = try allocator.dupe(u8, "feature"),
+        .result = .ok,
+    });
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(!try app.reviewed_store.containsFile(allocator, "/repo", app_test_support.files_two[0]));
+    try std.testing.expect(try app.reviewed_store.containsFile(allocator, "/other", app_test_support.files_two[1]));
+    try std.testing.expect(!app.staged_hunks.contains("/repo", "a", 0));
+    try std.testing.expect(app.staged_hunks.contains("/other", "b", 1));
+    try std.testing.expectEqual(@as(u8, 0), ctx.pending_tasks_with_len);
+    try std.testing.expectEqualStrings("switched branch: /repo", app.status.text());
 }
 
 test "requestPush clears previous push error details" {
@@ -11515,6 +12026,15 @@ fn clearPendingStatusTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocat
     ctx.pending_tasks_with_len = 0;
 }
 
+fn clearPendingBranchListTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
+    for (ctx.pendingTaskWithSlice()) |entry| {
+        const task: *BranchListLoadTask = @ptrCast(@alignCast(entry.ctx));
+        allocator.free(task.repo_root);
+        allocator.destroy(task);
+    }
+    ctx.pending_tasks_with_len = 0;
+}
+
 fn clearPendingStatusAndDiffTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
     const entries = ctx.pendingTaskWithSlice();
     if (entries.len >= 1) {
@@ -11533,6 +12053,51 @@ fn clearPendingStatusAndDiffTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.
         allocator.destroy(task);
     }
     ctx.pending_tasks_with_len = 0;
+}
+
+const BranchListItemSpec = struct {
+    name: []const u8,
+    oid: []const u8,
+    current: bool = false,
+};
+
+fn branchListForTest(allocator: std.mem.Allocator, specs: []const BranchListItemSpec) !app_load.BranchListLoadTaskResult {
+    const items = try allocator.alloc(git_backend.BranchListItem, specs.len);
+    errdefer allocator.free(items);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |item| {
+            allocator.free(item.name);
+            allocator.free(item.oid);
+        }
+    }
+    for (specs, 0..) |spec, index| {
+        items[index] = .{
+            .name = try allocator.dupe(u8, spec.name),
+            .oid = try allocator.dupe(u8, spec.oid),
+            .current = spec.current,
+        };
+        initialized += 1;
+    }
+    return .{ .loaded = .{ .branches = items } };
+}
+
+fn branchSwitchItemsForTest(allocator: std.mem.Allocator, specs: []const BranchListItemSpec) ![]app_state.BranchSwitchItem {
+    const items = try allocator.alloc(app_state.BranchSwitchItem, specs.len);
+    errdefer allocator.free(items);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*item| item.deinit(allocator);
+    }
+    for (specs, 0..) |spec, index| {
+        items[index] = .{
+            .name = try allocator.dupe(u8, spec.name),
+            .oid = try allocator.dupe(u8, spec.oid),
+            .current = spec.current,
+        };
+        initialized += 1;
+    }
+    return items;
 }
 
 fn testCombinedHunkBundle(allocator: std.mem.Allocator) !app_review_projection.CombinedHunkBundle {

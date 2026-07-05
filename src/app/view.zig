@@ -43,6 +43,8 @@ const repo_picker_list_label_col: u16 = 4;
 const commit_dialog_height: u16 = 22;
 const confirmation_dialog_width: u16 = 72;
 const confirmation_dialog_height: u16 = 9;
+const branch_switch_dialog_width: u16 = 72;
+const branch_switch_dialog_height: u16 = 18;
 
 const StateTone = enum {
     muted,
@@ -116,6 +118,9 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
     }
     if (app.overlay.isPullBranch()) {
         try viewPullConfirmation(app, surface);
+    }
+    if (app.overlay.isSwitchBranch()) {
+        try viewBranchSwitchPopup(app, surface);
     }
     if (app.overlay.isPushError()) {
         try viewPushError(app, surface);
@@ -1501,6 +1506,70 @@ fn viewPullConfirmation(app: anytype, surface: *chasen.Surface) !void {
     }
 }
 
+fn viewBranchSwitchPopup(app: anytype, surface: *chasen.Surface) !void {
+    const state = app.branch_switch;
+    if (!state.hasState()) return;
+
+    const modal = ui.Modal.init(.{});
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, branch_switch_dialog_width),
+        .dialog_height = @min(surface.size().height, branch_switch_dialog_height),
+        .title = "Switch branch",
+        .backdrop = false,
+        .border = .rounded,
+        .title_style = boldRoleStyle(app.theme, .accent),
+        .border_style = roleStyle(app.theme, .accent),
+    };
+    fillModalDialog(surface, opts);
+    modal.view(surface, opts);
+
+    const content_rect = ui.Modal.contentRect(surface, opts);
+    if (content_rect.width == 0 or content_rect.height == 0) return;
+    var content = surface.child(content_rect);
+    const size = content.size();
+    if (size.height == 0) return;
+
+    const subtitle = try std.fmt.allocPrint(content.frameAllocator(), "Current: {s}", .{state.current_branch});
+    try draw.copyClippedTextAt(&content, 0, 0, subtitle, roleStyle(app.theme, .muted));
+    if (state.loading) {
+        if (size.height > 2) try draw.copyClippedTextAt(&content, 0, 2, "Loading local branches...", roleStyle(app.theme, .prompt));
+        return;
+    }
+    if (state.branches.len == 0) {
+        if (size.height > 2) try draw.copyClippedTextAt(&content, 0, 2, "No local branches", roleStyle(app.theme, .muted));
+        return;
+    }
+
+    const footer_rows_needed: u16 = 2;
+    const list_start: u16 = 2;
+    const list_rows: u16 = size.height -| (list_start + footer_rows_needed);
+    const selected = @min(state.selected_index, state.branches.len - 1);
+    const start = listWindowStart(selected, state.branches.len, list_rows);
+    var row: u16 = 0;
+    while (row < list_rows and start + row < state.branches.len) : (row += 1) {
+        const index = start + row;
+        const branch = state.branches[index];
+        const marker: []const u8 = if (index == selected) ">" else " ";
+        const current: []const u8 = if (branch.current) "*" else " ";
+        const line = try std.fmt.allocPrint(content.frameAllocator(), "{s} {s} {s}", .{ marker, current, branch.name });
+        try draw.copyClippedTextAt(&content, 0, list_start + row, line, chasen.TextStyle{});
+    }
+
+    if (size.height >= 2) {
+        const hint_row = size.height - 1;
+        try draw.copyClippedTextAt(&content, 0, hint_row, "Enter: switch    Esc/q: cancel    j/k: move", roleStyle(app.theme, .accent));
+    }
+}
+
+fn listWindowStart(selected: usize, len: usize, rows: u16) usize {
+    if (rows == 0 or len == 0) return 0;
+    const visible: usize = @intCast(rows);
+    if (len <= visible) return 0;
+    const half = visible / 2;
+    const max_start = len - visible;
+    return @min(selected -| half, max_start);
+}
+
 fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
     const message = app.push_error_message orelse return;
     const modal = ui.Modal.init(.{});
@@ -2332,10 +2401,10 @@ const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .amend }, .description = "amend last commit" },
     .{ .key = .{ .action = .push }, .description = "push current branch" },
     .{ .key = .{ .action = .pull }, .description = "pull current branch" },
+    .{ .key = .{ .action = .branch_switch }, .description = "switch branch" },
     .{ .key = .{ .action = .discard }, .description = "discard selected file changes" },
     .{ .key = .{ .action = .open_editor }, .description = "open selected file in editor" },
     .{ .key = .{ .text = "a / N" }, .description = "approve / needs changes in review mode" },
-    .{ .key = .{ .text = "Home/End" }, .description = "first / last file" },
     .{ .key = .{ .pair = .{ .left = .first_file, .right = .last_file } }, .description = "first / last file" },
 };
 

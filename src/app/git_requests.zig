@@ -283,6 +283,51 @@ pub fn startFetch(
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
+pub const SwitchBranchRequest = struct {
+    repo_root: []u8,
+    expected_branch: []u8,
+    expected_oid: []u8,
+    target_branch: []u8,
+    target_oid: []u8,
+
+    pub fn deinit(self: *SwitchBranchRequest, allocator: std.mem.Allocator) void {
+        consumeSwitchBranchRequest(allocator, self);
+    }
+};
+
+pub fn startSwitchBranch(
+    comptime Msg: type,
+    ctx: *chasen.Ctx(Msg),
+    action_state: *actions.ActionState,
+    request: *SwitchBranchRequest,
+) !void {
+    defer consumeSwitchBranchRequest(ctx.allocator(), request);
+
+    const pending = action_state.begin(.switch_branch);
+    errdefer _ = action_state.finish(pending);
+
+    const Task = actions.SwitchBranchTask(Msg);
+    const task = try ctx.allocator().create(Task);
+    task.* = .{
+        .pending = pending,
+        .repo_root = request.repo_root,
+        .expected_branch = request.expected_branch,
+        .expected_oid = request.expected_oid,
+        .target_branch = request.target_branch,
+        .target_oid = request.target_oid,
+    };
+    request.* = .{
+        .repo_root = &.{},
+        .expected_branch = &.{},
+        .expected_oid = &.{},
+        .target_branch = &.{},
+        .target_oid = &.{},
+    };
+    errdefer destroySwitchBranchTask(Task, ctx.allocator(), task);
+
+    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+}
+
 pub fn startCredentialedPush(
     comptime Msg: type,
     ctx: *chasen.Ctx(Msg),
@@ -407,6 +452,30 @@ fn consumeFetchRequest(allocator: std.mem.Allocator, request: *FetchRequest) voi
 fn destroyFetchTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
     if (task.repo_root.len > 0) allocator.free(task.repo_root);
     if (task.remote.len > 0) allocator.free(task.remote);
+    allocator.destroy(task);
+}
+
+fn consumeSwitchBranchRequest(allocator: std.mem.Allocator, request: *SwitchBranchRequest) void {
+    if (request.repo_root.len > 0) allocator.free(request.repo_root);
+    if (request.expected_branch.len > 0) allocator.free(request.expected_branch);
+    if (request.expected_oid.len > 0) allocator.free(request.expected_oid);
+    if (request.target_branch.len > 0) allocator.free(request.target_branch);
+    if (request.target_oid.len > 0) allocator.free(request.target_oid);
+    request.* = .{
+        .repo_root = &.{},
+        .expected_branch = &.{},
+        .expected_oid = &.{},
+        .target_branch = &.{},
+        .target_oid = &.{},
+    };
+}
+
+fn destroySwitchBranchTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
+    if (task.repo_root.len > 0) allocator.free(task.repo_root);
+    if (task.expected_branch.len > 0) allocator.free(task.expected_branch);
+    if (task.expected_oid.len > 0) allocator.free(task.expected_oid);
+    if (task.target_branch.len > 0) allocator.free(task.target_branch);
+    if (task.target_oid.len > 0) allocator.free(task.target_oid);
     allocator.destroy(task);
 }
 

@@ -30,6 +30,7 @@ pub const KeyContext = struct {
     amend_confirmation_mode: bool = false,
     push_confirmation_mode: bool = false,
     pull_confirmation_mode: bool = false,
+    branch_switch_mode: bool = false,
     push_error_mode: bool = false,
     push_credential_mode: bool = false,
     search_query_len: usize = 0,
@@ -136,6 +137,11 @@ const Action = enum {
     confirm_pull,
     cancel_pull,
     request_fetch,
+    request_branch_switch,
+    branch_switch_move_previous,
+    branch_switch_move_next,
+    confirm_branch_switch,
+    cancel_branch_switch,
     close_push_error,
     open_push_credentials,
     run_interactive_push,
@@ -167,7 +173,7 @@ fn pasteToMsg(comptime Msg: type, context: KeyContext, text: []const u8) ?Msg {
     if (context.file_search_mode) return payloadMsg(Msg, "file_search_paste", text);
     if (context.repo_picker_mode) return payloadMsg(Msg, "repo_picker_paste", text);
     if (context.push_credential_mode) return payloadMsg(Msg, "push_credential_paste", text);
-    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.push_error_mode) return null;
+    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
     if (context.commit_panel_mode) return payloadMsg(Msg, "commit_panel_paste", text);
     return null;
 }
@@ -181,6 +187,7 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.amend_confirmation_mode) return amendConfirmationKeyToMsg(Msg, key);
     if (context.push_confirmation_mode) return pushConfirmationKeyToMsg(Msg, key);
     if (context.pull_confirmation_mode) return pullConfirmationKeyToMsg(Msg, key);
+    if (context.branch_switch_mode) return branchSwitchKeyToMsg(Msg, key);
     if (context.push_error_mode) return pushErrorKeyToMsg(Msg, key);
     if (context.push_credential_mode) return pushCredentialKeyToMsg(Msg, key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(Msg, key);
@@ -270,6 +277,14 @@ fn pushConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
 fn pullConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_pull);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_pull);
+    return null;
+}
+
+fn branchSwitchKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
+    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_branch_switch);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_branch_switch);
+    if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .branch_switch_move_previous);
+    if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .branch_switch_move_next);
     return null;
 }
 
@@ -415,6 +430,7 @@ fn publicActionToAction(action: keymap.PublicAction) Action {
         .push => .request_push,
         .pull => .request_pull,
         .fetch => .request_fetch,
+        .branch_switch => .request_branch_switch,
         .discard => .request_discard_selected_file,
         .toggle_display_mode => .toggle_display_mode,
         .toggle_line_numbers => .toggle_line_numbers,
@@ -577,6 +593,11 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .confirm_pull => voidMsg(Msg, "confirm_pull"),
         .cancel_pull => voidMsg(Msg, "cancel_pull"),
         .request_fetch => voidMsg(Msg, "request_fetch"),
+        .request_branch_switch => voidMsg(Msg, "request_branch_switch"),
+        .branch_switch_move_previous => voidMsg(Msg, "branch_switch_move_previous"),
+        .branch_switch_move_next => voidMsg(Msg, "branch_switch_move_next"),
+        .confirm_branch_switch => voidMsg(Msg, "confirm_branch_switch"),
+        .cancel_branch_switch => voidMsg(Msg, "cancel_branch_switch"),
         .close_push_error => voidMsg(Msg, "close_push_error"),
         .open_push_credentials => voidMsg(Msg, "open_push_credentials"),
         .run_interactive_push => voidMsg(Msg, "run_interactive_push"),
@@ -707,6 +728,11 @@ const TestMsg = union(enum) {
     confirm_pull,
     cancel_pull,
     request_fetch,
+    request_branch_switch,
+    branch_switch_move_previous,
+    branch_switch_move_next,
+    confirm_branch_switch,
+    cancel_branch_switch,
     close_push_error,
     open_push_credentials,
     run_interactive_push,
@@ -781,6 +807,12 @@ test "keyToMsg maps sidebar visibility and suppresses focus toggle while hidden"
     try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, .{ .codepoint = 'B' }).?);
     try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, shiftedAscii('b', 'B')).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .sidebar_hidden = true }, .{ .codepoint = chasen.Key.tab }));
+}
+
+test "keyToMsg maps plain b to branch switch without stealing sidebar toggle" {
+    try std.testing.expectEqual(TestMsg.request_branch_switch, keyToMsg(TestMsg, .{}, .{ .codepoint = 'b' }).?);
+    try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, .{ .codepoint = 'B' }).?);
+    try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, shiftedAscii('b', 'B')).?);
 }
 
 test "keyToMsg maps sidebar width adjustment keys" {

@@ -13,6 +13,7 @@ pub const PublicAction = enum {
     push,
     pull,
     fetch,
+    branch_switch,
     discard,
     toggle_display_mode,
     toggle_line_numbers,
@@ -221,6 +222,7 @@ fn defaultSpec(action: PublicAction) ?KeySpec {
         .push => shiftedAscii('p', 'P'),
         .pull => shiftedAscii('u', 'U'),
         .fetch => null,
+        .branch_switch => .{ .plain_codepoint = 'b' },
         .discard => shiftedAscii('d', 'D'),
         .toggle_display_mode => .{ .plain_codepoint = 'u' },
         .toggle_line_numbers => shiftedAscii('l', 'L'),
@@ -401,6 +403,13 @@ test "fetch is unbound by default and configurable" {
 
     var buffer: [16]u8 = undefined;
     try std.testing.expectEqualStrings("Ctrl+s", effective.display(.fetch, buffer[0..]).?);
+}
+
+test "branch switch uses plain b and sidebar keeps shifted B" {
+    const defaults: Effective = .{};
+    try std.testing.expectEqual(PublicAction.branch_switch, defaults.actionForKey(.{ .codepoint = 'b' }).?);
+    try std.testing.expectEqual(PublicAction.toggle_sidebar, defaults.actionForKey(.{ .codepoint = 'B' }).?);
+    try std.testing.expectEqual(PublicAction.toggle_sidebar, defaults.actionForKey(.{ .codepoint = 'b', .mods = .{ .shift = true } }).?);
 }
 
 test "validateConfig rejects reserved and duplicate effective bindings" {
