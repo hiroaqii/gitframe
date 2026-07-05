@@ -55,8 +55,10 @@ pub const BodyRowIterator = struct {
     metadata_index: usize = 0,
     hunk_index: usize = 0,
     line_index: usize = 0,
-    side_by_side_rows: SideBySideIterator = .init(&.{}),
+    side_by_side_rows: SideBySideIndexedIterator = .init(&.{}),
     folded_hunks: []const bool = &.{},
+    last_unified_line_index: ?usize = null,
+    last_side_by_side_row: ?SideBySideIndexedRow = null,
 
     const Phase = enum {
         metadata,
@@ -160,6 +162,8 @@ pub const BodyRowIterator = struct {
     }
 
     pub fn next(self: *BodyRowIterator) ?BodyRow {
+        self.last_unified_line_index = null;
+        self.last_side_by_side_row = null;
         while (true) {
             switch (self.phase) {
                 .metadata => {
@@ -204,13 +208,17 @@ pub const BodyRowIterator = struct {
                     switch (self.mode) {
                         .unified => {
                             if (self.line_index < hunk.lines.len) {
+                                self.last_unified_line_index = self.line_index;
                                 const line = hunk.lines[self.line_index];
                                 self.line_index += 1;
                                 return .{ .unified_line = line };
                             }
                         },
                         .side_by_side => {
-                            if (self.side_by_side_rows.next()) |row| return .{ .side_by_side = row };
+                            if (self.side_by_side_rows.next()) |row| {
+                                self.last_side_by_side_row = row;
+                                return .{ .side_by_side = row.plain() };
+                            }
                         },
                     }
                     self.hunk_index += 1;
@@ -226,6 +234,14 @@ pub const BodyRowIterator = struct {
             .hunk_header, .hunk_lines => if (self.hunk_index < self.file.hunks.len) self.hunk_index else null,
             else => null,
         };
+    }
+
+    pub fn currentUnifiedLineIndex(self: BodyRowIterator) ?usize {
+        return self.last_unified_line_index;
+    }
+
+    pub fn currentSideBySideRow(self: BodyRowIterator) ?SideBySideIndexedRow {
+        return self.last_side_by_side_row;
     }
 
     fn isFolded(self: BodyRowIterator, hunk_index: usize) bool {
@@ -587,6 +603,16 @@ pub const SideBySideIndexedPair = struct {
 pub const SideBySideIndexedRow = union(enum) {
     single: IndexedDiffLine,
     paired: SideBySideIndexedPair,
+
+    pub fn plain(self: SideBySideIndexedRow) SideBySideRow {
+        return switch (self) {
+            .single => |line| .{ .single = line.line },
+            .paired => |pair| .{ .paired = .{
+                .removed = if (pair.removed) |line| line.line else null,
+                .added = if (pair.added) |line| line.line else null,
+            } },
+        };
+    }
 };
 
 pub fn sideBySideRenderedOffsetForLine(lines: []const diff_parser.DiffLine, target_line_index: usize) ?usize {
@@ -742,6 +768,13 @@ pub const SideBySideIndexedIterator = struct {
         return .{ .single = .{ .line = line, .line_index = line_index } };
     }
 
+    pub fn skipRows(self: *SideBySideIndexedIterator, count: usize) void {
+        var skipped: usize = 0;
+        while (skipped < count) : (skipped += 1) {
+            if (self.next() == null) return;
+        }
+    }
+
     fn nextBlockRow(self: *SideBySideIndexedIterator) ?SideBySideIndexedRow {
         const max_len = @max(self.block_removed_len, self.block_added_len);
         if (self.block_offset >= max_len) {
@@ -799,6 +832,53 @@ test "body line offsets account for metadata and side-by-side pairs" {
     try std.testing.expectEqual(@as(usize, 5), renderedBodyLineCount(file, .side_by_side));
     try std.testing.expectEqual(@as(usize, 4), hunkBodyLineOffset(file, .unified, 1));
     try std.testing.expectEqual(@as(usize, 6), renderedBodyLineCount(file, .unified));
+}
+
+test "BodyRowIterator tracks current unified hunk line index" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{},
+        .hunks = &.{.{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .section = "", .lines = &.{
+            .{ .kind = .removed, .text = "old", .old_line = 1 },
+            .{ .kind = .added, .text = "new", .new_line = 1 },
+        } }},
+    };
+
+    var rows = BodyRowIterator.init(file, .unified);
+    try std.testing.expect(rows.next().? == .hunk_header);
+    try std.testing.expect(rows.next().? == .unified_line);
+    try std.testing.expectEqual(@as(?usize, 0), rows.currentUnifiedLineIndex());
+    try std.testing.expect(rows.next().? == .unified_line);
+    try std.testing.expectEqual(@as(?usize, 1), rows.currentUnifiedLineIndex());
+}
+
+test "BodyRowIterator tracks current side-by-side single and paired line indexes" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{},
+        .hunks = &.{.{ .old_start = 1, .old_count = 3, .new_start = 1, .new_count = 3, .section = "", .lines = &.{
+            .{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 },
+            .{ .kind = .removed, .text = "old", .old_line = 2 },
+            .{ .kind = .added, .text = "new", .new_line = 2 },
+            .{ .kind = .context, .text = "tail", .old_line = 3, .new_line = 3 },
+        } }},
+    };
+
+    var rows = BodyRowIterator.init(file, .side_by_side);
+    try std.testing.expect(rows.next().? == .hunk_header);
+
+    try std.testing.expect(rows.next().? == .side_by_side);
+    const first = rows.currentSideBySideRow().?;
+    try std.testing.expectEqual(@as(usize, 0), first.single.line_index);
+
+    try std.testing.expect(rows.next().? == .side_by_side);
+    const paired = rows.currentSideBySideRow().?.paired;
+    try std.testing.expectEqual(@as(usize, 1), paired.removed.?.line_index);
+    try std.testing.expectEqual(@as(usize, 2), paired.added.?.line_index);
+
+    try std.testing.expect(rows.next().? == .side_by_side);
+    const last = rows.currentSideBySideRow().?;
+    try std.testing.expectEqual(@as(usize, 3), last.single.line_index);
 }
 
 test "rendered line index matches iterator wrappers" {

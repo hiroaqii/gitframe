@@ -52,5 +52,8 @@ test {
     _ = @import("repo/state.zig");
     _ = @import("review/session.zig");
     _ = @import("review/state.zig");
+    _ = @import("syntax/provider.zig");
+    _ = @import("syntax/provider_none.zig");
+    _ = @import("syntax/provider_runtime.zig");
     _ = @import("theme");
 }

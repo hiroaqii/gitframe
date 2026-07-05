@@ -124,6 +124,7 @@ const MousePoint = struct {
 
 pub const ActiveDiffDisplay = union(enum) {
     loaded: struct {
+        file_index: usize,
         file: diff_parser.FileDiff,
         line_index: ?diff_view_model.RenderedLineIndex,
         folded_hunks: []const bool,
@@ -161,6 +162,13 @@ pub const ActiveDiffDisplay = union(enum) {
         return switch (self) {
             .loaded => |loaded| loaded.staged_flags,
             .combined_projection => |projection| projection.staged_flags,
+        };
+    }
+
+    pub fn loadedFileIndex(self: ActiveDiffDisplay) ?usize {
+        return switch (self) {
+            .loaded => |loaded| loaded.file_index,
+            .combined_projection => null,
         };
     }
 };
@@ -5481,6 +5489,7 @@ pub const App = struct {
         const file_index = self.selectedFileIndex(loaded) orelse return null;
         const file = loaded.document.files[file_index];
         return .{ .loaded = .{
+            .file_index = file_index,
             .file = file,
             .line_index = loaded.cachedRenderedLineIndex(file_index, mode),
             .folded_hunks = loaded.foldedHunksForFile(file_index),
