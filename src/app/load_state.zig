@@ -27,6 +27,19 @@ pub const StatusSnapshotReplaceDecision = enum {
     skip_identical,
 };
 
+pub const PendingReloadConsumptionDecision = enum {
+    no_pending_reload,
+    preserve_generation_mismatch,
+    consume_generation_match,
+};
+
+pub const WatchReloadRebuildDecision = enum {
+    rebuild_not_watch,
+    rebuild_no_current_loaded,
+    rebuild_text_changed,
+    skip_rebuild_identical_text,
+};
+
 pub const PendingLoad = union(enum) {
     repo_discovery: u64,
     diff_load: u64,
@@ -91,6 +104,36 @@ pub fn statusSnapshotReplaceDecision(
     if (!std.mem.eql(u8, root, result_repo_root)) return .replace_root_mismatch;
     if (!documents_equal) return .replace_changed;
     return .skip_identical;
+}
+
+/// Decide whether App may transfer ownership of pending reload metadata.
+///
+/// The decision lives here so generation-match policy has one implementation.
+/// The actual `PendingReload` value stays in App because it owns allocator-backed
+/// anchor state and visible restoration context.
+pub fn pendingReloadConsumption(
+    pending_generation: ?u64,
+    result_generation: u64,
+) PendingReloadConsumptionDecision {
+    const generation = pending_generation orelse return .no_pending_reload;
+    if (generation != result_generation) return .preserve_generation_mismatch;
+    return .consume_generation_match;
+}
+
+/// Decide whether an accepted loaded diff result should rebuild the session.
+///
+/// App computes text equality and performs any visible mutation. A non-consumed
+/// pending reload is represented as `consumed_pending_is_watch = false`, keeping
+/// this helper independent of App-owned `ReloadKind` and `PendingReload`.
+pub fn watchReloadRebuildDecision(
+    consumed_pending_is_watch: bool,
+    has_current_loaded: bool,
+    texts_equal: bool,
+) WatchReloadRebuildDecision {
+    if (!consumed_pending_is_watch) return .rebuild_not_watch;
+    if (!has_current_loaded) return .rebuild_no_current_loaded;
+    if (!texts_equal) return .rebuild_text_changed;
+    return .skip_rebuild_identical_text;
 }
 
 /// Runtime-owned load state for the active diff source.
@@ -293,5 +336,39 @@ test "statusSnapshotReplaceDecision names every replace and skip reason" {
     try std.testing.expectEqual(
         StatusSnapshotReplaceDecision.skip_identical,
         statusSnapshotReplaceDecision(false, false, "/repo", "/repo", true),
+    );
+}
+
+test "pendingReloadConsumption preserves ownership unless generations match" {
+    try std.testing.expectEqual(
+        PendingReloadConsumptionDecision.no_pending_reload,
+        pendingReloadConsumption(null, 3),
+    );
+    try std.testing.expectEqual(
+        PendingReloadConsumptionDecision.preserve_generation_mismatch,
+        pendingReloadConsumption(2, 3),
+    );
+    try std.testing.expectEqual(
+        PendingReloadConsumptionDecision.consume_generation_match,
+        pendingReloadConsumption(3, 3),
+    );
+}
+
+test "watchReloadRebuildDecision skips only consumed watch reload with identical text" {
+    try std.testing.expectEqual(
+        WatchReloadRebuildDecision.rebuild_not_watch,
+        watchReloadRebuildDecision(false, true, true),
+    );
+    try std.testing.expectEqual(
+        WatchReloadRebuildDecision.rebuild_no_current_loaded,
+        watchReloadRebuildDecision(true, false, true),
+    );
+    try std.testing.expectEqual(
+        WatchReloadRebuildDecision.rebuild_text_changed,
+        watchReloadRebuildDecision(true, true, false),
+    );
+    try std.testing.expectEqual(
+        WatchReloadRebuildDecision.skip_rebuild_identical_text,
+        watchReloadRebuildDecision(true, true, true),
     );
 }

@@ -1236,10 +1236,17 @@ pub const App = struct {
     }
 
     fn takePendingReloadIfGeneration(self: *App, generation: u64) ?PendingReload {
-        const pending = self.pending_reload orelse return null;
-        if (pending.generation != generation) return null;
-        self.pending_reload = null;
-        return pending;
+        const pending_generation = if (self.pending_reload) |pending| pending.generation else null;
+        switch (app_load_state.pendingReloadConsumption(pending_generation, generation)) {
+            .consume_generation_match => {
+                const pending = self.pending_reload.?;
+                self.pending_reload = null;
+                return pending;
+            },
+            .no_pending_reload,
+            .preserve_generation_mismatch,
+            => return null,
+        }
     }
 
     fn clearPendingReloadIfGeneration(self: *App, allocator: std.mem.Allocator, generation: u64) void {
@@ -3660,19 +3667,29 @@ pub const App = struct {
                 can_project_status = true;
             },
             .loaded => |*bundle| {
-                if (pending_reload) |*pending| {
-                    if (pending.kind == .watch) {
-                        if (self.activeLoadedDiffConst()) |current_loaded| {
-                            if (std.mem.eql(u8, current_loaded.text, bundle.loaded.text)) {
-                                const prefer_first_visible_file = !had_loaded_before and !had_pending_restore;
-                                if (prefer_first_visible_file and self.status_load_pending != null) {
-                                    self.pending_initial_first_visible_selection = true;
-                                }
-                                try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
-                                return;
-                            }
+                const current_loaded = self.activeLoadedDiffConst();
+                const consumed_pending_is_watch = if (pending_reload) |pending| pending.kind == .watch else false;
+                const texts_equal = consumed_pending_is_watch and if (current_loaded) |loaded|
+                    std.mem.eql(u8, loaded.text, bundle.loaded.text)
+                else
+                    false;
+                switch (app_load_state.watchReloadRebuildDecision(
+                    consumed_pending_is_watch,
+                    current_loaded != null,
+                    texts_equal,
+                )) {
+                    .skip_rebuild_identical_text => {
+                        const prefer_first_visible_file = !had_loaded_before and !had_pending_restore;
+                        if (prefer_first_visible_file and self.status_load_pending != null) {
+                            self.pending_initial_first_visible_selection = true;
                         }
-                    }
+                        try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
+                        return;
+                    },
+                    .rebuild_not_watch,
+                    .rebuild_no_current_loaded,
+                    .rebuild_text_changed,
+                    => {},
                 }
 
                 self.clearLoadedDiff();
