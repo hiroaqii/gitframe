@@ -4095,6 +4095,7 @@ pub const App = struct {
     }
 
     fn applyStatusProjection(self: *App, allocator: std.mem.Allocator, prefer_first_visible_file: bool) !void {
+        if (self.allocator == null) self.allocator = allocator;
         if (!diff_source.sourceAllowsStageProjection(self.config.source)) return;
 
         const status_document = self.git_status.document;
@@ -4102,6 +4103,12 @@ pub const App = struct {
             if (self.pending_selection_restore != null and
                 (self.load.hasPending() or self.status_load_pending != null)) return;
             if (self.activeLoadedDiff()) |loaded| {
+                if (loadedDiffIsStatusOnly(loaded)) {
+                    self.clearLoadedDiff();
+                    self.load.replaceEmpty(allocator, .no_changes);
+                    self.clearPendingSelectionRestore(allocator);
+                    return;
+                }
                 if (self.restorePendingSelectionByPath(allocator, loaded)) return;
             }
             self.clearPendingSelectionRestore(allocator);
@@ -4121,6 +4128,10 @@ pub const App = struct {
             },
             else => {},
         }
+    }
+
+    fn loadedDiffIsStatusOnly(loaded: *const LoadedDiff) bool {
+        return loaded.document.files.len == 0;
     }
 
     fn rebuildLoadedTreeWithStatus(self: *App, app_allocator: std.mem.Allocator, loaded: *LoadedDiff, prefer_first_visible_file: bool) !void {
@@ -12317,6 +12328,122 @@ test "finishDiffLoad projects earlier status snapshot into empty diff" {
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(usize, 0), loaded.tree.nodes[1].target.status_entry);
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target);
+}
+
+test "clean loaded status tears down status-only session after empty diff" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .load = .{ .generation = 2 },
+        .status_load_generation = 7,
+        .status_load_pending = 7,
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(allocator);
+    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
+    try app.git_status.replace("/repo", &current);
+    try app.createStatusOnlyLoadedSession(allocator, app.git_status.document);
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .empty,
+    });
+
+    try std.testing.expect(app.loadedDiff() != null);
+    try std.testing.expectEqual(@as(usize, 0), app.loadedDiff().?.document.files.len);
+
+    const clean = try git_status.StatusBundle.parseOwned(allocator, "");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 7,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = clean },
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), app.git_status.document.entries.len);
+    try std.testing.expect(app.loadedDiff() == null);
+    try std.testing.expect(app.load.state == .empty);
+    try std.testing.expectEqual(EmptyReason.no_changes, app.load.state.empty);
+}
+
+test "empty status result tears down status-only session after empty diff" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .load = .{ .generation = 2 },
+        .status_load_generation = 7,
+        .status_load_pending = 7,
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(allocator);
+    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
+    try app.git_status.replace("/repo", &current);
+    try app.createStatusOnlyLoadedSession(allocator, app.git_status.document);
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .empty,
+    });
+
+    try std.testing.expect(app.loadedDiff() != null);
+
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 7,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .empty,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), app.git_status.document.entries.len);
+    try std.testing.expect(app.loadedDiff() == null);
+    try std.testing.expect(app.load.state == .empty);
+    try std.testing.expectEqual(EmptyReason.no_changes, app.load.state.empty);
+}
+
+test "identical staged-only status keeps status-only session after empty diff" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .load = .{ .generation = 2 },
+        .status_load_generation = 7,
+        .status_load_pending = 7,
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(allocator);
+    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
+    try app.git_status.replace("/repo", &current);
+    try app.createStatusOnlyLoadedSession(allocator, app.git_status.document);
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .empty,
+    });
+
+    const loaded_after_diff = app.loadedDiff() orelse return error.ExpectedLoadedDiff;
+    try std.testing.expectEqual(@as(usize, 0), loaded_after_diff.document.files.len);
+    try std.testing.expectEqual(@as(usize, 1), app.git_status.document.entries.len);
+
+    const same = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 7,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = same },
+    });
+
+    const loaded_after_status = app.loadedDiff() orelse return error.ExpectedLoadedDiff;
+    try std.testing.expectEqual(@as(usize, 0), loaded_after_status.document.files.len);
+    try std.testing.expect(loaded_after_status.visibleNodeCount() > 0);
+    try std.testing.expectEqual(@as(usize, 1), app.git_status.document.entries.len);
 }
 
 test "finishRepoDiscovery records no repository as empty state" {
