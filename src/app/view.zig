@@ -868,7 +868,7 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
             .width = width - draw_col,
             .height = 1,
         });
-        _ = ui.key_hint.draw(&hint_area, 0, 0, hint_items, footerKeyHintOptions(app.theme));
+        _ = ui.key_hint.draw(&hint_area, 0, 0, hint_items, footerKeyHintOptions(app.theme)) catch {};
     }
 }
 
@@ -1247,7 +1247,7 @@ fn drawRepoPickerFooter(surface: *chasen.Surface, row: u16, input_mode: anytype,
     };
 
     const opts = footerKeyHintOptions(palette);
-    _ = ui.key_hint.draw(surface, 0, row, items, opts);
+    _ = ui.key_hint.draw(surface, 0, row, items, opts) catch {};
 }
 
 fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
