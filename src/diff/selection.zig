@@ -54,6 +54,32 @@ pub const Identity = union(enum) {
     }
 };
 
+pub const HeaderKind = enum {
+    loaded_file,
+    generated_file,
+    projection_file,
+};
+
+pub const HeaderIdentity = struct {
+    kind: HeaderKind,
+    /// Borrowed from the active loaded/projection arena. Active selections must
+    /// be cleared before the owning session/projection is destroyed or replaced.
+    path_key: []const u8,
+
+    pub fn eql(self: HeaderIdentity, other: HeaderIdentity) bool {
+        return self.kind == other.kind and std.mem.eql(u8, self.path_key, other.path_key);
+    }
+};
+
+pub const HeaderPathSelection = struct {
+    identity: HeaderIdentity,
+    moved: bool = false,
+
+    pub fn update(self: *HeaderPathSelection) void {
+        self.moved = true;
+    }
+};
+
 pub const DragSelection = struct {
     identity: Identity,
     side: Side,
@@ -98,11 +124,27 @@ pub const DragSelection = struct {
 pub const Owner = union(enum) {
     none,
     diff: DragSelection,
+    diff_header: HeaderPathSelection,
 
     pub fn activeDiff(self: Owner) ?DragSelection {
         return switch (self) {
             .none => null,
             .diff => |selection| selection,
+            .diff_header => null,
+        };
+    }
+
+    pub fn activeHeader(self: Owner) ?HeaderPathSelection {
+        return switch (self) {
+            .none, .diff => null,
+            .diff_header => |selection| selection,
+        };
+    }
+
+    pub fn activeMouseSelection(self: Owner) bool {
+        return switch (self) {
+            .none => false,
+            .diff, .diff_header => true,
         };
     }
 };

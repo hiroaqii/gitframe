@@ -26,6 +26,7 @@ pub const RenderOptions = struct {
     file_index: usize = 0,
     syntax_spans: syntax_provider.DocumentSpans = .empty(),
     selection: ?diff_selection.View = null,
+    header_selection: bool = false,
 };
 
 pub const SideBySideRegion = struct {
@@ -51,6 +52,21 @@ pub const SideBySideGeometry = struct {
 
 pub const FileStats = diff_file.Stats;
 
+pub const HeaderRegion = struct {
+    col: u16,
+    width: u16,
+
+    pub fn contains(self: HeaderRegion, col: u16) bool {
+        return col >= self.col and col < self.col + self.width;
+    }
+};
+
+pub const HeaderLayout = struct {
+    prefix: ?HeaderRegion = null,
+    path_target: ?HeaderRegion = null,
+    summary: ?HeaderRegion = null,
+};
+
 pub fn effectiveMode(width: u16, requested_mode: DisplayMode) DisplayMode {
     if (requested_mode == .side_by_side and width < side_by_side_min_width) return .unified;
     return requested_mode;
@@ -68,6 +84,78 @@ pub fn fileStats(file: diff_parser.FileDiff) FileStats {
 
 pub fn displayPath(file: diff_parser.FileDiff) []const u8 {
     return diff_file.displayPath(file);
+}
+
+pub fn fileHeaderSummaryWidth(file: diff_parser.FileDiff, requested_mode: DisplayMode, mode_width: u16) u16 {
+    const stats = fileStats(file);
+    const len = std.fmt.count("{s}  +{d} -{d}  {d} hunks", .{
+        modeLabel(mode_width, requested_mode),
+        stats.added,
+        stats.removed,
+        file.hunks.len,
+    });
+    return @intCast(@min(len, std.math.maxInt(u16)));
+}
+
+pub fn generatedHeaderSummaryWidth(added_lines: usize, truncated: bool, requested_mode: DisplayMode, mode_width: u16) u16 {
+    const suffix = if (truncated) "  truncated" else "";
+    const len = std.fmt.count("{s}  +{d} -0  generated{s}", .{
+        modeLabel(mode_width, requested_mode),
+        added_lines,
+        suffix,
+    });
+    return @intCast(@min(len, std.math.maxInt(u16)));
+}
+
+pub fn headerLayout(width: u16, title_prefix: ?[]const u8, path: []const u8, summary_width: u16) HeaderLayout {
+    if (width == 0) return .{};
+
+    const right_padding: u16 = 1;
+    const path_area_width: u16 = if (width > summary_width + 2 + right_padding)
+        @intCast(width - summary_width - 2 - right_padding)
+    else
+        width;
+    var layout: HeaderLayout = .{};
+    if (path_area_width == 0) return layout;
+
+    if (width > summary_width + 2 + right_padding) {
+        const summary_col: u16 = @intCast(width - summary_width - right_padding);
+        layout.summary = .{ .col = summary_col, .width = summary_width };
+    }
+
+    const label = title_prefix orelse "";
+    if (label.len == 0) {
+        layout.path_target = visibleTailClippedPathRegion(0, path_area_width, path);
+        return layout;
+    }
+
+    const label_width = chasen.text.displayWidth(label);
+    const separator_width: u16 = 3;
+    if (label_width > 0) {
+        layout.prefix = .{ .col = 0, .width = @intCast(@min(label_width, path_area_width)) };
+    }
+
+    const reserved_width = label_width + separator_width;
+    if (reserved_width >= path_area_width) return layout;
+
+    const path_col: u16 = @intCast(reserved_width);
+    layout.path_target = visibleTailClippedPathRegion(path_col, path_area_width - path_col, path);
+    return layout;
+}
+
+fn visibleTailClippedPathRegion(col: u16, available_width: u16, path: []const u8) ?HeaderRegion {
+    if (available_width == 0 or path.len == 0) return null;
+    const path_width = chasen.text.displayWidth(path);
+    if (path_width == 0) return null;
+    if (path_width <= available_width) {
+        return .{ .col = col, .width = @intCast(path_width) };
+    }
+
+    const marker_width: u16 = 2;
+    if (available_width <= marker_width) {
+        return .{ .col = col, .width = available_width };
+    }
+    return .{ .col = col, .width = available_width };
 }
 
 pub fn renderedBodyLineCount(file: diff_parser.FileDiff, mode: DisplayMode) usize {
@@ -103,7 +191,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     const styles = stylesForOptions(options);
     const content_width = bodyWidth(size.width);
     const mode = effectiveMode(content_width, options.requested_mode);
-    try renderFileHeader(surface, file, options.requested_mode, content_width, options.pane_active, options.title_prefix, styles);
+    try renderFileHeader(surface, file, options.requested_mode, content_width, options.pane_active, options.title_prefix, options.header_selection, styles);
     var body_surface = surface.child(.{
         .col = cursor_gutter_width,
         .row = 0,
@@ -176,7 +264,7 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, line
     const styles = stylesForOptions(options);
     const content_width = bodyWidth(size.width);
     const mode = effectiveMode(content_width, options.requested_mode);
-    try renderGeneratedFileHeader(surface, path, lines.len, truncated, options.requested_mode, content_width, options.pane_active, options.title_prefix, styles);
+    try renderGeneratedFileHeader(surface, path, lines.len, truncated, options.requested_mode, content_width, options.pane_active, options.title_prefix, options.header_selection, styles);
     var body_surface = surface.child(.{
         .col = cursor_gutter_width,
         .row = 0,
@@ -228,6 +316,7 @@ fn renderFileHeader(
     mode_width: u16,
     pane_active: bool,
     title_prefix: ?[]const u8,
+    header_selected: bool,
     styles: RenderStyles,
 ) !void {
     const stats = fileStats(file);
@@ -237,7 +326,7 @@ fn renderFileHeader(
         stats.removed,
         file.hunks.len,
     });
-    try drawHeaderLine(surface, title_prefix, displayPath(file), summary, pane_active, styles);
+    try drawHeaderLine(surface, title_prefix, displayPath(file), summary, pane_active, header_selected, styles);
 }
 
 fn renderGeneratedFileHeader(
@@ -249,6 +338,7 @@ fn renderGeneratedFileHeader(
     mode_width: u16,
     pane_active: bool,
     title_prefix: ?[]const u8,
+    header_selected: bool,
     styles: RenderStyles,
 ) !void {
     const suffix = if (truncated) "  truncated" else "";
@@ -257,30 +347,46 @@ fn renderGeneratedFileHeader(
         added_lines,
         suffix,
     });
-    try drawHeaderLine(surface, title_prefix, path, summary, pane_active, styles);
+    try drawHeaderLine(surface, title_prefix, path, summary, pane_active, header_selected, styles);
 }
 
-fn drawHeaderLine(surface: *chasen.Surface, title_prefix: ?[]const u8, path: []const u8, summary: []const u8, pane_active: bool, styles: RenderStyles) !void {
+fn drawHeaderLine(surface: *chasen.Surface, title_prefix: ?[]const u8, path: []const u8, summary: []const u8, pane_active: bool, header_selected: bool, styles: RenderStyles) !void {
     const size = surface.size();
     if (size.width == 0) return;
 
     const summary_width = chasen.text.displayWidth(summary);
-    const right_padding: u16 = 1;
-    if (size.width > summary_width + 2 + right_padding) {
-        const path_width: u16 = @intCast(size.width - summary_width - 2 - right_padding);
+    const layout = headerLayout(size.width, title_prefix, path, summary_width);
+
+    if (layout.summary) |summary_region| {
+        const path_width = summary_region.col -| 2;
         var path_area = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
         try drawHeaderPath(&path_area, title_prefix, path, fileHeaderStyle(pane_active, styles));
 
-        const summary_col: u16 = @intCast(size.width - summary_width - right_padding);
-        try draw.copyClippedTextAt(surface, summary_col, 0, summary, styles.metadata);
+        try draw.copyClippedTextAt(surface, summary_region.col, 0, summary, styles.metadata);
+        if (header_selected) {
+            if (layout.path_target) |region| applyHeaderRegionStyle(surface, region, styles.selection);
+        }
         return;
     }
 
     try drawHeaderPath(surface, title_prefix, path, fileHeaderStyle(pane_active, styles));
+    if (header_selected) {
+        if (layout.path_target) |region| applyHeaderRegionStyle(surface, region, styles.selection);
+    }
 }
 
 fn drawHeaderPath(surface: *chasen.Surface, title_prefix: ?[]const u8, path: []const u8, style: chasen.TextStyle) !void {
     try draw.copyPrefixedTailClippedPathAt(surface, 0, 0, title_prefix, path, style);
+}
+
+fn applyHeaderRegionStyle(surface: *chasen.Surface, region: HeaderRegion, style: chasen.TextStyle) void {
+    var col = region.col;
+    const end = @min(surface.size().width, region.col + region.width);
+    while (col < end) : (col += 1) {
+        var cell = surface.readCell(col, 0) orelse continue;
+        cell.style.bg = style.bg;
+        surface.writeCell(col, 0, cell);
+    }
 }
 
 fn drawHunkHeader(surface: *chasen.Surface, row: u16, header: []const u8, style: chasen.TextStyle, mode: DisplayMode, styles: RenderStyles) !void {
@@ -1842,6 +1948,46 @@ test "header clipping preserves repo prefix" {
     try ts.expectCellText(10, 0, " ");
     try ts.expectCellText(11, 0, "…");
     try ts.expectCellText(23, 0, "g");
+}
+
+test "headerLayout separates prefix from path target" {
+    const layout = headerLayout(40, "gitframe", "src/main.zig", 0);
+    try std.testing.expect(layout.prefix != null);
+    try std.testing.expect(layout.path_target != null);
+    try std.testing.expect(layout.prefix.?.contains(0));
+    try std.testing.expect(!layout.path_target.?.contains(0));
+    try std.testing.expect(layout.path_target.?.contains(11));
+}
+
+test "headerLayout disables path target when prefix consumes narrow width" {
+    const layout = headerLayout(8, "gitframe", "src/main.zig", 0);
+    try std.testing.expect(layout.prefix != null);
+    try std.testing.expect(layout.path_target == null);
+}
+
+test "header selection highlights path without highlighting prefix" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 5);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{},
+    };
+
+    try renderFile(&ts.surface, file, .{
+        .title_prefix = "gitframe",
+        .header_selection = true,
+    });
+
+    const prefix_cell = ts.surface.readCell(0, 0).?;
+    const path_cell = ts.surface.readCell(11, 0).?;
+    const selection_bg = theme.Palette.default().color(.diff_cursor);
+    try std.testing.expect(!prefix_cell.style.bg.eql(selection_bg));
+    try std.testing.expect(path_cell.style.bg.eql(selection_bg));
 }
 
 test "unified horizontal scroll keeps line numbers and prefix fixed" {

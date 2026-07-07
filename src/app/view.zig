@@ -502,6 +502,7 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         .file_index = display.loadedFileIndex() orelse 0,
         .syntax_spans = if (display.loadedFileIndex() != null) loaded.syntax_spans else .empty(),
         .selection = app.diffSelectionView(),
+        .header_selection = app.diffHeaderSelectionActive(),
     });
     drawDiffHeaderDetailRow(app, surface, active);
     drawSearchMatchMarker(app, surface);
@@ -559,6 +560,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                 .palette = app.theme,
                 .file_index = 0,
                 .syntax_spans = bundle.loaded.syntax_spans,
+                .header_selection = app.diffHeaderSelectionActive(),
             });
             drawPaneHeaderRule(surface, active, app.theme);
             return;
@@ -575,6 +577,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
             .line_numbers = app.viewer.view_options.line_numbers,
             .cursor_offset = app.visibleDiffCursorOffset(),
             .palette = app.theme,
+            .header_selection = app.diffHeaderSelectionActive(),
         });
         drawPaneHeaderRule(surface, active, app.theme);
         return;
@@ -944,7 +947,7 @@ const FooterSegments = struct {
     }
 };
 
-fn repoHeaderLabel(app: anytype) ?[]const u8 {
+pub fn repoHeaderLabel(app: anytype) ?[]const u8 {
     const root = app.repo_state.activeRoot() orelse return null;
     const base = std.fs.path.basename(root);
     if (base.len == 0) return root;

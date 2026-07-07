@@ -130,6 +130,11 @@ const DiffMouseHit = struct {
     point: diff_selection.Point,
 };
 
+const DiffHeaderTarget = struct {
+    identity: diff_selection.HeaderIdentity,
+    display_path: []const u8,
+};
+
 pub const ActiveDiffDisplay = union(enum) {
     loaded: struct {
         file_index: usize,
@@ -900,6 +905,12 @@ pub const App = struct {
         return selection.view();
     }
 
+    pub fn diffHeaderSelectionActive(self: *const App) bool {
+        const selection = self.selection_owner.activeHeader() orelse return false;
+        _ = self.displayedDiffHeaderTarget(selection.identity) orelse return false;
+        return true;
+    }
+
     pub fn handleEvent(self: *const App, event: chasen.Event) ?Msg {
         return switch (event) {
             .mouse => |mouse| self.mouseToMsg(mouse),
@@ -908,8 +919,7 @@ pub const App = struct {
     }
 
     fn mouseToMsg(self: *const App, mouse: anytype) ?Msg {
-        const active_diff_drag = self.selection_owner.activeDiff() != null;
-        if (active_diff_drag) {
+        if (self.selection_owner.activeMouseSelection()) {
             switch (mouse.type) {
                 .drag => return .{ .mouse_diff_drag = self.bodyMousePoint(mouse) },
                 .release => return .{ .mouse_diff_release = self.bodyMousePoint(mouse) },
@@ -988,6 +998,10 @@ pub const App = struct {
 
     fn pressDiffMouse(self: *App, point: MousePoint) void {
         self.viewer.focus = .diff;
+        if (self.diffHeaderMouseHit(point)) |hit| {
+            self.selection_owner = .{ .diff_header = .{ .identity = hit.identity } };
+            return;
+        }
         const hit = self.diffMouseHit(point) orelse {
             self.clearDiffSelection();
             return;
@@ -999,6 +1013,7 @@ pub const App = struct {
         const point = point_opt orelse return;
         switch (self.selection_owner) {
             .none => return,
+            .diff_header => |*selection| selection.update(),
             .diff => |*selection| {
                 const hit = self.diffMouseHit(point) orelse return;
                 if (!selection.identity.eql(hit.identity)) return;
@@ -1009,13 +1024,16 @@ pub const App = struct {
 
     fn releaseDiffMouse(self: *App, ctx: *chasen.Ctx(Msg), point_opt: ?MousePoint) !void {
         _ = point_opt;
-        const selection = switch (self.selection_owner) {
-            .none => return,
-            .diff => |selection| selection,
-        };
+        const owner = self.selection_owner;
         self.clearDiffSelection();
-        if (!selection.moved) return;
-        try self.copyDiffSelection(ctx, selection);
+        switch (owner) {
+            .none => return,
+            .diff => |selection| {
+                if (!selection.moved) return;
+                try self.copyDiffSelection(ctx, selection);
+            },
+            .diff_header => |selection| self.copyDiffHeaderPath(ctx, selection),
+        }
     }
 
     fn clearDiffSelection(self: *App) void {
@@ -1058,6 +1076,77 @@ pub const App = struct {
             .folded_hunks = loaded.foldedHunksForFile(file_index),
             .identity = current_identity,
         };
+    }
+
+    fn displayedDiffHeaderTarget(self: *const App, expected: ?diff_selection.HeaderIdentity) ?DiffHeaderTarget {
+        const target: DiffHeaderTarget = blk: {
+            if (self.activeGeneratedFileProjection()) |bundle| {
+                break :blk .{
+                    .identity = .{ .kind = .generated_file, .path_key = bundle.file.path },
+                    .display_path = bundle.file.path,
+                };
+            }
+            if (self.activeCombinedProjection()) |bundle| {
+                const path_key = diff_file.canonicalPathKey(bundle.projection.file) orelse return null;
+                break :blk .{
+                    .identity = .{ .kind = .projection_file, .path_key = path_key },
+                    .display_path = diff_file.displayPath(bundle.projection.file),
+                };
+            }
+            if (self.activeCachedDiffProjection()) |bundle| {
+                if (bundle.loaded.document.files.len == 0) return null;
+                const file = bundle.loaded.document.files[0];
+                const path_key = diff_file.canonicalPathKey(file) orelse return null;
+                break :blk .{
+                    .identity = .{ .kind = .projection_file, .path_key = path_key },
+                    .display_path = diff_file.displayPath(file),
+                };
+            }
+
+            const loaded = self.activeLoadedDiffConst() orelse return null;
+            const file_index = self.selectedFileIndex(loaded) orelse return null;
+            if (file_index >= loaded.document.files.len) return null;
+            const file = loaded.document.files[file_index];
+            const path_key = diff_file.canonicalPathKey(file) orelse return null;
+            break :blk .{
+                .identity = .{ .kind = .loaded_file, .path_key = path_key },
+                .display_path = diff_file.displayPath(file),
+            };
+        };
+
+        if (expected) |identity| {
+            if (!identity.eql(target.identity)) return null;
+        }
+        return target;
+    }
+
+    fn diffHeaderMouseHit(self: *const App, point: MousePoint) ?DiffHeaderTarget {
+        const target = self.displayedDiffHeaderTarget(null) orelse return null;
+        const raw_diff = self.rawDiffPaneGeometry() orelse return null;
+        if (point.col < raw_diff.col or point.col >= raw_diff.col + raw_diff.width) return null;
+        if (point.row != 0) return null;
+
+        const local_col = point.col - raw_diff.col;
+        const content_width = contentWidth(raw_diff.width);
+        const content_gutter = raw_diff.width - content_width;
+        if (local_col < content_gutter) return null;
+        const render_col = local_col - content_gutter;
+        if (render_col >= content_width) return null;
+
+        const summary_width = self.displayedDiffHeaderSummaryWidth(content_width) orelse return null;
+        const layout = diff_render.headerLayout(content_width, app_view.repoHeaderLabel(self), target.display_path, summary_width);
+        const path_target = layout.path_target orelse return null;
+        if (!path_target.contains(render_col)) return null;
+        return target;
+    }
+
+    fn displayedDiffHeaderSummaryWidth(self: *const App, content_width: u16) ?u16 {
+        const mode_width = diff_render.bodyWidth(content_width);
+        if (self.activeGeneratedFileProjection()) |bundle| {
+            return diff_render.generatedHeaderSummaryWidth(bundle.file.lines.len, bundle.file.truncated, self.viewer.display_mode, mode_width);
+        }
+        const file = self.displayedDiffFile() orelse return null;
+        return diff_render.fileHeaderSummaryWidth(file, self.viewer.display_mode, mode_width);
     }
 
     fn diffMouseHit(self: *const App, point: MousePoint) ?DiffMouseHit {
@@ -3859,6 +3948,13 @@ pub const App = struct {
         } };
     }
 
+    fn copyDiffHeaderPathDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
+        return .{ .clipboard_copy_finished = .{
+            .label = "file path",
+            .outcome = clipboardCopyOutcome(result.outcome),
+        } };
+    }
+
     fn clipboardCopyOutcome(outcome: chasen.Ctx(Msg).ClipboardCopyOutcome) ClipboardCopyOutcome {
         return switch (outcome) {
             .sent => .sent,
@@ -3912,6 +4008,14 @@ pub const App = struct {
             .label = "diff selection",
             .text = text,
         }, copyDiffSelectionDone);
+    }
+
+    fn copyDiffHeaderPath(self: *App, ctx: *chasen.Ctx(Msg), selection: diff_selection.HeaderPathSelection) void {
+        const target = self.displayedDiffHeaderTarget(selection.identity) orelse return;
+        self.queueClipboardCopy(ctx, .{
+            .label = "file path",
+            .text = target.display_path,
+        }, copyDiffHeaderPathDone);
     }
 
     fn queueClipboardCopy(
@@ -7100,6 +7204,31 @@ test "diff mouse drag starts on selected side and updates on drag only" {
     try std.testing.expectEqual(diff_selection.Side.old, dragged.side);
     try std.testing.expectEqual(@as(usize, 2), dragged.focus.line_index);
     try std.testing.expect(dragged.moved);
+}
+
+test "diff header mouse press starts header path owner only on path target" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 10 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .viewer = .{
+            .display_mode = .side_by_side,
+            .sidebar_hidden = true,
+        },
+    };
+
+    app.pressDiffMouse(.{ .col = 1, .row = 0 });
+    const header = app.selection_owner.activeHeader() orelse return error.ExpectedHeaderSelection;
+    try std.testing.expectEqual(diff_selection.HeaderKind.loaded_file, header.identity.kind);
+    try std.testing.expectEqualStrings("a", header.identity.path_key);
+
+    app.dragDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(app.selection_owner.activeHeader() != null);
+    try std.testing.expect(app.selection_owner.activeDiff() == null);
+
+    app.clearDiffSelection();
+    app.pressDiffMouse(.{ .col = 120, .row = 0 });
+    try std.testing.expect(app.selection_owner.activeHeader() == null);
+    try std.testing.expect(app.selection_owner.activeDiff() == null);
 }
 
 test "diff mouse drag rejects unified fallback and clears on invalidation" {
