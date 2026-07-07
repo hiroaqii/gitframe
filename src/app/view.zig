@@ -1082,7 +1082,6 @@ fn repoPickerLayout(height: u16, has_path_status: bool) RepoPickerLayout {
 }
 
 fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
-    const modal = ui.Modal.init(.{});
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, repo_picker_dialog_width),
         .dialog_height = @min(surface.size().height, 18),
@@ -1091,12 +1090,10 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
         .border = .rounded,
         .title_style = boldRoleStyle(app.theme, .accent),
     };
-    fillModalDialog(surface, opts);
-    modal.view(surface, opts);
-
-    const content_rect = ui.Modal.contentRect(surface, opts);
-    if (content_rect.width == 0 or content_rect.height == 0) return;
-    var content = surface.child(content_rect);
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
     const size = content.size();
 
     switch (app.repo_picker.input_mode) {
@@ -1251,7 +1248,6 @@ fn drawRepoPickerFooter(surface: *chasen.Surface, row: u16, input_mode: anytype,
 }
 
 fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
-    const modal = ui.Modal.init(.{});
     const title_style: chasen.TextStyle = if (app.commit_panel.mode == .amend)
         boldRoleStyle(app.theme, .amend)
     else
@@ -1264,12 +1260,10 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
         .border = .rounded,
         .title_style = title_style,
     };
-    fillModalDialog(surface, opts);
-    modal.view(surface, opts);
-
-    const content_rect = ui.Modal.contentRect(surface, opts);
-    if (content_rect.width == 0 or content_rect.height == 0) return;
-    var content = surface.child(content_rect);
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
     const size = content.size();
 
     const staged_text = try stagedSummaryText(content.frameAllocator(), app.stagedSummaryForActiveRepo());
@@ -1393,7 +1387,6 @@ fn viewCommitBody(body: *const app_commit_panel.BodyText, surface: *chasen.Surfa
 
 fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
     const confirmation = app.discard_confirmation orelse return;
-    const modal = ui.Modal.init(.{});
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, confirmation_dialog_width),
         .dialog_height = @min(surface.size().height, confirmation_dialog_height),
@@ -1403,12 +1396,10 @@ fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
         .title_style = boldRoleStyle(app.theme, .danger),
         .border_style = roleStyle(app.theme, .danger),
     };
-    fillModalDialog(surface, opts);
-    modal.view(surface, opts);
-
-    const content_rect = ui.Modal.contentRect(surface, opts);
-    if (content_rect.width == 0 or content_rect.height == 0) return;
-    var content = surface.child(content_rect);
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
     const size = content.size();
 
     try drawCenteredText(&content, 0, "This will discard unstaged tracked changes.", roleStyle(app.theme, .danger));
@@ -1422,7 +1413,6 @@ fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
 
 fn viewAmendConfirmation(app: anytype, surface: *chasen.Surface) !void {
     _ = app.amend_confirmation orelse return;
-    const modal = ui.Modal.init(.{});
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, confirmation_dialog_width),
         .dialog_height = @min(surface.size().height, confirmation_dialog_height),
@@ -1432,12 +1422,10 @@ fn viewAmendConfirmation(app: anytype, surface: *chasen.Surface) !void {
         .title_style = boldRoleStyle(app.theme, .amend),
         .border_style = roleStyle(app.theme, .amend),
     };
-    fillModalDialog(surface, opts);
-    modal.view(surface, opts);
-
-    const content_rect = ui.Modal.contentRect(surface, opts);
-    if (content_rect.width == 0 or content_rect.height == 0) return;
-    var content = surface.child(content_rect);
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
     const size = content.size();
 
     const line_count: u16 = 3;
@@ -1450,7 +1438,6 @@ fn viewAmendConfirmation(app: anytype, surface: *chasen.Surface) !void {
 
 fn viewPushConfirmation(app: anytype, surface: *chasen.Surface) !void {
     const confirmation = app.push_confirmation orelse return;
-    const modal = ui.Modal.init(.{});
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, confirmation_dialog_width),
         .dialog_height = @min(surface.size().height, confirmation_dialog_height),
@@ -1460,12 +1447,10 @@ fn viewPushConfirmation(app: anytype, surface: *chasen.Surface) !void {
         .title_style = boldRoleStyle(app.theme, .accent),
         .border_style = roleStyle(app.theme, .accent),
     };
-    fillModalDialog(surface, opts);
-    modal.view(surface, opts);
-
-    const content_rect = ui.Modal.contentRect(surface, opts);
-    if (content_rect.width == 0 or content_rect.height == 0) return;
-    var content = surface.child(content_rect);
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
     const size = content.size();
 
     const target = try std.fmt.allocPrint(content.frameAllocator(), "{s} -> {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
@@ -1489,7 +1474,6 @@ fn viewPushConfirmation(app: anytype, surface: *chasen.Surface) !void {
 
 fn viewPullConfirmation(app: anytype, surface: *chasen.Surface) !void {
     const confirmation = app.pull_confirmation orelse return;
-    const modal = ui.Modal.init(.{});
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, confirmation_dialog_width),
         .dialog_height = @min(surface.size().height, confirmation_dialog_height),
@@ -1499,12 +1483,10 @@ fn viewPullConfirmation(app: anytype, surface: *chasen.Surface) !void {
         .title_style = boldRoleStyle(app.theme, .accent),
         .border_style = roleStyle(app.theme, .accent),
     };
-    fillModalDialog(surface, opts);
-    modal.view(surface, opts);
-
-    const content_rect = ui.Modal.contentRect(surface, opts);
-    if (content_rect.width == 0 or content_rect.height == 0) return;
-    var content = surface.child(content_rect);
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
     const size = content.size();
 
     const target = try std.fmt.allocPrint(content.frameAllocator(), "Fetch {s}, then fast-forward {s} if behind?", .{ confirmation.remote, confirmation.branch });
@@ -1524,7 +1506,6 @@ fn viewBranchSwitchPopup(app: anytype, surface: *chasen.Surface) !void {
     const state = app.branch_switch;
     if (!state.hasState()) return;
 
-    const modal = ui.Modal.init(.{});
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, branch_switch_dialog_width),
         .dialog_height = @min(surface.size().height, branch_switch_dialog_height),
@@ -1534,12 +1515,10 @@ fn viewBranchSwitchPopup(app: anytype, surface: *chasen.Surface) !void {
         .title_style = boldRoleStyle(app.theme, .accent),
         .border_style = roleStyle(app.theme, .accent),
     };
-    fillModalDialog(surface, opts);
-    modal.view(surface, opts);
-
-    const content_rect = ui.Modal.contentRect(surface, opts);
-    if (content_rect.width == 0 or content_rect.height == 0) return;
-    var content = surface.child(content_rect);
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
     const size = content.size();
     if (size.height == 0) return;
 
@@ -1586,7 +1565,6 @@ fn listWindowStart(selected: usize, len: usize, rows: u16) usize {
 
 fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
     const message = app.push_error_message orelse return;
-    const modal = ui.Modal.init(.{});
     const opts = pushErrorModalOptions(surface.size(), message);
 
     const opts_with_title: ui.Modal.ViewOptions = .{
@@ -1598,12 +1576,10 @@ fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
         .title_style = boldRoleStyle(app.theme, .danger),
         .border_style = roleStyle(app.theme, .danger),
     };
-    fillModalDialog(surface, opts_with_title);
-    modal.view(surface, opts_with_title);
-
-    const content_rect = ui.Modal.contentRect(surface, opts_with_title);
-    if (content_rect.width == 0 or content_rect.height == 0) return;
-    var content = surface.child(content_rect);
+    const frame = ui.Modal.frame(surface, opts_with_title) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
     const size = content.size();
 
     if (size.height > 0) {
@@ -1633,7 +1609,6 @@ fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
 
 fn viewPushCredentials(app: anytype, surface: *chasen.Surface) !void {
     const prompt = app.push_credential_prompt orelse return;
-    const modal = ui.Modal.init(.{});
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, confirmation_dialog_width),
         .dialog_height = @min(surface.size().height, 13),
@@ -1643,12 +1618,10 @@ fn viewPushCredentials(app: anytype, surface: *chasen.Surface) !void {
         .title_style = boldRoleStyle(app.theme, .accent),
         .border_style = roleStyle(app.theme, .accent),
     };
-    fillModalDialog(surface, opts);
-    modal.view(surface, opts);
-
-    const content_rect = ui.Modal.contentRect(surface, opts);
-    if (content_rect.width == 0 or content_rect.height == 0) return;
-    var content = surface.child(content_rect);
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
     const size = content.size();
 
     const target = try std.fmt.allocPrint(content.frameAllocator(), "{s} -> {s}/{s}", .{ prompt.target.branch, prompt.target.remote, prompt.target.remote_branch });
@@ -1705,7 +1678,7 @@ pub fn pushErrorMaxScroll(size: chasen.Size, message: ?[]const u8) usize {
 
 fn pushErrorContentSize(size: chasen.Size, message: []const u8) chasen.Size {
     const opts = pushErrorModalOptions(size, message);
-    return ui.Modal.contentSizeForOverlay(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, .{
+    return modalContentSizeForRect(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, .{
         .dialog_width = opts.dialog_width,
         .dialog_height = opts.dialog_height,
     });
@@ -1715,7 +1688,7 @@ fn modalHeightForContent(size: chasen.Size, dialog_width: u16, desired_content_h
     var candidate = @min(size.height, push_error_dialog_min_height);
     const overlay: chasen.Rect = .{ .col = 0, .row = 0, .width = size.width, .height = size.height };
     while (candidate < size.height) : (candidate += 1) {
-        const content_size = ui.Modal.contentSizeForOverlay(overlay, .{
+        const content_size = modalContentSizeForRect(overlay, .{
             .dialog_width = dialog_width,
             .dialog_height = candidate,
         });
@@ -1937,14 +1910,11 @@ fn appendFooterItem(
 }
 
 fn viewHelpPopup(app: anytype, surface: *chasen.Surface) !void {
-    const modal = ui.Modal.init(.{});
     const opts = helpModalOptions(surface.size(), app.theme);
-    fillModalDialog(surface, opts);
-    modal.view(surface, opts);
-
-    const content_rect = ui.Modal.contentRect(surface, opts);
-    if (content_rect.width == 0 or content_rect.height == 0) return;
-    var content = surface.child(content_rect);
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
     const size = content.size();
 
     _ = content.borrowTextAt(0, 0, "GitFrame shortcuts", .{ .bold = true });
@@ -1993,12 +1963,10 @@ fn viewHelpPopup(app: anytype, surface: *chasen.Surface) !void {
     try drawHelpSections(app, &right, &help_right_sections, scroll);
 }
 
-fn fillModalDialog(surface: *chasen.Surface, opts: ui.Modal.ViewOptions) void {
+fn fillModalDialog(frame: ui.Modal.Frame) void {
     // Keep the normal screen visible outside the dialog while still making the
     // dialog itself an opaque surface, so diff text never bleeds into modal UI.
-    const rect = ui.Modal.dialogRect(surface, opts);
-    if (rect.width == 0 or rect.height == 0) return;
-    var dialog = surface.child(rect);
+    var dialog = frame.dialogSurface();
     dialog.fillAll(.{
         .char = .{ .grapheme = " ", .width = 1 },
         .style = .{},
@@ -2023,7 +1991,13 @@ fn helpModalOptions(size: chasen.Size, palette: theme.Palette) ui.Modal.ViewOpti
 
 pub fn helpContentSize(size: chasen.Size) chasen.Size {
     const opts = helpModalOptions(size, .default());
-    return ui.Modal.contentSizeForOverlay(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, opts);
+    return modalContentSizeForRect(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, opts);
+}
+
+fn modalContentSizeForRect(overlay_rect: chasen.Rect, opts: ui.Modal.ViewOptions) chasen.Size {
+    const dialog_rect = ui.Modal.dialogRectFor(overlay_rect, opts);
+    const content_rect = ui.Modal.contentRectFor(dialog_rect, opts.padding);
+    return .{ .width = content_rect.width, .height = content_rect.height };
 }
 
 fn helpBodyLayout(size: chasen.Size) HelpBodyLayout {
@@ -2321,7 +2295,7 @@ test "help popup uses one column on narrow content" {
 test "help content size uses Modal overlay sizing" {
     const size = chasen.Size{ .width = 140, .height = 20 };
     const opts = helpModalOptions(size, .default());
-    const expected = ui.Modal.contentSizeForOverlay(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, opts);
+    const expected = modalContentSizeForRect(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, opts);
 
     try std.testing.expectEqual(expected, helpContentSize(size));
 }
