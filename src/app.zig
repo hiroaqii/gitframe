@@ -368,10 +368,27 @@ pub const App = struct {
     branch_switch_load_generation: u64 = 0,
     branch_switch_load_pending: ?u64 = null,
 
+    const ClipboardCopyOutcome = union(enum) {
+        sent,
+        unsupported_runtime,
+        write_failed: []const u8,
+    };
+
+    const ClipboardCopyFinished = struct {
+        label: []const u8,
+        outcome: ClipboardCopyOutcome,
+    };
+
+    const CopyRequest = struct {
+        label: []const u8,
+        text: []const u8,
+    };
+
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
         load_finished: LoadFinishedMsg,
         action_finished: ActionFinishedMsg,
+        clipboard_copy_finished: ClipboardCopyFinished,
         select_previous_file,
         select_next_file,
         toggle_directory,
@@ -503,6 +520,8 @@ pub const App = struct {
         open_push_credentials,
         run_interactive_push,
         open_selected_file_in_editor,
+        copy_current_line,
+        copy_current_hunk,
         finish_review_approved,
         finish_review_needs_changes,
         finish_review_canceled,
@@ -579,6 +598,7 @@ pub const App = struct {
             },
             .load_finished => |finished| try self.finishLoadResult(ctx, finished),
             .action_finished => |finished| try self.finishActionResult(ctx, finished),
+            .clipboard_copy_finished => |finished| self.finishClipboardCopy(finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
             .toggle_directory => try self.toggleSelectedDirectory(),
@@ -767,6 +787,8 @@ pub const App = struct {
             .open_push_credentials => try self.openPushCredentialPrompt(ctx),
             .run_interactive_push => try self.runInteractivePush(ctx),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
+            .copy_current_line => self.copyCurrentLine(ctx),
+            .copy_current_hunk => try self.copyCurrentHunk(ctx),
             .finish_review_approved => try self.finishReview(ctx, .approved),
             .finish_review_needs_changes => try self.finishReview(ctx, .needs_changes),
             .finish_review_canceled => try self.finishReview(ctx, .canceled),
@@ -828,6 +850,7 @@ pub const App = struct {
             .terminal_resized,
             .load_finished,
             .action_finished,
+            .clipboard_copy_finished,
             .auto_reload_tick,
             => true,
             else => false,
@@ -3643,6 +3666,143 @@ pub const App = struct {
 
     fn pushForegroundDone(result: chasen.ForegroundCommandResult) Msg {
         return Msg.actionFinished(.{ .push_foreground = result });
+    }
+
+    fn copyCurrentLineDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
+        return .{ .clipboard_copy_finished = .{
+            .label = "current line",
+            .outcome = clipboardCopyOutcome(result.outcome),
+        } };
+    }
+
+    fn copyCurrentHunkDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
+        return .{ .clipboard_copy_finished = .{
+            .label = "current hunk",
+            .outcome = clipboardCopyOutcome(result.outcome),
+        } };
+    }
+
+    fn clipboardCopyOutcome(outcome: chasen.Ctx(Msg).ClipboardCopyOutcome) ClipboardCopyOutcome {
+        return switch (outcome) {
+            .sent => .sent,
+            .unsupported_runtime => .unsupported_runtime,
+            .write_failed => |err| .{ .write_failed = err },
+        };
+    }
+
+    fn copyCurrentLine(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        const text = self.currentDiffLineCopyText() orelse {
+            self.setStatus("no diff line selected", .{});
+            return;
+        };
+        self.queueClipboardCopy(ctx, .{
+            .label = "current line",
+            .text = text,
+        }, copyCurrentLineDone);
+    }
+
+    fn copyCurrentHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const hunk_index = self.selectedHunkIndex() orelse {
+            self.setStatus("no hunk selected", .{});
+            return;
+        };
+        const file = self.displayedDiffFile() orelse {
+            self.setStatus("no hunk selected", .{});
+            return;
+        };
+        if (hunk_index >= file.hunks.len) {
+            self.setStatus("no hunk selected", .{});
+            return;
+        }
+
+        const text = try newSideHunkCopyText(ctx.allocator(), file.hunks[hunk_index]);
+        defer ctx.allocator().free(text);
+        if (text.len == 0) {
+            self.setStatus("no new-side text in selected hunk", .{});
+            return;
+        }
+        self.queueClipboardCopy(ctx, .{
+            .label = "current hunk",
+            .text = text,
+        }, copyCurrentHunkDone);
+    }
+
+    fn queueClipboardCopy(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        request: CopyRequest,
+        finished: chasen.Ctx(Msg).ClipboardCopyFinishedFn,
+    ) void {
+        if (request.text.len == 0) {
+            self.setStatus("nothing to copy: {s}", .{request.label});
+            return;
+        }
+        ctx.terminal().copyToClipboard(.{
+            .text = request.text,
+            .finished = finished,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => self.setStatus("could not prepare clipboard copy", .{}),
+            error.ClipboardCopyLimitExceeded => self.setStatus("clipboard copy already queued", .{}),
+        };
+    }
+
+    fn finishClipboardCopy(self: *App, finished: ClipboardCopyFinished) void {
+        switch (finished.outcome) {
+            .sent => self.setStatus("clipboard copy sent: {s}", .{finished.label}),
+            .unsupported_runtime => self.setStatus("clipboard copy unavailable: {s}", .{finished.label}),
+            .write_failed => |err| self.setStatus("clipboard copy failed: {s}: {s}", .{ finished.label, err }),
+        }
+    }
+
+    fn currentDiffLineCopyText(self: *const App) ?[]const u8 {
+        const coordinate = switch (self.viewer.diff_cursor) {
+            .hunk_line => |line| line,
+            .metadata, .binary_marker, .hunk_header => return null,
+        };
+        const file = self.displayedDiffFile() orelse return null;
+        if (coordinate.hunk_index >= file.hunks.len) return null;
+        const hunk = file.hunks[coordinate.hunk_index];
+        if (coordinate.line_index >= hunk.lines.len) return null;
+
+        return switch (self.effectiveDisplayMode()) {
+            .unified => hunk.lines[coordinate.line_index].text,
+            .side_by_side => sideBySideLineCopyText(hunk, coordinate.line_index),
+        };
+    }
+
+    fn sideBySideLineCopyText(hunk: diff_parser.Hunk, line_index: usize) ?[]const u8 {
+        var rows = diff_view_model.SideBySideIndexedIterator.init(hunk.lines);
+        while (rows.next()) |row| {
+            switch (row) {
+                .single => |line| {
+                    if (line.line_index == line_index) return line.line.text;
+                },
+                .paired => |pair| {
+                    const matches_removed = if (pair.removed) |removed| removed.line_index == line_index else false;
+                    const matches_added = if (pair.added) |added| added.line_index == line_index else false;
+                    if (!matches_removed and !matches_added) continue;
+                    if (pair.added) |added| return added.line.text;
+                    if (pair.removed) |removed| return removed.line.text;
+                },
+            }
+        }
+        return null;
+    }
+
+    fn newSideHunkCopyText(allocator: std.mem.Allocator, hunk: diff_parser.Hunk) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+
+        for (hunk.lines) |line| {
+            switch (line.kind) {
+                .context, .added => {
+                    try out.writer.writeAll(line.text);
+                    try out.writer.writeByte('\n');
+                },
+                .removed, .metadata => {},
+            }
+        }
+        return try out.toOwnedSlice();
     }
 
     fn setStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
@@ -6475,6 +6635,70 @@ test "line number toggle clamps horizontal scroll without changing vertical scro
     try std.testing.expect(!app.viewer.view_options.line_numbers);
     try std.testing.expectEqual(old_scroll, app.viewer.diff_scroll);
     try std.testing.expect(app.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
+}
+
+test "current line copy text uses side-by-side paired new side" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 24 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .viewer = .{
+            .display_mode = .side_by_side,
+            .sidebar_hidden = true,
+            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } },
+            .diff_horizontal_scroll = 99,
+            .view_options = .{ .line_numbers = false },
+        },
+    };
+
+    try std.testing.expectEqualStrings("new", app.currentDiffLineCopyText().?);
+}
+
+test "side-by-side line copy falls back to removed side when no added pair exists" {
+    const hunk: diff_parser.Hunk = .{
+        .old_start = 1,
+        .old_count = 1,
+        .new_start = 1,
+        .new_count = 0,
+        .section = "",
+        .lines = &.{.{ .kind = .removed, .text = "deleted", .old_line = 1 }},
+    };
+
+    try std.testing.expectEqualStrings("deleted", App.sideBySideLineCopyText(hunk, 0).?);
+}
+
+test "new side hunk copy text is undecorated and keeps trailing newline" {
+    const text = try App.newSideHunkCopyText(std.testing.allocator, app_test_support.hunks[0]);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqualStrings("one\ntwo\nnew\nfour\n", text);
+}
+
+test "new side hunk copy text is empty for removed-only hunk" {
+    const hunk: diff_parser.Hunk = .{
+        .old_start = 1,
+        .old_count = 1,
+        .new_start = 1,
+        .new_count = 0,
+        .section = "",
+        .lines = &.{.{ .kind = .removed, .text = "deleted", .old_line = 1 }},
+    };
+
+    const text = try App.newSideHunkCopyText(std.testing.allocator, hunk);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("", text);
+}
+
+test "clipboard copy result status uses best-effort wording" {
+    var app: App = .{};
+
+    app.finishClipboardCopy(.{ .label = "current line", .outcome = .sent });
+    try std.testing.expectEqualStrings("clipboard copy sent: current line", app.status.text());
+
+    app.finishClipboardCopy(.{ .label = "current hunk", .outcome = .unsupported_runtime });
+    try std.testing.expectEqualStrings("clipboard copy unavailable: current hunk", app.status.text());
+
+    app.finishClipboardCopy(.{ .label = "current line", .outcome = .{ .write_failed = "BrokenPipe" } });
+    try std.testing.expectEqualStrings("clipboard copy failed: current line: BrokenPipe", app.status.text());
 }
 
 test "display mode toggle keeps nearby vertical scroll position" {

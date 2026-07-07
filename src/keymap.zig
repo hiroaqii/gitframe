@@ -27,6 +27,8 @@ pub const PublicAction = enum {
     last_file,
     page_up,
     page_down,
+    copy_current_line,
+    copy_current_hunk,
 };
 
 pub const action_count = @typeInfo(PublicAction).@"enum".fields.len;
@@ -236,6 +238,8 @@ fn defaultSpec(action: PublicAction) ?KeySpec {
         .last_file => shiftedAscii('g', 'G'),
         .page_up => .{ .named = .page_up },
         .page_down => .{ .named = .page_down },
+        .copy_current_line => .{ .plain_codepoint = 'y' },
+        .copy_current_hunk => shiftedAscii('y', 'Y'),
     };
 }
 
@@ -410,6 +414,13 @@ test "branch switch uses plain b and sidebar keeps shifted B" {
     try std.testing.expectEqual(PublicAction.branch_switch, defaults.actionForKey(.{ .codepoint = 'b' }).?);
     try std.testing.expectEqual(PublicAction.toggle_sidebar, defaults.actionForKey(.{ .codepoint = 'B' }).?);
     try std.testing.expectEqual(PublicAction.toggle_sidebar, defaults.actionForKey(.{ .codepoint = 'b', .mods = .{ .shift = true } }).?);
+}
+
+test "copy actions use y and shifted Y by default" {
+    const defaults: Effective = .{};
+    try std.testing.expectEqual(PublicAction.copy_current_line, defaults.actionForKey(.{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(PublicAction.copy_current_hunk, defaults.actionForKey(.{ .codepoint = 'Y' }).?);
+    try std.testing.expectEqual(PublicAction.copy_current_hunk, defaults.actionForKey(.{ .codepoint = 'y', .mods = .{ .shift = true } }).?);
 }
 
 test "validateConfig rejects reserved and duplicate effective bindings" {

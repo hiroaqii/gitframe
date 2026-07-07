@@ -149,6 +149,8 @@ const Action = enum {
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
+    copy_current_line,
+    copy_current_hunk,
     finish_review_approved,
     finish_review_needs_changes,
     finish_review_canceled,
@@ -446,6 +448,8 @@ fn publicActionToAction(action: keymap.PublicAction) Action {
         .last_file => .select_last_file,
         .page_up => .page_diff_up,
         .page_down => .page_diff_down,
+        .copy_current_line => .copy_current_line,
+        .copy_current_hunk => .copy_current_hunk,
     };
 }
 
@@ -607,6 +611,8 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .open_selected_file_in_editor => voidMsg(Msg, "open_selected_file_in_editor"),
         .toggle_display_mode => voidMsg(Msg, "toggle_display_mode"),
         .toggle_line_numbers => voidMsg(Msg, "toggle_line_numbers"),
+        .copy_current_line => voidMsg(Msg, "copy_current_line"),
+        .copy_current_hunk => voidMsg(Msg, "copy_current_hunk"),
         .finish_review_approved => voidMsg(Msg, "finish_review_approved"),
         .finish_review_needs_changes => voidMsg(Msg, "finish_review_needs_changes"),
         .finish_review_canceled => voidMsg(Msg, "finish_review_canceled"),
@@ -743,6 +749,8 @@ const TestMsg = union(enum) {
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
+    copy_current_line,
+    copy_current_hunk,
     finish_review_approved,
     finish_review_needs_changes,
     finish_review_canceled,
@@ -827,6 +835,15 @@ test "keyToMsg maps sidebar width adjustment keys" {
 test "keyToMsg maps view option toggles" {
     try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, .{ .codepoint = 'L' }).?);
     try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, shiftedAscii('l', 'L')).?);
+}
+
+test "keyToMsg maps copy actions only in viewer mode" {
+    try std.testing.expectEqual(TestMsg.copy_current_line, keyToMsg(TestMsg, .{}, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(TestMsg.copy_current_hunk, keyToMsg(TestMsg, .{}, .{ .codepoint = 'Y' }).?);
+    try std.testing.expectEqual(TestMsg.copy_current_hunk, keyToMsg(TestMsg, .{}, shiftedAscii('y', 'Y')).?);
+    try std.testing.expectEqual(TestMsg{ .search_insert = 'y' }, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'y' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'y' }));
 }
 
 test "keyToMsg maps stage action by focused pane" {
