@@ -3,6 +3,7 @@ const chasen = @import("chasen");
 const draw = @import("draw");
 const diff_file = @import("file.zig");
 const diff_parser = @import("parser.zig");
+const diff_selection = @import("selection.zig");
 const diff_view_model = @import("view_model.zig");
 const syntax_provider = @import("../syntax/provider.zig");
 const theme = @import("theme");
@@ -24,6 +25,28 @@ pub const RenderOptions = struct {
     palette: theme.Palette = .default(),
     file_index: usize = 0,
     syntax_spans: syntax_provider.DocumentSpans = .empty(),
+    selection: ?diff_selection.View = null,
+};
+
+pub const SideBySideRegion = struct {
+    col: u16,
+    width: u16,
+
+    pub fn contains(self: SideBySideRegion, col: u16) bool {
+        return col >= self.col and col < self.col + self.width;
+    }
+};
+
+pub const SideBySideGeometry = struct {
+    old: SideBySideRegion,
+    separator_col: u16,
+    new: SideBySideRegion,
+
+    pub fn sideAt(self: SideBySideGeometry, col: u16) ?diff_selection.Side {
+        if (self.old.contains(col)) return .old;
+        if (self.new.contains(col)) return .new;
+        return null;
+    }
 };
 
 pub const FileStats = diff_file.Stats;
@@ -61,6 +84,16 @@ pub fn visibleBodyRows(surface_height: u16) usize {
 
 pub fn bodyWidth(render_surface_width: u16) u16 {
     return render_surface_width -| cursor_gutter_width;
+}
+
+pub fn sideBySideGeometry(width: u16) SideBySideGeometry {
+    const gutter_col = width / 2;
+    const new_col = gutter_col + 1;
+    return .{
+        .old = .{ .col = 0, .width = gutter_col },
+        .separator_col = gutter_col,
+        .new = .{ .col = new_col, .width = if (width > new_col) width - new_col else 0 },
+    };
 }
 
 pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options: RenderOptions) !void {
@@ -125,10 +158,11 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
                 if (current_hunk_highlighted) {
                     if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), styles);
                 }
-                const gutter_col = body_surface.size().width / 2;
+                const geometry = sideBySideGeometry(body_surface.size().width);
+                const indexed_row = rows.currentSideBySideRow();
                 switch (side_row) {
-                    .single => |line| try drawSideBySideSingle(&body_surface, row, line, gutter_col, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles, sideBySideSingleSyntaxSpans(options, rows, line)),
-                    .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, gutter_col, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles, sideBySidePairSyntaxSpans(options, rows)),
+                    .single => |line| try drawSideBySideSingle(&body_surface, row, line, geometry, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles, sideBySideSingleSyntaxSpans(options, rows, line), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
+                    .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, geometry, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles, sideBySidePairSyntaxSpans(options, rows), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
                 }
             },
         }
@@ -175,8 +209,8 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, line
             .new_line = @intCast(index + 1),
         };
         if (mode == .side_by_side) {
-            const gutter_col = body_surface.size().width / 2;
-            try drawSideBySidePair(&body_surface, row, null, line, gutter_col, options.horizontal_scroll, options.line_numbers, false, styles, .{});
+            const geometry = sideBySideGeometry(body_surface.size().width);
+            try drawSideBySidePair(&body_surface, row, null, line, geometry, options.horizontal_scroll, options.line_numbers, false, styles, .{}, null);
         } else {
             try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, false, styles, .empty(), false);
         }
@@ -251,15 +285,15 @@ fn drawHeaderPath(surface: *chasen.Surface, title_prefix: ?[]const u8, path: []c
 
 fn drawHunkHeader(surface: *chasen.Surface, row: u16, header: []const u8, style: chasen.TextStyle, mode: DisplayMode, styles: RenderStyles) !void {
     if (mode == .side_by_side and surface.size().width >= side_by_side_min_width) {
-        const gutter_col = surface.size().width / 2;
+        const geometry = sideBySideGeometry(surface.size().width);
         var old_column = surface.child(.{
             .col = 0,
             .row = row,
-            .width = gutter_col,
+            .width = geometry.old.width,
             .height = 1,
         });
         try draw.copyClippedTextAt(&old_column, 0, 0, header, style);
-        _ = surface.borrowTextAt(gutter_col, row, "│", styles.metadata);
+        _ = surface.borrowTextAt(geometry.separator_col, row, "│", styles.metadata);
         return;
     }
 
@@ -298,7 +332,7 @@ fn hunkHeaderStyle(highlighted: bool, staged: bool, styles: RenderStyles) chasen
 }
 
 pub const body_start_row: u16 = 3;
-const cursor_gutter_width: u16 = 2;
+pub const cursor_gutter_width: u16 = 2;
 
 fn drawCursorMarker(surface: *chasen.Surface, row: u16, body_offset: usize, cursor_offset: ?usize, styles: RenderStyles) void {
     if (cursor_offset == null or cursor_offset.? != body_offset) return;
@@ -448,28 +482,37 @@ const SideBySideSyntaxSpans = struct {
     new_hunk_side_has_visible_syntax: bool = false,
 };
 
-fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, gutter_col: u16, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans) !void {
-    var columns = sideBySideRowColumns(surface, row, gutter_col);
-    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax);
-    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax);
-    drawSideBySideGutter(surface, row, gutter_col, styles);
+const SideBySideSelection = struct {
+    old: bool = false,
+    new: bool = false,
+};
+
+fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
+    drawSideBySideSelection(surface, row, geometry, selection, styles);
+    var columns = sideBySideRowColumns(surface, row, geometry);
+    const selected = selection orelse SideBySideSelection{};
+    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+    drawSideBySideGutter(surface, row, geometry, styles);
 }
 
-fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, gutter_col: u16, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans) !void {
-    var columns = sideBySideRowColumns(surface, row, gutter_col);
+fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
+    drawSideBySideSelection(surface, row, geometry, selection, styles);
+    var columns = sideBySideRowColumns(surface, row, geometry);
+    const selected = selection orelse SideBySideSelection{};
     switch (line.kind) {
         .removed => {
-            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax);
-            drawSideBySideGutter(surface, row, gutter_col, styles);
+            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+            drawSideBySideGutter(surface, row, geometry, styles);
         },
         .added => {
-            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax);
-            drawSideBySideGutter(surface, row, gutter_col, styles);
+            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+            drawSideBySideGutter(surface, row, geometry, styles);
         },
         .context => {
-            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax);
-            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax);
-            drawSideBySideGutter(surface, row, gutter_col, styles);
+            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+            drawSideBySideGutter(surface, row, geometry, styles);
         },
         .metadata => {
             try draw.copyClippedTextAt(surface, 0, row, line.text, styles.metadata);
@@ -477,8 +520,22 @@ fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.Di
     }
 }
 
-fn drawSideBySideGutter(surface: *chasen.Surface, row: u16, gutter_col: u16, styles: RenderStyles) void {
-    _ = surface.borrowTextAt(gutter_col, row, "│", styles.metadata);
+fn drawSideBySideSelection(surface: *chasen.Surface, row: u16, geometry: SideBySideGeometry, selection: ?SideBySideSelection, styles: RenderStyles) void {
+    const selected = selection orelse return;
+    if (selected.old) fillRowRegion(surface, row, geometry.old, styles.selection);
+    if (selected.new) fillRowRegion(surface, row, geometry.new, styles.selection);
+}
+
+fn fillRowRegion(surface: *chasen.Surface, row: u16, region: SideBySideRegion, style: chasen.TextStyle) void {
+    var col = region.col;
+    const end = @min(surface.size().width, region.col + region.width);
+    while (col < end) : (col += 1) {
+        _ = surface.borrowTextAt(col, row, " ", style);
+    }
+}
+
+fn drawSideBySideGutter(surface: *chasen.Surface, row: u16, geometry: SideBySideGeometry, styles: RenderStyles) void {
+    _ = surface.borrowTextAt(geometry.separator_col, row, "│", styles.metadata);
 }
 
 const SideBySideColumns = struct {
@@ -486,45 +543,88 @@ const SideBySideColumns = struct {
     new: chasen.Surface,
 };
 
-fn sideBySideRowColumns(surface: *chasen.Surface, row: u16, gutter_col: u16) SideBySideColumns {
-    const size = surface.size();
-    const new_col = gutter_col + 1;
+fn sideBySideRowColumns(surface: *chasen.Surface, row: u16, geometry: SideBySideGeometry) SideBySideColumns {
     return .{
         .old = surface.child(.{
-            .col = 0,
+            .col = geometry.old.col,
             .row = row,
-            .width = gutter_col,
+            .width = geometry.old.width,
             .height = 1,
         }),
         .new = surface.child(.{
-            .col = new_col,
+            .col = geometry.new.col,
             .row = row,
-            .width = if (size.width > new_col) size.width - new_col else 0,
+            .width = geometry.new.width,
             .height = 1,
         }),
     };
 }
 
-fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_provider.LineSpans, hunk_side_has_visible_syntax: bool) !void {
-    const layout = lineLayout(line_numbers, .side_by_side);
-    drawGutterLeadInBackground(surface, row, layout, gutterLeadInStyle(line.kind, staged, styles));
-    if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), lineNumberStyle(line.kind, staged, styles));
-    }
-    const prefix = if (line.kind == .removed and !hunk_side_has_visible_syntax) "-" else " ";
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, markerStyleForLine(line.kind, staged, styles));
-    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), syntax_spans, styles);
+fn sideBySideSelectionForIndexedRow(options: RenderOptions, file: diff_parser.FileDiff, hunk_index_opt: ?usize, row_opt: ?diff_view_model.SideBySideIndexedRow) ?SideBySideSelection {
+    const row = row_opt orelse return null;
+    return switch (row) {
+        .single => |line| sideBySideSelectionForLine(options, file, hunk_index_opt, line),
+        .paired => |pair| sideBySideSelectionForPair(options, file, hunk_index_opt, pair),
+    };
 }
 
-fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_provider.LineSpans, hunk_side_has_visible_syntax: bool) !void {
+fn sideBySideSelectionForLine(options: RenderOptions, file: diff_parser.FileDiff, hunk_index_opt: ?usize, line: diff_view_model.IndexedDiffLine) ?SideBySideSelection {
+    const selection = options.selection orelse return null;
+    if (!selection.identity.matchesLoadedFile(options.file_index, file)) return null;
+    const hunk_index = hunk_index_opt orelse return null;
+    const point = diff_selection.pointFromLine(hunk_index, line.line_index);
+    if (!selection.range().contains(point)) return null;
+    return switch (selection.side) {
+        .old => .{ .old = diff_selection.lineVisibleOnSide(line.line, .old) },
+        .new => .{ .new = diff_selection.lineVisibleOnSide(line.line, .new) },
+    };
+}
+
+fn sideBySideSelectionForPair(options: RenderOptions, file: diff_parser.FileDiff, hunk_index_opt: ?usize, pair: diff_view_model.SideBySideIndexedPair) ?SideBySideSelection {
+    const selection = options.selection orelse return null;
+    if (!selection.identity.matchesLoadedFile(options.file_index, file)) return null;
+    const hunk_index = hunk_index_opt orelse return null;
+    var selected: SideBySideSelection = .{};
+    const selected_range = selection.range();
+    if (pair.removed) |removed| {
+        const point = diff_selection.pointFromLine(hunk_index, removed.line_index);
+        selected.old = selection.side == .old and selected_range.contains(point) and diff_selection.lineVisibleOnSide(removed.line, .old);
+    }
+    if (pair.added) |added| {
+        const point = diff_selection.pointFromLine(hunk_index, added.line_index);
+        selected.new = selection.side == .new and selected_range.contains(point) and diff_selection.lineVisibleOnSide(added.line, .new);
+    }
+    if (!selected.old and !selected.new) return null;
+    return selected;
+}
+
+fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_provider.LineSpans, hunk_side_has_visible_syntax: bool, selected: bool) !void {
     const layout = lineLayout(line_numbers, .side_by_side);
-    drawGutterLeadInBackground(surface, row, layout, gutterLeadInStyle(line.kind, staged, styles));
+    drawGutterLeadInBackground(surface, row, layout, selectedStyle(gutterLeadInStyle(line.kind, staged, styles), selected, styles));
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), lineNumberStyle(line.kind, staged, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), selectedStyle(lineNumberStyle(line.kind, staged, styles), selected, styles));
+    }
+    const prefix = if (line.kind == .removed and !hunk_side_has_visible_syntax) "-" else " ";
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(markerStyleForLine(line.kind, staged, styles), selected, styles));
+    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), selected, styles), syntax_spans, styles);
+}
+
+fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_provider.LineSpans, hunk_side_has_visible_syntax: bool, selected: bool) !void {
+    const layout = lineLayout(line_numbers, .side_by_side);
+    drawGutterLeadInBackground(surface, row, layout, selectedStyle(gutterLeadInStyle(line.kind, staged, styles), selected, styles));
+    if (line_numbers) {
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), selectedStyle(lineNumberStyle(line.kind, staged, styles), selected, styles));
     }
     const prefix = if (line.kind == .added and !hunk_side_has_visible_syntax) "+" else " ";
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, markerStyleForLine(line.kind, staged, styles));
-    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), syntax_spans, styles);
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(markerStyleForLine(line.kind, staged, styles), selected, styles));
+    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), selected, styles), syntax_spans, styles);
+}
+
+fn selectedStyle(style: chasen.TextStyle, selected: bool, styles: RenderStyles) chasen.TextStyle {
+    if (!selected) return style;
+    var selected_style = style;
+    selected_style.bg = styles.selection.bg;
+    return selected_style;
 }
 
 pub const LineLayoutMode = enum {
@@ -737,6 +837,7 @@ const RenderStyles = struct {
     metadata: chasen.TextStyle,
     line_number: chasen.TextStyle,
     warning: chasen.TextStyle,
+    selection: chasen.TextStyle,
 
     fn fromPalette(palette: theme.Palette) RenderStyles {
         return .{
@@ -759,6 +860,7 @@ const RenderStyles = struct {
             .metadata = palette.style(.diff_metadata),
             .line_number = palette.style(.diff_line_number),
             .warning = palette.style(.warning),
+            .selection = .{ .bg = palette.color(.diff_cursor) },
         };
     }
 };
@@ -1245,14 +1347,55 @@ test "renderFile hides side-by-side diff prefixes by highlighted hunk side" {
         .syntax_spans = spans,
     });
 
-    const old_start = cursor_gutter_width;
-    const new_start = cursor_gutter_width + (bodyWidth(100) / 2) + 1;
+    const geometry = sideBySideGeometry(bodyWidth(100));
+    const old_start = cursor_gutter_width + geometry.old.col;
+    const new_start = cursor_gutter_width + geometry.new.col;
     try expectBgRange(&ts.surface, 4, old_start, old_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_removed_bg));
     try expectBgRange(&ts.surface, 4, new_start, new_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_added_bg));
     try ts.expectCellText(7, 4, " ");
     try ts.expectCellText(57, 4, " ");
     try ts.expectCellText(9, 4, "o");
     try ts.expectCellText(59, 4, "n");
+}
+
+test "renderFile highlights only the selected side-by-side pane side" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 6);
+    defer ts.deinit();
+
+    const palette = theme.Palette.default();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .section = "", .lines = &.{
+            .{ .kind = .removed, .text = "old", .old_line = 1 },
+            .{ .kind = .added, .text = "new", .new_line = 1 },
+        } }},
+    };
+    const geometry = sideBySideGeometry(bodyWidth(100));
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .side_by_side,
+        .selection = .{
+            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+            .side = .old,
+            .start = .{ .hunk_index = 0, .line_index = 0 },
+            .end = .{ .hunk_index = 0, .line_index = 0 },
+        },
+    });
+
+    const old_line_number = ts.surface.readCell(cursor_gutter_width + geometry.old.col, 4).?;
+    const old_body = ts.surface.readCell(cursor_gutter_width + geometry.old.col + lineTextStart(true, .side_by_side), 4).?;
+    const new_line_number = ts.surface.readCell(cursor_gutter_width + geometry.new.col, 4).?;
+    const new_body = ts.surface.readCell(cursor_gutter_width + geometry.new.col + lineTextStart(true, .side_by_side), 4).?;
+
+    try std.testing.expect(old_line_number.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(old_body.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(!new_line_number.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(!new_body.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(new_line_number.style.bg.eql(palette.color(.diff_added_bg)));
+    try std.testing.expect(new_body.style.bg.eql(palette.color(.diff_added_bg)));
 }
 
 test "renderFile normalizes highlighted side-by-side body base foreground" {
@@ -1527,10 +1670,11 @@ test "renderGeneratedAddedFile draws content on new side in side-by-side mode" {
 
     try renderGeneratedAddedFile(&ts.surface, "src/new.zig", &.{ "const value = 1;", "pub fn main() void {}" }, false, .{ .requested_mode = .side_by_side });
 
-    const new_start = cursor_gutter_width + (bodyWidth(90) / 2) + 1;
+    const geometry = sideBySideGeometry(bodyWidth(90));
+    const new_start = cursor_gutter_width + geometry.new.col;
     try expectBgRange(&ts.surface, 3, new_start, new_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_added_bg));
     try ts.expectCellText(0, 0, "s");
-    try ts.expectCellText(46, 3, "│");
+    try ts.expectCellText(cursor_gutter_width + geometry.separator_col, 3, "│");
     try ts.expectCellText(52, 3, "+");
     try ts.expectCellText(54, 3, "c");
 }

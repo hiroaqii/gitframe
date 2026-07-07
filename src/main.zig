@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
             },
             .terminal = .{
                 .env_map = init.environ_map,
-                .mouse = false,
+                .mouse = true,
                 // GitFrame has text-heavy prompts; keep IME/language toggles
                 // in the terminal/input-method layer.
                 .keyboard_protocol = .legacy,
@@ -92,7 +92,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .terminal = .{
             .env_map = init.environ_map,
-            .mouse = false,
+            .mouse = true,
             // GitFrame has text-heavy prompts; keep IME/language toggles
             // in the terminal/input-method layer.
             .keyboard_protocol = .legacy,

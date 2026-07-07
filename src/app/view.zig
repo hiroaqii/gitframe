@@ -501,6 +501,7 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         .palette = app.theme,
         .file_index = display.loadedFileIndex() orelse 0,
         .syntax_spans = if (display.loadedFileIndex() != null) loaded.syntax_spans else .empty(),
+        .selection = app.diffSelectionView(),
     });
     drawDiffHeaderDetailRow(app, surface, active);
     drawSearchMatchMarker(app, surface);
