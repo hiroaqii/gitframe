@@ -47,6 +47,10 @@ const confirmation_dialog_height: u16 = 9;
 const branch_switch_dialog_width: u16 = 72;
 const branch_switch_dialog_height: u16 = 18;
 
+fn scrollCells(scroll: usize) u16 {
+    return @intCast(@min(scroll, std.math.maxInt(u16)));
+}
+
 const StateTone = enum {
     muted,
     loading,
@@ -395,7 +399,7 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
         });
         const content = try sidebarTreeContent(surface.frameAllocator(), row_model);
         const effective_scroll = @min(horizontal_scroll, sidebar_view_model.maxHorizontalScroll(row_model, width));
-        const visible = chasen.text.dropToWidth(content, effective_scroll);
+        const visible = chasen.text.dropToWidth(content, scrollCells(effective_scroll));
         try draw.copyClippedTextAt(&path_area, 0, 0, visible, style);
     }
 

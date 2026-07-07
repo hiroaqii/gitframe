@@ -557,8 +557,12 @@ fn drawGutterLeadInBackground(surface: *chasen.Surface, row: u16, layout: LineLa
     }
 }
 
+fn scrollCells(horizontal_scroll: usize) u16 {
+    return @intCast(@min(horizontal_scroll, std.math.maxInt(u16)));
+}
+
 fn copyScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, horizontal_scroll: usize, style: chasen.TextStyle) !void {
-    const scrolled = chasen.text.dropToWidth(text, horizontal_scroll);
+    const scrolled = chasen.text.dropToWidth(text, scrollCells(horizontal_scroll));
     try copyPlainClippedTextAt(surface, col, row, scrolled, style);
 }
 
@@ -567,7 +571,7 @@ fn copyStyledScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, text: 
     if (spans.spans.len == 0) return;
     if (col >= surface.size().width) return;
 
-    const scrolled = chasen.text.dropToWidth(text, horizontal_scroll);
+    const scrolled = chasen.text.dropToWidth(text, scrollCells(horizontal_scroll));
     const visible_start = @intFromPtr(scrolled.ptr) - @intFromPtr(text.ptr);
     const visible_end = visible_start + chasen.text.clipToWidth(scrolled, surface.size().width - col).len;
     for (spans.spans) |span| {
