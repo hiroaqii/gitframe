@@ -7880,8 +7880,8 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
 
     try std.testing.expect(app.overlay.isSwitchBranch());
     try std.testing.expect(app.branch_switch.loading);
-    try std.testing.expectEqual(@as(u8, 1), ctx.pending_tasks_with_len);
-    const task: *BranchListLoadTask = @ptrCast(@alignCast(ctx.pendingTaskWithSlice()[0].ctx));
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    const task: *BranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0..ctx._pending_tasks_with_len][0].ctx));
     try std.testing.expectEqualStrings("/repo", task.repo_root);
     try std.testing.expectEqual(app.branch_switch.generation, task.generation);
 }
@@ -7911,7 +7911,7 @@ test "requestBranchSwitch rejects untracked-only status distinctly" {
 
     try std.testing.expect(!app.overlay.isSwitchBranch());
     try std.testing.expectEqualStrings("branch switch blocked: untracked files present", app.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx.pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
 test "finishBranchListLoad ignores stale result and accepts matching generation" {
@@ -7984,7 +7984,7 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
     try std.testing.expect(app.branch_switch.branches.len == 0);
     try std.testing.expect(app.staged_hunks.contains("/repo", "a", 0));
     try std.testing.expectEqualStrings("already on branch: main", app.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx.pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(app.actions.pending == null);
 }
 
@@ -8028,7 +8028,7 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
     try std.testing.expect(app.pending_selection_restore == null);
     try std.testing.expectEqual(@as(usize, 0), app.search.query.len);
     try std.testing.expectEqualStrings("switched branch: main -> feature", app.status.text());
-    try std.testing.expectEqual(@as(u8, 3), ctx.pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
 }
 
 test "finishSwitchBranch success clears completed repo marks when active repo changed" {
@@ -8068,7 +8068,7 @@ test "finishSwitchBranch success clears completed repo marks when active repo ch
     try std.testing.expect(try app.reviewed_store.containsFile(allocator, "/other", app_test_support.files_two[1]));
     try std.testing.expect(!app.staged_hunks.contains("/repo", "a", 0));
     try std.testing.expect(app.staged_hunks.contains("/other", "b", 1));
-    try std.testing.expectEqual(@as(u8, 0), ctx.pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expectEqualStrings("switched branch: /repo", app.status.text());
 }
 
@@ -8235,7 +8235,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
     try app.openSelectedFileInEditor(&ctx);
 
     try std.testing.expectEqualStrings("finish current git action before opening editor", app.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx.pending_foreground_commands_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     const pending = app.actions.pending orelse return error.ExpectedPendingAction;
     try std.testing.expectEqual(@as(u64, 7), pending.generation);
     try std.testing.expectEqual(app_actions.ActionKind.stage_file, pending.kind);
@@ -8463,7 +8463,7 @@ test "runInteractivePush rejects while another action is pending" {
     try std.testing.expectEqual(@as(u64, 7), pending.generation);
     try std.testing.expectEqual(app_actions.ActionKind.stage_file, pending.kind);
     try std.testing.expect(app.push_retry_target != null);
-    try std.testing.expectEqual(@as(u8, 0), ctx.pending_foreground_commands_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     try std.testing.expectEqualStrings("another git action is running", app.status.text());
 }
 
@@ -8488,7 +8488,7 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
         .oid = try allocator.dupe(u8, repo.oid),
     }, true);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
-    defer ctx.clearPendingEffectCopies();
+    defer ctx.runtimeClearPendingEffectCopies();
 
     try app.runInteractivePush(&ctx);
 
@@ -8497,9 +8497,9 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
     try std.testing.expect(!app.push_retry_credentials_available);
     try std.testing.expect(app.push_foreground != null);
     try std.testing.expect(app.actions.pending != null);
-    try std.testing.expectEqual(@as(u8, 1), ctx.pending_foreground_commands_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_foreground_commands_len);
 
-    const entry = ctx.pendingForegroundCommandSlice()[0];
+    const entry = ctx._pending_foreground_commands[0..ctx._pending_foreground_commands_len][0];
     try std.testing.expectEqualStrings(repo.repo_root, entry.cwd.?);
     try std.testing.expectEqualStrings("git", entry.argv[0]);
     try std.testing.expectEqualStrings("push", entry.argv[1]);
@@ -8523,7 +8523,7 @@ test "runInteractivePush keeps retry target when foreground queue is full" {
     var app: App = .{ .allocator = allocator };
     defer app.clearPushError(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
-    defer ctx.clearPendingEffectCopies();
+    defer ctx.runtimeClearPendingEffectCopies();
 
     const done = &struct {
         fn done(_: chasen.ForegroundCommandResult) App.Msg {
@@ -8579,7 +8579,7 @@ test "runInteractivePush stale snapshot does not queue foreground command" {
 
     try app.runInteractivePush(&ctx);
 
-    try std.testing.expectEqual(@as(u8, 0), ctx.pending_foreground_commands_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.push_retry_target != null);
     try std.testing.expectEqualStrings("push retry unavailable: branch changed; reload and try again", app.status.text());
@@ -8618,7 +8618,7 @@ test "finishPushForeground reloads matching active repo after failure" {
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.push_foreground == null);
-    try std.testing.expectEqual(@as(u8, 3), ctx.pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
     try std.testing.expectEqualStrings("interactive push exited: 1", app.status.text());
 }
 
@@ -8650,7 +8650,7 @@ test "finishPushForeground ignores stale request id" {
 
     try std.testing.expect(app.actions.pending != null);
     try std.testing.expect(app.push_foreground != null);
-    try std.testing.expectEqual(@as(u8, 0), ctx.pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
 test "openPushCredentialPrompt rejects non-HTTPS remote and frees retry target" {
@@ -10332,7 +10332,7 @@ test "cached source hunk unstage reload decision travels with task result" {
         .diff_load => {},
         .repo_discovery => return error.ExpectedReloadAfterCachedHunkUnstage,
     }
-    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskWithSlice().len);
+    try std.testing.expectEqual(@as(usize, 3), ctx._pending_tasks_with[0..ctx._pending_tasks_with_len].len);
 }
 
 test "clearLoadedDiff clears session staged hunk marks" {
@@ -11975,7 +11975,7 @@ test "status refresh path skips identical snapshot without rebuilding active tre
 
     app.startStatusLoad(&ctx, "/repo");
     try std.testing.expect(app.git_status.repo_root != null);
-    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskWithSlice().len);
+    try std.testing.expectEqual(@as(usize, 1), ctx._pending_tasks_with[0..ctx._pending_tasks_with_len].len);
     clearPendingStatusTasks(&ctx, std.testing.allocator);
 
     const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
@@ -12547,25 +12547,23 @@ fn setFileSearchInput(app: *App, query: []const u8) void {
 fn clearPendingStatusTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
     // finishStageHunk queues a status refresh. These tests assert the App-side
     // state transition only, so clean up the queued task context explicitly.
-    for (ctx.pendingTaskWithSlice()) |entry| {
+    for (ctx.takePendingTasksWith()) |entry| {
         const task: *StatusLoadTask = @ptrCast(@alignCast(entry.ctx));
         allocator.free(task.repo_root);
         allocator.destroy(task);
     }
-    ctx.pending_tasks_with_len = 0;
 }
 
 fn clearPendingBranchListTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
-    for (ctx.pendingTaskWithSlice()) |entry| {
+    for (ctx.takePendingTasksWith()) |entry| {
         const task: *BranchListLoadTask = @ptrCast(@alignCast(entry.ctx));
         allocator.free(task.repo_root);
         allocator.destroy(task);
     }
-    ctx.pending_tasks_with_len = 0;
 }
 
 fn clearPendingStatusAndDiffTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
-    const entries = ctx.pendingTaskWithSlice();
+    const entries = ctx.takePendingTasksWith();
     if (entries.len >= 1) {
         const task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
         allocator.free(task.repo_root);
@@ -12581,7 +12579,6 @@ fn clearPendingStatusAndDiffTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.
         diff_source.freeLoadRequest(allocator, task.request);
         allocator.destroy(task);
     }
-    ctx.pending_tasks_with_len = 0;
 }
 
 const BranchListItemSpec = struct {
