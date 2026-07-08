@@ -453,7 +453,7 @@ fn sidebarTreeContent(allocator: std.mem.Allocator, row: sidebar_view_model.Row)
 
 fn sidebarRowStyle(row: sidebar_view_model.Row, pane_active: bool, palette: theme.Palette) chasen.TextStyle {
     if (row.selected) return .{ .reverse = pane_active, .bold = true, .dim = !pane_active };
-    if (row.kind == .directory) return .{ .bold = true, .dim = !pane_active };
+    if (row.kind == .directory or row.kind == .repo_root) return .{ .bold = true, .dim = !pane_active };
     return switch (row.stage_presence) {
         .staged_only => .{ .fg = roleColor(palette, .staged), .dim = !pane_active },
         .mixed => .{ .fg = roleColor(palette, .prompt), .dim = !pane_active },

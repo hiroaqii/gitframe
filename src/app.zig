@@ -1698,7 +1698,7 @@ pub const App = struct {
                 return;
             },
             .conflict_unsupported => |path| {
-                self.setStatus("conflict under directory: {s}", .{path});
+                self.setStatus("conflict under selection: {s}", .{path});
                 return;
             },
             .no_stageable_content => |path| {
@@ -1721,7 +1721,7 @@ pub const App = struct {
             self.setStatus("could not start stage task", .{});
             return err;
         };
-        self.setStatus("staging: {s}", .{target.path});
+        self.setStatus("staging: {s}", .{target.label});
     }
 
     fn toggleSelectedFileStage(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -2086,15 +2086,15 @@ pub const App = struct {
                 return;
             },
             .conflict_unsupported => |target_path| {
-                if (target_path.kind == .directory) {
-                    self.setStatus("conflict under directory: {s}", .{target_path.path});
+                if (target_path.kind == .directory or target_path.kind == .repository) {
+                    self.setStatus("conflict under selection: {s}", .{target_path.path});
                 } else {
                     self.setStatus("conflict unstage is not supported yet", .{});
                 }
                 return;
             },
             .no_staged_content => |target_path| {
-                if (target_path.kind == .directory) {
+                if (target_path.kind == .directory or target_path.kind == .repository) {
                     self.setStatus("no staged files under: {s}", .{target_path.path});
                 } else {
                     self.setStatus("no staged content selected", .{});
@@ -2110,7 +2110,7 @@ pub const App = struct {
             self.setStatus("could not start unstage task", .{});
             return err;
         };
-        self.setStatus("unstaging: {s}", .{target.path});
+        self.setStatus("unstaging: {s}", .{target.label});
     }
 
     fn selectedUnstageTarget(self: *const App) UnstageTargetResult {
@@ -3848,7 +3848,7 @@ pub const App = struct {
         const action_target = self.selectedSidebarActionTarget() orelse return .no_path;
 
         return switch (action_target.kind) {
-            .directory => .directory_unsupported,
+            .repository, .directory => .directory_unsupported,
             .file => blk: {
                 if (self.editorTargetIsDeleted(repo_root, action_target.path)) return .deleted_file;
                 break :blk .{ .ready = .{ .repo_root = repo_root, .path = action_target.path } };
@@ -4652,7 +4652,10 @@ pub const App = struct {
         const allocator = self.loadArenaAllocator() orelse return;
         const previous_path_key = self.selectedStagePathKey();
         try self.ensureTreeOrderScope(app_allocator);
-        loaded.tree = try file_tree.buildWithStatusStable(allocator, loaded.document, self.git_status.document, self.stableOrderOptions(app_allocator));
+        loaded.tree = try file_tree.buildWithOptions(allocator, loaded.document, self.git_status.document, .{
+            .root = self.fileTreeRootOptions(),
+            .stable_order = self.stableOrderOptions(app_allocator),
+        });
         try loaded.rebuildVisibleNodes(allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
         // Status can finish before the diff reload triggered by a Git action.
         // In that case this projection is over the old diff, so keep the
@@ -4681,7 +4684,10 @@ pub const App = struct {
         var loaded: LoadedDiff = .{
             .text = "",
             .document = document,
-            .tree = try file_tree.buildWithStatusStable(arena_allocator, document, status_document, self.stableOrderOptions(allocator)),
+            .tree = try file_tree.buildWithOptions(arena_allocator, document, status_document, .{
+                .root = self.fileTreeRootOptions(),
+                .stable_order = self.stableOrderOptions(allocator),
+            }),
             .rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document),
             .collapsed_hunks = &.{},
             .collapsed_dirs = .empty,
@@ -4700,7 +4706,7 @@ pub const App = struct {
         var visible_index: usize = 0;
         while (visible_index < active_loaded.visibleNodeCount()) : (visible_index += 1) {
             const node_index = active_loaded.visibleNodeAt(visible_index) orelse continue;
-            if (active_loaded.tree.nodes[node_index].target == .directory) continue;
+            if (active_loaded.tree.nodes[node_index].target == .directory or active_loaded.tree.nodes[node_index].target == .repo_root) continue;
             self.viewer.selected_node = node_index;
             self.selectSidebarNode(active_loaded, node_index);
             break;
@@ -4790,8 +4796,14 @@ pub const App = struct {
                 self.resetDiffPosition();
                 self.clearSearchMatch();
             },
-            .directory => {},
+            .repo_root, .directory => {},
         }
+    }
+
+    fn fileTreeRootOptions(self: *const App) ?file_tree.RootOptions {
+        const root = self.activeRepoRoot() orelse return null;
+        const base = std.fs.path.basename(root);
+        return .{ .name = if (base.len == 0) root else base };
     }
 
     fn toggleSelectedDirectory(self: *App) !void {
@@ -5857,6 +5869,7 @@ pub const App = struct {
         // must use the sidebar cursor so they do not hit the previous file.
         const node = loaded.tree.nodes[self.viewer.selected_node];
         return switch (node.target) {
+            .repo_root => .{ .path = "", .kind = .repository },
             .directory => |path| .{ .path = if (path.len > 0) path else node.path, .kind = .directory },
             .diff_file, .status_entry => .{
                 .path = if (node.path_key.len > 0) node.path_key else node.path,
@@ -6507,7 +6520,7 @@ pub const App = struct {
                     self.viewer.selected_target = switch (node.target) {
                         .status_entry => |status_index| .{ .status_only = status_index },
                         .diff_file => |file_index| .{ .diff_file = file_index },
-                        .directory => self.viewer.selected_target,
+                        .repo_root, .directory => self.viewer.selected_target,
                     };
                     return;
                 }
@@ -11288,6 +11301,36 @@ test "pending selection restore can restore directory nodes" {
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.viewer.selected_target.?);
 }
 
+test "pending selection restore can restore repository root node" {
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root },
+        .{ .kind = .file, .name = "main.zig", .path = "src/main.zig", .path_key = "src/main.zig", .depth = 1, .target = .{ .diff_file = 0 } },
+    };
+    var visible_nodes = [_]usize{ 0, 1 };
+    var loaded: LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &app_test_support.files_one },
+        .tree = .{ .nodes = &nodes },
+        .visible_nodes = &visible_nodes,
+        .visible_node_count = 2,
+        .bytes = 0,
+        .lines = 0,
+    };
+    var app: App = .{
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .selected_node = 1,
+        },
+    };
+    defer app.clearPendingSelectionRestore(std.testing.allocator);
+
+    try app.setPendingSelectionRestore(std.testing.allocator, "");
+
+    try std.testing.expect(app.restorePendingSelectionOrFallback(std.testing.allocator, &loaded));
+    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.viewer.selected_target.?);
+}
+
 test "initialSelectionContext selects first diff file and hunk" {
     const loaded = app_test_support.loadedDiffTwo();
     const selection = App.initialSelectionContext(.{ .patch_file = "changes.diff" }, null, &loaded, null);
@@ -12671,6 +12714,7 @@ test "finishDiffLoad initially selects first visible file after status projectio
     const expected_target: context.SelectedTarget = switch (first_node.target) {
         .diff_file => |file_index| .{ .diff_file = file_index },
         .status_entry => |status_index| .{ .status_only = status_index },
+        .repo_root => return error.ExpectedVisibleFileNode,
         .directory => return error.ExpectedVisibleFileNode,
     };
 
@@ -12716,6 +12760,7 @@ test "finishDiffLoad keeps initial visible selection intent for later status pro
     const expected_target: context.SelectedTarget = switch (first_node.target) {
         .diff_file => |file_index| .{ .diff_file = file_index },
         .status_entry => |status_index| .{ .status_only = status_index },
+        .repo_root => return error.ExpectedVisibleFileNode,
         .directory => return error.ExpectedVisibleFileNode,
     };
 

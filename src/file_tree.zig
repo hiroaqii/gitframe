@@ -76,6 +76,15 @@ pub const StableOrderOptions = struct {
     order: *StableOrder,
 };
 
+pub const RootOptions = struct {
+    name: []const u8,
+};
+
+pub const BuildOptions = struct {
+    root: ?RootOptions = null,
+    stable_order: ?StableOrderOptions = null,
+};
+
 pub const Node = struct {
     kind: Kind,
     name: []const u8,
@@ -89,6 +98,7 @@ pub const Node = struct {
     target: context.SidebarTarget = .{ .directory = "" },
 
     pub const Kind = enum {
+        repo_root,
         directory,
         file,
     };
@@ -193,6 +203,7 @@ pub const FileTree = struct {
 
     pub fn isVisible(self: FileTree, node_index: usize, collapsed: *const CollapsedSet) bool {
         if (node_index >= self.nodes.len) return false;
+        if (self.nodes[node_index].kind == .repo_root) return true;
         return !hasCollapsedAncestor(self.nodes[node_index].path, collapsed);
     }
 };
@@ -210,6 +221,15 @@ pub fn buildWithStatusStable(
     document: diff_parser.DiffDocument,
     status_document: ?git_status.StatusDocument,
     stable_order: ?StableOrderOptions,
+) !FileTree {
+    return buildWithOptions(allocator, document, status_document, .{ .stable_order = stable_order });
+}
+
+pub fn buildWithOptions(
+    allocator: std.mem.Allocator,
+    document: diff_parser.DiffDocument,
+    status_document: ?git_status.StatusDocument,
+    options: BuildOptions,
 ) !FileTree {
     var rows: std.ArrayList(RowSource) = .empty;
     defer rows.deinit(allocator);
@@ -270,7 +290,7 @@ pub fn buildWithStatusStable(
     }
 
     std.mem.sort(RowSource, rows.items, {}, rowPathLessThan);
-    if (stable_order) |stable| try stable.order.remember(stable.allocator, rows.items);
+    if (options.stable_order) |stable| try stable.order.remember(stable.allocator, rows.items);
 
     var nodes: std.ArrayList(Node) = .empty;
     errdefer nodes.deinit(allocator);
@@ -295,6 +315,7 @@ pub fn buildWithStatusStable(
     }
 
     try sortNodesForDisplay(allocator, &nodes);
+    if (options.root) |root| try prependRootNode(allocator, &nodes, root.name, status_document);
 
     return .{ .nodes = try nodes.toOwnedSlice(allocator) };
 }
@@ -366,6 +387,62 @@ fn nodeSpanLessThan(source: []const Node, lhs: NodeSpan, rhs: NodeSpan) bool {
     if (lhs_node.kind != rhs_node.kind) return lhs_node.kind == .directory;
     if (!std.mem.eql(u8, lhs_node.name, rhs_node.name)) return std.mem.lessThan(u8, lhs_node.name, rhs_node.name);
     return std.mem.lessThan(u8, lhs_node.path, rhs_node.path);
+}
+
+fn prependRootNode(
+    allocator: std.mem.Allocator,
+    nodes: *std.ArrayList(Node),
+    root_name: []const u8,
+    status_document: ?git_status.StatusDocument,
+) !void {
+    if (nodes.items.len == 0) return;
+
+    var stats: Stats = .{};
+    for (nodes.items) |node| {
+        if (node.depth != 0) continue;
+        stats.add(node.stats);
+    }
+
+    for (nodes.items) |*node| {
+        node.depth += 1;
+    }
+
+    const copied_name = try allocator.dupe(u8, root_name);
+    try nodes.insert(allocator, 0, .{
+        .kind = .repo_root,
+        .name = copied_name,
+        .path = "",
+        .path_key = "",
+        .depth = 0,
+        .stats = stats,
+        .stage_presence = rootStagePresence(status_document),
+        .target = .repo_root,
+    });
+}
+
+fn rootStagePresence(status_document: ?git_status.StatusDocument) StagePresence {
+    const doc = status_document orelse return .clean_or_unknown;
+    var saw_staged = false;
+    var saw_unstaged = false;
+    var saw_untracked = false;
+    for (doc.entries) |entry| {
+        switch (stagePresenceFromEntry(entry)) {
+            .conflict => return .conflict,
+            .untracked => saw_untracked = true,
+            .unstaged_only => saw_unstaged = true,
+            .staged_only => saw_staged = true,
+            .mixed => {
+                saw_staged = true;
+                saw_unstaged = true;
+            },
+            .clean_or_unknown => {},
+        }
+    }
+    if (saw_untracked and !saw_staged and !saw_unstaged) return .untracked;
+    if (saw_staged and (saw_unstaged or saw_untracked)) return .mixed;
+    if (saw_staged) return .staged_only;
+    if (saw_unstaged or saw_untracked) return .unstaged_only;
+    return .clean_or_unknown;
 }
 
 pub fn displayPath(file: diff_parser.FileDiff) []const u8 {
@@ -559,6 +636,71 @@ test "build creates directory and file nodes with aggregate stats" {
     try std.testing.expectEqual(Status.modified, tree.nodes[3].status.?);
     try std.testing.expect(!tree.nodes[3].mode_changed);
     try std.testing.expectEqual(@as(?usize, 0), tree.nodes[3].diffFileIndex());
+}
+
+test "buildWithOptions prepends repository root with top-level aggregate stats" {
+    const text =
+        \\diff --git a/src/lib/root.zig b/src/lib/root.zig
+        \\--- a/src/lib/root.zig
+        \\+++ b/src/lib/root.zig
+        \\@@ -1 +1,3 @@
+        \\-old
+        \\+new
+        \\+added
+        \\+more
+        \\diff --git a/README.md b/README.md
+        \\--- a/README.md
+        \\+++ b/README.md
+        \\@@ -1 +1,2 @@
+        \\-old
+        \\+new
+        \\+added
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const document = try diff_parser.parse(allocator, text);
+    const tree = try buildWithOptions(allocator, document, null, .{ .root = .{ .name = "gitframe" } });
+
+    try std.testing.expectEqual(Node.Kind.repo_root, tree.nodes[0].kind);
+    try std.testing.expectEqualStrings("gitframe", tree.nodes[0].name);
+    try std.testing.expectEqual(@as(u16, 0), tree.nodes[0].depth);
+    try std.testing.expectEqual(@as(usize, 5), tree.nodes[0].stats.added);
+    try std.testing.expectEqual(@as(usize, 2), tree.nodes[0].stats.removed);
+    try std.testing.expect(tree.nodes[0].target == .repo_root);
+    try std.testing.expectEqual(@as(u16, 1), tree.nodes[1].depth);
+
+    var root_file_depth: ?u16 = null;
+    for (tree.nodes) |node| {
+        if (std.mem.eql(u8, node.path, "src/lib/root.zig")) {
+            root_file_depth = node.depth;
+            break;
+        }
+    }
+    try std.testing.expectEqual(@as(?u16, 3), root_file_depth);
+}
+
+test "buildWithOptions omits repository root without metadata" {
+    const text =
+        \\diff --git a/src/main.zig b/src/main.zig
+        \\--- a/src/main.zig
+        \\+++ b/src/main.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const document = try diff_parser.parse(allocator, text);
+    const tree = try buildWithOptions(allocator, document, null, .{});
+
+    try std.testing.expectEqual(Node.Kind.directory, tree.nodes[0].kind);
+    try std.testing.expect(tree.nodes[0].target != .repo_root);
 }
 
 test "directory descendant matching respects path boundaries" {

@@ -99,7 +99,7 @@ pub const LoadedDiff = struct {
         const node = self.tree.nodes[node_index];
         return switch (node.kind) {
             .file => self.shouldIncludeFileNode(node_index, hide_reviewed, status_filter),
-            .directory => self.hasMatchingFileDescendant(node_index, hide_reviewed, status_filter),
+            .repo_root, .directory => self.hasMatchingFileDescendant(node_index, hide_reviewed, status_filter),
         };
     }
 
@@ -122,11 +122,11 @@ pub const LoadedDiff = struct {
         if (directory_index >= self.tree.nodes.len) return false;
 
         const directory = self.tree.nodes[directory_index];
-        if (directory.kind != .directory) return false;
+        if (directory.kind != .directory and directory.kind != .repo_root) return false;
 
         for (self.tree.nodes, 0..) |node, index| {
             if (node.kind != .file) continue;
-            if (!file_tree.isPathAncestor(directory.path, node.path)) continue;
+            if (directory.kind == .directory and !file_tree.isPathAncestor(directory.path, node.path)) continue;
             if (self.shouldIncludeFileNode(index, hide_reviewed, status_filter)) return true;
         }
         return false;
@@ -244,9 +244,9 @@ pub const LoadedDiff = struct {
             while (index > 0) {
                 index -= 1;
                 const candidate = self.tree.nodes[index];
-                if (candidate.kind != .directory) continue;
+                if (candidate.kind != .directory and candidate.kind != .repo_root) continue;
                 if (candidate.depth >= node.depth) continue;
-                if (!file_tree.isPathAncestor(candidate.path, node.path)) continue;
+                if (candidate.kind == .directory and !file_tree.isPathAncestor(candidate.path, node.path)) continue;
                 if (self.visibleRowOfNode(index) != null) return index;
             }
             return null;
@@ -264,3 +264,31 @@ pub const LoadedDiff = struct {
         return null;
     }
 };
+
+test "repository root visibility follows filtered file descendants" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root },
+        .{ .kind = .file, .name = "added.zig", .path = "added.zig", .depth = 1, .status = .added, .target = .{ .diff_file = 0 } },
+        .{ .kind = .file, .name = "deleted.zig", .path = "deleted.zig", .depth = 1, .status = .deleted, .target = .{ .diff_file = 1 } },
+    };
+
+    var loaded: LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &.{} },
+        .tree = .{ .nodes = &nodes },
+        .bytes = 0,
+        .lines = 0,
+    };
+
+    try loaded.rebuildVisibleNodes(allocator, false, .added);
+    try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeAt(0).?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeAt(1).?);
+
+    try loaded.rebuildVisibleNodes(allocator, false, .modified);
+    try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
+}

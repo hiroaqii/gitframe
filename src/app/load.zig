@@ -753,7 +753,7 @@ pub fn runLoad(request: LoadRequest, allocator: std.mem.Allocator, io: std.Io) D
         .ok => |bytes| {
             defer allocator.free(bytes);
             if (bytes.len == 0) return .empty;
-            const bundle = buildLoadedBundleWithIo(allocator, io, bytes) catch |err| {
+            const bundle = buildLoadedBundleForRequest(allocator, io, bytes, request) catch |err| {
                 return .{ .failed = std.fmt.allocPrint(allocator, "Diff parse failed: {s}", .{@errorName(err)}) catch
                     return .{ .failed_static = "Diff parse failed: OutOfMemory" } };
             };
@@ -917,6 +917,16 @@ pub fn buildLoadedBundle(allocator: std.mem.Allocator, bytes: []const u8) !Loade
 }
 
 pub fn buildLoadedBundleWithIo(allocator: std.mem.Allocator, io: std.Io, bytes: []const u8) !LoadedDiffBundle {
+    return buildLoadedBundleWithOptions(allocator, io, bytes, .{});
+}
+
+fn buildLoadedBundleForRequest(allocator: std.mem.Allocator, io: std.Io, bytes: []const u8, request: LoadRequest) !LoadedDiffBundle {
+    const root = request.repo_root orelse return buildLoadedBundleWithOptions(allocator, io, bytes, .{});
+    const name = repoRootName(root);
+    return buildLoadedBundleWithOptions(allocator, io, bytes, .{ .root = .{ .name = name } });
+}
+
+fn buildLoadedBundleWithOptions(allocator: std.mem.Allocator, io: std.Io, bytes: []const u8, tree_options: file_tree.BuildOptions) !LoadedDiffBundle {
     var arena: std.heap.ArenaAllocator = .init(allocator);
     errdefer arena.deinit();
     const arena_allocator = arena.allocator();
@@ -926,7 +936,7 @@ pub fn buildLoadedBundleWithIo(allocator: std.mem.Allocator, io: std.Io, bytes: 
     const copied = try arena_allocator.dupe(u8, bytes);
     const document = try diff_parser.parse(arena_allocator, copied);
     const syntax_spans = try syntax_provider.buildDocumentSpans(arena_allocator, io, document);
-    const tree = try file_tree.build(arena_allocator, document);
+    const tree = try file_tree.buildWithOptions(arena_allocator, document, null, tree_options);
     const rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document);
     const collapsed_hunks = try arena_allocator.alloc(bool, document.totalHunks());
     @memset(collapsed_hunks, false);
@@ -947,6 +957,12 @@ pub fn buildLoadedBundleWithIo(allocator: std.mem.Allocator, io: std.Io, bytes: 
     // this local arena value, while the arena itself is moved by value across
     // the task-result boundary.
     return .{ .arena = arena, .loaded = loaded };
+}
+
+fn repoRootName(root: []const u8) []const u8 {
+    const base = std.fs.path.basename(root);
+    if (base.len == 0) return root;
+    return base;
 }
 
 pub fn countLines(bytes: []const u8) usize {

@@ -385,18 +385,22 @@ pub fn StageFileTask(comptime Msg: type) type {
         pending: PendingAction,
         repo_root: []u8,
         path: []u8,
+        label: []u8,
+        target_kind: git_ops.TargetKind,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer {
                 allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
+                if (task.label.len > 0) allocator.free(task.label);
                 allocator.destroy(task);
             }
 
-            const result = runStageFile(task.repo_root, task.path, allocator, io);
-            const path = task.path;
+            const result = runStageTarget(task.repo_root, task.path, task.target_kind, allocator, io);
+            const path = task.label;
             task.path = &.{};
+            task.label = &.{};
 
             return Msg.actionFinished(.{ .stage_file = StageFileFinished{
                 .pending = task.pending,
@@ -410,11 +414,13 @@ pub fn StageFileTask(comptime Msg: type) type {
             defer {
                 allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
+                if (task.label.len > 0) allocator.free(task.label);
                 allocator.destroy(task);
             }
 
-            const path = task.path;
+            const path = task.label;
             task.path = &.{};
+            task.label = &.{};
 
             return Msg.actionFinished(.{ .stage_file = StageFileFinished{
                 .pending = task.pending,
@@ -435,18 +441,22 @@ pub fn UnstageFileTask(comptime Msg: type) type {
         pending: PendingAction,
         repo_root: []u8,
         path: []u8,
+        label: []u8,
+        target_kind: git_ops.TargetKind,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer {
                 allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
+                if (task.label.len > 0) allocator.free(task.label);
                 allocator.destroy(task);
             }
 
-            const result = runUnstageFile(task.repo_root, task.path, allocator, io);
-            const path = task.path;
+            const result = runUnstageTarget(task.repo_root, task.path, task.target_kind, allocator, io);
+            const path = task.label;
             task.path = &.{};
+            task.label = &.{};
 
             return Msg.actionFinished(.{ .unstage_file = UnstageFileFinished{
                 .pending = task.pending,
@@ -460,11 +470,13 @@ pub fn UnstageFileTask(comptime Msg: type) type {
             defer {
                 allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
+                if (task.label.len > 0) allocator.free(task.label);
                 allocator.destroy(task);
             }
 
-            const path = task.path;
+            const path = task.label;
             task.path = &.{};
+            task.label = &.{};
 
             return Msg.actionFinished(.{ .unstage_file = UnstageFileFinished{
                 .pending = task.pending,
@@ -1109,11 +1121,31 @@ pub fn runStageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.
     }, allocator, io);
 }
 
+pub fn runStageTarget(repo_root: []const u8, path: []const u8, target_kind: git_ops.TargetKind, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+    return switch (target_kind) {
+        .repository => runOperationMapped("Stage", .{
+            .repo_root = repo_root,
+            .kind = .stage_all,
+        }, allocator, io),
+        .file, .directory => runStageFile(repo_root, path, allocator, io),
+    };
+}
+
 pub fn runUnstageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Unstage", .{
         .repo_root = repo_root,
         .kind = .{ .unstage_file = path },
     }, allocator, io);
+}
+
+pub fn runUnstageTarget(repo_root: []const u8, path: []const u8, target_kind: git_ops.TargetKind, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+    return switch (target_kind) {
+        .repository => runOperationMapped("Unstage", .{
+            .repo_root = repo_root,
+            .kind = .unstage_all,
+        }, allocator, io),
+        .file, .directory => runUnstageFile(repo_root, path, allocator, io),
+    };
 }
 
 pub fn runStageHunk(repo_root: []const u8, patch: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {

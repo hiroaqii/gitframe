@@ -25,11 +25,14 @@ pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *
         .pending = pending,
         .repo_root = &.{},
         .path = &.{},
+        .label = &.{},
+        .target_kind = target.kind,
     };
     errdefer destroyFileTask(Task, ctx.allocator(), task);
 
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
     task.path = try ctx.allocator().dupe(u8, target.path);
+    task.label = try ctx.allocator().dupe(u8, if (target.label.len > 0) target.label else target.path);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
@@ -44,11 +47,14 @@ pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
         .pending = pending,
         .repo_root = &.{},
         .path = &.{},
+        .label = &.{},
+        .target_kind = target.kind,
     };
     errdefer destroyFileTask(Task, ctx.allocator(), task);
 
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
     task.path = try ctx.allocator().dupe(u8, target.path);
+    task.label = try ctx.allocator().dupe(u8, if (target.label.len > 0) target.label else target.path);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
@@ -423,6 +429,7 @@ pub fn startCredentialedPush(
 fn destroyFileTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
     if (task.repo_root.len > 0) allocator.free(task.repo_root);
     if (task.path.len > 0) allocator.free(task.path);
+    if (@hasField(Task, "label") and task.label.len > 0) allocator.free(task.label);
     allocator.destroy(task);
 }
 

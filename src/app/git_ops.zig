@@ -11,6 +11,7 @@ const git_status = @import("../git/status.zig");
 /// concrete async task is started. Concrete git command execution remains in
 /// app/actions.zig.
 pub const TargetKind = enum {
+    repository,
     file,
     directory,
 };
@@ -43,6 +44,7 @@ pub const StageTarget = struct {
     repo_root: []const u8,
     path: []const u8,
     kind: TargetKind,
+    label: []const u8 = "",
 };
 
 pub const StageTargetResult = union(enum) {
@@ -128,6 +130,7 @@ pub const UnstageTarget = struct {
     repo_root: []const u8,
     path: []const u8,
     kind: TargetKind,
+    label: []const u8 = "",
 };
 
 pub const UnstageTargetResult = union(enum) {
@@ -458,6 +461,7 @@ pub fn stageTarget(ctx: TargetContext) StageTargetResult {
     const repo_root = ctx.repo_root orelse return .no_repo;
     const action_target = ctx.action_target orelse return .no_path;
     return switch (action_target.kind) {
+        .repository => repositoryStageTarget(repo_root, ctx.status),
         .file => fileStageTarget(repo_root, action_target, ctx.status),
         .directory => directoryStageTarget(repo_root, action_target.path, ctx.status),
     };
@@ -469,7 +473,7 @@ fn fileStageTarget(repo_root: []const u8, action_target: PathTarget, status: Sta
     if (status.freshEntryForPathKey(repo_root, action_target.path)) |entry| {
         if (!entry.isConflict() and entry.isStaged() and !entry.isUnstaged()) return .{ .already_staged = action_target.path };
     }
-    return .{ .ready = .{ .repo_root = repo_root, .path = action_target.path, .kind = .file } };
+    return .{ .ready = .{ .repo_root = repo_root, .path = action_target.path, .kind = .file, .label = action_target.path } };
 }
 
 fn directoryStageTarget(repo_root: []const u8, directory: []const u8, status: StatusSnapshot) StageTargetResult {
@@ -491,7 +495,25 @@ fn directoryStageTarget(repo_root: []const u8, directory: []const u8, status: St
     }
 
     if (!has_stageable) return .{ .no_stageable_content = directory };
-    return .{ .ready = .{ .repo_root = repo_root, .path = directory, .kind = .directory } };
+    return .{ .ready = .{ .repo_root = repo_root, .path = directory, .kind = .directory, .label = directory } };
+}
+
+fn repositoryStageTarget(repo_root: []const u8, status: StatusSnapshot) StageTargetResult {
+    if (!status.isFreshFor(repo_root)) return .stale_status;
+
+    var has_stageable = false;
+    for (status.entries) |entry| {
+        if (entry.isIgnored()) continue;
+        if (entry.isConflict()) return .{ .conflict_unsupported = repoRootLabel(repo_root) };
+
+        switch (file_tree.stagePresenceFromEntry(entry)) {
+            .untracked, .unstaged_only, .mixed => has_stageable = true,
+            .staged_only, .clean_or_unknown, .conflict => {},
+        }
+    }
+
+    if (!has_stageable) return .{ .no_stageable_content = repoRootLabel(repo_root) };
+    return .{ .ready = .{ .repo_root = repo_root, .path = "", .kind = .repository, .label = repoRootLabel(repo_root) } };
 }
 
 pub fn toggleStageTarget(ctx: TargetContext) ToggleStageTargetResult {
@@ -504,6 +526,7 @@ pub fn toggleStageTarget(ctx: TargetContext) ToggleStageTargetResult {
     if (!ctx.status.isFreshFor(repo_root)) return .stale_status;
 
     return switch (action_target.kind) {
+        .repository => repositoryStageToggleOperation(action_target, can_stage, can_unstage, ctx.status),
         .file => fileStageToggleOperation(action_target, can_stage, can_unstage, ctx.status),
         .directory => directoryStageToggleOperation(action_target, can_stage, can_unstage, ctx.status),
     };
@@ -534,12 +557,28 @@ fn directoryStageToggleOperation(action_target: PathTarget, can_stage: bool, can
     return .{ .no_content = action_target };
 }
 
+fn repositoryStageToggleOperation(action_target: PathTarget, can_stage: bool, can_unstage: bool, status: StatusSnapshot) ToggleStageTargetResult {
+    var has_unstaged = false;
+    var has_staged = false;
+    for (status.entries) |entry| {
+        if (entry.isIgnored()) continue;
+        if (entry.isConflict()) return .{ .conflict_unsupported = action_target };
+        if (entry.isUnstaged()) has_unstaged = true;
+        if (entry.isStaged()) has_staged = true;
+    }
+
+    if (has_unstaged) return if (can_stage) .{ .operation = .stage } else .unavailable_source;
+    if (has_staged) return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
+    return .{ .no_content = action_target };
+}
+
 pub fn unstageTarget(ctx: TargetContext) UnstageTargetResult {
     if (!diff_source.sourceAllowsUnstageAction(ctx.source)) return .unavailable_source;
     const repo_root = ctx.repo_root orelse return .no_repo;
     const action_target = ctx.action_target orelse return .no_path;
     if (!ctx.status.isFreshFor(repo_root)) return .stale_status;
     return switch (action_target.kind) {
+        .repository => repositoryUnstageTarget(repo_root, ctx.status),
         .file => fileUnstageTarget(repo_root, action_target, ctx.status),
         .directory => directoryUnstageTarget(repo_root, action_target.path, ctx.status),
     };
@@ -549,7 +588,7 @@ fn fileUnstageTarget(repo_root: []const u8, action_target: PathTarget, status: S
     const entry = status.entryForPathKey(action_target.path) orelse return .{ .no_staged_content = action_target };
     if (entry.isConflict()) return .{ .conflict_unsupported = action_target };
     if (!entry.isStaged()) return .{ .no_staged_content = action_target };
-    return .{ .ready = .{ .repo_root = repo_root, .path = action_target.path, .kind = .file } };
+    return .{ .ready = .{ .repo_root = repo_root, .path = action_target.path, .kind = .file, .label = action_target.path } };
 }
 
 fn directoryUnstageTarget(repo_root: []const u8, directory: []const u8, status: StatusSnapshot) UnstageTargetResult {
@@ -569,7 +608,25 @@ fn directoryUnstageTarget(repo_root: []const u8, directory: []const u8, status: 
     }
 
     if (!has_staged) return .{ .no_staged_content = .{ .path = directory, .kind = .directory } };
-    return .{ .ready = .{ .repo_root = repo_root, .path = directory, .kind = .directory } };
+    return .{ .ready = .{ .repo_root = repo_root, .path = directory, .kind = .directory, .label = directory } };
+}
+
+fn repositoryUnstageTarget(repo_root: []const u8, status: StatusSnapshot) UnstageTargetResult {
+    if (!status.isFreshFor(repo_root)) return .stale_status;
+
+    var has_staged = false;
+    for (status.entries) |entry| {
+        if (entry.isIgnored()) continue;
+        if (entry.isConflict()) return .{ .conflict_unsupported = .{ .path = repoRootLabel(repo_root), .kind = .repository } };
+
+        switch (file_tree.stagePresenceFromEntry(entry)) {
+            .staged_only, .mixed => has_staged = true,
+            .untracked, .unstaged_only, .clean_or_unknown, .conflict => {},
+        }
+    }
+
+    if (!has_staged) return .{ .no_staged_content = .{ .path = repoRootLabel(repo_root), .kind = .repository } };
+    return .{ .ready = .{ .repo_root = repo_root, .path = "", .kind = .repository, .label = repoRootLabel(repo_root) } };
 }
 
 pub fn discardTarget(ctx: TargetContext) DiscardTargetResult {
@@ -577,6 +634,7 @@ pub fn discardTarget(ctx: TargetContext) DiscardTargetResult {
     const repo_root = ctx.repo_root orelse return .no_repo;
     const action_target = ctx.action_target orelse return .no_path;
     if (action_target.kind == .directory) return .directory_unsupported;
+    if (action_target.kind == .repository) return .directory_unsupported;
     const entry = ctx.status.freshEntryForPathKey(repo_root, action_target.path) orelse return .stale_status;
     if (entry.isConflict()) return .conflict_unsupported;
     return switch (file_tree.stagePresenceFromEntry(entry)) {
@@ -584,6 +642,12 @@ pub fn discardTarget(ctx: TargetContext) DiscardTargetResult {
         .untracked => .untracked_unsupported,
         .staged_only, .clean_or_unknown, .conflict => .no_unstaged_content,
     };
+}
+
+fn repoRootLabel(repo_root: []const u8) []const u8 {
+    const base = std.fs.path.basename(repo_root);
+    if (base.len == 0) return repo_root;
+    return base;
 }
 
 test "stageTarget file allows stale status while suppressing fresh staged-only files" {
@@ -656,6 +720,71 @@ test "directory stage and unstage use descendant status entries" {
     })) {
         .ready => |ready| try std.testing.expectEqual(TargetKind.directory, ready.kind),
         else => return error.ExpectedDirectoryUnstageReady,
+    }
+}
+
+test "repository stage and unstage scan the whole fresh status snapshot" {
+    const entries = [_]git_status.StatusEntry{
+        .{ .raw = .{ ' ', 'M' }, .index = .unmodified, .worktree = .modified, .path = "src/a.zig" },
+        .{ .raw = .{ 'A', ' ' }, .index = .added, .worktree = .unmodified, .path = "src/b.zig" },
+        .{ .raw = .{ '?', '?' }, .index = .untracked, .worktree = .untracked, .path = "README.md" },
+    };
+    const status: StatusSnapshot = .{ .repo_root = "/work/gitframe", .loading = false, .entries = &entries };
+
+    switch (stageTarget(.{
+        .source = .unstaged,
+        .repo_root = "/work/gitframe",
+        .action_target = .{ .path = "", .kind = .repository },
+        .status = status,
+    })) {
+        .ready => |ready| {
+            try std.testing.expectEqual(TargetKind.repository, ready.kind);
+            try std.testing.expectEqualStrings("", ready.path);
+            try std.testing.expectEqualStrings("gitframe", ready.label);
+        },
+        else => return error.ExpectedRepositoryStageReady,
+    }
+
+    switch (unstageTarget(.{
+        .source = .unstaged,
+        .repo_root = "/work/gitframe",
+        .action_target = .{ .path = "", .kind = .repository },
+        .status = status,
+    })) {
+        .ready => |ready| {
+            try std.testing.expectEqual(TargetKind.repository, ready.kind);
+            try std.testing.expectEqualStrings("", ready.path);
+            try std.testing.expectEqualStrings("gitframe", ready.label);
+        },
+        else => return error.ExpectedRepositoryUnstageReady,
+    }
+}
+
+test "repository stage rejects conflicts and no-op snapshots" {
+    const conflict_entries = [_]git_status.StatusEntry{
+        .{ .raw = .{ 'U', 'U' }, .index = .unmerged, .worktree = .unmerged, .path = "src/conflict.zig" },
+    };
+    switch (stageTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .action_target = .{ .path = "", .kind = .repository },
+        .status = .{ .repo_root = "/repo", .loading = false, .entries = &conflict_entries },
+    })) {
+        .conflict_unsupported => |path| try std.testing.expectEqualStrings("repo", path),
+        else => return error.ExpectedRepositoryConflictReject,
+    }
+
+    const staged_entries = [_]git_status.StatusEntry{
+        .{ .raw = .{ 'A', ' ' }, .index = .added, .worktree = .unmodified, .path = "src/staged.zig" },
+    };
+    switch (stageTarget(.{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .action_target = .{ .path = "", .kind = .repository },
+        .status = .{ .repo_root = "/repo", .loading = false, .entries = &staged_entries },
+    })) {
+        .no_stageable_content => |path| try std.testing.expectEqualStrings("repo", path),
+        else => return error.ExpectedRepositoryNoStageableContent,
     }
 }
 

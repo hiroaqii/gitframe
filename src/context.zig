@@ -41,6 +41,7 @@ pub const PathKey = path_key.PathKey;
 /// targets, but their indexes are valid only for the active loaded/status
 /// generation.
 pub const SidebarTarget = union(enum) {
+    repo_root,
     directory: PathKey,
     diff_file: usize,
     status_entry: usize,

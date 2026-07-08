@@ -174,6 +174,8 @@ pub const BranchListRequest = struct {
 pub const OperationKind = union(enum) {
     stage_file: []const u8,
     unstage_file: []const u8,
+    stage_all,
+    unstage_all,
     discard_file: []const u8,
     stage_patch: StagePatchRequest,
     unstage_patch: StagePatchRequest,
@@ -316,6 +318,8 @@ pub const LocalCommandBackend = struct {
         return switch (request.kind) {
             .stage_file => |path| runGitAdd(allocator, io, request.repo_root, path),
             .unstage_file => |path| runGitUnstage(allocator, io, request.repo_root, path),
+            .stage_all => runGitAddAll(allocator, io, request.repo_root),
+            .unstage_all => runGitUnstageAll(allocator, io, request.repo_root),
             .discard_file => |path| runGitDiscard(allocator, io, request.repo_root, path),
             .stage_patch => |patch| runGitApplyCached(allocator, io, request.repo_root, patch.patch),
             .unstage_patch => |patch| runGitApplyCachedReverse(allocator, io, request.repo_root, patch.patch),
@@ -651,6 +655,18 @@ fn runGitAdd(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, pa
 
 fn runGitUnstage(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) LoadError!OperationResult {
     const argv = [_][]const u8{ "git", "restore", "--staged", "--", path };
+    const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(64 * 1024), .limited(256 * 1024));
+    return operationResultFromGitCommand(allocator, result, "git restore --staged");
+}
+
+fn runGitAddAll(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!OperationResult {
+    const argv = [_][]const u8{ "git", "add", "--all", "--", "." };
+    const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(64 * 1024), .limited(256 * 1024));
+    return operationResultFromGitCommand(allocator, result, "git add --all");
+}
+
+fn runGitUnstageAll(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!OperationResult {
+    const argv = [_][]const u8{ "git", "restore", "--staged", "--", "." };
     const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(64 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git restore --staged");
 }
