@@ -9,7 +9,8 @@ const SyntaxProvider = enum {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const syntax_provider = b.option(SyntaxProvider, "syntax-provider", "Syntax provider: none or flow_syntax") orelse .none;
+    const syntax_provider = b.option(SyntaxProvider, "syntax-provider", "Syntax provider: none or flow_syntax") orelse defaultSyntaxProvider(target);
+    const provider_enabled = syntax_provider == .flow_syntax;
 
     const chasen_dep = b.dependency("chasen", .{
         .target = target,
@@ -44,7 +45,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const build_options = b.addOptions();
-    build_options.addOption(bool, "syntax_provider_flow_syntax", syntax_provider == .flow_syntax);
+    build_options.addOption(bool, "syntax_provider_flow_syntax", provider_enabled);
 
     const mod = mod: {
         const base_imports: [6]std.Build.Module.Import = .{
@@ -62,15 +63,16 @@ pub fn build(b: *std.Build) void {
                 .imports = &base_imports,
             }),
             .flow_syntax => {
-                if (target.result.os.tag != .macos) {
-                    std.process.fatal("-Dsyntax-provider=flow_syntax is currently supported only for macOS targets", .{});
+                if (!supportsFlowSyntaxProvider(target)) {
+                    std.process.fatal("-Dsyntax-provider=flow_syntax is currently supported only for macOS and Linux targets", .{});
                 }
                 // Calling lazyDependency marks the dependency as needed, so keep
-                // it inside the provider-enabled macOS branch. Default Linux
-                // builds must not fetch or resolve flow-syntax.
+                // it inside the provider branch. Explicit `none` and
+                // unsupported-target defaults must not resolve flow-syntax.
                 const flow_syntax_dep = b.lazyDependency("flow_syntax", .{
                     .target = target,
                     .optimize = optimize,
+                    .@"use-llvm" = true,
                 }) orelse return;
                 const flow_imports: [7]std.Build.Module.Import = base_imports ++ .{
                     std.Build.Module.Import{ .name = "flow_syntax", .module = flow_syntax_dep.module("syntax") },
@@ -97,6 +99,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    configureFlowSyntaxArtifact(exe, target, provider_enabled);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -110,11 +113,13 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
+    configureFlowSyntaxArtifact(mod_tests, target, provider_enabled);
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    configureFlowSyntaxArtifact(exe_tests, target, provider_enabled);
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const draw_tests = b.addTest(.{
@@ -227,11 +232,12 @@ pub fn build(b: *std.Build) void {
         const syntax_provider_tests = b.addTest(.{
             .root_module = mod,
         });
+        configureFlowSyntaxArtifact(syntax_provider_tests, target, true);
         const run_syntax_provider_tests = b.addRunArtifact(syntax_provider_tests);
         test_syntax_provider_step.dependOn(&run_syntax_provider_tests.step);
     } else {
         test_syntax_provider_step.dependOn(&b.addFail(
-            "run `zig build test-syntax-provider -Dsyntax-provider=flow_syntax` on macOS",
+            "run `zig build test-syntax-provider -Dsyntax-provider=flow_syntax` on macOS or Linux",
         ).step);
     }
 
@@ -287,4 +293,24 @@ pub fn build(b: *std.Build) void {
         .root_module = keymap_mod,
     });
     test_step.dependOn(&b.addRunArtifact(keymap_tests).step);
+}
+
+fn supportsFlowSyntaxProvider(target: std.Build.ResolvedTarget) bool {
+    return switch (target.result.os.tag) {
+        .macos, .linux => true,
+        else => false,
+    };
+}
+
+fn defaultSyntaxProvider(target: std.Build.ResolvedTarget) SyntaxProvider {
+    return if (supportsFlowSyntaxProvider(target)) .flow_syntax else .none;
+}
+
+fn configureFlowSyntaxArtifact(artifact: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, provider_enabled: bool) void {
+    if (!provider_enabled) return;
+    artifact.use_llvm = true;
+    artifact.use_lld = switch (target.result.os.tag) {
+        .linux => true,
+        else => null,
+    };
 }
