@@ -397,6 +397,11 @@ pub const App = struct {
         text: []const u8,
     };
 
+    const PopupCopyTarget = struct {
+        label: []const u8,
+        text: []const u8,
+    };
+
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
         load_finished: LoadFinishedMsg,
@@ -498,6 +503,7 @@ pub const App = struct {
         push_error_scroll_down,
         push_error_page_up,
         push_error_page_down,
+        copy_popup,
         push_credential_tab,
         push_credential_submit,
         push_credential_cancel,
@@ -772,6 +778,7 @@ pub const App = struct {
             .push_error_scroll_down => self.scrollPushError(1),
             .push_error_page_up => self.pagePushError(-1),
             .push_error_page_down => self.pagePushError(1),
+            .copy_popup => self.copyPopup(ctx),
             .push_credential_tab => self.togglePushCredentialField(),
             .push_credential_submit => try self.submitPushCredentials(ctx),
             .push_credential_cancel => self.cancelPushCredentialPrompt(ctx.allocator()),
@@ -3955,6 +3962,13 @@ pub const App = struct {
         } };
     }
 
+    fn copyPopupDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
+        return .{ .clipboard_copy_finished = .{
+            .label = "push error",
+            .outcome = clipboardCopyOutcome(result.outcome),
+        } };
+    }
+
     fn clipboardCopyOutcome(outcome: chasen.Ctx(Msg).ClipboardCopyOutcome) ClipboardCopyOutcome {
         return switch (outcome) {
             .sent => .sent,
@@ -4016,6 +4030,28 @@ pub const App = struct {
             .label = "file path",
             .text = target.display_path,
         }, copyDiffHeaderPathDone);
+    }
+
+    fn copyPopup(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        const target = self.popupCopyTarget() orelse {
+            self.setStatus("nothing to copy: popup", .{});
+            return;
+        };
+        self.queueClipboardCopy(ctx, .{
+            .label = target.label,
+            .text = target.text,
+        }, copyPopupDone);
+    }
+
+    fn popupCopyTarget(self: *const App) ?PopupCopyTarget {
+        if (self.overlay.isPushError()) {
+            const message = self.push_error_message orelse return null;
+            return .{
+                .label = "push error",
+                .text = message,
+            };
+        }
+        return null;
     }
 
     fn queueClipboardCopy(
@@ -7004,6 +7040,35 @@ test "clipboard copy result status uses best-effort wording" {
 
     app.finishClipboardCopy(.{ .label = "current line", .outcome = .{ .write_failed = "BrokenPipe" } });
     try std.testing.expectEqualStrings("clipboard copy failed: current line: BrokenPipe", app.status.text());
+}
+
+test "copyPopup queues push error message text" {
+    var app: App = .{
+        .overlay = .{ .kind = .push_error },
+        .push_error_message = try std.testing.allocator.dupe(u8, "  fatal\nline two  "),
+    };
+    defer std.testing.allocator.free(app.push_error_message.?);
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.copyPopup(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    const entry = ctx._pending_clipboard_copies[0];
+    try std.testing.expectEqualStrings("  fatal\nline two  ", entry.text);
+    try std.testing.expectEqual(@as(chasen.Ctx(App.Msg).ClipboardCopyFinishedFn, App.copyPopupDone), entry.finished);
+}
+
+test "copyPopup reports empty target outside copyable popup" {
+    var app: App = .{};
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.copyPopup(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings("nothing to copy: popup", app.status.text());
 }
 
 test "display mode toggle keeps nearby vertical scroll position" {

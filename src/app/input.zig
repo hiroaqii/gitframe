@@ -106,6 +106,7 @@ const Action = enum {
     push_error_scroll_down,
     push_error_page_up,
     push_error_page_down,
+    copy_popup,
     push_credential_tab,
     push_credential_submit,
     push_credential_cancel,
@@ -295,6 +296,7 @@ fn pushErrorKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .close_push_error);
     if (key.codepoint == 'c' and !hasCommandModifier(key)) return actionToMsg(Msg, .open_push_credentials);
     if (key.codepoint == 'i' and !hasCommandModifier(key)) return actionToMsg(Msg, .run_interactive_push);
+    if (key.codepoint == 'y' and !hasCommandModifier(key)) return actionToMsg(Msg, .copy_popup);
     if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .push_error_scroll_up);
     if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .push_error_scroll_down);
     if (key.matches(chasen.Key.page_up, .{})) return actionToMsg(Msg, .push_error_page_up);
@@ -568,6 +570,7 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .push_error_scroll_down => voidMsg(Msg, "push_error_scroll_down"),
         .push_error_page_up => voidMsg(Msg, "push_error_page_up"),
         .push_error_page_down => voidMsg(Msg, "push_error_page_down"),
+        .copy_popup => voidMsg(Msg, "copy_popup"),
         .push_credential_tab => voidMsg(Msg, "push_credential_tab"),
         .push_credential_submit => voidMsg(Msg, "push_credential_submit"),
         .push_credential_cancel => voidMsg(Msg, "push_credential_cancel"),
@@ -704,6 +707,7 @@ const TestMsg = union(enum) {
     push_error_scroll_down,
     push_error_page_up,
     push_error_page_down,
+    copy_popup,
     push_credential_tab,
     push_credential_submit,
     push_credential_cancel,
@@ -1250,6 +1254,7 @@ test "keyToMsg maps push error modal keys" {
     try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'q' }).?);
     try std.testing.expectEqual(TestMsg.run_interactive_push, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'i' }).?);
+    try std.testing.expectEqual(TestMsg.copy_popup, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'y' }).?);
     try std.testing.expectEqual(TestMsg.push_error_scroll_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'k' }).?);
     try std.testing.expectEqual(TestMsg.push_error_scroll_down, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'j' }).?);
     try std.testing.expectEqual(TestMsg.push_error_scroll_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.up }).?);
@@ -1257,6 +1262,11 @@ test "keyToMsg maps push error modal keys" {
     try std.testing.expectEqual(TestMsg.push_error_page_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.page_up }).?);
     try std.testing.expectEqual(TestMsg.push_error_page_down, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.page_down }).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'P' }));
+}
+
+test "keyToMsg keeps printable y as editable popup input" {
+    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'y' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(TestMsg{ .push_credential_insert = 'y' }, keyToMsg(TestMsg, .{ .push_credential_mode = true }, .{ .codepoint = 'y' }).?);
 }
 
 test "keyToMsg opens and closes help outside prompt modes" {
