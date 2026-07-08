@@ -467,6 +467,7 @@ pub const App = struct {
         cancel_commit_panel,
         submit_commit_panel,
         generate_commit_message,
+        copy_commit_message,
         commit_panel_tab,
         commit_panel_enter,
         commit_panel_insert: u21,
@@ -735,6 +736,7 @@ pub const App = struct {
             .cancel_commit_panel => self.closeCommitPanel(),
             .submit_commit_panel => try self.submitCommitPanel(ctx),
             .generate_commit_message => try self.generateCommitMessage(ctx),
+            .copy_commit_message => self.copyCommitMessage(ctx),
             .commit_panel_tab => self.commit_panel.toggleField(),
             .commit_panel_enter => self.commit_panel.enter(),
             .commit_panel_insert => |codepoint| self.commit_panel.insert(codepoint),
@@ -3969,6 +3971,13 @@ pub const App = struct {
         } };
     }
 
+    fn copyCommitMessageDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
+        return .{ .clipboard_copy_finished = .{
+            .label = "commit message",
+            .outcome = clipboardCopyOutcome(result.outcome),
+        } };
+    }
+
     fn clipboardCopyOutcome(outcome: chasen.Ctx(Msg).ClipboardCopyOutcome) ClipboardCopyOutcome {
         return switch (outcome) {
             .sent => .sent,
@@ -4052,6 +4061,24 @@ pub const App = struct {
             };
         }
         return null;
+    }
+
+    fn copyCommitMessage(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        if (!self.commit_panel.is_open) {
+            self.setStatus("nothing to copy: commit message", .{});
+            return;
+        }
+        const text = self.commit_panel.formatMessage(ctx.allocator()) catch {
+            self.commit_panel.commit_error = .input_allocation_failed;
+            self.setStatus("could not prepare commit message copy", .{});
+            return;
+        };
+        defer ctx.allocator().free(text);
+
+        self.queueClipboardCopy(ctx, .{
+            .label = "commit message",
+            .text = text,
+        }, copyCommitMessageDone);
     }
 
     fn queueClipboardCopy(
@@ -7069,6 +7096,79 @@ test "copyPopup reports empty target outside copyable popup" {
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
     try std.testing.expectEqualStrings("nothing to copy: popup", app.status.text());
+}
+
+test "copyCommitMessage queues formatted commit message text" {
+    var app: App = .{
+        .commit_panel = app_commit_panel.State.init(std.testing.allocator),
+    };
+    defer app.commit_panel.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.commit_panel.open(.commit);
+    app.commit_panel.replaceDraft("  subject  ", "  body\n\nline two  ");
+
+    app.copyCommitMessage(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    const entry = ctx._pending_clipboard_copies[0];
+    try std.testing.expectEqualStrings("subject\n\nbody\n\nline two", entry.text);
+    try std.testing.expectEqual(@as(chasen.Ctx(App.Msg).ClipboardCopyFinishedFn, App.copyCommitMessageDone), entry.finished);
+}
+
+test "copyCommitMessage uses same commit panel state for amend mode" {
+    var app: App = .{
+        .commit_panel = app_commit_panel.State.init(std.testing.allocator),
+    };
+    defer app.commit_panel.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.commit_panel.open(.amend);
+    app.commit_panel.replaceDraft("amend subject", null);
+
+    app.copyCommitMessage(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings("amend subject", ctx._pending_clipboard_copies[0].text);
+}
+
+test "copyCommitMessage preserves body-only formatMessage shape" {
+    var app: App = .{
+        .commit_panel = app_commit_panel.State.init(std.testing.allocator),
+    };
+    defer app.commit_panel.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.commit_panel.open(.commit);
+    app.commit_panel.replaceDraft("", "body");
+
+    app.copyCommitMessage(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings("\n\nbody", ctx._pending_clipboard_copies[0].text);
+}
+
+test "copyCommitMessage reports empty draft and closed panel" {
+    var app: App = .{
+        .commit_panel = app_commit_panel.State.init(std.testing.allocator),
+    };
+    defer app.commit_panel.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.copyCommitMessage(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings("nothing to copy: commit message", app.status.text());
+
+    app.commit_panel.open(.commit);
+    app.copyCommitMessage(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings("nothing to copy: commit message", app.status.text());
 }
 
 test "display mode toggle keeps nearby vertical scroll position" {
