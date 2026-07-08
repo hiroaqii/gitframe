@@ -1142,20 +1142,19 @@ pub const App = struct {
         const render_col = local_col - content_gutter;
         if (render_col >= content_width) return null;
 
-        const summary_width = self.displayedDiffHeaderSummaryWidth(content_width) orelse return null;
-        const layout = diff_render.headerLayout(content_width, app_view.repoHeaderLabel(self), target.display_path, summary_width);
+        const layout = self.displayedDiffHeaderLayout(content_width, target.display_path) orelse return null;
         const path_target = layout.path_target orelse return null;
         if (!path_target.contains(render_col)) return null;
         return target;
     }
 
-    fn displayedDiffHeaderSummaryWidth(self: *const App, content_width: u16) ?u16 {
+    fn displayedDiffHeaderLayout(self: *const App, content_width: u16, display_path: []const u8) ?diff_render.HeaderLayout {
         const mode_width = diff_render.bodyWidth(content_width);
         if (self.activeGeneratedFileProjection()) |bundle| {
-            return diff_render.generatedHeaderSummaryWidth(bundle.file.lines.len, bundle.file.truncated, self.viewer.display_mode, mode_width);
+            return diff_render.generatedHeaderLayout(content_width, display_path, bundle.file.lines.len, bundle.file.truncated, self.viewer.display_mode, mode_width);
         }
         const file = self.displayedDiffFile() orelse return null;
-        return diff_render.fileHeaderSummaryWidth(file, self.viewer.display_mode, mode_width);
+        return diff_render.fileHeaderLayout(content_width, display_path, file, self.viewer.display_mode, mode_width);
     }
 
     fn diffMouseHit(self: *const App, point: MousePoint) ?DiffMouseHit {
@@ -6102,6 +6101,15 @@ pub const App = struct {
         };
         if (status_index >= self.git_status.document.entries.len) return null;
         return self.git_status.document.entries[status_index];
+    }
+
+    pub fn selectedStatusLineStats(self: *const App) ?file_tree.Stats {
+        const entry = self.selectedStatusEntry() orelse return null;
+        const path_key = entry.canonicalPathKey() orelse return null;
+        for (self.git_status.document.line_stats) |line_stats| {
+            if (std.mem.eql(u8, line_stats.path_key, path_key)) return line_stats.stats;
+        }
+        return null;
     }
 
     fn ensureTreeOrderScope(self: *App, allocator: std.mem.Allocator) !void {
@@ -12288,11 +12296,11 @@ test "status mode label uses diff content width after marker gutter" {
 
     try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
 
-    try ts.expectCellText(41, 0, "u");
-    try ts.expectCellText(42, 0, "n");
-    try ts.expectCellText(43, 0, "i");
-    try ts.expectCellText(49, 0, "(");
-    try ts.expectCellText(50, 0, "a");
+    try ts.expectCellText(57, 0, "u");
+    try ts.expectCellText(58, 0, "n");
+    try ts.expectCellText(59, 0, "i");
+    try ts.expectCellText(65, 0, "(");
+    try ts.expectCellText(66, 0, "a");
 }
 
 test "search input header does not show no match before submit" {

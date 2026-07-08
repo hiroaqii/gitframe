@@ -170,8 +170,9 @@ fn shouldShowStats(row: Row, width: u16, name_col: u16) bool {
     const stats_width: u16 = 12;
     const min_name_width_with_stats: u16 = 8;
 
-    // File names are the primary sidebar content; keep stats only when enough
-    // width remains for a recognizable name.
+    // File rows keep navigation quiet; selected file stats live in the diff
+    // pane header.
+    if (row.kind == .file) return false;
     return hasLineStats(row.stats) and
         width > name_col + stats_width + min_name_width_with_stats;
 }
@@ -236,10 +237,10 @@ test "layout keeps sidebar columns in one place" {
     try std.testing.expectEqual(@as(u16, 2), row_layout.badge_col.?);
     try std.testing.expectEqual(@as(?u16, null), row_layout.mode_col);
     try std.testing.expectEqual(@as(u16, 6), row_layout.name_col);
-    try std.testing.expectEqual(@as(u16, 22), row_layout.name_width);
+    try std.testing.expectEqual(@as(u16, 34), row_layout.name_width);
     try std.testing.expectEqual(@as(u16, 4), row_layout.tree_content_col);
-    try std.testing.expectEqual(@as(u16, 24), row_layout.tree_content_width);
-    try std.testing.expectEqual(@as(u16, 28), row_layout.stats_col.?);
+    try std.testing.expectEqual(@as(u16, 36), row_layout.tree_content_width);
+    try std.testing.expectEqual(@as(?u16, null), row_layout.stats_col);
 }
 
 test "layout reserves a mode badge column for mode-changed file rows" {
@@ -330,4 +331,32 @@ test "layout prioritizes file name over stats in narrow sidebars" {
     try std.testing.expectEqual(@as(?u16, null), row_layout.stats_col);
     try std.testing.expectEqual(@as(u16, 0), row_layout.stats_width);
     try std.testing.expect(row_layout.name_width > 0);
+}
+
+test "layout shows stats for repository root and directory rows" {
+    const nodes = [_]file_tree.Node{
+        .{
+            .kind = .repo_root,
+            .name = "repo",
+            .path = "",
+            .depth = 0,
+            .stats = .{ .added = 68, .removed = 3 },
+            .target = .repo_root,
+        },
+        .{
+            .kind = .directory,
+            .name = "src",
+            .path = "src",
+            .depth = 1,
+            .stats = .{ .added = 12, .removed = 4 },
+        },
+    };
+    const tree: file_tree.FileTree = .{ .nodes = &nodes };
+    const collapsed: file_tree.CollapsedSet = .empty;
+
+    const root_layout = layout(rowForNode(tree, &collapsed, &.{}, 0, 0).?, 40);
+    const directory_layout = layout(rowForNode(tree, &collapsed, &.{}, 1, 0).?, 40);
+
+    try std.testing.expect(root_layout.stats_col != null);
+    try std.testing.expect(directory_layout.stats_col != null);
 }

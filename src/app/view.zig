@@ -485,13 +485,11 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
     const display = (try app.activeDiffDisplay(surface.frameAllocator(), mode)) orelse return;
     const display_file = display.file();
-    const title_prefix = repoHeaderLabel(app);
     try diff_render.renderFile(&diff_content, display_file, .{
         .requested_mode = app.viewer.display_mode,
         .scroll = app.viewer.diff_scroll,
         .horizontal_scroll = app.viewer.diff_horizontal_scroll,
         .pane_active = active,
-        .title_prefix = title_prefix,
         .line_numbers = app.viewer.view_options.line_numbers,
         .highlighted_hunk = app.selectedHunkIndex(),
         .cursor_offset = app.visibleDiffCursorOffset(),
@@ -552,7 +550,6 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                 .scroll = app.viewer.diff_scroll,
                 .horizontal_scroll = app.viewer.diff_horizontal_scroll,
                 .pane_active = active,
-                .title_prefix = repoHeaderLabel(app),
                 .line_numbers = app.viewer.view_options.line_numbers,
                 .highlighted_hunk = app.selectedHunkIndex(),
                 .cursor_offset = app.visibleDiffCursorOffset(),
@@ -573,7 +570,6 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
             .scroll = app.viewer.diff_scroll,
             .horizontal_scroll = app.viewer.diff_horizontal_scroll,
             .pane_active = active,
-            .title_prefix = repoHeaderLabel(app),
             .line_numbers = app.viewer.view_options.line_numbers,
             .cursor_offset = app.visibleDiffCursorOffset(),
             .palette = app.theme,
@@ -589,26 +585,26 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                 .cached_diff, .generated_added_file => {},
                 .combined_hunks => {},
                 .status_body => |body| {
-                    try drawStatusBody(&content, repoHeaderLabel(app), body.path, body.message, active, app.theme);
+                    try drawStatusBody(&content, body.path, body.message, app.selectedStatusLineStats(), active, app.theme);
                     drawPaneHeaderRule(surface, active, app.theme);
                     return;
                 },
             }
         },
         .failed => |failed| {
-            try drawStatusBody(&content, repoHeaderLabel(app), failed.body.path, failed.body.message, active, app.theme);
+            try drawStatusBody(&content, failed.body.path, failed.body.message, app.selectedStatusLineStats(), active, app.theme);
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .pending => {
-            try drawStatusBody(&content, repoHeaderLabel(app), path, "Loading review projection...", active, app.theme);
+            try drawStatusBody(&content, path, "Loading review projection...", app.selectedStatusLineStats(), active, app.theme);
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .idle => {},
     }
 
-    try drawTitlePath(&content, repoHeaderLabel(app), path, paneTitleStyle(active, app.theme));
+    try drawTitlePath(&content, path, app.selectedStatusLineStats(), paneTitleStyle(active, app.theme), active, app.theme);
     const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "status: {s}{s}", .{ statusName(entry.index), statusSuffix(entry) });
     try draw.copyClippedTextAt(&content, 0, 2, status_text, .{ .fg = roleColor(app.theme, .muted), .dim = !active });
     switch (file_tree.stagePresenceFromEntry(entry)) {
@@ -632,13 +628,42 @@ fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool, palette: theme.Pal
     }
 }
 
-fn drawStatusBody(surface: *chasen.Surface, repo_label: ?[]const u8, path: []const u8, message: []const u8, active: bool, palette: theme.Palette) !void {
-    try drawTitlePath(surface, repo_label, path, paneTitleStyle(active, palette));
+fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u8, stats: ?file_tree.Stats, active: bool, palette: theme.Palette) !void {
+    try drawTitlePath(surface, path, stats, paneTitleStyle(active, palette), active, palette);
     try draw.copyClippedTextAt(surface, 0, 2, message, .{ .fg = roleColor(palette, .muted), .dim = !active });
 }
 
-fn drawTitlePath(surface: *chasen.Surface, repo_label: ?[]const u8, path: []const u8, style: chasen.TextStyle) !void {
-    try draw.copyPrefixedTailClippedPathAt(surface, 0, 0, repo_label, path, style);
+fn drawTitlePath(surface: *chasen.Surface, path: []const u8, stats: ?file_tree.Stats, style: chasen.TextStyle, active: bool, palette: theme.Palette) !void {
+    if (stats) |line_stats| {
+        if (line_stats.added != 0 or line_stats.removed != 0) {
+            const suffix = try std.fmt.allocPrint(surface.frameAllocator(), " +{d} -{d}", .{ line_stats.added, line_stats.removed });
+            const suffix_width = chasen.text.displayWidth(suffix);
+            const path_width = surface.size().width -| @as(u16, @intCast(@min(suffix_width, std.math.maxInt(u16))));
+            if (path_width > 8) {
+                var path_surface = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
+                try draw.copyTailClippedTextAt(&path_surface, 0, 0, path, style);
+                const suffix_col: u16 = @intCast(path_width);
+                try drawStatusLineStats(surface, suffix_col, line_stats, active, palette);
+                return;
+            }
+        }
+    }
+    try draw.copyTailClippedTextAt(surface, 0, 0, path, style);
+}
+
+fn drawStatusLineStats(surface: *chasen.Surface, col: u16, stats: file_tree.Stats, active: bool, palette: theme.Palette) !void {
+    var cursor = col;
+    try draw.copyClippedTextAt(surface, cursor, 0, " ", roleStyle(palette, .muted));
+    cursor +|= 1;
+    const added = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added});
+    try draw.copyClippedTextAt(surface, cursor, 0, added, .{ .fg = roleColor(palette, .success), .bold = true, .dim = !active });
+    cursor +|= @intCast(chasen.text.displayWidth(added));
+    if (cursor < surface.size().width) {
+        try draw.copyClippedTextAt(surface, cursor, 0, " ", roleStyle(palette, .muted));
+        cursor +|= 1;
+    }
+    const removed = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed});
+    try draw.copyClippedTextAt(surface, cursor, 0, removed, .{ .fg = roleColor(palette, .danger), .bold = true, .dim = !active });
 }
 
 fn statusName(status: git_status.StatusCode) []const u8 {
@@ -946,13 +971,6 @@ const FooterSegments = struct {
         return self.requiredWidth();
     }
 };
-
-pub fn repoHeaderLabel(app: anytype) ?[]const u8 {
-    const root = app.repo_state.activeRoot() orelse return null;
-    const base = std.fs.path.basename(root);
-    if (base.len == 0) return root;
-    return base;
-}
 
 fn branchStatusSidebarText(app: anytype, allocator: std.mem.Allocator, available_width: u16) ?[]const u8 {
     const root = app.repo_state.activeRoot() orelse return null;
