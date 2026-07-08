@@ -994,8 +994,7 @@ fn formatSidebarBranchStatus(allocator: std.mem.Allocator, status: git_branch_st
         " no upstream"
     else blk: {
         const ahead = if (status.ahead_behind) |ab| ab.ahead else 0;
-        const behind = if (status.ahead_behind) |ab| ab.behind else 0;
-        allocated_suffix = try std.fmt.allocPrint(allocator, " ↑{d} ↓{d}", .{ ahead, behind });
+        allocated_suffix = try std.fmt.allocPrint(allocator, " ↑{d}", .{ahead});
         break :blk allocated_suffix.?;
     };
     const reserved = chasen.text.displayWidth(suffix);
@@ -1036,7 +1035,7 @@ test "formatSidebarBranchStatus distinguishes upstream state" {
         .ahead_behind = .{ .ahead = 2, .behind = 1 },
     }, 80);
     defer std.testing.allocator.free(with_upstream);
-    try std.testing.expectEqualStrings("feature/topic ↑2 ↓1", with_upstream);
+    try std.testing.expectEqualStrings("feature/topic ↑2", with_upstream);
 
     const without_upstream = try formatSidebarBranchStatus(std.testing.allocator, .{
         .head = .{ .branch = "feature/topic" },
@@ -1054,7 +1053,18 @@ test "formatSidebarBranchStatus keeps branch prefix and tail when clipped" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.startsWith(u8, text, "feature/…"));
-    try std.testing.expect(std.mem.endsWith(u8, text, " ↑0 ↓0"));
+    try std.testing.expect(std.mem.endsWith(u8, text, " ↑0"));
+}
+
+test "formatSidebarBranchStatus omits behind count" {
+    const text = try formatSidebarBranchStatus(std.testing.allocator, .{
+        .head = .{ .branch = "main" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{ .ahead = 0, .behind = 7 },
+    }, 80);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqualStrings("main ↑0", text);
 }
 
 fn sourceFooterLabel(config: anytype) ?[]const u8 {
