@@ -261,6 +261,7 @@ pub fn buildWithStatusStable(
                 .name = baseName(path),
                 .path = path,
                 .path_key = path,
+                .stats = statusLineStats(doc, key),
                 .status = statusFromEntry(entry),
                 .stage_presence = stagePresenceFromEntry(entry),
                 .target = .{ .status_entry = status_entry_index },
@@ -428,6 +429,13 @@ fn statusFromEntry(entry: git_status.StatusEntry) ?Status {
     if (entry.index == .added or entry.worktree == .added) return .added;
     if (entry.index == .modified or entry.worktree == .modified or entry.isConflict()) return .modified;
     return null;
+}
+
+fn statusLineStats(document: git_status.StatusDocument, key: []const u8) Stats {
+    for (document.line_stats) |entry| {
+        if (std.mem.eql(u8, entry.path_key, key)) return entry.stats;
+    }
+    return .{};
 }
 
 pub fn stagePresenceFromEntry(entry: git_status.StatusEntry) StagePresence {
@@ -631,6 +639,40 @@ test "buildWithStatus adds untracked status-only rows" {
     try std.testing.expectEqual(Status.added, tree.nodes[2].status.?);
     try std.testing.expect(tree.nodes[2].target == .status_entry);
     try std.testing.expectEqual(@as(usize, 0), tree.nodes[2].target.status_entry);
+}
+
+test "buildWithStatus applies status-only line stats to files and directories" {
+    const diff_text =
+        \\diff --git a/src/main.zig b/src/main.zig
+        \\--- a/src/main.zig
+        \\+++ b/src/main.zig
+        \\@@ -1 +1,2 @@
+        \\ old
+        \\+new
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const document = try diff_parser.parse(allocator, diff_text);
+    const status_entries = [_]git_status.StatusEntry{
+        .{ .path = "src/added.zig", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked },
+    };
+    const line_stats = [_]git_status.StatusLineStats{
+        .{ .path_key = "src/added.zig", .stats = .{ .added = 3, .removed = 0 } },
+    };
+    const status_document: git_status.StatusDocument = .{ .entries = &status_entries, .line_stats = &line_stats };
+
+    const tree = try buildWithStatus(allocator, document, status_document);
+
+    try std.testing.expectEqual(@as(usize, 3), tree.nodes.len);
+    try std.testing.expectEqualStrings("src", tree.nodes[0].path);
+    try std.testing.expectEqual(@as(usize, 4), tree.nodes[0].stats.added);
+    try std.testing.expectEqualStrings("src/added.zig", tree.nodes[1].path);
+    try std.testing.expectEqual(@as(usize, 3), tree.nodes[1].stats.added);
+    try std.testing.expectEqualStrings("src/main.zig", tree.nodes[2].path);
+    try std.testing.expectEqual(@as(usize, 1), tree.nodes[2].stats.added);
 }
 
 test "buildWithStatus skips rows already present in diff" {

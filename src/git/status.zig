@@ -1,4 +1,5 @@
 const std = @import("std");
+const diff_file = @import("../diff/file.zig");
 const path_key = @import("../path_key.zig");
 
 pub const ParseError = error{
@@ -27,13 +28,29 @@ pub const StatusCode = enum {
 /// input buffer, such as async task results stored in app state.
 pub const StatusDocument = struct {
     entries: []const StatusEntry,
+    line_stats: []const StatusLineStats = &.{},
 
     pub fn eql(self: StatusDocument, other: StatusDocument) bool {
         if (self.entries.len != other.entries.len) return false;
         for (self.entries, other.entries) |left, right| {
             if (!left.eql(right)) return false;
         }
+        if (self.line_stats.len != other.line_stats.len) return false;
+        for (self.line_stats, other.line_stats) |left, right| {
+            if (!left.eql(right)) return false;
+        }
         return true;
+    }
+};
+
+pub const StatusLineStats = struct {
+    path_key: []const u8,
+    stats: diff_file.Stats,
+
+    pub fn eql(self: StatusLineStats, other: StatusLineStats) bool {
+        return std.mem.eql(u8, self.path_key, other.path_key) and
+            self.stats.added == other.stats.added and
+            self.stats.removed == other.stats.removed;
     }
 };
 
@@ -109,6 +126,19 @@ pub const StatusBundle = struct {
             .arena = arena,
             .document = document,
         };
+    }
+
+    pub fn attachLineStats(self: *StatusBundle, line_stats: []const StatusLineStats) ParseError!void {
+        const arena = if (self.arena) |*arena| arena else return error.OutOfMemory;
+        const arena_allocator = arena.allocator();
+        const copied = try arena_allocator.alloc(StatusLineStats, line_stats.len);
+        for (line_stats, 0..) |entry, index| {
+            copied[index] = .{
+                .path_key = try arena_allocator.dupe(u8, entry.path_key),
+                .stats = entry.stats,
+            };
+        }
+        self.document.line_stats = copied;
     }
 
     pub fn deinit(self: *StatusBundle) void {
@@ -356,6 +386,26 @@ test "status document equality includes length and entry equality" {
     try std.testing.expect(!document.eql(.{ .entries = &shorter_entries }));
 }
 
+test "status document equality includes line stats" {
+    const entries = [_]StatusEntry{
+        .{ .path = "a.zig", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked },
+    };
+    const line_stats = [_]StatusLineStats{
+        .{ .path_key = "a.zig", .stats = .{ .added = 1 } },
+    };
+    const same_line_stats = [_]StatusLineStats{
+        .{ .path_key = "a.zig", .stats = .{ .added = 1 } },
+    };
+    const changed_line_stats = [_]StatusLineStats{
+        .{ .path_key = "a.zig", .stats = .{ .added = 2 } },
+    };
+
+    const document: StatusDocument = .{ .entries = &entries, .line_stats = &line_stats };
+    try std.testing.expect(document.eql(.{ .entries = &entries, .line_stats = &same_line_stats }));
+    try std.testing.expect(!document.eql(.{ .entries = &entries, .line_stats = &changed_line_stats }));
+    try std.testing.expect(!document.eql(.{ .entries = &entries }));
+}
+
 test "parse untracked and ignored entries as worktree status" {
     const doc = try parse(std.testing.allocator, "?? new file.zig\x00!! ignored.tmp\x00");
     defer std.testing.allocator.free(doc.entries);
@@ -401,6 +451,21 @@ test "parseOwned keeps paths alive after source buffer is freed" {
     defer bundle.deinit();
 
     try std.testing.expectEqualStrings("src/main.zig", bundle.document.entries[0].path);
+}
+
+test "StatusBundle attaches line stats into bundle arena" {
+    const allocator = std.testing.allocator;
+    var bundle = try StatusBundle.parseOwned(allocator, "?? src/new.zig\x00");
+    defer bundle.deinit();
+
+    const source = [_]StatusLineStats{
+        .{ .path_key = "src/new.zig", .stats = .{ .added = 3 } },
+    };
+    try bundle.attachLineStats(&source);
+
+    try std.testing.expectEqual(@as(usize, 1), bundle.document.line_stats.len);
+    try std.testing.expectEqualStrings("src/new.zig", bundle.document.line_stats[0].path_key);
+    try std.testing.expectEqual(@as(usize, 3), bundle.document.line_stats[0].stats.added);
 }
 
 test "GitStatusState takes bundle arena and stores repo root" {

@@ -9,12 +9,20 @@ const git_backend = @import("../git/backend.zig");
 const git_branch_status = @import("../git/branch_status.zig");
 const git_status = @import("../git/status.zig");
 const loaded_diff = @import("../loaded_diff.zig");
+const path_key_mod = @import("../path_key.zig");
+const process_runner = @import("../process/runner.zig");
 const review_projection = @import("review_projection.zig");
 const repo_discovery = @import("../repo/discovery.zig");
 const syntax_provider = @import("../syntax/provider_runtime.zig");
 
 const LoadRequest = diff_source.LoadRequest;
 const LoadedDiff = loaded_diff.LoadedDiff;
+
+const status_line_stats_stdout_limit = 2 * 1024 * 1024;
+const status_line_stats_stderr_limit = 256 * 1024;
+const untracked_stats_per_file_bytes = review_projection.max_generated_file_bytes;
+const untracked_stats_max_files = 256;
+const untracked_stats_total_bytes = 4 * 1024 * 1024;
 
 /// Result payload sent from the asynchronous diff load task back to App.
 pub const DiffLoadFinished = struct {
@@ -481,10 +489,11 @@ pub fn runStatusLoad(repo_root: []const u8, allocator: std.mem.Allocator, io: st
             // as a loaded document so App can remember which repo was proven
             // clean; otherwise pull's clean-worktree gate sees the status as
             // stale forever on clean repositories.
-            const bundle = git_status.StatusBundle.parseOwned(allocator, bytes) catch |err| {
+            var bundle = git_status.StatusBundle.parseOwned(allocator, bytes) catch |err| {
                 return .{ .failed = std.fmt.allocPrint(allocator, "Status parse failed: {s}", .{@errorName(err)}) catch
                     return .{ .failed_static = "Status parse failed: OutOfMemory" } };
             };
+            populateStatusLineStats(allocator, io, repo_root, &bundle) catch {};
             return .{ .loaded = bundle };
         },
         .failed => |message| return .{ .failed = message },
@@ -506,6 +515,214 @@ pub fn runBranchStatusLoad(repo_root: []const u8, allocator: std.mem.Allocator, 
         .failed => |message| return .{ .failed = message },
         .failed_static => |message| return .{ .failed_static = message },
     }
+}
+
+const StatusStatsMap = std.StringHashMapUnmanaged(file_tree.Stats);
+
+fn populateStatusLineStats(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, bundle: *git_status.StatusBundle) !void {
+    var stats_map: StatusStatsMap = .empty;
+    defer deinitStatusStatsMap(allocator, &stats_map);
+
+    try collectTrackedStatusLineStats(allocator, io, repo_root, bundle.document, &stats_map, .staged);
+    try collectTrackedStatusLineStats(allocator, io, repo_root, bundle.document, &stats_map, .unstaged);
+    try collectUntrackedStatusLineStats(allocator, io, repo_root, bundle.document, &stats_map);
+
+    const line_stats = try statusStatsMapToList(allocator, stats_map);
+    defer {
+        for (line_stats) |entry| allocator.free(entry.path_key);
+        allocator.free(line_stats);
+    }
+
+    try bundle.attachLineStats(line_stats);
+}
+
+fn deinitStatusStatsMap(allocator: std.mem.Allocator, stats_map: *StatusStatsMap) void {
+    var iterator = stats_map.keyIterator();
+    while (iterator.next()) |key| allocator.free(key.*);
+    stats_map.deinit(allocator);
+}
+
+const TrackedStatsSide = enum {
+    staged,
+    unstaged,
+};
+
+fn collectTrackedStatusLineStats(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repo_root: []const u8,
+    document: git_status.StatusDocument,
+    stats_map: *StatusStatsMap,
+    side: TrackedStatsSide,
+) !void {
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(allocator);
+
+    for (document.entries) |entry| {
+        if (entry.isIgnored() or entry.isUntracked()) continue;
+        const include = switch (side) {
+            .staged => entry.isStaged(),
+            .unstaged => entry.isUnstaged(),
+        };
+        if (!include) continue;
+        const key = entry.canonicalPathKey() orelse continue;
+        try paths.append(allocator, key);
+    }
+    if (paths.items.len == 0) return;
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "git");
+    try argv.append(allocator, "diff");
+    if (side == .staged) try argv.append(allocator, "--cached");
+    try argv.append(allocator, "--no-renames");
+    try argv.append(allocator, "--numstat");
+    try argv.append(allocator, "-z");
+    try argv.append(allocator, "--");
+    for (paths.items) |path| try argv.append(allocator, path);
+
+    const result = process_runner.runCaptured(allocator, io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = repo_root },
+        .stdout_limit = .limited(status_line_stats_stdout_limit),
+        .stderr_limit = .limited(status_line_stats_stderr_limit),
+    }) catch return;
+    defer result.deinit(allocator);
+
+    switch (result.term) {
+        .exited => |code| if (code == 0) try parseNumstatZIntoMap(allocator, result.stdout, stats_map),
+        else => {},
+    }
+}
+
+fn parseNumstatZIntoMap(allocator: std.mem.Allocator, bytes: []const u8, stats_map: *StatusStatsMap) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const field = nextZField(bytes, &offset) orelse break;
+        if (field.len == 0) continue;
+        const parsed = parseNumstatField(field) orelse continue;
+        const key = path_key_mod.canonicalRepoPath(parsed.path) orelse continue;
+        try addStatusStats(allocator, stats_map, key, parsed.stats);
+    }
+}
+
+const NumstatField = struct {
+    path: []const u8,
+    stats: file_tree.Stats,
+};
+
+fn parseNumstatField(field: []const u8) ?NumstatField {
+    const first_tab = std.mem.indexOfScalar(u8, field, '\t') orelse return null;
+    const second_tab = std.mem.indexOfScalarPos(u8, field, first_tab + 1, '\t') orelse return null;
+    const added_text = field[0..first_tab];
+    const removed_text = field[first_tab + 1 .. second_tab];
+    if (std.mem.eql(u8, added_text, "-") or std.mem.eql(u8, removed_text, "-")) return null;
+    const added = std.fmt.parseInt(usize, added_text, 10) catch return null;
+    const removed = std.fmt.parseInt(usize, removed_text, 10) catch return null;
+    const path = field[second_tab + 1 ..];
+    if (path.len == 0) return null;
+    return .{ .path = path, .stats = .{ .added = added, .removed = removed } };
+}
+
+fn collectUntrackedStatusLineStats(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repo_root: []const u8,
+    document: git_status.StatusDocument,
+    stats_map: *StatusStatsMap,
+) !void {
+    return collectUntrackedStatusLineStatsWithBudget(allocator, io, repo_root, document, stats_map, .{
+        .per_file_bytes = untracked_stats_per_file_bytes,
+        .max_files = untracked_stats_max_files,
+        .total_bytes = untracked_stats_total_bytes,
+    });
+}
+
+const UntrackedStatsBudget = struct {
+    per_file_bytes: usize,
+    max_files: usize,
+    total_bytes: usize,
+};
+
+fn collectUntrackedStatusLineStatsWithBudget(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repo_root: []const u8,
+    document: git_status.StatusDocument,
+    stats_map: *StatusStatsMap,
+    budget: UntrackedStatsBudget,
+) !void {
+    var inspected_files: usize = 0;
+    var inspected_bytes: usize = 0;
+
+    for (document.entries) |entry| {
+        if (!entry.isUntracked()) continue;
+        if (inspected_files >= budget.max_files) return;
+        const key = entry.canonicalPathKey() orelse continue;
+        inspected_files += 1;
+
+        const content = readRepoFileLimited(allocator, io, repo_root, key, budget.per_file_bytes) catch continue;
+        defer allocator.free(content);
+
+        if (inspected_bytes + content.len > budget.total_bytes) return;
+        inspected_bytes += content.len;
+
+        if (std.mem.indexOfScalar(u8, content, 0) != null) continue;
+        try addStatusStats(allocator, stats_map, key, .{ .added = addedFileLineCount(content) });
+    }
+}
+
+fn addStatusStats(allocator: std.mem.Allocator, stats_map: *StatusStatsMap, key: []const u8, stats: file_tree.Stats) !void {
+    const result = try stats_map.getOrPut(allocator, key);
+    if (result.found_existing) {
+        result.value_ptr.add(stats);
+        return;
+    }
+    errdefer _ = stats_map.remove(key);
+    result.key_ptr.* = try allocator.dupe(u8, key);
+    result.value_ptr.* = stats;
+}
+
+fn statusStatsMapToList(allocator: std.mem.Allocator, stats_map: StatusStatsMap) ![]git_status.StatusLineStats {
+    var line_stats = try allocator.alloc(git_status.StatusLineStats, stats_map.count());
+    errdefer {
+        for (line_stats) |entry| allocator.free(entry.path_key);
+        allocator.free(line_stats);
+    }
+
+    var iterator = stats_map.iterator();
+    var index: usize = 0;
+    while (iterator.next()) |entry| : (index += 1) {
+        line_stats[index] = .{
+            .path_key = try allocator.dupe(u8, entry.key_ptr.*),
+            .stats = entry.value_ptr.*,
+        };
+    }
+    std.mem.sort(git_status.StatusLineStats, line_stats, {}, statusLineStatsLessThan);
+    return line_stats;
+}
+
+fn statusLineStatsLessThan(_: void, lhs: git_status.StatusLineStats, rhs: git_status.StatusLineStats) bool {
+    return std.mem.lessThan(u8, lhs.path_key, rhs.path_key);
+}
+
+fn addedFileLineCount(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+
+    var count: usize = 1;
+    const end = if (bytes[bytes.len - 1] == '\n') bytes.len - 1 else bytes.len;
+    for (bytes[0..end]) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    return count;
+}
+
+fn nextZField(text: []const u8, offset: *usize) ?[]const u8 {
+    if (offset.* >= text.len) return null;
+    const start = offset.*;
+    const end = std.mem.indexOfScalarPos(u8, text, start, 0) orelse text.len;
+    offset.* = if (end < text.len) end + 1 else text.len;
+    return text[start..end];
 }
 
 pub fn runBranchListLoad(repo_root: []const u8, allocator: std.mem.Allocator, io: std.Io) BranchListLoadTaskResult {
@@ -658,6 +875,10 @@ fn loadGeneratedAddedFile(request: review_projection.Request, allocator: std.mem
 }
 
 fn readRepoFile(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path_key: []const u8) ![]u8 {
+    return readRepoFileLimited(allocator, io, repo_root, path_key, review_projection.max_generated_file_bytes);
+}
+
+fn readRepoFileLimited(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path_key: []const u8, limit: usize) ![]u8 {
     try validateRepoRelativePath(path_key);
 
     var current_dir = try std.Io.Dir.openDirAbsolute(io, repo_root, .{});
@@ -670,7 +891,7 @@ fn readRepoFile(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8,
         const stat = try current_dir.statFile(io, component, .{ .follow_symlinks = false });
         if (next == null) {
             if (stat.kind != .file) return error.InvalidPath;
-            return try current_dir.readFileAlloc(io, component, allocator, .limited(review_projection.max_generated_file_bytes));
+            return try current_dir.readFileAlloc(io, component, allocator, .limited(limit));
         }
 
         if (stat.kind != .directory) return error.InvalidPath;
@@ -760,6 +981,100 @@ test "readRepoFile rejects symlink components" {
     try std.testing.expectError(error.InvalidPath, readRepoFile(std.testing.allocator, io, repo_root, "linked-dir/inside.txt"));
 }
 
+test "addedFileLineCount uses diff stats semantics" {
+    try std.testing.expectEqual(@as(usize, 0), addedFileLineCount(""));
+    try std.testing.expectEqual(@as(usize, 1), addedFileLineCount("one"));
+    try std.testing.expectEqual(@as(usize, 1), addedFileLineCount("one\n"));
+    try std.testing.expectEqual(@as(usize, 2), addedFileLineCount("one\ntwo"));
+    try std.testing.expectEqual(@as(usize, 2), addedFileLineCount("one\ntwo\n"));
+    try std.testing.expectEqual(@as(usize, 1), addedFileLineCount("\n"));
+}
+
+test "parseNumstatZIntoMap parses single-path records and ignores binary records" {
+    var stats_map: StatusStatsMap = .empty;
+    defer deinitStatusStatsMap(std.testing.allocator, &stats_map);
+
+    try parseNumstatZIntoMap(std.testing.allocator, "3\t1\tsrc/a.zig\x00-\t-\tbin.dat\x00", &stats_map);
+
+    try std.testing.expectEqual(@as(usize, 1), stats_map.count());
+    const stats = stats_map.get("src/a.zig") orelse return error.ExpectedStats;
+    try std.testing.expectEqual(@as(usize, 3), stats.added);
+    try std.testing.expectEqual(@as(usize, 1), stats.removed);
+}
+
+test "parseNumstatZIntoMap accumulates duplicate paths" {
+    var stats_map: StatusStatsMap = .empty;
+    defer deinitStatusStatsMap(std.testing.allocator, &stats_map);
+
+    try parseNumstatZIntoMap(std.testing.allocator, "3\t1\tsrc/a.zig\x002\t4\tsrc/a.zig\x00", &stats_map);
+
+    const stats = stats_map.get("src/a.zig") orelse return error.ExpectedStats;
+    try std.testing.expectEqual(@as(usize, 5), stats.added);
+    try std.testing.expectEqual(@as(usize, 5), stats.removed);
+}
+
+test "collectUntrackedStatusLineStats skips binary and oversized files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "one.txt", .data = "one\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "two.txt", .data = "two\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "binary.dat", .data = "a\x00b" });
+    const oversized = try std.testing.allocator.alloc(u8, untracked_stats_per_file_bytes + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "oversized.txt", .data = oversized });
+    const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+
+    const entries = [_]git_status.StatusEntry{
+        .{ .path = "one.txt", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked },
+        .{ .path = "two.txt", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked },
+        .{ .path = "binary.dat", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked },
+        .{ .path = "oversized.txt", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked },
+    };
+    const document: git_status.StatusDocument = .{ .entries = &entries };
+    var stats_map: StatusStatsMap = .empty;
+    defer deinitStatusStatsMap(std.testing.allocator, &stats_map);
+
+    try collectUntrackedStatusLineStats(std.testing.allocator, io, repo_root, document, &stats_map);
+
+    try std.testing.expectEqual(@as(usize, 2), stats_map.count());
+    try std.testing.expectEqual(@as(usize, 1), stats_map.get("one.txt").?.added);
+    try std.testing.expectEqual(@as(usize, 1), stats_map.get("two.txt").?.added);
+    try std.testing.expect(stats_map.get("binary.dat") == null);
+    try std.testing.expect(stats_map.get("oversized.txt") == null);
+}
+
+test "collectUntrackedStatusLineStats consumes max-files budget for failed reads" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "valid.txt", .data = "valid\n" });
+    const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+
+    const entries = [_]git_status.StatusEntry{
+        .{ .path = "missing-1.txt", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked },
+        .{ .path = "missing-2.txt", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked },
+        .{ .path = "valid.txt", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked },
+    };
+    const document: git_status.StatusDocument = .{ .entries = &entries };
+    var stats_map: StatusStatsMap = .empty;
+    defer deinitStatusStatsMap(std.testing.allocator, &stats_map);
+
+    try collectUntrackedStatusLineStatsWithBudget(std.testing.allocator, io, repo_root, document, &stats_map, .{
+        .per_file_bytes = untracked_stats_per_file_bytes,
+        .max_files = 2,
+        .total_bytes = untracked_stats_total_bytes,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), stats_map.count());
+    try std.testing.expect(stats_map.get("valid.txt") == null);
+}
+
 test "runStatusLoad preserves clean repository snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -776,6 +1091,72 @@ test "runStatusLoad preserves clean repository snapshot" {
         .loaded => |bundle| try std.testing.expectEqual(@as(usize, 0), bundle.document.entries.len),
         else => return error.ExpectedCleanStatusSnapshot,
     }
+}
+
+test "runStatusLoad attaches line stats for staged and untracked added files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+    try tmp.dir.createDir(io, "src", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/staged.zig", .data = "one\ntwo\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/untracked.zig", .data = "alpha\nbeta\n" });
+    try runTestGit(io, &.{ "git", "add", "src/staged.zig" }, tmp.dir);
+
+    const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+
+    var result = runStatusLoad(repo_root, std.testing.allocator, io);
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .loaded => |bundle| {
+            const staged = statusLineStatsForTest(bundle.document, "src/staged.zig") orelse return error.ExpectedStagedStats;
+            try std.testing.expectEqual(@as(usize, 2), staged.added);
+            try std.testing.expectEqual(@as(usize, 0), staged.removed);
+
+            const untracked = statusLineStatsForTest(bundle.document, "src/untracked.zig") orelse return error.ExpectedUntrackedStats;
+            try std.testing.expectEqual(@as(usize, 2), untracked.added);
+            try std.testing.expectEqual(@as(usize, 0), untracked.removed);
+        },
+        else => return error.ExpectedStatusSnapshot,
+    }
+}
+
+test "runStatusLoad keys staged rename stats by current path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "old.txt", .data = "one\ntwo\n" });
+    try runTestGit(io, &.{ "git", "add", "old.txt" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "mv", "old.txt", "new.txt" }, tmp.dir);
+
+    const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+
+    var result = runStatusLoad(repo_root, std.testing.allocator, io);
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .loaded => |bundle| {
+            const renamed = statusLineStatsForTest(bundle.document, "new.txt") orelse return error.ExpectedRenameStats;
+            try std.testing.expectEqual(@as(usize, 2), renamed.added);
+            try std.testing.expectEqual(@as(usize, 0), renamed.removed);
+            try std.testing.expect(statusLineStatsForTest(bundle.document, "old.txt") == null);
+        },
+        else => return error.ExpectedStatusSnapshot,
+    }
+}
+
+fn statusLineStatsForTest(document: git_status.StatusDocument, key: []const u8) ?file_tree.Stats {
+    for (document.line_stats) |entry| {
+        if (std.mem.eql(u8, entry.path_key, key)) return entry.stats;
+    }
+    return null;
 }
 
 fn runTestGit(io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !void {
