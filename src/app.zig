@@ -836,9 +836,17 @@ pub const App = struct {
                 }
             },
             .auto_reload_tick => try self.autoReloadTick(ctx),
-            .quit => ctx.quit(),
+            .quit => self.requestQuit(ctx),
         }
         try self.ensureReviewProjection(ctx);
+    }
+
+    fn requestQuit(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        if (app_git_requests.hasPendingAction(self.actions)) {
+            self.setStatus("finish current git action before quitting", .{});
+            return;
+        }
+        ctx.quit();
     }
 
     fn finishLoadResult(self: *App, ctx: *chasen.Ctx(Msg), finished: LoadFinishedMsg) !void {
@@ -5789,6 +5797,11 @@ pub const App = struct {
     }
 
     fn finishReview(self: *App, ctx: *chasen.Ctx(Msg), decision: review_session.Decision) !void {
+        if (app_git_requests.hasPendingAction(self.actions)) {
+            self.setStatus("finish current git action before finishing review", .{});
+            return;
+        }
+
         const output = self.review_output orelse {
             self.setStatus("review output is not configured", .{});
             return;
@@ -9080,6 +9093,64 @@ test "openSelectedFileInEditor blocks while git action is pending" {
     const pending = app.actions.pending orelse return error.ExpectedPendingAction;
     try std.testing.expectEqual(@as(u64, 7), pending.generation);
     try std.testing.expectEqual(app_actions.ActionKind.stage_file, pending.kind);
+}
+
+test "quit waits for pending git action" {
+    var app: App = .{ .allocator = std.testing.allocator };
+    app.actions.pending = .{ .generation = 7, .kind = .stage_file };
+    defer app.actions.clear();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    app.requestQuit(&ctx);
+
+    try std.testing.expect(!ctx.shouldQuit());
+    try std.testing.expect(app.actions.pending != null);
+    try std.testing.expectEqualStrings("finish current git action before quitting", app.status.text());
+}
+
+test "quit exits when no git action is pending" {
+    var app: App = .{ .allocator = std.testing.allocator };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    app.requestQuit(&ctx);
+
+    try std.testing.expect(ctx.shouldQuit());
+}
+
+test "finishReview waits for pending git action before writing output" {
+    var output: review_session.Output = .{};
+    defer output.deinit(std.testing.allocator);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .review_output = &output,
+    };
+    app.actions.pending = .{ .generation = 7, .kind = .stage_file };
+    defer app.actions.clear();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishReview(&ctx, .canceled);
+
+    try std.testing.expect(!ctx.shouldQuit());
+    try std.testing.expect(!output.ready);
+    try std.testing.expect(app.actions.pending != null);
+    try std.testing.expectEqualStrings("finish current git action before finishing review", app.status.text());
+}
+
+test "finishReview writes output and quits when no git action is pending" {
+    var output: review_session.Output = .{};
+    defer output.deinit(std.testing.allocator);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .review_output = &output,
+    };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishReview(&ctx, .approved);
+
+    try std.testing.expect(ctx.shouldQuit());
+    try std.testing.expect(output.ready);
+    try std.testing.expectEqual(@as(u8, 0), output.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, output.json.items, "\"decision\":\"approved\"") != null);
 }
 
 test "finishPush does not reload a stale active repository" {
