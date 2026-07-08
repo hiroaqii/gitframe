@@ -24,6 +24,7 @@ const diff_hunk_projection = @import("diff/hunk_projection.zig");
 const diff_patch = @import("diff/patch.zig");
 const diff_render = @import("diff/render.zig");
 const diff_search = @import("diff/search.zig");
+const diff_selection = @import("diff/selection.zig");
 const diff_source = @import("diff/source.zig");
 const diff_view_model = @import("diff/view_model.zig");
 const editor = @import("editor.zig");
@@ -121,6 +122,17 @@ const MousePane = enum {
 const MousePoint = struct {
     col: u16,
     row: u16,
+};
+
+const DiffMouseHit = struct {
+    identity: diff_selection.Identity,
+    side: diff_selection.Side,
+    point: diff_selection.Point,
+};
+
+const DiffHeaderTarget = struct {
+    identity: diff_selection.HeaderIdentity,
+    display_path: []const u8,
 };
 
 pub const ActiveDiffDisplay = union(enum) {
@@ -367,11 +379,34 @@ pub const App = struct {
     branch_switch: app_state.BranchSwitchState = .{},
     branch_switch_load_generation: u64 = 0,
     branch_switch_load_pending: ?u64 = null,
+    selection_owner: diff_selection.Owner = .none,
+
+    const ClipboardCopyOutcome = union(enum) {
+        sent,
+        unsupported_runtime,
+        write_failed: []const u8,
+    };
+
+    const ClipboardCopyFinished = struct {
+        label: []const u8,
+        outcome: ClipboardCopyOutcome,
+    };
+
+    const CopyRequest = struct {
+        label: []const u8,
+        text: []const u8,
+    };
+
+    const PopupCopyTarget = struct {
+        label: []const u8,
+        text: []const u8,
+    };
 
     pub const Msg = union(enum) {
         terminal_resized: chasen.Size,
         load_finished: LoadFinishedMsg,
         action_finished: ActionFinishedMsg,
+        clipboard_copy_finished: ClipboardCopyFinished,
         select_previous_file,
         select_next_file,
         toggle_directory,
@@ -403,6 +438,9 @@ pub const App = struct {
         mouse_diff_wheel_down,
         mouse_diff_wheel_left,
         mouse_diff_wheel_right,
+        mouse_diff_press: MousePoint,
+        mouse_diff_drag: ?MousePoint,
+        mouse_diff_release: ?MousePoint,
         toggle_display_mode,
         toggle_line_numbers,
         enter_search,
@@ -429,6 +467,7 @@ pub const App = struct {
         cancel_commit_panel,
         submit_commit_panel,
         generate_commit_message,
+        copy_commit_message,
         commit_panel_tab,
         commit_panel_enter,
         commit_panel_insert: u21,
@@ -465,6 +504,7 @@ pub const App = struct {
         push_error_scroll_down,
         push_error_page_up,
         push_error_page_down,
+        copy_popup,
         push_credential_tab,
         push_credential_submit,
         push_credential_cancel,
@@ -503,6 +543,8 @@ pub const App = struct {
         open_push_credentials,
         run_interactive_push,
         open_selected_file_in_editor,
+        copy_current_line,
+        copy_current_hunk,
         finish_review_approved,
         finish_review_needs_changes,
         finish_review_canceled,
@@ -567,8 +609,10 @@ pub const App = struct {
         switch (msg) {
             .terminal_resized => |size| {
                 const previous_width = self.diffPaneWidth();
+                const previous_mode = self.effectiveDisplayMode();
                 self.terminal_size = size;
                 self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
+                if (previous_mode != self.effectiveDisplayMode()) self.clearDiffSelection();
                 self.clampSidebarHorizontalScroll();
                 self.clampDiffNavigationKeepingHunkVisible();
                 self.updateSearchMatchOffset();
@@ -579,6 +623,7 @@ pub const App = struct {
             },
             .load_finished => |finished| try self.finishLoadResult(ctx, finished),
             .action_finished => |finished| try self.finishActionResult(ctx, finished),
+            .clipboard_copy_finished => |finished| self.finishClipboardCopy(finished),
             .select_previous_file => self.selectFileDelta(-1),
             .select_next_file => self.selectFileDelta(1),
             .toggle_directory => try self.toggleSelectedDirectory(),
@@ -632,7 +677,11 @@ pub const App = struct {
                 self.viewer.focus = .diff;
                 self.scrollDiffHorizontal(.right);
             },
+            .mouse_diff_press => |point| self.pressDiffMouse(point),
+            .mouse_diff_drag => |point| self.dragDiffMouse(point),
+            .mouse_diff_release => |point| try self.releaseDiffMouse(ctx, point),
             .toggle_display_mode => {
+                self.clearDiffSelection();
                 const old_mode = self.effectiveDisplayMode();
                 const old_scroll = self.viewer.diff_scroll;
                 self.viewer.display_mode = self.viewer.display_mode.toggled();
@@ -687,6 +736,7 @@ pub const App = struct {
             .cancel_commit_panel => self.closeCommitPanel(),
             .submit_commit_panel => try self.submitCommitPanel(ctx),
             .generate_commit_message => try self.generateCommitMessage(ctx),
+            .copy_commit_message => self.copyCommitMessage(ctx),
             .commit_panel_tab => self.commit_panel.toggleField(),
             .commit_panel_enter => self.commit_panel.enter(),
             .commit_panel_insert => |codepoint| self.commit_panel.insert(codepoint),
@@ -718,6 +768,7 @@ pub const App = struct {
             .repo_picker_move_left => self.moveRepoPickerCursorLeft(),
             .repo_picker_move_right => self.moveRepoPickerCursorRight(),
             .open_help => {
+                self.clearDiffSelection();
                 self.overlay.openHelp();
             },
             .close_help => self.overlay.close(),
@@ -729,6 +780,7 @@ pub const App = struct {
             .push_error_scroll_down => self.scrollPushError(1),
             .push_error_page_up => self.pagePushError(-1),
             .push_error_page_down => self.pagePushError(1),
+            .copy_popup => self.copyPopup(ctx),
             .push_credential_tab => self.togglePushCredentialField(),
             .push_credential_submit => try self.submitPushCredentials(ctx),
             .push_credential_cancel => self.cancelPushCredentialPrompt(ctx.allocator()),
@@ -767,6 +819,8 @@ pub const App = struct {
             .open_push_credentials => try self.openPushCredentialPrompt(ctx),
             .run_interactive_push => try self.runInteractivePush(ctx),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
+            .copy_current_line => self.copyCurrentLine(ctx),
+            .copy_current_hunk => try self.copyCurrentHunk(ctx),
             .finish_review_approved => try self.finishReview(ctx, .approved),
             .finish_review_needs_changes => try self.finishReview(ctx, .needs_changes),
             .finish_review_canceled => try self.finishReview(ctx, .canceled),
@@ -828,6 +882,7 @@ pub const App = struct {
             .terminal_resized,
             .load_finished,
             .action_finished,
+            .clipboard_copy_finished,
             .auto_reload_tick,
             => true,
             else => false,
@@ -853,6 +908,18 @@ pub const App = struct {
         return hints;
     }
 
+    pub fn diffSelectionView(self: *const App) ?diff_selection.View {
+        const selection = self.selection_owner.activeDiff() orelse return null;
+        _ = self.normalLoadedDiffSelectionTarget(selection.identity) orelse return null;
+        return selection.view();
+    }
+
+    pub fn diffHeaderSelectionActive(self: *const App) bool {
+        const selection = self.selection_owner.activeHeader() orelse return false;
+        _ = self.displayedDiffHeaderTarget(selection.identity) orelse return false;
+        return true;
+    }
+
     pub fn handleEvent(self: *const App, event: chasen.Event) ?Msg {
         return switch (event) {
             .mouse => |mouse| self.mouseToMsg(mouse),
@@ -861,6 +928,14 @@ pub const App = struct {
     }
 
     fn mouseToMsg(self: *const App, mouse: anytype) ?Msg {
+        if (self.selection_owner.activeMouseSelection()) {
+            switch (mouse.type) {
+                .drag => return .{ .mouse_diff_drag = self.bodyMousePoint(mouse) },
+                .release => return .{ .mouse_diff_release = self.bodyMousePoint(mouse) },
+                else => {},
+            }
+        }
+
         if (self.search.mode or self.file_search.mode or self.commit_panel.is_open or self.repo_picker.mode) return null;
         if (mouse.type != .press) return null;
 
@@ -883,7 +958,7 @@ pub const App = struct {
         return switch (mouse.button) {
             .left => switch (pane) {
                 .sidebar => self.sidebarClickToMsg(mouse),
-                .diff => .focus_diff,
+                .diff => .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null },
             },
             .wheel_up => switch (pane) {
                 .sidebar => .mouse_sidebar_wheel_up,
@@ -928,6 +1003,213 @@ pub const App = struct {
         const body_row: usize = point.row - sidebar_header_rows;
         const node_index = loaded.sidebarNodeAtBodyRow(self.viewer.selected_node, visible_rows, body_row) orelse return .focus_sidebar;
         return .{ .sidebar_click_node = node_index };
+    }
+
+    fn pressDiffMouse(self: *App, point: MousePoint) void {
+        self.viewer.focus = .diff;
+        if (self.diffHeaderMouseHit(point)) |hit| {
+            self.selection_owner = .{ .diff_header = .{ .identity = hit.identity } };
+            return;
+        }
+        const hit = self.diffMouseHit(point) orelse {
+            self.clearDiffSelection();
+            return;
+        };
+        self.selection_owner = .{ .diff = diff_selection.DragSelection.init(hit.identity, hit.side, hit.point) };
+    }
+
+    fn dragDiffMouse(self: *App, point_opt: ?MousePoint) void {
+        const point = point_opt orelse return;
+        switch (self.selection_owner) {
+            .none => return,
+            .diff_header => |*selection| selection.update(),
+            .diff => |*selection| {
+                const hit = self.diffMouseHit(point) orelse return;
+                if (!selection.identity.eql(hit.identity)) return;
+                selection.update(hit.point);
+            },
+        }
+    }
+
+    fn releaseDiffMouse(self: *App, ctx: *chasen.Ctx(Msg), point_opt: ?MousePoint) !void {
+        _ = point_opt;
+        const owner = self.selection_owner;
+        self.clearDiffSelection();
+        switch (owner) {
+            .none => return,
+            .diff => |selection| {
+                if (!selection.moved) return;
+                try self.copyDiffSelection(ctx, selection);
+            },
+            .diff_header => |selection| self.copyDiffHeaderPath(ctx, selection),
+        }
+    }
+
+    fn clearDiffSelection(self: *App) void {
+        self.selection_owner = .none;
+    }
+
+    const NormalLoadedDiffSelectionTarget = struct {
+        file_index: usize,
+        file: diff_parser.FileDiff,
+        line_index: diff_view_model.RenderedLineIndex,
+        folded_hunks: []const bool,
+        identity: diff_selection.Identity,
+    };
+
+    fn normalLoadedDiffSelectionTarget(self: *const App, identity: ?diff_selection.Identity) ?NormalLoadedDiffSelectionTarget {
+        if (self.selectedStatusEntry() != null) return null;
+        if (self.activeGeneratedFileProjection() != null) return null;
+        if (self.activeCombinedProjection() != null) return null;
+        if (self.activeCachedDiffProjection() != null) return null;
+
+        const loaded = self.activeLoadedDiffConst() orelse return null;
+        const file_index = self.selectedFileIndex(loaded) orelse return null;
+        if (file_index >= loaded.document.files.len) return null;
+        const file = loaded.document.files[file_index];
+        const path_key = diff_file.canonicalPathKey(file) orelse return null;
+        const current_identity: diff_selection.Identity = .{ .loaded_file = .{
+            .file_index = file_index,
+            .path_key = path_key,
+        } };
+        if (identity) |expected| {
+            if (!expected.eql(current_identity)) return null;
+            if (!expected.matchesLoadedFile(file_index, file)) return null;
+        }
+
+        const mode = self.effectiveDisplayMode();
+        return .{
+            .file_index = file_index,
+            .file = file,
+            .line_index = loaded.cachedRenderedLineIndex(file_index, mode) orelse loaded.renderedLineIndex(file_index, mode),
+            .folded_hunks = loaded.foldedHunksForFile(file_index),
+            .identity = current_identity,
+        };
+    }
+
+    fn displayedDiffHeaderTarget(self: *const App, expected: ?diff_selection.HeaderIdentity) ?DiffHeaderTarget {
+        const target: DiffHeaderTarget = blk: {
+            if (self.activeGeneratedFileProjection()) |bundle| {
+                break :blk .{
+                    .identity = .{ .kind = .generated_file, .path_key = bundle.file.path },
+                    .display_path = bundle.file.path,
+                };
+            }
+            if (self.activeCombinedProjection()) |bundle| {
+                const path_key = diff_file.canonicalPathKey(bundle.projection.file) orelse return null;
+                break :blk .{
+                    .identity = .{ .kind = .projection_file, .path_key = path_key },
+                    .display_path = diff_file.displayPath(bundle.projection.file),
+                };
+            }
+            if (self.activeCachedDiffProjection()) |bundle| {
+                if (bundle.loaded.document.files.len == 0) return null;
+                const file = bundle.loaded.document.files[0];
+                const path_key = diff_file.canonicalPathKey(file) orelse return null;
+                break :blk .{
+                    .identity = .{ .kind = .projection_file, .path_key = path_key },
+                    .display_path = diff_file.displayPath(file),
+                };
+            }
+
+            const loaded = self.activeLoadedDiffConst() orelse return null;
+            const file_index = self.selectedFileIndex(loaded) orelse return null;
+            if (file_index >= loaded.document.files.len) return null;
+            const file = loaded.document.files[file_index];
+            const path_key = diff_file.canonicalPathKey(file) orelse return null;
+            break :blk .{
+                .identity = .{ .kind = .loaded_file, .path_key = path_key },
+                .display_path = diff_file.displayPath(file),
+            };
+        };
+
+        if (expected) |identity| {
+            if (!identity.eql(target.identity)) return null;
+        }
+        return target;
+    }
+
+    fn diffHeaderMouseHit(self: *const App, point: MousePoint) ?DiffHeaderTarget {
+        const target = self.displayedDiffHeaderTarget(null) orelse return null;
+        const raw_diff = self.rawDiffPaneGeometry() orelse return null;
+        if (point.col < raw_diff.col or point.col >= raw_diff.col + raw_diff.width) return null;
+        if (point.row != 0) return null;
+
+        const local_col = point.col - raw_diff.col;
+        const content_width = contentWidth(raw_diff.width);
+        const content_gutter = raw_diff.width - content_width;
+        if (local_col < content_gutter) return null;
+        const render_col = local_col - content_gutter;
+        if (render_col >= content_width) return null;
+
+        const summary_width = self.displayedDiffHeaderSummaryWidth(content_width) orelse return null;
+        const layout = diff_render.headerLayout(content_width, app_view.repoHeaderLabel(self), target.display_path, summary_width);
+        const path_target = layout.path_target orelse return null;
+        if (!path_target.contains(render_col)) return null;
+        return target;
+    }
+
+    fn displayedDiffHeaderSummaryWidth(self: *const App, content_width: u16) ?u16 {
+        const mode_width = diff_render.bodyWidth(content_width);
+        if (self.activeGeneratedFileProjection()) |bundle| {
+            return diff_render.generatedHeaderSummaryWidth(bundle.file.lines.len, bundle.file.truncated, self.viewer.display_mode, mode_width);
+        }
+        const file = self.displayedDiffFile() orelse return null;
+        return diff_render.fileHeaderSummaryWidth(file, self.viewer.display_mode, mode_width);
+    }
+
+    fn diffMouseHit(self: *const App, point: MousePoint) ?DiffMouseHit {
+        const target = self.normalLoadedDiffSelectionTarget(null) orelse return null;
+        const raw_diff = self.rawDiffPaneGeometry() orelse return null;
+        if (point.col < raw_diff.col or point.col >= raw_diff.col + raw_diff.width) return null;
+        if (point.row < diff_render.body_start_row) return null;
+
+        const local_col = point.col - raw_diff.col;
+        const content_width = contentWidth(raw_diff.width);
+        const content_gutter = raw_diff.width - content_width;
+        if (local_col < content_gutter) return null;
+        const render_col = local_col - content_gutter;
+        if (render_col >= content_width or render_col < diff_render.cursor_gutter_width) return null;
+
+        const body_width = diff_render.bodyWidth(content_width);
+        if (diff_render.effectiveMode(body_width, self.viewer.display_mode) != .side_by_side) return null;
+
+        const body_col = render_col - diff_render.cursor_gutter_width;
+        const geometry = diff_render.sideBySideGeometry(body_width);
+        const side = geometry.sideAt(body_col) orelse return null;
+
+        const visible_body_row: usize = point.row - diff_render.body_start_row;
+        if (visible_body_row >= self.diffVisibleRows()) return null;
+        const offset = self.viewer.diff_scroll + visible_body_row;
+        const coordinate = diff_view_model.coordinateAtOffset(target.file, .side_by_side, offset, target.folded_hunks, target.line_index) orelse return null;
+        const hunk_line = switch (coordinate) {
+            .hunk_line => |line| line,
+            .metadata, .binary_marker, .hunk_header => return null,
+        };
+
+        return .{
+            .identity = target.identity,
+            .side = side,
+            .point = diff_selection.pointFromLine(hunk_line.hunk_index, hunk_line.line_index),
+        };
+    }
+
+    const RawDiffPaneGeometry = struct {
+        col: u16,
+        width: u16,
+    };
+
+    fn rawDiffPaneGeometry(self: *const App) ?RawDiffPaneGeometry {
+        const size = self.layoutSize();
+        if (size.width == 0) return null;
+        if (self.viewer.sidebar_hidden) return .{ .col = 0, .width = size.width };
+
+        const sidebar_width = sidebarWidth(size.width, self.viewer.sidebar_width);
+        if (size.width <= sidebar_width + 1) return null;
+        return .{
+            .col = sidebar_width + 1,
+            .width = size.width - sidebar_width - 1,
+        };
     }
 
     fn bodyMousePoint(self: *const App, mouse: anytype) ?MousePoint {
@@ -1886,6 +2168,7 @@ pub const App = struct {
             .repo_root = owned_repo_root,
             .path = owned_path,
         };
+        self.clearDiffSelection();
         self.overlay.openDiscardFile();
     }
 
@@ -1933,6 +2216,7 @@ pub const App = struct {
         self.cancelPushConfirmation(self.allocator.?);
         self.cancelPullConfirmation(self.allocator.?);
         self.overlay.close();
+        self.clearDiffSelection();
         self.commit_panel.open(mode);
     }
 
@@ -2140,6 +2424,7 @@ pub const App = struct {
             .body = parts.body,
         };
         parts = .{ .subject = &.{}, .body = null };
+        self.clearDiffSelection();
         self.overlay.openAmendCommit();
     }
 
@@ -2244,6 +2529,7 @@ pub const App = struct {
             .oid = owned_oid,
             .ahead_behind = target.ahead_behind,
         };
+        self.clearDiffSelection();
         self.overlay.openPushBranch();
     }
 
@@ -2357,6 +2643,7 @@ pub const App = struct {
             .ahead = target.ahead,
             .behind = target.behind,
         };
+        self.clearDiffSelection();
         self.overlay.openPullBranch();
     }
 
@@ -2519,6 +2806,7 @@ pub const App = struct {
         owned_current_branch = &.{};
         owned_current_oid = &.{};
         self.branch_switch_load_pending = generation;
+        self.clearDiffSelection();
         self.overlay.openSwitchBranch();
         errdefer self.clearBranchSwitch(ctx.allocator());
 
@@ -2589,6 +2877,7 @@ pub const App = struct {
         self.push_error_message = try allocator.dupe(u8, message);
         self.push_retry_target = retry_target;
         self.push_retry_credentials_available = retry_target != null and credentials_available;
+        self.clearDiffSelection();
         self.overlay.openPushError();
     }
 
@@ -2621,6 +2910,7 @@ pub const App = struct {
         if (self.push_retry_target) |*existing| existing.deinit(allocator);
         self.push_retry_target = target;
         self.push_retry_credentials_available = credentials_available;
+        self.clearDiffSelection();
         self.overlay.openPushError();
     }
 
@@ -2734,6 +3024,7 @@ pub const App = struct {
         prompt.* = .{ .target = target };
         self.cancelPushCredentialPrompt(ctx.allocator());
         self.push_credential_prompt = prompt;
+        self.clearDiffSelection();
         self.overlay.openPushCredentials();
     }
 
@@ -3645,6 +3936,229 @@ pub const App = struct {
         return Msg.actionFinished(.{ .push_foreground = result });
     }
 
+    fn copyCurrentLineDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
+        return .{ .clipboard_copy_finished = .{
+            .label = "current line",
+            .outcome = clipboardCopyOutcome(result.outcome),
+        } };
+    }
+
+    fn copyCurrentHunkDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
+        return .{ .clipboard_copy_finished = .{
+            .label = "current hunk",
+            .outcome = clipboardCopyOutcome(result.outcome),
+        } };
+    }
+
+    fn copyDiffSelectionDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
+        return .{ .clipboard_copy_finished = .{
+            .label = "diff selection",
+            .outcome = clipboardCopyOutcome(result.outcome),
+        } };
+    }
+
+    fn copyDiffHeaderPathDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
+        return .{ .clipboard_copy_finished = .{
+            .label = "file path",
+            .outcome = clipboardCopyOutcome(result.outcome),
+        } };
+    }
+
+    fn copyPopupDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
+        return .{ .clipboard_copy_finished = .{
+            .label = "push error",
+            .outcome = clipboardCopyOutcome(result.outcome),
+        } };
+    }
+
+    fn copyCommitMessageDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
+        return .{ .clipboard_copy_finished = .{
+            .label = "commit message",
+            .outcome = clipboardCopyOutcome(result.outcome),
+        } };
+    }
+
+    fn clipboardCopyOutcome(outcome: chasen.Ctx(Msg).ClipboardCopyOutcome) ClipboardCopyOutcome {
+        return switch (outcome) {
+            .sent => .sent,
+            .unsupported_runtime => .unsupported_runtime,
+            .write_failed => |err| .{ .write_failed = err },
+        };
+    }
+
+    fn copyCurrentLine(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        const text = self.currentDiffLineCopyText() orelse {
+            self.setStatus("no diff line selected", .{});
+            return;
+        };
+        self.queueClipboardCopy(ctx, .{
+            .label = "current line",
+            .text = text,
+        }, copyCurrentLineDone);
+    }
+
+    fn copyCurrentHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const hunk_index = self.selectedHunkIndex() orelse {
+            self.setStatus("no hunk selected", .{});
+            return;
+        };
+        const file = self.displayedDiffFile() orelse {
+            self.setStatus("no hunk selected", .{});
+            return;
+        };
+        if (hunk_index >= file.hunks.len) {
+            self.setStatus("no hunk selected", .{});
+            return;
+        }
+
+        const text = try newSideHunkCopyText(ctx.allocator(), file.hunks[hunk_index]);
+        defer ctx.allocator().free(text);
+        if (text.len == 0) {
+            self.setStatus("no new-side text in selected hunk", .{});
+            return;
+        }
+        self.queueClipboardCopy(ctx, .{
+            .label = "current hunk",
+            .text = text,
+        }, copyCurrentHunkDone);
+    }
+
+    fn copyDiffSelection(self: *App, ctx: *chasen.Ctx(Msg), selection: diff_selection.DragSelection) !void {
+        const target = self.normalLoadedDiffSelectionTarget(selection.identity) orelse return;
+        const text = try diff_selection.copyText(ctx.allocator(), target.file, selection);
+        defer ctx.allocator().free(text);
+        self.queueClipboardCopy(ctx, .{
+            .label = "diff selection",
+            .text = text,
+        }, copyDiffSelectionDone);
+    }
+
+    fn copyDiffHeaderPath(self: *App, ctx: *chasen.Ctx(Msg), selection: diff_selection.HeaderPathSelection) void {
+        const target = self.displayedDiffHeaderTarget(selection.identity) orelse return;
+        self.queueClipboardCopy(ctx, .{
+            .label = "file path",
+            .text = target.display_path,
+        }, copyDiffHeaderPathDone);
+    }
+
+    fn copyPopup(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        const target = self.popupCopyTarget() orelse {
+            self.setStatus("nothing to copy: popup", .{});
+            return;
+        };
+        self.queueClipboardCopy(ctx, .{
+            .label = target.label,
+            .text = target.text,
+        }, copyPopupDone);
+    }
+
+    fn popupCopyTarget(self: *const App) ?PopupCopyTarget {
+        if (self.overlay.isPushError()) {
+            const message = self.push_error_message orelse return null;
+            return .{
+                .label = "push error",
+                .text = message,
+            };
+        }
+        return null;
+    }
+
+    fn copyCommitMessage(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        if (!self.commit_panel.is_open) {
+            self.setStatus("nothing to copy: commit message", .{});
+            return;
+        }
+        const text = self.commit_panel.formatMessage(ctx.allocator()) catch {
+            self.commit_panel.commit_error = .input_allocation_failed;
+            self.setStatus("could not prepare commit message copy", .{});
+            return;
+        };
+        defer ctx.allocator().free(text);
+
+        self.queueClipboardCopy(ctx, .{
+            .label = "commit message",
+            .text = text,
+        }, copyCommitMessageDone);
+    }
+
+    fn queueClipboardCopy(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        request: CopyRequest,
+        finished: chasen.Ctx(Msg).ClipboardCopyFinishedFn,
+    ) void {
+        if (request.text.len == 0) {
+            self.setStatus("nothing to copy: {s}", .{request.label});
+            return;
+        }
+        ctx.terminal().copyToClipboard(.{
+            .text = request.text,
+            .finished = finished,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => self.setStatus("could not prepare clipboard copy", .{}),
+            error.ClipboardCopyLimitExceeded => self.setStatus("clipboard copy already queued", .{}),
+        };
+    }
+
+    fn finishClipboardCopy(self: *App, finished: ClipboardCopyFinished) void {
+        switch (finished.outcome) {
+            .sent => self.setStatus("clipboard copy sent: {s}", .{finished.label}),
+            .unsupported_runtime => self.setStatus("clipboard copy unavailable: {s}", .{finished.label}),
+            .write_failed => |err| self.setStatus("clipboard copy failed: {s}: {s}", .{ finished.label, err }),
+        }
+    }
+
+    fn currentDiffLineCopyText(self: *const App) ?[]const u8 {
+        const coordinate = switch (self.viewer.diff_cursor) {
+            .hunk_line => |line| line,
+            .metadata, .binary_marker, .hunk_header => return null,
+        };
+        const file = self.displayedDiffFile() orelse return null;
+        if (coordinate.hunk_index >= file.hunks.len) return null;
+        const hunk = file.hunks[coordinate.hunk_index];
+        if (coordinate.line_index >= hunk.lines.len) return null;
+
+        return switch (self.effectiveDisplayMode()) {
+            .unified => hunk.lines[coordinate.line_index].text,
+            .side_by_side => sideBySideLineCopyText(hunk, coordinate.line_index),
+        };
+    }
+
+    fn sideBySideLineCopyText(hunk: diff_parser.Hunk, line_index: usize) ?[]const u8 {
+        var rows = diff_view_model.SideBySideIndexedIterator.init(hunk.lines);
+        while (rows.next()) |row| {
+            switch (row) {
+                .single => |line| {
+                    if (line.line_index == line_index) return line.line.text;
+                },
+                .paired => |pair| {
+                    const matches_removed = if (pair.removed) |removed| removed.line_index == line_index else false;
+                    const matches_added = if (pair.added) |added| added.line_index == line_index else false;
+                    if (!matches_removed and !matches_added) continue;
+                    if (pair.added) |added| return added.line.text;
+                    if (pair.removed) |removed| return removed.line.text;
+                },
+            }
+        }
+        return null;
+    }
+
+    fn newSideHunkCopyText(allocator: std.mem.Allocator, hunk: diff_parser.Hunk) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+
+        for (hunk.lines) |line| {
+            switch (line.kind) {
+                .context, .added => {
+                    try out.writer.writeAll(line.text);
+                    try out.writer.writeByte('\n');
+                },
+                .removed, .metadata => {},
+            }
+        }
+        return try out.toOwnedSlice();
+    }
+
     fn setStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
         self.status.set(fmt, args);
     }
@@ -4199,6 +4713,7 @@ pub const App = struct {
     }
 
     fn clearLoadedDiff(self: *App) void {
+        self.clearDiffSelection();
         self.load.clearCurrent(self.allocator);
         // allocator is null only before App.init has completed; deinit paths can
         // still call this while no owned projection/session state exists.
@@ -4270,6 +4785,7 @@ pub const App = struct {
                 }
             },
             .status_entry => |status_index| {
+                self.clearDiffSelection();
                 self.viewer.selected_target = .{ .status_only = status_index };
                 self.resetDiffPosition();
                 self.clearSearchMatch();
@@ -4615,6 +5131,7 @@ pub const App = struct {
 
     fn enterSearchMode(self: *App) void {
         if (self.blockUnsupportedSearchTarget()) return;
+        self.clearDiffSelection();
         self.search.input = self.search.query;
         self.search.mode = true;
     }
@@ -4632,6 +5149,7 @@ pub const App = struct {
     }
 
     fn enterFileSearchMode(self: *App) void {
+        self.clearDiffSelection();
         self.file_search_return_focus = if (self.viewer.sidebar_hidden) .diff else self.viewer.focus;
         if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
         self.file_search.mode = true;
@@ -4651,6 +5169,7 @@ pub const App = struct {
         }
 
         self.clearBranchSwitch(allocator);
+        self.clearDiffSelection();
         self.repo_picker.mode = true;
         self.repo_picker.input_mode = .list;
         self.repo_picker.list.mode = true;
@@ -5939,9 +6458,11 @@ pub const App = struct {
 
     fn toggleSidebarVisibility(self: *App) void {
         const previous_width = self.diffPaneWidth();
+        const previous_mode = self.effectiveDisplayMode();
         self.viewer.sidebar_hidden = !self.viewer.sidebar_hidden;
         if (self.viewer.sidebar_hidden) self.viewer.focus = .diff;
         self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
+        if (previous_mode != self.effectiveDisplayMode()) self.clearDiffSelection();
         self.clampDiffNavigationKeepingHunkVisible();
         self.updateSearchMatchOffset();
         self.scrollSearchMatchIntoView();
@@ -5951,6 +6472,7 @@ pub const App = struct {
     fn adjustSidebarWidth(self: *App, direction: SizeDirection) void {
         const total_width = self.layoutSize().width;
         const previous_width = self.diffPaneWidth();
+        const previous_mode = self.effectiveDisplayMode();
         const current = sidebarWidth(total_width, self.viewer.sidebar_width);
         const step: u16 = 4;
         const next = switch (direction) {
@@ -5961,6 +6483,7 @@ pub const App = struct {
         self.viewer.sidebar_width = sidebarWidth(total_width, next);
         self.clampSidebarHorizontalScroll();
         self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
+        if (previous_mode != self.effectiveDisplayMode()) self.clearDiffSelection();
         self.clampDiffNavigationKeepingHunkVisible();
         self.updateSearchMatchOffset();
         self.scrollSearchMatchIntoView();
@@ -6052,6 +6575,11 @@ pub const App = struct {
     }
 
     fn setSelectedDiffFile(self: *App, file_index: usize) void {
+        const same_target = if (self.viewer.selected_target) |target|
+            if (target.diffFileIndex()) |current| current == file_index else false
+        else
+            false;
+        if (!same_target) self.clearDiffSelection();
         self.viewer.selected_target = .{ .diff_file = file_index };
         self.viewer.selected_file = file_index;
     }
@@ -6477,6 +7005,172 @@ test "line number toggle clamps horizontal scroll without changing vertical scro
     try std.testing.expect(app.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
 }
 
+test "current line copy text uses side-by-side paired new side" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 24 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .viewer = .{
+            .display_mode = .side_by_side,
+            .sidebar_hidden = true,
+            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } },
+            .diff_horizontal_scroll = 99,
+            .view_options = .{ .line_numbers = false },
+        },
+    };
+
+    try std.testing.expectEqualStrings("new", app.currentDiffLineCopyText().?);
+}
+
+test "side-by-side line copy falls back to removed side when no added pair exists" {
+    const hunk: diff_parser.Hunk = .{
+        .old_start = 1,
+        .old_count = 1,
+        .new_start = 1,
+        .new_count = 0,
+        .section = "",
+        .lines = &.{.{ .kind = .removed, .text = "deleted", .old_line = 1 }},
+    };
+
+    try std.testing.expectEqualStrings("deleted", App.sideBySideLineCopyText(hunk, 0).?);
+}
+
+test "new side hunk copy text is undecorated and keeps trailing newline" {
+    const text = try App.newSideHunkCopyText(std.testing.allocator, app_test_support.hunks[0]);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqualStrings("one\ntwo\nnew\nfour\n", text);
+}
+
+test "new side hunk copy text is empty for removed-only hunk" {
+    const hunk: diff_parser.Hunk = .{
+        .old_start = 1,
+        .old_count = 1,
+        .new_start = 1,
+        .new_count = 0,
+        .section = "",
+        .lines = &.{.{ .kind = .removed, .text = "deleted", .old_line = 1 }},
+    };
+
+    const text = try App.newSideHunkCopyText(std.testing.allocator, hunk);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("", text);
+}
+
+test "clipboard copy result status uses best-effort wording" {
+    var app: App = .{};
+
+    app.finishClipboardCopy(.{ .label = "current line", .outcome = .sent });
+    try std.testing.expectEqualStrings("clipboard copy sent: current line", app.status.text());
+
+    app.finishClipboardCopy(.{ .label = "current hunk", .outcome = .unsupported_runtime });
+    try std.testing.expectEqualStrings("clipboard copy unavailable: current hunk", app.status.text());
+
+    app.finishClipboardCopy(.{ .label = "current line", .outcome = .{ .write_failed = "BrokenPipe" } });
+    try std.testing.expectEqualStrings("clipboard copy failed: current line: BrokenPipe", app.status.text());
+}
+
+test "copyPopup queues push error message text" {
+    var app: App = .{
+        .overlay = .{ .kind = .push_error },
+        .push_error_message = try std.testing.allocator.dupe(u8, "  fatal\nline two  "),
+    };
+    defer std.testing.allocator.free(app.push_error_message.?);
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.copyPopup(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    const entry = ctx._pending_clipboard_copies[0];
+    try std.testing.expectEqualStrings("  fatal\nline two  ", entry.text);
+    try std.testing.expectEqual(@as(chasen.Ctx(App.Msg).ClipboardCopyFinishedFn, App.copyPopupDone), entry.finished);
+}
+
+test "copyPopup reports empty target outside copyable popup" {
+    var app: App = .{};
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.copyPopup(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings("nothing to copy: popup", app.status.text());
+}
+
+test "copyCommitMessage queues formatted commit message text" {
+    var app: App = .{
+        .commit_panel = app_commit_panel.State.init(std.testing.allocator),
+    };
+    defer app.commit_panel.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.commit_panel.open(.commit);
+    app.commit_panel.replaceDraft("  subject  ", "  body\n\nline two  ");
+
+    app.copyCommitMessage(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    const entry = ctx._pending_clipboard_copies[0];
+    try std.testing.expectEqualStrings("subject\n\nbody\n\nline two", entry.text);
+    try std.testing.expectEqual(@as(chasen.Ctx(App.Msg).ClipboardCopyFinishedFn, App.copyCommitMessageDone), entry.finished);
+}
+
+test "copyCommitMessage uses same commit panel state for amend mode" {
+    var app: App = .{
+        .commit_panel = app_commit_panel.State.init(std.testing.allocator),
+    };
+    defer app.commit_panel.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.commit_panel.open(.amend);
+    app.commit_panel.replaceDraft("amend subject", null);
+
+    app.copyCommitMessage(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings("amend subject", ctx._pending_clipboard_copies[0].text);
+}
+
+test "copyCommitMessage preserves body-only formatMessage shape" {
+    var app: App = .{
+        .commit_panel = app_commit_panel.State.init(std.testing.allocator),
+    };
+    defer app.commit_panel.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.commit_panel.open(.commit);
+    app.commit_panel.replaceDraft("", "body");
+
+    app.copyCommitMessage(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings("\n\nbody", ctx._pending_clipboard_copies[0].text);
+}
+
+test "copyCommitMessage reports empty draft and closed panel" {
+    var app: App = .{
+        .commit_panel = app_commit_panel.State.init(std.testing.allocator),
+    };
+    defer app.commit_panel.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.copyCommitMessage(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings("nothing to copy: commit message", app.status.text());
+
+    app.commit_panel.open(.commit);
+    app.copyCommitMessage(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings("nothing to copy: commit message", app.status.text());
+}
+
 test "display mode toggle keeps nearby vertical scroll position" {
     var app: App = .{
         .terminal_size = .{ .width = 140, .height = 8 },
@@ -6639,6 +7333,132 @@ test "mouse wheel routes through diff scroll cursor sync" {
 
     try std.testing.expectEqual(Focus.diff, app.viewer.focus);
     try std.testing.expect(app.visibleDiffCursorOffset() != null);
+}
+
+test "diff mouse drag starts on selected side and updates on drag only" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 10 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .viewer = .{
+            .display_mode = .side_by_side,
+            .sidebar_hidden = true,
+        },
+    };
+
+    const old_point: MousePoint = .{
+        .col = 4,
+        .row = diff_render.body_start_row + 1,
+    };
+    app.pressDiffMouse(old_point);
+    const started = app.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expectEqual(diff_selection.Side.old, started.side);
+    try std.testing.expectEqual(@as(usize, 0), started.focus.hunk_index);
+    try std.testing.expectEqual(@as(usize, 0), started.focus.line_index);
+
+    const motion_msg = app.handleEvent(app_test_support.mouseEventTyped(4, diff_render.body_start_row + 2, .none, .motion));
+    try std.testing.expect(motion_msg == null);
+    const after_motion = app.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expectEqual(@as(usize, 0), after_motion.focus.line_index);
+
+    const new_side_point: MousePoint = .{
+        .col = 72,
+        .row = diff_render.body_start_row + 3,
+    };
+    app.dragDiffMouse(new_side_point);
+    const dragged = app.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expectEqual(diff_selection.Side.old, dragged.side);
+    try std.testing.expectEqual(@as(usize, 2), dragged.focus.line_index);
+    try std.testing.expect(dragged.moved);
+}
+
+test "diff header mouse press starts header path owner only on path target" {
+    var app: App = .{
+        .terminal_size = .{ .width = 140, .height = 10 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .viewer = .{
+            .display_mode = .side_by_side,
+            .sidebar_hidden = true,
+        },
+    };
+
+    app.pressDiffMouse(.{ .col = 1, .row = 0 });
+    const header = app.selection_owner.activeHeader() orelse return error.ExpectedHeaderSelection;
+    try std.testing.expectEqual(diff_selection.HeaderKind.loaded_file, header.identity.kind);
+    try std.testing.expectEqualStrings("a", header.identity.path_key);
+
+    app.dragDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(app.selection_owner.activeHeader() != null);
+    try std.testing.expect(app.selection_owner.activeDiff() == null);
+
+    app.clearDiffSelection();
+    app.pressDiffMouse(.{ .col = 120, .row = 0 });
+    try std.testing.expect(app.selection_owner.activeHeader() == null);
+    try std.testing.expect(app.selection_owner.activeDiff() == null);
+}
+
+test "diff mouse drag rejects unified fallback and clears on invalidation" {
+    var app: App = .{
+        .terminal_size = .{ .width = 50, .height = 10 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .viewer = .{
+            .display_mode = .side_by_side,
+            .sidebar_hidden = true,
+        },
+    };
+
+    app.pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(app.selection_owner.activeDiff() == null);
+
+    app.terminal_size.width = 140;
+    app.pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(app.selection_owner.activeDiff() != null);
+
+    try app.update(.toggle_display_mode, undefined);
+    try std.testing.expect(app.selection_owner.activeDiff() == null);
+
+    app.viewer.display_mode = .side_by_side;
+    app.pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(app.selection_owner.activeDiff() != null);
+    app.clearLoadedDiff();
+    try std.testing.expect(app.selection_owner.activeDiff() == null);
+}
+
+test "sidebar layout fallback clears active diff mouse drag" {
+    var app: App = .{
+        .terminal_size = .{ .width = 90, .height = 10 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .viewer = .{
+            .display_mode = .side_by_side,
+            .sidebar_hidden = true,
+        },
+    };
+
+    app.pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(app.selection_owner.activeDiff() != null);
+
+    app.toggleSidebarVisibility();
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
+    try std.testing.expect(app.selection_owner.activeDiff() == null);
+}
+
+test "sidebar width growth fallback clears active diff mouse drag" {
+    var app: App = .{
+        .terminal_size = .{ .width = 110, .height = 10 },
+        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        .viewer = .{
+            .display_mode = .side_by_side,
+            .sidebar_hidden = false,
+            .sidebar_width = 31,
+        },
+    };
+
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
+    app.pressDiffMouse(.{ .col = 37, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(app.selection_owner.activeDiff() != null);
+
+    app.adjustSidebarWidth(.grow);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
+    try std.testing.expect(app.selection_owner.activeDiff() == null);
 }
 
 test "diff scroll cursor sync keeps search state" {

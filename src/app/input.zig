@@ -52,6 +52,7 @@ const Action = enum {
     cancel_commit_panel,
     submit_commit_panel,
     generate_commit_message,
+    copy_commit_message,
     commit_panel_tab,
     commit_panel_enter,
     commit_panel_backspace,
@@ -106,6 +107,7 @@ const Action = enum {
     push_error_scroll_down,
     push_error_page_up,
     push_error_page_down,
+    copy_popup,
     push_credential_tab,
     push_credential_submit,
     push_credential_cancel,
@@ -149,6 +151,8 @@ const Action = enum {
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
+    copy_current_line,
+    copy_current_hunk,
     finish_review_approved,
     finish_review_needs_changes,
     finish_review_canceled,
@@ -293,6 +297,7 @@ fn pushErrorKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .close_push_error);
     if (key.codepoint == 'c' and !hasCommandModifier(key)) return actionToMsg(Msg, .open_push_credentials);
     if (key.codepoint == 'i' and !hasCommandModifier(key)) return actionToMsg(Msg, .run_interactive_push);
+    if (key.codepoint == 'y' and !hasCommandModifier(key)) return actionToMsg(Msg, .copy_popup);
     if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .push_error_scroll_up);
     if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .push_error_scroll_down);
     if (key.matches(chasen.Key.page_up, .{})) return actionToMsg(Msg, .push_error_page_up);
@@ -314,6 +319,7 @@ fn pushCredentialKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
 fn commitPanelKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .cancel_commit_panel);
     if (key.matches('g', .{ .ctrl = true })) return actionToMsg(Msg, .generate_commit_message);
+    if (key.matches('y', .{ .ctrl = true })) return actionToMsg(Msg, .copy_commit_message);
     if (key.matches(chasen.Key.enter, .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return actionToMsg(Msg, .submit_commit_panel);
     if (key.matches(chasen.Key.tab, .{})) return actionToMsg(Msg, .commit_panel_tab);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .commit_panel_enter);
@@ -446,6 +452,8 @@ fn publicActionToAction(action: keymap.PublicAction) Action {
         .last_file => .select_last_file,
         .page_up => .page_diff_up,
         .page_down => .page_diff_down,
+        .copy_current_line => .copy_current_line,
+        .copy_current_hunk => .copy_current_hunk,
     };
 }
 
@@ -510,6 +518,7 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .cancel_commit_panel => voidMsg(Msg, "cancel_commit_panel"),
         .submit_commit_panel => voidMsg(Msg, "submit_commit_panel"),
         .generate_commit_message => voidMsg(Msg, "generate_commit_message"),
+        .copy_commit_message => voidMsg(Msg, "copy_commit_message"),
         .commit_panel_tab => voidMsg(Msg, "commit_panel_tab"),
         .commit_panel_enter => voidMsg(Msg, "commit_panel_enter"),
         .commit_panel_backspace => voidMsg(Msg, "commit_panel_backspace"),
@@ -564,6 +573,7 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .push_error_scroll_down => voidMsg(Msg, "push_error_scroll_down"),
         .push_error_page_up => voidMsg(Msg, "push_error_page_up"),
         .push_error_page_down => voidMsg(Msg, "push_error_page_down"),
+        .copy_popup => voidMsg(Msg, "copy_popup"),
         .push_credential_tab => voidMsg(Msg, "push_credential_tab"),
         .push_credential_submit => voidMsg(Msg, "push_credential_submit"),
         .push_credential_cancel => voidMsg(Msg, "push_credential_cancel"),
@@ -607,6 +617,8 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .open_selected_file_in_editor => voidMsg(Msg, "open_selected_file_in_editor"),
         .toggle_display_mode => voidMsg(Msg, "toggle_display_mode"),
         .toggle_line_numbers => voidMsg(Msg, "toggle_line_numbers"),
+        .copy_current_line => voidMsg(Msg, "copy_current_line"),
+        .copy_current_hunk => voidMsg(Msg, "copy_current_hunk"),
         .finish_review_approved => voidMsg(Msg, "finish_review_approved"),
         .finish_review_needs_changes => voidMsg(Msg, "finish_review_needs_changes"),
         .finish_review_canceled => voidMsg(Msg, "finish_review_canceled"),
@@ -640,6 +652,7 @@ const TestMsg = union(enum) {
     cancel_commit_panel,
     submit_commit_panel,
     generate_commit_message,
+    copy_commit_message,
     commit_panel_tab,
     commit_panel_enter,
     commit_panel_backspace,
@@ -698,6 +711,7 @@ const TestMsg = union(enum) {
     push_error_scroll_down,
     push_error_page_up,
     push_error_page_down,
+    copy_popup,
     push_credential_tab,
     push_credential_submit,
     push_credential_cancel,
@@ -743,6 +757,8 @@ const TestMsg = union(enum) {
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
+    copy_current_line,
+    copy_current_hunk,
     finish_review_approved,
     finish_review_needs_changes,
     finish_review_canceled,
@@ -829,6 +845,15 @@ test "keyToMsg maps view option toggles" {
     try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, shiftedAscii('l', 'L')).?);
 }
 
+test "keyToMsg maps copy actions only in viewer mode" {
+    try std.testing.expectEqual(TestMsg.copy_current_line, keyToMsg(TestMsg, .{}, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(TestMsg.copy_current_hunk, keyToMsg(TestMsg, .{}, .{ .codepoint = 'Y' }).?);
+    try std.testing.expectEqual(TestMsg.copy_current_hunk, keyToMsg(TestMsg, .{}, shiftedAscii('y', 'Y')).?);
+    try std.testing.expectEqual(TestMsg{ .search_insert = 'y' }, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'y' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'y' }));
+}
+
 test "keyToMsg maps stage action by focused pane" {
     try std.testing.expectEqual(TestMsg.toggle_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 's' }).?);
     try std.testing.expectEqual(TestMsg.toggle_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 's' }).?);
@@ -864,6 +889,7 @@ test "keyToMsg maps commit panel command and routes panel input" {
     try std.testing.expectEqual(TestMsg.submit_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter, .mods = .{ .ctrl = true } }).?);
     try std.testing.expectEqual(TestMsg.submit_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 's', .mods = .{ .ctrl = true } }).?);
     try std.testing.expectEqual(TestMsg.generate_commit_message, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'g', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(TestMsg.copy_commit_message, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'y', .mods = .{ .ctrl = true } }).?);
     try std.testing.expectEqual(TestMsg.commit_panel_tab, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.tab }).?);
     try std.testing.expectEqual(TestMsg.commit_panel_enter, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
     try std.testing.expectEqual(TestMsg.commit_panel_backspace, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.backspace }).?);
@@ -872,6 +898,7 @@ test "keyToMsg maps commit panel command and routes panel input" {
     try std.testing.expectEqual(TestMsg.commit_panel_move_up, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.up }).?);
     try std.testing.expectEqual(TestMsg.commit_panel_move_down, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.down }).?);
     try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'x' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'y' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'y' }).?);
     try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'R' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'R' }).?);
     try std.testing.expectEqual(TestMsg.enter_commit_panel, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'c' }).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
@@ -1233,6 +1260,7 @@ test "keyToMsg maps push error modal keys" {
     try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'q' }).?);
     try std.testing.expectEqual(TestMsg.run_interactive_push, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'i' }).?);
+    try std.testing.expectEqual(TestMsg.copy_popup, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'y' }).?);
     try std.testing.expectEqual(TestMsg.push_error_scroll_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'k' }).?);
     try std.testing.expectEqual(TestMsg.push_error_scroll_down, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'j' }).?);
     try std.testing.expectEqual(TestMsg.push_error_scroll_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.up }).?);
@@ -1240,6 +1268,11 @@ test "keyToMsg maps push error modal keys" {
     try std.testing.expectEqual(TestMsg.push_error_page_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.page_up }).?);
     try std.testing.expectEqual(TestMsg.push_error_page_down, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.page_down }).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'P' }));
+}
+
+test "keyToMsg keeps printable y as editable popup input" {
+    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'y' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(TestMsg{ .push_credential_insert = 'y' }, keyToMsg(TestMsg, .{ .push_credential_mode = true }, .{ .codepoint = 'y' }).?);
 }
 
 test "keyToMsg opens and closes help outside prompt modes" {

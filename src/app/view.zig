@@ -501,6 +501,8 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
         .palette = app.theme,
         .file_index = display.loadedFileIndex() orelse 0,
         .syntax_spans = if (display.loadedFileIndex() != null) loaded.syntax_spans else .empty(),
+        .selection = app.diffSelectionView(),
+        .header_selection = app.diffHeaderSelectionActive(),
     });
     drawDiffHeaderDetailRow(app, surface, active);
     drawSearchMatchMarker(app, surface);
@@ -558,6 +560,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
                 .palette = app.theme,
                 .file_index = 0,
                 .syntax_spans = bundle.loaded.syntax_spans,
+                .header_selection = app.diffHeaderSelectionActive(),
             });
             drawPaneHeaderRule(surface, active, app.theme);
             return;
@@ -574,6 +577,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
             .line_numbers = app.viewer.view_options.line_numbers,
             .cursor_offset = app.visibleDiffCursorOffset(),
             .palette = app.theme,
+            .header_selection = app.diffHeaderSelectionActive(),
         });
         drawPaneHeaderRule(surface, active, app.theme);
         return;
@@ -943,7 +947,7 @@ const FooterSegments = struct {
     }
 };
 
-fn repoHeaderLabel(app: anytype) ?[]const u8 {
+pub fn repoHeaderLabel(app: anytype) ?[]const u8 {
     const root = app.repo_state.activeRoot() orelse return null;
     const base = std.fs.path.basename(root);
     if (base.len == 0) return root;
@@ -1333,7 +1337,7 @@ fn drawCommitCounter(surface: *chasen.Surface, row: u16, len: usize, max: ?usize
 }
 
 fn commitHelpRows(width: u16) u16 {
-    const single_line = "Tab: field  Enter: newline  Ctrl+g: generate  Ctrl+s/Ctrl+Enter: validate  Esc: close";
+    const single_line = "Tab: field  Enter: newline  Ctrl+g: generate  Ctrl+y: copy  Ctrl+s/Ctrl+Enter: validate  Esc: close";
     return if (chasen.text.displayWidth(single_line) <= width) 1 else 2;
 }
 
@@ -1344,12 +1348,12 @@ fn viewCommitHelp(app: anytype, surface: *chasen.Surface, start_row: u16, rows: 
     const style: chasen.TextStyle = roleStyle(app.theme, .muted);
     const submit_label = app.commit_panel.submitLabel();
     if (rows <= 1) {
-        const text = try std.fmt.allocPrint(surface.frameAllocator(), "Tab: field  Enter: newline  Ctrl+g: generate  Ctrl+s/Ctrl+Enter: {s}  Esc: close", .{submit_label});
+        const text = try std.fmt.allocPrint(surface.frameAllocator(), "Tab: field  Enter: newline  Ctrl+g: generate  Ctrl+y: copy  Ctrl+s/Ctrl+Enter: {s}  Esc: close", .{submit_label});
         try draw.copyClippedTextAt(surface, 0, start_row, text, style);
         return;
     }
 
-    try draw.copyClippedTextAt(surface, 0, start_row, "Tab: field  Enter: newline  Ctrl+g: generate", style);
+    try draw.copyClippedTextAt(surface, 0, start_row, "Tab: field  Enter: newline  Ctrl+g: generate  Ctrl+y: copy", style);
     if (start_row + 1 < size.height) {
         const line2 = try std.fmt.allocPrint(surface.frameAllocator(), "Ctrl+s/Ctrl+Enter: {s}  Esc: close", .{submit_label});
         try draw.copyClippedTextAt(surface, 0, start_row + 1, line2, style);
