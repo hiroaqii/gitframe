@@ -170,9 +170,8 @@ fn shouldShowStats(row: Row, width: u16, name_col: u16) bool {
     const stats_width: u16 = 12;
     const min_name_width_with_stats: u16 = 8;
 
-    // File rows keep navigation quiet; selected file stats live in the diff
-    // pane header.
-    if (row.kind == .file) return false;
+    // Keep navigation rows quiet; repository totals remain visible at the root.
+    if (row.kind != .repo_root) return false;
     return hasLineStats(row.stats) and
         width > name_col + stats_width + min_name_width_with_stats;
 }
@@ -333,7 +332,7 @@ test "layout prioritizes file name over stats in narrow sidebars" {
     try std.testing.expect(row_layout.name_width > 0);
 }
 
-test "layout shows stats for repository root and directory rows" {
+test "layout shows stats only for repository root rows" {
     const nodes = [_]file_tree.Node{
         .{
             .kind = .repo_root,
@@ -358,5 +357,5 @@ test "layout shows stats for repository root and directory rows" {
     const directory_layout = layout(rowForNode(tree, &collapsed, &.{}, 1, 0).?, 40);
 
     try std.testing.expect(root_layout.stats_col != null);
-    try std.testing.expect(directory_layout.stats_col != null);
+    try std.testing.expectEqual(@as(?u16, null), directory_layout.stats_col);
 }
