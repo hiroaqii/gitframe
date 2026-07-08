@@ -9,7 +9,7 @@ const SyntaxProvider = enum {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const syntax_provider = b.option(SyntaxProvider, "syntax-provider", "Syntax provider: none or flow_syntax") orelse .none;
+    const syntax_provider = b.option(SyntaxProvider, "syntax-provider", "Syntax provider: none or flow_syntax") orelse defaultSyntaxProvider(target);
     const provider_enabled = syntax_provider == .flow_syntax;
 
     const chasen_dep = b.dependency("chasen", .{
@@ -67,8 +67,8 @@ pub fn build(b: *std.Build) void {
                     std.process.fatal("-Dsyntax-provider=flow_syntax is currently supported only for macOS and Linux targets", .{});
                 }
                 // Calling lazyDependency marks the dependency as needed, so keep
-                // it inside the explicit provider branch. Default builds must
-                // not fetch or resolve flow-syntax.
+                // it inside the provider branch. Explicit `none` and
+                // unsupported-target defaults must not resolve flow-syntax.
                 const flow_syntax_dep = b.lazyDependency("flow_syntax", .{
                     .target = target,
                     .optimize = optimize,
@@ -300,6 +300,10 @@ fn supportsFlowSyntaxProvider(target: std.Build.ResolvedTarget) bool {
         .macos, .linux => true,
         else => false,
     };
+}
+
+fn defaultSyntaxProvider(target: std.Build.ResolvedTarget) SyntaxProvider {
+    return if (supportsFlowSyntaxProvider(target)) .flow_syntax else .none;
 }
 
 fn configureFlowSyntaxArtifact(artifact: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, provider_enabled: bool) void {
