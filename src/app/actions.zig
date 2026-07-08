@@ -399,7 +399,6 @@ pub fn StageFileTask(comptime Msg: type) type {
 
             const result = runStageTarget(task.repo_root, task.path, task.target_kind, allocator, io);
             const path = task.label;
-            task.path = &.{};
             task.label = &.{};
 
             return Msg.actionFinished(.{ .stage_file = StageFileFinished{
@@ -419,7 +418,6 @@ pub fn StageFileTask(comptime Msg: type) type {
             }
 
             const path = task.label;
-            task.path = &.{};
             task.label = &.{};
 
             return Msg.actionFinished(.{ .stage_file = StageFileFinished{
@@ -455,7 +453,6 @@ pub fn UnstageFileTask(comptime Msg: type) type {
 
             const result = runUnstageTarget(task.repo_root, task.path, task.target_kind, allocator, io);
             const path = task.label;
-            task.path = &.{};
             task.label = &.{};
 
             return Msg.actionFinished(.{ .unstage_file = UnstageFileFinished{
@@ -475,7 +472,6 @@ pub fn UnstageFileTask(comptime Msg: type) type {
             }
 
             const path = task.label;
-            task.path = &.{};
             task.label = &.{};
 
             return Msg.actionFinished(.{ .unstage_file = UnstageFileFinished{
@@ -1463,6 +1459,125 @@ test "validateStagedDiffForJson rejects empty and invalid utf8 diffs" {
     const invalid = [_]u8{ 'd', 'i', 'f', 'f', '\n', 0xff };
     try std.testing.expectEqualStrings("staged diff is not valid UTF-8", validateStagedDiffForJson(&invalid).?);
     try std.testing.expect(validateStagedDiffForJson("diff --git a/a b/a\n+ok\n") == null);
+}
+
+const FileTaskTestActionMsg = union(enum) {
+    stage_file: StageFileFinished,
+    unstage_file: UnstageFileFinished,
+};
+
+const FileTaskTestMsg = union(enum) {
+    action: FileTaskTestActionMsg,
+
+    pub fn actionFinished(msg: FileTaskTestActionMsg) @This() {
+        return .{ .action = msg };
+    }
+};
+
+fn makeStageFileTaskForTest(allocator: std.mem.Allocator, pending: PendingAction) !*StageFileTask(FileTaskTestMsg) {
+    const Task = StageFileTask(FileTaskTestMsg);
+    const task = try allocator.create(Task);
+    task.* = .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, "/__gitframe_missing_repo__"),
+        .path = try allocator.dupe(u8, "src/main.zig"),
+        .label = try allocator.dupe(u8, "src/main.zig"),
+        .target_kind = .file,
+    };
+    return task;
+}
+
+fn makeUnstageFileTaskForTest(allocator: std.mem.Allocator, pending: PendingAction) !*UnstageFileTask(FileTaskTestMsg) {
+    const Task = UnstageFileTask(FileTaskTestMsg);
+    const task = try allocator.create(Task);
+    task.* = .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, "/__gitframe_missing_repo__"),
+        .path = try allocator.dupe(u8, "src/main.zig"),
+        .label = try allocator.dupe(u8, "src/main.zig"),
+        .target_kind = .file,
+    };
+    return task;
+}
+
+fn expectStageFileFinished(msg: FileTaskTestMsg) StageFileFinished {
+    return switch (msg) {
+        .action => |action| switch (action) {
+            .stage_file => |payload| payload,
+            else => unreachable,
+        },
+    };
+}
+
+fn expectUnstageFileFinished(msg: FileTaskTestMsg) UnstageFileFinished {
+    return switch (msg) {
+        .action => |action| switch (action) {
+            .unstage_file => |payload| payload,
+            else => unreachable,
+        },
+    };
+}
+
+test "StageFileTask run frees borrowed command path and moves label" {
+    const allocator = std.testing.allocator;
+    const Task = StageFileTask(FileTaskTestMsg);
+    const task = try makeStageFileTaskForTest(allocator, .{ .generation = 11, .kind = .stage_file });
+
+    var finished = expectStageFileFinished(Task.run(task, allocator, std.testing.io));
+    defer finished.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 11), finished.pending.generation);
+    try std.testing.expectEqual(ActionKind.stage_file, finished.pending.kind);
+    try std.testing.expectEqualStrings("src/main.zig", finished.path);
+    try std.testing.expectEqual(FileActionTaskResult.failed, std.meta.activeTag(finished.result));
+}
+
+test "StageFileTask failed frees borrowed command path and moves label" {
+    const allocator = std.testing.allocator;
+    const Task = StageFileTask(FileTaskTestMsg);
+    const task = try makeStageFileTaskForTest(allocator, .{ .generation = 12, .kind = .stage_file });
+
+    var finished = expectStageFileFinished(Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator));
+    defer finished.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 12), finished.pending.generation);
+    try std.testing.expectEqual(ActionKind.stage_file, finished.pending.kind);
+    try std.testing.expectEqualStrings("src/main.zig", finished.path);
+    try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
+        .failed_static => |message| message,
+        else => return error.UnexpectedResult,
+    });
+}
+
+test "UnstageFileTask run frees borrowed command path and moves label" {
+    const allocator = std.testing.allocator;
+    const Task = UnstageFileTask(FileTaskTestMsg);
+    const task = try makeUnstageFileTaskForTest(allocator, .{ .generation = 13, .kind = .unstage_file });
+
+    var finished = expectUnstageFileFinished(Task.run(task, allocator, std.testing.io));
+    defer finished.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 13), finished.pending.generation);
+    try std.testing.expectEqual(ActionKind.unstage_file, finished.pending.kind);
+    try std.testing.expectEqualStrings("src/main.zig", finished.path);
+    try std.testing.expectEqual(FileActionTaskResult.failed, std.meta.activeTag(finished.result));
+}
+
+test "UnstageFileTask failed frees borrowed command path and moves label" {
+    const allocator = std.testing.allocator;
+    const Task = UnstageFileTask(FileTaskTestMsg);
+    const task = try makeUnstageFileTaskForTest(allocator, .{ .generation = 14, .kind = .unstage_file });
+
+    var finished = expectUnstageFileFinished(Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator));
+    defer finished.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 14), finished.pending.generation);
+    try std.testing.expectEqual(ActionKind.unstage_file, finished.pending.kind);
+    try std.testing.expectEqualStrings("src/main.zig", finished.path);
+    try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
+        .failed_static => |message| message,
+        else => return error.UnexpectedResult,
+    });
 }
 
 test "StageHunkTask failed preserves identity and transfers moved fields" {
