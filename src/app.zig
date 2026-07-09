@@ -44,6 +44,8 @@ const sidebar_view_model = @import("sidebar/view_model.zig");
 
 const auto_reload_timer_id = "gitframe.auto_reload";
 const auto_reload_interval_ns = 2 * std.time.ns_per_s;
+const git_action_spinner_timer_id = "gitframe.git_action_spinner";
+const git_action_spinner_interval_ns = 120 * std.time.ns_per_ms;
 
 const PendingRecentPathDiscovery = struct {
     kind: repo_state.RecentKind,
@@ -330,6 +332,8 @@ pub const App = struct {
     allocator: ?std.mem.Allocator = null,
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
     actions: app_actions.ActionState = .{},
+    git_action_spinner_tick: u8 = 0,
+    git_action_spinner_timer_running: bool = false,
     load: LoadRuntimeState = .{},
     status: app_state.StatusMessage = .{},
     viewer: ViewerState = .{},
@@ -550,6 +554,7 @@ pub const App = struct {
         finish_review_canceled,
         reload,
         auto_reload_tick,
+        git_action_spinner_tick,
         quit,
 
         pub fn loadFinished(inner: LoadFinishedMsg) @This() {
@@ -836,9 +841,11 @@ pub const App = struct {
                 }
             },
             .auto_reload_tick => try self.autoReloadTick(ctx),
+            .git_action_spinner_tick => self.gitActionSpinnerTick(ctx),
             .quit => self.requestQuit(ctx),
         }
         try self.ensureReviewProjection(ctx);
+        self.reconcileGitActionSpinnerTimer(ctx);
     }
 
     fn requestQuit(self: *App, ctx: *chasen.Ctx(Msg)) void {
@@ -892,9 +899,35 @@ pub const App = struct {
             .action_finished,
             .clipboard_copy_finished,
             .auto_reload_tick,
+            .git_action_spinner_tick,
             => true,
             else => false,
         };
+    }
+
+    fn gitActionSpinnerTick(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        if (self.actions.pending == null) {
+            self.git_action_spinner_tick = 0;
+            self.git_action_spinner_timer_running = false;
+            ctx.timer().cancel(git_action_spinner_timer_id) catch {};
+            ctx.redraw().skip();
+            return;
+        }
+        self.git_action_spinner_tick +%= 1;
+    }
+
+    fn reconcileGitActionSpinnerTimer(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        if (self.actions.pending != null) {
+            if (self.git_action_spinner_timer_running) return;
+            ctx.timer().every(git_action_spinner_timer_id, git_action_spinner_interval_ns, .git_action_spinner_tick) catch return;
+            self.git_action_spinner_timer_running = true;
+            return;
+        }
+
+        if (!self.git_action_spinner_timer_running) return;
+        self.git_action_spinner_timer_running = false;
+        self.git_action_spinner_tick = 0;
+        ctx.timer().cancel(git_action_spinner_timer_id) catch {};
     }
 
     pub fn view(self: *const App, surface: *chasen.Surface) !void {
@@ -7575,9 +7608,47 @@ test "system events keep previous ephemeral status" {
     try std.testing.expectEqualStrings("staged: src/app.zig", app.status.text());
 }
 
+test "git action spinner ticks keep previous ephemeral status" {
+    var app: App = .{};
+    app.setStatus("pushing: {s}", .{"main -> origin/main"});
+    _ = app.actions.begin(.push);
+    app.git_action_spinner_timer_running = true;
+
+    try app.update(.git_action_spinner_tick, undefined);
+
+    try std.testing.expectEqualStrings("pushing: main -> origin/main", app.status.text());
+    try std.testing.expectEqual(@as(u8, 1), app.git_action_spinner_tick);
+}
+
+test "git action spinner starts when pending action is visible after update" {
+    var app: App = .{};
+    _ = app.actions.begin(.push);
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 40 } }, &tc.ctx);
+
+    try std.testing.expect(app.git_action_spinner_timer_running);
+    try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
+}
+
+test "git action spinner self-cancels stale ticks without redraw" {
+    var app: App = .{ .git_action_spinner_timer_running = true };
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+
+    try app.update(.git_action_spinner_tick, &tc.ctx);
+
+    try std.testing.expect(!app.git_action_spinner_timer_running);
+    try std.testing.expectEqual(@as(u8, 0), app.git_action_spinner_tick);
+    try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
+    try std.testing.expect(tc.redrawSuppressed());
+}
+
 test "grouped result messages keep previous ephemeral status" {
     try std.testing.expect(App.msgKeepsEphemeralStatus(.{ .load_finished = undefined }));
     try std.testing.expect(App.msgKeepsEphemeralStatus(.{ .action_finished = undefined }));
+    try std.testing.expect(App.msgKeepsEphemeralStatus(.git_action_spinner_tick));
 }
 
 test "modal transitions clear previous ephemeral status" {

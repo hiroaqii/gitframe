@@ -3,6 +3,7 @@ const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const app_commit_panel = @import("commit_panel.zig");
 const app_repo_picker = @import("repo_picker.zig");
+const app_actions = @import("actions.zig");
 const app_state = @import("state.zig");
 const draw = @import("draw");
 const diff_render = @import("../diff/render.zig");
@@ -875,7 +876,12 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         .style = roleStyle(app.theme, .staged),
         .drop_priority = .watch,
     });
-    if (app.status.text().len > 0) footer_segments.append(.{
+    if (gitActionSpinnerText(app, surface.frameAllocator())) |spinner_text| {
+        footer_segments.append(.{
+            .text = spinner_text,
+            .style = roleStyle(app.theme, .prompt),
+        });
+    } else if (app.status.text().len > 0) footer_segments.append(.{
         .text = app.status.text(),
         .style = roleStyle(app.theme, .prompt),
     });
@@ -971,6 +977,34 @@ const FooterSegments = struct {
         return self.requiredWidth();
     }
 };
+
+fn gitActionSpinnerText(app: anytype, allocator: std.mem.Allocator) ?[]const u8 {
+    const pending = app.actions.pending orelse return null;
+    const label = if (app.status.text().len > 0)
+        app.status.text()
+    else
+        pendingActionFallbackLabel(pending.kind);
+    const spinner = ui.Spinner.init(.{});
+    return std.fmt.allocPrint(allocator, "{s} {s}", .{ spinner.frameAt(app.git_action_spinner_tick), label }) catch label;
+}
+
+fn pendingActionFallbackLabel(kind: anytype) []const u8 {
+    return switch (kind) {
+        .refresh_status => "refresh",
+        .stage_file => "stage",
+        .unstage_file => "unstage",
+        .stage_hunk => "hunk stage",
+        .unstage_hunk => "hunk unstage",
+        .discard_file => "discard",
+        .commit => "commit",
+        .generate_commit_message => "generate",
+        .amend => "amend",
+        .push => "push",
+        .pull => "pull",
+        .fetch => "fetch",
+        .switch_branch => "switch",
+    };
+}
 
 fn branchStatusSidebarText(app: anytype, allocator: std.mem.Allocator, available_width: u16) ?[]const u8 {
     const root = app.repo_state.activeRoot() orelse return null;
@@ -2295,6 +2329,81 @@ test "footer segment fit includes left inset" {
     try std.testing.expectEqual(@as(u16, 3), segments.requiredWidth());
     try std.testing.expect(!segments.items[1].visible);
 }
+
+test "footer shows pending spinner with current status label" {
+    var app: FooterSpinnerTestApp = .{};
+    app.status.set("pushing: main -> origin/main", .{});
+    app.actions.pending = .{ .generation = 1, .kind = .push };
+    app.git_action_spinner_tick = 1;
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(96, 1);
+    defer ts.deinit();
+
+    viewFooter(app, &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "/ pushing: main -> origin/main") != null);
+}
+
+test "footer falls back to pending kind when status is empty" {
+    var app: FooterSpinnerTestApp = .{};
+    app.actions.pending = .{ .generation = 1, .kind = .push };
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 1);
+    defer ts.deinit();
+
+    viewFooter(app, &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "| push") != null);
+}
+
+const FooterSpinnerTestApp = struct {
+    const Source = enum {
+        unstaged,
+        cached,
+        stdin,
+        pager,
+        patch_file,
+        range,
+        no_index,
+    };
+
+    const FileSearch = struct {
+        const Input = struct {
+            fn slice(_: @This()) []const u8 {
+                return "";
+            }
+        };
+
+        mode: bool = false,
+        input: Input = .{},
+        no_match: bool = false,
+    };
+
+    const Viewer = struct {
+        sidebar_hidden: bool = false,
+    };
+
+    const Config = struct {
+        source: Source = .unstaged,
+        watch: bool = false,
+    };
+
+    file_search: FileSearch = .{},
+    viewer: Viewer = .{},
+    keymap: keymap.Effective = .{},
+    theme: theme.Palette = .default(),
+    terminal_size: chasen.Size = .{ .width = 80, .height = 24 },
+    config: Config = .{},
+    status: app_state.StatusMessage = .{},
+    actions: app_actions.ActionState = .{},
+    git_action_spinner_tick: u8 = 0,
+};
 
 test "shell content size matches panel content surface" {
     var ts: chasen.testing.TestSurface = undefined;
