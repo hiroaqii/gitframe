@@ -12,7 +12,6 @@ const context_export = @import("../context_export.zig");
 /// This is intentionally a taxonomy, not an executable backend API. Concrete
 /// requests/results live next to the first implementation of each operation.
 pub const ActionKind = enum {
-    refresh_status,
     stage_file,
     unstage_file,
     stage_hunk,
@@ -25,6 +24,28 @@ pub const ActionKind = enum {
     pull,
     fetch,
     switch_branch,
+
+    /// Whether an already-running background read must be discarded while
+    /// this action is pending. Keep this exhaustive: adding an action must
+    /// make its repository-mutation policy explicit.
+    pub fn blocksBackgroundAcceptance(self: ActionKind) bool {
+        return switch (self) {
+            .assist_commit_message,
+            => false,
+            .stage_file,
+            .unstage_file,
+            .stage_hunk,
+            .unstage_hunk,
+            .discard_file,
+            .commit,
+            .amend,
+            .push,
+            .pull,
+            .fetch,
+            .switch_branch,
+            => true,
+        };
+    }
 };
 
 pub const PendingAction = struct {
@@ -65,6 +86,13 @@ pub const ActionState = struct {
         self.pending = null;
     }
 };
+
+test "ActionKind background acceptance policy distinguishes reads from mutations" {
+    try std.testing.expect(!ActionKind.assist_commit_message.blocksBackgroundAcceptance());
+    try std.testing.expect(ActionKind.stage_file.blocksBackgroundAcceptance());
+    try std.testing.expect(ActionKind.fetch.blocksBackgroundAcceptance());
+    try std.testing.expect(ActionKind.switch_branch.blocksBackgroundAcceptance());
+}
 
 pub const StageFileFinished = struct {
     pending: PendingAction,
@@ -1490,7 +1518,7 @@ fn runOperationMapped(comptime prefix: []const u8, request: git_backend.Operatio
 test "ActionState tracks current pending action" {
     var state: ActionState = .{};
 
-    const first = state.begin(.refresh_status);
+    const first = state.begin(.assist_commit_message);
     try std.testing.expect(state.isCurrent(first));
 
     const second = state.begin(.stage_file);

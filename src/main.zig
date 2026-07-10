@@ -133,14 +133,21 @@ fn printHelp(io: std.Io) !void {
         \\  --pager           Read Git pager input from stdin and strip ANSI color
         \\  --difftool L R    Compare two paths using git diff --no-index
         \\  --range <range>   Show a commit range, for example main...HEAD
-        \\  --watch           Poll and reload the active diff every 2 seconds
+        \\  --watch           Force-enable automatic reload for reloadable sources
+        \\  --no-watch        Disable automatic reload
         \\  --stats-summary   Print runtime timing summary after exit
         \\  --export-context  Print initial selection context JSON and exit
         \\  --review          Print a review result JSON after exit
         \\  -h, --help        Show this help
         \\
         \\Default:
-        \\  gitframe          Show unstaged changes in the current repository
+        \\  gitframe          Show unstaged changes and reload automatically every 3 seconds
+        \\
+        \\Config:
+        \\  [reload]
+        \\  auto = true
+        \\  interval_seconds = 3  # accepted range: 1..60
+        \\  stdin and pager input remain one-shot even when auto reload is enabled
         \\
     );
     try stdout.flush();

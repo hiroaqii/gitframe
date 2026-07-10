@@ -334,12 +334,28 @@ pub const PushCredentialPrompt = struct {
 ///
 /// Store the length instead of a slice into `buf`. That keeps the value
 /// self-contained even if App state is copied in tests or future snapshots.
+pub const StatusProvenance = union(enum) {
+    general,
+    source_reload_failure: [32]u8,
+};
+
 pub const StatusMessage = struct {
     buf: [160]u8 = undefined,
     len: usize = 0,
     clear_on_next_input: bool = false,
+    provenance: StatusProvenance = .general,
 
     pub fn set(self: *StatusMessage, comptime fmt: []const u8, args: anytype) void {
+        self.provenance = .general;
+        self.setText(fmt, args);
+    }
+
+    pub fn setSourceReloadFailure(self: *StatusMessage, identity: [32]u8, comptime fmt: []const u8, args: anytype) void {
+        self.provenance = .{ .source_reload_failure = identity };
+        self.setText(fmt, args);
+    }
+
+    fn setText(self: *StatusMessage, comptime fmt: []const u8, args: anytype) void {
         const formatted = std.fmt.bufPrint(&self.buf, fmt, args) catch {
             self.len = validUtf8PrefixLen(&self.buf);
             self.clear_on_next_input = true;
@@ -352,10 +368,25 @@ pub const StatusMessage = struct {
     pub fn clear(self: *StatusMessage) void {
         self.len = 0;
         self.clear_on_next_input = false;
+        self.provenance = .general;
     }
 
     pub fn clearIfEphemeral(self: *StatusMessage) void {
         if (self.clear_on_next_input) self.clear();
+    }
+
+    /// Clear a recovered source failure only when the visible message still
+    /// belongs to that exact failure. Auxiliary failures may replace it while
+    /// the source read is in flight and must not be erased by source recovery.
+    pub fn clearSourceReloadFailure(self: *StatusMessage, identity: [32]u8) bool {
+        switch (self.provenance) {
+            .general => return false,
+            .source_reload_failure => |current| {
+                if (!std.mem.eql(u8, &current, &identity)) return false;
+            },
+        }
+        self.clear();
+        return true;
     }
 
     pub fn text(self: *const StatusMessage) []const u8 {
@@ -532,6 +563,23 @@ test "StatusMessage clears only ephemeral text" {
 
     try std.testing.expectEqualStrings("", status.text());
     try std.testing.expect(!status.clear_on_next_input);
+}
+
+test "StatusMessage clears only the matching source reload failure" {
+    var status: StatusMessage = .{};
+    const first = [_]u8{1} ** 32;
+    const second = [_]u8{2} ** 32;
+
+    status.setSourceReloadFailure(first, "source failed", .{});
+    try std.testing.expect(!status.clearSourceReloadFailure(second));
+    try std.testing.expectEqualStrings("source failed", status.text());
+    try std.testing.expect(status.clearSourceReloadFailure(first));
+    try std.testing.expectEqualStrings("", status.text());
+
+    status.setSourceReloadFailure(first, "source failed", .{});
+    status.set("status failed", .{});
+    try std.testing.expect(!status.clearSourceReloadFailure(first));
+    try std.testing.expectEqualStrings("status failed", status.text());
 }
 
 test "ReviewDisplayState defaults to showing all files" {

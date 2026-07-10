@@ -51,6 +51,7 @@ pub const StageTargetResult = union(enum) {
     ready: StageTarget,
     already_staged: []const u8,
     stale_status,
+    stale_source,
     conflict_unsupported: []const u8,
     no_stageable_content: []const u8,
     unavailable_source,
@@ -64,6 +65,7 @@ pub const ToggleStageTargetResult = union(enum) {
     no_repo,
     no_path,
     stale_status,
+    stale_source,
     conflict_unsupported: PathTarget,
     no_content: PathTarget,
 };
@@ -93,6 +95,7 @@ pub const HunkStageTargetResult = union(enum) {
     no_hunk,
     offscreen_cursor,
     stale_status,
+    stale_source,
     conflict_unsupported,
     binary_unsupported,
     unsupported_file_state,
@@ -114,6 +117,7 @@ pub const HunkUnstageTargetResult = union(enum) {
     binary_unsupported,
     unsupported_file_state,
     patch_failed,
+    stale_source,
 };
 
 pub const ToggleHunkTargetResult = union(enum) {
@@ -124,6 +128,7 @@ pub const ToggleHunkTargetResult = union(enum) {
     no_path,
     no_hunk,
     offscreen_cursor,
+    stale_source,
 };
 
 pub const UnstageTarget = struct {
@@ -139,6 +144,7 @@ pub const UnstageTargetResult = union(enum) {
     no_repo,
     no_path,
     stale_status,
+    stale_source,
     conflict_unsupported: PathTarget,
     no_staged_content: PathTarget,
 };
@@ -154,6 +160,7 @@ pub const DiscardTargetResult = union(enum) {
     no_repo,
     no_path,
     stale_status,
+    stale_source,
     directory_unsupported,
     conflict_unsupported,
     untracked_unsupported,
@@ -250,6 +257,7 @@ pub const StatusSnapshot = struct {
     /// Repo root used by the most recent status load.
     repo_root: ?[]const u8,
     loading: bool,
+    fresh: bool = true,
     entries: []const git_status.StatusEntry,
 
     pub fn entryForPathKey(self: StatusSnapshot, path_key: []const u8) ?git_status.StatusEntry {
@@ -261,14 +269,14 @@ pub const StatusSnapshot = struct {
     }
 
     pub fn freshEntryForPathKey(self: StatusSnapshot, active_repo_root: []const u8, path_key: []const u8) ?git_status.StatusEntry {
-        if (self.loading) return null;
+        if (self.loading or !self.fresh) return null;
         const snapshot_root = self.repo_root orelse return null;
         if (!std.mem.eql(u8, snapshot_root, active_repo_root)) return null;
         return self.entryForPathKey(path_key);
     }
 
     fn isFreshFor(self: StatusSnapshot, active_repo_root: []const u8) bool {
-        if (self.loading) return false;
+        if (self.loading or !self.fresh) return false;
         const snapshot_root = self.repo_root orelse return false;
         return std.mem.eql(u8, snapshot_root, active_repo_root);
     }
@@ -280,15 +288,17 @@ pub const TargetContext = struct {
     repo_root: ?[]const u8,
     action_target: ?PathTarget,
     status: StatusSnapshot,
+    source_fresh: bool = true,
 };
 
 pub const BranchStatusSnapshot = struct {
     repo_root: ?[]const u8,
     loading: bool,
+    fresh: bool = true,
     status: git_branch_status.BranchStatus,
 
     fn freshFor(self: BranchStatusSnapshot, active_repo_root: []const u8) bool {
-        if (self.loading) return false;
+        if (self.loading or !self.fresh) return false;
         const snapshot_root = self.repo_root orelse return false;
         return std.mem.eql(u8, snapshot_root, active_repo_root);
     }
@@ -458,6 +468,7 @@ fn pullWorktreeState(entries: []const git_status.StatusEntry) PullWorktreeState 
 
 pub fn stageTarget(ctx: TargetContext) StageTargetResult {
     if (!diff_source.sourceAllowsStageAction(ctx.source)) return .unavailable_source;
+    if (!ctx.source_fresh) return .stale_source;
     const repo_root = ctx.repo_root orelse return .no_repo;
     const action_target = ctx.action_target orelse return .no_path;
     return switch (action_target.kind) {
@@ -520,6 +531,7 @@ pub fn toggleStageTarget(ctx: TargetContext) ToggleStageTargetResult {
     const can_stage = diff_source.sourceAllowsStageAction(ctx.source);
     const can_unstage = diff_source.sourceAllowsUnstageAction(ctx.source);
     if (!can_stage and !can_unstage) return .unavailable_source;
+    if (!ctx.source_fresh) return .stale_source;
 
     const repo_root = ctx.repo_root orelse return .no_repo;
     const action_target = ctx.action_target orelse return .no_path;
@@ -574,6 +586,7 @@ fn repositoryStageToggleOperation(action_target: PathTarget, can_stage: bool, ca
 
 pub fn unstageTarget(ctx: TargetContext) UnstageTargetResult {
     if (!diff_source.sourceAllowsUnstageAction(ctx.source)) return .unavailable_source;
+    if (!ctx.source_fresh) return .stale_source;
     const repo_root = ctx.repo_root orelse return .no_repo;
     const action_target = ctx.action_target orelse return .no_path;
     if (!ctx.status.isFreshFor(repo_root)) return .stale_status;
@@ -631,6 +644,7 @@ fn repositoryUnstageTarget(repo_root: []const u8, status: StatusSnapshot) Unstag
 
 pub fn discardTarget(ctx: TargetContext) DiscardTargetResult {
     if (!diff_source.sourceAllowsDiscardAction(ctx.source)) return .unavailable_source;
+    if (!ctx.source_fresh) return .stale_source;
     const repo_root = ctx.repo_root orelse return .no_repo;
     const action_target = ctx.action_target orelse return .no_path;
     if (action_target.kind == .directory) return .directory_unsupported;
@@ -681,6 +695,28 @@ test "stageTarget file allows stale status while suppressing fresh staged-only f
         .already_staged => |path| try std.testing.expectEqualStrings("src/main.zig", path),
         else => return error.ExpectedAlreadyStaged,
     }
+}
+
+test "stale source blocks optimistic file stage and all diff-derived file targets" {
+    const target: PathTarget = .{ .path = "src/main.zig", .kind = .file };
+    const entries = [_]git_status.StatusEntry{.{
+        .raw = .{ 'M', 'M' },
+        .index = .modified,
+        .worktree = .modified,
+        .path = "src/main.zig",
+    }};
+    const ctx: TargetContext = .{
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .action_target = target,
+        .status = .{ .repo_root = "/repo", .loading = false, .entries = &entries },
+        .source_fresh = false,
+    };
+
+    try std.testing.expectEqual(StageTargetResult.stale_source, stageTarget(ctx));
+    try std.testing.expectEqual(ToggleStageTargetResult.stale_source, toggleStageTarget(ctx));
+    try std.testing.expectEqual(UnstageTargetResult.stale_source, unstageTarget(ctx));
+    try std.testing.expectEqual(DiscardTargetResult.stale_source, discardTarget(ctx));
 }
 
 test "toggleStageTarget keeps stale status strict" {

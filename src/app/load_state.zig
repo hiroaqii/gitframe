@@ -3,12 +3,6 @@ const loaded_diff = @import("../loaded_diff.zig");
 
 const LoadedDiff = loaded_diff.LoadedDiff;
 
-pub const AuxiliaryLoadAcceptance = enum {
-    accepted_pending,
-    accepted_without_pending,
-    stale_generation,
-};
-
 pub const BranchListAcceptance = enum {
     accepted,
     no_pending,
@@ -51,19 +45,6 @@ pub const PendingLoad = union(enum) {
         };
     }
 };
-
-/// Accept status-like auxiliary loads by generation, and clear the pending
-/// marker only when this result owns it. Some auxiliary snapshots may already
-/// have had their pending marker cleared by a newer UI path; keeping generation
-/// as the authority preserves the existing stale-result contract.
-pub fn acceptAuxiliaryLoadResult(pending: *?u64, current_generation: u64, result_generation: u64) AuxiliaryLoadAcceptance {
-    if (result_generation != current_generation) return .stale_generation;
-    if (pending.* == result_generation) {
-        pending.* = null;
-        return .accepted_pending;
-    }
-    return .accepted_without_pending;
-}
 
 /// Branch-list results are stricter than status snapshots: the popup that
 /// requested the list must still exist, still have the same generation, and
@@ -256,18 +237,6 @@ pub const EmptyReason = enum {
     no_changes,
     no_repository,
 };
-
-test "acceptAuxiliaryLoadResult rejects stale generation and clears matching pending" {
-    var pending: ?u64 = 3;
-
-    try std.testing.expectEqual(AuxiliaryLoadAcceptance.stale_generation, acceptAuxiliaryLoadResult(&pending, 4, 3));
-    try std.testing.expectEqual(@as(?u64, 3), pending);
-
-    try std.testing.expectEqual(AuxiliaryLoadAcceptance.accepted_pending, acceptAuxiliaryLoadResult(&pending, 3, 3));
-    try std.testing.expectEqual(@as(?u64, null), pending);
-
-    try std.testing.expectEqual(AuxiliaryLoadAcceptance.accepted_without_pending, acceptAuxiliaryLoadResult(&pending, 3, 3));
-}
 
 test "acceptBranchListResult requires pending state generation and repo match" {
     var pending: ?u64 = null;

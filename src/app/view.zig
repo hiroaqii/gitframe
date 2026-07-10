@@ -4,6 +4,7 @@ const ui = @import("chasen_ui");
 const app_commit_panel = @import("commit_panel.zig");
 const app_repo_picker = @import("repo_picker.zig");
 const app_actions = @import("actions.zig");
+const app_auto_reload = @import("auto_reload.zig");
 const app_state = @import("state.zig");
 const draw = @import("draw");
 const diff_render = @import("../diff/render.zig");
@@ -871,10 +872,10 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         .style = roleStyle(app.theme, .prompt),
         .drop_priority = .source,
     });
-    if (app.config.watch) footer_segments.append(.{
-        .text = "watch",
+    if (app.auto_reload.enabled()) footer_segments.append(.{
+        .text = "auto",
         .style = roleStyle(app.theme, .staged),
-        .drop_priority = .watch,
+        .drop_priority = .auto,
     });
     if (gitActionSpinnerText(app, surface.frameAllocator())) |spinner_text| {
         footer_segments.append(.{
@@ -909,7 +910,7 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
 
 const FooterDropPriority = enum {
     source,
-    watch,
+    auto,
 };
 
 const FooterSegment = struct {
@@ -930,7 +931,7 @@ const FooterSegments = struct {
     }
 
     fn fit(self: *FooterSegments, width: u16) void {
-        const order = [_]FooterDropPriority{ .source, .watch };
+        const order = [_]FooterDropPriority{ .source, .auto };
         for (order) |priority| {
             if (self.requiredWidth() <= width) return;
             self.drop(priority);
@@ -990,7 +991,6 @@ fn gitActionSpinnerText(app: anytype, allocator: std.mem.Allocator) ?[]const u8 
 
 fn pendingActionFallbackLabel(kind: anytype) []const u8 {
     return switch (kind) {
-        .refresh_status => "refresh",
         .stage_file => "stage",
         .unstage_file => "unstage",
         .stage_hunk => "hunk stage",
@@ -1008,7 +1008,13 @@ fn pendingActionFallbackLabel(kind: anytype) []const u8 {
 
 fn branchStatusSidebarText(app: anytype, allocator: std.mem.Allocator, available_width: u16) ?[]const u8 {
     const root = app.repo_state.activeRoot() orelse return null;
-    if (app.branch_status_load_pending != null) return "loading branch";
+    if (app.branch_status_load.pending) |pending| {
+        const has_retained_snapshot = if (app.branch_status.repo_root) |snapshot_root|
+            std.mem.eql(u8, root, snapshot_root)
+        else
+            false;
+        if (pending.origin == .foreground or !has_retained_snapshot) return "loading branch";
+    }
 
     const snapshot_root = app.branch_status.repo_root orelse return null;
     if (!std.mem.eql(u8, root, snapshot_root)) return null;
@@ -1099,6 +1105,41 @@ test "formatSidebarBranchStatus omits behind count" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expectEqualStrings("main ↑0", text);
+}
+
+test "branch sidebar retains background snapshot but shows foreground loading" {
+    const Repo = struct {
+        fn activeRoot(_: @This()) ?[]const u8 {
+            return "/repo";
+        }
+    };
+    var builder = git_branch_status.Builder.init(std.testing.allocator);
+    errdefer builder.deinit();
+    try builder.setBranchHead("main");
+    var bundle = builder.finish();
+    var branch_status: git_branch_status.State = .{};
+    try branch_status.replace("/repo", &bundle);
+
+    var app = struct {
+        repo_state: Repo = .{},
+        branch_status: git_branch_status.State,
+        branch_status_load: app_auto_reload.AuxiliaryTracker,
+    }{
+        .branch_status = branch_status,
+        .branch_status_load = .{
+            .generation = 1,
+            .pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 },
+            .freshness = .stale_refresh,
+        },
+    };
+    defer app.branch_status.deinit();
+
+    const retained = branchStatusSidebarText(&app, std.testing.allocator, 80).?;
+    defer std.testing.allocator.free(retained);
+    try std.testing.expectEqualStrings("main no upstream", retained);
+
+    app.branch_status_load.pending.?.origin = .foreground;
+    try std.testing.expectEqualStrings("loading branch", branchStatusSidebarText(&app, std.testing.allocator, 80).?);
 }
 
 fn sourceFooterLabel(config: anytype) ?[]const u8 {
@@ -2362,6 +2403,22 @@ test "footer falls back to pending kind when status is empty" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "| push") != null);
 }
 
+test "footer labels enabled automatic reload as auto" {
+    const app: FooterSpinnerTestApp = .{
+        .auto_reload = .{ .activation = .automatic, .interval_ns = 3 * std.time.ns_per_s },
+    };
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 1);
+    defer ts.deinit();
+
+    viewFooter(app, &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "auto") != null);
+}
+
 const FooterSpinnerTestApp = struct {
     const Source = enum {
         unstaged,
@@ -2391,7 +2448,6 @@ const FooterSpinnerTestApp = struct {
 
     const Config = struct {
         source: Source = .unstaged,
-        watch: bool = false,
     };
 
     file_search: FileSearch = .{},
@@ -2400,6 +2456,7 @@ const FooterSpinnerTestApp = struct {
     theme: theme.Palette = .default(),
     terminal_size: chasen.Size = .{ .width = 80, .height = 24 },
     config: Config = .{},
+    auto_reload: app_auto_reload.State = .{},
     status: app_state.StatusMessage = .{},
     actions: app_actions.ActionState = .{},
     git_action_spinner_tick: u8 = 0,
@@ -2580,7 +2637,7 @@ const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .help }, .description = "open / close help" },
     .{ .key = .{ .text = "q" }, .description = "quit" },
     .{ .key = .{ .action = .toggle_sidebar }, .description = "show / hide sidebar" },
-    .{ .key = .{ .action = .reload }, .description = "reload active repository" },
+    .{ .key = .{ .action = .reload }, .description = "force reload (auto by default; --no-watch disables)" },
     .{ .key = .{ .action = .repo_picker }, .description = "switch repository" },
     .{ .key = .{ .action = .commit }, .description = "open commit panel" },
     .{ .key = .{ .action = .amend }, .description = "amend last commit" },

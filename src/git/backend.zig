@@ -158,8 +158,14 @@ pub const GitDiffRequest = struct {
 };
 
 /// Request for a read-only `git status` snapshot in a concrete repository.
+pub const ReadOrigin = enum {
+    foreground,
+    background,
+};
+
 pub const GitStatusRequest = struct {
     repo_root: []const u8,
+    origin: ReadOrigin = .foreground,
 };
 
 /// Request for branch/upstream/ahead-behind status in a concrete repository.
@@ -303,7 +309,7 @@ pub const LocalCommandBackend = struct {
     }
 
     pub fn loadStatus(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
-        return loadGitStatus(allocator, io, request.repo_root);
+        return loadGitStatus(allocator, io, request);
     }
 
     pub fn loadBranchStatus(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
@@ -459,10 +465,28 @@ fn loadGitFileDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const 
     };
 }
 
-fn loadGitStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!StatusLoadResult {
-    const argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
-    const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(max_status_bytes), .limited(256 * 1024));
+const foreground_status_argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
+const background_status_argv = [_][]const u8{ "git", "--no-optional-locks", "status", "--porcelain=v1", "-z", "-uall" };
+
+pub fn statusArgvForOrigin(origin: ReadOrigin) []const []const u8 {
+    return switch (origin) {
+        .foreground => &foreground_status_argv,
+        .background => &background_status_argv,
+    };
+}
+
+fn loadGitStatus(allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
+    const argv = statusArgvForOrigin(request.origin);
+    const result = try runCapturedCommand(allocator, io, request.repo_root, argv, .limited(max_status_bytes), .limited(256 * 1024));
     return statusResultFromGitCommand(allocator, result, "git status");
+}
+
+test "background status suppresses optional locks without changing foreground argv" {
+    try std.testing.expectEqualSlices([]const u8, &foreground_status_argv, statusArgvForOrigin(.foreground));
+    try std.testing.expectEqualSlices([]const u8, &background_status_argv, statusArgvForOrigin(.background));
+    try std.testing.expectEqualStrings("status", statusArgvForOrigin(.foreground)[1]);
+    try std.testing.expectEqualStrings("--no-optional-locks", statusArgvForOrigin(.background)[1]);
+    try std.testing.expectEqualStrings("status", statusArgvForOrigin(.background)[2]);
 }
 
 fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!BranchStatusLoadResult {

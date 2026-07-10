@@ -37,7 +37,36 @@ pub const BranchStatus = struct {
             .detached, .unknown => null,
         };
     }
+
+    pub fn eql(lhs: BranchStatus, rhs: BranchStatus) bool {
+        if (!optionalTextEql(lhs.oid, rhs.oid)) return false;
+        if (!headEql(lhs.head, rhs.head)) return false;
+        if (!upstreamEql(lhs.upstream, rhs.upstream)) return false;
+        return std.meta.eql(lhs.ahead_behind, rhs.ahead_behind);
+    }
 };
+
+fn optionalTextEql(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return std.mem.eql(u8, lhs.?, rhs.?);
+}
+
+fn headEql(lhs: Head, rhs: Head) bool {
+    if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
+    return switch (lhs) {
+        .branch => |name| std.mem.eql(u8, name, rhs.branch),
+        .detached, .unknown => true,
+    };
+}
+
+fn upstreamEql(lhs: ?Upstream, rhs: ?Upstream) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    const left = lhs.?;
+    const right = rhs.?;
+    return std.mem.eql(u8, left.name, right.name) and
+        std.mem.eql(u8, left.remote, right.remote) and
+        std.mem.eql(u8, left.remote_branch, right.remote_branch);
+}
 
 pub const BranchStatusBundle = struct {
     arena: ?std.heap.ArenaAllocator,
@@ -222,4 +251,17 @@ test "builder preserves upstream without remote branch" {
     try std.testing.expectEqualStrings("origin", upstream.name);
     try std.testing.expectEqualStrings("origin", upstream.remote);
     try std.testing.expectEqualStrings("", upstream.remote_branch);
+}
+
+test "branch status equality compares borrowed values" {
+    const first: BranchStatus = .{
+        .oid = "abc",
+        .head = .{ .branch = "main" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{ .ahead = 1, .behind = 2 },
+    };
+    try std.testing.expect(first.eql(first));
+    var changed = first;
+    changed.ahead_behind = .{ .ahead = 2, .behind = 1 };
+    try std.testing.expect(!first.eql(changed));
 }

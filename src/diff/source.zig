@@ -20,9 +20,15 @@ pub const PathPair = struct {
     right: []const u8,
 };
 
+pub const AutoReloadOverride = enum {
+    inherit,
+    enabled,
+    disabled,
+};
+
 pub const CliConfig = struct {
     source: SourceMode = .unstaged,
-    watch: bool = false,
+    auto_reload: AutoReloadOverride = .inherit,
     stats_summary: bool = false,
     export_context: bool = false,
     review_mode: bool = false,
@@ -77,8 +83,8 @@ pub fn sourceIsOneShotInput(source: SourceMode) bool {
 
 pub fn sourceSupportsWatch(source: SourceMode) bool {
     return switch (source) {
-        .unstaged, .cached, .range, .patch_file => true,
-        .stdin, .pager, .no_index => false,
+        .unstaged, .cached, .range, .patch_file, .no_index => true,
+        .stdin, .pager => false,
     };
 }
 
@@ -124,6 +130,7 @@ pub const ParseArgsError = error{
     TooManyInputs,
     ConflictingSourceMode,
     ConflictingOutputMode,
+    ConflictingWatchOverride,
     UnsupportedWatchSource,
 };
 
@@ -152,10 +159,13 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
             const left = args[index + 1];
             const right = args[index + 2];
             try setSourceMode(&config, .{ .no_index = .{ .left = left, .right = right } });
-            if (index + 3 < args.len) return error.TooManyInputs;
             index += 2;
         } else if (std.mem.eql(u8, arg, "--watch")) {
-            config.watch = true;
+            if (config.auto_reload == .disabled) return error.ConflictingWatchOverride;
+            config.auto_reload = .enabled;
+        } else if (std.mem.eql(u8, arg, "--no-watch")) {
+            if (config.auto_reload == .enabled) return error.ConflictingWatchOverride;
+            config.auto_reload = .disabled;
         } else if (std.mem.eql(u8, arg, "--stats-summary")) {
             config.stats_summary = true;
         } else if (std.mem.eql(u8, arg, "--export-context")) {
@@ -183,7 +193,7 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
         }
     }
 
-    if (config.watch and !sourceSupportsWatch(config.source)) return error.UnsupportedWatchSource;
+    if (config.auto_reload == .enabled and !sourceSupportsWatch(config.source)) return error.UnsupportedWatchSource;
 
     return config;
 }
@@ -402,7 +412,26 @@ test "parseArgs accepts watch mode" {
     const config = try parseArgs(args[0..]);
 
     try std.testing.expect(config.source == .unstaged);
-    try std.testing.expect(config.watch);
+    try std.testing.expectEqual(AutoReloadOverride.enabled, config.auto_reload);
+}
+
+test "parseArgs keeps auto reload inherited without flags" {
+    const args = [_][]const u8{"gitframe"};
+    const config = try parseArgs(args[0..]);
+
+    try std.testing.expectEqual(AutoReloadOverride.inherit, config.auto_reload);
+}
+
+test "parseArgs accepts no-watch override and rejects conflicts" {
+    const disabled_args = [_][]const u8{ "gitframe", "--no-watch" };
+    const disabled = try parseArgs(disabled_args[0..]);
+    try std.testing.expectEqual(AutoReloadOverride.disabled, disabled.auto_reload);
+
+    const watch_first = [_][]const u8{ "gitframe", "--watch", "--no-watch" };
+    try std.testing.expectError(error.ConflictingWatchOverride, parseArgs(watch_first[0..]));
+
+    const no_watch_first = [_][]const u8{ "gitframe", "--no-watch", "--watch" };
+    try std.testing.expectError(error.ConflictingWatchOverride, parseArgs(no_watch_first[0..]));
 }
 
 test "parseArgs accepts stats summary mode" {
@@ -446,12 +475,26 @@ test "parseArgs rejects watch with pager" {
     try std.testing.expectError(error.UnsupportedWatchSource, parseArgs(args[0..]));
 }
 
-test "parseArgs rejects watch with difftool" {
-    const before = [_][]const u8{ "gitframe", "--watch", "--difftool", "left.txt", "right.txt" };
-    try std.testing.expectError(error.UnsupportedWatchSource, parseArgs(before[0..]));
+test "parseArgs allows inherited and explicitly disabled auto reload for one-shot sources" {
+    const inherited_args = [_][]const u8{ "gitframe", "--stdin" };
+    const inherited = try parseArgs(inherited_args[0..]);
+    try std.testing.expectEqual(AutoReloadOverride.inherit, inherited.auto_reload);
 
-    const after = [_][]const u8{ "gitframe", "--difftool", "left.txt", "right.txt", "--watch" };
-    try std.testing.expectError(error.TooManyInputs, parseArgs(after[0..]));
+    const disabled_args = [_][]const u8{ "gitframe", "--stdin", "--no-watch" };
+    const disabled = try parseArgs(disabled_args[0..]);
+    try std.testing.expectEqual(AutoReloadOverride.disabled, disabled.auto_reload);
+}
+
+test "parseArgs accepts watch with difftool" {
+    const args = [_][]const u8{ "gitframe", "--watch", "--difftool", "left.txt", "right.txt" };
+    const config = try parseArgs(args[0..]);
+    try std.testing.expect(config.source == .no_index);
+    try std.testing.expectEqual(AutoReloadOverride.enabled, config.auto_reload);
+
+    const trailing = [_][]const u8{ "gitframe", "--difftool", "left.txt", "right.txt", "--watch" };
+    const trailing_config = try parseArgs(trailing[0..]);
+    try std.testing.expect(trailing_config.source == .no_index);
+    try std.testing.expectEqual(AutoReloadOverride.enabled, trailing_config.auto_reload);
 }
 
 test "parseArgs accepts range option" {
@@ -554,14 +597,14 @@ test "sourceIsOneShotInput identifies stdin and pager" {
     try std.testing.expect(!sourceIsOneShotInput(.{ .no_index = .{ .left = "left", .right = "right" } }));
 }
 
-test "sourceSupportsWatch rejects one-shot and difftool sources" {
+test "sourceSupportsWatch rejects only one-shot sources" {
     try std.testing.expect(sourceSupportsWatch(.unstaged));
     try std.testing.expect(sourceSupportsWatch(.cached));
     try std.testing.expect(sourceSupportsWatch(.{ .range = "main...HEAD" }));
     try std.testing.expect(sourceSupportsWatch(.{ .patch_file = "change.diff" }));
     try std.testing.expect(!sourceSupportsWatch(.stdin));
     try std.testing.expect(!sourceSupportsWatch(.{ .pager = "diff" }));
-    try std.testing.expect(!sourceSupportsWatch(.{ .no_index = .{ .left = "left", .right = "right" } }));
+    try std.testing.expect(sourceSupportsWatch(.{ .no_index = .{ .left = "left", .right = "right" } }));
 }
 
 test "stage action is narrower than stage projection" {

@@ -16,6 +16,12 @@ pub const Config = struct {
     keymap: KeymapConfig = .{},
     actions: ExternalActionsConfig = .{},
     remote: RemoteWorkflowConfig = .{},
+    reload: ReloadConfig = .{},
+};
+
+pub const ReloadConfig = struct {
+    auto: bool = true,
+    interval_seconds: u8 = 3,
 };
 
 pub const State = struct {
@@ -268,6 +274,8 @@ const TomlParseError = error{
     InvalidSection,
     InvalidKeyValue,
     InvalidInteger,
+    InvalidBoolean,
+    InvalidReloadInterval,
     InvalidString,
     InvalidArray,
     UnsupportedEscape,
@@ -297,6 +305,8 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
     var action_state: ?ExternalActionParseState = null;
     var saw_empty_actions_section = false;
     var saw_actions_array = false;
+    var saw_reload_auto = false;
+    var saw_reload_interval = false;
 
     var lines = std.mem.splitScalar(u8, input, '\n');
     while (lines.next()) |raw_line| {
@@ -347,6 +357,21 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
                 const spec = keymap.parseKeySpec(spec_text) orelse return error.InvalidKeyBinding;
                 config.keymap.set(action, spec);
             },
+            .reload => {
+                if (std.mem.eql(u8, key, "auto")) {
+                    if (saw_reload_auto) return error.DuplicateKey;
+                    config.reload.auto = try parseTomlBool(value);
+                    saw_reload_auto = true;
+                } else if (std.mem.eql(u8, key, "interval_seconds")) {
+                    if (saw_reload_interval) return error.DuplicateKey;
+                    const interval = std.fmt.parseInt(u8, value, 10) catch return error.InvalidInteger;
+                    if (interval < 1 or interval > 60) return error.InvalidReloadInterval;
+                    config.reload.interval_seconds = interval;
+                    saw_reload_interval = true;
+                } else {
+                    return error.UnknownKey;
+                }
+            },
             .action_entry => {
                 if (action_state) |*state| {
                     try parseExternalActionField(state, key, value);
@@ -374,6 +399,7 @@ const ConfigSection = enum {
     actions,
     action_entry,
     remote,
+    reload,
 };
 
 fn trimTomlLine(line: []const u8) []const u8 {
@@ -403,7 +429,14 @@ fn parseConfigSection(line: []const u8) TomlParseError!ConfigSection {
     if (std.mem.eql(u8, name, "keymap")) return .keymap;
     if (std.mem.eql(u8, name, "actions")) return .actions;
     if (std.mem.eql(u8, name, "remote")) return .remote;
+    if (std.mem.eql(u8, name, "reload")) return .reload;
     return error.UnknownSection;
+}
+
+fn parseTomlBool(value: []const u8) TomlParseError!bool {
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return error.InvalidBoolean;
 }
 
 fn isActionsArrayHeader(line: []const u8) bool {
@@ -804,6 +837,51 @@ test "loadConfig accepts reserved empty TOML sections" {
     defer result.deinit();
     try std.testing.expect(result.warning == null);
     try std.testing.expectEqual(@as(u32, supported_schema_version), result.config.value.schema_version);
+    try std.testing.expect(result.config.value.reload.auto);
+    try std.testing.expectEqual(@as(u8, 3), result.config.value.reload.interval_seconds);
+}
+
+test "parse config accepts reload policy" {
+    const parsed = try parseConfigToml(
+        \\schema_version = 1
+        \\[reload]
+        \\auto = false
+        \\interval_seconds = 1
+        \\
+    );
+    try std.testing.expect(!parsed.reload.auto);
+    try std.testing.expectEqual(@as(u8, 1), parsed.reload.interval_seconds);
+
+    const upper = try parseConfigToml(
+        \\[reload]
+        \\interval_seconds = 60
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 60), upper.reload.interval_seconds);
+}
+
+test "parse config rejects invalid reload policy" {
+    try std.testing.expectError(error.InvalidReloadInterval, parseConfigToml(
+        \\[reload]
+        \\interval_seconds = 0
+        \\
+    ));
+    try std.testing.expectError(error.InvalidReloadInterval, parseConfigToml(
+        \\[reload]
+        \\interval_seconds = 61
+        \\
+    ));
+    try std.testing.expectError(error.InvalidBoolean, parseConfigToml(
+        \\[reload]
+        \\auto = "yes"
+        \\
+    ));
+    try std.testing.expectError(error.DuplicateKey, parseConfigToml(
+        \\[reload]
+        \\auto = true
+        \\auto = false
+        \\
+    ));
 }
 
 test "loadConfig accepts editor argv template" {

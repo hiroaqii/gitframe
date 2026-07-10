@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const app_actions = @import("app/actions.zig");
+const app_auto_reload = @import("app/auto_reload.zig");
 const app_commit_panel = @import("app/commit_panel.zig");
 const app_direction = @import("app/direction.zig");
 const app_input = @import("app/input.zig");
@@ -43,7 +44,6 @@ const review_state = @import("review/state.zig");
 const sidebar_view_model = @import("sidebar/view_model.zig");
 
 const auto_reload_timer_id = "gitframe.auto_reload";
-const auto_reload_interval_ns = 2 * std.time.ns_per_s;
 const git_action_spinner_timer_id = "gitframe.git_action_spinner";
 const git_action_spinner_interval_ns = 120 * std.time.ns_per_ms;
 
@@ -250,6 +250,7 @@ const ReloadKind = enum {
 const DiffLoadStartOptions = struct {
     clear_visible_state: bool,
     kind: ReloadKind,
+    background_cycle_id: ?u64 = null,
 };
 
 const ReloadAnchor = struct {
@@ -276,6 +277,16 @@ const PendingReload = struct {
 
     fn deinit(self: *PendingReload, allocator: std.mem.Allocator) void {
         if (self.anchor) |*anchor| anchor.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const DeferredSourceApply = struct {
+    finished: DiffLoadFinished,
+    cycle_id: u64,
+
+    fn deinit(self: *DeferredSourceApply, allocator: std.mem.Allocator) void {
+        self.finished.result.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -335,6 +346,8 @@ pub const App = struct {
     git_action_spinner_tick: u8 = 0,
     git_action_spinner_timer_running: bool = false,
     load: LoadRuntimeState = .{},
+    auto_reload: app_auto_reload.State = .{},
+    deferred_source_apply: ?DeferredSourceApply = null,
     status: app_state.StatusMessage = .{},
     viewer: ViewerState = .{},
     search: DiffSearchState = .{},
@@ -357,12 +370,10 @@ pub const App = struct {
     review_projection_next_id: u64 = 0,
     repo_state: repo_state.State = .{},
     git_status: git_status.GitStatusState = .{},
-    status_load_generation: u64 = 0,
-    status_load_pending: ?u64 = null,
+    status_load: app_auto_reload.AuxiliaryTracker = .{},
     pending_reload: ?PendingReload = null,
     branch_status: git_branch_status.State = .{},
-    branch_status_load_generation: u64 = 0,
-    branch_status_load_pending: ?u64 = null,
+    branch_status_load: app_auto_reload.AuxiliaryTracker = .{},
     /// One-shot startup selection intent used when diff finishes before status.
     pending_initial_first_visible_selection: bool = false,
     tree_order: file_tree.StableOrder = .{},
@@ -554,6 +565,7 @@ pub const App = struct {
         finish_review_canceled,
         reload,
         auto_reload_tick,
+        focus_lost,
         git_action_spinner_tick,
         quit,
 
@@ -569,11 +581,12 @@ pub const App = struct {
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         self.allocator = ctx.allocator();
         self.commit_panel = app_commit_panel.State.init(ctx.allocator());
-        if (self.config.watch) {
-            try ctx.timer().every(auto_reload_timer_id, auto_reload_interval_ns, .auto_reload_tick);
+        self.auto_reload = .init(self.config.auto_reload, self.user_config.reload, self.config.source);
+        if (self.auto_reload.enabled()) {
+            try ctx.timer().every(auto_reload_timer_id, self.auto_reload.interval_ns, .auto_reload_tick);
         }
         if (diff_source.sourceRequiresRepo(self.config.source)) {
-            try self.startRepoDiscovery(ctx);
+            try self.startRepoDiscovery(ctx, null);
         } else {
             try self.startDiffLoad(ctx, .initial);
         }
@@ -581,7 +594,8 @@ pub const App = struct {
 
     pub fn deinit(self: *App, deinit_ctx: chasen.AppDeinitContext) void {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
-        self.clearLoadedDiff();
+        self.terminateDiffSelection();
+        self.clearSourceDisplay();
         self.repo_state.deinit(deinit_ctx.allocator);
         self.git_status.deinit();
         self.branch_status.deinit();
@@ -606,6 +620,7 @@ pub const App = struct {
         if (self.tree_order_scope) |scope| deinit_ctx.allocator.free(scope);
         if (self.pending_selection_restore) |*restore| restore.deinit(deinit_ctx.allocator);
         self.clearPendingReload(deinit_ctx.allocator);
+        self.clearDeferredSourceApply(deinit_ctx.allocator);
     }
 
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
@@ -835,14 +850,18 @@ pub const App = struct {
                 if (diff_source.sourceIsOneShotInput(self.config.source)) {
                     ctx.redraw().skip();
                 } else if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
-                    try self.startRepoDiscovery(ctx);
+                    try self.startRepoDiscovery(ctx, null);
                 } else {
                     try self.startDiffLoad(ctx, .manual);
                 }
             },
             .auto_reload_tick => try self.autoReloadTick(ctx),
+            .focus_lost => self.terminateDiffSelection(),
             .git_action_spinner_tick => self.gitActionSpinnerTick(ctx),
             .quit => self.requestQuit(ctx),
+        }
+        if (!self.selection_owner.activeMouseSelection() and self.deferred_source_apply != null) {
+            try self.applyDeferredSource(ctx);
         }
         try self.ensureReviewProjection(ctx);
         self.reconcileGitActionSpinnerTimer(ctx);
@@ -899,6 +918,7 @@ pub const App = struct {
             .action_finished,
             .clipboard_copy_finished,
             .auto_reload_tick,
+            .focus_lost,
             .git_action_spinner_tick,
             => true,
             else => false,
@@ -964,6 +984,7 @@ pub const App = struct {
     pub fn handleEvent(self: *const App, event: chasen.Event) ?Msg {
         return switch (event) {
             .mouse => |mouse| self.mouseToMsg(mouse),
+            .focus_out => .focus_lost,
             else => app_input.eventToMsg(Msg, self.keyContext(), event),
         };
     }
@@ -1087,6 +1108,13 @@ pub const App = struct {
     }
 
     fn clearDiffSelection(self: *App) void {
+        self.terminateDiffSelection();
+    }
+
+    /// Single termination boundary for every mouse-selection lifetime. Update
+    /// resolves a deferred background source result after this becomes idle;
+    /// deinit discards that result explicitly.
+    fn terminateDiffSelection(self: *App) void {
         self.selection_owner = .none;
     }
 
@@ -1349,23 +1377,25 @@ pub const App = struct {
         app_view.drawSearchMatchMarker(self, surface);
     }
 
-    fn startRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+    fn startRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg), background_cycle_id: ?u64) !void {
         const task = try ctx.allocator().create(RepoDiscoveryTask);
         errdefer ctx.allocator().destroy(task);
 
         const generation = self.load.beginRepoDiscovery();
-        task.* = .{ .generation = generation };
+        task.* = .{ .generation = generation, .background_cycle_id = background_cycle_id };
         self.clearPendingReload(ctx.allocator());
-        self.clearLoadedDiff();
+        self.clearSourceDisplay();
         self.load.state = .loading;
         ctx.task().spawnWith(.{ .ctx = task, .run = RepoDiscoveryTask.run, .failed = RepoDiscoveryTask.failed }) catch |err| {
             _ = self.load.clearPendingIfCurrent(.{ .repo_discovery = generation });
             try self.storeFailedMessage(ctx.allocator(), "Could not start repo discovery task");
             return err;
         };
+        if (background_cycle_id) |cycle_id| _ = self.auto_reload.markMemberStarted(cycle_id, .source);
     }
 
     fn finishRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg), finished: RepoDiscoveryFinished) !void {
+        self.auto_reload.finishMember(finished.background_cycle_id, .source);
         var result = finished.result;
         defer result.deinit(ctx.allocator());
 
@@ -1381,7 +1411,7 @@ pub const App = struct {
                 self.repo_state.replace(ctx.allocator(), discovery);
 
                 if (self.activeRepoRoot() == null) {
-                    self.clearLoadedDiff();
+                    self.clearSourceDisplay();
                     self.load.replaceEmpty(ctx.allocator(), .no_repository);
                     return;
                 }
@@ -1399,6 +1429,7 @@ pub const App = struct {
 
     fn startDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), kind: ReloadKind) !void {
         const repo_root = self.repoRootForCurrentSource() catch |err| {
+            self.clearSourceDisplay();
             self.load.replaceEmpty(ctx.allocator(), switch (err) {
                 error.MissingRepoRoot => .no_repository,
             });
@@ -1409,9 +1440,11 @@ pub const App = struct {
     }
 
     fn startDiffLoadWithRepoRoot(self: *App, ctx: *chasen.Ctx(Msg), repo_root: ?[]const u8, options: DiffLoadStartOptions) !void {
+        if (options.kind != .watch) self.clearDeferredSourceApply(ctx.allocator());
+        if (options.kind == .repo_switch) self.auto_reload.clearAcceptedSource();
         if (repo_root) |root| {
-            self.startStatusLoad(ctx, root);
-            self.startBranchStatusLoad(ctx, root);
+            self.startStatusLoad(ctx, root, if (options.kind == .watch) .background else .foreground, options.background_cycle_id);
+            self.startBranchStatusLoad(ctx, root, options.background_cycle_id);
         } else {
             self.dropStatusSnapshot();
             self.invalidateBranchStatusSnapshot();
@@ -1434,10 +1467,15 @@ pub const App = struct {
             // before the async task crosses the update boundary.
             .request = request,
             .generation = generation,
+            .expected_fingerprint = if (options.kind == .watch and !options.clear_visible_state)
+                if (self.auto_reload.accepted_source) |accepted| accepted.fingerprint else null
+            else
+                null,
+            .background_cycle_id = options.background_cycle_id,
         };
 
         if (options.clear_visible_state) {
-            self.clearLoadedDiff();
+            self.clearSourceDisplay();
             self.load.state = .loading;
         }
         ctx.task().spawnWith(.{ .ctx = task, .run = DiffLoadTask.run, .failed = DiffLoadTask.failed }) catch |err| {
@@ -1446,9 +1484,16 @@ pub const App = struct {
             try self.storeFailedMessage(ctx.allocator(), "Could not start diff load task");
             return err;
         };
+        if (options.background_cycle_id) |cycle_id| _ = self.auto_reload.markMemberStarted(cycle_id, .source);
     }
 
-    fn startStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), repo_root: []const u8) void {
+    fn startStatusLoad(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        repo_root: []const u8,
+        origin: git_backend.ReadOrigin,
+        background_cycle_id: ?u64,
+    ) void {
         if (self.git_status.repo_root) |current_root| {
             if (std.mem.eql(u8, current_root, repo_root)) {
                 self.invalidateStatusSnapshot();
@@ -1474,9 +1519,11 @@ pub const App = struct {
 
         task.* = .{
             .repo_root = owned_root,
-            .generation = self.status_load_generation,
+            .generation = self.status_load.generation,
+            .origin = origin,
+            .background_cycle_id = background_cycle_id,
         };
-        self.status_load_pending = self.status_load_generation;
+        self.status_load.begin(background_cycle_id);
 
         ctx.task().spawnWith(.{ .ctx = task, .run = StatusLoadTask.run, .failed = StatusLoadTask.failed }) catch {
             // Status is auxiliary data. Keep the diff load going even if this
@@ -1485,14 +1532,24 @@ pub const App = struct {
             ctx.allocator().free(owned_root);
             ctx.allocator().destroy(task);
             self.clearPendingSelectionRestore(ctx.allocator());
-            self.status_load_pending = null;
+            self.status_load.pending = null;
+            self.status_load.markFailure(background_cycle_id != null and self.git_status.repo_root != null);
             self.setStatus("could not start status load task", .{});
             return;
         };
+        if (background_cycle_id) |cycle_id| _ = self.auto_reload.markMemberStarted(cycle_id, .status);
     }
 
-    fn startBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), repo_root: []const u8) void {
-        self.invalidateBranchStatusSnapshot();
+    fn startBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), repo_root: []const u8, background_cycle_id: ?u64) void {
+        if (self.branch_status.repo_root) |current_root| {
+            if (std.mem.eql(u8, current_root, repo_root)) {
+                _ = self.branch_status_load.prepare(true);
+            } else {
+                self.invalidateBranchStatusSnapshot();
+            }
+        } else {
+            self.invalidateBranchStatusSnapshot();
+        }
 
         const task = ctx.allocator().create(BranchStatusLoadTask) catch {
             self.setStatus("could not allocate branch status load task", .{});
@@ -1507,33 +1564,35 @@ pub const App = struct {
 
         task.* = .{
             .repo_root = owned_root,
-            .generation = self.branch_status_load_generation,
+            .generation = self.branch_status_load.generation,
+            .background_cycle_id = background_cycle_id,
         };
-        self.branch_status_load_pending = self.branch_status_load_generation;
+        self.branch_status_load.begin(background_cycle_id);
 
         ctx.task().spawnWith(.{ .ctx = task, .run = BranchStatusLoadTask.run, .failed = BranchStatusLoadTask.failed }) catch {
             ctx.allocator().free(owned_root);
             ctx.allocator().destroy(task);
-            self.branch_status_load_pending = null;
+            self.branch_status_load.pending = null;
+            self.branch_status_load.markFailure(background_cycle_id != null and self.branch_status.repo_root != null);
             self.setStatus("could not start branch status load task", .{});
             return;
         };
+        if (background_cycle_id) |cycle_id| _ = self.auto_reload.markMemberStarted(cycle_id, .branch);
     }
 
     fn invalidateStatusSnapshot(self: *App) void {
-        self.status_load_generation +%= 1;
-        self.status_load_pending = null;
+        _ = self.status_load.prepare(true);
         self.pending_initial_first_visible_selection = false;
     }
 
     fn dropStatusSnapshot(self: *App) void {
-        self.invalidateStatusSnapshot();
+        _ = self.status_load.prepare(false);
+        self.pending_initial_first_visible_selection = false;
         self.git_status.clear();
     }
 
     fn invalidateBranchStatusSnapshot(self: *App) void {
-        self.branch_status_load_generation +%= 1;
-        self.branch_status_load_pending = null;
+        _ = self.branch_status_load.prepare(false);
         self.branch_status.clear();
     }
 
@@ -1594,6 +1653,31 @@ pub const App = struct {
         self.pending_reload = null;
     }
 
+    fn clearDeferredSourceApply(self: *App, allocator: std.mem.Allocator) void {
+        var deferred = self.deferred_source_apply orelse return;
+        self.deferred_source_apply = null;
+        _ = self.load.clearPendingIfCurrent(.{ .diff_load = deferred.finished.generation });
+        self.clearPendingReloadIfGeneration(allocator, deferred.finished.generation);
+        self.auto_reload.finishMember(deferred.cycle_id, .deferred_source_apply);
+        deferred.deinit(allocator);
+    }
+
+    fn applyDeferredSource(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const deferred = self.deferred_source_apply orelse return;
+        self.deferred_source_apply = null;
+        defer self.auto_reload.finishMember(deferred.cycle_id, .deferred_source_apply);
+
+        var finished = deferred.finished;
+        if (self.backgroundAcceptanceBlocked(deferred.cycle_id)) {
+            defer finished.result.deinit(ctx.allocator());
+            _ = self.load.finishPending(.{ .diff_load = finished.generation });
+            self.clearPendingReloadIfGeneration(ctx.allocator(), finished.generation);
+            return;
+        }
+        finished.background_cycle_id = null;
+        try self.finishDiffLoad(ctx, finished);
+    }
+
     fn ensureReviewProjection(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         const target = self.reviewProjectionTarget() orelse {
             if (self.review_projection != .idle) {
@@ -1608,7 +1692,7 @@ pub const App = struct {
             target.kind,
             target.source_kind,
             self.load.generation,
-            self.status_load_generation,
+            self.status_load.generation,
         )) return;
 
         self.review_projection.deinit(ctx.allocator());
@@ -1621,7 +1705,7 @@ pub const App = struct {
             target.kind,
             target.source_kind,
             self.load.generation,
-            self.status_load_generation,
+            self.status_load.generation,
         );
         errdefer state_request.deinit(ctx.allocator());
 
@@ -1633,7 +1717,7 @@ pub const App = struct {
             target.kind,
             target.source_kind,
             self.load.generation,
-            self.status_load_generation,
+            self.status_load.generation,
         );
         var task_request_moved = false;
         errdefer if (!task_request_moved) task_request.deinit(ctx.allocator());
@@ -1737,6 +1821,10 @@ pub const App = struct {
                 self.setStatus("status is still loading", .{});
                 return;
             },
+            .stale_source => {
+                self.setStatus("source is stale; press r to reload", .{});
+                return;
+            },
             .conflict_unsupported => |path| {
                 self.setStatus("conflict under selection: {s}", .{path});
                 return;
@@ -1778,6 +1866,7 @@ pub const App = struct {
             .unavailable_source, .no_repo => self.setStatus("stage toggle unavailable for this source", .{}),
             .no_path => self.setStatus("no file selected", .{}),
             .stale_status => self.setStatus("status is still loading", .{}),
+            .stale_source => self.setStatus("source is stale; press r to reload", .{}),
             .conflict_unsupported => |target| {
                 if (target.kind == .directory) {
                     self.setStatus("conflict under directory: {s}", .{target.path});
@@ -1826,6 +1915,10 @@ pub const App = struct {
                 self.setStatus("status is still loading", .{});
                 return;
             },
+            .stale_source => {
+                self.setStatus("source is stale; press r to reload", .{});
+                return;
+            },
             .conflict_unsupported => {
                 self.setStatus("conflict hunk stage is not supported yet", .{});
                 return;
@@ -1871,6 +1964,7 @@ pub const App = struct {
             .no_path => self.setStatus("hunk stage toggle unavailable for status-only file", .{}),
             .no_hunk => self.setStatus("no hunk selected", .{}),
             .offscreen_cursor => self.setStatus("cursor is offscreen; move cursor first", .{}),
+            .stale_source => self.setStatus("source is stale; press r to reload", .{}),
         }
     }
 
@@ -1917,6 +2011,10 @@ pub const App = struct {
                 self.setStatus("could not build hunk patch", .{});
                 return;
             },
+            .stale_source => {
+                self.setStatus("source is stale; press r to reload", .{});
+                return;
+            },
         };
 
         app_git_requests.startUnstageHunk(Msg, ctx, &self.actions, &target) catch |err| {
@@ -1930,6 +2028,7 @@ pub const App = struct {
         const can_stage = diff_source.sourceAllowsStageAction(self.config.source);
         const can_unstage = diff_source.sourceAllowsUnstageAction(self.config.source);
         if (!can_stage and !can_unstage) return .unavailable_source;
+        if (!self.auto_reload.sourceIsActionable()) return .stale_source;
 
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
         if (self.activeCombinedProjection()) |bundle| {
@@ -1960,6 +2059,7 @@ pub const App = struct {
 
     fn selectedHunkStageTarget(self: *const App, allocator: std.mem.Allocator) HunkStageTargetResult {
         if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
+        if (!self.auto_reload.sourceIsActionable()) return .stale_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
         if (self.activeCombinedProjection()) |bundle| {
             return self.selectedProjectedHunkStageTarget(allocator, repo_root, bundle);
@@ -1992,6 +2092,7 @@ pub const App = struct {
 
     fn selectedHunkUnstageTarget(self: *const App, allocator: std.mem.Allocator) HunkUnstageTargetResult {
         if (!diff_source.sourceAllowsUnstageAction(self.config.source)) return .unavailable_source;
+        if (!self.auto_reload.sourceIsActionable()) return .stale_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
         if (self.activeCombinedProjection()) |bundle| {
             return self.selectedProjectedHunkUnstageTarget(allocator, repo_root, bundle);
@@ -2125,6 +2226,10 @@ pub const App = struct {
                 self.setStatus("status is still loading", .{});
                 return;
             },
+            .stale_source => {
+                self.setStatus("source is stale; press r to reload", .{});
+                return;
+            },
             .conflict_unsupported => |target_path| {
                 if (target_path.kind == .directory or target_path.kind == .repository) {
                     self.setStatus("conflict under selection: {s}", .{target_path.path});
@@ -2175,6 +2280,10 @@ pub const App = struct {
             },
             .stale_status => {
                 self.setStatus("status is still loading", .{});
+                return;
+            },
+            .stale_source => {
+                self.setStatus("source is stale; press r to reload", .{});
                 return;
             },
             .directory_unsupported => {
@@ -3234,7 +3343,8 @@ pub const App = struct {
             .repo_root = self.activeRepoRoot(),
             .branch_status = .{
                 .repo_root = self.branch_status.repo_root,
-                .loading = self.branch_status_load_pending != null,
+                .loading = self.branch_status_load.isPending(),
+                .fresh = self.branch_status_load.isFresh(),
                 .status = self.branch_status.status,
             },
         });
@@ -3246,12 +3356,14 @@ pub const App = struct {
             .repo_root = self.activeRepoRoot(),
             .branch_status = .{
                 .repo_root = self.branch_status.repo_root,
-                .loading = self.branch_status_load_pending != null,
+                .loading = self.branch_status_load.isPending(),
+                .fresh = self.branch_status_load.isFresh(),
                 .status = self.branch_status.status,
             },
             .status = .{
                 .repo_root = self.git_status.repo_root,
-                .loading = self.status_load_pending != null,
+                .loading = self.status_load.isPending(),
+                .fresh = self.status_load.isFresh(),
                 .entries = self.git_status.document.entries,
             },
         });
@@ -3263,7 +3375,8 @@ pub const App = struct {
             .repo_root = self.activeRepoRoot(),
             .branch_status = .{
                 .repo_root = self.branch_status.repo_root,
-                .loading = self.branch_status_load_pending != null,
+                .loading = self.branch_status_load.isPending(),
+                .fresh = self.branch_status_load.isFresh(),
                 .status = self.branch_status.status,
             },
         });
@@ -3275,12 +3388,14 @@ pub const App = struct {
             .repo_root = self.activeRepoRoot(),
             .branch_status = .{
                 .repo_root = self.branch_status.repo_root,
-                .loading = self.branch_status_load_pending != null,
+                .loading = self.branch_status_load.isPending(),
+                .fresh = self.branch_status_load.isFresh(),
                 .status = self.branch_status.status,
             },
             .status = .{
                 .repo_root = self.git_status.repo_root,
-                .loading = self.status_load_pending != null,
+                .loading = self.status_load.isPending(),
+                .fresh = self.status_load.isFresh(),
                 .entries = self.git_status.document.entries,
             },
         });
@@ -3353,9 +3468,10 @@ pub const App = struct {
 
     pub fn stagedSummaryForActiveRepo(self: *const App) app_commit_panel.StagedSummary {
         if (!diff_source.sourceAllowsStageProjection(self.config.source)) return .unavailable;
+        if (!self.auto_reload.sourceIsActionable()) return .loading_or_stale;
 
         const active_root = self.activeRepoRoot() orelse return .unavailable;
-        if (self.status_load_pending != null) return .loading_or_stale;
+        if (!self.status_load.isFresh()) return .loading_or_stale;
         const snapshot_root = self.git_status.repo_root orelse return .unavailable;
         if (!std.mem.eql(u8, active_root, snapshot_root)) return .loading_or_stale;
 
@@ -3395,7 +3511,7 @@ pub const App = struct {
             if (result.mark_source == .session) {
                 try self.staged_hunks.add(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
             }
-            self.startStatusLoad(ctx, result.repo_root);
+            self.startStatusLoad(ctx, result.repo_root, .foreground, null);
         }
     }
 
@@ -3432,7 +3548,7 @@ pub const App = struct {
             if (result.mark_source == .session) {
                 _ = self.staged_hunks.remove(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
             }
-            self.startStatusLoad(ctx, result.repo_root);
+            self.startStatusLoad(ctx, result.repo_root, .foreground, null);
         }
     }
 
@@ -3847,7 +3963,7 @@ pub const App = struct {
             return;
         }
         if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
-            try self.startRepoDiscovery(ctx);
+            try self.startRepoDiscovery(ctx, null);
             return;
         }
         // Commit/amend can change HEAD and ahead/behind counts; this reload
@@ -3872,6 +3988,10 @@ pub const App = struct {
             },
             .no_path => {
                 self.setStatus("no file selected", .{});
+                return;
+            },
+            .stale_source => {
+                self.setStatus("source is stale; press r to reload", .{});
                 return;
             },
             .directory_unsupported => {
@@ -3936,6 +4056,7 @@ pub const App = struct {
         no_path,
         directory_unsupported,
         deleted_file,
+        stale_source,
     };
 
     fn selectedEditorTarget(self: *const App) EditorTargetResult {
@@ -3943,6 +4064,7 @@ pub const App = struct {
         // sidebar. Do not derive this from the rendered diff/projection, which
         // can represent staged or synthetic content for the same file.
         if (!diff_source.sourceAllowsEditorAction(self.config.source)) return .unavailable_source;
+        if (!self.auto_reload.sourceIsActionable()) return .stale_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
         const action_target = self.selectedSidebarActionTarget() orelse return .no_path;
 
@@ -4018,7 +4140,7 @@ pub const App = struct {
             return;
         }
         if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
-            try self.startRepoDiscovery(ctx);
+            try self.startRepoDiscovery(ctx, null);
         } else {
             try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
                 ctx.redraw().skip();
@@ -4321,6 +4443,7 @@ pub const App = struct {
         defer if (status_result) |*result| result.deinit(allocator);
 
         const selection = switch (load_result) {
+            .unchanged => unreachable,
             .empty => blk: {
                 status_result = initialStatusLoadResultIfNeeded(config.source, repo_root, allocator, io);
                 break :blk initialSelectionContext(config.source, repo_root, null, initialStatusDocument(optionalStatusResultPtr(&status_result)));
@@ -4402,25 +4525,57 @@ pub const App = struct {
     }
 
     fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (!self.config.watch) return;
+        if (!self.auto_reload.enabled()) return;
         if (diff_source.sourceIsOneShotInput(self.config.source)) return;
-        if (self.repo_picker.mode or self.search.mode or self.file_search.mode or self.commit_panel.is_open) {
+        if (self.repo_picker.mode or self.search.mode or self.file_search.mode or self.commit_panel.is_open or
+            self.selection_owner.activeMouseSelection() or app_git_requests.hasPendingAction(self.actions))
+        {
             ctx.redraw().skip();
             return;
         }
-        if (self.load.hasPending() or self.load.state == .loading) {
+        if (self.auto_reload.background_cycle != null or self.load.hasPending() or self.load.state == .loading or
+            self.status_load.isPending() or self.branch_status_load.isPending())
+        {
             ctx.redraw().skip();
             return;
         }
 
         if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
-            try self.startRepoDiscovery(ctx);
-        } else {
-            try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
+            if (self.auto_reload.activation != .forced) {
                 ctx.redraw().skip();
                 return;
-            }, .{ .clear_visible_state = self.load.state == .idle, .kind = .watch });
+            }
+            const cycle_id = self.auto_reload.beginCycle() orelse {
+                ctx.redraw().skip();
+                return;
+            };
+            errdefer self.auto_reload.discardEmptyCycle(cycle_id);
+            try self.startRepoDiscovery(ctx, cycle_id);
+            self.auto_reload.discardEmptyCycle(cycle_id);
+        } else {
+            const cycle_id = self.auto_reload.beginCycle() orelse {
+                ctx.redraw().skip();
+                return;
+            };
+            errdefer self.auto_reload.discardEmptyCycle(cycle_id);
+            try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
+                self.auto_reload.discardEmptyCycle(cycle_id);
+                ctx.redraw().skip();
+                return;
+            }, .{
+                .clear_visible_state = self.load.state == .idle,
+                .kind = .watch,
+                .background_cycle_id = cycle_id,
+            });
+            self.auto_reload.discardEmptyCycle(cycle_id);
         }
+        ctx.redraw().skip();
+    }
+
+    fn backgroundAcceptanceBlocked(self: *const App, background_cycle_id: ?u64) bool {
+        _ = background_cycle_id orelse return false;
+        const pending = self.actions.pending orelse return false;
+        return pending.kind.blocksBackgroundAcceptance();
     }
 
     fn repoRootForCurrentSource(self: *const App) error{MissingRepoRoot}!?[]const u8 {
@@ -4443,6 +4598,26 @@ pub const App = struct {
 
     fn finishDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: DiffLoadFinished) !void {
         if (self.allocator == null) self.allocator = ctx.allocator();
+        if (self.backgroundAcceptanceBlocked(finished.background_cycle_id)) {
+            self.auto_reload.finishMember(finished.background_cycle_id, .source);
+            var blocked_result = finished.result;
+            defer blocked_result.deinit(ctx.allocator());
+            _ = self.load.finishPending(.{ .diff_load = finished.generation });
+            self.clearPendingReloadIfGeneration(ctx.allocator(), finished.generation);
+            return;
+        }
+        if ((finished.result == .loaded or finished.result == .empty) and self.selection_owner.activeMouseSelection() and
+            self.load.isCurrent(finished.generation) and self.deferred_source_apply == null)
+        {
+            if (finished.background_cycle_id) |cycle_id| {
+                if (self.auto_reload.moveMember(cycle_id, .source, .deferred_source_apply)) {
+                    self.deferred_source_apply = .{ .finished = finished, .cycle_id = cycle_id };
+                    ctx.redraw().skip();
+                    return;
+                }
+            }
+        }
+        self.auto_reload.finishMember(finished.background_cycle_id, .source);
 
         var result = finished.result;
         defer result.deinit(ctx.allocator());
@@ -4462,9 +4637,15 @@ pub const App = struct {
 
         switch (result) {
             .empty => {
-                self.clearLoadedDiff();
+                self.clearSourceDisplayForReplacement();
                 self.load.replaceEmpty(ctx.allocator(), .no_changes);
+                _ = self.acceptSourceFingerprint(app_auto_reload.SourceFingerprint.init(""));
                 can_project_status = true;
+            },
+            .unchanged => |fingerprint| {
+                const visible_status_changed = self.acceptSourceFingerprint(fingerprint);
+                if (!visible_status_changed) ctx.redraw().skip();
+                return;
             },
             .loaded => |*bundle| {
                 const current_loaded = self.activeLoadedDiffConst();
@@ -4479,8 +4660,9 @@ pub const App = struct {
                     texts_equal,
                 )) {
                     .skip_rebuild_identical_text => {
+                        _ = self.acceptSourceFingerprint(bundle.fingerprint);
                         const prefer_first_visible_file = !had_loaded_before and !had_pending_restore;
-                        if (prefer_first_visible_file and self.status_load_pending != null) {
+                        if (prefer_first_visible_file and self.status_load.isPending()) {
                             self.pending_initial_first_visible_selection = true;
                         }
                         try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
@@ -4492,7 +4674,7 @@ pub const App = struct {
                     => {},
                 }
 
-                self.clearLoadedDiff();
+                self.clearSourceDisplayForReplacement();
                 var loaded = bundle.loaded;
                 var arena = bundle.takeArena();
                 errdefer arena.deinit();
@@ -4512,6 +4694,7 @@ pub const App = struct {
                     .loaded = loaded,
                     .reviewed_files_owned = true,
                 });
+                _ = self.acceptSourceFingerprint(bundle.fingerprint);
 
                 const active_loaded = self.activeLoadedDiff().?;
                 const restored_from_anchor = if (pending_reload) |*pending|
@@ -4537,12 +4720,37 @@ pub const App = struct {
                 can_project_status = true;
             },
             .failed => |message| {
-                self.clearLoadedDiff();
+                if (pending_reload != null and pending_reload.?.kind == .watch) {
+                    const trimmed = git_ops.trimGitOutput(message);
+                    if (self.auto_reload.markSourceFailure(trimmed)) {
+                        self.status.setSourceReloadFailure(
+                            self.auto_reload.last_failure.?.digest,
+                            "auto reload failed: {s}",
+                            .{trimmed},
+                        );
+                    } else {
+                        ctx.redraw().skip();
+                    }
+                    return;
+                }
+                self.clearSourceDisplay();
                 self.clearPendingSelectionRestore(ctx.allocator());
                 try self.storeFailedMessage(ctx.allocator(), git_ops.trimGitOutput(message));
             },
             .failed_static => |message| {
-                self.clearLoadedDiff();
+                if (pending_reload != null and pending_reload.?.kind == .watch) {
+                    if (self.auto_reload.markSourceFailure(message)) {
+                        self.status.setSourceReloadFailure(
+                            self.auto_reload.last_failure.?.digest,
+                            "auto reload failed: {s}",
+                            .{message},
+                        );
+                    } else {
+                        ctx.redraw().skip();
+                    }
+                    return;
+                }
+                self.clearSourceDisplay();
                 self.clearPendingSelectionRestore(ctx.allocator());
                 try self.storeFailedMessage(ctx.allocator(), message);
             },
@@ -4552,23 +4760,34 @@ pub const App = struct {
         // here so the final sidebar does not depend on which task finished
         // first.
         const prefer_first_visible_file = !had_loaded_before and !had_pending_restore;
-        if (prefer_first_visible_file and self.status_load_pending != null) {
+        if (prefer_first_visible_file and self.status_load.isPending()) {
             self.pending_initial_first_visible_selection = true;
         }
         if (can_project_status) try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
     }
 
+    fn acceptSourceFingerprint(self: *App, fingerprint: app_auto_reload.SourceFingerprint) bool {
+        const recovered_failure = self.auto_reload.last_failure;
+        self.auto_reload.acceptSource(fingerprint);
+        const failure = recovered_failure orelse return false;
+        return self.status.clearSourceReloadFailure(failure.digest);
+    }
+
     fn finishStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: StatusLoadFinished) !void {
+        self.auto_reload.finishMember(finished.background_cycle_id, .status);
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        switch (app_load_state.acceptAuxiliaryLoadResult(&self.status_load_pending, self.status_load_generation, result.generation)) {
-            .accepted_pending, .accepted_without_pending => {},
-            .stale_generation => return,
+        if (self.backgroundAcceptanceBlocked(result.background_cycle_id)) {
+            _ = self.status_load.accept(result.generation);
+            return;
         }
+
+        if (!self.status_load.accept(result.generation)) return;
 
         switch (result.result) {
             .empty => {
+                self.status_load.markSuccess();
                 self.git_status.clear();
                 const prefer_first_visible_file = self.pending_initial_first_visible_selection;
                 self.pending_initial_first_visible_selection = false;
@@ -4576,7 +4795,11 @@ pub const App = struct {
             },
             .loaded => |*bundle| {
                 switch (self.canSkipStatusSnapshotReplace(result.repo_root, bundle.document)) {
-                    .skip_identical => return,
+                    .skip_identical => {
+                        self.status_load.markSuccess();
+                        ctx.redraw().skip();
+                        return;
+                    },
                     .replace_pending_selection_restore,
                     .replace_pending_initial_selection,
                     .replace_no_snapshot,
@@ -4585,19 +4808,24 @@ pub const App = struct {
                     => {},
                 }
                 try self.git_status.replace(result.repo_root, bundle);
+                self.status_load.markSuccess();
                 result.result = .empty;
                 const prefer_first_visible_file = self.pending_initial_first_visible_selection;
                 self.pending_initial_first_visible_selection = false;
                 try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
             },
             .failed => |message| {
-                self.git_status.clear();
+                const retain = result.background_cycle_id != null and self.git_status.repo_root != null;
+                self.status_load.markFailure(retain);
+                if (!retain) self.git_status.clear();
                 self.pending_initial_first_visible_selection = false;
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
-                self.git_status.clear();
+                const retain = result.background_cycle_id != null and self.git_status.repo_root != null;
+                self.status_load.markFailure(retain);
+                if (!retain) self.git_status.clear();
                 self.pending_initial_first_visible_selection = false;
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{message});
@@ -4615,31 +4843,53 @@ pub const App = struct {
         );
     }
 
+    fn branchStatusSnapshotEquals(self: *const App, repo_root: []const u8, status: git_branch_status.BranchStatus) bool {
+        const current_root = self.branch_status.repo_root orelse return false;
+        return std.mem.eql(u8, current_root, repo_root) and self.branch_status.status.eql(status);
+    }
+
     fn finishBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: BranchStatusLoadFinished) void {
+        self.auto_reload.finishMember(finished.background_cycle_id, .branch);
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        switch (app_load_state.acceptAuxiliaryLoadResult(&self.branch_status_load_pending, self.branch_status_load_generation, result.generation)) {
-            .accepted_pending, .accepted_without_pending => {},
-            .stale_generation => return,
+        if (self.backgroundAcceptanceBlocked(result.background_cycle_id)) {
+            _ = self.branch_status_load.accept(result.generation);
+            return;
         }
 
+        if (!self.branch_status_load.accept(result.generation)) return;
+
         switch (result.result) {
-            .empty => self.branch_status.clear(),
+            .empty => {
+                self.branch_status.clear();
+                self.branch_status_load.markSuccess();
+            },
             .loaded => |*bundle| {
+                if (self.branchStatusSnapshotEquals(result.repo_root, bundle.status)) {
+                    self.branch_status_load.markSuccess();
+                    ctx.redraw().skip();
+                    return;
+                }
                 self.branch_status.replace(result.repo_root, bundle) catch {
                     self.branch_status.clear();
+                    self.branch_status_load.markFailure(false);
                     self.setStatus("branch status parse failed", .{});
                     return;
                 };
+                self.branch_status_load.markSuccess();
                 result.result = .empty;
             },
             .failed => |message| {
-                self.branch_status.clear();
+                const retain = result.background_cycle_id != null and self.branch_status.repo_root != null;
+                self.branch_status_load.markFailure(retain);
+                if (!retain) self.branch_status.clear();
                 self.setStatus("branch status load failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
-                self.branch_status.clear();
+                const retain = result.background_cycle_id != null and self.branch_status.repo_root != null;
+                self.branch_status_load.markFailure(retain);
+                if (!retain) self.branch_status.clear();
                 self.setStatus("branch status load failed: {s}", .{message});
             },
         }
@@ -4663,7 +4913,7 @@ pub const App = struct {
             current.kind,
             current.source_kind,
             self.load.generation,
-            self.status_load_generation,
+            self.status_load.generation,
         )) return;
 
         self.review_projection.deinit(ctx.allocator());
@@ -4714,7 +4964,7 @@ pub const App = struct {
         const status_document = self.git_status.document;
         if (status_document.entries.len == 0) {
             if (self.pending_selection_restore != null and
-                (self.load.hasPending() or self.status_load_pending != null)) return;
+                (self.load.hasPending() or self.status_load.isPending())) return;
             if (self.activeLoadedDiff()) |loaded| {
                 if (loadedDiffIsStatusOnly(loaded)) {
                     self.clearLoadedDiff();
@@ -4831,6 +5081,22 @@ pub const App = struct {
         self.viewer.sidebar_horizontal_scroll = 0;
         self.viewer.diff_cursor = .{ .metadata = 0 };
         self.clearSearchMatch();
+    }
+
+    /// Destructive source transition: invalidate source authority and tear
+    /// down its visible session. Projection-only teardown must call
+    /// clearLoadedDiff() so an accepted empty/loaded source remains authoritative.
+    fn clearSourceDisplay(self: *App) void {
+        self.auto_reload.clearAcceptedSource();
+        self.clearLoadedDiff();
+    }
+
+    /// Accepted source replacement: prevent the old fingerprint from being
+    /// used while the new display is materialized, but retain source-failure
+    /// provenance until acceptSourceFingerprint() can clear its owned status.
+    fn clearSourceDisplayForReplacement(self: *App) void {
+        self.auto_reload.invalidateAcceptedSnapshot();
+        self.clearLoadedDiff();
     }
 
     fn selectFileDelta(self: *App, delta: i2) void {
@@ -5989,9 +6255,11 @@ pub const App = struct {
             .action_target = self.selectedSidebarActionTarget(),
             .status = .{
                 .repo_root = self.git_status.repo_root,
-                .loading = self.status_load_pending != null,
+                .loading = self.status_load.isPending(),
+                .fresh = self.status_load.isFresh(),
                 .entries = self.git_status.document.entries,
             },
+            .source_fresh = self.auto_reload.sourceIsActionable(),
         };
     }
 
@@ -6004,7 +6272,7 @@ pub const App = struct {
     }
 
     fn freshStatusEntryForPathKey(self: *const App, repo_root: []const u8, path_key: []const u8) ?git_status.StatusEntry {
-        if (self.status_load_pending != null) return null;
+        if (!self.status_load.isFresh()) return null;
         const snapshot_root = self.git_status.repo_root orelse return null;
         if (!std.mem.eql(u8, snapshot_root, repo_root)) return null;
         return self.statusEntryForPathKey(path_key);
@@ -6344,7 +6612,7 @@ pub const App = struct {
                     target.kind,
                     target.source_kind,
                     self.load.generation,
-                    self.status_load_generation,
+                    self.status_load.generation,
                 )) break :blk null;
                 break :blk switch (ready.value) {
                     .generated_added_file => |*bundle| bundle,
@@ -6367,7 +6635,7 @@ pub const App = struct {
                     target.kind,
                     target.source_kind,
                     self.load.generation,
-                    self.status_load_generation,
+                    self.status_load.generation,
                 )) break :blk null;
                 break :blk switch (ready.value) {
                     .cached_diff => |*bundle| bundle,
@@ -6392,7 +6660,7 @@ pub const App = struct {
                     target.kind,
                     target.source_kind,
                     self.load.generation,
-                    self.status_load_generation,
+                    self.status_load.generation,
                 )) break :blk null;
                 break :blk switch (ready.value) {
                     .combined_hunks => |*bundle| bundle,
@@ -8351,14 +8619,14 @@ test "pending selection restore waits for status projection after stage" {
     defer app.clearPendingSelectionRestore(std.testing.allocator);
 
     try app.setPendingSelectionRestore(std.testing.allocator, "b");
-    app.status_load_pending = 1;
+    app.status_load.pending = .{ .generation = 1 };
 
     // Diff reload can finish before the status reload. In that intermediate
     // tree the staged file is absent, so do not consume the pending restore yet.
     try app.applyStatusProjection(std.testing.allocator, false);
     try std.testing.expect(app.pending_selection_restore != null);
 
-    app.status_load_pending = null;
+    app.status_load.pending = null;
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
     try app.git_status.replace("/repo", &status_bundle);
     try app.applyStatusProjection(std.testing.allocator, false);
@@ -8376,13 +8644,14 @@ test "staged summary distinguishes pending missing and ready status snapshots" {
         } } },
     };
     defer app.git_status.deinit();
+    acceptTestSource(&app);
 
     try std.testing.expectEqual(app_commit_panel.StagedSummary.unavailable, app.stagedSummaryForActiveRepo());
 
-    app.status_load_pending = 1;
+    app.status_load.pending = .{ .generation = 1 };
     try std.testing.expectEqual(app_commit_panel.StagedSummary.loading_or_stale, app.stagedSummaryForActiveRepo());
 
-    app.status_load_pending = null;
+    app.status_load.pending = null;
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  staged.zig\x00 M unstaged.zig\x00?? new.zig\x00");
     try app.git_status.replace("/repo", &status_bundle);
 
@@ -8720,7 +8989,7 @@ test "pending selection restore clears when status finishes empty after reload" 
             .selected_file = 0,
             .selected_node = 0,
         },
-        .status_load_generation = 7,
+        .status_load = .{ .generation = 7 },
     };
     defer app.clearLoadedDiff();
     defer app.clearPendingSelectionRestore(std.testing.allocator);
@@ -8815,8 +9084,7 @@ fn appGitOutputAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir, 
 test "stale branch status result is ignored" {
     var app: App = .{
         .allocator = std.testing.allocator,
-        .branch_status_load_generation = 2,
-        .branch_status_load_pending = 2,
+        .branch_status_load = .{ .generation = 2, .pending = .{ .generation = 2 } },
     };
     defer app.branch_status.deinit();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -8836,7 +9104,89 @@ test "stale branch status result is ignored" {
 
     try std.testing.expect(app.branch_status.repo_root == null);
     try std.testing.expect(std.meta.eql(git_branch_status.Head.unknown, app.branch_status.status.head));
-    try std.testing.expectEqual(@as(?u64, 2), app.branch_status_load_pending);
+    try std.testing.expectEqual(@as(?u64, 2), if (app.branch_status_load.pending) |pending| pending.generation else null);
+}
+
+test "background branch failure retains display and identical recovery restores freshness" {
+    var app: App = .{ .allocator = std.testing.allocator };
+    defer app.branch_status.deinit();
+    var current = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc",
+        .branch = "main",
+        .upstream = "origin/main",
+        .ahead = 1,
+        .behind = 0,
+    });
+    try app.branch_status.replace("/repo", &current);
+    const root_ptr = app.branch_status.repo_root.?.ptr;
+
+    app.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.auto_reload.beginCycle().?;
+    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .branch));
+    const generation = app.branch_status_load.prepare(true);
+    app.branch_status_load.begin(cycle_id);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    app.finishBranchStatusLoad(&ctx, .{
+        .generation = generation,
+        .background_cycle_id = cycle_id,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .failed_static = "transient branch failure" },
+    });
+
+    try std.testing.expectEqualStrings("/repo", app.branch_status.repo_root.?);
+    try std.testing.expect(!app.branch_status_load.isFresh());
+    try std.testing.expect(app.auto_reload.background_cycle == null);
+
+    const recovery_generation = app.branch_status_load.prepare(true);
+    app.branch_status_load.begin(null);
+    const same = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "abc",
+        .branch = "main",
+        .upstream = "origin/main",
+        .ahead = 1,
+        .behind = 0,
+    });
+    app.finishBranchStatusLoad(&ctx, .{
+        .generation = recovery_generation,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = same },
+    });
+    try std.testing.expect(app.branch_status_load.isFresh());
+    try std.testing.expectEqual(root_ptr, app.branch_status.repo_root.?.ptr);
+}
+
+test "background branch completion during repository action is discarded and releases cycle" {
+    var app: App = .{ .allocator = std.testing.allocator };
+    defer app.branch_status.deinit();
+    var current = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "old-oid",
+        .branch = "old-branch",
+    });
+    try app.branch_status.replace("/repo", &current);
+
+    app.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.auto_reload.beginCycle().?;
+    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .branch));
+    const generation = app.branch_status_load.prepare(true);
+    app.branch_status_load.begin(cycle_id);
+    _ = app.actions.begin(.stage_file);
+    const changed = try branchStatusBundleForTest(std.testing.allocator, .{
+        .oid = "new-oid",
+        .branch = "new-branch",
+    });
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    app.finishBranchStatusLoad(&ctx, .{
+        .generation = generation,
+        .background_cycle_id = cycle_id,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = changed },
+    });
+
+    try std.testing.expectEqualStrings("old-branch", app.branch_status.status.branchName().?);
+    try std.testing.expect(!app.branch_status_load.isPending());
+    try std.testing.expectEqual(app_auto_reload.AuxiliaryFreshness.stale_refresh, app.branch_status_load.freshness);
+    try std.testing.expect(app.auto_reload.background_cycle == null);
 }
 
 test "requestPush snapshots the active branch target" {
@@ -10312,7 +10662,7 @@ test "selectionContext keeps status-only selection while status load is pending"
             .canonical_root = "/repo",
         } } },
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
-        .status_load_pending = 9,
+        .status_load = .{ .generation = 9, .pending = .{ .generation = 9 } },
     };
     defer app.git_status.deinit();
 
@@ -10398,6 +10748,7 @@ test "selectedEditorTarget accepts status-only file rows" {
         },
     };
     defer app.git_status.deinit();
+    acceptTestSource(&app);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/staged.zig\x00");
     try app.git_status.replace("/repo", &status_bundle);
@@ -10425,6 +10776,7 @@ test "selectedEditorTarget rejects deleted and historical sources" {
             .selected_target = .{ .diff_file = 1 },
         },
     };
+    acceptTestSource(&app);
 
     try std.testing.expectEqual(App.EditorTargetResult.deleted_file, app.selectedEditorTarget());
 
@@ -10465,6 +10817,7 @@ test "selectedEditorTarget rejects deleted status-only file rows from fresh stat
         },
     };
     defer app.git_status.deinit();
+    acceptTestSource(&app);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " D src/deleted.zig\x00");
     try app.git_status.replace("/repo", &status_bundle);
@@ -10473,10 +10826,11 @@ test "selectedEditorTarget rejects deleted status-only file rows from fresh stat
 }
 
 test "selectedEditorTarget rejects live sources without active repo" {
-    const app: App = .{
+    var app: App = .{
         .config = .{ .source = .unstaged },
         .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
     };
+    acceptTestSource(&app);
 
     try std.testing.expectEqual(App.EditorTargetResult.no_repo, app.selectedEditorTarget());
 }
@@ -10493,6 +10847,7 @@ test "selectedEditorTarget rejects directory rows" {
         .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
         .viewer = .{ .selected_node = 0 },
     };
+    acceptTestSource(&app);
 
     try std.testing.expectEqual(App.EditorTargetResult.directory_unsupported, app.selectedEditorTarget());
 }
@@ -10509,6 +10864,7 @@ test "selectedStageTarget skips only fresh staged-only files" {
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
     defer app.git_status.deinit();
+    acceptTestSource(&app);
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
     try app.git_status.replace("/repo", &staged_bundle);
@@ -10534,12 +10890,12 @@ test "selectedStageTarget skips only fresh staged-only files" {
         else => return error.ExpectedConflictStageTarget,
     }
 
-    app.status_load_pending = 1;
+    app.status_load.pending = .{ .generation = 1 };
     switch (app.selectedStageTarget()) {
         .ready => {},
         else => return error.ExpectedStaleStatusStageTarget,
     }
-    app.status_load_pending = null;
+    app.status_load.pending = null;
 
     var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
     try app.git_status.replace("/other", &other_repo_bundle);
@@ -10567,6 +10923,7 @@ test "selectedStageToggleOperation resolves file operation from fresh status" {
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
     defer app.git_status.deinit();
+    acceptTestSource(&app);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "AM src/added.zig\x00");
     try app.git_status.replace("/repo", &mixed_bundle);
@@ -10582,12 +10939,12 @@ test "selectedStageToggleOperation resolves file operation from fresh status" {
         else => return error.ExpectedToggleUnstageOperation,
     }
 
-    app.status_load_pending = 1;
+    app.status_load.pending = .{ .generation = 1 };
     switch (app.selectedStageToggleOperation()) {
         .stale_status => {},
         else => return error.ExpectedToggleStaleStatus,
     }
-    app.status_load_pending = null;
+    app.status_load.pending = null;
 
     var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "UU src/added.zig\x00");
     try app.git_status.replace("/repo", &conflict_bundle);
@@ -10626,6 +10983,7 @@ test "selectedStageToggleOperation resolves directory operation from descendants
         .viewer = .{ .selected_node = 0 },
     };
     defer app.git_status.deinit();
+    acceptTestSource(&app);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00A  src/b\x00");
     try app.git_status.replace("/repo", &mixed_bundle);
@@ -10664,6 +11022,7 @@ test "selectedUnstageTarget requires fresh staged status" {
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
     defer app.git_status.deinit();
+    acceptTestSource(&app);
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
     try app.git_status.replace("/repo", &staged_bundle);
@@ -10689,12 +11048,12 @@ test "selectedUnstageTarget requires fresh staged status" {
     }
     app.config.source = .unstaged;
 
-    app.status_load_pending = 1;
+    app.status_load.pending = .{ .generation = 1 };
     switch (app.selectedUnstageTarget()) {
         .stale_status => {},
         else => return error.ExpectedStaleUnstageStatus,
     }
-    app.status_load_pending = null;
+    app.status_load.pending = null;
 
     var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
     try app.git_status.replace("/other", &other_repo_bundle);
@@ -10735,6 +11094,7 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
         .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
     defer app.staged_hunks.deinit(std.testing.allocator);
+    acceptTestSource(&app);
 
     switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
         .not_staged_hunk => {},
@@ -10773,6 +11133,7 @@ test "selectedHunkUnstageTarget supports cached source without session mark" {
         .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
+    acceptTestSource(&app);
 
     switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
         .ready => |target| {
@@ -10800,6 +11161,7 @@ test "selectedHunkToggleOperation resolves source and session staged state" {
         .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
     defer app.staged_hunks.deinit(std.testing.allocator);
+    acceptTestSource(&app);
 
     switch (app.selectedHunkToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
@@ -10860,7 +11222,7 @@ test "active diff display uses ready combined projection by identity" {
             .canonical_root = "/repo",
         } } },
         .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
-        .status_load_generation = 3,
+        .status_load = .{ .generation = 3 },
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
     defer app.git_status.deinit();
@@ -10877,7 +11239,7 @@ test "active diff display uses ready combined projection by identity" {
         .combined_hunks,
         .unstaged,
         app.load.generation,
-        app.status_load_generation,
+        app.status_load.generation,
     );
     app.review_projection = .{ .ready = .{
         .request = request,
@@ -10904,7 +11266,7 @@ test "cached preview uses displayed diff for cursor movement" {
             .canonical_root = "/repo",
         } } },
         .load = .{ .generation = 7 },
-        .status_load_generation = 3,
+        .status_load = .{ .generation = 3 },
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
     defer app.git_status.deinit();
@@ -10921,7 +11283,7 @@ test "cached preview uses displayed diff for cursor movement" {
         .cached_diff,
         .unstaged,
         app.load.generation,
-        app.status_load_generation,
+        app.status_load.generation,
     );
     app.review_projection = .{ .ready = .{
         .request = request,
@@ -10945,7 +11307,7 @@ test "cached preview supports diff search" {
             .canonical_root = "/repo",
         } } },
         .load = .{ .generation = 7 },
-        .status_load_generation = 3,
+        .status_load = .{ .generation = 3 },
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
     defer app.git_status.deinit();
@@ -10962,7 +11324,7 @@ test "cached preview supports diff search" {
         .cached_diff,
         .unstaged,
         app.load.generation,
-        app.status_load_generation,
+        app.status_load.generation,
     );
     app.review_projection = .{ .ready = .{
         .request = request,
@@ -10990,7 +11352,7 @@ test "cached preview keeps search input while projection is pending" {
             .canonical_root = "/repo",
         } } },
         .load = .{ .generation = 7 },
-        .status_load_generation = 3,
+        .status_load = .{ .generation = 3 },
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
     defer app.git_status.deinit();
@@ -11007,7 +11369,7 @@ test "cached preview keeps search input while projection is pending" {
         .cached_diff,
         .unstaged,
         app.load.generation,
-        app.status_load_generation,
+        app.status_load.generation,
     );
     app.review_projection = .{ .pending = request };
 
@@ -11028,7 +11390,7 @@ test "cached preview keeps search input while projection is pending" {
         .cached_diff,
         .unstaged,
         app.load.generation,
-        app.status_load_generation,
+        app.status_load.generation,
     );
     try app.finishReviewProjectionLoad(&ctx, .{
         .request = ready_request,
@@ -11049,7 +11411,7 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
             .canonical_root = "/repo",
         } } },
         .load = .{ .generation = 7 },
-        .status_load_generation = 3,
+        .status_load = .{ .generation = 3 },
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
     };
     defer app.git_status.deinit();
@@ -11066,7 +11428,7 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
         .generated_added_file,
         .unstaged,
         app.load.generation,
-        app.status_load_generation,
+        app.status_load.generation,
     );
     app.review_projection = .{ .ready = .{
         .request = request,
@@ -11091,7 +11453,7 @@ test "generated preview blocks diff search" {
             .canonical_root = "/repo",
         } } },
         .load = .{ .generation = 7 },
-        .status_load_generation = 3,
+        .status_load = .{ .generation = 3 },
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
     };
     defer app.git_status.deinit();
@@ -11108,7 +11470,7 @@ test "generated preview blocks diff search" {
         .generated_added_file,
         .unstaged,
         app.load.generation,
-        app.status_load_generation,
+        app.status_load.generation,
     );
     app.review_projection = .{ .ready = .{
         .request = request,
@@ -11136,7 +11498,7 @@ test "staged new file preview blocks diff search" {
             .canonical_root = "/repo",
         } } },
         .load = .{ .generation = 7 },
-        .status_load_generation = 3,
+        .status_load = .{ .generation = 3 },
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
     defer app.git_status.deinit();
@@ -11153,7 +11515,7 @@ test "staged new file preview blocks diff search" {
         .cached_diff,
         .unstaged,
         app.load.generation,
-        app.status_load_generation,
+        app.status_load.generation,
     );
     app.review_projection = .{ .ready = .{
         .request = request,
@@ -11181,7 +11543,7 @@ test "staged new file preview does not refresh existing search query" {
             .canonical_root = "/repo",
         } } },
         .load = .{ .generation = 7 },
-        .status_load_generation = 3,
+        .status_load = .{ .generation = 3 },
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
     defer app.git_status.deinit();
@@ -11198,7 +11560,7 @@ test "staged new file preview does not refresh existing search query" {
         .cached_diff,
         .unstaged,
         app.load.generation,
-        app.status_load_generation,
+        app.status_load.generation,
     );
     app.review_projection = .{ .ready = .{
         .request = request,
@@ -11223,11 +11585,12 @@ test "projected hunk actions route through original cached and unstaged origins"
             .canonical_root = "/repo",
         } } },
         .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
-        .status_load_generation = 3,
+        .status_load = .{ .generation = 3 },
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
     defer app.git_status.deinit();
     defer app.review_projection.deinit(std.testing.allocator);
+    acceptTestSource(&app);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
     try app.git_status.replace("/repo", &mixed_bundle);
@@ -11240,7 +11603,7 @@ test "projected hunk actions route through original cached and unstaged origins"
         .combined_hunks,
         .unstaged,
         app.load.generation,
-        app.status_load_generation,
+        app.status_load.generation,
     );
     app.review_projection = .{ .ready = .{
         .request = request,
@@ -11339,13 +11702,13 @@ test "stagedHunkFlagsForFile normalizes all staged hunks only when status is sta
     try std.testing.expect(mixed_flags[0]);
     try std.testing.expect(mixed_flags[1]);
 
-    app.status_load_pending = 1;
+    app.status_load.pending = .{ .generation = 1 };
     const stale_flags = try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
     try std.testing.expectEqual(@as(usize, 2), stale_flags.len);
     try std.testing.expect(stale_flags[0]);
     try std.testing.expect(stale_flags[1]);
 
-    app.status_load_pending = null;
+    app.status_load.pending = null;
     var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.git_status.replace("/other", &other_repo_bundle);
     const missing_flags = try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
@@ -11372,6 +11735,7 @@ test "stagedHunkFlagsForFile display normalization does not clear hunk action ma
     };
     defer app.staged_hunks.deinit(std.testing.allocator);
     defer app.git_status.deinit();
+    acceptTestSource(&app);
 
     try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
     try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 1);
@@ -11460,7 +11824,7 @@ test "projection hunk action results reload status without mutating session mark
 
     try std.testing.expect(!app.staged_hunks.contains("/repo", "a", 1));
     try std.testing.expectEqual(@as(usize, 0), app.staged_hunks.items.items.len);
-    try std.testing.expect(app.status_load_pending != null);
+    try std.testing.expect(app.status_load.isPending());
     clearPendingStatusTasks(&ctx, allocator);
 
     try app.staged_hunks.add(allocator, "/repo", "a", 1);
@@ -11476,7 +11840,7 @@ test "projection hunk action results reload status without mutating session mark
 
     try std.testing.expect(app.staged_hunks.contains("/repo", "a", 1));
     try std.testing.expectEqual(@as(usize, 1), app.staged_hunks.items.items.len);
-    try std.testing.expect(app.status_load_pending != null);
+    try std.testing.expect(app.status_load.isPending());
 }
 
 test "cached source hunk unstage reload decision travels with task result" {
@@ -11553,6 +11917,7 @@ test "directory stage target uses sidebar cursor and status subtree" {
         },
     };
     defer app.git_status.deinit();
+    acceptTestSource(&app);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00?? src/b\x00M  other.zig\x00");
     try app.git_status.replace("/repo", &status_bundle);
@@ -11596,6 +11961,7 @@ test "directory unstage target scans staged subtree" {
         },
     };
     defer app.git_status.deinit();
+    acceptTestSource(&app);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/a\x00AM src/b\x00 M other.zig\x00");
     try app.git_status.replace("/repo", &status_bundle);
@@ -13072,8 +13438,7 @@ test "finishDiffLoad initially selects first visible file after status projectio
 test "finishDiffLoad keeps initial visible selection intent for later status projection" {
     var app: App = .{
         .load = .{ .generation = 1 },
-        .status_load_generation = 7,
-        .status_load_pending = 7,
+        .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
     };
     defer app.clearLoadedDiff();
     defer app.git_status.deinit();
@@ -13124,8 +13489,7 @@ test "status projection rebuild keeps selected node on same path key" {
             .selected_file = 1,
             .selected_node = 1,
         },
-        .status_load_generation = 1,
-        .status_load_pending = 1,
+        .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
     };
     defer app.clearLoadedDiff();
     defer app.git_status.deinit();
@@ -13151,8 +13515,7 @@ test "status load skips identical snapshot without rebuilding active tree" {
     var app: App = .{
         .allocator = std.testing.allocator,
         .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
-        .status_load_generation = 1,
-        .status_load_pending = 1,
+        .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
     };
     defer app.clearLoadedDiff();
     defer app.git_status.deinit();
@@ -13185,14 +13548,14 @@ test "status refresh path skips identical snapshot without rebuilding active tre
     try app.git_status.replace("/repo", &current);
     const tree_ptr = app.activeLoadedDiffConst().?.tree.nodes.ptr;
 
-    app.startStatusLoad(&ctx, "/repo");
+    app.startStatusLoad(&ctx, "/repo", .foreground, null);
     try std.testing.expect(app.git_status.repo_root != null);
     try std.testing.expectEqual(@as(usize, 1), ctx._pending_tasks_with[0..ctx._pending_tasks_with_len].len);
     clearPendingStatusTasks(&ctx, std.testing.allocator);
 
     const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
     try app.finishStatusLoad(&ctx, .{
-        .generation = app.status_load_generation,
+        .generation = app.status_load.generation,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = same },
     });
@@ -13208,7 +13571,7 @@ test "status refresh drops snapshot when repo root changes" {
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? old.zig\x00");
     try app.git_status.replace("/old", &current);
 
-    app.startStatusLoad(&ctx, "/new");
+    app.startStatusLoad(&ctx, "/new", .foreground, null);
     defer clearPendingStatusTasks(&ctx, std.testing.allocator);
 
     try std.testing.expect(app.git_status.repo_root == null);
@@ -13217,8 +13580,7 @@ test "status refresh drops snapshot when repo root changes" {
 
 test "finishStatusLoad keeps clean repository snapshot fresh" {
     var app: App = .{
-        .status_load_generation = 1,
-        .status_load_pending = 1,
+        .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
     };
     defer app.git_status.deinit();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -13230,9 +13592,73 @@ test "finishStatusLoad keeps clean repository snapshot fresh" {
         .result = .{ .loaded = clean },
     });
 
-    try std.testing.expect(app.status_load_pending == null);
+    try std.testing.expect(!app.status_load.isPending());
     try std.testing.expectEqualStrings("/repo", app.git_status.repo_root.?);
     try std.testing.expectEqual(@as(usize, 0), app.git_status.document.entries.len);
+}
+
+test "background status failure retains display snapshot and marks action freshness stale" {
+    var app: App = .{ .allocator = std.testing.allocator };
+    defer app.git_status.deinit();
+    var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a.zig\x00");
+    try app.git_status.replace("/repo", &current);
+
+    app.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.auto_reload.beginCycle().?;
+    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .status));
+    const generation = app.status_load.prepare(true);
+    app.status_load.begin(cycle_id);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishStatusLoad(&ctx, .{
+        .generation = generation,
+        .background_cycle_id = cycle_id,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .failed_static = "transient status failure" },
+    });
+
+    try std.testing.expectEqualStrings("/repo", app.git_status.repo_root.?);
+    try std.testing.expectEqual(@as(usize, 1), app.git_status.document.entries.len);
+    try std.testing.expect(!app.status_load.isFresh());
+    try std.testing.expect(app.auto_reload.background_cycle == null);
+
+    const recovery_generation = app.status_load.prepare(true);
+    app.status_load.begin(null);
+    const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a.zig\x00");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = recovery_generation,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = same },
+    });
+    try std.testing.expect(app.status_load.isFresh());
+}
+
+test "background status completion during repository action is discarded and releases cycle" {
+    var app: App = .{ .allocator = std.testing.allocator };
+    defer app.git_status.deinit();
+    var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M old.zig\x00");
+    try app.git_status.replace("/repo", &current);
+
+    app.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.auto_reload.beginCycle().?;
+    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .status));
+    const generation = app.status_load.prepare(true);
+    app.status_load.begin(cycle_id);
+    _ = app.actions.begin(.stage_file);
+    const changed = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M new.zig\x00");
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishStatusLoad(&ctx, .{
+        .generation = generation,
+        .background_cycle_id = cycle_id,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = changed },
+    });
+
+    try std.testing.expectEqualStrings("old.zig", app.git_status.document.entries[0].path);
+    try std.testing.expect(!app.status_load.isPending());
+    try std.testing.expectEqual(app_auto_reload.AuxiliaryFreshness.stale_refresh, app.status_load.freshness);
+    try std.testing.expect(app.auto_reload.background_cycle == null);
 }
 
 test "finishDiffLoad frees stale loaded bundle" {
@@ -13246,6 +13672,37 @@ test "finishDiffLoad frees stale loaded bundle" {
     });
 
     try std.testing.expect(app.load.state == .idle);
+}
+
+test "auto reload tick skips while auxiliary cycle members or mouse selection are pending" {
+    var app: App = .{};
+    app.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.status_load.pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 };
+    var status_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.autoReloadTick(&status_ctx);
+    try std.testing.expectEqual(@as(usize, 0), status_ctx._pending_tasks_with_len);
+    try std.testing.expect(status_ctx._redraw_suppressed);
+
+    app.status_load.pending = null;
+    app.branch_status_load.pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 };
+    var branch_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.autoReloadTick(&branch_ctx);
+    try std.testing.expectEqual(@as(usize, 0), branch_ctx._pending_tasks_with_len);
+    try std.testing.expect(branch_ctx._redraw_suppressed);
+
+    app.branch_status_load.pending = null;
+    app.selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } };
+    var selection_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.autoReloadTick(&selection_ctx);
+    try std.testing.expectEqual(@as(usize, 0), selection_ctx._pending_tasks_with_len);
+    try std.testing.expect(selection_ctx._redraw_suppressed);
+
+    app.selection_owner = .none;
+    _ = app.actions.begin(.stage_file);
+    var action_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.autoReloadTick(&action_ctx);
+    try std.testing.expectEqual(@as(usize, 0), action_ctx._pending_tasks_with_len);
+    try std.testing.expect(action_ctx._redraw_suppressed);
 }
 
 test "stale diff result does not clear newer pending reload metadata" {
@@ -13316,6 +13773,530 @@ test "watch no-op diff load preserves session view state and staged hunk marks" 
     try std.testing.expectEqual(@as(usize, 2), app.viewer.sidebar_horizontal_scroll);
     try std.testing.expect(app.staged_hunks.contains("/repo", "a", 0));
     try std.testing.expect(app.pending_reload == null);
+}
+
+test "unchanged recovery clears its source failure and redraws" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = app_test_support.diff_one;
+    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .pending_reload = .{
+            .generation = 2,
+            .kind = .watch,
+            .anchor = .{
+                .path_key = try std.testing.allocator.dupe(u8, "a"),
+                .selected_target_tag = .diff_file,
+                .visible_sidebar_row = 0,
+                .diff_cursor = .{ .hunk_header = 0 },
+                .diff_cursor_offset = 0,
+                .diff_scroll = 0,
+                .diff_horizontal_scroll = 0,
+                .sidebar_horizontal_scroll = 0,
+                .search_coordinate = null,
+            },
+        },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload.acceptSource(fingerprint);
+    _ = app.auto_reload.markSourceFailure("transient");
+    app.status.setSourceReloadFailure(app.auto_reload.last_failure.?.digest, "auto reload failed: transient", .{});
+    const before = app.activeLoadedDiffConst().?.text.ptr;
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .unchanged = fingerprint },
+    });
+
+    try std.testing.expect(app.pending_reload == null);
+    try std.testing.expect(app.auto_reload.sourceIsFresh());
+    try std.testing.expectEqual(before, app.activeLoadedDiffConst().?.text.ptr);
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expect(!ctx._redraw_suppressed);
+}
+
+test "unchanged source recovery preserves a newer auxiliary failure" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = app_test_support.diff_one;
+    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload.acceptSource(fingerprint);
+    _ = app.auto_reload.markSourceFailure("source transient");
+    app.status.setSourceReloadFailure(app.auto_reload.last_failure.?.digest, "source failed", .{});
+    app.setStatus("status load failed: auxiliary transient", .{});
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .unchanged = fingerprint },
+    });
+
+    try std.testing.expectEqualStrings("status load failed: auxiliary transient", app.status.text());
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "auxiliary failure followed by source failure clears only the recovered source message" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = app_test_support.diff_one;
+    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .failed_static = "auxiliary transient" },
+    });
+    try std.testing.expectEqualStrings("status load failed: auxiliary transient", app.status.text());
+
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload.acceptSource(fingerprint);
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .failed_static = "source transient" },
+    });
+    try std.testing.expectEqualStrings("auto reload failed: source transient", app.status.text());
+
+    app.load.generation = 3;
+    app.load.pending = .{ .diff_load = 3 };
+    app.pending_reload = .{ .generation = 3, .kind = .watch };
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 3,
+        .result = .{ .unchanged = fingerprint },
+    });
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expect(!ctx._redraw_suppressed);
+}
+
+test "ordinary unchanged source completion suppresses redraw" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = app_test_support.diff_one;
+    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload.acceptSource(fingerprint);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .unchanged = fingerprint },
+    });
+
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "changed loaded recovery clears its matching source failure and redraws" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = "old";
+    const old_fingerprint = app_auto_reload.SourceFingerprint.init("old");
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload.acceptSource(old_fingerprint);
+    _ = app.auto_reload.markSourceFailure("source transient");
+    app.status.setSourceReloadFailure(app.auto_reload.last_failure.?.digest, "auto reload failed: source transient", .{});
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .loaded = bundle },
+    });
+
+    try std.testing.expect(app.auto_reload.sourceIsFresh());
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expect(!ctx._redraw_suppressed);
+}
+
+test "empty recovery clears its matching source failure and redraws" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = "old";
+    const old_fingerprint = app_auto_reload.SourceFingerprint.init("old");
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload.acceptSource(old_fingerprint);
+    _ = app.auto_reload.markSourceFailure("source transient");
+    app.status.setSourceReloadFailure(app.auto_reload.last_failure.?.digest, "auto reload failed: source transient", .{});
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .empty,
+    });
+
+    try std.testing.expect(app.load.state == .empty);
+    try std.testing.expect(app.auto_reload.sourceIsFresh());
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expect(!ctx._redraw_suppressed);
+}
+
+test "destructive action-result failure invalidates accepted source before identical success" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = app_test_support.diff_one;
+    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .pending_reload = .{ .generation = 2, .kind = .action_result },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload.acceptSource(fingerprint);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .failed_static = "foreground failed" },
+    });
+    try std.testing.expect(app.auto_reload.accepted_source == null);
+    try std.testing.expect(app.activeLoadedDiffConst() == null);
+
+    app.load.generation = 3;
+    app.load.pending = .{ .diff_load = 3 };
+    app.pending_reload = .{ .generation = 3, .kind = .watch };
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 3,
+        .result = .{ .loaded = bundle },
+    });
+    try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
+    try std.testing.expect(app.auto_reload.accepted_source.?.fingerprint.eql(fingerprint));
+}
+
+test "destructive manual failure invalidates accepted source before identical success" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = app_test_support.diff_one;
+    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .pending_reload = .{ .generation = 2, .kind = .manual },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload.acceptSource(fingerprint);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .failed_static = "manual failed" },
+    });
+    try std.testing.expect(app.auto_reload.accepted_source == null);
+    try std.testing.expect(app.load.state == .failed);
+
+    app.load.generation = 3;
+    app.load.pending = .{ .diff_load = 3 };
+    app.pending_reload = .{ .generation = 3, .kind = .watch };
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 3,
+        .result = .{ .loaded = bundle },
+    });
+    try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
+    try std.testing.expect(app.auto_reload.accepted_source.?.fingerprint.eql(fingerprint));
+}
+
+test "diff task start failure invalidates accepted source and next watch cannot return unchanged" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = app_test_support.diff_one;
+    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .config = .{ .source = .stdin },
+        .load = app_test_support.loadState(current),
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.auto_reload.acceptSource(fingerprint);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    ctx._pending_tasks_with_len = 16;
+
+    try std.testing.expectError(error.TaskLimitExceeded, app.startDiffLoadWithRepoRoot(&ctx, null, .{
+        .clear_visible_state = true,
+        .kind = .manual,
+    }));
+    try std.testing.expect(app.auto_reload.accepted_source == null);
+    try std.testing.expect(app.load.state == .failed);
+
+    ctx._pending_tasks_with_len = 0;
+    try app.startDiffLoadWithRepoRoot(&ctx, null, .{
+        .clear_visible_state = false,
+        .kind = .watch,
+    });
+    const entries = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    const task: *DiffLoadTask = @ptrCast(@alignCast(entries[0].ctx));
+    try std.testing.expect(task.expected_fingerprint == null);
+    const generation = task.generation;
+    diff_source.freeLoadRequest(std.testing.allocator, task.request);
+    std.testing.allocator.destroy(task);
+
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    try app.finishDiffLoad(&ctx, .{
+        .generation = generation,
+        .result = .{ .loaded = bundle },
+    });
+    try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
+}
+
+test "watch failure retains display and blocks source-derived actions until success" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = app_test_support.diff_one;
+    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload.acceptSource(fingerprint);
+    const before = app.activeLoadedDiffConst().?.text.ptr;
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .failed_static = "transient failure" },
+    });
+    try std.testing.expectEqual(before, app.activeLoadedDiffConst().?.text.ptr);
+    try std.testing.expect(!app.auto_reload.sourceIsActionable());
+
+    app.load.generation = 3;
+    app.load.pending = .{ .diff_load = 3 };
+    app.pending_reload = .{ .generation = 3, .kind = .watch };
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 3,
+        .result = .{ .unchanged = fingerprint },
+    });
+    try std.testing.expect(app.auto_reload.sourceIsActionable());
+    try std.testing.expectEqual(before, app.activeLoadedDiffConst().?.text.ptr);
+}
+
+test "changed watch result arriving during mouse selection defers apply until release" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = "old";
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+        .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
+    };
+    defer app.clearDeferredSourceApply(std.testing.allocator);
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.auto_reload.beginCycle().?;
+    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .source));
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .background_cycle_id = cycle_id,
+        .result = .{ .loaded = bundle },
+    });
+    try std.testing.expect(app.deferred_source_apply != null);
+    try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
+    try std.testing.expect(app.auto_reload.background_cycle.?.pending.deferred_source_apply);
+
+    app.clearDiffSelection();
+    try app.applyDeferredSource(&ctx);
+    try std.testing.expect(app.deferred_source_apply == null);
+    try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
+    try std.testing.expect(app.auto_reload.background_cycle == null);
+}
+
+test "background source completion during repository action is discarded and releases cycle" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = "old";
+    const accepted = app_auto_reload.SourceFingerprint.init("old");
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.auto_reload.acceptSource(accepted);
+    const cycle_id = app.auto_reload.beginCycle().?;
+    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .source));
+    _ = app.actions.begin(.stage_file);
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .background_cycle_id = cycle_id,
+        .result = .{ .loaded = bundle },
+    });
+
+    try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
+    try std.testing.expect(app.auto_reload.accepted_source.?.fingerprint.eql(accepted));
+    try std.testing.expect(app.load.pending == null);
+    try std.testing.expect(app.pending_reload == null);
+    try std.testing.expect(app.auto_reload.background_cycle == null);
+
+    app.actions.clear();
+    app.load.generation = 3;
+    app.load.pending = .{ .diff_load = 3 };
+    app.pending_reload = .{ .generation = 3, .kind = .action_result };
+    const authoritative = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 3,
+        .result = .{ .loaded = authoritative },
+    });
+    try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
+}
+
+test "deferred background source is discarded when a repository action starts" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = "old";
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+        .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
+    };
+    defer app.clearDeferredSourceApply(std.testing.allocator);
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.auto_reload.beginCycle().?;
+    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .source));
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .background_cycle_id = cycle_id,
+        .result = .{ .loaded = bundle },
+    });
+    try std.testing.expect(app.deferred_source_apply != null);
+
+    _ = app.actions.begin(.stage_file);
+    app.clearDiffSelection();
+    try app.applyDeferredSource(&ctx);
+
+    try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
+    try std.testing.expect(app.deferred_source_apply == null);
+    try std.testing.expect(app.pending_reload == null);
+    try std.testing.expect(app.auto_reload.background_cycle == null);
+}
+
+test "empty watch result defers during selection and focus loss applies it" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = "old";
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .load = app_test_support.loadState(current),
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+        .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
+    };
+    defer app.clearDeferredSourceApply(std.testing.allocator);
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.auto_reload.beginCycle().?;
+    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .source));
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .background_cycle_id = cycle_id,
+        .result = .empty,
+    });
+    try std.testing.expect(app.deferred_source_apply != null);
+    try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
+
+    try app.update(.focus_lost, &ctx);
+    try std.testing.expect(!app.selection_owner.activeMouseSelection());
+    try std.testing.expect(app.deferred_source_apply == null);
+    try std.testing.expect(app.load.state == .empty);
+    try std.testing.expect(app.auto_reload.background_cycle == null);
+}
+
+test "focus loss terminates selection without a deferred result" {
+    var app: App = .{
+        .config = .{ .source = .{ .no_index = .{ .left = "left", .right = "right" } } },
+        .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
+    };
+    app.auto_reload = .init(.inherit, .{}, app.config.source);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try std.testing.expectEqual(App.Msg.focus_lost, app.handleEvent(.focus_out).?);
+    try app.update(.focus_lost, &ctx);
+    try std.testing.expect(!app.selection_owner.activeMouseSelection());
+    try std.testing.expect(app.deferred_source_apply == null);
+
+    try app.autoReloadTick(&ctx);
+    const entries = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    const task: *DiffLoadTask = @ptrCast(@alignCast(entries[0].ctx));
+    const cycle_id = task.background_cycle_id.?;
+    const generation = task.generation;
+    diff_source.freeLoadRequest(std.testing.allocator, task.request);
+    std.testing.allocator.destroy(task);
+    _ = app.load.clearPendingIfCurrent(.{ .diff_load = generation });
+    app.clearPendingReloadIfGeneration(std.testing.allocator, generation);
+    app.auto_reload.finishMember(cycle_id, .source);
+    try std.testing.expect(app.auto_reload.background_cycle == null);
 }
 
 test "anchored reload keeps cursor when search query is present" {
@@ -13410,8 +14391,7 @@ test "watch no-op preserves selected path when status finishes before diff" {
             .selected_file = 1,
             .selected_node = 1,
         },
-        .status_load_generation = 1,
-        .status_load_pending = 1,
+        .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
         .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearLoadedDiff();
@@ -13450,8 +14430,7 @@ test "watch no-op preserves selected path when status finishes after diff" {
             .selected_file = 1,
             .selected_node = 1,
         },
-        .status_load_generation = 1,
-        .status_load_pending = 1,
+        .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
         .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearLoadedDiff();
@@ -13547,8 +14526,7 @@ test "clean loaded status tears down status-only session after empty diff" {
     var app: App = .{
         .allocator = allocator,
         .load = .{ .generation = 2 },
-        .status_load_generation = 7,
-        .status_load_pending = 7,
+        .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
     };
     defer app.clearLoadedDiff();
     defer app.git_status.deinit();
@@ -13564,9 +14542,11 @@ test "clean loaded status tears down status-only session after empty diff" {
         .generation = 2,
         .result = .empty,
     });
+    const empty_fingerprint = app_auto_reload.SourceFingerprint.init("");
 
     try std.testing.expect(app.loadedDiff() != null);
     try std.testing.expectEqual(@as(usize, 0), app.loadedDiff().?.document.files.len);
+    try std.testing.expect(app.auto_reload.accepted_source.?.fingerprint.eql(empty_fingerprint));
 
     const clean = try git_status.StatusBundle.parseOwned(allocator, "");
     try app.finishStatusLoad(&ctx, .{
@@ -13579,6 +14559,131 @@ test "clean loaded status tears down status-only session after empty diff" {
     try std.testing.expect(app.loadedDiff() == null);
     try std.testing.expect(app.load.state == .empty);
     try std.testing.expectEqual(EmptyReason.no_changes, app.load.state.empty);
+    try std.testing.expect(app.auto_reload.accepted_source.?.fingerprint.eql(empty_fingerprint));
+    try std.testing.expect(app.auto_reload.sourceIsFresh());
+
+    try app.startDiffLoadWithRepoRoot(&ctx, null, .{
+        .clear_visible_state = false,
+        .kind = .watch,
+    });
+    const entries = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    const task: *DiffLoadTask = @ptrCast(@alignCast(entries[0].ctx));
+    try std.testing.expect(task.expected_fingerprint.?.eql(empty_fingerprint));
+    const generation = task.generation;
+    diff_source.freeLoadRequest(allocator, task.request);
+    allocator.destroy(task);
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = generation,
+        .result = .{ .unchanged = empty_fingerprint },
+    });
+    try std.testing.expect(app.load.state == .empty);
+    try std.testing.expect(app.auto_reload.sourceIsFresh());
+}
+
+test "source failure before clean status-only teardown remains stale" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .load = .{ .generation = 2 },
+        .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
+    };
+    defer app.clearLoadedDiff();
+    defer app.clearPendingReload(allocator);
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(allocator);
+    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
+    try app.git_status.replace("/repo", &current);
+    try app.finishDiffLoad(&ctx, .{ .generation = 2, .result = .empty });
+    try std.testing.expect(app.loadedDiff() != null);
+
+    app.load.generation = 3;
+    app.load.pending = .{ .diff_load = 3 };
+    app.pending_reload = .{ .generation = 3, .kind = .watch };
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 3,
+        .result = .{ .failed_static = "source transient" },
+    });
+    try std.testing.expect(!app.auto_reload.sourceIsActionable());
+
+    const clean = try git_status.StatusBundle.parseOwned(allocator, "");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 7,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = clean },
+    });
+
+    try std.testing.expect(app.loadedDiff() == null);
+    try std.testing.expect(!app.auto_reload.sourceIsActionable());
+    try std.testing.expect(app.auto_reload.last_failure != null);
+    try std.testing.expectEqualStrings("auto reload failed: source transient", app.status.text());
+}
+
+test "source failure after clean status-only teardown remains stale" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .load = .{ .generation = 2 },
+        .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
+    };
+    defer app.clearLoadedDiff();
+    defer app.clearPendingReload(allocator);
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(allocator);
+    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
+    try app.git_status.replace("/repo", &current);
+    try app.finishDiffLoad(&ctx, .{ .generation = 2, .result = .empty });
+    const clean = try git_status.StatusBundle.parseOwned(allocator, "");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 7,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = clean },
+    });
+    try std.testing.expect(app.auto_reload.sourceIsFresh());
+
+    app.load.generation = 3;
+    app.load.pending = .{ .diff_load = 3 };
+    app.pending_reload = .{ .generation = 3, .kind = .watch };
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 3,
+        .result = .{ .failed_static = "later source transient" },
+    });
+
+    try std.testing.expect(!app.auto_reload.sourceIsActionable());
+    try std.testing.expect(app.auto_reload.last_failure != null);
+}
+
+test "fresh status-only targets fail closed without accepted source" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(allocator);
+    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "AM src/main.zig\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+    try app.createStatusOnlyLoadedSession(allocator, app.git_status.document);
+    try std.testing.expect(app.auto_reload.accepted_source == null);
+
+    try std.testing.expectEqual(StageTargetResult.stale_source, app.selectedStageTarget());
+    try std.testing.expectEqual(UnstageTargetResult.stale_source, app.selectedUnstageTarget());
+    try std.testing.expectEqual(DiscardTargetResult.stale_source, app.selectedDiscardTarget());
 }
 
 test "empty status result tears down status-only session after empty diff" {
@@ -13586,8 +14691,7 @@ test "empty status result tears down status-only session after empty diff" {
     var app: App = .{
         .allocator = allocator,
         .load = .{ .generation = 2 },
-        .status_load_generation = 7,
-        .status_load_pending = 7,
+        .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
     };
     defer app.clearLoadedDiff();
     defer app.git_status.deinit();
@@ -13623,8 +14727,7 @@ test "identical staged-only status keeps status-only session after empty diff" {
     var app: App = .{
         .allocator = allocator,
         .load = .{ .generation = 2 },
-        .status_load_generation = 7,
-        .status_load_pending = 7,
+        .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
     };
     defer app.clearLoadedDiff();
     defer app.git_status.deinit();
@@ -13754,6 +14857,10 @@ fn setFileSearchInput(app: *App, query: []const u8) void {
     @memcpy(app.file_search.input.buffer[0..query.len], query);
     app.file_search.input.len = query.len;
     app.file_search.input.cursor = query.len;
+}
+
+fn acceptTestSource(app: *App) void {
+    app.auto_reload.acceptSource(app_auto_reload.SourceFingerprint.init("test source"));
 }
 
 fn clearPendingStatusTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
