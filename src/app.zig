@@ -2413,7 +2413,6 @@ pub const App = struct {
         return .{
             .subject = parts.subject,
             .body = body,
-            .revision = self.commit_panel.draft_revision,
         };
     }
 
@@ -3516,21 +3515,6 @@ pub const App = struct {
                         .improve => self.setStatus("improved commit message ignored; draft changed", .{}),
                     }
                     return;
-                }
-                switch (result.mode) {
-                    .generate => {
-                        if (!self.commit_panel.draftIsEmpty()) {
-                            self.commit_panel.commit_error = .draft_not_empty;
-                            self.setStatus("generated commit message ignored; draft is no longer empty", .{});
-                            return;
-                        }
-                    },
-                    .improve => |snapshot| {
-                        if (self.commit_panel.draft_revision != snapshot.revision) {
-                            self.setStatus("improved commit message ignored; draft changed", .{});
-                            return;
-                        }
-                    },
                 }
                 self.commit_panel.replaceDraft(message.subject, message.body);
                 if (self.commit_panel.commit_error) |_| {
@@ -8480,15 +8464,15 @@ test "finishCommitMessageAssist ignores stale result after popup close" {
     try std.testing.expectEqualStrings("", app.commit_panel.subject.slice());
 }
 
-test "finishCommitMessageAssist does not overwrite non-empty generated draft" {
+test "finishCommitMessageAssist ignores generated draft after user edit" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     var app = testAppWithCommitPanel();
     defer app.commit_panel.deinit();
 
     app.commit_panel.open(.commit);
-    app.commit_panel.insert('x');
-    const pending = app.actions.begin(.assist_commit_message);
     const launch_revision = app.commit_panel.draft_revision;
+    const pending = app.actions.begin(.assist_commit_message);
+    app.commit_panel.insert('x');
     const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{ .ok = .{
         .subject = try std.testing.allocator.dupe(u8, "Generated subject"),
         .body = null,
@@ -8498,8 +8482,8 @@ test "finishCommitMessageAssist does not overwrite non-empty generated draft" {
     app.finishCommitMessageAssist(&ctx, finished);
 
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expectEqual(app_commit_panel.CommitError.draft_not_empty, app.commit_panel.commit_error.?);
     try std.testing.expectEqualStrings("x", app.commit_panel.subject.slice());
+    try std.testing.expectEqualStrings("generated commit message ignored; draft changed", app.status.text());
 }
 
 test "finishCommitMessageAssist failure keeps draft unchanged" {
@@ -8554,7 +8538,7 @@ test "finishCommitMessageAssist replaces unchanged improved draft" {
     app.commit_panel.paste("Draft subject");
     const snapshot = try app.buildDraftSnapshot(std.testing.allocator);
     const pending = app.actions.begin(.assist_commit_message);
-    const launch_revision = snapshot.revision;
+    const launch_revision = app.commit_panel.draft_revision;
     const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .{ .improve = snapshot }, .{ .ok = .{
         .subject = try std.testing.allocator.dupe(u8, "Improved subject"),
         .body = try std.testing.allocator.dupe(u8, "Improved body"),
@@ -8577,9 +8561,9 @@ test "finishCommitMessageAssist ignores improved draft after user edit" {
     app.commit_panel.open(.commit);
     app.commit_panel.paste("Draft subject");
     const snapshot = try app.buildDraftSnapshot(std.testing.allocator);
+    const launch_revision = app.commit_panel.draft_revision;
     app.commit_panel.paste(" edited");
     const pending = app.actions.begin(.assist_commit_message);
-    const launch_revision = snapshot.revision;
     const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .{ .improve = snapshot }, .{ .ok = .{
         .subject = try std.testing.allocator.dupe(u8, "Improved subject"),
         .body = null,
@@ -8625,7 +8609,7 @@ test "finishCommitMessageAssist ignores improved draft after edit then restore" 
     app.commit_panel.open(.commit);
     app.commit_panel.paste("Draft subject");
     const snapshot = try app.buildDraftSnapshot(std.testing.allocator);
-    const launch_revision = snapshot.revision;
+    const launch_revision = app.commit_panel.draft_revision;
     app.commit_panel.insert('x');
     app.commit_panel.backspace();
     try std.testing.expectEqualStrings("Draft subject", app.commit_panel.subject.slice());
@@ -8651,7 +8635,7 @@ test "finishCommitMessageAssist ignores improved draft after close and reopen" {
     app.commit_panel.open(.commit);
     app.commit_panel.paste("Draft subject");
     const snapshot = try app.buildDraftSnapshot(std.testing.allocator);
-    const launch_revision = snapshot.revision;
+    const launch_revision = app.commit_panel.draft_revision;
     const pending = app.actions.begin(.assist_commit_message);
     app.commit_panel.close();
     app.commit_panel.open(.commit);

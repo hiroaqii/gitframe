@@ -12,7 +12,6 @@ pub const CommitError = enum {
     status_loading,
     status_unavailable,
     action_pending,
-    draft_not_empty,
     assist_failed,
     commit_failed,
     amend_failed,
@@ -27,7 +26,6 @@ pub const CommitError = enum {
             .status_loading => "Status is still loading",
             .status_unavailable => "Status is unavailable",
             .action_pending => "Another git action is running",
-            .draft_not_empty => "Clear the draft before generating a commit message",
             .assist_failed => "Could not assist commit message",
             .commit_failed => "Commit failed",
             .amend_failed => "Amend failed",
@@ -555,7 +553,7 @@ pub const State = struct {
         }
         if (self.commit_error) |err| {
             switch (err) {
-                .subject_too_long, .message_too_large, .input_allocation_failed, .draft_not_empty, .assist_failed, .commit_failed, .amend_failed => self.commit_error = null,
+                .subject_too_long, .message_too_large, .input_allocation_failed, .assist_failed, .commit_failed, .amend_failed => self.commit_error = null,
                 else => {},
             }
         }

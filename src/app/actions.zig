@@ -184,12 +184,11 @@ pub const CommitFinished = struct {
 pub const DraftSnapshot = struct {
     subject: []u8,
     body: []u8,
-    revision: u64,
 
     pub fn deinit(self: *DraftSnapshot, allocator: std.mem.Allocator) void {
         if (self.subject.len > 0) allocator.free(self.subject);
         if (self.body.len > 0) allocator.free(self.body);
-        self.* = .{ .subject = &.{}, .body = &.{}, .revision = 0 };
+        self.* = .{ .subject = &.{}, .body = &.{} };
     }
 };
 
