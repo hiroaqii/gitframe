@@ -13,7 +13,7 @@ pub const CommitError = enum {
     status_unavailable,
     action_pending,
     draft_not_empty,
-    generate_failed,
+    assist_failed,
     commit_failed,
     amend_failed,
 
@@ -28,7 +28,7 @@ pub const CommitError = enum {
             .status_unavailable => "Status is unavailable",
             .action_pending => "Another git action is running",
             .draft_not_empty => "Clear the draft before generating a commit message",
-            .generate_failed => "Could not generate commit message",
+            .assist_failed => "Could not assist commit message",
             .commit_failed => "Commit failed",
             .amend_failed => "Amend failed",
         };
@@ -214,6 +214,7 @@ pub const State = struct {
     subject: text_buffer.TextBuffer = .{},
     body: BodyText = .{},
     commit_error: ?CommitError = null,
+    draft_revision: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) State {
         return .{ .allocator = allocator };
@@ -242,6 +243,7 @@ pub const State = struct {
         self.subject.clearRetainingCapacity();
         self.body.clearRetainingCapacity();
         self.commit_error = null;
+        self.bumpDraftRevision();
     }
 
     pub fn title(self: *const State) []const u8 {
@@ -292,6 +294,7 @@ pub const State = struct {
                 return;
             },
         }
+        self.bumpDraftRevision();
         self.refreshInputError();
     }
 
@@ -323,6 +326,7 @@ pub const State = struct {
                     self.commit_error = .input_allocation_failed;
                     return;
                 };
+                self.bumpDraftRevision();
                 self.refreshInputError();
             },
         }
@@ -337,10 +341,12 @@ pub const State = struct {
     }
 
     pub fn backspace(self: *State) void {
+        const before_len = self.totalRawBytes();
         switch (self.active_field) {
             .subject => self.subject.backspace(),
             .body => self.body.backspace(),
         }
+        if (self.totalRawBytes() != before_len) self.bumpDraftRevision();
         self.refreshInputError();
     }
 
@@ -418,7 +424,7 @@ pub const State = struct {
             return;
         };
         if (!std.unicode.utf8ValidateSlice(subject) or (body != null and !std.unicode.utf8ValidateSlice(body.?))) {
-            self.commit_error = .generate_failed;
+            self.commit_error = .assist_failed;
             return;
         }
         const body_len = if (body) |text| text.len else 0;
@@ -431,19 +437,32 @@ pub const State = struct {
             return;
         }
 
-        self.subject.clearRetainingCapacity();
-        self.body.clearRetainingCapacity();
-        self.active_field = .subject;
-        self.subject.insertSlice(allocator, subject) catch {
+        var new_subject: text_buffer.TextBuffer = .{};
+        defer new_subject.deinit(allocator);
+        var new_body: BodyText = .{};
+        defer new_body.deinit(allocator);
+
+        new_subject.insertSlice(allocator, subject) catch {
             self.commit_error = .input_allocation_failed;
             return;
         };
         if (body) |text| {
-            self.body.insertSlice(allocator, text) catch {
+            new_body.insertSlice(allocator, text) catch {
                 self.commit_error = .input_allocation_failed;
                 return;
             };
         }
+
+        var old_subject = self.subject;
+        var old_body = self.body;
+        self.subject = new_subject;
+        self.body = new_body;
+        new_subject = .{};
+        new_body = .{};
+        old_subject.deinit(allocator);
+        old_body.deinit(allocator);
+        self.active_field = .subject;
+        self.bumpDraftRevision();
         self.refreshInputError();
     }
 
@@ -517,7 +536,12 @@ pub const State = struct {
                 return;
             },
         }
+        if (text.len > 0) self.bumpDraftRevision();
         self.refreshInputError();
+    }
+
+    fn bumpDraftRevision(self: *State) void {
+        self.draft_revision +%= 1;
     }
 
     fn refreshInputError(self: *State) void {
@@ -531,7 +555,7 @@ pub const State = struct {
         }
         if (self.commit_error) |err| {
             switch (err) {
-                .subject_too_long, .message_too_large, .input_allocation_failed, .draft_not_empty, .generate_failed, .commit_failed, .amend_failed => self.commit_error = null,
+                .subject_too_long, .message_too_large, .input_allocation_failed, .draft_not_empty, .assist_failed, .commit_failed, .amend_failed => self.commit_error = null,
                 else => {},
             }
         }
@@ -771,6 +795,75 @@ test "State clears transient allocation error after valid edit" {
 
     try std.testing.expect(state.commit_error == null);
     try std.testing.expect(state.validateSubmit(.{ .ready = .{ .count = 1 } }) == null);
+}
+
+test "State replaceDraft increments revision once on success" {
+    var state: State = .init(std.testing.allocator);
+    defer state.deinit();
+
+    state.insert('x');
+    const before = state.draft_revision;
+
+    state.replaceDraft("Generated subject", "Generated body");
+
+    try std.testing.expectEqual(before +% 1, state.draft_revision);
+    try std.testing.expectEqualStrings("Generated subject", state.subject.slice());
+    try std.testing.expectEqualStrings("Generated body", state.body.slice());
+    try std.testing.expectEqual(Field.subject, state.active_field);
+}
+
+test "State replaceDraft preserves draft when subject construction allocation fails" {
+    var state: State = .init(std.testing.allocator);
+    defer state.deinit();
+
+    state.paste("Original subject");
+    state.enter();
+    state.paste("Original body");
+    state.body.moveLeft();
+    const revision = state.draft_revision;
+    const subject_cursor = state.subject.cursor;
+    const body_cursor = state.body.cursor();
+    const active_field = state.active_field;
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    state.allocator = failing_allocator.allocator();
+    state.replaceDraft("New subject", "New body");
+    state.allocator = std.testing.allocator;
+
+    try std.testing.expectEqual(CommitError.input_allocation_failed, state.commit_error.?);
+    try std.testing.expectEqualStrings("Original subject", state.subject.slice());
+    try std.testing.expectEqualStrings("Original body", state.body.slice());
+    try std.testing.expectEqual(subject_cursor, state.subject.cursor);
+    try std.testing.expectEqual(body_cursor, state.body.cursor());
+    try std.testing.expectEqual(active_field, state.active_field);
+    try std.testing.expectEqual(revision, state.draft_revision);
+}
+
+test "State replaceDraft preserves draft when body construction allocation fails" {
+    var state: State = .init(std.testing.allocator);
+    defer state.deinit();
+
+    state.paste("Original subject");
+    state.enter();
+    state.paste("Original body");
+    state.body.moveLeft();
+    const revision = state.draft_revision;
+    const subject_cursor = state.subject.cursor;
+    const body_cursor = state.body.cursor();
+    const active_field = state.active_field;
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    state.allocator = failing_allocator.allocator();
+    state.replaceDraft("New subject", "New body");
+    state.allocator = std.testing.allocator;
+
+    try std.testing.expectEqual(CommitError.input_allocation_failed, state.commit_error.?);
+    try std.testing.expectEqualStrings("Original subject", state.subject.slice());
+    try std.testing.expectEqualStrings("Original body", state.body.slice());
+    try std.testing.expectEqual(subject_cursor, state.subject.cursor);
+    try std.testing.expectEqual(body_cursor, state.body.cursor());
+    try std.testing.expectEqual(active_field, state.active_field);
+    try std.testing.expectEqual(revision, state.draft_revision);
 }
 
 test "BodyText edits at the cursor" {

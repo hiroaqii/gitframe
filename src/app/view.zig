@@ -997,7 +997,7 @@ fn pendingActionFallbackLabel(kind: anytype) []const u8 {
         .unstage_hunk => "hunk unstage",
         .discard_file => "discard",
         .commit => "commit",
-        .generate_commit_message => "generate",
+        .assist_commit_message => "assist",
         .amend => "amend",
         .push => "push",
         .pull => "pull",

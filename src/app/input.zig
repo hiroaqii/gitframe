@@ -51,7 +51,7 @@ const Action = enum {
     file_search_backspace,
     cancel_commit_panel,
     submit_commit_panel,
-    generate_commit_message,
+    assist_commit_message,
     copy_commit_message,
     commit_panel_tab,
     commit_panel_enter,
@@ -318,7 +318,7 @@ fn pushCredentialKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
 
 fn commitPanelKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .cancel_commit_panel);
-    if (key.matches('g', .{ .ctrl = true })) return actionToMsg(Msg, .generate_commit_message);
+    if (key.matches('g', .{ .ctrl = true })) return actionToMsg(Msg, .assist_commit_message);
     if (key.matches('y', .{ .ctrl = true })) return actionToMsg(Msg, .copy_commit_message);
     if (key.matches(chasen.Key.enter, .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return actionToMsg(Msg, .submit_commit_panel);
     if (key.matches(chasen.Key.tab, .{})) return actionToMsg(Msg, .commit_panel_tab);
@@ -517,7 +517,7 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .file_search_backspace => voidMsg(Msg, "file_search_backspace"),
         .cancel_commit_panel => voidMsg(Msg, "cancel_commit_panel"),
         .submit_commit_panel => voidMsg(Msg, "submit_commit_panel"),
-        .generate_commit_message => voidMsg(Msg, "generate_commit_message"),
+        .assist_commit_message => voidMsg(Msg, "assist_commit_message"),
         .copy_commit_message => voidMsg(Msg, "copy_commit_message"),
         .commit_panel_tab => voidMsg(Msg, "commit_panel_tab"),
         .commit_panel_enter => voidMsg(Msg, "commit_panel_enter"),
@@ -651,7 +651,7 @@ const TestMsg = union(enum) {
     file_search_paste: []const u8,
     cancel_commit_panel,
     submit_commit_panel,
-    generate_commit_message,
+    assist_commit_message,
     copy_commit_message,
     commit_panel_tab,
     commit_panel_enter,
@@ -888,7 +888,7 @@ test "keyToMsg maps commit panel command and routes panel input" {
     try std.testing.expectEqual(TestMsg.cancel_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(TestMsg.submit_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter, .mods = .{ .ctrl = true } }).?);
     try std.testing.expectEqual(TestMsg.submit_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 's', .mods = .{ .ctrl = true } }).?);
-    try std.testing.expectEqual(TestMsg.generate_commit_message, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'g', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(TestMsg.assist_commit_message, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'g', .mods = .{ .ctrl = true } }).?);
     try std.testing.expectEqual(TestMsg.copy_commit_message, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'y', .mods = .{ .ctrl = true } }).?);
     try std.testing.expectEqual(TestMsg.commit_panel_tab, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.tab }).?);
     try std.testing.expectEqual(TestMsg.commit_panel_enter, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter }).?);

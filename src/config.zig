@@ -56,6 +56,7 @@ pub const ExternalActionInput = enum {
     selection_context,
     review_context,
     staged_diff,
+    commit_message_context,
 };
 
 pub const ExternalActionScope = enum {
@@ -472,6 +473,7 @@ fn parseExternalActionInput(value: []const u8) TomlParseError!ExternalActionInpu
     if (std.mem.eql(u8, text, "selection_context")) return .selection_context;
     if (std.mem.eql(u8, text, "review_context")) return .review_context;
     if (std.mem.eql(u8, text, "staged_diff")) return .staged_diff;
+    if (std.mem.eql(u8, text, "commit_message_context")) return .commit_message_context;
     return error.InvalidActionInput;
 }
 
@@ -562,9 +564,20 @@ fn validateExternalActionConfig(action: ExternalActionConfig, seen_id: bool, see
         try validateExternalActionPlaceholders(action.scope, arg);
     }
 
-    if (action.scope == .commit and (action.stdin != .staged_diff or action.output != .commit_message)) return error.InvalidActionContract;
-    if (action.stdin == .staged_diff and action.scope != .commit) return error.InvalidActionContract;
-    if (action.output == .commit_message and action.scope != .commit) return error.InvalidActionContract;
+    if (!isValidExternalActionContract(action.scope, action.stdin, action.output)) return error.InvalidActionContract;
+}
+
+fn isValidExternalActionContract(scope: ExternalActionScope, stdin: ExternalActionInput, output: ExternalActionOutput) bool {
+    return switch (scope) {
+        .generic => switch (stdin) {
+            .selection_context, .review_context => output == .display,
+            .staged_diff, .commit_message_context => false,
+        },
+        .commit => switch (stdin) {
+            .staged_diff, .commit_message_context => output == .commit_message,
+            .selection_context, .review_context => false,
+        },
+    };
 }
 
 fn validateExternalActionsConfig(actions: ExternalActionsConfig) TomlParseError!void {
@@ -900,6 +913,13 @@ test "loadConfig accepts external action definitions" {
         \\scope = "commit"
         \\output = "commit_message"
         \\
+        \\[[actions]]
+        \\id = "commit-message-improve"
+        \\argv = ["helper", "--improve", "{repo_root}"]
+        \\stdin = "commit_message_context"
+        \\scope = "commit"
+        \\output = "commit_message"
+        \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
@@ -908,7 +928,7 @@ test "loadConfig accepts external action definitions" {
     try std.testing.expect(result.warning == null);
 
     const actions = result.config.value.actions.slice();
-    try std.testing.expectEqual(@as(usize, 3), actions.len);
+    try std.testing.expectEqual(@as(usize, 4), actions.len);
     try std.testing.expectEqualStrings("ai-review-selection", actions[0].id);
     try std.testing.expectEqualStrings("AI review selection", actions[0].label.?);
     try std.testing.expectEqual(@as(u8, 3), actions[0].argv_len);
@@ -922,6 +942,10 @@ test "loadConfig accepts external action definitions" {
     try std.testing.expectEqual(ExternalActionInput.staged_diff, actions[2].stdin);
     try std.testing.expectEqual(ExternalActionScope.commit, actions[2].scope);
     try std.testing.expectEqual(ExternalActionOutput.commit_message, actions[2].output);
+    try std.testing.expectEqualStrings("commit-message-improve", actions[3].id);
+    try std.testing.expectEqual(ExternalActionInput.commit_message_context, actions[3].stdin);
+    try std.testing.expectEqual(ExternalActionScope.commit, actions[3].scope);
+    try std.testing.expectEqual(ExternalActionOutput.commit_message, actions[3].output);
 }
 
 test "loadConfig accepts empty actions section" {
@@ -1188,6 +1212,26 @@ test "loadConfig rejects commit action target placeholders" {
         \\stdin = "staged_diff"
         \\scope = "commit"
         \\output = "commit_message"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+}
+
+test "loadConfig rejects commit message context outside commit scope" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-commit-context-generic-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\id = "commit-message-improve"
+        \\argv = ["helper"]
+        \\stdin = "commit_message_context"
+        \\output = "display"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};

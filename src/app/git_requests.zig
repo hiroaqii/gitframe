@@ -164,36 +164,41 @@ pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *act
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
-pub const GenerateCommitMessageRequest = struct {
+pub const CommitMessageAssistRequest = struct {
     repo_root: []u8,
     action_id: []u8,
     argv: [][]u8,
+    launch_revision: u64,
+    mode: actions.CommitMessageAssistMode,
 
-    pub fn deinit(self: *GenerateCommitMessageRequest, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *CommitMessageAssistRequest, allocator: std.mem.Allocator) void {
         if (self.repo_root.len > 0) allocator.free(self.repo_root);
         if (self.action_id.len > 0) allocator.free(self.action_id);
         for (self.argv) |arg| allocator.free(arg);
         if (self.argv.len > 0) allocator.free(self.argv);
-        self.* = .{ .repo_root = &.{}, .action_id = &.{}, .argv = &.{} };
+        self.mode.deinit(allocator);
+        self.* = .{ .repo_root = &.{}, .action_id = &.{}, .argv = &.{}, .launch_revision = 0, .mode = .generate };
     }
 };
 
-pub fn startGenerateCommitMessage(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, request: *GenerateCommitMessageRequest) !void {
+pub fn startCommitMessageAssist(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, request: *CommitMessageAssistRequest) !void {
     defer request.deinit(ctx.allocator());
 
-    const pending = action_state.begin(.generate_commit_message);
+    const pending = action_state.begin(.assist_commit_message);
     errdefer _ = action_state.finish(pending);
 
-    const Task = actions.GenerateCommitMessageTask(Msg);
+    const Task = actions.CommitMessageAssistTask(Msg);
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
         .repo_root = request.repo_root,
         .action_id = request.action_id,
         .argv = request.argv,
+        .launch_revision = request.launch_revision,
+        .mode = request.mode,
     };
-    request.* = .{ .repo_root = &.{}, .action_id = &.{}, .argv = &.{} };
-    errdefer destroyGenerateCommitMessageTask(Task, ctx.allocator(), task);
+    request.* = .{ .repo_root = &.{}, .action_id = &.{}, .argv = &.{}, .launch_revision = 0, .mode = .generate };
+    errdefer destroyCommitMessageAssistTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
@@ -538,11 +543,12 @@ fn destroyCommitTask(comptime Task: type, allocator: std.mem.Allocator, task: *T
     allocator.destroy(task);
 }
 
-fn destroyGenerateCommitMessageTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
+fn destroyCommitMessageAssistTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
     if (task.repo_root.len > 0) allocator.free(task.repo_root);
     if (task.action_id.len > 0) allocator.free(task.action_id);
     for (task.argv) |arg| allocator.free(arg);
     if (task.argv.len > 0) allocator.free(task.argv);
+    task.mode.deinit(allocator);
     allocator.destroy(task);
 }
 

@@ -87,7 +87,7 @@ const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
 const AmendFinished = app_actions.AmendFinished;
 const CommitFinished = app_actions.CommitFinished;
-const GenerateCommitMessageFinished = app_actions.GenerateCommitMessageFinished;
+const CommitMessageAssistFinished = app_actions.CommitMessageAssistFinished;
 const DiscardFileFinished = app_actions.DiscardFileFinished;
 const FetchFinished = app_actions.FetchFinished;
 const FetchTargetResult = git_ops.FetchTargetResult;
@@ -205,7 +205,7 @@ const ActionFinishedMsg = union(enum) {
     unstage_hunk: UnstageHunkFinished,
     discard_file: DiscardFileFinished,
     commit: CommitFinished,
-    generate_commit_message: GenerateCommitMessageFinished,
+    assist_commit_message: CommitMessageAssistFinished,
     amend: AmendFinished,
     push: PushFinished,
     pull: PullFinished,
@@ -470,7 +470,7 @@ pub const App = struct {
         enter_amend_panel,
         cancel_commit_panel,
         submit_commit_panel,
-        generate_commit_message,
+        assist_commit_message,
         copy_commit_message,
         commit_panel_tab,
         commit_panel_enter,
@@ -740,7 +740,7 @@ pub const App = struct {
             .enter_amend_panel => self.enterCommitPanelMode(.amend),
             .cancel_commit_panel => self.closeCommitPanel(),
             .submit_commit_panel => try self.submitCommitPanel(ctx),
-            .generate_commit_message => try self.generateCommitMessage(ctx),
+            .assist_commit_message => try self.assistCommitMessage(ctx),
             .copy_commit_message => self.copyCommitMessage(ctx),
             .commit_panel_tab => self.commit_panel.toggleField(),
             .commit_panel_enter => self.commit_panel.enter(),
@@ -876,7 +876,7 @@ pub const App = struct {
             .unstage_hunk => |result| try self.finishUnstageHunk(ctx, result),
             .discard_file => |result| try self.finishDiscardFile(ctx, result),
             .commit => |result| try self.finishCommit(ctx, result),
-            .generate_commit_message => |result| self.finishGenerateCommitMessage(ctx, result),
+            .assist_commit_message => |result| self.finishCommitMessageAssist(ctx, result),
             .amend => |result| try self.finishAmend(ctx, result),
             .push => |result| try self.finishPush(ctx, result),
             .pull => |result| try self.finishPull(ctx, result),
@@ -2262,7 +2262,7 @@ pub const App = struct {
 
     fn closeCommitPanel(self: *App) void {
         if (self.actions.pending) |pending| {
-            if (pending.kind == .generate_commit_message) self.actions.clear();
+            if (pending.kind == .assist_commit_message) self.actions.clear();
         }
         self.commit_panel.close();
     }
@@ -2293,18 +2293,14 @@ pub const App = struct {
         try self.startCommitTask(ctx, repo_root);
     }
 
-    fn generateCommitMessage(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+    fn assistCommitMessage(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
             self.commit_panel.commit_error = .action_pending;
-            self.setStatus("finish current git action before generating commit message", .{});
+            self.setStatus("finish current git action before assisting commit message", .{});
             return;
         }
         if (!self.commit_panel.is_open or self.commit_panel.mode != .commit) {
-            self.setStatus("commit message generation is only available in commit mode", .{});
-            return;
-        }
-        if (!self.commit_panel.draftIsEmpty()) {
-            self.commit_panel.commit_error = .draft_not_empty;
+            self.setStatus("commit message assist is only available in commit mode", .{});
             return;
         }
         switch (self.stagedSummaryForActiveRepo()) {
@@ -2327,24 +2323,44 @@ pub const App = struct {
             return;
         };
 
-        const action = self.resolveCommitMessageAction() catch |err| {
-            self.setStatus("{s}", .{commitMessageActionResolveMessage(err)});
-            return;
-        };
+        const draft_empty = self.commit_panel.draftIsEmpty();
+        const action = if (draft_empty)
+            self.resolveGenerateCommitMessageAction() catch |err| {
+                self.setStatus("{s}", .{commitMessageActionResolveMessage(.generate, err)});
+                return;
+            }
+        else
+            self.resolveImproveCommitMessageAction() catch |err| {
+                self.setStatus("{s}", .{commitMessageActionResolveMessage(.improve, err)});
+                return;
+            };
 
-        var request = self.buildGenerateCommitMessageRequest(ctx.allocator(), repo_root, action) catch |err| {
+        const mode = if (draft_empty)
+            app_actions.CommitMessageAssistMode.generate
+        else
+            app_actions.CommitMessageAssistMode{ .improve = self.buildDraftSnapshot(ctx.allocator()) catch |err| {
+                self.commit_panel.commit_error = .input_allocation_failed;
+                self.setStatus("could not snapshot commit message draft: {s}", .{@errorName(err)});
+                return err;
+            } };
+
+        var request = self.buildCommitMessageAssistRequest(ctx.allocator(), repo_root, action, mode) catch |err| {
             self.commit_panel.commit_error = .input_allocation_failed;
             self.setStatus("could not prepare commit message action: {s}", .{@errorName(err)});
             return err;
         };
 
-        app_git_requests.startGenerateCommitMessage(Msg, ctx, &self.actions, &request) catch |err| {
-            self.commit_panel.commit_error = .generate_failed;
+        app_git_requests.startCommitMessageAssist(Msg, ctx, &self.actions, &request) catch |err| {
+            self.commit_panel.commit_error = .assist_failed;
             self.setStatus("could not start commit message action", .{});
             return err;
         };
 
-        self.setStatus("generating commit message...", .{});
+        if (draft_empty) {
+            self.setStatus("generating commit message...", .{});
+        } else {
+            self.setStatus("improving commit message...", .{});
+        }
     }
 
     const CommitMessageActionResolveError = error{
@@ -2352,7 +2368,7 @@ pub const App = struct {
         Multiple,
     };
 
-    fn resolveCommitMessageAction(self: *const App) CommitMessageActionResolveError!config_mod.ExternalActionConfig {
+    fn resolveGenerateCommitMessageAction(self: *const App) CommitMessageActionResolveError!config_mod.ExternalActionConfig {
         var found: ?config_mod.ExternalActionConfig = null;
         for (self.user_config.actions.slice()) |action| {
             if (action.scope == .commit and action.stdin == .staged_diff and action.output == .commit_message) {
@@ -2363,20 +2379,53 @@ pub const App = struct {
         return found orelse error.Missing;
     }
 
-    fn commitMessageActionResolveMessage(err: CommitMessageActionResolveError) []const u8 {
+    fn resolveImproveCommitMessageAction(self: *const App) CommitMessageActionResolveError!config_mod.ExternalActionConfig {
+        var found: ?config_mod.ExternalActionConfig = null;
+        for (self.user_config.actions.slice()) |action| {
+            if (action.scope == .commit and action.stdin == .commit_message_context and action.output == .commit_message) {
+                if (found != null) return error.Multiple;
+                found = action;
+            }
+        }
+        return found orelse error.Missing;
+    }
+
+    const CommitMessageAssistResolveMode = enum { generate, improve };
+
+    fn commitMessageActionResolveMessage(mode: CommitMessageAssistResolveMode, err: CommitMessageActionResolveError) []const u8 {
         return switch (err) {
-            error.Missing => "commit message action is not configured",
-            error.Multiple => "multiple commit message actions configured",
+            error.Missing => switch (mode) {
+                .generate => "commit message action is not configured",
+                .improve => "commit message improve action is not configured",
+            },
+            error.Multiple => switch (mode) {
+                .generate => "multiple commit message actions configured",
+                .improve => "multiple commit message improve actions configured",
+            },
         };
     }
 
-    fn buildGenerateCommitMessageRequest(
+    fn buildDraftSnapshot(self: *const App, allocator: std.mem.Allocator) !app_actions.DraftSnapshot {
+        var parts = try self.commit_panel.formatMessageParts(allocator);
+        errdefer parts.deinit(allocator);
+        const body = if (parts.body) |body_text| body_text else try allocator.dupe(u8, "");
+        parts.body = null;
+        return .{
+            .subject = parts.subject,
+            .body = body,
+            .revision = self.commit_panel.draft_revision,
+        };
+    }
+
+    fn buildCommitMessageAssistRequest(
         self: *const App,
         allocator: std.mem.Allocator,
         repo_root: []const u8,
         action: config_mod.ExternalActionConfig,
-    ) !app_git_requests.GenerateCommitMessageRequest {
-        _ = self;
+        mode: app_actions.CommitMessageAssistMode,
+    ) !app_git_requests.CommitMessageAssistRequest {
+        var owned_mode = mode;
+        errdefer owned_mode.deinit(allocator);
         const owned_root = try allocator.dupe(u8, repo_root);
         errdefer allocator.free(owned_root);
         const owned_id = try allocator.dupe(u8, action.id);
@@ -2398,6 +2447,8 @@ pub const App = struct {
             .repo_root = owned_root,
             .action_id = owned_id,
             .argv = argv,
+            .launch_revision = self.commit_panel.draft_revision,
+            .mode = owned_mode,
         };
     }
 
@@ -3449,38 +3500,62 @@ pub const App = struct {
         }
     }
 
-    fn finishGenerateCommitMessage(self: *App, ctx: *chasen.Ctx(Msg), finished: GenerateCommitMessageFinished) void {
+    fn finishCommitMessageAssist(self: *App, ctx: *chasen.Ctx(Msg), finished: CommitMessageAssistFinished) void {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
         if (!self.actions.finish(result.pending)) return;
         if (!self.commit_panel.is_open or self.commit_panel.mode != .commit) return;
         if (!self.activeRepoMatches(result.repo_root)) return;
-        if (!self.commit_panel.draftIsEmpty()) {
-            self.commit_panel.commit_error = .draft_not_empty;
-            self.setStatus("generated commit message ignored; draft is no longer empty", .{});
-            return;
-        }
 
         switch (result.result) {
             .ok => |message| {
-                self.commit_panel.replaceDraft(message.subject, message.body);
-                if (self.commit_panel.commit_error) |_| {
-                    self.setStatus("generated commit message could not be inserted", .{});
+                if (self.commit_panel.draft_revision != result.launch_revision) {
+                    switch (result.mode) {
+                        .generate => self.setStatus("generated commit message ignored; draft changed", .{}),
+                        .improve => self.setStatus("improved commit message ignored; draft changed", .{}),
+                    }
                     return;
                 }
-                if (message.truncated) {
-                    self.setStatus("generated commit message from truncated staged diff", .{});
-                } else {
-                    self.setStatus("generated commit message", .{});
+                switch (result.mode) {
+                    .generate => {
+                        if (!self.commit_panel.draftIsEmpty()) {
+                            self.commit_panel.commit_error = .draft_not_empty;
+                            self.setStatus("generated commit message ignored; draft is no longer empty", .{});
+                            return;
+                        }
+                    },
+                    .improve => |snapshot| {
+                        if (self.commit_panel.draft_revision != snapshot.revision) {
+                            self.setStatus("improved commit message ignored; draft changed", .{});
+                            return;
+                        }
+                    },
+                }
+                self.commit_panel.replaceDraft(message.subject, message.body);
+                if (self.commit_panel.commit_error) |_| {
+                    self.setStatus("commit message could not be inserted", .{});
+                    return;
+                }
+                switch (result.mode) {
+                    .generate => if (message.truncated) {
+                        self.setStatus("generated commit message from truncated staged diff", .{});
+                    } else {
+                        self.setStatus("generated commit message", .{});
+                    },
+                    .improve => if (message.truncated) {
+                        self.setStatus("improved commit message from truncated staged diff", .{});
+                    } else {
+                        self.setStatus("improved commit message", .{});
+                    },
                 }
             },
             .failed => |message| {
-                self.commit_panel.commit_error = .generate_failed;
+                self.commit_panel.commit_error = .assist_failed;
                 self.setStatus("{s}", .{message});
             },
             .failed_static => |message| {
-                self.commit_panel.commit_error = .generate_failed;
+                self.commit_panel.commit_error = .assist_failed;
                 self.setStatus("{s}", .{message});
             },
         }
@@ -8341,11 +8416,13 @@ fn testAppWithCommitPanel() App {
     };
 }
 
-fn generatedCommitMessageFinished(
+fn commitMessageAssistFinished(
     allocator: std.mem.Allocator,
     pending: app_actions.PendingAction,
-    result: app_actions.GenerateCommitMessageResult,
-) !GenerateCommitMessageFinished {
+    launch_revision: u64,
+    mode: app_actions.CommitMessageAssistMode,
+    result: app_actions.CommitMessageActionResult,
+) !CommitMessageAssistFinished {
     const repo_root = try allocator.dupe(u8, "/repo");
     errdefer allocator.free(repo_root);
     const action_id = try allocator.dupe(u8, "commit-message");
@@ -8353,24 +8430,27 @@ fn generatedCommitMessageFinished(
         .pending = pending,
         .repo_root = repo_root,
         .action_id = action_id,
+        .launch_revision = launch_revision,
+        .mode = mode,
         .result = result,
     };
 }
 
-test "finishGenerateCommitMessage inserts editable draft and truncated warning" {
+test "finishCommitMessageAssist inserts generated editable draft and truncated warning" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     var app = testAppWithCommitPanel();
     defer app.commit_panel.deinit();
 
     app.commit_panel.open(.commit);
-    const pending = app.actions.begin(.generate_commit_message);
-    const finished = try generatedCommitMessageFinished(std.testing.allocator, pending, .{ .ok = .{
+    const pending = app.actions.begin(.assist_commit_message);
+    const launch_revision = app.commit_panel.draft_revision;
+    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{ .ok = .{
         .subject = try std.testing.allocator.dupe(u8, "Generated subject"),
         .body = try std.testing.allocator.dupe(u8, "Generated body"),
         .truncated = true,
     } });
 
-    app.finishGenerateCommitMessage(&ctx, finished);
+    app.finishCommitMessageAssist(&ctx, finished);
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expectEqualStrings("Generated subject", app.commit_panel.subject.slice());
@@ -8378,93 +8458,222 @@ test "finishGenerateCommitMessage inserts editable draft and truncated warning" 
     try std.testing.expectEqualStrings("generated commit message from truncated staged diff", app.status.text());
 }
 
-test "finishGenerateCommitMessage ignores stale result after popup close" {
+test "finishCommitMessageAssist ignores stale result after popup close" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     var app = testAppWithCommitPanel();
     defer app.commit_panel.deinit();
 
     app.commit_panel.open(.commit);
-    const pending = app.actions.begin(.generate_commit_message);
-    app.closeCommitPanel();
-    const finished = try generatedCommitMessageFinished(std.testing.allocator, pending, .{ .ok = .{
+    const pending = app.actions.begin(.assist_commit_message);
+    const launch_revision = app.commit_panel.draft_revision;
+    app.commit_panel.close();
+    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{ .ok = .{
         .subject = try std.testing.allocator.dupe(u8, "Generated subject"),
         .body = null,
         .truncated = false,
     } });
 
-    app.finishGenerateCommitMessage(&ctx, finished);
+    app.finishCommitMessageAssist(&ctx, finished);
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(!app.commit_panel.is_open);
     try std.testing.expectEqualStrings("", app.commit_panel.subject.slice());
 }
 
-test "finishGenerateCommitMessage does not overwrite non-empty draft" {
+test "finishCommitMessageAssist does not overwrite non-empty generated draft" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     var app = testAppWithCommitPanel();
     defer app.commit_panel.deinit();
 
     app.commit_panel.open(.commit);
     app.commit_panel.insert('x');
-    const pending = app.actions.begin(.generate_commit_message);
-    const finished = try generatedCommitMessageFinished(std.testing.allocator, pending, .{ .ok = .{
+    const pending = app.actions.begin(.assist_commit_message);
+    const launch_revision = app.commit_panel.draft_revision;
+    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{ .ok = .{
         .subject = try std.testing.allocator.dupe(u8, "Generated subject"),
         .body = null,
         .truncated = false,
     } });
 
-    app.finishGenerateCommitMessage(&ctx, finished);
+    app.finishCommitMessageAssist(&ctx, finished);
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expectEqual(app_commit_panel.CommitError.draft_not_empty, app.commit_panel.commit_error.?);
     try std.testing.expectEqualStrings("x", app.commit_panel.subject.slice());
 }
 
-test "finishGenerateCommitMessage failure keeps draft unchanged" {
+test "finishCommitMessageAssist failure keeps draft unchanged" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     var app = testAppWithCommitPanel();
     defer app.commit_panel.deinit();
 
     app.commit_panel.open(.commit);
-    const pending = app.actions.begin(.generate_commit_message);
-    const finished = try generatedCommitMessageFinished(std.testing.allocator, pending, .{
+    const pending = app.actions.begin(.assist_commit_message);
+    const launch_revision = app.commit_panel.draft_revision;
+    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{
         .failed = try std.testing.allocator.dupe(u8, "commit-message: failed"),
     });
 
-    app.finishGenerateCommitMessage(&ctx, finished);
+    app.finishCommitMessageAssist(&ctx, finished);
 
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expectEqual(app_commit_panel.CommitError.generate_failed, app.commit_panel.commit_error.?);
+    try std.testing.expectEqual(app_commit_panel.CommitError.assist_failed, app.commit_panel.commit_error.?);
     try std.testing.expectEqualStrings("", app.commit_panel.subject.slice());
     try std.testing.expectEqualStrings("commit-message: failed", app.status.text());
 }
 
-test "finishGenerateCommitMessage rejects long subject without mutating draft" {
+test "finishCommitMessageAssist rejects long subject without mutating draft" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     var app = testAppWithCommitPanel();
     defer app.commit_panel.deinit();
 
     app.commit_panel.open(.commit);
-    const pending = app.actions.begin(.generate_commit_message);
+    const pending = app.actions.begin(.assist_commit_message);
+    const launch_revision = app.commit_panel.draft_revision;
     var long_subject: [app_commit_panel.max_subject_chars + 1]u8 = undefined;
     @memset(&long_subject, 'a');
-    const finished = try generatedCommitMessageFinished(std.testing.allocator, pending, .{ .ok = .{
+    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{ .ok = .{
         .subject = try std.testing.allocator.dupe(u8, &long_subject),
         .body = null,
         .truncated = false,
     } });
 
-    app.finishGenerateCommitMessage(&ctx, finished);
+    app.finishCommitMessageAssist(&ctx, finished);
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expectEqual(app_commit_panel.CommitError.subject_too_long, app.commit_panel.commit_error.?);
     try std.testing.expectEqualStrings("", app.commit_panel.subject.slice());
 }
 
+test "finishCommitMessageAssist replaces unchanged improved draft" {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var app = testAppWithCommitPanel();
+    defer app.commit_panel.deinit();
+
+    app.commit_panel.open(.commit);
+    app.commit_panel.paste("Draft subject");
+    const snapshot = try app.buildDraftSnapshot(std.testing.allocator);
+    const pending = app.actions.begin(.assist_commit_message);
+    const launch_revision = snapshot.revision;
+    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .{ .improve = snapshot }, .{ .ok = .{
+        .subject = try std.testing.allocator.dupe(u8, "Improved subject"),
+        .body = try std.testing.allocator.dupe(u8, "Improved body"),
+        .truncated = false,
+    } });
+
+    app.finishCommitMessageAssist(&ctx, finished);
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expectEqualStrings("Improved subject", app.commit_panel.subject.slice());
+    try std.testing.expectEqualStrings("Improved body", app.commit_panel.body.slice());
+    try std.testing.expectEqualStrings("improved commit message", app.status.text());
+}
+
+test "finishCommitMessageAssist ignores improved draft after user edit" {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var app = testAppWithCommitPanel();
+    defer app.commit_panel.deinit();
+
+    app.commit_panel.open(.commit);
+    app.commit_panel.paste("Draft subject");
+    const snapshot = try app.buildDraftSnapshot(std.testing.allocator);
+    app.commit_panel.paste(" edited");
+    const pending = app.actions.begin(.assist_commit_message);
+    const launch_revision = snapshot.revision;
+    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .{ .improve = snapshot }, .{ .ok = .{
+        .subject = try std.testing.allocator.dupe(u8, "Improved subject"),
+        .body = null,
+        .truncated = false,
+    } });
+
+    app.finishCommitMessageAssist(&ctx, finished);
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expectEqualStrings("Draft subject edited", app.commit_panel.subject.slice());
+    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.status.text());
+}
+
+test "finishCommitMessageAssist ignores generated draft after edit then clear" {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var app = testAppWithCommitPanel();
+    defer app.commit_panel.deinit();
+
+    app.commit_panel.open(.commit);
+    const launch_revision = app.commit_panel.draft_revision;
+    const pending = app.actions.begin(.assist_commit_message);
+    app.commit_panel.insert('x');
+    app.commit_panel.backspace();
+    try std.testing.expect(app.commit_panel.draftIsEmpty());
+    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{ .ok = .{
+        .subject = try std.testing.allocator.dupe(u8, "Generated subject"),
+        .body = null,
+        .truncated = false,
+    } });
+
+    app.finishCommitMessageAssist(&ctx, finished);
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expectEqualStrings("", app.commit_panel.subject.slice());
+    try std.testing.expectEqualStrings("generated commit message ignored; draft changed", app.status.text());
+}
+
+test "finishCommitMessageAssist ignores improved draft after edit then restore" {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var app = testAppWithCommitPanel();
+    defer app.commit_panel.deinit();
+
+    app.commit_panel.open(.commit);
+    app.commit_panel.paste("Draft subject");
+    const snapshot = try app.buildDraftSnapshot(std.testing.allocator);
+    const launch_revision = snapshot.revision;
+    app.commit_panel.insert('x');
+    app.commit_panel.backspace();
+    try std.testing.expectEqualStrings("Draft subject", app.commit_panel.subject.slice());
+    const pending = app.actions.begin(.assist_commit_message);
+    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .{ .improve = snapshot }, .{ .ok = .{
+        .subject = try std.testing.allocator.dupe(u8, "Improved subject"),
+        .body = null,
+        .truncated = false,
+    } });
+
+    app.finishCommitMessageAssist(&ctx, finished);
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expectEqualStrings("Draft subject", app.commit_panel.subject.slice());
+    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.status.text());
+}
+
+test "finishCommitMessageAssist ignores improved draft after close and reopen" {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var app = testAppWithCommitPanel();
+    defer app.commit_panel.deinit();
+
+    app.commit_panel.open(.commit);
+    app.commit_panel.paste("Draft subject");
+    const snapshot = try app.buildDraftSnapshot(std.testing.allocator);
+    const launch_revision = snapshot.revision;
+    const pending = app.actions.begin(.assist_commit_message);
+    app.commit_panel.close();
+    app.commit_panel.open(.commit);
+    app.commit_panel.paste("Draft subject");
+    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .{ .improve = snapshot }, .{ .ok = .{
+        .subject = try std.testing.allocator.dupe(u8, "Improved subject"),
+        .body = null,
+        .truncated = false,
+    } });
+
+    app.finishCommitMessageAssist(&ctx, finished);
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expectEqualStrings("Draft subject", app.commit_panel.subject.slice());
+    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.status.text());
+}
+
 test "resolveCommitMessageAction reports missing and multiple configs" {
     var missing = testAppWithCommitPanel();
     defer missing.commit_panel.deinit();
-    try std.testing.expectError(error.Missing, missing.resolveCommitMessageAction());
+    try std.testing.expectError(error.Missing, missing.resolveGenerateCommitMessageAction());
+    try std.testing.expectError(error.Missing, missing.resolveImproveCommitMessageAction());
 
     var multiple = testAppWithCommitPanel();
     defer multiple.commit_panel.deinit();
@@ -8481,7 +8690,11 @@ test "resolveCommitMessageAction reports missing and multiple configs" {
     multiple.user_config.actions.items[1] = other;
     multiple.user_config.actions.len = 2;
 
-    try std.testing.expectError(error.Multiple, multiple.resolveCommitMessageAction());
+    try std.testing.expectError(error.Multiple, multiple.resolveGenerateCommitMessageAction());
+
+    multiple.user_config.actions.items[0].stdin = .commit_message_context;
+    multiple.user_config.actions.items[1].stdin = .commit_message_context;
+    try std.testing.expectError(error.Multiple, multiple.resolveImproveCommitMessageAction());
 }
 
 test "pending selection restore survives status projection while diff reload is pending" {
