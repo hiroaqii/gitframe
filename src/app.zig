@@ -196,6 +196,13 @@ const LoadFinishedMsg = union(enum) {
     branch_status_loaded: BranchStatusLoadFinished,
     branch_list_loaded: BranchListLoadFinished,
     review_projection_loaded: ReviewProjectionFinished,
+
+    fn deinit(self: *LoadFinishedMsg, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            inline else => |*finished| finished.deinit(allocator),
+        }
+        self.* = undefined;
+    }
 };
 
 const ActionFinishedMsg = union(enum) {
@@ -213,6 +220,14 @@ const ActionFinishedMsg = union(enum) {
     switch_branch: SwitchBranchFinished,
     push_foreground: chasen.ForegroundCommandResult,
     editor: chasen.ForegroundCommandResult,
+
+    fn deinit(self: *ActionFinishedMsg, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .push_foreground, .editor => {},
+            inline else => |*finished| finished.deinit(allocator),
+        }
+        self.* = undefined;
+    }
 };
 
 const DiffLoadStartOptions = struct {
@@ -324,6 +339,8 @@ pub const App = struct {
     };
 
     pub const Msg = union(enum) {
+        pub const undelivered_policy = .deinit;
+
         terminal_resized: chasen.Size,
         load_finished: LoadFinishedMsg,
         action_finished: ActionFinishedMsg,
@@ -481,6 +498,23 @@ pub const App = struct {
 
         pub fn actionFinished(inner: ActionFinishedMsg) @This() {
             return .{ .action_finished = inner };
+        }
+
+        /// Releases messages that the Chasen runtime cannot deliver to
+        /// `App.update`, most notably task results completed during shutdown.
+        /// Synchronous borrowed paste variants and timer/control variants own
+        /// no storage and therefore require no action here.
+        pub fn deinitUndelivered(self: *@This(), allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                .load_finished => |*finished| finished.deinit(allocator),
+                .action_finished => |*finished| finished.deinit(allocator),
+                // Keep every owned async result grouped under load_finished or
+                // action_finished so their exhaustive inner deinit switches
+                // force classification. A new top-level owned variant must add
+                // an explicit arm here instead of relying on this plain case.
+                else => {},
+            }
+            self.* = undefined;
         }
     };
 
@@ -8172,6 +8206,65 @@ test "grouped result messages keep previous ephemeral status" {
     try std.testing.expect(App.msgKeepsEphemeralStatus(.{ .load_finished = undefined }));
     try std.testing.expect(App.msgKeepsEphemeralStatus(.{ .action_finished = undefined }));
     try std.testing.expect(App.msgKeepsEphemeralStatus(.git_action_spinner_tick));
+}
+
+test "undelivered action result releases owned payloads" {
+    var msg = App.Msg.actionFinished(.{ .stage_file = .{
+        .pending = .{ .generation = 1, .kind = .stage_file },
+        .path = try std.testing.allocator.dupe(u8, "src/app.zig"),
+        .result = .{ .failed = try std.testing.allocator.dupe(u8, "failed") },
+    } });
+
+    msg.deinitUndelivered(std.testing.allocator);
+}
+
+test "undelivered diff and status loads release owned payloads" {
+    var diff_msg = App.Msg.loadFinished(.{ .diff_loaded = .{
+        .generation = 1,
+        .result = .{ .loaded = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one) },
+    } });
+    diff_msg.deinitUndelivered(std.testing.allocator);
+
+    var status_msg = App.Msg.loadFinished(.{ .status_loaded = .{
+        .generation = 2,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .failed = try std.testing.allocator.dupe(u8, "status failed") },
+    } });
+    status_msg.deinitUndelivered(std.testing.allocator);
+}
+
+test "undelivered repo and projection loads release owned payloads" {
+    var repo_msg = App.Msg.loadFinished(.{ .repos_discovered = .{
+        .generation = 1,
+        .result = .{ .failed = try std.testing.allocator.dupe(u8, "discovery failed") },
+    } });
+    repo_msg.deinitUndelivered(std.testing.allocator);
+
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        7,
+        "/repo",
+        "src/app.zig",
+        .generated_added_file,
+        .cached,
+        3,
+        4,
+    );
+    var projection_msg = App.Msg.loadFinished(.{ .review_projection_loaded = .{
+        .request = request,
+        .result = .{ .failed = try app_review_projection.statusBodyAlloc(
+            std.testing.allocator,
+            "src/app.zig",
+            "{s}",
+            .{"projection failed"},
+        ) },
+    } });
+    projection_msg.deinitUndelivered(std.testing.allocator);
+}
+
+test "undelivered plain root message is a no-op" {
+    var msg: App.Msg = .quit;
+    msg.deinitUndelivered(std.testing.allocator);
 }
 
 test "modal transitions clear previous ephemeral status" {

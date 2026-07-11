@@ -30,6 +30,11 @@ pub const DiffLoadFinished = struct {
     generation: u64,
     background_cycle_id: ?u64 = null,
     result: DiffLoadTaskResult,
+
+    pub fn deinit(self: *DiffLoadFinished, allocator: std.mem.Allocator) void {
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 /// Result payload sent from the asynchronous repository discovery task.
@@ -37,6 +42,11 @@ pub const RepoDiscoveryFinished = struct {
     generation: u64,
     background_cycle_id: ?u64 = null,
     result: RepoDiscoveryTaskResult,
+
+    pub fn deinit(self: *RepoDiscoveryFinished, allocator: std.mem.Allocator) void {
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 /// Result payload sent from repository picker path discovery.
@@ -494,6 +504,7 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
 fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
     return switch (failure) {
         .start_failed => |message| message,
+        .runtime_abandoned => "runtime shutting down",
     };
 }
 

@@ -1174,6 +1174,7 @@ pub fn SwitchBranchTask(comptime Msg: type) type {
 fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
     return switch (failure) {
         .start_failed => |message| message,
+        .runtime_abandoned => "runtime shutting down",
     };
 }
 
