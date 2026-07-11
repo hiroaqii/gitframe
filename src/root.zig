@@ -35,6 +35,7 @@ test {
     _ = @import("app/load.zig");
     _ = @import("app/load_state.zig");
     _ = @import("app/pages/review.zig");
+    _ = @import("app/pages/review/navigation.zig");
     _ = @import("app/prompt.zig");
     _ = @import("app/repo_picker.zig");
     _ = @import("app/review_projection.zig");

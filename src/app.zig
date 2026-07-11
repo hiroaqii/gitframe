@@ -11,6 +11,7 @@ const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
 const page = @import("app/page.zig");
 const review_page = @import("app/pages/review.zig");
+const review_navigation = @import("app/pages/review/navigation.zig");
 const app_prompt = @import("app/prompt.zig");
 const app_repo_picker = @import("app/repo_picker.zig");
 const app_review_projection = @import("app/review_projection.zig");
@@ -121,72 +122,7 @@ const MousePane = enum {
     diff,
 };
 
-const MousePoint = struct {
-    col: u16,
-    row: u16,
-};
-
-const DiffMouseHit = struct {
-    identity: diff_selection.Identity,
-    side: diff_selection.Side,
-    point: diff_selection.Point,
-};
-
-const DiffHeaderTarget = struct {
-    identity: diff_selection.HeaderIdentity,
-    display_path: []const u8,
-};
-
-pub const ActiveDiffDisplay = union(enum) {
-    loaded: struct {
-        file_index: usize,
-        file: diff_parser.FileDiff,
-        line_index: ?diff_view_model.RenderedLineIndex,
-        folded_hunks: []const bool,
-        staged_flags: []const bool,
-    },
-    combined_projection: struct {
-        file: diff_parser.FileDiff,
-        line_index: diff_view_model.RenderedLineIndex,
-        staged_flags: []const bool,
-        hunk_states: []const diff_hunk_projection.ProjectedHunkState,
-    },
-
-    pub fn file(self: ActiveDiffDisplay) diff_parser.FileDiff {
-        return switch (self) {
-            .loaded => |loaded| loaded.file,
-            .combined_projection => |projection| projection.file,
-        };
-    }
-
-    pub fn lineIndex(self: ActiveDiffDisplay) ?diff_view_model.RenderedLineIndex {
-        return switch (self) {
-            .loaded => |loaded| loaded.line_index,
-            .combined_projection => |projection| projection.line_index,
-        };
-    }
-
-    pub fn foldedHunks(self: ActiveDiffDisplay) []const bool {
-        return switch (self) {
-            .loaded => |loaded| loaded.folded_hunks,
-            .combined_projection => &.{},
-        };
-    }
-
-    pub fn stagedFlags(self: ActiveDiffDisplay) []const bool {
-        return switch (self) {
-            .loaded => |loaded| loaded.staged_flags,
-            .combined_projection => |projection| projection.staged_flags,
-        };
-    }
-
-    pub fn loadedFileIndex(self: ActiveDiffDisplay) ?usize {
-        return switch (self) {
-            .loaded => |loaded| loaded.file_index,
-            .combined_projection => null,
-        };
-    }
-};
+const MousePoint = review_navigation.MousePoint;
 
 const LoadFinishedMsg = union(enum) {
     repos_discovered: RepoDiscoveryFinished,
@@ -234,18 +170,6 @@ const DiffLoadStartOptions = struct {
     clear_visible_state: bool,
     kind: review_page.ReloadKind,
     background_cycle_id: ?u64 = null,
-};
-
-const DisplayNavigationSnapshot = struct {
-    selected_target: ?context.SelectedTarget,
-    selected_node: usize,
-    diff_cursor: diff_view_model.BodyCoordinate,
-    diff_scroll: usize,
-    diff_horizontal_scroll: usize,
-    sidebar_horizontal_scroll: usize,
-    search_coordinate: ?diff_view_model.BodyCoordinate,
-    search_match_offset: ?usize,
-    display_mode: diff_render.DisplayMode,
 };
 
 const PushForegroundState = struct {
@@ -551,6 +475,30 @@ pub const App = struct {
         self.clearBranchSwitch(deinit_ctx.allocator);
     }
 
+    /// Builds the concrete Review navigation owner with only the shell inputs
+    /// needed by Review-local cursor/search/selection logic. The controller
+    /// deliberately cannot reach App, overlays, processes, or async effects.
+    fn reviewNavigation(self: *App) review_navigation.Controller {
+        const size = app_view.shellContentSize(self.terminal_size);
+        return .{
+            .page = &self.pages.review,
+            .repo_root = self.activeRepoRoot(),
+            .source = self.config.source,
+            .layout = .{ .width = size.width, .height = size.height },
+            .diagnostics = .{ .target = &self.status },
+        };
+    }
+
+    fn reviewNavigationView(self: *const App) review_navigation.View {
+        const size = app_view.shellContentSize(self.terminal_size);
+        return .{
+            .page = &self.pages.review,
+            .repo_root = self.activeRepoRoot(),
+            .source = self.config.source,
+            .layout = .{ .width = size.width, .height = size.height },
+        };
+    }
+
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         self.clearEphemeralStatusForUserAction(msg);
         const tracks_display_navigation = msgTracksDisplayNavigation(msg);
@@ -558,99 +506,99 @@ pub const App = struct {
 
         switch (msg) {
             .terminal_resized => |size| {
-                const previous_width = self.diffPaneWidth();
-                const previous_mode = self.effectiveDisplayMode();
+                const previous_width = self.reviewNavigationView().diffPaneWidth();
+                const previous_mode = self.reviewNavigationView().effectiveDisplayMode();
                 self.terminal_size = size;
-                self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
-                if (previous_mode != self.effectiveDisplayMode()) self.clearDiffSelection();
-                self.clampSidebarHorizontalScroll();
-                self.clampDiffNavigationKeepingHunkVisible();
-                self.updateSearchMatchOffset();
-                self.scrollSearchMatchIntoView();
-                self.clampDiffNavigation();
+                self.reviewNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
+                if (previous_mode != self.reviewNavigationView().effectiveDisplayMode()) self.reviewNavigation().clearDiffSelection();
+                self.reviewNavigation().clampSidebarHorizontalScroll();
+                self.reviewNavigation().clampDiffNavigationKeepingHunkVisible();
+                self.reviewNavigation().updateSearchMatchOffset();
+                self.reviewNavigation().scrollSearchMatchIntoView();
+                self.reviewNavigation().clampDiffNavigation();
                 self.clampHelpScroll();
                 self.clampPushErrorScroll();
             },
             .load_finished => |finished| try self.finishLoadResult(ctx, finished),
             .action_finished => |finished| try self.finishActionResult(ctx, finished),
             .clipboard_copy_finished => |finished| self.finishClipboardCopy(finished),
-            .select_previous_file => self.selectFileDelta(-1),
-            .select_next_file => self.selectFileDelta(1),
-            .toggle_directory => try self.toggleSelectedDirectory(),
-            .expand_directory => try self.expandSelectedDirectory(),
-            .collapse_or_parent_directory => try self.collapseOrSelectParentDirectory(),
-            .scroll_diff_up => self.moveDiffCursorRows(.up),
-            .scroll_diff_down => self.moveDiffCursorRows(.down),
-            .scroll_diff_left => self.scrollDiffHorizontal(.left),
-            .scroll_diff_right => self.scrollDiffHorizontal(.right),
-            .scroll_sidebar_left => self.scrollSidebarHorizontal(.left),
-            .scroll_sidebar_right => self.scrollSidebarHorizontal(.right),
-            .page_diff_up => self.moveDiffCursorPage(.up),
-            .page_diff_down => self.moveDiffCursorPage(.down),
-            .select_previous_hunk => self.selectHunkDelta(-1),
-            .select_next_hunk => self.selectHunkDelta(1),
-            .toggle_hunk_fold => self.toggleSelectedHunkFold(),
-            .select_first_file => self.selectFileAbsolute(0),
-            .select_last_file => self.selectLastFile(),
+            .select_previous_file => self.reviewNavigation().selectFileDelta(-1),
+            .select_next_file => self.reviewNavigation().selectFileDelta(1),
+            .toggle_directory => try self.reviewNavigation().toggleSelectedDirectory(),
+            .expand_directory => try self.reviewNavigation().expandSelectedDirectory(),
+            .collapse_or_parent_directory => try self.reviewNavigation().collapseOrSelectParentDirectory(),
+            .scroll_diff_up => self.reviewNavigation().moveDiffCursorRows(.up),
+            .scroll_diff_down => self.reviewNavigation().moveDiffCursorRows(.down),
+            .scroll_diff_left => self.reviewNavigation().scrollDiffHorizontal(.left),
+            .scroll_diff_right => self.reviewNavigation().scrollDiffHorizontal(.right),
+            .scroll_sidebar_left => self.reviewNavigation().scrollSidebarHorizontal(.left),
+            .scroll_sidebar_right => self.reviewNavigation().scrollSidebarHorizontal(.right),
+            .page_diff_up => self.reviewNavigation().moveDiffCursorPage(.up),
+            .page_diff_down => self.reviewNavigation().moveDiffCursorPage(.down),
+            .select_previous_hunk => self.reviewNavigation().selectHunkDelta(-1),
+            .select_next_hunk => self.reviewNavigation().selectHunkDelta(1),
+            .toggle_hunk_fold => self.reviewNavigation().toggleSelectedHunkFold(),
+            .select_first_file => self.reviewNavigation().selectFileAbsolute(0),
+            .select_last_file => self.reviewNavigation().selectLastFile(),
             .toggle_focus => {
                 if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = self.pages.review.viewer.focus.toggled();
             },
-            .toggle_sidebar_visibility => self.toggleSidebarVisibility(),
-            .decrease_sidebar_width => self.adjustSidebarWidth(.shrink),
-            .increase_sidebar_width => self.adjustSidebarWidth(.grow),
+            .toggle_sidebar_visibility => self.reviewNavigation().toggleSidebarVisibility(),
+            .decrease_sidebar_width => self.reviewNavigation().adjustSidebarWidth(.shrink),
+            .increase_sidebar_width => self.reviewNavigation().adjustSidebarWidth(.grow),
             .focus_sidebar => {
                 if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .sidebar;
             },
             .focus_diff => self.pages.review.viewer.focus = .diff,
-            .sidebar_click_node => |node_index| try self.clickSidebarNode(node_index),
+            .sidebar_click_node => |node_index| try self.reviewNavigation().clickSidebarNode(node_index),
             .mouse_sidebar_wheel_up => {
                 if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .sidebar;
-                self.selectFileDelta(-1);
+                self.reviewNavigation().selectFileDelta(-1);
             },
             .mouse_sidebar_wheel_down => {
                 if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .sidebar;
-                self.selectFileDelta(1);
+                self.reviewNavigation().selectFileDelta(1);
             },
             .mouse_diff_wheel_up => {
                 self.pages.review.viewer.focus = .diff;
-                self.scrollDiff(.up);
+                self.reviewNavigation().scrollDiff(.up);
             },
             .mouse_diff_wheel_down => {
                 self.pages.review.viewer.focus = .diff;
-                self.scrollDiff(.down);
+                self.reviewNavigation().scrollDiff(.down);
             },
             .mouse_diff_wheel_left => {
                 self.pages.review.viewer.focus = .diff;
-                self.scrollDiffHorizontal(.left);
+                self.reviewNavigation().scrollDiffHorizontal(.left);
             },
             .mouse_diff_wheel_right => {
                 self.pages.review.viewer.focus = .diff;
-                self.scrollDiffHorizontal(.right);
+                self.reviewNavigation().scrollDiffHorizontal(.right);
             },
-            .mouse_diff_press => |point| self.pressDiffMouse(point),
-            .mouse_diff_drag => |point| self.dragDiffMouse(point),
+            .mouse_diff_press => |point| self.reviewNavigation().pressDiffMouse(point),
+            .mouse_diff_drag => |point| self.reviewNavigation().dragDiffMouse(point),
             .mouse_diff_release => |point| try self.releaseDiffMouse(ctx, point),
             .toggle_display_mode => {
-                self.clearDiffSelection();
-                const old_mode = self.effectiveDisplayMode();
+                self.reviewNavigation().clearDiffSelection();
+                const old_mode = self.reviewNavigationView().effectiveDisplayMode();
                 const old_scroll = self.pages.review.viewer.diff_scroll;
                 self.pages.review.viewer.display_mode = self.pages.review.viewer.display_mode.toggled();
-                const new_mode = self.effectiveDisplayMode();
-                self.pages.review.viewer.diff_scroll = self.remapDiffScrollForModeChange(old_mode, new_mode, old_scroll);
-                self.resetDiffHorizontalScroll();
-                self.updateSearchMatchOffset();
-                self.scrollSearchMatchIntoView();
-                self.applyDiffCursorScrolloff();
-                self.clampDiffNavigation();
+                const new_mode = self.reviewNavigationView().effectiveDisplayMode();
+                self.pages.review.viewer.diff_scroll = self.reviewNavigationView().remapDiffScrollForModeChange(old_mode, new_mode, old_scroll);
+                self.reviewNavigation().resetDiffHorizontalScroll();
+                self.reviewNavigation().updateSearchMatchOffset();
+                self.reviewNavigation().scrollSearchMatchIntoView();
+                self.reviewNavigation().applyDiffCursorScrolloff();
+                self.reviewNavigation().clampDiffNavigation();
             },
             .toggle_line_numbers => {
                 self.pages.review.viewer.view_options.toggleLineNumbers();
-                self.clampDiffHorizontalScrollToVisibleRows();
+                self.reviewNavigation().clampDiffHorizontalScrollToVisibleRows();
             },
-            .enter_search => self.enterSearchMode(),
-            .cancel_search => self.cancelSearchMode(),
-            .clear_search => self.clearSearch(),
-            .submit_search => self.submitSearch(),
+            .enter_search => self.reviewNavigation().enterSearchMode(),
+            .cancel_search => self.reviewNavigation().cancelSearchMode(),
+            .clear_search => self.reviewNavigation().clearSearch(),
+            .submit_search => self.reviewNavigation().submitSearch(),
             .search_insert => |codepoint| self.pages.review.search.input.insert(codepoint) catch {
                 self.setStatus("search query is too long", .{});
             },
@@ -660,11 +608,11 @@ pub const App = struct {
             .search_backspace => self.pages.review.search.input.backspace(),
             .search_move_left => self.pages.review.search.input.moveLeft(),
             .search_move_right => self.pages.review.search.input.moveRight(),
-            .select_next_search_match => self.selectSearchMatch(.forward),
-            .select_previous_search_match => self.selectSearchMatch(.backward),
-            .enter_file_search => self.enterFileSearchMode(),
-            .cancel_file_search => self.cancelFileSearchMode(ctx.allocator()),
-            .submit_file_search => try self.submitFileSearch(ctx.allocator()),
+            .select_next_search_match => self.reviewNavigation().selectSearchMatch(.forward),
+            .select_previous_search_match => self.reviewNavigation().selectSearchMatch(.backward),
+            .enter_file_search => self.reviewNavigation().enterFileSearchMode(),
+            .cancel_file_search => self.reviewNavigation().cancelFileSearchMode(ctx.allocator()),
+            .submit_file_search => try self.reviewNavigation().submitFileSearch(ctx.allocator()),
             .file_search_insert => |codepoint| {
                 self.pages.review.file_search.resetNoMatch();
                 self.pages.review.file_search.input.insert(codepoint) catch {
@@ -718,7 +666,7 @@ pub const App = struct {
             .repo_picker_move_left => self.moveRepoPickerCursorLeft(),
             .repo_picker_move_right => self.moveRepoPickerCursorRight(),
             .open_help => {
-                self.clearDiffSelection();
+                self.reviewNavigation().clearDiffSelection();
                 self.overlay.openHelp();
             },
             .close_help => self.overlay.close(),
@@ -739,9 +687,9 @@ pub const App = struct {
             .push_credential_backspace => self.backspacePushCredential(),
             .push_credential_move_left => self.movePushCredentialLeft(),
             .push_credential_move_right => self.movePushCredentialRight(),
-            .toggle_reviewed_file => try self.toggleReviewedFile(ctx.allocator()),
-            .toggle_hide_reviewed_files => try self.toggleHideReviewedFiles(),
-            .cycle_changed_file_filter => try self.cycleChangedFileFilter(),
+            .toggle_reviewed_file => try self.reviewNavigation().toggleReviewedFile(ctx.allocator()),
+            .toggle_hide_reviewed_files => try self.reviewNavigation().toggleHideReviewedFiles(),
+            .cycle_changed_file_filter => try self.reviewNavigation().cycleChangedFileFilter(),
             .toggle_selected_file => try self.toggleSelectedFileStage(ctx),
             .toggle_selected_hunk => try self.toggleSelectedHunkStage(ctx),
             .stage_selected_file => try self.stageSelectedFile(ctx),
@@ -775,7 +723,7 @@ pub const App = struct {
             .finish_review_needs_changes => try self.finishReview(ctx, .needs_changes),
             .finish_review_canceled => try self.finishReview(ctx, .canceled),
             .reload => {
-                self.clearPendingSelectionRestore(ctx.allocator());
+                self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
                 self.clearBranchSwitch(ctx.allocator());
                 if (diff_source.sourceIsOneShotInput(self.config.source)) {
                     ctx.redraw().skip();
@@ -786,7 +734,7 @@ pub const App = struct {
                 }
             },
             .auto_reload_tick => try self.autoReloadTick(ctx),
-            .focus_lost => self.terminateDiffSelection(),
+            .focus_lost => self.reviewNavigation().terminateDiffSelection(),
             .git_action_spinner_tick => self.gitActionSpinnerTick(ctx),
             .quit => self.requestQuit(ctx),
         }
@@ -844,18 +792,8 @@ pub const App = struct {
         };
     }
 
-    fn displayNavigationSnapshot(self: *const App) DisplayNavigationSnapshot {
-        return .{
-            .selected_target = self.pages.review.viewer.selected_target,
-            .selected_node = self.pages.review.viewer.selected_node,
-            .diff_cursor = self.pages.review.viewer.diff_cursor,
-            .diff_scroll = self.pages.review.viewer.diff_scroll,
-            .diff_horizontal_scroll = self.pages.review.viewer.diff_horizontal_scroll,
-            .sidebar_horizontal_scroll = self.pages.review.viewer.sidebar_horizontal_scroll,
-            .search_coordinate = if (self.pages.review.search.match) |match| match.coordinate else null,
-            .search_match_offset = self.pages.review.search.match_offset,
-            .display_mode = self.pages.review.viewer.display_mode,
-        };
+    fn displayNavigationSnapshot(self: *const App) review_navigation.DisplayNavigationSnapshot {
+        return self.reviewNavigationView().displayNavigationSnapshot();
     }
 
     fn requestQuit(self: *App, ctx: *chasen.Ctx(Msg)) void {
@@ -961,15 +899,11 @@ pub const App = struct {
     }
 
     pub fn diffSelectionView(self: *const App) ?diff_selection.View {
-        const selection = self.pages.review.selection_owner.activeDiff() orelse return null;
-        _ = self.normalLoadedDiffSelectionTarget(selection.identity) orelse return null;
-        return selection.view();
+        return self.reviewNavigationView().diffSelectionView();
     }
 
     pub fn diffHeaderSelectionActive(self: *const App) bool {
-        const selection = self.pages.review.selection_owner.activeHeader() orelse return false;
-        _ = self.displayedDiffHeaderTarget(selection.identity) orelse return false;
-        return true;
+        return self.reviewNavigationView().diffHeaderSelectionActive();
     }
 
     pub fn handleEvent(self: *const App, event: chasen.Event) ?Msg {
@@ -1034,7 +968,7 @@ pub const App = struct {
     }
 
     fn mousePane(self: *const App, mouse: anytype) ?MousePane {
-        _ = self.activeLoadedDiffConst() orelse return null;
+        _ = self.reviewNavigationView().activeLoadedDiffConst() orelse return null;
 
         const point = self.bodyMousePoint(mouse) orelse return null;
         const size = self.layoutSize();
@@ -1051,43 +985,17 @@ pub const App = struct {
         const body_height = terminalBodyHeight(self.layoutSize().height);
         if (point.row < sidebar_header_rows or body_height <= sidebar_header_rows) return .focus_sidebar;
 
-        const loaded = self.activeLoadedDiffConst() orelse return .focus_sidebar;
+        const loaded = self.reviewNavigationView().activeLoadedDiffConst() orelse return .focus_sidebar;
         const visible_rows: usize = body_height - sidebar_header_rows;
         const body_row: usize = point.row - sidebar_header_rows;
         const node_index = loaded.sidebarNodeAtBodyRow(self.pages.review.viewer.selected_node, visible_rows, body_row) orelse return .focus_sidebar;
         return .{ .sidebar_click_node = node_index };
     }
 
-    fn pressDiffMouse(self: *App, point: MousePoint) void {
-        self.pages.review.viewer.focus = .diff;
-        if (self.diffHeaderMouseHit(point)) |hit| {
-            self.pages.review.selection_owner = .{ .diff_header = .{ .identity = hit.identity } };
-            return;
-        }
-        const hit = self.diffMouseHit(point) orelse {
-            self.clearDiffSelection();
-            return;
-        };
-        self.pages.review.selection_owner = .{ .diff = diff_selection.DragSelection.init(hit.identity, hit.side, hit.point) };
-    }
-
-    fn dragDiffMouse(self: *App, point_opt: ?MousePoint) void {
-        const point = point_opt orelse return;
-        switch (self.pages.review.selection_owner) {
-            .none => return,
-            .diff_header => |*selection| selection.update(),
-            .diff => |*selection| {
-                const hit = self.diffMouseHit(point) orelse return;
-                if (!selection.identity.eql(hit.identity)) return;
-                selection.update(hit.point);
-            },
-        }
-    }
-
     fn releaseDiffMouse(self: *App, ctx: *chasen.Ctx(Msg), point_opt: ?MousePoint) !void {
         _ = point_opt;
         const owner = self.pages.review.selection_owner;
-        self.clearDiffSelection();
+        self.reviewNavigation().clearDiffSelection();
         switch (owner) {
             .none => return,
             .diff => |selection| {
@@ -1098,179 +1006,9 @@ pub const App = struct {
         }
     }
 
-    fn clearDiffSelection(self: *App) void {
-        self.terminateDiffSelection();
-    }
-
     /// Single termination boundary for every mouse-selection lifetime. Update
     /// resolves a deferred background source result after this becomes idle;
     /// deinit discards that result explicitly.
-    fn terminateDiffSelection(self: *App) void {
-        self.pages.review.selection_owner = .none;
-    }
-
-    const NormalLoadedDiffSelectionTarget = struct {
-        file_index: usize,
-        file: diff_parser.FileDiff,
-        line_index: diff_view_model.RenderedLineIndex,
-        folded_hunks: []const bool,
-        identity: diff_selection.Identity,
-    };
-
-    fn normalLoadedDiffSelectionTarget(self: *const App, identity: ?diff_selection.Identity) ?NormalLoadedDiffSelectionTarget {
-        if (self.selectedStatusEntry() != null) return null;
-        if (self.activeGeneratedFileProjection() != null) return null;
-        if (self.activeCombinedProjection() != null) return null;
-        if (self.activeCachedDiffProjection() != null) return null;
-
-        const loaded = self.activeLoadedDiffConst() orelse return null;
-        const file_index = self.selectedFileIndex(loaded) orelse return null;
-        if (file_index >= loaded.document.files.len) return null;
-        const file = loaded.document.files[file_index];
-        const path_key = diff_file.canonicalPathKey(file) orelse return null;
-        const current_identity: diff_selection.Identity = .{ .loaded_file = .{
-            .file_index = file_index,
-            .path_key = path_key,
-        } };
-        if (identity) |expected| {
-            if (!expected.eql(current_identity)) return null;
-            if (!expected.matchesLoadedFile(file_index, file)) return null;
-        }
-
-        const mode = self.effectiveDisplayMode();
-        return .{
-            .file_index = file_index,
-            .file = file,
-            .line_index = loaded.cachedRenderedLineIndex(file_index, mode) orelse loaded.renderedLineIndex(file_index, mode),
-            .folded_hunks = loaded.foldedHunksForFile(file_index),
-            .identity = current_identity,
-        };
-    }
-
-    fn displayedDiffHeaderTarget(self: *const App, expected: ?diff_selection.HeaderIdentity) ?DiffHeaderTarget {
-        const target: DiffHeaderTarget = blk: {
-            if (self.activeGeneratedFileProjection()) |bundle| {
-                break :blk .{
-                    .identity = .{ .kind = .generated_file, .path_key = bundle.file.path },
-                    .display_path = bundle.file.path,
-                };
-            }
-            if (self.activeCombinedProjection()) |bundle| {
-                const path_key = diff_file.canonicalPathKey(bundle.projection.file) orelse return null;
-                break :blk .{
-                    .identity = .{ .kind = .projection_file, .path_key = path_key },
-                    .display_path = diff_file.displayPath(bundle.projection.file),
-                };
-            }
-            if (self.activeCachedDiffProjection()) |bundle| {
-                if (bundle.loaded.document.files.len == 0) return null;
-                const file = bundle.loaded.document.files[0];
-                const path_key = diff_file.canonicalPathKey(file) orelse return null;
-                break :blk .{
-                    .identity = .{ .kind = .projection_file, .path_key = path_key },
-                    .display_path = diff_file.displayPath(file),
-                };
-            }
-
-            const loaded = self.activeLoadedDiffConst() orelse return null;
-            const file_index = self.selectedFileIndex(loaded) orelse return null;
-            if (file_index >= loaded.document.files.len) return null;
-            const file = loaded.document.files[file_index];
-            const path_key = diff_file.canonicalPathKey(file) orelse return null;
-            break :blk .{
-                .identity = .{ .kind = .loaded_file, .path_key = path_key },
-                .display_path = diff_file.displayPath(file),
-            };
-        };
-
-        if (expected) |identity| {
-            if (!identity.eql(target.identity)) return null;
-        }
-        return target;
-    }
-
-    fn diffHeaderMouseHit(self: *const App, point: MousePoint) ?DiffHeaderTarget {
-        const target = self.displayedDiffHeaderTarget(null) orelse return null;
-        const raw_diff = self.rawDiffPaneGeometry() orelse return null;
-        if (point.col < raw_diff.col or point.col >= raw_diff.col + raw_diff.width) return null;
-        if (point.row != 0) return null;
-
-        const local_col = point.col - raw_diff.col;
-        const content_width = contentWidth(raw_diff.width);
-        const content_gutter = raw_diff.width - content_width;
-        if (local_col < content_gutter) return null;
-        const render_col = local_col - content_gutter;
-        if (render_col >= content_width) return null;
-
-        const layout = self.displayedDiffHeaderLayout(content_width, target.display_path) orelse return null;
-        const path_target = layout.path_target orelse return null;
-        if (!path_target.contains(render_col)) return null;
-        return target;
-    }
-
-    fn displayedDiffHeaderLayout(self: *const App, content_width: u16, display_path: []const u8) ?diff_render.HeaderLayout {
-        const mode_width = diff_render.bodyWidth(content_width);
-        if (self.activeGeneratedFileProjection()) |bundle| {
-            return diff_render.generatedHeaderLayout(content_width, display_path, bundle.file.lines.len, bundle.file.truncated, self.pages.review.viewer.display_mode, mode_width);
-        }
-        const file = self.displayedDiffFile() orelse return null;
-        return diff_render.fileHeaderLayout(content_width, display_path, file, self.pages.review.viewer.display_mode, mode_width);
-    }
-
-    fn diffMouseHit(self: *const App, point: MousePoint) ?DiffMouseHit {
-        const target = self.normalLoadedDiffSelectionTarget(null) orelse return null;
-        const raw_diff = self.rawDiffPaneGeometry() orelse return null;
-        if (point.col < raw_diff.col or point.col >= raw_diff.col + raw_diff.width) return null;
-        if (point.row < diff_render.body_start_row) return null;
-
-        const local_col = point.col - raw_diff.col;
-        const content_width = contentWidth(raw_diff.width);
-        const content_gutter = raw_diff.width - content_width;
-        if (local_col < content_gutter) return null;
-        const render_col = local_col - content_gutter;
-        if (render_col >= content_width or render_col < diff_render.cursor_gutter_width) return null;
-
-        const body_width = diff_render.bodyWidth(content_width);
-        if (diff_render.effectiveMode(body_width, self.pages.review.viewer.display_mode) != .side_by_side) return null;
-
-        const body_col = render_col - diff_render.cursor_gutter_width;
-        const geometry = diff_render.sideBySideGeometry(body_width);
-        const side = geometry.sideAt(body_col) orelse return null;
-
-        const visible_body_row: usize = point.row - diff_render.body_start_row;
-        if (visible_body_row >= self.diffVisibleRows()) return null;
-        const offset = self.pages.review.viewer.diff_scroll + visible_body_row;
-        const coordinate = diff_view_model.coordinateAtOffset(target.file, .side_by_side, offset, target.folded_hunks, target.line_index) orelse return null;
-        const hunk_line = switch (coordinate) {
-            .hunk_line => |line| line,
-            .metadata, .binary_marker, .hunk_header => return null,
-        };
-
-        return .{
-            .identity = target.identity,
-            .side = side,
-            .point = diff_selection.pointFromLine(hunk_line.hunk_index, hunk_line.line_index),
-        };
-    }
-
-    const RawDiffPaneGeometry = struct {
-        col: u16,
-        width: u16,
-    };
-
-    fn rawDiffPaneGeometry(self: *const App) ?RawDiffPaneGeometry {
-        const size = self.layoutSize();
-        if (size.width == 0) return null;
-        if (self.pages.review.viewer.sidebar_hidden) return .{ .col = 0, .width = size.width };
-
-        const sidebar_width = sidebarWidth(size.width, self.pages.review.viewer.sidebar_width);
-        if (size.width <= sidebar_width + 1) return null;
-        return .{
-            .col = sidebar_width + 1,
-            .width = size.width - sidebar_width - 1,
-        };
-    }
-
     fn bodyMousePoint(self: *const App, mouse: anytype) ?MousePoint {
         const point = self.contentMousePoint(mouse) orelse return null;
         if (point.row >= terminalBodyHeight(self.layoutSize().height)) return null;
@@ -1496,14 +1234,14 @@ pub const App = struct {
         }
 
         const task = ctx.allocator().create(StatusLoadTask) catch {
-            self.clearPendingSelectionRestore(ctx.allocator());
+            self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
             self.setStatus("could not allocate status load task", .{});
             return;
         };
 
         const owned_root = ctx.allocator().dupe(u8, repo_root) catch {
             ctx.allocator().destroy(task);
-            self.clearPendingSelectionRestore(ctx.allocator());
+            self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
             self.setStatus("could not allocate status repo root", .{});
             return;
         };
@@ -1522,7 +1260,7 @@ pub const App = struct {
             // in-flight status result from restoring a stale snapshot.
             ctx.allocator().free(owned_root);
             ctx.allocator().destroy(task);
-            self.clearPendingSelectionRestore(ctx.allocator());
+            self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
             self.pages.review.status_load.pending = null;
             self.pages.review.status_load.markFailure(background_cycle_id != null and self.pages.review.git_status.repo_root != null);
             self.setStatus("could not start status load task", .{});
@@ -1603,8 +1341,8 @@ pub const App = struct {
     }
 
     fn captureReloadAnchor(self: *const App, allocator: std.mem.Allocator) !?review_page.ReloadAnchor {
-        const loaded = self.activeLoadedDiffConst() orelse return null;
-        const path_key = self.selectedStagePathKey() orelse return null;
+        const loaded = self.reviewNavigationView().activeLoadedDiffConst() orelse return null;
+        const path_key = self.reviewNavigationView().selectedStagePathKey() orelse return null;
         const selected_target = self.pages.review.viewer.selected_target orelse return null;
 
         const visible_row = loaded.visibleRowOfNode(self.pages.review.viewer.selected_node) orelse 0;
@@ -1613,7 +1351,7 @@ pub const App = struct {
             .selected_target_tag = std.meta.activeTag(selected_target),
             .visible_sidebar_row = visible_row,
             .diff_cursor = self.pages.review.viewer.diff_cursor,
-            .diff_cursor_offset = self.selectedDiffCursorOffset(),
+            .diff_cursor_offset = self.reviewNavigationView().selectedDiffCursorOffset(),
             .diff_scroll = self.pages.review.viewer.diff_scroll,
             .diff_horizontal_scroll = self.pages.review.viewer.diff_horizontal_scroll,
             .sidebar_horizontal_scroll = self.pages.review.viewer.sidebar_horizontal_scroll,
@@ -1812,7 +1550,7 @@ pub const App = struct {
     fn canRetainDisplayedProjection(self: *const App) bool {
         const request = self.pages.review.review_projection.displayed.request() orelse return false;
         const repo_root = self.activeRepoRoot() orelse return false;
-        const path_key = self.selectedStagePathKey() orelse return false;
+        const path_key = self.reviewNavigationView().selectedStagePathKey() orelse return false;
         return request.matchesDisplayIdentity(
             repo_root,
             path_key,
@@ -1840,9 +1578,9 @@ pub const App = struct {
         const repo_root = self.activeRepoRoot() orelse return null;
         const source_kind = reviewProjectionSourceKind(self.config.source);
 
-        if (self.selectedFile()) |file| {
+        if (self.reviewNavigationView().selectedFile()) |file| {
             const path_key = diff_file.canonicalPathKey(file) orelse return null;
-            const entry = self.freshStatusEntryForPathKey(repo_root, path_key) orelse return null;
+            const entry = self.reviewNavigationView().freshStatusEntryForPathKey(repo_root, path_key) orelse return null;
             if (sourceIsUnstaged(self.config.source) and isCombinedHunkProjectionCandidate(file, entry)) {
                 return .{
                     .repo_root = repo_root,
@@ -1935,8 +1673,8 @@ pub const App = struct {
                 return;
             },
         };
-        try self.setPendingSelectionRestore(ctx.allocator(), target.path);
-        errdefer self.clearPendingSelectionRestore(ctx.allocator());
+        try self.reviewNavigation().setPendingSelectionRestore(ctx.allocator(), target.path);
+        errdefer self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
 
         app_git_requests.startStageFile(Msg, ctx, &self.actions, target) catch |err| {
             self.setStatus("could not start stage task", .{});
@@ -2130,7 +1868,7 @@ pub const App = struct {
 
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
         if (self.currentCombinedProjection()) |bundle| {
-            if (!self.diffCursorIsVisible()) return .offscreen_cursor;
+            if (!self.reviewNavigationView().diffCursorIsVisible()) return .offscreen_cursor;
             const projected_index = self.selectedHunkIndex() orelse return .no_hunk;
             if (projected_index >= bundle.projection.hunk_states.len) return .no_hunk;
             return switch (bundle.projection.hunk_states[projected_index].origin) {
@@ -2138,11 +1876,11 @@ pub const App = struct {
                 .cached => if (can_unstage) .{ .operation = .unstage } else .unavailable_source,
             };
         }
-        if (self.activeCombinedProjection() != null) return .stale_status;
+        if (self.reviewNavigationView().activeCombinedProjection() != null) return .stale_status;
 
-        const file = self.selectedFile() orelse return .no_file;
+        const file = self.reviewNavigationView().selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
-        if (!self.diffCursorIsVisible()) return .offscreen_cursor;
+        if (!self.reviewNavigationView().diffCursorIsVisible()) return .offscreen_cursor;
         const hunk_index = self.selectedHunkIndex() orelse return .no_hunk;
         if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
 
@@ -2163,13 +1901,13 @@ pub const App = struct {
         if (self.currentCombinedProjection()) |bundle| {
             return self.selectedProjectedHunkStageTarget(allocator, repo_root, bundle);
         }
-        if (self.activeCombinedProjection() != null) return .stale_status;
-        const file = self.selectedFile() orelse return .no_file;
+        if (self.reviewNavigationView().activeCombinedProjection() != null) return .stale_status;
+        const file = self.reviewNavigationView().selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
-        if (!self.diffCursorIsVisible()) return .offscreen_cursor;
+        if (!self.reviewNavigationView().diffCursorIsVisible()) return .offscreen_cursor;
         const hunk_index = self.selectedHunkIndex() orelse return .no_hunk;
         if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
-        const entry = self.freshStatusEntryForPathKey(repo_root, path) orelse return .stale_status;
+        const entry = self.reviewNavigationView().freshStatusEntryForPathKey(repo_root, path) orelse return .stale_status;
         if (entry.isConflict()) return .conflict_unsupported;
         if (file.is_binary) return .binary_unsupported;
         if (diff_file.status(file) != .modified or diff_file.hasModeChange(file)) return .unsupported_file_state;
@@ -2197,10 +1935,10 @@ pub const App = struct {
         if (self.currentCombinedProjection()) |bundle| {
             return self.selectedProjectedHunkUnstageTarget(allocator, repo_root, bundle);
         }
-        if (self.activeCombinedProjection() != null) return .stale_status;
-        const file = self.selectedFile() orelse return .no_file;
+        if (self.reviewNavigationView().activeCombinedProjection() != null) return .stale_status;
+        const file = self.reviewNavigationView().selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
-        if (!self.diffCursorIsVisible()) return .offscreen_cursor;
+        if (!self.reviewNavigationView().diffCursorIsVisible()) return .offscreen_cursor;
         const hunk_index = self.selectedHunkIndex() orelse return .no_hunk;
         if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
         if (file.is_binary) return .binary_unsupported;
@@ -2235,7 +1973,7 @@ pub const App = struct {
         bundle: *const app_review_projection.CombinedHunkBundle,
     ) HunkStageTargetResult {
         const path = diff_file.canonicalPathKey(bundle.projection.file) orelse return .no_path;
-        if (!self.diffCursorIsVisible()) return .offscreen_cursor;
+        if (!self.reviewNavigationView().diffCursorIsVisible()) return .offscreen_cursor;
         const projected_index = self.selectedHunkIndex() orelse return .no_hunk;
         if (projected_index >= bundle.projection.hunk_states.len) return .no_hunk;
         const state = bundle.projection.hunk_states[projected_index];
@@ -2271,7 +2009,7 @@ pub const App = struct {
         bundle: *const app_review_projection.CombinedHunkBundle,
     ) HunkUnstageTargetResult {
         const path = diff_file.canonicalPathKey(bundle.projection.file) orelse return .no_path;
-        if (!self.diffCursorIsVisible()) return .offscreen_cursor;
+        if (!self.reviewNavigationView().diffCursorIsVisible()) return .offscreen_cursor;
         const projected_index = self.selectedHunkIndex() orelse return .no_hunk;
         if (projected_index >= bundle.projection.hunk_states.len) return .no_hunk;
         const state = bundle.projection.hunk_states[projected_index];
@@ -2349,8 +2087,8 @@ pub const App = struct {
             },
         };
 
-        try self.setPendingSelectionRestore(ctx.allocator(), target.path);
-        errdefer self.clearPendingSelectionRestore(ctx.allocator());
+        try self.reviewNavigation().setPendingSelectionRestore(ctx.allocator(), target.path);
+        errdefer self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
 
         app_git_requests.startUnstageFile(Msg, ctx, &self.actions, target) catch |err| {
             self.setStatus("could not start unstage task", .{});
@@ -2418,7 +2156,7 @@ pub const App = struct {
             .repo_root = owned_repo_root,
             .path = owned_path,
         };
-        self.clearDiffSelection();
+        self.reviewNavigation().clearDiffSelection();
         self.overlay.openDiscardFile();
     }
 
@@ -2429,8 +2167,8 @@ pub const App = struct {
             return;
         }
 
-        try self.setPendingSelectionRestore(ctx.allocator(), confirmation.path);
-        errdefer self.clearPendingSelectionRestore(ctx.allocator());
+        try self.reviewNavigation().setPendingSelectionRestore(ctx.allocator(), confirmation.path);
+        errdefer self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
 
         app_git_requests.startDiscardFile(Msg, ctx, &self.actions, confirmation.repo_root, confirmation.path) catch |err| {
             self.setStatus("could not start discard task", .{});
@@ -2466,7 +2204,7 @@ pub const App = struct {
         self.cancelPushConfirmation(self.allocator.?);
         self.cancelPullConfirmation(self.allocator.?);
         self.overlay.close();
-        self.clearDiffSelection();
+        self.reviewNavigation().clearDiffSelection();
         self.commit_panel.open(mode);
     }
 
@@ -2724,7 +2462,7 @@ pub const App = struct {
             .body = parts.body,
         };
         parts = .{ .subject = &.{}, .body = null };
-        self.clearDiffSelection();
+        self.reviewNavigation().clearDiffSelection();
         self.overlay.openAmendCommit();
     }
 
@@ -2829,7 +2567,7 @@ pub const App = struct {
             .oid = owned_oid,
             .ahead_behind = target.ahead_behind,
         };
-        self.clearDiffSelection();
+        self.reviewNavigation().clearDiffSelection();
         self.overlay.openPushBranch();
     }
 
@@ -2943,7 +2681,7 @@ pub const App = struct {
             .ahead = target.ahead,
             .behind = target.behind,
         };
-        self.clearDiffSelection();
+        self.reviewNavigation().clearDiffSelection();
         self.overlay.openPullBranch();
     }
 
@@ -3106,7 +2844,7 @@ pub const App = struct {
         owned_current_branch = &.{};
         owned_current_oid = &.{};
         self.branch_switch_load_pending = generation;
-        self.clearDiffSelection();
+        self.reviewNavigation().clearDiffSelection();
         self.overlay.openSwitchBranch();
         errdefer self.clearBranchSwitch(ctx.allocator());
 
@@ -3177,7 +2915,7 @@ pub const App = struct {
         self.push_error_message = try allocator.dupe(u8, message);
         self.push_retry_target = retry_target;
         self.push_retry_credentials_available = retry_target != null and credentials_available;
-        self.clearDiffSelection();
+        self.reviewNavigation().clearDiffSelection();
         self.overlay.openPushError();
     }
 
@@ -3210,7 +2948,7 @@ pub const App = struct {
         if (self.push_retry_target) |*existing| existing.deinit(allocator);
         self.push_retry_target = target;
         self.push_retry_credentials_available = credentials_available;
-        self.clearDiffSelection();
+        self.reviewNavigation().clearDiffSelection();
         self.overlay.openPushError();
     }
 
@@ -3324,7 +3062,7 @@ pub const App = struct {
         prompt.* = .{ .target = target };
         self.cancelPushCredentialPrompt(ctx.allocator());
         self.push_credential_prompt = prompt;
-        self.clearDiffSelection();
+        self.reviewNavigation().clearDiffSelection();
         self.overlay.openPushCredentials();
     }
 
@@ -3590,7 +3328,7 @@ pub const App = struct {
         if (!self.actions.finish(result.pending)) return;
 
         if (self.setActionFailureStatus("stage", result.result)) {
-            self.clearPendingSelectionRestore(ctx.allocator());
+            self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
             return;
         }
 
@@ -3623,7 +3361,7 @@ pub const App = struct {
         if (!self.actions.finish(result.pending)) return;
 
         if (self.setActionFailureStatus("unstage", result.result)) {
-            self.clearPendingSelectionRestore(ctx.allocator());
+            self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
             return;
         }
 
@@ -3660,7 +3398,7 @@ pub const App = struct {
         if (!self.actions.finish(result.pending)) return;
 
         if (self.setActionFailureStatus("discard", result.result)) {
-            self.clearPendingSelectionRestore(ctx.allocator());
+            self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
             return;
         }
 
@@ -3907,8 +3645,8 @@ pub const App = struct {
                 const reviewed_clear_failed = if (self.pages.review.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
                 self.pages.review.staged_hunks.clearRepo(ctx.allocator(), result.repo_root);
                 if (active_matches) {
-                    self.clearPendingSelectionRestore(ctx.allocator());
-                    self.clearSearch();
+                    self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
+                    self.reviewNavigation().clearSearch();
                     self.setStatus("switched branch: {s} -> {s}", .{ result.old_branch, result.new_branch });
                     if (reviewed_clear_failed) self.setStatus("switched branch: {s} -> {s}; could not clear reviewed marks", .{ result.old_branch, result.new_branch });
                     try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = true, .kind = .action_result });
@@ -4179,18 +3917,18 @@ pub const App = struct {
     }
 
     fn editorTargetIsDeleted(self: *const App, repo_root: []const u8, path_key: []const u8) bool {
-        if (self.freshStatusEntryForPathKey(repo_root, path_key)) |entry| {
+        if (self.reviewNavigationView().freshStatusEntryForPathKey(repo_root, path_key)) |entry| {
             return entry.worktree == .deleted or (entry.index == .deleted and !entry.isUnstaged());
         }
 
-        const file = self.selectedFile() orelse return false;
+        const file = self.reviewNavigationView().selectedFile() orelse return false;
         const selected_key = diff_file.canonicalPathKey(file) orelse return false;
         if (!std.mem.eql(u8, selected_key, path_key)) return false;
         return diff_file.status(file) == .deleted;
     }
 
     fn editorTargetLine(self: *const App) ?u32 {
-        const file = self.selectedFile() orelse return null;
+        const file = self.reviewNavigationView().selectedFile() orelse return null;
         return switch (self.pages.review.viewer.diff_cursor) {
             .hunk_line => |line| worktreeLineForHunkLine(file, line.hunk_index, line.line_index),
             .hunk_header => |hunk_index| worktreeLineForHunkLine(file, hunk_index, 0),
@@ -4324,7 +4062,7 @@ pub const App = struct {
             self.setStatus("no hunk selected", .{});
             return;
         };
-        const file = self.displayedDiffFile() orelse {
+        const file = self.reviewNavigationView().displayedDiffFile() orelse {
             self.setStatus("no hunk selected", .{});
             return;
         };
@@ -4346,7 +4084,7 @@ pub const App = struct {
     }
 
     fn copyDiffSelection(self: *App, ctx: *chasen.Ctx(Msg), selection: diff_selection.DragSelection) !void {
-        const target = self.normalLoadedDiffSelectionTarget(selection.identity) orelse return;
+        const target = self.reviewNavigationView().normalLoadedDiffSelectionTarget(selection.identity) orelse return;
         const text = try diff_selection.copyText(ctx.allocator(), target.file, selection);
         defer ctx.allocator().free(text);
         self.queueClipboardCopy(ctx, .{
@@ -4356,7 +4094,7 @@ pub const App = struct {
     }
 
     fn copyDiffHeaderPath(self: *App, ctx: *chasen.Ctx(Msg), selection: diff_selection.HeaderPathSelection) void {
-        const target = self.displayedDiffHeaderTarget(selection.identity) orelse return;
+        const target = self.reviewNavigationView().displayedDiffHeaderTarget(selection.identity) orelse return;
         self.queueClipboardCopy(ctx, .{
             .label = "file path",
             .text = target.display_path,
@@ -4435,12 +4173,12 @@ pub const App = struct {
             .hunk_line => |line| line,
             .metadata, .binary_marker, .hunk_header => return null,
         };
-        const file = self.displayedDiffFile() orelse return null;
+        const file = self.reviewNavigationView().displayedDiffFile() orelse return null;
         if (coordinate.hunk_index >= file.hunks.len) return null;
         const hunk = file.hunks[coordinate.hunk_index];
         if (coordinate.line_index >= hunk.lines.len) return null;
 
-        return switch (self.effectiveDisplayMode()) {
+        return switch (self.reviewNavigationView().effectiveDisplayMode()) {
             .unified => hunk.lines[coordinate.line_index].text,
             .side_by_side => sideBySideLineCopyText(hunk, coordinate.line_index),
         };
@@ -4733,7 +4471,7 @@ pub const App = struct {
 
         // Capture this before clearLoadedDiff(): the previous loaded session is
         // what distinguishes first load from reload/restore paths.
-        const had_loaded_before = self.activeLoadedDiffConst() != null;
+        const had_loaded_before = self.reviewNavigationView().activeLoadedDiffConst() != null;
         const had_pending_restore = self.pages.review.pending_selection_restore != null;
 
         switch (result) {
@@ -4758,7 +4496,7 @@ pub const App = struct {
                 return;
             },
             .loaded => |*bundle| {
-                const current_loaded = self.activeLoadedDiffConst();
+                const current_loaded = self.reviewNavigationView().activeLoadedDiffConst();
                 const consumed_pending_is_watch = if (pending_reload) |pending| pending.kind == .watch else false;
                 const texts_equal = consumed_pending_is_watch and if (current_loaded) |loaded|
                     std.mem.eql(u8, loaded.text, bundle.loaded.text)
@@ -4794,7 +4532,7 @@ pub const App = struct {
                 var arena = bundle.takeArena();
                 errdefer arena.deinit();
 
-                try self.materializeReviewedFiles(ctx.allocator(), &loaded);
+                try self.reviewNavigation().materializeReviewedFiles(ctx.allocator(), &loaded);
                 errdefer ctx.allocator().free(loaded.reviewed_files);
 
                 if (self.pages.review.review_display.hide_reviewed_files or self.pages.review.review_display.changed_file_filter != .all) {
@@ -4815,28 +4553,28 @@ pub const App = struct {
                 }
                 _ = self.acceptSourceFingerprint(bundle.fingerprint);
 
-                const active_loaded = self.activeLoadedDiff().?;
+                const active_loaded = self.reviewNavigation().activeLoadedDiff().?;
                 const restored_from_anchor = if (self.pages.review.pending_display_navigation_restore) |*restore|
-                    self.restoreReloadAnchor(active_loaded, restore.authoritative())
+                    self.reviewNavigation().restoreReloadAnchor(active_loaded, restore.authoritative())
                 else if (pending_reload) |*pending|
-                    if (pending.anchor) |*anchor| self.restoreReloadAnchor(active_loaded, anchor) else false
+                    if (pending.anchor) |*anchor| self.reviewNavigation().restoreReloadAnchor(active_loaded, anchor) else false
                 else
                     false;
                 if (restored_from_anchor) {
-                    self.clampSelection(active_loaded.document.files.len);
-                    self.clampDiffNavigation();
+                    self.reviewNavigation().clampSelection(active_loaded.document.files.len);
+                    self.reviewNavigation().clampDiffNavigation();
                 } else {
                     if (!had_loaded_before and !had_pending_restore) {
-                        self.selectFirstVisibleFile(active_loaded);
+                        self.reviewNavigation().selectFirstVisibleFile(active_loaded);
                     } else {
-                        self.syncSidebarNodeToSelectedFile(active_loaded);
+                        self.reviewNavigation().syncSidebarNodeToSelectedFile(active_loaded);
                     }
-                    self.clampSelection(active_loaded.document.files.len);
+                    self.reviewNavigation().clampSelection(active_loaded.document.files.len);
                     if (self.pages.review.review_display.hide_reviewed_files) {
-                        self.reconcileSelectionAfterVisibleNodeChange(active_loaded);
+                        self.reviewNavigation().reconcileSelectionAfterVisibleNodeChange(active_loaded);
                     }
-                    self.clampDiffNavigation();
-                    self.refreshSearchForSelectedFile();
+                    self.reviewNavigation().clampDiffNavigation();
+                    self.reviewNavigation().refreshSearchForSelectedFile();
                 }
                 can_project_status = true;
             },
@@ -4855,7 +4593,7 @@ pub const App = struct {
                     return;
                 }
                 self.clearSourceDisplay();
-                self.clearPendingSelectionRestore(ctx.allocator());
+                self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
                 try self.storeFailedMessage(ctx.allocator(), git_ops.trimGitOutput(message));
             },
             .failed_static => |message| {
@@ -4872,7 +4610,7 @@ pub const App = struct {
                     return;
                 }
                 self.clearSourceDisplay();
-                self.clearPendingSelectionRestore(ctx.allocator());
+                self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
                 try self.storeFailedMessage(ctx.allocator(), message);
             },
         }
@@ -4946,7 +4684,7 @@ pub const App = struct {
                     self.pages.review.git_status.clear();
                 }
                 self.pages.review.pending_initial_first_visible_selection = false;
-                self.clearPendingSelectionRestore(ctx.allocator());
+                self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
@@ -4957,7 +4695,7 @@ pub const App = struct {
                     self.pages.review.git_status.clear();
                 }
                 self.pages.review.pending_initial_first_visible_selection = false;
-                self.clearPendingSelectionRestore(ctx.allocator());
+                self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{message});
             },
         }
@@ -5063,7 +4801,7 @@ pub const App = struct {
                 } else if (local_navigation) |*anchor| {
                     self.restoreDisplayedNavigation(anchor);
                 } else {
-                    self.refreshSearchForSelectedFile();
+                    self.reviewNavigation().refreshSearchForSelectedFile();
                 }
                 consumed = true;
             },
@@ -5102,23 +4840,23 @@ pub const App = struct {
 
     fn restoreDisplayedNavigation(self: *App, anchor: *const review_page.ReloadAnchor) void {
         self.pages.review.viewer.diff_cursor = anchor.diff_cursor;
-        if (self.selectedDiffCursorOffset() == null) {
+        if (self.reviewNavigationView().selectedDiffCursorOffset() == null) {
             if (anchor.diff_cursor_offset) |offset| {
-                const line_count = self.displayedDiffLineCount();
+                const line_count = self.reviewNavigationView().displayedDiffLineCount();
                 if (line_count > 0) {
-                    self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(@min(offset, line_count - 1)) orelse self.pages.review.viewer.diff_cursor;
+                    self.pages.review.viewer.diff_cursor = self.reviewNavigationView().selectedCoordinateAtOffset(@min(offset, line_count - 1)) orelse self.pages.review.viewer.diff_cursor;
                 }
             }
         }
-        if (self.selectedDiffCursorOffset() == null) self.initializeDiffCursorForSelectedFile();
+        if (self.reviewNavigationView().selectedDiffCursorOffset() == null) self.reviewNavigation().initializeDiffCursorForSelectedFile();
         self.pages.review.viewer.diff_scroll = anchor.diff_scroll;
         self.pages.review.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
         self.pages.review.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
-        self.clampDiffNavigation();
-        self.keepDiffCursorVisible();
-        self.restoreSearchFromReloadAnchor(anchor);
-        self.clampSidebarHorizontalScroll();
-        self.clampDiffHorizontalScrollToVisibleRows();
+        self.reviewNavigation().clampDiffNavigation();
+        self.reviewNavigation().keepDiffCursorVisible();
+        self.reviewNavigation().restoreSearchFromReloadAnchor(anchor);
+        self.reviewNavigation().clampSidebarHorizontalScroll();
+        self.reviewNavigation().clampDiffHorizontalScrollToVisibleRows();
     }
 
     fn applyStatusProjection(self: *App, allocator: std.mem.Allocator, prefer_first_visible_file: bool) !void {
@@ -5129,20 +4867,20 @@ pub const App = struct {
         if (status_document.entries.len == 0) {
             if (self.pages.review.pending_selection_restore != null and
                 (self.pages.review.load.hasPending() or self.pages.review.status_load.isPending())) return;
-            if (self.activeLoadedDiff()) |loaded| {
+            if (self.reviewNavigation().activeLoadedDiff()) |loaded| {
                 if (loadedDiffIsStatusOnly(loaded)) {
                     self.clearLoadedDiff();
                     self.pages.review.load.replaceEmpty(allocator, .no_changes);
-                    self.clearPendingSelectionRestore(allocator);
+                    self.reviewNavigation().clearPendingSelectionRestore(allocator);
                     return;
                 }
-                if (self.restorePendingSelectionByPath(allocator, loaded)) return;
+                if (self.reviewNavigation().restorePendingSelectionByPath(allocator, loaded)) return;
             }
-            self.clearPendingSelectionRestore(allocator);
+            self.reviewNavigation().clearPendingSelectionRestore(allocator);
             return;
         }
 
-        if (self.activeLoadedDiff()) |loaded| {
+        if (self.reviewNavigation().activeLoadedDiff()) |loaded| {
             try self.rebuildLoadedTreeWithStatus(allocator, loaded, prefer_first_visible_file);
             return;
         }
@@ -5162,12 +4900,12 @@ pub const App = struct {
     }
 
     fn rebuildLoadedTreeWithStatus(self: *App, app_allocator: std.mem.Allocator, loaded: *LoadedDiff, prefer_first_visible_file: bool) !void {
-        const allocator = self.loadArenaAllocator() orelse return;
-        const previous_path_key = self.selectedStagePathKey();
-        try self.ensureTreeOrderScope(app_allocator);
+        const allocator = self.reviewNavigation().loadArenaAllocator() orelse return;
+        const previous_path_key = self.reviewNavigationView().selectedStagePathKey();
+        try self.reviewNavigation().ensureTreeOrderScope(app_allocator);
         loaded.tree = try file_tree.buildWithOptions(allocator, loaded.document, self.pages.review.git_status.document, .{
-            .root = self.fileTreeRootOptions(),
-            .stable_order = self.stableOrderOptions(app_allocator),
+            .root = self.reviewNavigationView().fileTreeRootOptions(),
+            .stable_order = self.reviewNavigation().stableOrderOptions(app_allocator),
         });
         try loaded.rebuildVisibleNodes(allocator, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
         // Status can finish before the diff reload triggered by a Git action.
@@ -5175,15 +4913,15 @@ pub const App = struct {
         // pending path restore for the incoming loaded diff.
         if (self.pages.review.pending_selection_restore != null and self.pages.review.load.hasPending()) return;
         if (prefer_first_visible_file) {
-            self.selectFirstVisibleFile(loaded);
-        } else if (!self.restorePendingSelectionOrFallback(app_allocator, loaded)) {
+            self.reviewNavigation().selectFirstVisibleFile(loaded);
+        } else if (!self.reviewNavigation().restorePendingSelectionOrFallback(app_allocator, loaded)) {
             if (previous_path_key) |path_key| {
-                if (findNodeByPathKey(loaded, path_key)) |node_index| {
-                    self.selectSidebarNode(loaded, node_index);
+                if (review_navigation.findNodeByPathKey(loaded, path_key)) |node_index| {
+                    self.reviewNavigation().selectSidebarNode(loaded, node_index);
                     return;
                 }
             }
-            self.reconcileSelectionAfterVisibleNodeChange(loaded);
+            self.reviewNavigation().reconcileSelectionAfterVisibleNodeChange(loaded);
         }
     }
 
@@ -5193,13 +4931,13 @@ pub const App = struct {
         const arena_allocator = arena.allocator();
 
         const document = diff_parser.DiffDocument{ .files = &.{} };
-        try self.ensureTreeOrderScope(allocator);
+        try self.reviewNavigation().ensureTreeOrderScope(allocator);
         var loaded: LoadedDiff = .{
             .text = "",
             .document = document,
             .tree = try file_tree.buildWithOptions(arena_allocator, document, status_document, .{
-                .root = self.fileTreeRootOptions(),
-                .stable_order = self.stableOrderOptions(allocator),
+                .root = self.reviewNavigationView().fileTreeRootOptions(),
+                .stable_order = self.reviewNavigation().stableOrderOptions(allocator),
             }),
             .rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document),
             .collapsed_hunks = &.{},
@@ -5219,18 +4957,18 @@ pub const App = struct {
             .reviewed_files_owned = false,
         });
 
-        const active_loaded = self.activeLoadedDiff().?;
+        const active_loaded = self.reviewNavigation().activeLoadedDiff().?;
         var visible_index: usize = 0;
         while (visible_index < active_loaded.visibleNodeCount()) : (visible_index += 1) {
             const node_index = active_loaded.visibleNodeAt(visible_index) orelse continue;
             if (active_loaded.tree.nodes[node_index].target == .directory or active_loaded.tree.nodes[node_index].target == .repo_root) continue;
             self.pages.review.viewer.selected_node = node_index;
-            self.selectSidebarNode(active_loaded, node_index);
+            self.reviewNavigation().selectSidebarNode(active_loaded, node_index);
             break;
         }
-        _ = self.restorePendingSelectionOrFallback(allocator, active_loaded);
+        _ = self.reviewNavigation().restorePendingSelectionOrFallback(allocator, active_loaded);
         if (self.pages.review.pending_display_navigation_restore) |*restore| {
-            _ = self.restoreReloadAnchor(active_loaded, restore.authoritative());
+            _ = self.reviewNavigation().restoreReloadAnchor(active_loaded, restore.authoritative());
         }
     }
 
@@ -5240,7 +4978,7 @@ pub const App = struct {
 
     fn clearLoadedDiff(self: *App) void {
         self.advanceSourceSessionRevision();
-        self.clearDiffSelection();
+        self.reviewNavigation().clearDiffSelection();
         self.pages.review.load.clearCurrent(self.allocator);
         // allocator is null only before App.init has completed; deinit paths can
         // still call this while no owned projection/session state exists.
@@ -5253,7 +4991,7 @@ pub const App = struct {
         self.pages.review.viewer.diff_horizontal_scroll = 0;
         self.pages.review.viewer.sidebar_horizontal_scroll = 0;
         self.pages.review.viewer.diff_cursor = .{ .metadata = 0 };
-        self.clearSearchMatch();
+        self.reviewNavigation().clearSearchMatch();
     }
 
     fn advanceSourceSessionRevision(self: *App) void {
@@ -5280,446 +5018,6 @@ pub const App = struct {
         self.clearLoadedDiff();
     }
 
-    fn selectFileDelta(self: *App, delta: i2) void {
-        const loaded = self.activeLoadedDiff() orelse return;
-        if (loaded.tree.nodes.len == 0 or loaded.visibleNodeCount() == 0) return;
-
-        if (delta < 0) {
-            if (loaded.previousVisibleNodeIndex(self.pages.review.viewer.selected_node)) |previous| {
-                self.selectSidebarNode(loaded, previous);
-            }
-        } else if (loaded.nextVisibleNodeIndex(self.pages.review.viewer.selected_node)) |next| {
-            self.selectSidebarNode(loaded, next);
-        }
-        self.clampSelection(loaded.document.files.len);
-        self.clampDiffNavigation();
-    }
-
-    fn selectFileAbsolute(self: *App, index: usize) void {
-        const file_count = self.loadedFileCount() orelse return;
-        if (file_count == 0) return;
-        const target = @min(index, file_count - 1);
-        if (self.selectedDiffFileTarget() == target) {
-            if (self.activeLoadedDiff()) |loaded| {
-                self.syncSidebarNodeToSelectedFile(loaded);
-            }
-            self.clampSelection(file_count);
-            return;
-        }
-        self.setSelectedDiffFile(target);
-        if (self.activeLoadedDiff()) |loaded| {
-            self.syncSidebarNodeToSelectedFile(loaded);
-        }
-        self.resetDiffPosition();
-        self.refreshSearchForSelectedFile();
-        self.clampSelection(file_count);
-        self.clampDiffNavigation();
-    }
-
-    fn selectLastFile(self: *App) void {
-        const file_count = self.loadedFileCount() orelse return;
-        if (file_count == 0) return;
-        self.selectFileAbsolute(file_count - 1);
-    }
-
-    fn selectSidebarNode(self: *App, loaded: *LoadedDiff, node_index: usize) void {
-        if (node_index >= loaded.tree.nodes.len) return;
-        const previous_file = self.selectedDiffFileTarget();
-        self.pages.review.viewer.selected_node = node_index;
-        // File rows change the active diff pane file. Directory rows only move
-        // the sidebar cursor and keep the previous selected target visible.
-        switch (loaded.tree.nodes[node_index].target) {
-            .diff_file => |file_index| {
-                self.setSelectedDiffFile(file_index);
-                if (previous_file == null or file_index != previous_file.?) {
-                    self.resetDiffPosition();
-                    self.refreshSearchForSelectedFile();
-                }
-            },
-            .status_entry => |status_index| {
-                self.clearDiffSelection();
-                self.pages.review.viewer.selected_target = .{ .status_only = status_index };
-                self.resetDiffPosition();
-                self.clearSearchMatch();
-            },
-            .repo_root, .directory => {},
-        }
-    }
-
-    fn fileTreeRootOptions(self: *const App) ?file_tree.RootOptions {
-        const root = self.activeRepoRoot() orelse return null;
-        const base = std.fs.path.basename(root);
-        return .{ .name = if (base.len == 0) root else base };
-    }
-
-    fn toggleSelectedDirectory(self: *App) !void {
-        const loaded = self.activeLoadedDiff() orelse return;
-        if (self.pages.review.viewer.selected_node >= loaded.tree.nodes.len) return;
-        const node = loaded.tree.nodes[self.pages.review.viewer.selected_node];
-        if (node.kind != .directory) return;
-        const allocator = self.loadArenaAllocator() orelse return;
-        try file_tree.toggle(allocator, &loaded.collapsed_dirs, node.path);
-        try loaded.rebuildVisibleNodes(allocator, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
-        self.clampSelection(loaded.document.files.len);
-        self.clampSidebarHorizontalScroll();
-    }
-
-    fn clickSidebarNode(self: *App, node_index: usize) !void {
-        if (self.pages.review.viewer.sidebar_hidden) return;
-        const loaded = self.activeLoadedDiff() orelse return;
-        if (node_index >= loaded.tree.nodes.len) return;
-
-        self.pages.review.viewer.focus = .sidebar;
-        self.selectSidebarNode(loaded, node_index);
-
-        const node = loaded.tree.nodes[node_index];
-        if (node.kind == .directory) try self.toggleSelectedDirectory();
-
-        self.clampSelection(loaded.document.files.len);
-        self.clampDiffNavigation();
-    }
-
-    fn expandSelectedDirectory(self: *App) !void {
-        const loaded = self.activeLoadedDiff() orelse return;
-        if (self.pages.review.viewer.selected_node >= loaded.tree.nodes.len) return;
-        const node = loaded.tree.nodes[self.pages.review.viewer.selected_node];
-        if (node.kind != .directory) return;
-        file_tree.expand(&loaded.collapsed_dirs, node.path);
-        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
-        self.clampSelection(loaded.document.files.len);
-        self.clampSidebarHorizontalScroll();
-    }
-
-    fn collapseOrSelectParentDirectory(self: *App) !void {
-        const loaded = self.activeLoadedDiff() orelse return;
-        if (self.pages.review.viewer.selected_node >= loaded.tree.nodes.len) return;
-        const node = loaded.tree.nodes[self.pages.review.viewer.selected_node];
-        if (node.kind == .directory and !file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) {
-            const allocator = self.loadArenaAllocator() orelse return;
-            try file_tree.collapse(allocator, &loaded.collapsed_dirs, node.path);
-            try loaded.rebuildVisibleNodes(allocator, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
-            self.clampSelection(loaded.document.files.len);
-            self.clampSidebarHorizontalScroll();
-            return;
-        }
-        if (loaded.tree.parentDirectoryNodeIndex(self.pages.review.viewer.selected_node)) |parent| {
-            self.pages.review.viewer.selected_node = parent;
-            self.clampSelection(loaded.document.files.len);
-        }
-    }
-
-    fn scrollDiff(self: *App, direction: VerticalDirection) void {
-        const old_scroll = self.pages.review.viewer.diff_scroll;
-        const old_cursor_offset = self.selectedDiffCursorOffset();
-        switch (direction) {
-            .up => self.pages.review.viewer.diff_scroll -|= 1,
-            .down => self.pages.review.viewer.diff_scroll += 1,
-        }
-        self.clampDiffNavigation();
-        self.syncDiffCursorAfterViewportScroll(direction, old_scroll, old_cursor_offset);
-    }
-
-    fn scrollDiffHorizontal(self: *App, direction: HorizontalDirection) void {
-        const step: usize = 8;
-        switch (direction) {
-            .left => self.pages.review.viewer.diff_horizontal_scroll -|= step,
-            .right => {
-                self.pages.review.viewer.diff_horizontal_scroll += step;
-                self.clampDiffHorizontalScrollToVisibleRows();
-            },
-        }
-    }
-
-    fn scrollSidebarHorizontal(self: *App, direction: HorizontalDirection) void {
-        const step: usize = 4;
-        switch (direction) {
-            .left => self.pages.review.viewer.sidebar_horizontal_scroll -|= step,
-            .right => {
-                self.pages.review.viewer.sidebar_horizontal_scroll += step;
-                self.clampSidebarHorizontalScroll();
-            },
-        }
-    }
-
-    fn clampSidebarHorizontalScroll(self: *App) void {
-        const max_scroll = self.visibleSidebarMaxHorizontalScroll();
-        if (self.pages.review.viewer.sidebar_horizontal_scroll > max_scroll) {
-            self.pages.review.viewer.sidebar_horizontal_scroll = max_scroll;
-        }
-    }
-
-    fn visibleSidebarMaxHorizontalScroll(self: *const App) usize {
-        const loaded = self.activeLoadedDiffConst() orelse return 0;
-        const width = sidebarWidth(self.layoutSize().width, self.pages.review.viewer.sidebar_width);
-        const source = sidebar_view_model.Source{
-            .tree = loaded.tree,
-            .collapsed = &loaded.collapsed_dirs,
-            .reviewed_files = loaded.reviewed_files,
-            .visible_nodes = loaded.materializedVisibleNodes(),
-        };
-
-        var max_scroll: usize = 0;
-        var visible_index: usize = 0;
-        while (visible_index < loaded.visibleNodeCount()) : (visible_index += 1) {
-            const row = sidebar_view_model.rowAt(source, visible_index, self.pages.review.viewer.selected_node) orelse continue;
-            max_scroll = @max(max_scroll, sidebar_view_model.maxHorizontalScroll(row, width));
-        }
-        return max_scroll;
-    }
-
-    fn clampDiffHorizontalScrollToVisibleRows(self: *App) void {
-        const max_scroll = self.visibleBodyTextMaxHorizontalScroll();
-        if (self.pages.review.viewer.diff_horizontal_scroll > max_scroll) {
-            self.pages.review.viewer.diff_horizontal_scroll = max_scroll;
-        }
-    }
-
-    fn visibleBodyTextMaxHorizontalScroll(self: *const App) usize {
-        const file = self.selectedFile() orelse return 0;
-        const mode = self.effectiveDisplayMode();
-        const visible_rows = self.diffVisibleRows();
-        if (visible_rows == 0) return 0;
-
-        const pane_width = self.diffPaneWidth();
-        const line_index = self.selectedFileCachedLineIndex(mode);
-        var max_scroll: usize = 0;
-        var rows = if (line_index) |index|
-            diff_view_model.BodyRowIterator.initAtWithFolded(file, mode, index, self.pages.review.viewer.diff_scroll, self.selectedFoldedHunks())
-        else
-            diff_view_model.BodyRowIterator.initWithFolded(file, mode, self.selectedFoldedHunks());
-        var skipped: usize = if (line_index != null) self.pages.review.viewer.diff_scroll else 0;
-        var visible: usize = 0;
-        while (rows.next()) |body_row| {
-            if (skipped < self.pages.review.viewer.diff_scroll) {
-                skipped += 1;
-                continue;
-            }
-            if (visible >= visible_rows) break;
-            visible += 1;
-            max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(body_row, pane_width, self.pages.review.viewer.view_options.line_numbers));
-        }
-        return max_scroll;
-    }
-
-    fn pageDiff(self: *App, direction: VerticalDirection) void {
-        const rows = self.diffVisibleRows();
-        const step: usize = @max(rows, 1);
-        switch (direction) {
-            .up => self.pages.review.viewer.diff_scroll -|= step,
-            .down => self.pages.review.viewer.diff_scroll += step,
-        }
-        self.clampDiffNavigation();
-    }
-
-    fn moveDiffCursorRows(self: *App, direction: VerticalDirection) void {
-        const current = self.selectedDiffCursorOffset() orelse {
-            self.initializeDiffCursorForSelectedFile();
-            self.applyDiffCursorScrolloff();
-            return;
-        };
-        const line_count = self.displayedDiffLineCount();
-        if (line_count == 0) return;
-        const target = switch (direction) {
-            .up => current -| 1,
-            .down => @min(current + 1, line_count - 1),
-        };
-        self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(target) orelse self.pages.review.viewer.diff_cursor;
-        self.applyDiffCursorScrolloff();
-    }
-
-    fn moveDiffCursorPage(self: *App, direction: VerticalDirection) void {
-        const current = self.selectedDiffCursorOffset() orelse {
-            self.initializeDiffCursorForSelectedFile();
-            self.applyDiffCursorScrolloff();
-            return;
-        };
-        const line_count = self.displayedDiffLineCount();
-        if (line_count == 0) return;
-        const step = @max(self.diffVisibleRows(), 1);
-        const target = switch (direction) {
-            .up => current -| step,
-            .down => @min(current + step, line_count - 1),
-        };
-        self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(target) orelse self.pages.review.viewer.diff_cursor;
-        self.applyDiffCursorScrolloff();
-    }
-
-    fn selectHunkDelta(self: *App, delta: i2) void {
-        const file = self.displayedDiffFile() orelse return;
-        if (file.hunks.len == 0) return;
-
-        const current = self.selectedHunkIndex();
-        const target = if (delta < 0) blk: {
-            if (current) |hunk_index| {
-                if (self.pages.review.viewer.diff_cursor == .hunk_line) break :blk hunk_index;
-                break :blk hunk_index -| 1;
-            }
-            break :blk 0;
-        } else blk: {
-            if (current) |hunk_index| break :blk @min(hunk_index + 1, file.hunks.len - 1);
-            break :blk 0;
-        };
-        self.pages.review.viewer.diff_cursor = .{ .hunk_header = target };
-        self.applyDiffCursorScrolloff();
-    }
-
-    fn toggleSelectedHunkFold(self: *App) void {
-        if (self.activeCombinedProjection() != null) {
-            self.setStatus("hunk fold is unavailable for mixed staged/unstaged view", .{});
-            return;
-        }
-        const loaded = self.activeLoadedDiff() orelse return;
-        const file_index = self.selectedFileIndex(loaded) orelse return;
-        if (file_index >= loaded.document.files.len) return;
-        const file = loaded.document.files[file_index];
-        const hunk_index = self.selectedHunkIndex() orelse return;
-        if (hunk_index >= file.hunks.len) return;
-
-        if (!loaded.isHunkFolded(file_index, hunk_index) and
-            self.currentSearchMatchInHunkBody(hunk_index))
-        {
-            return;
-        }
-
-        const folding = !loaded.isHunkFolded(file_index, hunk_index);
-        loaded.toggleHunkFold(file_index, hunk_index);
-        if (folding) {
-            switch (self.pages.review.viewer.diff_cursor) {
-                .hunk_line => |line| if (line.hunk_index == hunk_index) {
-                    self.pages.review.viewer.diff_cursor = .{ .hunk_header = hunk_index };
-                },
-                else => {},
-            }
-        }
-        self.updateSearchMatchOffset();
-        self.applyDiffCursorScrolloff();
-        self.clampDiffNavigation();
-    }
-
-    fn scrollSelectedHunkIntoView(self: *App) void {
-        const mode = self.effectiveDisplayMode();
-        const hunk_index = self.selectedHunkIndex() orelse return;
-        const target = self.selectedHunkOffset(mode, hunk_index);
-        const visible_rows = self.diffVisibleRows();
-        if (target < self.pages.review.viewer.diff_scroll) {
-            self.pages.review.viewer.diff_scroll = target;
-        } else if (visible_rows > 0 and target >= self.pages.review.viewer.diff_scroll + visible_rows) {
-            self.pages.review.viewer.diff_scroll = target + 1 - visible_rows;
-        }
-    }
-
-    fn clampDiffNavigation(self: *App) void {
-        if (self.selectedFile() == null) {
-            const line_count = self.selectedProjectionLineCount();
-            const visible_rows = self.diffVisibleRows();
-            const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
-            if (self.pages.review.viewer.diff_scroll > max_scroll) self.pages.review.viewer.diff_scroll = max_scroll;
-            return;
-        }
-
-        if (self.selectedDiffCursorOffset() == null) {
-            self.initializeDiffCursorForSelectedFile();
-        }
-
-        const mode = self.effectiveDisplayMode();
-        const line_count = self.selectedFileLineIndex(mode).lineCount();
-        const visible_rows = self.diffVisibleRows();
-        const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
-        if (self.pages.review.viewer.diff_scroll > max_scroll) self.pages.review.viewer.diff_scroll = max_scroll;
-    }
-
-    fn selectedProjectionLineCount(self: *const App) usize {
-        if (self.selectedStatusEntry() == null) return 0;
-        return switch (self.pages.review.review_projection.displayed) {
-            .ready => |ready| switch (ready.value) {
-                .cached_diff => |bundle| if (bundle.loaded.document.files.len > 0)
-                    if (bundle.loaded.cachedRenderedLineIndex(0, self.effectiveDisplayMode())) |index| index.lineCount() else 0
-                else
-                    0,
-                .generated_added_file => |bundle| bundle.file.lines.len + @as(usize, if (bundle.file.truncated) 1 else 0),
-                .combined_hunks => |bundle| bundle.projection.lineIndex(self.effectiveDisplayMode()).lineCount(),
-                .status_body => 1,
-            },
-            .failed => 1,
-            .idle => 0,
-        };
-    }
-
-    fn clampDiffNavigationKeepingHunkVisible(self: *App) void {
-        self.clampDiffNavigation();
-        self.applyDiffCursorScrolloff();
-        self.clampDiffNavigation();
-    }
-
-    fn remapDiffScrollForModeChange(
-        self: *const App,
-        old_mode: diff_render.DisplayMode,
-        new_mode: diff_render.DisplayMode,
-        old_scroll: usize,
-    ) usize {
-        if (old_mode == new_mode) return old_scroll;
-
-        const old_index = self.selectedFileLineIndex(old_mode);
-        const new_index = self.selectedFileLineIndex(new_mode);
-        if (old_index.lineCount() == 0 or new_index.lineCount() == 0) return 0;
-
-        const hunk_index = old_index.hunkIndexAtOffset(old_scroll) orelse {
-            return @min(old_scroll, new_index.lineCount() - 1);
-        };
-
-        const old_hunk_offset = old_index.hunkOffset(hunk_index);
-        const old_hunk_rows = old_index.hunkLineCount(hunk_index);
-        const new_hunk_offset = new_index.hunkOffset(hunk_index);
-        const new_hunk_rows = new_index.hunkLineCount(hunk_index);
-        if (old_hunk_rows == 0 or new_hunk_rows == 0) return @min(new_hunk_offset, new_index.lineCount() - 1);
-
-        const old_local = @min(old_scroll - old_hunk_offset, old_hunk_rows - 1);
-        const new_local = if (old_hunk_rows <= 1)
-            0
-        else
-            old_local * (new_hunk_rows - 1) / (old_hunk_rows - 1);
-        return @min(new_hunk_offset + new_local, new_index.lineCount() - 1);
-    }
-
-    fn resetDiffPosition(self: *App) void {
-        self.pages.review.viewer.diff_scroll = 0;
-        self.initializeDiffCursorForSelectedFile();
-        self.clearSearchMatch();
-    }
-
-    fn enterSearchMode(self: *App) void {
-        if (self.blockUnsupportedSearchTarget()) return;
-        self.clearDiffSelection();
-        self.pages.review.search.input = self.pages.review.search.query;
-        self.pages.review.search.mode = true;
-    }
-
-    fn cancelSearchMode(self: *App) void {
-        self.pages.review.search.input = self.pages.review.search.query;
-        self.pages.review.search.mode = false;
-    }
-
-    fn clearSearch(self: *App) void {
-        self.pages.review.search.mode = false;
-        self.pages.review.search.input = .{};
-        self.pages.review.search.query = .{};
-        self.clearSearchMatch();
-    }
-
-    fn enterFileSearchMode(self: *App) void {
-        self.clearDiffSelection();
-        self.pages.review.file_search_return_focus = if (self.pages.review.viewer.sidebar_hidden) .diff else self.pages.review.viewer.focus;
-        if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .sidebar;
-        self.pages.review.file_search.mode = true;
-        self.pages.review.file_search.input = .{};
-        self.pages.review.file_search.resetNoMatch();
-    }
-
-    fn cancelFileSearchMode(self: *App, allocator: std.mem.Allocator) void {
-        self.pages.review.file_search.deinit(allocator);
-        self.pages.review.viewer.focus = if (self.pages.review.viewer.sidebar_hidden) .diff else self.pages.review.file_search_return_focus;
-    }
-
     fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("finish current git action before switching repos", .{});
@@ -5727,7 +5025,7 @@ pub const App = struct {
         }
 
         self.clearBranchSwitch(allocator);
-        self.clearDiffSelection();
+        self.reviewNavigation().clearDiffSelection();
         self.repo_picker.mode = true;
         self.repo_picker.input_mode = .list;
         self.repo_picker.list.mode = true;
@@ -5936,15 +5234,15 @@ pub const App = struct {
         self.repo_picker.deinit(allocator);
         self.pending_repo_path_recent_source = null;
         self.clearRepoPickerItems(allocator);
-        self.clearPendingSelectionRestore(allocator);
+        self.reviewNavigation().clearPendingSelectionRestore(allocator);
         self.clearPendingReload(allocator);
         self.clearBranchSwitch(allocator);
     }
 
     fn resetViewAfterRepoSwitch(self: *App) void {
-        self.setSelectedDiffFile(0);
+        self.reviewNavigation().setSelectedDiffFile(0);
         self.pages.review.viewer.selected_node = 0;
-        self.clearSearch();
+        self.reviewNavigation().clearSearch();
     }
 
     fn submitRepoPickerPath(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -6129,212 +5427,6 @@ pub const App = struct {
         self.repo_picker_discovery = null;
     }
 
-    fn toggleReviewedFile(self: *App, allocator: std.mem.Allocator) !void {
-        const loaded = self.activeLoadedDiff() orelse return;
-        if (self.pages.review.viewer.selected_node >= loaded.tree.nodes.len) return;
-
-        const file_index = self.selectedFileIndex(loaded) orelse return;
-        if (file_index >= loaded.reviewed_files.len) return;
-        const file = loaded.document.files[file_index];
-        if (self.activeRepoRoot() != null and diff_file.canonicalPathKey(file) == null) return;
-
-        const reviewed = !loaded.reviewed_files[file_index];
-        try self.pages.review.reviewed_store.set(allocator, self.activeRepoRoot(), file, reviewed);
-        loaded.reviewed_files[file_index] = reviewed;
-        if (self.pages.review.review_display.hide_reviewed_files) {
-            try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, true, self.pages.review.review_display.changed_file_filter);
-            self.reconcileSelectionAfterVisibleNodeChange(loaded);
-            self.clampSidebarHorizontalScroll();
-            self.clampDiffNavigation();
-        }
-    }
-
-    fn toggleHideReviewedFiles(self: *App) !void {
-        self.pages.review.review_display.hide_reviewed_files = !self.pages.review.review_display.hide_reviewed_files;
-        const loaded = self.activeLoadedDiff() orelse return;
-        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
-        self.reconcileSelectionAfterVisibleNodeChange(loaded);
-        self.clampSidebarHorizontalScroll();
-        self.clampDiffNavigation();
-    }
-
-    fn cycleChangedFileFilter(self: *App) !void {
-        self.pages.review.review_display.changed_file_filter = self.pages.review.review_display.changed_file_filter.next();
-        const loaded = self.activeLoadedDiff() orelse return;
-        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
-        self.reconcileSelectionAfterVisibleNodeChange(loaded);
-        self.clampSidebarHorizontalScroll();
-        self.clampDiffNavigation();
-    }
-
-    fn submitFileSearch(self: *App, allocator: std.mem.Allocator) !void {
-        const query = std.mem.trim(u8, self.pages.review.file_search.input.slice(), " \t\r\n");
-        if (query.len == 0) {
-            self.cancelFileSearchMode(allocator);
-            return;
-        }
-
-        const loaded = self.activeLoadedDiff() orelse {
-            self.pages.review.file_search.no_match = true;
-            return;
-        };
-        const node_index = try self.findFileNodeWithFilter(allocator, loaded, query) orelse {
-            self.pages.review.file_search.clearFilter(allocator);
-            self.pages.review.file_search.no_match = true;
-            return;
-        };
-
-        // Go-to-file should land on the file row, not on a still-collapsed
-        // parent directory that hides the matched path.
-        file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
-        const load_allocator = self.loadArenaAllocator() orelse {
-            self.pages.review.file_search.clearFilter(allocator);
-            return;
-        };
-        loaded.rebuildVisibleNodes(load_allocator, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter) catch {
-            self.pages.review.file_search.clearFilter(allocator);
-            self.pages.review.file_search.no_match = true;
-            return;
-        };
-        self.selectSidebarNode(loaded, node_index);
-        self.clampSelection(loaded.document.files.len);
-        self.clampDiffNavigation();
-        self.cancelFileSearchMode(allocator);
-    }
-
-    fn submitSearch(self: *App) void {
-        self.pages.review.search.mode = false;
-        if (self.blockUnsupportedSearchTarget()) return;
-        self.pages.review.search.query = self.pages.review.search.input;
-        self.clearSearchMatch();
-        if (self.pages.review.search.query.len == 0) {
-            return;
-        }
-        self.selectSearchMatch(.forward);
-    }
-
-    fn selectSearchMatch(self: *App, direction: diff_search.Direction) void {
-        if (self.blockUnsupportedSearchTarget()) return;
-        const mode = self.effectiveDisplayMode();
-        const target = self.displayedSearchTarget(mode) orelse return;
-        if (self.pages.review.search.query.len == 0) return;
-
-        const line_count = target.line_index.lineCount();
-        if (line_count == 0) return;
-        const base = if (self.pages.review.search.match) |match| match.coordinate else null;
-        const next = diff_search.findMatch(target.file, mode, self.pages.review.search.query.slice(), base, direction) orelse {
-            self.clearSearchMatch();
-            return;
-        };
-        self.unfoldSearchMatchIfNeeded(next);
-        self.setSearchMatch(next);
-        self.pages.review.viewer.diff_cursor = next.coordinate;
-        self.resetDiffHorizontalScroll();
-        self.applyDiffCursorScrolloff();
-        self.clampDiffNavigation();
-    }
-
-    fn refreshSearchForSelectedFile(self: *App) void {
-        self.clearSearchMatch();
-        if (self.pages.review.search.query.len == 0) return;
-        if (self.unsupportedSearchMessage() != null) return;
-        const mode = self.effectiveDisplayMode();
-        const target = self.displayedSearchTarget(mode) orelse return;
-        const next = diff_search.findMatch(target.file, mode, self.pages.review.search.query.slice(), null, .forward) orelse return;
-        self.unfoldSearchMatchIfNeeded(next);
-        self.setSearchMatch(next);
-        self.pages.review.viewer.diff_cursor = next.coordinate;
-        self.applyDiffCursorScrolloff();
-    }
-
-    fn clearSearchMatch(self: *App) void {
-        self.pages.review.search.match = null;
-        self.pages.review.search.match_offset = null;
-    }
-
-    fn setSearchMatch(self: *App, match: diff_search.Match) void {
-        self.pages.review.search.match = match;
-        self.updateSearchMatchOffset();
-    }
-
-    fn updateSearchMatchOffset(self: *App) void {
-        self.pages.review.search.match_offset = null;
-        if (self.unsupportedSearchMessage() != null) {
-            self.clearSearchMatch();
-            return;
-        }
-        const match = self.pages.review.search.match orelse return;
-        const mode = self.effectiveDisplayMode();
-        const target = self.displayedSearchTarget(mode) orelse {
-            self.clearSearchMatch();
-            return;
-        };
-        const offset = diff_view_model.renderedOffsetForCoordinate(target.file, mode, match.coordinate, target.line_index) orelse {
-            self.clearSearchMatch();
-            return;
-        };
-        self.pages.review.search.match_offset = offset;
-    }
-
-    fn blockUnsupportedSearchTarget(self: *App) bool {
-        if (self.unsupportedSearchMessage()) |message| {
-            self.clearSearchMatch();
-            self.setStatus("{s}", .{message});
-            return true;
-        }
-        return false;
-    }
-
-    fn unsupportedSearchMessage(self: *const App) ?[]const u8 {
-        if (self.activeCombinedProjection() != null) {
-            return "search is unavailable for mixed staged/unstaged view";
-        }
-        if (self.activeGeneratedFileProjection() != null) {
-            return "search is unavailable for generated file preview";
-        }
-        if (self.activeCachedDiffProjection() != null) {
-            if (self.selectedStatusEntry()) |entry| {
-                if (entry.index == .added and !entry.isUnstaged()) {
-                    return "search is unavailable for staged new file preview";
-                }
-            }
-        }
-        return null;
-    }
-
-    fn unfoldSearchMatchIfNeeded(self: *App, match: diff_search.Match) void {
-        if (self.activeCombinedProjection() != null or
-            self.activeCachedDiffProjection() != null or
-            self.activeGeneratedFileProjection() != null) return;
-
-        const hunk_index = switch (match.coordinate) {
-            .hunk_line => |line| line.hunk_index,
-            else => return,
-        };
-        const loaded = self.activeLoadedDiff() orelse return;
-        const file_index = self.selectedFileIndex(loaded) orelse return;
-        if (!loaded.isHunkFolded(file_index, hunk_index)) return;
-        loaded.setHunkFolded(file_index, hunk_index, false);
-    }
-
-    fn currentSearchMatchInHunkBody(self: *const App, hunk_index: usize) bool {
-        const match = self.pages.review.search.match orelse return false;
-        return switch (match.coordinate) {
-            .hunk_line => |line| line.hunk_index == hunk_index,
-            else => false,
-        };
-    }
-
-    fn scrollSearchMatchIntoView(self: *App) void {
-        const offset = self.pages.review.search.match_offset orelse return;
-        const visible_rows = self.diffVisibleRows();
-        if (offset < self.pages.review.viewer.diff_scroll) {
-            self.pages.review.viewer.diff_scroll = offset;
-        } else if (visible_rows > 0 and offset >= self.pages.review.viewer.diff_scroll + visible_rows) {
-            self.pages.review.viewer.diff_scroll = offset + 1 - visible_rows;
-        }
-    }
-
     fn finishReview(self: *App, ctx: *chasen.Ctx(Msg), decision: review_session.Decision) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("finish current git action before finishing review", .{});
@@ -6367,7 +5459,7 @@ pub const App = struct {
         return .{
             .repo_root = self.activeRepoRoot(),
             .source = sourceContext(self.config.source),
-            .selected = self.currentSelection(),
+            .selected = self.reviewNavigationView().currentSelection(),
         };
     }
 
@@ -6390,28 +5482,9 @@ pub const App = struct {
         };
     }
 
-    fn currentSelection(self: *const App) ?context.Selection {
-        const target = self.pages.review.viewer.selected_target orelse return null;
-        return switch (target) {
-            .diff_file => |file_index| if (self.activeLoadedDiffConst()) |loaded|
-                self.diffFileSelection(loaded, file_index)
-            else
-                null,
-            .status_only => |status_index| self.statusOnlySelection(status_index),
-        };
-    }
-
-    fn selectedStagePathKey(self: *const App) ?[]const u8 {
-        const selection = self.selectionContext().selected orelse return null;
-        return switch (selection) {
-            .diff_file => |file| file.path_key,
-            .status_only => |status| status.path_key,
-        };
-    }
-
     fn selectedSidebarActionTarget(self: *const App) ?PathTarget {
-        const loaded = self.activeLoadedDiffConst() orelse {
-            const path = self.selectedStagePathKey() orelse return null;
+        const loaded = self.reviewNavigationView().activeLoadedDiffConst() orelse {
+            const path = self.reviewNavigationView().selectedStagePathKey() orelse return null;
             return .{ .path = path, .kind = .file };
         };
         if (self.pages.review.viewer.selected_node >= loaded.tree.nodes.len) return null;
@@ -6444,391 +5517,24 @@ pub const App = struct {
         };
     }
 
-    fn statusEntryForPathKey(self: *const App, path_key: []const u8) ?git_status.StatusEntry {
-        for (self.pages.review.git_status.document.entries) |entry| {
-            const entry_key = entry.canonicalPathKey() orelse continue;
-            if (std.mem.eql(u8, entry_key, path_key)) return entry;
-        }
-        return null;
-    }
-
-    fn freshStatusEntryForPathKey(self: *const App, repo_root: []const u8, path_key: []const u8) ?git_status.StatusEntry {
-        if (!self.pages.review.status_load.isFresh()) return null;
-        const snapshot_root = self.pages.review.git_status.repo_root orelse return null;
-        if (!std.mem.eql(u8, snapshot_root, repo_root)) return null;
-        return self.statusEntryForPathKey(path_key);
-    }
-
-    fn isFreshStagedOnlyPath(self: *const App, repo_root: []const u8, path_key: []const u8) bool {
-        const entry = self.freshStatusEntryForPathKey(repo_root, path_key) orelse return false;
-        return !entry.isConflict() and entry.isStaged() and !entry.isUnstaged();
-    }
-
-    fn setPendingSelectionRestore(self: *App, allocator: std.mem.Allocator, path_key: []const u8) !void {
-        self.clearPendingSelectionRestore(allocator);
-        const visible_row = if (self.activeLoadedDiffConst()) |loaded|
-            loaded.visibleRowOfNode(self.pages.review.viewer.selected_node) orelse 0
-        else
-            0;
-        self.pages.review.pending_selection_restore = .{
-            .path_key = try allocator.dupe(u8, path_key),
-            .visible_row = visible_row,
-        };
-    }
-
-    fn clearPendingSelectionRestore(self: *App, allocator: std.mem.Allocator) void {
-        if (self.pages.review.pending_selection_restore) |*restore| restore.deinit(allocator);
-        self.pages.review.pending_selection_restore = null;
-    }
-
-    fn restorePendingSelectionOrFallback(self: *App, allocator: std.mem.Allocator, loaded: *LoadedDiff) bool {
-        const restore = self.pages.review.pending_selection_restore orelse return false;
-        defer self.clearPendingSelectionRestore(allocator);
-
-        if (findNodeByPathKey(loaded, restore.path_key)) |node_index| {
-            self.selectSidebarNode(loaded, node_index);
-            return true;
-        }
-
-        if (loaded.visibleNodeCount() == 0) {
-            self.pages.review.viewer.selected_target = null;
-            self.pages.review.viewer.selected_node = 0;
-            return true;
-        }
-
-        const row = @min(restore.visible_row, loaded.visibleNodeCount() - 1);
-        if (nearestVisibleFileNode(loaded, row)) |node_index| {
-            self.selectSidebarNode(loaded, node_index);
-            return true;
-        }
-
-        return false;
-    }
-
-    fn restorePendingSelectionByPath(self: *App, allocator: std.mem.Allocator, loaded: *LoadedDiff) bool {
-        const restore = self.pages.review.pending_selection_restore orelse return false;
-        if (findNodeByPathKey(loaded, restore.path_key)) |node_index| {
-            defer self.clearPendingSelectionRestore(allocator);
-            self.selectSidebarNode(loaded, node_index);
-            return true;
-        }
-        return false;
-    }
-
-    fn restoreReloadAnchor(self: *App, loaded: *LoadedDiff, anchor: *const review_page.ReloadAnchor) bool {
-        const selected_same_path = if (findNodeByPathKey(loaded, anchor.path_key)) |node_index| blk: {
-            self.selectSidebarNode(loaded, node_index);
-            break :blk true;
-        } else blk: {
-            if (loaded.visibleNodeCount() == 0) {
-                self.pages.review.viewer.selected_target = null;
-                self.pages.review.viewer.selected_node = 0;
-                self.resetDiffPosition();
-                self.clearSearchMatch();
-                return true;
-            }
-            const row = @min(anchor.visible_sidebar_row, loaded.visibleNodeCount() - 1);
-            if (nearestVisibleFileNode(loaded, row)) |node_index| {
-                self.selectSidebarNode(loaded, node_index);
-                break :blk false;
-            }
-            return false;
-        };
-
-        self.pages.review.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
-        self.pages.review.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
-
-        if (selected_same_path and std.meta.activeTag(self.pages.review.viewer.selected_target.?) == anchor.selected_target_tag) {
-            self.pages.review.viewer.diff_cursor = anchor.diff_cursor;
-            if (self.selectedDiffCursorOffset() == null) {
-                if (anchor.diff_cursor_offset) |offset| {
-                    self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(offset) orelse self.pages.review.viewer.diff_cursor;
-                }
-            }
-        } else if (anchor.diff_cursor_offset) |offset| {
-            self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(offset) orelse self.pages.review.viewer.diff_cursor;
-        }
-
-        if (self.selectedDiffCursorOffset() == null) {
-            self.initializeDiffCursorForSelectedFile();
-        }
-
-        self.pages.review.viewer.diff_scroll = anchor.diff_scroll;
-        self.clampDiffNavigation();
-        self.keepDiffCursorVisible();
-        self.restoreSearchFromReloadAnchor(anchor);
-        self.clampSidebarHorizontalScroll();
-        self.clampDiffHorizontalScrollToVisibleRows();
-        return true;
-    }
-
-    fn keepDiffCursorVisible(self: *App) void {
-        const offset = self.selectedDiffCursorOffset() orelse return;
-        const visible_rows = self.diffVisibleRows();
-        if (offset < self.pages.review.viewer.diff_scroll) {
-            self.pages.review.viewer.diff_scroll = offset;
-        } else if (visible_rows > 0 and offset >= self.pages.review.viewer.diff_scroll + visible_rows) {
-            self.pages.review.viewer.diff_scroll = offset + 1 - visible_rows;
-        }
-        self.clampDiffNavigation();
-    }
-
-    fn restoreSearchFromReloadAnchor(self: *App, anchor: *const review_page.ReloadAnchor) void {
-        self.clearSearchMatch();
-        if (self.pages.review.search.query.len == 0) return;
-
-        if (anchor.search_coordinate) |coordinate| {
-            self.pages.review.search.match = .{ .coordinate = coordinate };
-            self.updateSearchMatchOffset();
-            if (self.pages.review.search.match != null) return;
-        }
-
-        self.refreshSearchForSelectedFile();
-    }
-
-    fn findNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
-        for (loaded.tree.nodes, 0..) |node, index| {
-            const node_key = if (node.path_key.len > 0) node.path_key else node.path;
-            if (std.mem.eql(u8, node_key, path_key)) return index;
-        }
-        return null;
-    }
-
-    fn findFileNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
-        for (loaded.tree.nodes, 0..) |node, index| {
-            if (node.kind != .file) continue;
-            const node_key = if (node.path_key.len > 0) node.path_key else node.path;
-            if (std.mem.eql(u8, node_key, path_key)) return index;
-        }
-        return null;
-    }
-
-    fn nearestVisibleFileNode(loaded: *const LoadedDiff, visible_row: usize) ?usize {
-        var row = visible_row;
-        while (row < loaded.visibleNodeCount()) : (row += 1) {
-            const node_index = loaded.visibleNodeAt(row) orelse continue;
-            if (loaded.tree.nodes[node_index].kind == .file) return node_index;
-        }
-
-        row = @min(visible_row, loaded.visibleNodeCount() - 1);
-        while (true) {
-            const node_index = loaded.visibleNodeAt(row) orelse return null;
-            if (loaded.tree.nodes[node_index].kind == .file) return node_index;
-            if (row == 0) break;
-            row -= 1;
-        }
-        return null;
-    }
-
-    fn diffFileSelection(self: *const App, loaded: *const LoadedDiff, file_index: usize) ?context.Selection {
-        if (file_index >= loaded.document.files.len) return null;
-        const file = loaded.document.files[file_index];
-        return .{ .diff_file = .{
-            .file_index = file_index,
-            .display_path = diff_file.displayPath(file),
-            .path_key = diff_file.canonicalPathKey(file),
-            .hunk_index = if (self.selectedHunkIndex()) |hunk_index|
-                if (hunk_index < file.hunks.len) hunk_index else null
-            else
-                null,
-        } };
-    }
-
-    fn statusOnlySelection(self: *const App, status_index: usize) ?context.Selection {
-        const repo_root = self.activeRepoRoot() orelse return null;
-        const status_root = self.pages.review.git_status.repo_root orelse return null;
-        if (!std.mem.eql(u8, repo_root, status_root)) return null;
-        if (status_index >= self.pages.review.git_status.document.entries.len) return null;
-        const entry = self.pages.review.git_status.document.entries[status_index];
-        const path_key = entry.canonicalPathKey() orelse return null;
-        return .{ .status_only = .{
-            .status_index = status_index,
-            .path_key = path_key,
-        } };
-    }
-
     pub fn selectedStatusEntry(self: *const App) ?git_status.StatusEntry {
-        const target = self.pages.review.viewer.selected_target orelse return null;
-        const status_index = switch (target) {
-            .status_only => |index| index,
-            else => return null,
-        };
-        if (status_index >= self.pages.review.git_status.document.entries.len) return null;
-        return self.pages.review.git_status.document.entries[status_index];
+        return self.reviewNavigationView().selectedStatusEntry();
     }
 
     pub fn selectedStatusLineStats(self: *const App) ?file_tree.Stats {
-        const entry = self.selectedStatusEntry() orelse return null;
-        const path_key = entry.canonicalPathKey() orelse return null;
-        for (self.pages.review.git_status.document.line_stats) |line_stats| {
-            if (std.mem.eql(u8, line_stats.path_key, path_key)) return line_stats.stats;
-        }
-        return null;
+        return self.reviewNavigationView().selectedStatusLineStats();
     }
 
-    fn ensureTreeOrderScope(self: *App, allocator: std.mem.Allocator) !void {
-        const scope = try self.treeOrderScopeText(allocator);
-        defer allocator.free(scope);
-
-        if (self.pages.review.tree_order_scope) |current| {
-            if (std.mem.eql(u8, current, scope)) return;
-            allocator.free(current);
-            self.pages.review.tree_order_scope = null;
-            self.pages.review.tree_order.reset(allocator);
-        }
-
-        self.pages.review.tree_order_scope = try allocator.dupe(u8, scope);
-    }
-
-    fn treeOrderScopeText(self: *const App, allocator: std.mem.Allocator) ![]u8 {
-        const repo_root = self.activeRepoRoot() orelse "";
-        return switch (self.config.source) {
-            .unstaged => std.fmt.allocPrint(allocator, "{s}\x1funstaged", .{repo_root}),
-            .cached => std.fmt.allocPrint(allocator, "{s}\x1fcached", .{repo_root}),
-            .range => |range| std.fmt.allocPrint(allocator, "{s}\x1frange\x1f{s}", .{ repo_root, range }),
-            .patch_file => |path| std.fmt.allocPrint(allocator, "{s}\x1fpatch\x1f{s}", .{ repo_root, path }),
-            .stdin => std.fmt.allocPrint(allocator, "{s}\x1fstdin", .{repo_root}),
-            .pager => std.fmt.allocPrint(allocator, "{s}\x1fpager", .{repo_root}),
-            .no_index => |paths| std.fmt.allocPrint(allocator, "{s}\x1fno-index\x1f{s}\x1f{s}", .{ repo_root, paths.left, paths.right }),
-        };
-    }
-
-    fn stableOrderOptions(self: *App, allocator: std.mem.Allocator) ?file_tree.StableOrderOptions {
-        return .{
-            .allocator = allocator,
-            .order = &self.pages.review.tree_order,
-        };
-    }
-
-    fn selectedFile(self: *const App) ?diff_parser.FileDiff {
-        const loaded = self.activeLoadedDiffConst() orelse return null;
-        const file_index = self.selectedFileIndex(loaded) orelse return null;
-        return loaded.document.files[file_index];
-    }
-
-    fn displayedDiffFile(self: *const App) ?diff_parser.FileDiff {
-        if (self.activeCombinedProjection()) |bundle| return bundle.projection.file;
-        if (self.activeCachedDiffProjection()) |bundle| {
-            if (bundle.loaded.document.files.len == 0) return null;
-            return bundle.loaded.document.files[0];
-        }
-        return self.selectedFile();
-    }
-
-    const SearchTarget = struct {
-        file: diff_parser.FileDiff,
-        line_index: diff_view_model.RenderedLineIndex,
-        folded_hunks: []const bool,
-    };
-
-    fn displayedSearchTarget(self: *const App, mode: diff_render.DisplayMode) ?SearchTarget {
-        if (self.activeGeneratedFileProjection() != null) return null;
-        if (self.activeCombinedProjection() != null) return null;
-
-        if (self.activeCachedDiffProjection()) |bundle| {
-            if (bundle.loaded.document.files.len == 0) return null;
-            return .{
-                .file = bundle.loaded.document.files[0],
-                .line_index = bundle.loaded.cachedRenderedLineIndex(0, mode) orelse bundle.loaded.renderedLineIndex(0, mode),
-                .folded_hunks = &.{},
-            };
-        }
-
-        const file = self.displayedDiffFile() orelse return null;
-        return .{
-            .file = file,
-            .line_index = self.selectedFileLineIndex(mode),
-            .folded_hunks = self.selectedFoldedHunks(),
-        };
-    }
-
-    fn displayedGeneratedLineCount(self: *const App) ?usize {
-        const bundle = self.activeGeneratedFileProjection() orelse return null;
-        return bundle.file.lines.len + @as(usize, if (bundle.file.truncated) 1 else 0);
-    }
-
-    fn displayedDiffLineIndex(self: *const App, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
-        if (self.activeCombinedProjection()) |bundle| return bundle.projection.lineIndex(mode);
-        if (self.activeCachedDiffProjection()) |bundle| {
-            if (bundle.loaded.document.files.len == 0) return null;
-            return bundle.loaded.cachedRenderedLineIndex(0, mode);
-        }
-        return null;
-    }
-
-    pub fn activeDiffDisplay(self: *const App, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?ActiveDiffDisplay {
-        if (self.activeCombinedProjection()) |bundle| {
-            const states = bundle.projection.hunk_states;
-            const flags = try allocator.alloc(bool, states.len);
-            for (states, flags) |state, *flag| flag.* = state.state == .staged;
-            return .{ .combined_projection = .{
-                .file = bundle.projection.file,
-                .line_index = bundle.projection.lineIndex(mode),
-                .staged_flags = flags,
-                .hunk_states = states,
-            } };
-        }
-
-        const loaded = self.activeLoadedDiffConst() orelse return null;
-        const file_index = self.selectedFileIndex(loaded) orelse return null;
-        const file = loaded.document.files[file_index];
-        return .{ .loaded = .{
-            .file_index = file_index,
-            .file = file,
-            .line_index = loaded.cachedRenderedLineIndex(file_index, mode),
-            .folded_hunks = loaded.foldedHunksForFile(file_index),
-            .staged_flags = try self.stagedHunkFlagsForFile(allocator, file),
-        } };
+    pub fn activeDiffDisplay(self: *const App, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?review_navigation.ActiveDiffDisplay {
+        return self.reviewNavigationView().activeDiffDisplay(allocator, mode);
     }
 
     pub fn activeGeneratedFileProjection(self: *const App) ?*const app_review_projection.GeneratedFileBundle {
-        return switch (self.pages.review.review_projection.displayed) {
-            .ready => |*ready| blk: {
-                if (ready.request.kind != .generated_added_file or !self.displayedProjectionRequestIsActive(ready.request)) break :blk null;
-                break :blk switch (ready.value) {
-                    .generated_added_file => |*bundle| bundle,
-                    else => null,
-                };
-            },
-            else => null,
-        };
+        return self.reviewNavigationView().activeGeneratedFileProjection();
     }
 
     pub fn activeCachedDiffProjection(self: *const App) ?*const app_load.LoadedDiffBundle {
-        return switch (self.pages.review.review_projection.displayed) {
-            .ready => |*ready| blk: {
-                if (ready.request.kind != .cached_diff or !self.displayedProjectionRequestIsActive(ready.request)) break :blk null;
-                break :blk switch (ready.value) {
-                    .cached_diff => |*bundle| bundle,
-                    else => null,
-                };
-            },
-            else => null,
-        };
-    }
-
-    fn activeCombinedProjection(self: *const App) ?*const app_review_projection.CombinedHunkBundle {
-        return switch (self.pages.review.review_projection.displayed) {
-            .ready => |*ready| blk: {
-                if (ready.request.kind != .combined_hunks or !self.displayedProjectionRequestIsActive(ready.request)) break :blk null;
-                break :blk switch (ready.value) {
-                    .combined_hunks => |*bundle| bundle,
-                    else => null,
-                };
-            },
-            else => null,
-        };
-    }
-
-    fn displayedProjectionRequestIsActive(self: *const App, request: app_review_projection.Request) bool {
-        const repo_root = self.activeRepoRoot() orelse return false;
-        const path_key = self.selectedStagePathKey() orelse return false;
-        return request.matchesDisplayIdentity(
-            repo_root,
-            path_key,
-            reviewProjectionSourceKind(self.config.source),
-            self.pages.review.source_session_revision,
-        );
+        return self.reviewNavigationView().activeCachedDiffProjection();
     }
 
     fn currentCombinedProjection(self: *const App) ?*const app_review_projection.CombinedHunkBundle {
@@ -6842,396 +5548,25 @@ pub const App = struct {
             self.pages.review.source_session_revision,
             self.pages.review.status_snapshot_revision,
         )) return null;
-        return self.activeCombinedProjection();
-    }
-
-    fn selectedFileLineIndex(self: *const App, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {
-        if (self.displayedDiffLineIndex(mode)) |index| return index;
-        const loaded = self.activeLoadedDiffConst() orelse return .{ .mode = mode };
-        const file_index = self.selectedFileIndex(loaded) orelse return .{ .mode = mode };
-        return loaded.renderedLineIndex(file_index, mode);
-    }
-
-    fn displayedDiffLineCount(self: *const App) usize {
-        if (self.displayedGeneratedLineCount()) |line_count| return line_count;
-        return self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
-    }
-
-    fn selectedFileCachedLineIndex(self: *const App, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
-        const loaded = self.activeLoadedDiffConst() orelse return null;
-        const file_index = self.selectedFileIndex(loaded) orelse return null;
-        return loaded.cachedRenderedLineIndex(file_index, mode);
-    }
-
-    fn selectedFoldedHunks(self: *const App) []const bool {
-        if (self.activeCombinedProjection() != null or self.activeCachedDiffProjection() != null) return &.{};
-        const loaded = self.activeLoadedDiffConst() orelse return &.{};
-        const file_index = self.selectedFileIndex(loaded) orelse return &.{};
-        return loaded.foldedHunksForFile(file_index);
-    }
-
-    fn selectedHunkOffset(self: *const App, mode: diff_render.DisplayMode, hunk_index: usize) usize {
-        if (self.activeCombinedProjection()) |bundle| return bundle.projection.lineIndex(mode).hunkOffset(hunk_index);
-        const loaded = self.activeLoadedDiffConst() orelse return 0;
-        const file_index = self.selectedFileIndex(loaded) orelse return 0;
-        if (loaded.rendered_line_cache.indexFor(file_index, mode)) |index| return index.hunkOffset(hunk_index);
-        return diff_view_model.hunkBodyLineOffsetFolded(loaded.document.files[file_index], mode, hunk_index, loaded.foldedHunksForFile(file_index));
+        return self.reviewNavigationView().activeCombinedProjection();
     }
 
     pub fn selectedHunkIndex(self: *const App) ?usize {
-        return switch (self.pages.review.viewer.diff_cursor) {
-            .hunk_header => |hunk_index| hunk_index,
-            .hunk_line => |line| line.hunk_index,
-            .metadata, .binary_marker => null,
-        };
-    }
-
-    pub fn stagedHunkFlagsForFile(self: *const App, allocator: std.mem.Allocator, file: diff_parser.FileDiff) ![]const bool {
-        if (self.pages.review.staged_hunks.items.items.len == 0 or file.hunks.len == 0) return &.{};
-        const repo_root = self.activeRepoRoot() orelse return &.{};
-        const path = diff_file.canonicalPathKey(file) orelse return &.{};
-
-        var marked_count: usize = 0;
-        for (0..file.hunks.len) |hunk_index| {
-            if (self.pages.review.staged_hunks.contains(repo_root, path, hunk_index)) marked_count += 1;
-        }
-
-        if (marked_count == 0) return &.{};
-        if (marked_count == file.hunks.len and self.isFreshStagedOnlyPath(repo_root, path)) return &.{};
-
-        const flags = try allocator.alloc(bool, file.hunks.len);
-        @memset(flags, false);
-        for (flags, 0..) |*flag, hunk_index| {
-            flag.* = self.pages.review.staged_hunks.contains(repo_root, path, hunk_index);
-        }
-        return flags;
-    }
-
-    fn selectedDiffCursorOffset(self: *const App) ?usize {
-        if (self.displayedGeneratedLineCount()) |line_count| {
-            return switch (self.pages.review.viewer.diff_cursor) {
-                .metadata => |offset| if (offset < line_count) offset else null,
-                else => null,
-            };
-        }
-
-        const mode = self.effectiveDisplayMode();
-        const file = self.displayedDiffFile() orelse return null;
-        const index = self.displayedDiffLineIndex(mode) orelse self.selectedFileCachedLineIndex(mode);
-        return diff_view_model.renderedOffsetForCoordinate(file, mode, self.pages.review.viewer.diff_cursor, index);
-    }
-
-    fn selectedCoordinateAtOffset(self: *const App, offset: usize) ?diff_view_model.BodyCoordinate {
-        if (self.displayedGeneratedLineCount()) |line_count| {
-            if (offset >= line_count) return null;
-            return .{ .metadata = offset };
-        }
-
-        const mode = self.effectiveDisplayMode();
-        const file = self.displayedDiffFile() orelse return null;
-        const index = self.displayedDiffLineIndex(mode) orelse self.selectedFileCachedLineIndex(mode);
-        return diff_view_model.coordinateAtOffset(file, mode, offset, self.selectedFoldedHunks(), index);
-    }
-
-    fn initializeDiffCursorForSelectedFile(self: *App) void {
-        self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(0) orelse .{ .metadata = 0 };
+        return self.reviewNavigationView().selectedHunkIndex();
     }
 
     pub fn visibleDiffCursorOffset(self: *const App) ?usize {
-        const offset = self.selectedDiffCursorOffset() orelse return null;
-        const visible_rows = self.diffVisibleRows();
-        if (offset < self.pages.review.viewer.diff_scroll) return null;
-        if (visible_rows == 0 or offset >= self.pages.review.viewer.diff_scroll + visible_rows) return null;
-        return offset;
-    }
-
-    fn diffCursorIsVisible(self: *const App) bool {
-        return self.visibleDiffCursorOffset() != null;
-    }
-
-    fn applyDiffCursorScrolloff(self: *App) void {
-        const cursor_offset = self.selectedDiffCursorOffset() orelse {
-            self.clampDiffNavigation();
-            return;
-        };
-        const visible_rows = self.diffVisibleRows();
-        if (visible_rows == 0) {
-            self.clampDiffNavigation();
-            return;
-        }
-        const margin = @min(@as(usize, 8), visible_rows / 3);
-        if (cursor_offset < self.pages.review.viewer.diff_scroll + margin) {
-            self.pages.review.viewer.diff_scroll = cursor_offset -| margin;
-        } else {
-            const lower_edge = self.pages.review.viewer.diff_scroll + visible_rows -| margin;
-            if (cursor_offset >= lower_edge) {
-                self.pages.review.viewer.diff_scroll = cursor_offset + margin + 1 - visible_rows;
-            }
-        }
-        self.clampDiffNavigation();
-    }
-
-    fn syncDiffCursorAfterViewportScroll(self: *App, direction: VerticalDirection, old_scroll: usize, old_cursor_offset: ?usize) void {
-        const line_count = self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
-        if (line_count == 0) return;
-        const visible_rows = self.diffVisibleRows();
-        if (visible_rows == 0) return;
-
-        // Mouse-wheel scrolling is viewport-first, but hunk actions still use
-        // the diff cursor. Keep the cursor near the user's visible scroll
-        // position without letting normal scrolloff pull the viewport back.
-        const margin = @min(@as(usize, 8), visible_rows / 3);
-        const target = if (old_cursor_offset) |offset| blk: {
-            if (offset >= old_scroll and offset < old_scroll + visible_rows) {
-                break :blk self.pages.review.viewer.diff_scroll + (offset - old_scroll);
-            }
-            break :blk switch (direction) {
-                .up => self.pages.review.viewer.diff_scroll + margin,
-                .down => self.pages.review.viewer.diff_scroll + visible_rows - 1 -| margin,
-            };
-        } else blk: {
-            break :blk switch (direction) {
-                .up => self.pages.review.viewer.diff_scroll + margin,
-                .down => self.pages.review.viewer.diff_scroll + visible_rows - 1 -| margin,
-            };
-        };
-
-        self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(@min(target, line_count - 1)) orelse self.pages.review.viewer.diff_cursor;
-    }
-
-    fn loadedFileCount(self: *const App) ?usize {
-        const loaded = self.activeLoadedDiffConst() orelse return null;
-        return loaded.document.files.len;
-    }
-
-    fn effectiveDisplayMode(self: *const App) diff_render.DisplayMode {
-        return diff_render.effectiveMode(diff_render.bodyWidth(self.diffPaneWidth()), self.pages.review.viewer.display_mode);
+        return self.reviewNavigationView().visibleDiffCursorOffset();
     }
 
     fn layoutSize(self: *const App) chasen.Size {
         return app_view.shellContentSize(self.terminal_size);
-    }
-
-    fn diffVisibleRows(self: *const App) usize {
-        return diff_render.visibleBodyRows(terminalBodyHeight(self.layoutSize().height));
-    }
-
-    fn diffPaneWidth(self: *const App) u16 {
-        const width = self.layoutSize().width;
-        if (self.pages.review.viewer.sidebar_hidden) return contentWidth(width);
-        const sidebar_width = sidebarWidth(width, self.pages.review.viewer.sidebar_width);
-        if (width <= sidebar_width + 1) return 0;
-        return contentWidth(width - sidebar_width - 1);
-    }
-
-    fn toggleSidebarVisibility(self: *App) void {
-        const previous_width = self.diffPaneWidth();
-        const previous_mode = self.effectiveDisplayMode();
-        self.pages.review.viewer.sidebar_hidden = !self.pages.review.viewer.sidebar_hidden;
-        if (self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .diff;
-        self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
-        if (previous_mode != self.effectiveDisplayMode()) self.clearDiffSelection();
-        self.clampDiffNavigationKeepingHunkVisible();
-        self.updateSearchMatchOffset();
-        self.scrollSearchMatchIntoView();
-        self.clampDiffNavigation();
-    }
-
-    fn adjustSidebarWidth(self: *App, direction: SizeDirection) void {
-        const total_width = self.layoutSize().width;
-        const previous_width = self.diffPaneWidth();
-        const previous_mode = self.effectiveDisplayMode();
-        const current = sidebarWidth(total_width, self.pages.review.viewer.sidebar_width);
-        const step: u16 = 4;
-        const next = switch (direction) {
-            .shrink => if (current > step) current - step else 0,
-            .grow => current +| step,
-        };
-
-        self.pages.review.viewer.sidebar_width = sidebarWidth(total_width, next);
-        self.clampSidebarHorizontalScroll();
-        self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
-        if (previous_mode != self.effectiveDisplayMode()) self.clearDiffSelection();
-        self.clampDiffNavigationKeepingHunkVisible();
-        self.updateSearchMatchOffset();
-        self.scrollSearchMatchIntoView();
-        self.clampDiffNavigation();
-    }
-
-    fn resetDiffHorizontalScroll(self: *App) void {
-        self.pages.review.viewer.diff_horizontal_scroll = 0;
-    }
-
-    fn resetDiffHorizontalScrollIfPaneWidthChanged(self: *App, previous_width: u16) void {
-        if (self.diffPaneWidth() != previous_width) self.resetDiffHorizontalScroll();
-    }
-
-    fn clampSelection(self: *App, file_count: usize) void {
-        if (file_count == 0) {
-            if (self.activeLoadedDiff()) |loaded| {
-                if (loaded.tree.nodes.len > 0) {
-                    self.pages.review.viewer.selected_node = @min(self.pages.review.viewer.selected_node, loaded.tree.nodes.len - 1);
-                    const node = loaded.tree.nodes[self.pages.review.viewer.selected_node];
-                    self.pages.review.viewer.selected_target = switch (node.target) {
-                        .status_entry => |status_index| .{ .status_only = status_index },
-                        .diff_file => |file_index| .{ .diff_file = file_index },
-                        .repo_root, .directory => self.pages.review.viewer.selected_target,
-                    };
-                    return;
-                }
-            }
-            self.pages.review.viewer.selected_target = null;
-            self.pages.review.viewer.selected_file = 0;
-            self.pages.review.viewer.selected_node = 0;
-            return;
-        }
-        if (self.pages.review.viewer.selected_target) |target| {
-            switch (target) {
-                .diff_file => |file_index| if (file_index >= file_count) {
-                    self.setSelectedDiffFile(file_count - 1);
-                },
-                .status_only => |status_index| if (status_index >= self.pages.review.git_status.document.entries.len) {
-                    self.setSelectedDiffFile(file_count - 1);
-                },
-            }
-        } else {
-            self.setSelectedDiffFile(file_count - 1);
-        }
-        if (self.activeLoadedDiff()) |loaded| {
-            if (self.pages.review.viewer.selected_node >= loaded.tree.nodes.len) {
-                self.syncSidebarNodeToSelectedFile(loaded);
-            }
-            if (loaded.visibleAncestorOrSelf(self.pages.review.viewer.selected_node)) |visible_node| {
-                self.pages.review.viewer.selected_node = visible_node;
-            } else if (self.selectedFileIndex(loaded)) |file_index| {
-                if (loaded.tree.selectedNodeIndex(file_index)) |file_node| {
-                    self.pages.review.viewer.selected_node = file_node;
-                }
-            }
-        }
-    }
-
-    fn reconcileSelectionAfterVisibleNodeChange(self: *App, loaded: *LoadedDiff) void {
-        if (loaded.visibleRowOfNode(self.pages.review.viewer.selected_node) != null) {
-            return;
-        }
-
-        if (loaded.firstVisibleFileNode()) |file_node| {
-            self.selectSidebarNode(loaded, file_node);
-            return;
-        }
-
-        if (loaded.visibleAncestorOrSelf(self.pages.review.viewer.selected_node)) |visible_node| {
-            self.selectSidebarNode(loaded, visible_node);
-            return;
-        }
-
-        if (loaded.visibleNodeAt(0)) |node_index| {
-            self.pages.review.viewer.selected_node = node_index;
-        }
-    }
-
-    pub fn selectedFileIndex(self: *const App, loaded: *const LoadedDiff) ?usize {
-        if (loaded.document.files.len == 0) return null;
-        const file_index = self.selectedDiffFileTarget() orelse return null;
-        return @min(file_index, loaded.document.files.len - 1);
-    }
-
-    fn selectedDiffFileTarget(self: *const App) ?usize {
-        const target = self.pages.review.viewer.selected_target orelse return null;
-        return target.diffFileIndex();
-    }
-
-    fn setSelectedDiffFile(self: *App, file_index: usize) void {
-        const same_target = if (self.pages.review.viewer.selected_target) |target|
-            if (target.diffFileIndex()) |current| current == file_index else false
-        else
-            false;
-        if (!same_target) self.clearDiffSelection();
-        self.pages.review.viewer.selected_target = .{ .diff_file = file_index };
-        self.pages.review.viewer.selected_file = file_index;
-    }
-
-    fn syncSidebarNodeToSelectedFile(self: *App, loaded: *const LoadedDiff) void {
-        const file_index = self.selectedFileIndex(loaded) orelse {
-            self.pages.review.viewer.selected_node = 0;
-            return;
-        };
-        self.pages.review.viewer.selected_node = loaded.tree.selectedNodeIndex(file_index) orelse 0;
-    }
-
-    fn selectFirstVisibleFile(self: *App, loaded: *LoadedDiff) void {
-        if (loaded.firstVisibleFileNode()) |node_index| {
-            self.selectSidebarNode(loaded, node_index);
-            return;
-        }
-        // Empty or fully filtered trees keep the existing fallback selection.
-        self.syncSidebarNodeToSelectedFile(loaded);
-    }
-
-    fn materializeReviewedFiles(self: *App, allocator: std.mem.Allocator, loaded: *LoadedDiff) !void {
-        const reviewed_files = try allocator.alloc(bool, loaded.document.files.len);
-        errdefer allocator.free(reviewed_files);
-
-        for (loaded.document.files, 0..) |file, index| {
-            reviewed_files[index] = try self.pages.review.reviewed_store.containsFile(allocator, self.activeRepoRoot(), file);
-        }
-        loaded.reviewed_files = reviewed_files;
-    }
-
-    fn findFileNodeWithFilter(self: *App, allocator: std.mem.Allocator, loaded: *const LoadedDiff, query: []const u8) !?usize {
-        var labels: std.ArrayList([]const u8) = .empty;
-        defer labels.deinit(allocator);
-        var node_indexes: std.ArrayList(usize) = .empty;
-        defer node_indexes.deinit(allocator);
-
-        for (loaded.tree.nodes, 0..) |node, index| {
-            if (node.kind != .file) continue;
-            if (!loaded.shouldIncludeFileNode(index, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter)) continue;
-            try labels.append(allocator, node.path);
-            try node_indexes.append(allocator, index);
-        }
-
-        // ListFilter owns the filtered index arrays, while file path labels
-        // remain borrowed from the active LoadedDiff.
-        try self.pages.review.file_search.filter.applyWithSourceIndexes(allocator, labels.items, node_indexes.items, query);
-        return self.pages.review.file_search.filter.sourceIndex(0);
-    }
-
-    fn loadedDiff(self: *App) ?*LoadedDiff {
-        return self.activeLoadedDiff();
-    }
-
-    fn activeLoadedDiff(self: *App) ?*LoadedDiff {
-        return switch (self.pages.review.load.state) {
-            .loaded => |*session| &session.loaded,
-            else => null,
-        };
-    }
-
-    fn activeLoadedDiffConst(self: *const App) ?*const LoadedDiff {
-        return switch (self.pages.review.load.state) {
-            .loaded => |*session| &session.loaded,
-            else => null,
-        };
-    }
-
-    fn loadArenaAllocator(self: *App) ?std.mem.Allocator {
-        return switch (self.pages.review.load.state) {
-            .loaded => |*session| session.arena.allocator(),
-            .failed => |*failed| failed.arena.allocator(),
-            else => null,
-        };
     }
 };
 
 const footer_rows: u16 = app_view.footer_rows;
 const sidebar_header_rows: u16 = app_view.sidebar_header_rows;
 const diff_body_start_row: u16 = app_view.diff_body_start_row;
-
-fn contentWidth(width: u16) u16 {
-    return app_view.contentWidth(width);
-}
 
 fn terminalBodyHeight(terminal_height: u16) u16 {
     return app_view.terminalBodyHeight(terminal_height);
@@ -7284,51 +5619,6 @@ fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
     return app_view.sidebarWidth(total_width, preferred_width);
 }
 
-fn maxHorizontalScrollForBodyRow(body_row: diff_view_model.BodyRow, pane_width: u16, line_numbers: bool) usize {
-    return switch (body_row) {
-        .unified_line => |line| maxHorizontalScrollForText(line.text, visibleTextWidth(pane_width, diff_render.lineTextStart(line_numbers, .unified))),
-        .side_by_side => |side_row| maxHorizontalScrollForSideBySideRow(side_row, pane_width, line_numbers),
-        else => 0,
-    };
-}
-
-fn maxHorizontalScrollForSideBySideRow(side_row: diff_view_model.SideBySideRow, pane_width: u16, line_numbers: bool) usize {
-    const gutter_col = pane_width / 2;
-    const new_col = gutter_col + 1;
-    const text_col = diff_render.lineTextStart(line_numbers, .side_by_side);
-    const old_text_width: u16 = visibleTextWidth(gutter_col, text_col);
-    const new_width: u16 = if (pane_width > new_col) pane_width - new_col else 0;
-    const new_text_width: u16 = visibleTextWidth(new_width, text_col);
-    var max_scroll: usize = 0;
-    switch (side_row) {
-        .single => |line| {
-            switch (line.kind) {
-                .added => max_scroll = @max(max_scroll, maxHorizontalScrollForText(line.text, new_text_width)),
-                .context => {
-                    max_scroll = @max(max_scroll, maxHorizontalScrollForText(line.text, old_text_width));
-                    max_scroll = @max(max_scroll, maxHorizontalScrollForText(line.text, new_text_width));
-                },
-                else => max_scroll = @max(max_scroll, maxHorizontalScrollForText(line.text, old_text_width)),
-            }
-        },
-        .paired => |pair| {
-            if (pair.removed) |line| max_scroll = @max(max_scroll, maxHorizontalScrollForText(line.text, old_text_width));
-            if (pair.added) |line| max_scroll = @max(max_scroll, maxHorizontalScrollForText(line.text, new_text_width));
-        },
-    }
-    return max_scroll;
-}
-
-fn visibleTextWidth(total_width: u16, text_col: u16) u16 {
-    return if (total_width > text_col) total_width - text_col else 0;
-}
-
-fn maxHorizontalScrollForText(text: []const u8, visible_width: u16) usize {
-    const width = chasen.text.displayWidth(text);
-    if (width <= visible_width) return 0;
-    return width - visible_width;
-}
-
 fn pathLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.lessThan(u8, lhs, rhs);
 }
@@ -7338,216 +5628,6 @@ test "countLines handles empty and trailing newline inputs" {
     try std.testing.expectEqual(@as(usize, 1), app_load.countLines("one"));
     try std.testing.expectEqual(@as(usize, 2), app_load.countLines("one\n"));
     try std.testing.expectEqual(@as(usize, 2), app_load.countLines("one\ntwo"));
-}
-
-test "file selection boundary does not reset diff position" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .diff_scroll = 4,
-                .diff_cursor = .{ .hunk_header = 1 },
-            },
-        } },
-        .terminal_size = .{ .width = 100, .height = 8 },
-    };
-
-    app.selectFileDelta(-1);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
-    try std.testing.expectEqual(@as(usize, 4), app.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(?usize, 1), app.selectedHunkIndex());
-
-    app.selectFileAbsolute(0);
-    try std.testing.expectEqual(@as(usize, 4), app.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(?usize, 1), app.selectedHunkIndex());
-}
-
-test "mode toggle keeps selected hunk visible" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .display_mode = .unified,
-                .diff_cursor = .{ .hunk_header = 1 },
-            },
-        } },
-        .terminal_size = .{ .width = 100, .height = 8 },
-    };
-
-    app.scrollSelectedHunkIntoView();
-    try std.testing.expect(app.pages.review.viewer.diff_scroll > 0);
-
-    app.pages.review.viewer.display_mode = .side_by_side;
-    app.clampDiffNavigationKeepingHunkVisible();
-
-    const file = app_test_support.file_with_hunks;
-    const target = diff_render.hunkBodyLineOffset(file, app.effectiveDisplayMode(), app.selectedHunkIndex().?);
-    const visible_rows = app.diffVisibleRows();
-    try std.testing.expect(target >= app.pages.review.viewer.diff_scroll);
-    try std.testing.expect(visible_rows == 0 or target < app.pages.review.viewer.diff_scroll + visible_rows);
-}
-
-test "sidebar visibility toggle uses full diff width and keeps selection" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .focus = .sidebar,
-                .selected_file = 0,
-                .selected_node = 1,
-                .display_mode = .side_by_side,
-            },
-        } },
-        .terminal_size = .{ .width = 80, .height = 8 },
-    };
-
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
-
-    app.toggleSidebarVisibility();
-
-    try std.testing.expect(app.pages.review.viewer.sidebar_hidden);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
-
-    app.toggleSidebarVisibility();
-
-    try std.testing.expect(!app.pages.review.viewer.sidebar_hidden);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
-}
-
-test "sidebar width adjustment clamps and affects effective mode" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .display_mode = .side_by_side },
-        } },
-        .terminal_size = .{ .width = 104, .height = 8 },
-    };
-
-    try std.testing.expectEqual(@as(?u16, null), app.pages.review.viewer.sidebar_width);
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
-
-    app.adjustSidebarWidth(.shrink);
-    try std.testing.expectEqual(@as(?u16, 30), app.pages.review.viewer.sidebar_width);
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
-
-    app.adjustSidebarWidth(.shrink);
-    try std.testing.expectEqual(@as(?u16, 26), app.pages.review.viewer.sidebar_width);
-    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
-
-    app.adjustSidebarWidth(.grow);
-    try std.testing.expectEqual(@as(?u16, 30), app.pages.review.viewer.sidebar_width);
-}
-
-test "sidebar width remains stored while sidebar is hidden" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .display_mode = .side_by_side },
-        } },
-        .terminal_size = .{ .width = 104, .height = 8 },
-    };
-
-    app.adjustSidebarWidth(.shrink);
-    app.toggleSidebarVisibility();
-    app.adjustSidebarWidth(.shrink);
-
-    try std.testing.expect(app.pages.review.viewer.sidebar_hidden);
-    try std.testing.expectEqual(@as(?u16, 26), app.pages.review.viewer.sidebar_width);
-    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
-
-    app.toggleSidebarVisibility();
-
-    try std.testing.expect(!app.pages.review.viewer.sidebar_hidden);
-    try std.testing.expectEqual(@as(?u16, 26), app.pages.review.viewer.sidebar_width);
-    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
-}
-
-test "horizontal scroll uses diff focus arrows and clamps to visible text" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
-            .viewer = .{ .focus = .diff, .display_mode = .unified },
-        } },
-        .terminal_size = .{ .width = 80, .height = 12 },
-    };
-
-    app.scrollDiffHorizontal(.right);
-    try std.testing.expectEqual(@as(usize, 8), app.pages.review.viewer.diff_horizontal_scroll);
-
-    for (0..20) |_| app.scrollDiffHorizontal(.right);
-    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll > 0);
-    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
-
-    app.scrollDiffHorizontal(.left);
-    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
-}
-
-test "layout changes reset horizontal scroll only when diff pane width changes" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
-            .viewer = .{
-                .display_mode = .side_by_side,
-                .diff_horizontal_scroll = 16,
-            },
-        } },
-        .terminal_size = .{ .width = 100, .height = 8 },
-    };
-
-    app.toggleSidebarVisibility();
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_horizontal_scroll);
-
-    app.pages.review.viewer.diff_horizontal_scroll = 16;
-    app.adjustSidebarWidth(.shrink);
-    try std.testing.expectEqual(@as(usize, 16), app.pages.review.viewer.diff_horizontal_scroll);
-
-    app.toggleSidebarVisibility();
-    app.pages.review.viewer.diff_horizontal_scroll = 16;
-    app.adjustSidebarWidth(.shrink);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_horizontal_scroll);
-}
-
-test "search resync without pane width change keeps horizontal scroll" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
-            .viewer = .{
-                .display_mode = .side_by_side,
-                .sidebar_hidden = true,
-            },
-        } },
-        .terminal_size = .{ .width = 100, .height = 8 },
-    };
-
-    setDiffSearchQuery(&app, "wide");
-    app.submitSearch();
-    app.pages.review.viewer.diff_horizontal_scroll = 16;
-
-    app.adjustSidebarWidth(.shrink);
-
-    try std.testing.expectEqual(@as(usize, 16), app.pages.review.viewer.diff_horizontal_scroll);
-}
-
-test "side-by-side context horizontal clamp checks both columns" {
-    const line = diff_parser.DiffLine{
-        .kind = .context,
-        .text = "0123456789012345678901234567890123456789",
-        .old_line = 1,
-        .new_line = 1,
-    };
-
-    try std.testing.expectEqual(
-        @as(usize, 8),
-        maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, 80, true),
-    );
-    try std.testing.expect(
-        maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, 80, false) <
-            maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, 80, true),
-    );
 }
 
 test "display mode and search navigation reset horizontal scroll" {
@@ -7567,7 +5647,7 @@ test "display mode and search navigation reset horizontal scroll" {
 
     app.pages.review.viewer.diff_horizontal_scroll = 16;
     setDiffSearchQuery(&app, "wide");
-    app.submitSearch();
+    app.reviewNavigation().submitSearch();
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_horizontal_scroll);
 }
 
@@ -7590,7 +5670,7 @@ test "line number toggle clamps horizontal scroll without changing vertical scro
 
     try std.testing.expect(!app.pages.review.viewer.view_options.line_numbers);
     try std.testing.expectEqual(old_scroll, app.pages.review.viewer.diff_scroll);
-    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
+    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll <= app.reviewNavigationView().visibleBodyTextMaxHorizontalScroll());
 }
 
 test "current line copy text uses side-by-side paired new side" {
@@ -7773,13 +5853,13 @@ test "display mode toggle keeps nearby vertical scroll position" {
         } },
         .terminal_size = .{ .width = 140, .height = 8 },
     };
-    app.pages.review.viewer.diff_cursor = app.selectedCoordinateAtOffset(app.pages.review.viewer.diff_scroll) orelse app.pages.review.viewer.diff_cursor;
+    app.pages.review.viewer.diff_cursor = app.reviewNavigationView().selectedCoordinateAtOffset(app.pages.review.viewer.diff_scroll) orelse app.pages.review.viewer.diff_cursor;
 
     try app.update(.toggle_display_mode, undefined);
 
-    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.reviewNavigationView().effectiveDisplayMode());
     try std.testing.expect(app.pages.review.viewer.diff_scroll > 0);
-    try std.testing.expect(app.pages.review.viewer.diff_scroll <= app.selectedFileLineIndex(app.effectiveDisplayMode()).lineCount());
+    try std.testing.expect(app.pages.review.viewer.diff_scroll <= app.reviewNavigationView().selectedFileLineIndex(app.reviewNavigationView().effectiveDisplayMode()).lineCount());
 }
 
 test "display mode toggle brings cursor back into view after wheel scroll" {
@@ -7803,125 +5883,6 @@ test "display mode toggle brings cursor back into view after wheel scroll" {
     try std.testing.expect(app.visibleDiffCursorOffset() != null);
 }
 
-test "mouse diff scroll keeps cursor in the viewport" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .display_mode = .unified,
-                .sidebar_hidden = true,
-                .diff_scroll = 12,
-                .diff_cursor = .{ .hunk_header = 0 },
-            },
-        } },
-        .terminal_size = .{ .width = 140, .height = 8 },
-    };
-
-    try std.testing.expect(app.visibleDiffCursorOffset() == null);
-
-    app.scrollDiff(.down);
-
-    try std.testing.expect(app.visibleDiffCursorOffset() != null);
-}
-
-test "diff cursor initialization skips hidden metadata rows" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffMetadataOnly()),
-        } },
-        .terminal_size = .{ .width = 100, .height = 12 },
-    };
-
-    app.initializeDiffCursorForSelectedFile();
-
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.review.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
-}
-
-test "diff cursor initialization selects binary marker after hidden metadata" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffBinaryOnly()),
-        } },
-        .terminal_size = .{ .width = 100, .height = 12 },
-    };
-
-    app.initializeDiffCursorForSelectedFile();
-
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate.binary_marker, app.pages.review.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
-}
-
-test "diff scroll keeps visible cursor screen position stable" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .display_mode = .unified,
-                .sidebar_hidden = true,
-                .diff_scroll = 3,
-            },
-        } },
-        .terminal_size = .{ .width = 140, .height = 8 },
-    };
-    const old_scroll = app.pages.review.viewer.diff_scroll;
-    const old_offset = old_scroll + 1;
-    app.pages.review.viewer.diff_cursor = app.selectedCoordinateAtOffset(old_offset) orelse return error.ExpectedCoordinate;
-
-    app.scrollDiff(.down);
-
-    const new_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
-    try std.testing.expectEqual(old_offset - old_scroll, new_offset - app.pages.review.viewer.diff_scroll);
-}
-
-test "diff scroll syncs invisible cursor to scrolloff margin" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .display_mode = .unified,
-                .sidebar_hidden = true,
-            },
-        } },
-        .terminal_size = .{ .width = 140, .height = 8 },
-    };
-    const line_count = app.selectedFileLineIndex(app.effectiveDisplayMode()).lineCount();
-    const visible_rows = app.diffVisibleRows();
-    const margin = @min(@as(usize, 8), visible_rows / 3);
-
-    app.pages.review.viewer.diff_scroll = 0;
-    app.pages.review.viewer.diff_cursor = app.selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
-    app.scrollDiff(.up);
-    try std.testing.expectEqual(app.pages.review.viewer.diff_scroll + margin, app.selectedDiffCursorOffset().?);
-
-    app.pages.review.viewer.diff_scroll = line_count - visible_rows;
-    app.pages.review.viewer.diff_cursor = app.selectedCoordinateAtOffset(0) orelse return error.ExpectedCoordinate;
-    app.scrollDiff(.down);
-    try std.testing.expectEqual(app.pages.review.viewer.diff_scroll + visible_rows - 1 -| margin, app.selectedDiffCursorOffset().?);
-}
-
-test "diff row movement continues from wheel-synced visible cursor" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .display_mode = .unified,
-                .sidebar_hidden = true,
-            },
-        } },
-        .terminal_size = .{ .width = 140, .height = 8 },
-    };
-    const line_count = app.selectedFileLineIndex(app.effectiveDisplayMode()).lineCount();
-    app.pages.review.viewer.diff_scroll = 0;
-    app.pages.review.viewer.diff_cursor = app.selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
-
-    app.scrollDiff(.up);
-    const synced_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
-    app.moveDiffCursorRows(.down);
-
-    try std.testing.expectEqual(synced_offset + 1, app.selectedDiffCursorOffset().?);
-}
-
 test "mouse wheel routes through diff scroll cursor sync" {
     var app: App = .{
         .pages = .{ .review = .{
@@ -7943,71 +5904,6 @@ test "mouse wheel routes through diff scroll cursor sync" {
     try std.testing.expect(app.visibleDiffCursorOffset() != null);
 }
 
-test "diff mouse drag starts on selected side and updates on drag only" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .display_mode = .side_by_side,
-                .sidebar_hidden = true,
-            },
-        } },
-        .terminal_size = .{ .width = 140, .height = 10 },
-    };
-
-    const old_point: MousePoint = .{
-        .col = 4,
-        .row = diff_render.body_start_row + 1,
-    };
-    app.pressDiffMouse(old_point);
-    const started = app.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
-    try std.testing.expectEqual(diff_selection.Side.old, started.side);
-    try std.testing.expectEqual(@as(usize, 0), started.focus.hunk_index);
-    try std.testing.expectEqual(@as(usize, 0), started.focus.line_index);
-
-    const motion_msg = app.handleEvent(app_test_support.mouseEventTyped(4, diff_render.body_start_row + 2, .none, .motion));
-    try std.testing.expect(motion_msg == null);
-    const after_motion = app.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
-    try std.testing.expectEqual(@as(usize, 0), after_motion.focus.line_index);
-
-    const new_side_point: MousePoint = .{
-        .col = 72,
-        .row = diff_render.body_start_row + 3,
-    };
-    app.dragDiffMouse(new_side_point);
-    const dragged = app.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
-    try std.testing.expectEqual(diff_selection.Side.old, dragged.side);
-    try std.testing.expectEqual(@as(usize, 2), dragged.focus.line_index);
-    try std.testing.expect(dragged.moved);
-}
-
-test "diff header mouse press starts header path owner only on path target" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .display_mode = .side_by_side,
-                .sidebar_hidden = true,
-            },
-        } },
-        .terminal_size = .{ .width = 140, .height = 10 },
-    };
-
-    app.pressDiffMouse(.{ .col = 1, .row = 0 });
-    const header = app.pages.review.selection_owner.activeHeader() orelse return error.ExpectedHeaderSelection;
-    try std.testing.expectEqual(diff_selection.HeaderKind.loaded_file, header.identity.kind);
-    try std.testing.expectEqualStrings("a", header.identity.path_key);
-
-    app.dragDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.pages.review.selection_owner.activeHeader() != null);
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
-
-    app.clearDiffSelection();
-    app.pressDiffMouse(.{ .col = 120, .row = 0 });
-    try std.testing.expect(app.pages.review.selection_owner.activeHeader() == null);
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
-}
-
 test "diff mouse drag rejects unified fallback and clears on invalidation" {
     var app: App = .{
         .pages = .{ .review = .{
@@ -8020,116 +5916,21 @@ test "diff mouse drag rejects unified fallback and clears on invalidation" {
         .terminal_size = .{ .width = 50, .height = 10 },
     };
 
-    app.pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
+    app.reviewNavigation().pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
     try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
 
     app.terminal_size.width = 140;
-    app.pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
+    app.reviewNavigation().pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
     try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
 
     try app.update(.toggle_display_mode, undefined);
     try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
 
     app.pages.review.viewer.display_mode = .side_by_side;
-    app.pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
+    app.reviewNavigation().pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
     try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
     app.clearLoadedDiff();
     try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
-}
-
-test "sidebar layout fallback clears active diff mouse drag" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .display_mode = .side_by_side,
-                .sidebar_hidden = true,
-            },
-        } },
-        .terminal_size = .{ .width = 90, .height = 10 },
-    };
-
-    app.pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
-
-    app.toggleSidebarVisibility();
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
-}
-
-test "sidebar width growth fallback clears active diff mouse drag" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .display_mode = .side_by_side,
-                .sidebar_hidden = false,
-                .sidebar_width = 31,
-            },
-        } },
-        .terminal_size = .{ .width = 110, .height = 10 },
-    };
-
-    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
-    app.pressDiffMouse(.{ .col = 37, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
-
-    app.adjustSidebarWidth(.grow);
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
-}
-
-test "diff scroll cursor sync keeps search state" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .display_mode = .unified,
-                .sidebar_hidden = true,
-                .diff_scroll = 12,
-                .diff_cursor = .{ .hunk_header = 0 },
-            },
-        } },
-        .terminal_size = .{ .width = 140, .height = 8 },
-    };
-    setDiffSearchQuery(&app, "late new");
-    app.submitSearch();
-    const old_match = app.pages.review.search.match orelse return error.ExpectedSearchMatch;
-    const old_match_offset = app.pages.review.search.match_offset;
-
-    app.scrollDiff(.down);
-
-    try std.testing.expect(std.meta.eql(old_match, app.pages.review.search.match.?));
-    try std.testing.expectEqual(old_match_offset, app.pages.review.search.match_offset);
-}
-
-test "display mode scroll remap preserves hunk-local ratio" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var loaded = app_test_support.loadedDiffOne();
-    loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
-
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(loaded),
-            .viewer = .{
-                .display_mode = .unified,
-                .sidebar_hidden = true,
-            },
-        } },
-        .terminal_size = .{ .width = 140, .height = 8 },
-    };
-
-    const old_index = app.selectedFileLineIndex(.unified);
-    const old_scroll = old_index.hunkOffset(0) + 3;
-    const new_scroll = app.remapDiffScrollForModeChange(.unified, .side_by_side, old_scroll);
-
-    const hunk_index = old_index.hunkIndexAtOffset(old_scroll) orelse return error.ExpectedHunkOffset;
-    const new_index = app.selectedFileLineIndex(.side_by_side);
-    const old_local = old_scroll - old_index.hunkOffset(hunk_index);
-    const expected_local = old_local * (new_index.hunkLineCount(hunk_index) - 1) / (old_index.hunkLineCount(hunk_index) - 1);
-    try std.testing.expectEqual(new_index.hunkOffset(hunk_index) + expected_local, new_scroll);
 }
 
 test "hidden sidebar keeps tab from changing focus" {
@@ -8422,7 +6223,7 @@ test "mouse click toggles sidebar directory rows" {
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedSidebarDirectoryClickMessage;
     try app.update(msg, undefined);
 
-    const loaded = app.loadedDiff().?;
+    const loaded = app.reviewNavigation().loadedDiff().?;
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
@@ -8494,7 +6295,7 @@ test "mouse wheel scrolls the pane under the pointer" {
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
 
-    app.selectFileAbsolute(0);
+    app.reviewNavigation().selectFileAbsolute(0);
     const diff_col = content.col + sidebarWidth(app.layoutSize().width, app.pages.review.viewer.sidebar_width) + 1;
     const diff_msg = app.handleEvent(app_test_support.mouseEvent(diff_col, content.row + 2, .wheel_down)) orelse return error.ExpectedDiffWheelMessage;
     try app.update(diff_msg, undefined);
@@ -8701,178 +6502,6 @@ test "repo picker filter overflow reports status for insert and paste" {
     try std.testing.expectEqualStrings("repository filter is too long", app.status.text());
 }
 
-test "mode change resyncs search match to rendered body offsets" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .display_mode = .unified },
-        } },
-        .terminal_size = .{ .width = 140, .height = 14 },
-    };
-    setDiffSearchQuery(&app, "late new");
-
-    app.submitSearch();
-    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 9), app.pages.review.search.match_offset);
-
-    app.pages.review.viewer.display_mode = .side_by_side;
-    app.clampDiffNavigationKeepingHunkVisible();
-    app.updateSearchMatchOffset();
-
-    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 7), app.pages.review.search.match_offset);
-    try std.testing.expect(app.pages.review.search.match_offset.? >= app.pages.review.viewer.diff_scroll);
-    try std.testing.expect(app.pages.review.search.match_offset.? < app.pages.review.viewer.diff_scroll + app.diffVisibleRows());
-}
-
-test "mode change keeps search near later matches" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .display_mode = .unified },
-        } },
-        .terminal_size = .{ .width = 140, .height = 8 },
-    };
-    setDiffSearchQuery(&app, "new");
-
-    app.submitSearch();
-    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
-    app.selectSearchMatch(.forward);
-    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 9), app.pages.review.search.match_offset);
-
-    app.pages.review.viewer.display_mode = .side_by_side;
-    app.clampDiffNavigationKeepingHunkVisible();
-    app.updateSearchMatchOffset();
-
-    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 7), app.pages.review.search.match_offset);
-}
-
-test "toggle selected hunk fold updates active rendered line cache" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    const allocator = arena.allocator();
-    var loaded = app_test_support.loadedDiffOne();
-    loaded.collapsed_hunks = try allocator.alloc(bool, loaded.document.totalHunks());
-    @memset(loaded.collapsed_hunks, false);
-    loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
-
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(arena, loaded),
-            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
-        } },
-        .terminal_size = .{ .width = 100, .height = 12 },
-    };
-    defer app.clearLoadedDiff();
-
-    try std.testing.expectEqual(@as(usize, 10), app.selectedFileLineIndex(.unified).lineCount());
-    app.toggleSelectedHunkFold();
-
-    const active = app.loadedDiff().?;
-    try std.testing.expect(active.isHunkFolded(0, 0));
-    try std.testing.expectEqual(@as(usize, 5), app.selectedFileLineIndex(.unified).lineCount());
-    try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .unified).hunkLineCount(0));
-    try std.testing.expectEqual(@as(usize, 4), app.selectedFileLineIndex(.side_by_side).lineCount());
-    try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .side_by_side).hunkLineCount(0));
-}
-
-test "search unfolds folded hunk body matches before setting offset" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    const allocator = arena.allocator();
-    var loaded = app_test_support.loadedDiffOne();
-    loaded.collapsed_hunks = try allocator.alloc(bool, loaded.document.totalHunks());
-    @memset(loaded.collapsed_hunks, false);
-    loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
-    loaded.setHunkFolded(0, 0, true);
-
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(arena, loaded),
-        } },
-        .terminal_size = .{ .width = 100, .height = 12 },
-    };
-    defer app.clearLoadedDiff();
-    setDiffSearchQuery(&app, "new");
-
-    app.submitSearch();
-
-    const active = app.loadedDiff().?;
-    try std.testing.expect(!active.isHunkFolded(0, 0));
-    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
-}
-
-test "manual fold keeps hunk open when it contains active search match" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    const allocator = arena.allocator();
-    var loaded = app_test_support.loadedDiffOne();
-    loaded.collapsed_hunks = try allocator.alloc(bool, loaded.document.totalHunks());
-    @memset(loaded.collapsed_hunks, false);
-    loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
-
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(arena, loaded),
-        } },
-        .terminal_size = .{ .width = 100, .height = 12 },
-    };
-    defer app.clearLoadedDiff();
-    setDiffSearchQuery(&app, "new");
-    app.submitSearch();
-
-    app.toggleSelectedHunkFold();
-
-    const active = app.loadedDiff().?;
-    try std.testing.expect(!active.isHunkFolded(0, 0));
-    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
-}
-
-test "file change resyncs retained search query to selected file" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
-            .viewer = .{ .display_mode = .unified },
-        } },
-        .terminal_size = .{ .width = 100, .height = 12 },
-    };
-    setDiffSearchQuery(&app, "target");
-
-    app.selectFileAbsolute(1);
-
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
-    try expectSearchCoordinate(&app, .{ .metadata = 0 });
-    try std.testing.expectEqual(@as(?usize, 0), app.pages.review.search.match_offset);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
-}
-
-test "sidebar navigation can select directories without changing selected file" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-            .viewer = .{
-                .selected_file = 0,
-                .selected_node = 1,
-            },
-        } },
-        .terminal_size = .{ .width = 100, .height = 12 },
-    };
-
-    app.selectFileDelta(-1);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
-
-    app.selectFileDelta(1);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
-
-    app.selectFileDelta(1);
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
-}
-
 test "sidebar navigation keeps status-only target through clamp" {
     var app: App = .{
         .pages = .{ .review = .{
@@ -8893,7 +6522,7 @@ test "sidebar navigation keeps status-only target through clamp" {
     try app.pages.review.git_status.replace("/repo", &status_bundle);
     try app.applyStatusProjection(std.testing.allocator, false);
 
-    const loaded = app.loadedDiff().?;
+    const loaded = app.reviewNavigation().loadedDiff().?;
     const status_node = blk: {
         for (loaded.tree.nodes, 0..) |node, index| {
             switch (node.target) {
@@ -8904,11 +6533,11 @@ test "sidebar navigation keeps status-only target through clamp" {
         return error.ExpectedStatusOnlyNode;
     };
 
-    app.selectSidebarNode(loaded, status_node);
-    app.clampSelection(loaded.document.files.len);
+    app.reviewNavigation().selectSidebarNode(loaded, status_node);
+    app.reviewNavigation().clampSelection(loaded.document.files.len);
 
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expect(app.selectedFileIndex(loaded) == null);
+    try std.testing.expect(app.reviewNavigationView().selectedFileIndex(loaded) == null);
     try std.testing.expect(app.selectedStatusEntry() != null);
 }
 
@@ -8929,11 +6558,11 @@ test "sidebar navigation moves between status-only nodes" {
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
     const first_node = app.pages.review.viewer.selected_node;
 
-    app.selectFileDelta(1);
+    app.reviewNavigation().selectFileDelta(1);
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 1 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expect(app.pages.review.viewer.selected_node != first_node);
 
-    app.selectFileDelta(-1);
+    app.reviewNavigation().selectFileDelta(-1);
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqual(first_node, app.pages.review.viewer.selected_node);
 }
@@ -8955,9 +6584,9 @@ test "pending selection restore waits for status projection after stage" {
     defer app.pages.review.git_status.deinit();
     defer app.pages.review.tree_order.deinit(std.testing.allocator);
     defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
-    defer app.clearPendingSelectionRestore(std.testing.allocator);
+    defer app.reviewNavigation().clearPendingSelectionRestore(std.testing.allocator);
 
-    try app.setPendingSelectionRestore(std.testing.allocator, "b");
+    try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "b");
     app.pages.review.status_load.pending = .{ .generation = 1 };
 
     // Diff reload can finish before the status reload. In that intermediate
@@ -9306,9 +6935,9 @@ test "pending selection restore survives status projection while diff reload is 
     defer app.pages.review.git_status.deinit();
     defer app.pages.review.tree_order.deinit(std.testing.allocator);
     defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
-    defer app.clearPendingSelectionRestore(std.testing.allocator);
+    defer app.reviewNavigation().clearPendingSelectionRestore(std.testing.allocator);
 
-    try app.setPendingSelectionRestore(std.testing.allocator, "b");
+    try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "b");
     app.pages.review.load.pending = .{ .diff_load = app.pages.review.load.generation + 1 };
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
@@ -9335,9 +6964,9 @@ test "pending selection restore clears when status finishes empty after reload" 
         .terminal_size = .{ .width = 100, .height = 12 },
     };
     defer app.clearLoadedDiff();
-    defer app.clearPendingSelectionRestore(std.testing.allocator);
+    defer app.reviewNavigation().clearPendingSelectionRestore(std.testing.allocator);
 
-    try app.setPendingSelectionRestore(std.testing.allocator, "missing.zig");
+    try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "missing.zig");
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.finishStatusLoad(&ctx, .{
@@ -9818,13 +7447,13 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
     };
     defer app.pages.review.reviewed_store.deinit(allocator);
     defer app.pages.review.staged_hunks.deinit(allocator);
-    defer app.clearPendingSelectionRestore(allocator);
+    defer app.reviewNavigation().clearPendingSelectionRestore(allocator);
     defer app.pages.review.tree_order.deinit(allocator);
     defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
 
     try app.pages.review.reviewed_store.set(allocator, app.activeRepoRoot(), app_test_support.files_two[0], true);
     try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 0);
-    try app.setPendingSelectionRestore(allocator, "a");
+    try app.reviewNavigation().setPendingSelectionRestore(allocator, "a");
     setDiffSearchQuery(&app, "needle");
 
     const pending = app.actions.begin(.switch_branch);
@@ -10575,162 +8204,14 @@ test "manual reload clears action selection restore" {
         .allocator = std.testing.allocator,
         .config = .{ .source = .stdin },
     };
-    defer app.clearPendingSelectionRestore(std.testing.allocator);
+    defer app.reviewNavigation().clearPendingSelectionRestore(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app.setPendingSelectionRestore(std.testing.allocator, "src/main.zig");
+    try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "src/main.zig");
 
     try app.update(.reload, &ctx);
 
     try std.testing.expect(app.pages.review.pending_selection_restore == null);
-}
-
-test "toggling selected directory collapses visible descendants" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
-            .viewer = .{
-                .selected_file = 0,
-                .selected_node = 0,
-            },
-        } },
-        .terminal_size = .{ .width = 100, .height = 12 },
-    };
-    defer app.clearLoadedDiff();
-
-    try app.toggleSelectedDirectory();
-
-    const loaded = app.pages.review.load.state.loaded.loaded;
-    try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
-    try std.testing.expectEqual(@as(usize, 1), loaded.tree.visibleNodeCount(&loaded.collapsed_dirs));
-    try std.testing.expect(loaded.visible_nodes.len >= loaded.tree.nodes.len);
-    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
-    try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-}
-
-test "file search selects matching file and expands ancestors" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
-            .viewer = .{
-                .selected_file = 0,
-                .selected_node = 0,
-            },
-            .file_search = .{ .mode = true },
-        } },
-        .terminal_size = .{ .width = 100, .height = 12 },
-    };
-    defer app.clearLoadedDiff();
-
-    var loaded = app.loadedDiff().?;
-    try file_tree.collapse(app.loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
-    setFileSearchInput(&app, "src/b");
-
-    try app.submitFileSearch(std.testing.allocator);
-
-    loaded = app.loadedDiff().?;
-    try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
-    try std.testing.expect(!app.pages.review.file_search.mode);
-}
-
-test "file search keeps prompt open on no match" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-            .file_search = .{ .mode = true },
-        } },
-        .terminal_size = .{ .width = 100, .height = 12 },
-    };
-    setFileSearchInput(&app, "missing");
-
-    defer app.pages.review.file_search.deinit(std.testing.allocator);
-
-    try app.submitFileSearch(std.testing.allocator);
-
-    try std.testing.expect(app.pages.review.file_search.mode);
-    try std.testing.expect(app.pages.review.file_search.no_match);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
-}
-
-test "file search skips hidden reviewed matches" {
-    var reviewed = [_]bool{ true, false };
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
-                .text = "",
-                .document = .{ .files = &app_test_support.files_two },
-                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            }),
-            .file_search = .{ .mode = true },
-            .review_display = .{ .hide_reviewed_files = true },
-        } },
-    };
-    defer app.clearLoadedDiff();
-    try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, true, .all);
-    setFileSearchInput(&app, "src");
-
-    try app.submitFileSearch(std.testing.allocator);
-
-    try std.testing.expect(!app.pages.review.file_search.mode);
-    try std.testing.expect(!app.pages.review.file_search.no_match);
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
-}
-
-test "file search trims empty input and restores focus on cancel" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-            .viewer = .{ .focus = .diff },
-        } },
-        .terminal_size = .{ .width = 100, .height = 12 },
-    };
-
-    app.enterFileSearchMode();
-    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
-    setFileSearchInput(&app, "   ");
-
-    try app.submitFileSearch(std.testing.allocator);
-
-    try std.testing.expect(!app.pages.review.file_search.mode);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
-}
-
-test "file search keeps diff focus while sidebar is hidden" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
-            .viewer = .{ .focus = .diff, .sidebar_hidden = true },
-        } },
-        .terminal_size = .{ .width = 100, .height = 12 },
-    };
-    defer app.clearLoadedDiff();
-
-    app.enterFileSearchMode();
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    setFileSearchInput(&app, "   ");
-
-    try app.submitFileSearch(std.testing.allocator);
-
-    try std.testing.expect(!app.pages.review.file_search.mode);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-
-    app.enterFileSearchMode();
-    setFileSearchInput(&app, "src/b");
-
-    try app.submitFileSearch(std.testing.allocator);
-
-    try std.testing.expect(!app.pages.review.file_search.mode);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
 }
 
 fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette {
@@ -11007,30 +8488,6 @@ test "diff header detail row dims separator when inactive" {
     try ts.expectCellText(0, 1, "─");
     try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.gray));
     try std.testing.expect(ts.surface.readCell(0, 1).?.style.dim);
-}
-
-test "selectedStagePathKey accepts diff and status-only selections" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
-            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
-        } },
-        .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "repo",
-            .display_path = "/repo",
-            .canonical_root = "/repo",
-        } } },
-    };
-    defer app.clearLoadedDiff();
-
-    try std.testing.expectEqualStrings("src/added.zig", app.selectedStagePathKey().?);
-
-    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    defer app.pages.review.git_status.deinit();
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
-    app.pages.review.viewer.selected_target = .{ .status_only = 0 };
-
-    try std.testing.expectEqualStrings("src/new.zig", app.selectedStagePathKey().?);
 }
 
 test "selectionContext keeps status-only selection while status load is pending" {
@@ -11707,9 +9164,9 @@ test "background status refresh retains combined projection while cursor moves" 
     } };
     acceptTestSource(&app);
 
-    const projection_before = app.activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
+    const projection_before = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
     const hunks_before = projection_before.projection.file.hunks.ptr;
-    const cursor_before = app.selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
+    const cursor_before = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
     try std.testing.expect(cursor_before > 0);
 
     _ = app.pages.review.status_load.prepare(true);
@@ -11717,10 +9174,10 @@ test "background status refresh retains combined projection while cursor moves" 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.ensureReviewProjection(&ctx);
 
-    const retained = app.activeCombinedProjection() orelse return error.ExpectedRetainedProjection;
+    const retained = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedRetainedProjection;
     try std.testing.expectEqual(hunks_before, retained.projection.file.hunks.ptr);
-    app.moveDiffCursorRows(.down);
-    const cursor_after = app.selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
+    app.reviewNavigation().moveDiffCursorRows(.down);
+    const cursor_after = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
     try std.testing.expect(cursor_after > cursor_before);
     try std.testing.expect(cursor_after != 0);
     switch (app.selectedHunkToggleOperation()) {
@@ -11766,7 +9223,7 @@ test "unchanged full cycle preserves projection semantic identity" {
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
 
-    const projection_before = app.activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
+    const projection_before = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
     const hunks_before = projection_before.projection.file.hunks.ptr;
     const cursor_before = app.pages.review.viewer.diff_cursor;
     const scroll_before = app.pages.review.viewer.diff_scroll;
@@ -11780,7 +9237,7 @@ test "unchanged full cycle preserves projection semantic identity" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.ensureReviewProjection(&ctx);
 
-    const projection_after = app.activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
+    const projection_after = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
     try std.testing.expectEqual(hunks_before, projection_after.projection.file.hunks.ptr);
     try std.testing.expect(!app.pages.review.review_projection.hasPending());
     try std.testing.expectEqual(@as(u64, 17), app.pages.review.source_session_revision);
@@ -11870,7 +9327,7 @@ test "final projection prefers explicit interim navigation override" {
 
     try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 0 }, app.pages.review.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(?usize, 0), app.selectedDiffCursorOffset());
+    try std.testing.expectEqual(@as(?usize, 0), app.reviewNavigationView().selectedDiffCursorOffset());
 }
 
 test "empty watch source carries combined navigation into cached projection" {
@@ -11914,7 +9371,7 @@ test "empty watch source carries combined navigation into cached projection" {
         .request = displayed_request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
-    const original_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
+    const original_offset = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
     try std.testing.expect(original_offset > 0);
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -11923,8 +9380,8 @@ test "empty watch source carries combined navigation into cached projection" {
         .result = .empty,
     });
     try std.testing.expect(app.pages.review.pending_display_navigation_restore != null);
-    try std.testing.expect(app.activeLoadedDiffConst() != null);
-    try std.testing.expectEqual(@as(usize, 0), app.activeLoadedDiffConst().?.document.files.len);
+    try std.testing.expect(app.reviewNavigationView().activeLoadedDiffConst() != null);
+    try std.testing.expectEqual(@as(usize, 0), app.reviewNavigationView().activeLoadedDiffConst().?.document.files.len);
 
     const staged_only = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.finishStatusLoad(&ctx, .{
@@ -11963,7 +9420,7 @@ test "empty watch source carries combined navigation into cached projection" {
 
     try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
     try std.testing.expect(app.activeCachedDiffProjection() != null);
-    const final_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
+    const final_offset = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
     try std.testing.expect(final_offset > 0);
     try std.testing.expect(final_offset <= original_offset);
 }
@@ -12012,7 +9469,7 @@ test "empty watch source carries generated navigation into generated projection"
         .request = displayed_request,
         .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "a", "one\ntwo\nthree\nfour\n", false) },
     } };
-    const original_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
+    const original_offset = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
     try std.testing.expectEqual(@as(usize, 2), original_offset);
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -12059,7 +9516,7 @@ test "empty watch source carries generated navigation into generated projection"
 
     try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
     try std.testing.expect(app.activeGeneratedFileProjection() != null);
-    try std.testing.expectEqual(@as(?usize, 2), app.selectedDiffCursorOffset());
+    try std.testing.expectEqual(@as(?usize, 2), app.reviewNavigationView().selectedDiffCursorOffset());
 }
 
 test "fresh empty status consumes pending display restore at raw terminal" {
@@ -12115,7 +9572,7 @@ test "fresh empty status consumes pending display restore at raw terminal" {
     });
 
     try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
-    try std.testing.expect(app.activeLoadedDiffConst() == null);
+    try std.testing.expect(app.reviewNavigationView().activeLoadedDiffConst() == null);
     try std.testing.expect(app.pages.review.load.state == .empty);
 }
 
@@ -12138,8 +9595,8 @@ test "explicit interim navigation creates override but automatic state does not"
     };
     defer app.clearLoadedDiff();
 
-    app.initializeDiffCursorForSelectedFile();
-    try std.testing.expectEqual(@as(?usize, 0), app.selectedDiffCursorOffset());
+    app.reviewNavigation().initializeDiffCursorForSelectedFile();
+    try std.testing.expectEqual(@as(?usize, 0), app.reviewNavigationView().selectedDiffCursorOffset());
 
     app.pages.review.pending_display_navigation_restore = .{
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
@@ -12170,17 +9627,17 @@ test "explicit interim navigation creates override but automatic state does not"
     var restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
     var override = restore.override orelse return error.ExpectedNavigationOverride;
     try std.testing.expectEqual(app.pages.review.viewer.diff_cursor, override.diff_cursor);
-    try std.testing.expectEqual(app.selectedDiffCursorOffset(), override.diff_cursor_offset);
+    try std.testing.expectEqual(app.reviewNavigationView().selectedDiffCursorOffset(), override.diff_cursor_offset);
 
     try app.update(.scroll_diff_down, &ctx);
     try std.testing.expectEqual(@as(u64, 2), app.pages.review.display_navigation_input_revision);
     restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
     override = restore.override orelse return error.ExpectedNavigationOverride;
     try std.testing.expectEqual(app.pages.review.viewer.diff_cursor, override.diff_cursor);
-    try std.testing.expectEqual(app.selectedDiffCursorOffset(), override.diff_cursor_offset);
+    try std.testing.expectEqual(app.reviewNavigationView().selectedDiffCursorOffset(), override.diff_cursor_offset);
 
     const revision_before_clamp = app.pages.review.display_navigation_input_revision;
-    app.clampDiffNavigation();
+    app.reviewNavigation().clampDiffNavigation();
     try std.testing.expectEqual(revision_before_clamp, app.pages.review.display_navigation_input_revision);
 }
 
@@ -12298,96 +9755,6 @@ test "superseded projection completion cannot replace display" {
     try std.testing.expectEqual(stale_status_revision, app.pages.review.review_projection.pending.?.status_snapshot_revision);
 }
 
-test "cached preview uses displayed diff for cursor movement" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = .{ .generation = 7 },
-            .status_load = .{ .generation = 3 },
-            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
-        } },
-        .terminal_size = .{ .width = 100, .height = 40 },
-        .config = .{ .source = .unstaged },
-        .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "repo",
-            .display_path = "/repo",
-            .canonical_root = "/repo",
-        } } },
-    };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
-
-    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
-
-    const request = try app_review_projection.cloneRequest(
-        std.testing.allocator,
-        1,
-        "/repo",
-        "a",
-        .cached_diff,
-        .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
-    );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
-        .request = request,
-        .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
-    } };
-
-    try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
-    app.moveDiffCursorRows(.down);
-    try std.testing.expectEqual(@as(?usize, 1), app.visibleDiffCursorOffset());
-    app.selectHunkDelta(1);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 0 }, app.pages.review.viewer.diff_cursor);
-}
-
-test "cached preview supports diff search" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = .{ .generation = 7 },
-            .status_load = .{ .generation = 3 },
-            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
-        } },
-        .terminal_size = .{ .width = 100, .height = 40 },
-        .config = .{ .source = .unstaged },
-        .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "repo",
-            .display_path = "/repo",
-            .canonical_root = "/repo",
-        } } },
-    };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
-
-    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
-
-    const request = try app_review_projection.cloneRequest(
-        std.testing.allocator,
-        1,
-        "/repo",
-        "a",
-        .cached_diff,
-        .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
-    );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
-        .request = request,
-        .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
-    } };
-
-    setDiffSearchInput(&app, "staged");
-    app.submitSearch();
-
-    try std.testing.expect(app.pages.review.search.match != null);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{
-        .hunk_line = .{ .hunk_index = 0, .line_index = 1 },
-    }, app.pages.review.search.match.?.coordinate);
-    try std.testing.expectEqual(@as(?usize, 2), app.pages.review.search.match_offset);
-    try std.testing.expectEqual(app.pages.review.search.match.?.coordinate, app.pages.review.viewer.diff_cursor);
-}
-
 test "cached preview keeps search input while projection is pending" {
     var app: App = .{
         .pages = .{ .review = .{
@@ -12421,10 +9788,10 @@ test "cached preview keeps search input while projection is pending" {
     );
     app.pages.review.review_projection.pending = request;
 
-    app.enterSearchMode();
+    app.reviewNavigation().enterSearchMode();
     try std.testing.expect(app.pages.review.search.mode);
     setDiffSearchInput(&app, "staged");
-    app.submitSearch();
+    app.reviewNavigation().submitSearch();
     try std.testing.expect(!app.pages.review.search.mode);
     try std.testing.expect(app.pages.review.search.match == null);
     try std.testing.expectEqualStrings("staged", app.pages.review.search.query.slice());
@@ -12447,187 +9814,6 @@ test "cached preview keeps search input while projection is pending" {
 
     try std.testing.expect(app.pages.review.search.match != null);
     try std.testing.expectEqual(@as(?usize, 2), app.pages.review.search.match_offset);
-}
-
-test "generated preview uses metadata cursor rows and ignores hunk movement" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = .{ .generation = 7 },
-            .status_load = .{ .generation = 3 },
-            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
-        } },
-        .terminal_size = .{ .width = 100, .height = 40 },
-        .config = .{ .source = .unstaged },
-        .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "repo",
-            .display_path = "/repo",
-            .canonical_root = "/repo",
-        } } },
-    };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
-
-    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
-
-    const request = try app_review_projection.cloneRequest(
-        std.testing.allocator,
-        1,
-        "/repo",
-        "src/new.zig",
-        .generated_added_file,
-        .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
-    );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
-        .request = request,
-        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n", false) },
-    } };
-
-    try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
-    app.moveDiffCursorRows(.down);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.review.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(?usize, 1), app.visibleDiffCursorOffset());
-    app.selectHunkDelta(1);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.review.viewer.diff_cursor);
-}
-
-test "generated preview blocks diff search" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = .{ .generation = 7 },
-            .status_load = .{ .generation = 3 },
-            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
-        } },
-        .terminal_size = .{ .width = 100, .height = 40 },
-        .config = .{ .source = .unstaged },
-        .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "repo",
-            .display_path = "/repo",
-            .canonical_root = "/repo",
-        } } },
-    };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
-
-    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
-
-    const request = try app_review_projection.cloneRequest(
-        std.testing.allocator,
-        1,
-        "/repo",
-        "src/new.zig",
-        .generated_added_file,
-        .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
-    );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
-        .request = request,
-        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n", false) },
-    } };
-
-    app.enterSearchMode();
-    try std.testing.expect(!app.pages.review.search.mode);
-    try std.testing.expectEqualStrings("search is unavailable for generated file preview", app.status.text());
-
-    setDiffSearchInput(&app, "two");
-    app.submitSearch();
-    try std.testing.expect(app.pages.review.search.match == null);
-    try std.testing.expect(app.pages.review.search.match_offset == null);
-    try std.testing.expectEqualStrings("search is unavailable for generated file preview", app.status.text());
-}
-
-test "staged new file preview blocks diff search" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = .{ .generation = 7 },
-            .status_load = .{ .generation = 3 },
-            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
-        } },
-        .terminal_size = .{ .width = 100, .height = 40 },
-        .config = .{ .source = .unstaged },
-        .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "repo",
-            .display_path = "/repo",
-            .canonical_root = "/repo",
-        } } },
-    };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
-
-    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
-
-    const request = try app_review_projection.cloneRequest(
-        std.testing.allocator,
-        1,
-        "/repo",
-        "src/new.zig",
-        .cached_diff,
-        .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
-    );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
-        .request = request,
-        .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
-    } };
-
-    app.enterSearchMode();
-    try std.testing.expect(!app.pages.review.search.mode);
-    try std.testing.expectEqualStrings("search is unavailable for staged new file preview", app.status.text());
-
-    setDiffSearchInput(&app, "staged");
-    app.submitSearch();
-    try std.testing.expect(app.pages.review.search.match == null);
-    try std.testing.expect(app.pages.review.search.match_offset == null);
-    try std.testing.expectEqualStrings("search is unavailable for staged new file preview", app.status.text());
-}
-
-test "staged new file preview does not refresh existing search query" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = .{ .generation = 7 },
-            .status_load = .{ .generation = 3 },
-            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
-        } },
-        .terminal_size = .{ .width = 100, .height = 40 },
-        .config = .{ .source = .unstaged },
-        .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "repo",
-            .display_path = "/repo",
-            .canonical_root = "/repo",
-        } } },
-    };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
-
-    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
-
-    const request = try app_review_projection.cloneRequest(
-        std.testing.allocator,
-        1,
-        "/repo",
-        "src/new.zig",
-        .cached_diff,
-        .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
-    );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
-        .request = request,
-        .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
-    } };
-
-    app.pages.review.search.query.insertSlice("staged") catch unreachable;
-    app.refreshSearchForSelectedFile();
-
-    try std.testing.expect(app.pages.review.search.match == null);
-    try std.testing.expect(app.pages.review.search.match_offset == null);
 }
 
 test "projected hunk actions route through original cached and unstaged origins" {
@@ -12704,81 +9890,6 @@ test "projected hunk actions route through original cached and unstaged origins"
     }
 }
 
-test "stagedHunkFlagsForFile keeps partial staged display flags" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        } },
-        .allocator = std.testing.allocator,
-        .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "repo",
-            .display_path = "/repo",
-            .canonical_root = "/repo",
-        } } },
-    };
-    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
-    defer app.pages.review.git_status.deinit();
-
-    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
-
-    const flags = try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
-    try std.testing.expectEqual(@as(usize, 2), flags.len);
-    try std.testing.expect(flags[0]);
-    try std.testing.expect(!flags[1]);
-}
-
-test "stagedHunkFlagsForFile normalizes all staged hunks only when status is staged-only" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        } },
-        .allocator = std.testing.allocator,
-        .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "repo",
-            .display_path = "/repo",
-            .canonical_root = "/repo",
-        } } },
-    };
-    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
-    defer app.pages.review.git_status.deinit();
-
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 1);
-
-    var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.pages.review.git_status.replace("/repo", &staged_bundle);
-    try std.testing.expectEqual(@as(usize, 0), (try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks)).len);
-
-    var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
-    const mixed_flags = try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
-    try std.testing.expectEqual(@as(usize, 2), mixed_flags.len);
-    try std.testing.expect(mixed_flags[0]);
-    try std.testing.expect(mixed_flags[1]);
-
-    app.pages.review.status_load.pending = .{ .generation = 1 };
-    const stale_flags = try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
-    try std.testing.expectEqual(@as(usize, 2), stale_flags.len);
-    try std.testing.expect(stale_flags[0]);
-    try std.testing.expect(stale_flags[1]);
-
-    app.pages.review.status_load.pending = null;
-    var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.pages.review.git_status.replace("/other", &other_repo_bundle);
-    const missing_flags = try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
-    try std.testing.expectEqual(@as(usize, 2), missing_flags.len);
-    try std.testing.expect(missing_flags[0]);
-    try std.testing.expect(missing_flags[1]);
-}
-
 test "stagedHunkFlagsForFile display normalization does not clear hunk action marks" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -12806,7 +9917,7 @@ test "stagedHunkFlagsForFile display normalization does not clear hunk action ma
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.pages.review.git_status.replace("/repo", &staged_bundle);
-    try std.testing.expectEqual(@as(usize, 0), (try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try app.reviewNavigationView().stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks)).len);
 
     switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
         .ready => |target| {
@@ -13074,58 +10185,6 @@ test "directory unstage target scans staged subtree" {
     }
 }
 
-test "pending selection restore can restore directory nodes" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-            .viewer = .{
-                .selected_target = .{ .diff_file = 1 },
-                .selected_node = 1,
-            },
-        } },
-    };
-    defer app.clearPendingSelectionRestore(std.testing.allocator);
-
-    try app.setPendingSelectionRestore(std.testing.allocator, "src");
-    var loaded = app_test_support.loadedDiffNested();
-
-    try std.testing.expect(app.restorePendingSelectionOrFallback(std.testing.allocator, &loaded));
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
-}
-
-test "pending selection restore can restore repository root node" {
-    const nodes = [_]file_tree.Node{
-        .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root },
-        .{ .kind = .file, .name = "main.zig", .path = "src/main.zig", .path_key = "src/main.zig", .depth = 1, .target = .{ .diff_file = 0 } },
-    };
-    var visible_nodes = [_]usize{ 0, 1 };
-    var loaded: LoadedDiff = .{
-        .text = "",
-        .document = .{ .files = &app_test_support.files_one },
-        .tree = .{ .nodes = &nodes },
-        .visible_nodes = &visible_nodes,
-        .visible_node_count = 2,
-        .bytes = 0,
-        .lines = 0,
-    };
-    var app: App = .{
-        .pages = .{ .review = .{
-            .viewer = .{
-                .selected_target = .{ .diff_file = 0 },
-                .selected_node = 1,
-            },
-        } },
-    };
-    defer app.clearPendingSelectionRestore(std.testing.allocator);
-
-    try app.setPendingSelectionRestore(std.testing.allocator, "");
-
-    try std.testing.expect(app.restorePendingSelectionOrFallback(std.testing.allocator, &loaded));
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
-}
-
 test "initialSelectionContext selects first diff file and hunk" {
     const loaded = app_test_support.loadedDiffTwo();
     const selection = App.initialSelectionContext(.{ .patch_file = "changes.diff" }, null, &loaded, null);
@@ -13222,27 +10281,6 @@ test "diff search row keeps active focus style" {
     try std.testing.expect(!style.reverse);
 }
 
-test "changed file filter keeps only matching status rows" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffTwoWithStatuses()),
-            .review_display = .{ .changed_file_filter = .added },
-            .viewer = .{
-                .selected_node = 1,
-                .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
-            },
-        } },
-    };
-    defer app.clearLoadedDiff();
-
-    try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, false, app.pages.review.review_display.changed_file_filter);
-
-    const loaded = app.loadedDiff().?;
-    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
-    try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
-}
-
 test "finishDiffLoad applies active changed file filter" {
     var app: App = .{
         .pages = .{ .review = .{
@@ -13260,213 +10298,12 @@ test "finishDiffLoad applies active changed file filter" {
         .result = .{ .loaded = bundle },
     });
 
-    const loaded = app.loadedDiff().?;
+    const loaded = app.reviewNavigation().loadedDiff().?;
     try std.testing.expectEqual(@as(usize, 2), loaded.document.files.len);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(?usize, 1), loaded.visibleNodeAt(1));
     try std.testing.expectEqual(file_tree.Status.added, loaded.tree.nodes[1].status.?);
-}
-
-test "cycling changed file filter rebuilds visible nodes and reconciles selection" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffTwoWithStatuses()),
-            .viewer = .{
-                .selected_node = 1,
-                .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
-            },
-        } },
-    };
-    defer app.clearLoadedDiff();
-
-    try app.cycleChangedFileFilter();
-
-    const loaded = app.loadedDiff().?;
-    try std.testing.expectEqual(ChangedFileFilter.modified, app.pages.review.review_display.changed_file_filter);
-    try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
-}
-
-test "file search skips files outside active changed filter" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
-            .file_search = .{ .mode = true },
-            .review_display = .{ .changed_file_filter = .added },
-        } },
-    };
-    setFileSearchInput(&app, "deleted");
-    defer app.pages.review.file_search.deinit(std.testing.allocator);
-
-    try app.submitFileSearch(std.testing.allocator);
-
-    try std.testing.expect(app.pages.review.file_search.mode);
-    try std.testing.expect(app.pages.review.file_search.no_match);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
-}
-
-test "toggleReviewedFile toggles selected diff target" {
-    var reviewed = [_]bool{ false, false };
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(.{
-                .text = "",
-                .document = .{ .files = &app_test_support.files_two },
-                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            }),
-            .viewer = .{
-                .selected_node = 0,
-                .selected_file = 0,
-            },
-        } },
-    };
-    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
-
-    try app.toggleReviewedFile(std.testing.allocator);
-    try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
-
-    app.pages.review.viewer.selected_node = 1;
-    try app.toggleReviewedFile(std.testing.allocator);
-    try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
-
-    try app.toggleReviewedFile(std.testing.allocator);
-    try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
-}
-
-test "toggleReviewedFile uses selected target while cursor is on directory" {
-    var reviewed = [_]bool{ false, false };
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(.{
-                .text = "",
-                .document = .{ .files = &app_test_support.files_two },
-                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            }),
-            .viewer = .{
-                .selected_node = 0,
-                .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
-            },
-        } },
-    };
-    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
-
-    try app.toggleReviewedFile(std.testing.allocator);
-    try std.testing.expectEqualSlices(bool, &.{ false, true }, &reviewed);
-}
-
-test "toggleReviewedFile ignores unkeyable files in repository input" {
-    const unkeyable_files = [_]diff_parser.FileDiff{.{
-        .header = "metadata only",
-        .old_path = null,
-        .new_path = null,
-        .metadata = &.{},
-        .hunks = &.{},
-    }};
-    const nodes = [_]file_tree.Node{
-        .{ .kind = .file, .name = "metadata", .path = "metadata", .depth = 0, .target = .{ .diff_file = 0 } },
-    };
-    var reviewed = [_]bool{false};
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(.{
-                .text = "",
-                .document = .{ .files = &unkeyable_files },
-                .tree = .{ .nodes = &nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            }),
-        } },
-        .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "repo",
-            .display_path = "repo",
-            .canonical_root = "/repo",
-        } } },
-    };
-
-    try app.toggleReviewedFile(std.testing.allocator);
-    try std.testing.expectEqualSlices(bool, &.{false}, &reviewed);
-}
-
-test "raw reviewed state stays in active load only" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
-            .viewer = .{
-                .selected_node = 0,
-                .selected_file = 0,
-            },
-        } },
-        .allocator = std.testing.allocator,
-    };
-    defer app.clearLoadedDiff();
-    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
-
-    var loaded = app.loadedDiff().?;
-    try app.materializeReviewedFiles(std.testing.allocator, loaded);
-    app.pages.review.load.state.loaded.reviewed_files_owned = true;
-
-    try app.toggleReviewedFile(std.testing.allocator);
-    try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded.reviewed_files);
-
-    app.clearLoadedDiff();
-    app.pages.review.load.state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffTwo()) };
-    loaded = app.loadedDiff().?;
-    try app.materializeReviewedFiles(std.testing.allocator, loaded);
-    app.pages.review.load.state.loaded.reviewed_files_owned = true;
-
-    try std.testing.expectEqualSlices(bool, &.{ false, false }, loaded.reviewed_files);
-}
-
-test "reviewed state is scoped by active repository root" {
-    const allocator = std.testing.allocator;
-    const repos = try allocator.alloc(repo_discovery.RepoEntry, 2);
-    repos[0] = .{
-        .label = try allocator.dupe(u8, "one"),
-        .display_path = try allocator.dupe(u8, "one"),
-        .canonical_root = try allocator.dupe(u8, "/work/one"),
-    };
-    repos[1] = .{
-        .label = try allocator.dupe(u8, "two"),
-        .display_path = try allocator.dupe(u8, "two"),
-        .canonical_root = try allocator.dupe(u8, "/work/two"),
-    };
-
-    var app: App = .{
-        .allocator = allocator,
-        .repo_state = .{ .discovery = .{ .workspace = .{
-            .current_root = try allocator.dupe(u8, "/work"),
-            .repos = repos,
-        } } },
-    };
-    defer app.repo_state.deinit(allocator);
-    defer app.pages.review.reviewed_store.deinit(allocator);
-
-    try app.pages.review.reviewed_store.set(allocator, app.activeRepoRoot(), app_test_support.files_two[0], true);
-
-    var loaded_one = app_test_support.loadedDiffTwo();
-    try app.materializeReviewedFiles(allocator, &loaded_one);
-    defer allocator.free(loaded_one.reviewed_files);
-    try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded_one.reviewed_files);
-
-    app.repo_state.active_index = 1;
-    var loaded_two = app_test_support.loadedDiffTwo();
-    try app.materializeReviewedFiles(allocator, &loaded_two);
-    defer allocator.free(loaded_two.reviewed_files);
-    try std.testing.expectEqualSlices(bool, &.{ false, false }, loaded_two.reviewed_files);
 }
 
 test "repo picker focuses active workspace repository" {
@@ -13900,10 +10737,10 @@ test "repo switch clears action selection restore" {
     defer app.repo_picker.deinit(allocator);
     defer app.deinitRepoPickerItems(allocator);
     defer app.recent_repos.deinit(allocator);
-    defer app.clearPendingSelectionRestore(allocator);
+    defer app.reviewNavigation().clearPendingSelectionRestore(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
-    try app.setPendingSelectionRestore(allocator, "src/main.zig");
+    try app.reviewNavigation().setPendingSelectionRestore(allocator, "src/main.zig");
     try app.enterRepoPickerMode(allocator);
 
     try app.submitRepoPicker(&ctx);
@@ -13936,129 +10773,6 @@ test "sidebar renders reviewed marker" {
 
     try ts.expectCellText(1, sidebar_header_rows, "✓");
     try ts.expectCellText(2, sidebar_header_rows, "A");
-}
-
-test "hide reviewed files removes reviewed file rows from visible list" {
-    var reviewed = [_]bool{ true, false };
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
-                .text = "",
-                .document = .{ .files = &app_test_support.files_two },
-                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            }),
-            .viewer = .{
-                .selected_node = 1,
-                .selected_file = 0,
-            },
-        } },
-    };
-    defer app.clearLoadedDiff();
-
-    try app.toggleHideReviewedFiles();
-
-    const loaded = app.loadedDiff().?;
-    try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
-    try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
-    try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
-    try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
-}
-
-test "hide reviewed files removes directories with no visible file descendants" {
-    var reviewed = [_]bool{ true, true };
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
-                .text = "",
-                .document = .{ .files = &app_test_support.files_two },
-                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            }),
-            .viewer = .{
-                .selected_node = 1,
-                .selected_file = 0,
-            },
-        } },
-    };
-    defer app.clearLoadedDiff();
-
-    try app.toggleHideReviewedFiles();
-
-    const loaded = app.loadedDiff().?;
-    try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
-}
-
-test "hide reviewed files keeps directories for non-contiguous unreviewed descendants" {
-    var reviewed = [_]bool{ true, false };
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
-                .text = "",
-                .document = .{ .files = &app_test_support.files_two },
-                .tree = .{ .nodes = &app_test_support.tree_non_contiguous_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            }),
-            .viewer = .{
-                .selected_node = 1,
-                .selected_file = 0,
-            },
-        } },
-    };
-    defer app.clearLoadedDiff();
-
-    try app.toggleHideReviewedFiles();
-
-    const loaded = app.loadedDiff().?;
-    try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
-    try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
-    try std.testing.expectEqual(@as(?usize, 4), loaded.visibleNodeAt(1));
-}
-
-test "marking a visible file as reviewed while hidden moves selection" {
-    var reviewed = [_]bool{ false, false };
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
-                .text = "",
-                .document = .{ .files = &app_test_support.files_two },
-                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            }),
-            .viewer = .{
-                .selected_node = 1,
-                .selected_file = 0,
-            },
-            .review_display = .{ .hide_reviewed_files = true },
-        } },
-    };
-    defer app.clearLoadedDiff();
-    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
-    try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, true, .all);
-
-    try app.toggleReviewedFile(std.testing.allocator);
-
-    const loaded = app.loadedDiff().?;
-    try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
-    try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
-    try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
-    try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
 }
 
 test "search match marker is drawn on visible match row" {
@@ -14143,30 +10857,6 @@ test "search input header does not show no match before submit" {
     try ts.expectCellText(1, 1, "s");
     try ts.expectCellText(9, 1, "m");
     try ts.expectCellText(16, 1, " ");
-}
-
-test "canceling edited search restores committed query and match" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .search = .{
-                .match = .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } },
-                .match_offset = 4,
-            },
-        } },
-        .terminal_size = .{ .width = 90, .height = 11 },
-    };
-    setDiffSearchQuery(&app, "new");
-
-    app.enterSearchMode();
-    app.pages.review.search.input.backspace();
-    try app.pages.review.search.input.insert('x');
-    app.cancelSearchMode();
-
-    try std.testing.expectEqualStrings("new", app.pages.review.search.query.slice());
-    try std.testing.expectEqualStrings("new", app.pages.review.search.input.slice());
-    try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
 }
 
 test "load empty state shows actionable no changes message" {
@@ -14565,7 +11255,7 @@ test "finishDiffLoad initially selects first visible file after status projectio
         .result = .{ .loaded = bundle },
     });
 
-    const loaded = app.activeLoadedDiffConst().?;
+    const loaded = app.reviewNavigationView().activeLoadedDiffConst().?;
     const first_node_index = loaded.firstVisibleFileNode() orelse return error.ExpectedVisibleFileNode;
     const first_node = loaded.tree.nodes[first_node_index];
     const expected_target: context.SelectedTarget = switch (first_node.target) {
@@ -14612,7 +11302,7 @@ test "finishDiffLoad keeps initial visible selection intent for later status pro
 
     try std.testing.expect(!app.pages.review.pending_initial_first_visible_selection);
 
-    const loaded = app.activeLoadedDiffConst().?;
+    const loaded = app.reviewNavigationView().activeLoadedDiffConst().?;
     const first_node_index = loaded.firstVisibleFileNode() orelse return error.ExpectedVisibleFileNode;
     const first_node = loaded.tree.nodes[first_node_index];
     const expected_target: context.SelectedTarget = switch (first_node.target) {
@@ -14645,7 +11335,7 @@ test "status projection rebuild keeps selected node on same path key" {
     defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    const before_path = app.selectedStagePathKey() orelse return error.ExpectedSelectedPath;
+    const before_path = app.reviewNavigationView().selectedStagePathKey() orelse return error.ExpectedSelectedPath;
     try std.testing.expectEqualStrings("b", before_path);
 
     const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
@@ -14655,7 +11345,7 @@ test "status projection rebuild keeps selected node on same path key" {
         .result = .{ .loaded = status_bundle },
     });
 
-    const after_path = app.selectedStagePathKey() orelse return error.ExpectedSelectedPath;
+    const after_path = app.reviewNavigationView().selectedStagePathKey() orelse return error.ExpectedSelectedPath;
     try std.testing.expectEqualStrings("b", after_path);
 }
 
@@ -14673,7 +11363,7 @@ test "status load skips identical snapshot without rebuilding active tree" {
 
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
     try app.pages.review.git_status.replace("/repo", &current);
-    const tree_ptr = app.activeLoadedDiffConst().?.tree.nodes.ptr;
+    const tree_ptr = app.reviewNavigationView().activeLoadedDiffConst().?.tree.nodes.ptr;
 
     const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
     try app.finishStatusLoad(&ctx, .{
@@ -14682,7 +11372,7 @@ test "status load skips identical snapshot without rebuilding active tree" {
         .result = .{ .loaded = same },
     });
 
-    try std.testing.expectEqual(tree_ptr, app.activeLoadedDiffConst().?.tree.nodes.ptr);
+    try std.testing.expectEqual(tree_ptr, app.reviewNavigationView().activeLoadedDiffConst().?.tree.nodes.ptr);
 }
 
 test "status refresh path skips identical snapshot without rebuilding active tree" {
@@ -14698,7 +11388,7 @@ test "status refresh path skips identical snapshot without rebuilding active tre
 
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
     try app.pages.review.git_status.replace("/repo", &current);
-    const tree_ptr = app.activeLoadedDiffConst().?.tree.nodes.ptr;
+    const tree_ptr = app.reviewNavigationView().activeLoadedDiffConst().?.tree.nodes.ptr;
 
     app.startStatusLoad(&ctx, "/repo", .foreground, null);
     try std.testing.expect(app.pages.review.git_status.repo_root != null);
@@ -14712,7 +11402,7 @@ test "status refresh path skips identical snapshot without rebuilding active tre
         .result = .{ .loaded = same },
     });
 
-    try std.testing.expectEqual(tree_ptr, app.activeLoadedDiffConst().?.tree.nodes.ptr);
+    try std.testing.expectEqual(tree_ptr, app.reviewNavigationView().activeLoadedDiffConst().?.tree.nodes.ptr);
 }
 
 test "status refresh drops snapshot when repo root changes" {
@@ -15036,7 +11726,7 @@ test "unchanged recovery clears its source failure and redraws" {
     app.pages.review.auto_reload.acceptSource(fingerprint);
     _ = app.pages.review.auto_reload.markSourceFailure("transient");
     app.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "auto reload failed: transient", .{});
-    const before = app.activeLoadedDiffConst().?.text.ptr;
+    const before = app.reviewNavigationView().activeLoadedDiffConst().?.text.ptr;
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
@@ -15046,7 +11736,7 @@ test "unchanged recovery clears its source failure and redraws" {
 
     try std.testing.expect(app.pages.review.pending_reload == null);
     try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
-    try std.testing.expectEqual(before, app.activeLoadedDiffConst().?.text.ptr);
+    try std.testing.expectEqual(before, app.reviewNavigationView().activeLoadedDiffConst().?.text.ptr);
     try std.testing.expectEqualStrings("", app.status.text());
     try std.testing.expect(!ctx._redraw_suppressed);
 }
@@ -15236,7 +11926,7 @@ test "destructive action-result failure invalidates accepted source before ident
         .result = .{ .failed_static = "foreground failed" },
     });
     try std.testing.expect(app.pages.review.auto_reload.accepted_source == null);
-    try std.testing.expect(app.activeLoadedDiffConst() == null);
+    try std.testing.expect(app.reviewNavigationView().activeLoadedDiffConst() == null);
 
     app.pages.review.load.generation = 3;
     app.pages.review.load.pending = .{ .diff_load = 3 };
@@ -15246,7 +11936,7 @@ test "destructive action-result failure invalidates accepted source before ident
         .generation = 3,
         .result = .{ .loaded = bundle },
     });
-    try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
+    try std.testing.expectEqualStrings(app_test_support.diff_one, app.reviewNavigationView().activeLoadedDiffConst().?.text);
     try std.testing.expect(app.pages.review.auto_reload.accepted_source.?.fingerprint.eql(fingerprint));
 }
 
@@ -15283,7 +11973,7 @@ test "destructive manual failure invalidates accepted source before identical su
         .generation = 3,
         .result = .{ .loaded = bundle },
     });
-    try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
+    try std.testing.expectEqualStrings(app_test_support.diff_one, app.reviewNavigationView().activeLoadedDiffConst().?.text);
     try std.testing.expect(app.pages.review.auto_reload.accepted_source.?.fingerprint.eql(fingerprint));
 }
 
@@ -15329,7 +12019,7 @@ test "diff task start failure invalidates accepted source and next watch cannot 
         .generation = generation,
         .result = .{ .loaded = bundle },
     });
-    try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
+    try std.testing.expectEqualStrings(app_test_support.diff_one, app.reviewNavigationView().activeLoadedDiffConst().?.text);
 }
 
 test "watch failure retains display and blocks source-derived actions until success" {
@@ -15348,14 +12038,14 @@ test "watch failure retains display and blocks source-derived actions until succ
     app.pages.review.load.generation = 2;
     app.pages.review.load.pending = .{ .diff_load = 2 };
     app.pages.review.auto_reload.acceptSource(fingerprint);
-    const before = app.activeLoadedDiffConst().?.text.ptr;
+    const before = app.reviewNavigationView().activeLoadedDiffConst().?.text.ptr;
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
         .generation = 2,
         .result = .{ .failed_static = "transient failure" },
     });
-    try std.testing.expectEqual(before, app.activeLoadedDiffConst().?.text.ptr);
+    try std.testing.expectEqual(before, app.reviewNavigationView().activeLoadedDiffConst().?.text.ptr);
     try std.testing.expect(!app.pages.review.auto_reload.sourceIsActionable());
 
     app.pages.review.load.generation = 3;
@@ -15366,7 +12056,7 @@ test "watch failure retains display and blocks source-derived actions until succ
         .result = .{ .unchanged = fingerprint },
     });
     try std.testing.expect(app.pages.review.auto_reload.sourceIsActionable());
-    try std.testing.expectEqual(before, app.activeLoadedDiffConst().?.text.ptr);
+    try std.testing.expectEqual(before, app.reviewNavigationView().activeLoadedDiffConst().?.text.ptr);
 }
 
 test "changed watch result arriving during mouse selection defers apply until release" {
@@ -15397,13 +12087,13 @@ test "changed watch result arriving during mouse selection defers apply until re
         .result = .{ .loaded = bundle },
     });
     try std.testing.expect(app.pages.review.deferred_source_apply != null);
-    try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
+    try std.testing.expectEqualStrings("old", app.reviewNavigationView().activeLoadedDiffConst().?.text);
     try std.testing.expect(app.pages.review.auto_reload.background_cycle.?.pending.deferred_source_apply);
 
-    app.clearDiffSelection();
+    app.reviewNavigation().clearDiffSelection();
     try app.applyDeferredSource(&ctx);
     try std.testing.expect(app.pages.review.deferred_source_apply == null);
-    try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
+    try std.testing.expectEqualStrings(app_test_support.diff_one, app.reviewNavigationView().activeLoadedDiffConst().?.text);
     try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 }
 
@@ -15436,7 +12126,7 @@ test "background source completion during repository action is discarded and rel
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
+    try std.testing.expectEqualStrings("old", app.reviewNavigationView().activeLoadedDiffConst().?.text);
     try std.testing.expect(app.pages.review.auto_reload.accepted_source.?.fingerprint.eql(accepted));
     try std.testing.expect(app.pages.review.load.pending == null);
     try std.testing.expect(app.pages.review.pending_reload == null);
@@ -15451,7 +12141,7 @@ test "background source completion during repository action is discarded and rel
         .generation = 3,
         .result = .{ .loaded = authoritative },
     });
-    try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
+    try std.testing.expectEqualStrings(app_test_support.diff_one, app.reviewNavigationView().activeLoadedDiffConst().?.text);
 }
 
 test "deferred background source is discarded when a repository action starts" {
@@ -15484,10 +12174,10 @@ test "deferred background source is discarded when a repository action starts" {
     try std.testing.expect(app.pages.review.deferred_source_apply != null);
 
     _ = app.actions.begin(.stage_file);
-    app.clearDiffSelection();
+    app.reviewNavigation().clearDiffSelection();
     try app.applyDeferredSource(&ctx);
 
-    try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
+    try std.testing.expectEqualStrings("old", app.reviewNavigationView().activeLoadedDiffConst().?.text);
     try std.testing.expect(app.pages.review.deferred_source_apply == null);
     try std.testing.expect(app.pages.review.pending_reload == null);
     try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
@@ -15535,7 +12225,7 @@ test "deferred changed watch captures navigation when selection ends" {
 
     app.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
     const navigation_at_apply = app.pages.review.viewer.diff_cursor;
-    app.clearDiffSelection();
+    app.reviewNavigation().clearDiffSelection();
     try app.applyDeferredSource(&ctx);
 
     try std.testing.expect(app.pages.review.deferred_source_apply == null);
@@ -15572,7 +12262,7 @@ test "empty watch result defers during selection and focus loss applies it" {
         .result = .empty,
     });
     try std.testing.expect(app.pages.review.deferred_source_apply != null);
-    try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
+    try std.testing.expectEqualStrings("old", app.reviewNavigationView().activeLoadedDiffConst().?.text);
 
     try app.update(.focus_lost, &ctx);
     try std.testing.expect(!app.pages.review.selection_owner.activeMouseSelection());
@@ -15732,7 +12422,7 @@ test "watch no-op preserves selected path when status finishes before diff" {
         .result = .{ .loaded = bundle },
     });
 
-    const selected_path = app.selectedStagePathKey() orelse return error.ExpectedSelectedPath;
+    const selected_path = app.reviewNavigationView().selectedStagePathKey() orelse return error.ExpectedSelectedPath;
     try std.testing.expectEqualStrings("b", selected_path);
 }
 
@@ -15773,7 +12463,7 @@ test "watch no-op preserves selected path when status finishes after diff" {
         .result = .{ .loaded = status_bundle },
     });
 
-    const selected_path = app.selectedStagePathKey() orelse return error.ExpectedSelectedPath;
+    const selected_path = app.reviewNavigationView().selectedStagePathKey() orelse return error.ExpectedSelectedPath;
     try std.testing.expectEqualStrings("b", selected_path);
 }
 
@@ -15838,7 +12528,7 @@ test "finishDiffLoad projects earlier status snapshot into empty diff" {
         .result = .empty,
     });
 
-    const loaded = app.loadedDiff().?;
+    const loaded = app.reviewNavigation().loadedDiff().?;
     try std.testing.expectEqual(@as(usize, 0), loaded.document.files.len);
     try std.testing.expectEqual(@as(usize, 2), loaded.tree.nodes.len);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
@@ -15871,8 +12561,8 @@ test "clean loaded status tears down status-only session after empty diff" {
     });
     const empty_fingerprint = app_auto_reload.SourceFingerprint.init("");
 
-    try std.testing.expect(app.loadedDiff() != null);
-    try std.testing.expectEqual(@as(usize, 0), app.loadedDiff().?.document.files.len);
+    try std.testing.expect(app.reviewNavigation().loadedDiff() != null);
+    try std.testing.expectEqual(@as(usize, 0), app.reviewNavigation().loadedDiff().?.document.files.len);
     try std.testing.expect(app.pages.review.auto_reload.accepted_source.?.fingerprint.eql(empty_fingerprint));
 
     const clean = try git_status.StatusBundle.parseOwned(allocator, "");
@@ -15883,7 +12573,7 @@ test "clean loaded status tears down status-only session after empty diff" {
     });
 
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.git_status.document.entries.len);
-    try std.testing.expect(app.loadedDiff() == null);
+    try std.testing.expect(app.reviewNavigation().loadedDiff() == null);
     try std.testing.expect(app.pages.review.load.state == .empty);
     try std.testing.expectEqual(EmptyReason.no_changes, app.pages.review.load.state.empty);
     try std.testing.expect(app.pages.review.auto_reload.accepted_source.?.fingerprint.eql(empty_fingerprint));
@@ -15928,7 +12618,7 @@ test "source failure before clean status-only teardown remains stale" {
     var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
     try app.pages.review.git_status.replace("/repo", &current);
     try app.finishDiffLoad(&ctx, .{ .generation = 2, .result = .empty });
-    try std.testing.expect(app.loadedDiff() != null);
+    try std.testing.expect(app.reviewNavigation().loadedDiff() != null);
 
     app.pages.review.load.generation = 3;
     app.pages.review.load.pending = .{ .diff_load = 3 };
@@ -15946,7 +12636,7 @@ test "source failure before clean status-only teardown remains stale" {
         .result = .{ .loaded = clean },
     });
 
-    try std.testing.expect(app.loadedDiff() == null);
+    try std.testing.expect(app.reviewNavigation().loadedDiff() == null);
     try std.testing.expect(!app.pages.review.auto_reload.sourceIsActionable());
     try std.testing.expect(app.pages.review.auto_reload.last_failure != null);
     try std.testing.expectEqualStrings("auto reload failed: source transient", app.status.text());
@@ -16041,7 +12731,7 @@ test "empty status result tears down status-only session after empty diff" {
         .result = .empty,
     });
 
-    try std.testing.expect(app.loadedDiff() != null);
+    try std.testing.expect(app.reviewNavigation().loadedDiff() != null);
 
     try app.finishStatusLoad(&ctx, .{
         .generation = 7,
@@ -16050,7 +12740,7 @@ test "empty status result tears down status-only session after empty diff" {
     });
 
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.git_status.document.entries.len);
-    try std.testing.expect(app.loadedDiff() == null);
+    try std.testing.expect(app.reviewNavigation().loadedDiff() == null);
     try std.testing.expect(app.pages.review.load.state == .empty);
     try std.testing.expectEqual(EmptyReason.no_changes, app.pages.review.load.state.empty);
 }
@@ -16079,7 +12769,7 @@ test "identical staged-only status keeps status-only session after empty diff" {
         .result = .empty,
     });
 
-    const loaded_after_diff = app.loadedDiff() orelse return error.ExpectedLoadedDiff;
+    const loaded_after_diff = app.reviewNavigation().loadedDiff() orelse return error.ExpectedLoadedDiff;
     try std.testing.expectEqual(@as(usize, 0), loaded_after_diff.document.files.len);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.git_status.document.entries.len);
 
@@ -16090,7 +12780,7 @@ test "identical staged-only status keeps status-only session after empty diff" {
         .result = .{ .loaded = same },
     });
 
-    const loaded_after_status = app.loadedDiff() orelse return error.ExpectedLoadedDiff;
+    const loaded_after_status = app.reviewNavigation().loadedDiff() orelse return error.ExpectedLoadedDiff;
     try std.testing.expectEqual(@as(usize, 0), loaded_after_status.document.files.len);
     try std.testing.expect(loaded_after_status.visibleNodeCount() > 0);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.git_status.document.entries.len);
@@ -16137,10 +12827,10 @@ test "finishDiffLoad failure clears pending selection restore" {
         .allocator = std.testing.allocator,
     };
     defer app.clearLoadedDiff();
-    defer app.clearPendingSelectionRestore(std.testing.allocator);
+    defer app.reviewNavigation().clearPendingSelectionRestore(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app.setPendingSelectionRestore(std.testing.allocator, "src/main.zig");
+    try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "src/main.zig");
 
     try app.finishDiffLoad(&ctx, .{
         .generation = 1,
