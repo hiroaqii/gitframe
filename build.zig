@@ -11,6 +11,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const syntax_provider = b.option(SyntaxProvider, "syntax-provider", "Syntax provider: none or flow_syntax") orelse defaultSyntaxProvider(target);
     const provider_enabled = syntax_provider == .flow_syntax;
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Run aggregate tests matching any filter",
+    ) orelse &.{};
 
     const chasen_dep = b.dependency("chasen", .{
         .target = target,
@@ -112,18 +117,21 @@ pub fn build(b: *std.Build) void {
 
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .filters = test_filters,
     });
     configureFlowSyntaxArtifact(mod_tests, target, provider_enabled);
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = test_filters,
     });
     configureFlowSyntaxArtifact(exe_tests, target, provider_enabled);
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const draw_tests = b.addTest(.{
         .root_module = draw_mod,
+        .filters = test_filters,
     });
     const run_draw_tests = b.addRunArtifact(draw_tests);
 
@@ -133,6 +141,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     const run_diff_source_tests = b.addRunArtifact(diff_source_tests);
 
@@ -142,6 +151,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     const run_diff_parser_tests = b.addRunArtifact(diff_parser_tests);
 
@@ -151,6 +161,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     const run_diff_view_model_tests = b.addRunArtifact(diff_view_model_tests);
 
@@ -160,6 +171,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     const run_diff_search_tests = b.addRunArtifact(diff_search_tests);
 
@@ -169,6 +181,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     const run_file_tree_tests = b.addRunArtifact(file_tree_tests);
 
@@ -181,6 +194,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "chasen", .module = chasen_dep.module("chasen") },
             },
         }),
+        .filters = test_filters,
     });
     const run_sidebar_view_model_tests = b.addRunArtifact(sidebar_view_model_tests);
 
@@ -190,6 +204,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     const run_repo_discovery_tests = b.addRunArtifact(repo_discovery_tests);
 
@@ -291,6 +306,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&core_wasm.step);
     const keymap_tests = b.addTest(.{
         .root_module = keymap_mod,
+        .filters = test_filters,
     });
     test_step.dependOn(&b.addRunArtifact(keymap_tests).step);
 }
