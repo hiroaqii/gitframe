@@ -117,6 +117,7 @@ pub const HunkUnstageTargetResult = union(enum) {
     binary_unsupported,
     unsupported_file_state,
     patch_failed,
+    stale_status,
     stale_source,
 };
 
@@ -128,6 +129,7 @@ pub const ToggleHunkTargetResult = union(enum) {
     no_path,
     no_hunk,
     offscreen_cursor,
+    stale_status,
     stale_source,
 };
 

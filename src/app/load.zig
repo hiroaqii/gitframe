@@ -1375,8 +1375,8 @@ test "ReviewProjectionTask failed preserves request identity" {
         .path_key = try allocator.dupe(u8, "src/main.zig"),
         .kind = .cached_diff,
         .source_kind = .unstaged,
-        .load_generation = 2,
-        .status_generation = 3,
+        .source_session_revision = 2,
+        .status_snapshot_revision = 3,
     } };
 
     const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
@@ -1388,8 +1388,8 @@ test "ReviewProjectionTask failed preserves request identity" {
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 11), finished.request.id);
-    try std.testing.expectEqual(@as(u64, 2), finished.request.load_generation);
-    try std.testing.expectEqual(@as(u64, 3), finished.request.status_generation);
+    try std.testing.expectEqual(@as(u64, 2), finished.request.source_session_revision);
+    try std.testing.expectEqual(@as(u64, 3), finished.request.status_snapshot_revision);
     try std.testing.expectEqualStrings("/repo", finished.request.repo_root);
     try std.testing.expectEqualStrings("src/main.zig", finished.request.path_key);
     try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {

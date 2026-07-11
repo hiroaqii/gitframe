@@ -281,6 +281,38 @@ const PendingReload = struct {
     }
 };
 
+const PendingDisplayNavigationRestore = struct {
+    repo_root: []u8,
+    source_kind: app_review_projection.SourceKind,
+    source_session_revision: u64,
+    original: ReloadAnchor,
+    override: ?ReloadAnchor = null,
+    captured_input_revision: u64,
+
+    fn deinit(self: *PendingDisplayNavigationRestore, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        self.original.deinit(allocator);
+        if (self.override) |*anchor| anchor.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn authoritative(self: *const PendingDisplayNavigationRestore) *const ReloadAnchor {
+        return if (self.override) |*anchor| anchor else &self.original;
+    }
+};
+
+const DisplayNavigationSnapshot = struct {
+    selected_target: ?context.SelectedTarget,
+    selected_node: usize,
+    diff_cursor: diff_view_model.BodyCoordinate,
+    diff_scroll: usize,
+    diff_horizontal_scroll: usize,
+    sidebar_horizontal_scroll: usize,
+    search_coordinate: ?diff_view_model.BodyCoordinate,
+    search_match_offset: ?usize,
+    display_mode: diff_render.DisplayMode,
+};
+
 const DeferredSourceApply = struct {
     finished: DiffLoadFinished,
     cycle_id: u64,
@@ -366,8 +398,12 @@ pub const App = struct {
     overlay: app_state.OverlayState = .{},
     review_display: app_state.ReviewDisplayState = .{},
     staged_hunks: app_state.StagedHunkMarks = .{},
-    review_projection: app_review_projection.State = .idle,
+    review_projection: app_review_projection.State = .{},
     review_projection_next_id: u64 = 0,
+    source_session_revision: u64 = 0,
+    status_snapshot_revision: u64 = 0,
+    pending_display_navigation_restore: ?PendingDisplayNavigationRestore = null,
+    display_navigation_input_revision: u64 = 0,
     repo_state: repo_state.State = .{},
     git_status: git_status.GitStatusState = .{},
     status_load: app_auto_reload.AuxiliaryTracker = .{},
@@ -621,10 +657,13 @@ pub const App = struct {
         if (self.pending_selection_restore) |*restore| restore.deinit(deinit_ctx.allocator);
         self.clearPendingReload(deinit_ctx.allocator);
         self.clearDeferredSourceApply(deinit_ctx.allocator);
+        self.clearPendingDisplayNavigationRestore(deinit_ctx.allocator);
     }
 
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         self.clearEphemeralStatusForUserAction(msg);
+        const tracks_display_navigation = msgTracksDisplayNavigation(msg);
+        const navigation_before = if (tracks_display_navigation) self.displayNavigationSnapshot() else undefined;
 
         switch (msg) {
             .terminal_resized => |size| {
@@ -860,11 +899,72 @@ pub const App = struct {
             .git_action_spinner_tick => self.gitActionSpinnerTick(ctx),
             .quit => self.requestQuit(ctx),
         }
+        if (tracks_display_navigation) {
+            const navigation_after = self.displayNavigationSnapshot();
+            if (!std.meta.eql(navigation_before, navigation_after)) {
+                self.display_navigation_input_revision +%= 1;
+                if (self.pending_display_navigation_restore != null) {
+                    try self.capturePendingDisplayNavigationOverride(ctx.allocator());
+                }
+            }
+        }
         if (!self.selection_owner.activeMouseSelection() and self.deferred_source_apply != null) {
             try self.applyDeferredSource(ctx);
         }
         try self.ensureReviewProjection(ctx);
         self.reconcileGitActionSpinnerTimer(ctx);
+    }
+
+    fn msgTracksDisplayNavigation(msg: Msg) bool {
+        return switch (msg) {
+            .select_previous_file,
+            .select_next_file,
+            .toggle_directory,
+            .expand_directory,
+            .collapse_or_parent_directory,
+            .scroll_diff_up,
+            .scroll_diff_down,
+            .scroll_diff_left,
+            .scroll_diff_right,
+            .scroll_sidebar_left,
+            .scroll_sidebar_right,
+            .page_diff_up,
+            .page_diff_down,
+            .select_previous_hunk,
+            .select_next_hunk,
+            .toggle_hunk_fold,
+            .select_first_file,
+            .select_last_file,
+            .sidebar_click_node,
+            .mouse_sidebar_wheel_up,
+            .mouse_sidebar_wheel_down,
+            .mouse_diff_wheel_up,
+            .mouse_diff_wheel_down,
+            .mouse_diff_wheel_left,
+            .mouse_diff_wheel_right,
+            .toggle_display_mode,
+            .clear_search,
+            .submit_search,
+            .select_next_search_match,
+            .select_previous_search_match,
+            .submit_file_search,
+            => true,
+            else => false,
+        };
+    }
+
+    fn displayNavigationSnapshot(self: *const App) DisplayNavigationSnapshot {
+        return .{
+            .selected_target = self.viewer.selected_target,
+            .selected_node = self.viewer.selected_node,
+            .diff_cursor = self.viewer.diff_cursor,
+            .diff_scroll = self.viewer.diff_scroll,
+            .diff_horizontal_scroll = self.viewer.diff_horizontal_scroll,
+            .sidebar_horizontal_scroll = self.viewer.sidebar_horizontal_scroll,
+            .search_coordinate = if (self.search.match) |match| match.coordinate else null,
+            .search_match_offset = self.search.match_offset,
+            .display_mode = self.viewer.display_mode,
+        };
     }
 
     fn requestQuit(self: *App, ctx: *chasen.Ctx(Msg)) void {
@@ -1588,6 +1688,7 @@ pub const App = struct {
     fn dropStatusSnapshot(self: *App) void {
         _ = self.status_load.prepare(false);
         self.pending_initial_first_visible_selection = false;
+        if (self.git_status.repo_root != null or self.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
         self.git_status.clear();
     }
 
@@ -1653,6 +1754,62 @@ pub const App = struct {
         self.pending_reload = null;
     }
 
+    fn capturePendingDisplayNavigationRestore(self: *const App, allocator: std.mem.Allocator) !?PendingDisplayNavigationRestore {
+        const repo_root = self.activeRepoRoot() orelse return null;
+        var anchor = try self.captureReloadAnchor(allocator) orelse return null;
+        errdefer anchor.deinit(allocator);
+        const owned_root = try allocator.dupe(u8, repo_root);
+        return .{
+            .repo_root = owned_root,
+            .source_kind = reviewProjectionSourceKind(self.config.source),
+            .source_session_revision = self.source_session_revision,
+            .original = anchor,
+            .captured_input_revision = self.display_navigation_input_revision,
+        };
+    }
+
+    fn installPendingDisplayNavigationRestore(self: *App, allocator: std.mem.Allocator, restore: PendingDisplayNavigationRestore) void {
+        self.clearPendingDisplayNavigationRestore(allocator);
+        self.pending_display_navigation_restore = restore;
+        self.pending_display_navigation_restore.?.source_session_revision = self.source_session_revision;
+    }
+
+    fn clearPendingDisplayNavigationRestore(self: *App, allocator: std.mem.Allocator) void {
+        if (self.pending_display_navigation_restore) |*restore| restore.deinit(allocator);
+        self.pending_display_navigation_restore = null;
+    }
+
+    fn capturePendingDisplayNavigationOverride(self: *App, allocator: std.mem.Allocator) !void {
+        const captured_revision = if (self.pending_display_navigation_restore) |restore| restore.captured_input_revision else return;
+        if (captured_revision == self.display_navigation_input_revision) return;
+
+        const repo_root = self.activeRepoRoot() orelse {
+            self.clearPendingDisplayNavigationRestore(allocator);
+            return;
+        };
+        const restore_identity_matches = if (self.pending_display_navigation_restore) |restore|
+            restore.source_session_revision == self.source_session_revision and
+                restore.source_kind == reviewProjectionSourceKind(self.config.source) and
+                std.mem.eql(u8, restore.repo_root, repo_root)
+        else
+            false;
+        if (!restore_identity_matches) {
+            self.clearPendingDisplayNavigationRestore(allocator);
+            return;
+        }
+
+        var latest = try self.captureReloadAnchor(allocator) orelse {
+            self.clearPendingDisplayNavigationRestore(allocator);
+            return;
+        };
+        errdefer latest.deinit(allocator);
+
+        const restore = &self.pending_display_navigation_restore.?;
+        if (restore.override) |*previous| previous.deinit(allocator);
+        restore.override = latest;
+        restore.captured_input_revision = self.display_navigation_input_revision;
+    }
+
     fn clearDeferredSourceApply(self: *App, allocator: std.mem.Allocator) void {
         var deferred = self.deferred_source_apply orelse return;
         self.deferred_source_apply = null;
@@ -1680,22 +1837,42 @@ pub const App = struct {
 
     fn ensureReviewProjection(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         const target = self.reviewProjectionTarget() orelse {
-            if (self.review_projection != .idle) {
+            if (self.canRetainDisplayedProjection()) return;
+            if (self.pending_display_navigation_restore != null and !self.status_load.isFresh()) return;
+            if (self.pending_display_navigation_restore != null) {
+                self.clearPendingDisplayNavigationRestore(self.allocator orelse ctx.allocator());
+            }
+            if (self.review_projection.hasPending() or self.review_projection.hasDisplayed()) {
                 self.review_projection.deinit(self.allocator orelse ctx.allocator());
             }
             return;
         };
 
-        if (self.review_projection.matches(
+        if (self.pending_display_navigation_restore != null and !self.pendingDisplayRestoreMatchesTarget(target)) {
+            self.clearPendingDisplayNavigationRestore(self.allocator orelse ctx.allocator());
+        }
+
+        if (self.review_projection.displayedMatches(
             target.repo_root,
             target.path_key,
             target.kind,
             target.source_kind,
-            self.load.generation,
-            self.status_load.generation,
+            self.source_session_revision,
+            self.status_snapshot_revision,
+        )) return;
+        if (self.review_projection.pendingMatches(
+            target.repo_root,
+            target.path_key,
+            target.kind,
+            target.source_kind,
+            self.source_session_revision,
+            self.status_snapshot_revision,
         )) return;
 
-        self.review_projection.deinit(ctx.allocator());
+        self.review_projection.clearPending(ctx.allocator());
+        if (!self.displayedProjectionMatchesStableIdentity(target.repo_root, target.path_key, target.source_kind)) {
+            self.review_projection.clearDisplayed(ctx.allocator());
+        }
         self.review_projection_next_id +%= 1;
         var state_request = try app_review_projection.cloneRequest(
             ctx.allocator(),
@@ -1704,8 +1881,8 @@ pub const App = struct {
             target.path_key,
             target.kind,
             target.source_kind,
-            self.load.generation,
-            self.status_load.generation,
+            self.source_session_revision,
+            self.status_snapshot_revision,
         );
         errdefer state_request.deinit(ctx.allocator());
 
@@ -1716,8 +1893,8 @@ pub const App = struct {
             target.path_key,
             target.kind,
             target.source_kind,
-            self.load.generation,
-            self.status_load.generation,
+            self.source_session_revision,
+            self.status_snapshot_revision,
         );
         var task_request_moved = false;
         errdefer if (!task_request_moved) task_request.deinit(ctx.allocator());
@@ -1733,7 +1910,32 @@ pub const App = struct {
             return err;
         };
 
-        self.review_projection = .{ .pending = state_request };
+        self.review_projection.pending = state_request;
+    }
+
+    fn displayedProjectionMatchesStableIdentity(self: *const App, repo_root: []const u8, path_key: []const u8, source_kind: app_review_projection.SourceKind) bool {
+        const request = self.review_projection.displayed.request() orelse return false;
+        return request.matchesDisplayIdentity(repo_root, path_key, source_kind, self.source_session_revision);
+    }
+
+    fn canRetainDisplayedProjection(self: *const App) bool {
+        const request = self.review_projection.displayed.request() orelse return false;
+        const repo_root = self.activeRepoRoot() orelse return false;
+        const path_key = self.selectedStagePathKey() orelse return false;
+        return request.matchesDisplayIdentity(
+            repo_root,
+            path_key,
+            reviewProjectionSourceKind(self.config.source),
+            self.source_session_revision,
+        ) and !self.status_load.isFresh();
+    }
+
+    fn pendingDisplayRestoreMatchesTarget(self: *const App, target: ProjectionTarget) bool {
+        const restore = self.pending_display_navigation_restore orelse return false;
+        return restore.source_session_revision == self.source_session_revision and
+            restore.source_kind == target.source_kind and
+            std.mem.eql(u8, restore.repo_root, target.repo_root) and
+            std.mem.eql(u8, restore.authoritative().path_key, target.path_key);
     }
 
     const ProjectionTarget = struct {
@@ -1964,6 +2166,7 @@ pub const App = struct {
             .no_path => self.setStatus("hunk stage toggle unavailable for status-only file", .{}),
             .no_hunk => self.setStatus("no hunk selected", .{}),
             .offscreen_cursor => self.setStatus("cursor is offscreen; move cursor first", .{}),
+            .stale_status => self.setStatus("status is still loading", .{}),
             .stale_source => self.setStatus("source is stale; press r to reload", .{}),
         }
     }
@@ -2011,6 +2214,10 @@ pub const App = struct {
                 self.setStatus("could not build hunk patch", .{});
                 return;
             },
+            .stale_status => {
+                self.setStatus("status is still loading", .{});
+                return;
+            },
             .stale_source => {
                 self.setStatus("source is stale; press r to reload", .{});
                 return;
@@ -2031,7 +2238,7 @@ pub const App = struct {
         if (!self.auto_reload.sourceIsActionable()) return .stale_source;
 
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
-        if (self.activeCombinedProjection()) |bundle| {
+        if (self.currentCombinedProjection()) |bundle| {
             if (!self.diffCursorIsVisible()) return .offscreen_cursor;
             const projected_index = self.selectedHunkIndex() orelse return .no_hunk;
             if (projected_index >= bundle.projection.hunk_states.len) return .no_hunk;
@@ -2040,6 +2247,7 @@ pub const App = struct {
                 .cached => if (can_unstage) .{ .operation = .unstage } else .unavailable_source,
             };
         }
+        if (self.activeCombinedProjection() != null) return .stale_status;
 
         const file = self.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
@@ -2061,9 +2269,10 @@ pub const App = struct {
         if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
         if (!self.auto_reload.sourceIsActionable()) return .stale_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
-        if (self.activeCombinedProjection()) |bundle| {
+        if (self.currentCombinedProjection()) |bundle| {
             return self.selectedProjectedHunkStageTarget(allocator, repo_root, bundle);
         }
+        if (self.activeCombinedProjection() != null) return .stale_status;
         const file = self.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
         if (!self.diffCursorIsVisible()) return .offscreen_cursor;
@@ -2094,9 +2303,10 @@ pub const App = struct {
         if (!diff_source.sourceAllowsUnstageAction(self.config.source)) return .unavailable_source;
         if (!self.auto_reload.sourceIsActionable()) return .stale_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
-        if (self.activeCombinedProjection()) |bundle| {
+        if (self.currentCombinedProjection()) |bundle| {
             return self.selectedProjectedHunkUnstageTarget(allocator, repo_root, bundle);
         }
+        if (self.activeCombinedProjection() != null) return .stale_status;
         const file = self.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
         if (!self.diffCursorIsVisible()) return .offscreen_cursor;
@@ -4534,7 +4744,7 @@ pub const App = struct {
             return;
         }
         if (self.auto_reload.background_cycle != null or self.load.hasPending() or self.load.state == .loading or
-            self.status_load.isPending() or self.branch_status_load.isPending())
+            self.status_load.isPending() or self.branch_status_load.isPending() or self.review_projection.hasPending())
         {
             ctx.redraw().skip();
             return;
@@ -4637,8 +4847,17 @@ pub const App = struct {
 
         switch (result) {
             .empty => {
+                var acceptance_restore = if (pending_reload) |pending|
+                    if (pending.kind == .watch) try self.capturePendingDisplayNavigationRestore(ctx.allocator()) else null
+                else
+                    null;
+                errdefer if (acceptance_restore) |*restore| restore.deinit(ctx.allocator());
                 self.clearSourceDisplayForReplacement();
                 self.load.replaceEmpty(ctx.allocator(), .no_changes);
+                if (acceptance_restore) |restore| {
+                    self.installPendingDisplayNavigationRestore(ctx.allocator(), restore);
+                    acceptance_restore = null;
+                }
                 _ = self.acceptSourceFingerprint(app_auto_reload.SourceFingerprint.init(""));
                 can_project_status = true;
             },
@@ -4674,6 +4893,11 @@ pub const App = struct {
                     => {},
                 }
 
+                var acceptance_restore = if (consumed_pending_is_watch)
+                    try self.capturePendingDisplayNavigationRestore(ctx.allocator())
+                else
+                    null;
+                errdefer if (acceptance_restore) |*restore| restore.deinit(ctx.allocator());
                 self.clearSourceDisplayForReplacement();
                 var loaded = bundle.loaded;
                 var arena = bundle.takeArena();
@@ -4694,10 +4918,16 @@ pub const App = struct {
                     .loaded = loaded,
                     .reviewed_files_owned = true,
                 });
+                if (acceptance_restore) |restore| {
+                    self.installPendingDisplayNavigationRestore(ctx.allocator(), restore);
+                    acceptance_restore = null;
+                }
                 _ = self.acceptSourceFingerprint(bundle.fingerprint);
 
                 const active_loaded = self.activeLoadedDiff().?;
-                const restored_from_anchor = if (pending_reload) |*pending|
+                const restored_from_anchor = if (self.pending_display_navigation_restore) |*restore|
+                    self.restoreReloadAnchor(active_loaded, restore.authoritative())
+                else if (pending_reload) |*pending|
                     if (pending.anchor) |*anchor| self.restoreReloadAnchor(active_loaded, anchor) else false
                 else
                     false;
@@ -4787,6 +5017,8 @@ pub const App = struct {
 
         switch (result.result) {
             .empty => {
+                const same_root = if (self.git_status.repo_root) |root| std.mem.eql(u8, root, result.repo_root) else false;
+                if (!same_root or self.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
                 self.status_load.markSuccess();
                 self.git_status.clear();
                 const prefer_first_visible_file = self.pending_initial_first_visible_selection;
@@ -4807,6 +5039,7 @@ pub const App = struct {
                     .replace_changed,
                     => {},
                 }
+                self.advanceStatusSnapshotRevision();
                 try self.git_status.replace(result.repo_root, bundle);
                 self.status_load.markSuccess();
                 result.result = .empty;
@@ -4817,7 +5050,10 @@ pub const App = struct {
             .failed => |message| {
                 const retain = result.background_cycle_id != null and self.git_status.repo_root != null;
                 self.status_load.markFailure(retain);
-                if (!retain) self.git_status.clear();
+                if (!retain) {
+                    if (self.git_status.repo_root != null or self.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
+                    self.git_status.clear();
+                }
                 self.pending_initial_first_visible_selection = false;
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{git_ops.trimGitOutput(message)});
@@ -4825,7 +5061,10 @@ pub const App = struct {
             .failed_static => |message| {
                 const retain = result.background_cycle_id != null and self.git_status.repo_root != null;
                 self.status_load.markFailure(retain);
-                if (!retain) self.git_status.clear();
+                if (!retain) {
+                    if (self.git_status.repo_root != null or self.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
+                    self.git_status.clear();
+                }
                 self.pending_initial_first_visible_selection = false;
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{message});
@@ -4900,10 +5139,7 @@ pub const App = struct {
         var consumed = false;
         defer if (!consumed) result.deinit(ctx.allocator());
 
-        const pending_id = switch (self.review_projection) {
-            .pending => |request| request.id,
-            else => return,
-        };
+        const pending_id = if (self.review_projection.pending) |request| request.id else return;
         if (pending_id != result.request.id) return;
 
         const current = self.reviewProjectionTarget() orelse return;
@@ -4912,25 +5148,40 @@ pub const App = struct {
             current.path_key,
             current.kind,
             current.source_kind,
-            self.load.generation,
-            self.status_load.generation,
+            self.source_session_revision,
+            self.status_snapshot_revision,
         )) return;
 
-        self.review_projection.deinit(ctx.allocator());
+        var local_navigation = if (self.pending_display_navigation_restore == null)
+            try self.captureReloadAnchor(ctx.allocator())
+        else
+            null;
+        defer if (local_navigation) |*anchor| anchor.deinit(ctx.allocator());
+
+        self.review_projection.clearPending(ctx.allocator());
+        self.review_projection.clearDisplayed(ctx.allocator());
         switch (result.result) {
             .ready => |ready| {
-                self.review_projection = .{ .ready = .{
+                self.review_projection.displayed = .{ .ready = .{
                     .request = result.request,
                     .value = ready,
                 } };
-                self.refreshSearchForSelectedFile();
+                if (self.pending_display_navigation_restore) |*restore| {
+                    self.restoreDisplayedNavigation(restore.authoritative());
+                    self.clearPendingDisplayNavigationRestore(ctx.allocator());
+                } else if (local_navigation) |*anchor| {
+                    self.restoreDisplayedNavigation(anchor);
+                } else {
+                    self.refreshSearchForSelectedFile();
+                }
                 consumed = true;
             },
             .failed => |body| {
-                self.review_projection = .{ .failed = .{
+                self.review_projection.displayed = .{ .failed = .{
                     .request = result.request,
                     .body = body,
                 } };
+                self.clearPendingDisplayNavigationRestore(ctx.allocator());
                 consumed = true;
             },
             .failed_static => |message| {
@@ -4941,20 +5192,42 @@ pub const App = struct {
                     result.request.path_key,
                     result.request.kind,
                     result.request.source_kind,
-                    result.request.load_generation,
-                    result.request.status_generation,
+                    result.request.source_session_revision,
+                    result.request.status_snapshot_revision,
                 );
                 errdefer request.deinit(ctx.allocator());
 
                 var body = try app_review_projection.statusBodyAlloc(ctx.allocator(), result.request.path_key, "{s}", .{message});
                 errdefer body.deinit(ctx.allocator());
 
-                self.review_projection = .{ .failed = .{
+                self.review_projection.displayed = .{ .failed = .{
                     .request = request,
                     .body = body,
                 } };
+                self.clearPendingDisplayNavigationRestore(ctx.allocator());
             },
         }
+    }
+
+    fn restoreDisplayedNavigation(self: *App, anchor: *const ReloadAnchor) void {
+        self.viewer.diff_cursor = anchor.diff_cursor;
+        if (self.selectedDiffCursorOffset() == null) {
+            if (anchor.diff_cursor_offset) |offset| {
+                const line_count = self.displayedDiffLineCount();
+                if (line_count > 0) {
+                    self.viewer.diff_cursor = self.selectedCoordinateAtOffset(@min(offset, line_count - 1)) orelse self.viewer.diff_cursor;
+                }
+            }
+        }
+        if (self.selectedDiffCursorOffset() == null) self.initializeDiffCursorForSelectedFile();
+        self.viewer.diff_scroll = anchor.diff_scroll;
+        self.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
+        self.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
+        self.clampDiffNavigation();
+        self.keepDiffCursorVisible();
+        self.restoreSearchFromReloadAnchor(anchor);
+        self.clampSidebarHorizontalScroll();
+        self.clampDiffHorizontalScrollToVisibleRows();
     }
 
     fn applyStatusProjection(self: *App, allocator: std.mem.Allocator, prefer_first_visible_file: bool) !void {
@@ -5045,6 +5318,10 @@ pub const App = struct {
         };
         try loaded.rebuildVisibleNodes(arena_allocator, false, self.review_display.changed_file_filter);
 
+        self.advanceSourceSessionRevision();
+        if (self.pending_display_navigation_restore) |*restore| {
+            restore.source_session_revision = self.source_session_revision;
+        }
         self.load.replaceLoaded(allocator, .{
             .arena = arena,
             .loaded = loaded,
@@ -5061,6 +5338,9 @@ pub const App = struct {
             break;
         }
         _ = self.restorePendingSelectionOrFallback(allocator, active_loaded);
+        if (self.pending_display_navigation_restore) |*restore| {
+            _ = self.restoreReloadAnchor(active_loaded, restore.authoritative());
+        }
     }
 
     fn storeFailedMessage(self: *App, allocator: std.mem.Allocator, message: []const u8) !void {
@@ -5068,6 +5348,7 @@ pub const App = struct {
     }
 
     fn clearLoadedDiff(self: *App) void {
+        self.advanceSourceSessionRevision();
         self.clearDiffSelection();
         self.load.clearCurrent(self.allocator);
         // allocator is null only before App.init has completed; deinit paths can
@@ -5075,12 +5356,21 @@ pub const App = struct {
         if (self.allocator) |allocator| {
             self.review_projection.deinit(allocator);
             self.staged_hunks.clear(allocator);
+            self.clearPendingDisplayNavigationRestore(allocator);
         }
         self.viewer.diff_scroll = 0;
         self.viewer.diff_horizontal_scroll = 0;
         self.viewer.sidebar_horizontal_scroll = 0;
         self.viewer.diff_cursor = .{ .metadata = 0 };
         self.clearSearchMatch();
+    }
+
+    fn advanceSourceSessionRevision(self: *App) void {
+        self.source_session_revision +%= 1;
+    }
+
+    fn advanceStatusSnapshotRevision(self: *App) void {
+        self.status_snapshot_revision +%= 1;
     }
 
     /// Destructive source transition: invalidate source authority and tear
@@ -5449,7 +5739,7 @@ pub const App = struct {
 
     fn selectedProjectionLineCount(self: *const App) usize {
         if (self.selectedStatusEntry() == null) return 0;
-        return switch (self.review_projection) {
+        return switch (self.review_projection.displayed) {
             .ready => |ready| switch (ready.value) {
                 .cached_diff => |bundle| if (bundle.loaded.document.files.len > 0)
                     if (bundle.loaded.cachedRenderedLineIndex(0, self.effectiveDisplayMode())) |index| index.lineCount() else 0
@@ -5459,7 +5749,7 @@ pub const App = struct {
                 .combined_hunks => |bundle| bundle.projection.lineIndex(self.effectiveDisplayMode()).lineCount(),
                 .status_body => 1,
             },
-            .pending, .failed => 1,
+            .failed => 1,
             .idle => 0,
         };
     }
@@ -6601,19 +6891,9 @@ pub const App = struct {
     }
 
     pub fn activeGeneratedFileProjection(self: *const App) ?*const app_review_projection.GeneratedFileBundle {
-        const target = self.reviewProjectionTarget() orelse return null;
-        if (target.kind != .generated_added_file) return null;
-
-        return switch (self.review_projection) {
+        return switch (self.review_projection.displayed) {
             .ready => |*ready| blk: {
-                if (!ready.request.matchesBorrowed(
-                    target.repo_root,
-                    target.path_key,
-                    target.kind,
-                    target.source_kind,
-                    self.load.generation,
-                    self.status_load.generation,
-                )) break :blk null;
+                if (ready.request.kind != .generated_added_file or !self.displayedProjectionRequestIsActive(ready.request)) break :blk null;
                 break :blk switch (ready.value) {
                     .generated_added_file => |*bundle| bundle,
                     else => null,
@@ -6624,19 +6904,9 @@ pub const App = struct {
     }
 
     pub fn activeCachedDiffProjection(self: *const App) ?*const app_load.LoadedDiffBundle {
-        const target = self.reviewProjectionTarget() orelse return null;
-        if (target.kind != .cached_diff) return null;
-
-        return switch (self.review_projection) {
+        return switch (self.review_projection.displayed) {
             .ready => |*ready| blk: {
-                if (!ready.request.matchesBorrowed(
-                    target.repo_root,
-                    target.path_key,
-                    target.kind,
-                    target.source_kind,
-                    self.load.generation,
-                    self.status_load.generation,
-                )) break :blk null;
+                if (ready.request.kind != .cached_diff or !self.displayedProjectionRequestIsActive(ready.request)) break :blk null;
                 break :blk switch (ready.value) {
                     .cached_diff => |*bundle| bundle,
                     else => null,
@@ -6647,21 +6917,9 @@ pub const App = struct {
     }
 
     fn activeCombinedProjection(self: *const App) ?*const app_review_projection.CombinedHunkBundle {
-        // Recompute the target identity on each call so reload/status
-        // generation changes cannot leave a stale projection active.
-        const target = self.reviewProjectionTarget() orelse return null;
-        if (target.kind != .combined_hunks) return null;
-
-        return switch (self.review_projection) {
+        return switch (self.review_projection.displayed) {
             .ready => |*ready| blk: {
-                if (!ready.request.matchesBorrowed(
-                    target.repo_root,
-                    target.path_key,
-                    target.kind,
-                    target.source_kind,
-                    self.load.generation,
-                    self.status_load.generation,
-                )) break :blk null;
+                if (ready.request.kind != .combined_hunks or !self.displayedProjectionRequestIsActive(ready.request)) break :blk null;
                 break :blk switch (ready.value) {
                     .combined_hunks => |*bundle| bundle,
                     else => null,
@@ -6669,6 +6927,31 @@ pub const App = struct {
             },
             else => null,
         };
+    }
+
+    fn displayedProjectionRequestIsActive(self: *const App, request: app_review_projection.Request) bool {
+        const repo_root = self.activeRepoRoot() orelse return false;
+        const path_key = self.selectedStagePathKey() orelse return false;
+        return request.matchesDisplayIdentity(
+            repo_root,
+            path_key,
+            reviewProjectionSourceKind(self.config.source),
+            self.source_session_revision,
+        );
+    }
+
+    fn currentCombinedProjection(self: *const App) ?*const app_review_projection.CombinedHunkBundle {
+        const target = self.reviewProjectionTarget() orelse return null;
+        if (target.kind != .combined_hunks) return null;
+        if (!self.review_projection.displayedMatches(
+            target.repo_root,
+            target.path_key,
+            target.kind,
+            target.source_kind,
+            self.source_session_revision,
+            self.status_snapshot_revision,
+        )) return null;
+        return self.activeCombinedProjection();
     }
 
     fn selectedFileLineIndex(self: *const App, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {
@@ -11238,10 +11521,10 @@ test "active diff display uses ready combined projection by identity" {
         "a",
         .combined_hunks,
         .unstaged,
-        app.load.generation,
-        app.status_load.generation,
+        app.source_session_revision,
+        app.status_snapshot_revision,
     );
-    app.review_projection = .{ .ready = .{
+    app.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
@@ -11254,6 +11537,617 @@ test "active diff display uses ready combined projection by identity" {
     try std.testing.expectEqual(@as(usize, 2), display.combined_projection.staged_flags.len);
     try std.testing.expect(display.combined_projection.staged_flags[0]);
     try std.testing.expect(!display.combined_projection.staged_flags[1]);
+}
+
+test "background status refresh retains combined projection while cursor moves" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+        .source_session_revision = 11,
+        .status_snapshot_revision = 13,
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 } },
+    };
+    defer app.git_status.deinit();
+    defer app.review_projection.deinit(std.testing.allocator);
+
+    var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
+    try app.git_status.replace("/repo", &mixed_bundle);
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .combined_hunks,
+        .unstaged,
+        app.source_session_revision,
+        app.status_snapshot_revision,
+    );
+    app.review_projection.displayed = .{ .ready = .{
+        .request = request,
+        .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
+    } };
+    acceptTestSource(&app);
+
+    const projection_before = app.activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
+    const hunks_before = projection_before.projection.file.hunks.ptr;
+    const cursor_before = app.selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
+    try std.testing.expect(cursor_before > 0);
+
+    _ = app.status_load.prepare(true);
+    app.load.generation +%= 1;
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.ensureReviewProjection(&ctx);
+
+    const retained = app.activeCombinedProjection() orelse return error.ExpectedRetainedProjection;
+    try std.testing.expectEqual(hunks_before, retained.projection.file.hunks.ptr);
+    app.moveDiffCursorRows(.down);
+    const cursor_after = app.selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
+    try std.testing.expect(cursor_after > cursor_before);
+    try std.testing.expect(cursor_after != 0);
+    switch (app.selectedHunkToggleOperation()) {
+        .stale_status => {},
+        else => return error.ExpectedStaleProjectedHunkAuthority,
+    }
+}
+
+test "unchanged full cycle preserves projection semantic identity" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+        .source_session_revision = 17,
+        .status_snapshot_revision = 19,
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 }, .diff_scroll = 2 },
+    };
+    defer app.git_status.deinit();
+    defer app.review_projection.deinit(std.testing.allocator);
+
+    var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
+    try app.git_status.replace("/repo", &mixed_bundle);
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .combined_hunks,
+        .unstaged,
+        app.source_session_revision,
+        app.status_snapshot_revision,
+    );
+    app.review_projection.displayed = .{ .ready = .{
+        .request = request,
+        .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
+    } };
+
+    const projection_before = app.activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
+    const hunks_before = projection_before.projection.file.hunks.ptr;
+    const cursor_before = app.viewer.diff_cursor;
+    const scroll_before = app.viewer.diff_scroll;
+
+    const status_generation = app.status_load.prepare(true);
+    app.status_load.begin(1);
+    app.load.generation +%= 1;
+    try std.testing.expect(app.status_load.accept(status_generation));
+    app.status_load.markSuccess();
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.ensureReviewProjection(&ctx);
+
+    const projection_after = app.activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
+    try std.testing.expectEqual(hunks_before, projection_after.projection.file.hunks.ptr);
+    try std.testing.expect(!app.review_projection.hasPending());
+    try std.testing.expectEqual(@as(u64, 17), app.source_session_revision);
+    try std.testing.expectEqual(@as(u64, 19), app.status_snapshot_revision);
+    try std.testing.expectEqual(cursor_before, app.viewer.diff_cursor);
+    try std.testing.expectEqual(scroll_before, app.viewer.diff_scroll);
+}
+
+test "final projection prefers explicit interim navigation override" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+        .source_session_revision = 23,
+        .status_snapshot_revision = 29,
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+
+    var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
+    try app.git_status.replace("/repo", &mixed_bundle);
+
+    const state_request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .combined_hunks,
+        .unstaged,
+        app.source_session_revision,
+        app.status_snapshot_revision,
+    );
+    app.review_projection.pending = state_request;
+    app.pending_display_navigation_restore = .{
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .source_kind = .unstaged,
+        .source_session_revision = app.source_session_revision,
+        .original = .{
+            .path_key = try std.testing.allocator.dupe(u8, "a"),
+            .selected_target_tag = .diff_file,
+            .visible_sidebar_row = 0,
+            .diff_cursor = .{ .hunk_header = 1 },
+            .diff_cursor_offset = 5,
+            .diff_scroll = 4,
+            .diff_horizontal_scroll = 0,
+            .sidebar_horizontal_scroll = 0,
+            .search_coordinate = null,
+        },
+        .override = .{
+            .path_key = try std.testing.allocator.dupe(u8, "a"),
+            .selected_target_tag = .diff_file,
+            .visible_sidebar_row = 0,
+            .diff_cursor = .{ .hunk_header = 0 },
+            .diff_cursor_offset = 0,
+            .diff_scroll = 0,
+            .diff_horizontal_scroll = 0,
+            .sidebar_horizontal_scroll = 0,
+            .search_coordinate = null,
+        },
+        .captured_input_revision = 4,
+    };
+
+    const result_request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .combined_hunks,
+        .unstaged,
+        app.source_session_revision,
+        app.status_snapshot_revision,
+    );
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.finishReviewProjectionLoad(&ctx, .{
+        .request = result_request,
+        .result = .{ .ready = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) } },
+    });
+
+    try std.testing.expect(app.pending_display_navigation_restore == null);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 0 }, app.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(?usize, 0), app.selectedDiffCursorOffset());
+}
+
+test "empty watch source carries combined navigation into cached projection" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 2, .pending = .{ .diff_load = 2 }, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+        .status_load = .{ .generation = 7, .pending = .{ .generation = 7, .origin = .background, .background_cycle_id = 1 } },
+        .source_session_revision = 37,
+        .status_snapshot_revision = 41,
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 }, .diff_scroll = 3 },
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+
+    var mixed_status = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
+    try app.git_status.replace("/repo", &mixed_status);
+    const displayed_request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .combined_hunks,
+        .unstaged,
+        app.source_session_revision,
+        app.status_snapshot_revision,
+    );
+    app.review_projection.displayed = .{ .ready = .{
+        .request = displayed_request,
+        .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
+    } };
+    const original_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
+    try std.testing.expect(original_offset > 0);
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .empty,
+    });
+    try std.testing.expect(app.pending_display_navigation_restore != null);
+    try std.testing.expect(app.activeLoadedDiffConst() != null);
+    try std.testing.expectEqual(@as(usize, 0), app.activeLoadedDiffConst().?.document.files.len);
+
+    const staged_only = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 7,
+        .background_cycle_id = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = staged_only },
+    });
+    const target = app.reviewProjectionTarget() orelse return error.ExpectedCachedProjectionTarget;
+    try std.testing.expectEqual(app_review_projection.Kind.cached_diff, target.kind);
+
+    app.review_projection.pending = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        2,
+        target.repo_root,
+        target.path_key,
+        target.kind,
+        target.source_kind,
+        app.source_session_revision,
+        app.status_snapshot_revision,
+    );
+    const result_request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        2,
+        target.repo_root,
+        target.path_key,
+        target.kind,
+        target.source_kind,
+        app.source_session_revision,
+        app.status_snapshot_revision,
+    );
+    try app.finishReviewProjectionLoad(&ctx, .{
+        .request = result_request,
+        .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) } },
+    });
+
+    try std.testing.expect(app.pending_display_navigation_restore == null);
+    try std.testing.expect(app.activeCachedDiffProjection() != null);
+    const final_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
+    try std.testing.expect(final_offset > 0);
+    try std.testing.expect(final_offset <= original_offset);
+}
+
+test "empty watch source carries generated navigation into generated projection" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .source_session_revision = 43,
+        .status_snapshot_revision = 47,
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+
+    var untracked = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? a\x00");
+    try app.git_status.replace("/repo", &untracked);
+    try app.createStatusOnlyLoadedSession(std.testing.allocator, app.git_status.document);
+    app.viewer.diff_cursor = .{ .metadata = 2 };
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.status_load = .{ .generation = 7, .pending = .{ .generation = 7, .origin = .background, .background_cycle_id = 1 } };
+    app.pending_reload = .{ .generation = 2, .kind = .watch };
+
+    const displayed_request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .generated_added_file,
+        .unstaged,
+        app.source_session_revision,
+        app.status_snapshot_revision,
+    );
+    app.review_projection.displayed = .{ .ready = .{
+        .request = displayed_request,
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "a", "one\ntwo\nthree\nfour\n", false) },
+    } };
+    const original_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
+    try std.testing.expectEqual(@as(usize, 2), original_offset);
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .empty,
+    });
+    try std.testing.expect(app.pending_display_navigation_restore != null);
+
+    const same_untracked = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? a\x00");
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 7,
+        .background_cycle_id = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = same_untracked },
+    });
+    const target = app.reviewProjectionTarget() orelse return error.ExpectedGeneratedProjectionTarget;
+    try std.testing.expectEqual(app_review_projection.Kind.generated_added_file, target.kind);
+
+    app.review_projection.pending = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        2,
+        target.repo_root,
+        target.path_key,
+        target.kind,
+        target.source_kind,
+        app.source_session_revision,
+        app.status_snapshot_revision,
+    );
+    const result_request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        2,
+        target.repo_root,
+        target.path_key,
+        target.kind,
+        target.source_kind,
+        app.source_session_revision,
+        app.status_snapshot_revision,
+    );
+    try app.finishReviewProjectionLoad(&ctx, .{
+        .request = result_request,
+        .result = .{ .ready = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "a", "one\ntwo\nthree\nfour\nfive\n", false) } },
+    });
+
+    try std.testing.expect(app.pending_display_navigation_restore == null);
+    try std.testing.expect(app.activeGeneratedFileProjection() != null);
+    try std.testing.expectEqual(@as(?usize, 2), app.selectedDiffCursorOffset());
+}
+
+test "fresh empty status consumes pending display restore at raw terminal" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .generation = 2, .pending = .{ .diff_load = 2 }, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+        .status_load = .{ .generation = 7, .pending = .{ .generation = 7, .origin = .background, .background_cycle_id = 1 } },
+        .source_session_revision = 53,
+        .status_snapshot_revision = 59,
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 } },
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+
+    var mixed_status = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
+    try app.git_status.replace("/repo", &mixed_status);
+    const displayed_request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .combined_hunks,
+        .unstaged,
+        app.source_session_revision,
+        app.status_snapshot_revision,
+    );
+    app.review_projection.displayed = .{ .ready = .{
+        .request = displayed_request,
+        .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
+    } };
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.finishDiffLoad(&ctx, .{ .generation = 2, .result = .empty });
+    try std.testing.expect(app.pending_display_navigation_restore != null);
+
+    try app.finishStatusLoad(&ctx, .{
+        .generation = 7,
+        .background_cycle_id = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .empty,
+    });
+
+    try std.testing.expect(app.pending_display_navigation_restore == null);
+    try std.testing.expect(app.activeLoadedDiffConst() == null);
+    try std.testing.expect(app.load.state == .empty);
+}
+
+test "explicit interim navigation creates override but automatic state does not" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = .{ .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+        .source_session_revision = 31,
+        .status_load = .{ .freshness = .stale_refresh },
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .metadata = 0 } },
+    };
+    defer app.clearLoadedDiff();
+
+    app.initializeDiffCursorForSelectedFile();
+    try std.testing.expectEqual(@as(?usize, 0), app.selectedDiffCursorOffset());
+
+    app.pending_display_navigation_restore = .{
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .source_kind = .unstaged,
+        .source_session_revision = app.source_session_revision,
+        .original = .{
+            .path_key = try std.testing.allocator.dupe(u8, "a"),
+            .selected_target_tag = .diff_file,
+            .visible_sidebar_row = 0,
+            .diff_cursor = .{ .hunk_header = 1 },
+            .diff_cursor_offset = 5,
+            .diff_scroll = 4,
+            .diff_horizontal_scroll = 0,
+            .sidebar_horizontal_scroll = 0,
+            .search_coordinate = null,
+        },
+        .captured_input_revision = 0,
+    };
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.update(.scroll_diff_up, &ctx);
+    try std.testing.expectEqual(@as(u64, 0), app.display_navigation_input_revision);
+    try std.testing.expect(app.pending_display_navigation_restore.?.override == null);
+
+    try app.update(.scroll_diff_down, &ctx);
+
+    try std.testing.expectEqual(@as(u64, 1), app.display_navigation_input_revision);
+    var restore = app.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
+    var override = restore.override orelse return error.ExpectedNavigationOverride;
+    try std.testing.expectEqual(app.viewer.diff_cursor, override.diff_cursor);
+    try std.testing.expectEqual(app.selectedDiffCursorOffset(), override.diff_cursor_offset);
+
+    try app.update(.scroll_diff_down, &ctx);
+    try std.testing.expectEqual(@as(u64, 2), app.display_navigation_input_revision);
+    restore = app.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
+    override = restore.override orelse return error.ExpectedNavigationOverride;
+    try std.testing.expectEqual(app.viewer.diff_cursor, override.diff_cursor);
+    try std.testing.expectEqual(app.selectedDiffCursorOffset(), override.diff_cursor_offset);
+
+    const revision_before_clamp = app.display_navigation_input_revision;
+    app.clampDiffNavigation();
+    try std.testing.expectEqual(revision_before_clamp, app.display_navigation_input_revision);
+}
+
+test "selected path change supersedes pending display restore" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .source_session_revision = 61,
+        .status_snapshot_revision = 67,
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00M  b\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+    try app.createStatusOnlyLoadedSession(std.testing.allocator, app.git_status.document);
+    app.viewer.selected_target = .{ .status_only = 1 };
+    app.pending_display_navigation_restore = .{
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .source_kind = .unstaged,
+        .source_session_revision = app.source_session_revision,
+        .original = .{
+            .path_key = try std.testing.allocator.dupe(u8, "a"),
+            .selected_target_tag = .status_only,
+            .visible_sidebar_row = 0,
+            .diff_cursor = .{ .hunk_header = 0 },
+            .diff_cursor_offset = 0,
+            .diff_scroll = 0,
+            .diff_horizontal_scroll = 0,
+            .sidebar_horizontal_scroll = 0,
+            .search_coordinate = null,
+        },
+        .captured_input_revision = 0,
+    };
+    app.review_projection.pending = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        2,
+        "/repo",
+        "b",
+        .cached_diff,
+        .unstaged,
+        app.source_session_revision,
+        app.status_snapshot_revision,
+    );
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.ensureReviewProjection(&ctx);
+
+    try std.testing.expect(app.pending_display_navigation_restore == null);
+    try std.testing.expect(app.review_projection.pending != null);
+    try std.testing.expectEqualStrings("b", app.review_projection.pending.?.path_key);
+}
+
+test "superseded projection completion cannot replace display" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .source_session_revision = 71,
+        .status_snapshot_revision = 73,
+    };
+    defer app.clearLoadedDiff();
+    defer app.git_status.deinit();
+    defer app.tree_order.deinit(std.testing.allocator);
+    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
+    try app.git_status.replace("/repo", &status_bundle);
+    try app.createStatusOnlyLoadedSession(std.testing.allocator, app.git_status.document);
+    const stale_status_revision = app.status_snapshot_revision - 1;
+    app.review_projection.pending = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .cached_diff,
+        .unstaged,
+        app.source_session_revision,
+        stale_status_revision,
+    );
+    const result_request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .cached_diff,
+        .unstaged,
+        app.source_session_revision,
+        stale_status_revision,
+    );
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishReviewProjectionLoad(&ctx, .{
+        .request = result_request,
+        .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) } },
+    });
+
+    try std.testing.expect(app.review_projection.pending != null);
+    try std.testing.expect(!app.review_projection.hasDisplayed());
+    try std.testing.expectEqual(stale_status_revision, app.review_projection.pending.?.status_snapshot_revision);
 }
 
 test "cached preview uses displayed diff for cursor movement" {
@@ -11282,10 +12176,10 @@ test "cached preview uses displayed diff for cursor movement" {
         "a",
         .cached_diff,
         .unstaged,
-        app.load.generation,
-        app.status_load.generation,
+        app.source_session_revision,
+        app.status_snapshot_revision,
     );
-    app.review_projection = .{ .ready = .{
+    app.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
@@ -11323,10 +12217,10 @@ test "cached preview supports diff search" {
         "a",
         .cached_diff,
         .unstaged,
-        app.load.generation,
-        app.status_load.generation,
+        app.source_session_revision,
+        app.status_snapshot_revision,
     );
-    app.review_projection = .{ .ready = .{
+    app.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
@@ -11368,10 +12262,10 @@ test "cached preview keeps search input while projection is pending" {
         "a",
         .cached_diff,
         .unstaged,
-        app.load.generation,
-        app.status_load.generation,
+        app.source_session_revision,
+        app.status_snapshot_revision,
     );
-    app.review_projection = .{ .pending = request };
+    app.review_projection.pending = request;
 
     app.enterSearchMode();
     try std.testing.expect(app.search.mode);
@@ -11389,8 +12283,8 @@ test "cached preview keeps search input while projection is pending" {
         "a",
         .cached_diff,
         .unstaged,
-        app.load.generation,
-        app.status_load.generation,
+        app.source_session_revision,
+        app.status_snapshot_revision,
     );
     try app.finishReviewProjectionLoad(&ctx, .{
         .request = ready_request,
@@ -11427,10 +12321,10 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
         "src/new.zig",
         .generated_added_file,
         .unstaged,
-        app.load.generation,
-        app.status_load.generation,
+        app.source_session_revision,
+        app.status_snapshot_revision,
     );
-    app.review_projection = .{ .ready = .{
+    app.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n", false) },
     } };
@@ -11469,10 +12363,10 @@ test "generated preview blocks diff search" {
         "src/new.zig",
         .generated_added_file,
         .unstaged,
-        app.load.generation,
-        app.status_load.generation,
+        app.source_session_revision,
+        app.status_snapshot_revision,
     );
-    app.review_projection = .{ .ready = .{
+    app.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n", false) },
     } };
@@ -11514,10 +12408,10 @@ test "staged new file preview blocks diff search" {
         "src/new.zig",
         .cached_diff,
         .unstaged,
-        app.load.generation,
-        app.status_load.generation,
+        app.source_session_revision,
+        app.status_snapshot_revision,
     );
-    app.review_projection = .{ .ready = .{
+    app.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
@@ -11559,10 +12453,10 @@ test "staged new file preview does not refresh existing search query" {
         "src/new.zig",
         .cached_diff,
         .unstaged,
-        app.load.generation,
-        app.status_load.generation,
+        app.source_session_revision,
+        app.status_snapshot_revision,
     );
-    app.review_projection = .{ .ready = .{
+    app.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
@@ -11602,10 +12496,10 @@ test "projected hunk actions route through original cached and unstaged origins"
         "a",
         .combined_hunks,
         .unstaged,
-        app.load.generation,
-        app.status_load.generation,
+        app.source_session_revision,
+        app.status_snapshot_revision,
     );
-    app.review_projection = .{ .ready = .{
+    app.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
@@ -13691,6 +14585,22 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     try std.testing.expect(branch_ctx._redraw_suppressed);
 
     app.branch_status_load.pending = null;
+    app.review_projection.pending = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        1,
+        "/repo",
+        "a",
+        .cached_diff,
+        .unstaged,
+        1,
+        1,
+    );
+    var projection_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.autoReloadTick(&projection_ctx);
+    try std.testing.expectEqual(@as(usize, 0), projection_ctx._pending_tasks_with_len);
+    try std.testing.expect(projection_ctx._redraw_suppressed);
+    app.review_projection.clearPending(std.testing.allocator);
+
     app.selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } };
     var selection_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.autoReloadTick(&selection_ctx);
@@ -13773,6 +14683,57 @@ test "watch no-op diff load preserves session view state and staged hunk marks" 
     try std.testing.expectEqual(@as(usize, 2), app.viewer.sidebar_horizontal_scroll);
     try std.testing.expect(app.staged_hunks.contains("/repo", "a", 0));
     try std.testing.expect(app.pending_reload == null);
+}
+
+test "changed watch reload restores acceptance-time navigation instead of launch anchor" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = "old";
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = app_test_support.loadState(current),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .selected_node = 0,
+            .diff_cursor = .{ .hunk_header = 0 },
+        },
+        .pending_reload = .{
+            .generation = 2,
+            .kind = .watch,
+            .anchor = .{
+                .path_key = try std.testing.allocator.dupe(u8, "a"),
+                .selected_target_tag = .diff_file,
+                .visible_sidebar_row = 0,
+                .diff_cursor = .{ .metadata = 0 },
+                .diff_cursor_offset = 0,
+                .diff_scroll = 0,
+                .diff_horizontal_scroll = 0,
+                .sidebar_horizontal_scroll = 0,
+                .search_coordinate = null,
+            },
+        },
+    };
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    const acceptance_cursor = app.viewer.diff_cursor;
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .result = .{ .loaded = bundle },
+    });
+
+    try std.testing.expectEqual(acceptance_cursor, app.viewer.diff_cursor);
+    try std.testing.expect(app.pending_reload == null);
+    const restore = app.pending_display_navigation_restore orelse return error.ExpectedAcceptanceTimeRestore;
+    try std.testing.expectEqual(acceptance_cursor, restore.original.diff_cursor);
 }
 
 test "unchanged recovery clears its source failure and redraws" {
@@ -14235,6 +15196,56 @@ test "deferred background source is discarded when a repository action starts" {
     try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
     try std.testing.expect(app.deferred_source_apply == null);
     try std.testing.expect(app.pending_reload == null);
+    try std.testing.expect(app.auto_reload.background_cycle == null);
+}
+
+test "deferred changed watch captures navigation when selection ends" {
+    var current = app_test_support.loadedDiffOne();
+    current.text = "old";
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .load = app_test_support.loadState(current),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .selected_node = 0,
+            .diff_cursor = .{ .metadata = 0 },
+        },
+        .pending_reload = .{ .generation = 2, .kind = .watch },
+        .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
+    };
+    defer app.clearDeferredSourceApply(std.testing.allocator);
+    defer app.clearPendingReload(std.testing.allocator);
+    defer app.clearLoadedDiff();
+    app.load.generation = 2;
+    app.load.pending = .{ .diff_load = 2 };
+    app.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.auto_reload.beginCycle().?;
+    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .source));
+    const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .generation = 2,
+        .background_cycle_id = cycle_id,
+        .result = .{ .loaded = bundle },
+    });
+    try std.testing.expect(app.deferred_source_apply != null);
+    try std.testing.expect(app.pending_display_navigation_restore == null);
+
+    app.viewer.diff_cursor = .{ .hunk_header = 0 };
+    const navigation_at_apply = app.viewer.diff_cursor;
+    app.clearDiffSelection();
+    try app.applyDeferredSource(&ctx);
+
+    try std.testing.expect(app.deferred_source_apply == null);
+    try std.testing.expectEqual(navigation_at_apply, app.viewer.diff_cursor);
+    const restore = app.pending_display_navigation_restore orelse return error.ExpectedAcceptanceTimeRestore;
+    try std.testing.expectEqual(navigation_at_apply, restore.original.diff_cursor);
     try std.testing.expect(app.auto_reload.background_cycle == null);
 }
 

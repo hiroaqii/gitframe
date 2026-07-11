@@ -22,8 +22,8 @@ pub const Request = struct {
     path_key: []u8,
     kind: Kind,
     source_kind: SourceKind,
-    load_generation: u64,
-    status_generation: u64,
+    source_session_revision: u64,
+    status_snapshot_revision: u64,
 
     pub fn deinit(self: *Request, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_root);
@@ -31,11 +31,18 @@ pub const Request = struct {
         self.* = undefined;
     }
 
-    pub fn matchesBorrowed(self: Request, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, load_generation: u64, status_generation: u64) bool {
+    pub fn matchesBorrowed(self: Request, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
         return self.kind == kind and
             self.source_kind == source_kind and
-            self.load_generation == load_generation and
-            self.status_generation == status_generation and
+            self.source_session_revision == source_session_revision and
+            self.status_snapshot_revision == status_snapshot_revision and
+            std.mem.eql(u8, self.repo_root, repo_root) and
+            std.mem.eql(u8, self.path_key, path_key);
+    }
+
+    pub fn matchesDisplayIdentity(self: Request, repo_root: []const u8, path_key: []const u8, source_kind: SourceKind, source_session_revision: u64) bool {
+        return self.source_kind == source_kind and
+            self.source_session_revision == source_session_revision and
             std.mem.eql(u8, self.repo_root, repo_root) and
             std.mem.eql(u8, self.path_key, path_key);
     }
@@ -126,9 +133,8 @@ pub const Finished = struct {
     }
 };
 
-pub const State = union(enum) {
+pub const Displayed = union(enum) {
     idle,
-    pending: Request,
     ready: struct {
         request: Request,
         value: Ready,
@@ -138,10 +144,9 @@ pub const State = union(enum) {
         body: StatusBody,
     },
 
-    pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Displayed, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .idle => {},
-            .pending => |*request| request.deinit(allocator),
             .ready => |*ready| {
                 ready.request.deinit(allocator);
                 ready.value.deinit(allocator);
@@ -154,13 +159,49 @@ pub const State = union(enum) {
         self.* = .idle;
     }
 
-    pub fn matches(self: State, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, load_generation: u64, status_generation: u64) bool {
-        return switch (self) {
-            .idle => false,
-            .pending => |request| request.matchesBorrowed(repo_root, path_key, kind, source_kind, load_generation, status_generation),
-            .ready => |ready| ready.request.matchesBorrowed(repo_root, path_key, kind, source_kind, load_generation, status_generation),
-            .failed => |failed| failed.request.matchesBorrowed(repo_root, path_key, kind, source_kind, load_generation, status_generation),
+    pub fn request(self: *const Displayed) ?*const Request {
+        return switch (self.*) {
+            .idle => null,
+            .ready => |*ready| &ready.request,
+            .failed => |*failed| &failed.request,
         };
+    }
+};
+
+pub const State = struct {
+    displayed: Displayed = .idle,
+    pending: ?Request = null,
+
+    pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        self.clearPending(allocator);
+        self.displayed.deinit(allocator);
+    }
+
+    pub fn clearPending(self: *State, allocator: std.mem.Allocator) void {
+        if (self.pending) |*request| request.deinit(allocator);
+        self.pending = null;
+    }
+
+    pub fn clearDisplayed(self: *State, allocator: std.mem.Allocator) void {
+        self.displayed.deinit(allocator);
+    }
+
+    pub fn hasPending(self: State) bool {
+        return self.pending != null;
+    }
+
+    pub fn hasDisplayed(self: *const State) bool {
+        return self.displayed.request() != null;
+    }
+
+    pub fn pendingMatches(self: State, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
+        const request = self.pending orelse return false;
+        return request.matchesBorrowed(repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision);
+    }
+
+    pub fn displayedMatches(self: *const State, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
+        const request = self.displayed.request() orelse return false;
+        return request.matchesBorrowed(repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision);
     }
 };
 
@@ -171,8 +212,8 @@ pub fn cloneRequest(
     path_key: []const u8,
     kind: Kind,
     source_kind: SourceKind,
-    load_generation: u64,
-    status_generation: u64,
+    source_session_revision: u64,
+    status_snapshot_revision: u64,
 ) !Request {
     const owned_root = try allocator.dupe(u8, repo_root);
     errdefer allocator.free(owned_root);
@@ -183,8 +224,8 @@ pub fn cloneRequest(
         .path_key = owned_path,
         .kind = kind,
         .source_kind = source_kind,
-        .load_generation = load_generation,
-        .status_generation = status_generation,
+        .source_session_revision = source_session_revision,
+        .status_snapshot_revision = status_snapshot_revision,
     };
 }
 
@@ -236,15 +277,13 @@ test "generated file splits content lines in an owned arena" {
     try std.testing.expectEqualStrings("two", bundle.file.lines[1]);
 }
 
-test "state matches projection request identity" {
+test "request matches semantic projection identity" {
     var request = try cloneRequest(std.testing.allocator, 1, "/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20);
     defer request.deinit(std.testing.allocator);
 
-    const state = State{ .pending = request };
-
-    try std.testing.expect(state.matches("/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20));
-    try std.testing.expect(!state.matches("/repo", "src/main.zig", .generated_added_file, .unstaged, 10, 20));
-    try std.testing.expect(!state.matches("/repo", "src/main.zig", .cached_diff, .cached, 10, 20));
-    try std.testing.expect(!state.matches("/repo", "src/main.zig", .cached_diff, .unstaged, 11, 20));
-    try std.testing.expect(!state.matches("/other", "src/main.zig", .cached_diff, .unstaged, 10, 20));
+    try std.testing.expect(request.matchesBorrowed("/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20));
+    try std.testing.expect(!request.matchesBorrowed("/repo", "src/main.zig", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(!request.matchesBorrowed("/repo", "src/main.zig", .cached_diff, .cached, 10, 20));
+    try std.testing.expect(!request.matchesBorrowed("/repo", "src/main.zig", .cached_diff, .unstaged, 11, 20));
+    try std.testing.expect(!request.matchesBorrowed("/other", "src/main.zig", .cached_diff, .unstaged, 10, 20));
 }

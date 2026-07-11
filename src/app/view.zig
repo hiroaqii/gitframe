@@ -581,7 +581,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
         return;
     }
 
-    switch (app.review_projection) {
+    switch (app.review_projection.displayed) {
         .ready => |ready| {
             switch (ready.value) {
                 .cached_diff, .generated_added_file => {},
@@ -598,12 +598,13 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
-        .pending => {
-            try drawStatusBody(&content, path, "Loading review projection...", app.selectedStatusLineStats(), active, app.theme);
-            drawPaneHeaderRule(surface, active, app.theme);
-            return;
-        },
         .idle => {},
+    }
+
+    if (app.review_projection.hasPending()) {
+        try drawStatusBody(&content, path, "Loading review projection...", app.selectedStatusLineStats(), active, app.theme);
+        drawPaneHeaderRule(surface, active, app.theme);
+        return;
     }
 
     try drawTitlePath(&content, path, app.selectedStatusLineStats(), paneTitleStyle(active, app.theme), active, app.theme);
