@@ -10,10 +10,13 @@ const app_input = @import("app/input.zig");
 const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
 const page = @import("app/page.zig");
+const app_shell_layout = @import("app/shell_layout.zig");
 const review_page = @import("app/pages/review.zig");
+const review_layout = @import("app/pages/review/layout.zig");
 const review_navigation = @import("app/pages/review/navigation.zig");
 const review_operations = @import("app/pages/review/operations.zig");
 const review_reload = @import("app/pages/review/reload.zig");
+const review_view = @import("app/pages/review/view.zig");
 const app_prompt = @import("app/prompt.zig");
 const app_repo_picker = @import("app/repo_picker.zig");
 const app_review_projection = @import("app/review_projection.zig");
@@ -113,12 +116,6 @@ const UnstageFileFinished = app_actions.UnstageFileFinished;
 const UnstageHunkFinished = app_actions.UnstageHunkFinished;
 const UnstageTargetResult = git_ops.UnstageTargetResult;
 const VerticalDirection = app_direction.Vertical;
-pub const EmptyRemoteActionHints = struct {
-    show_repo_picker: bool = false,
-    show_pull: bool = false,
-    fetch_key: ?[]const u8 = null,
-};
-
 const MousePane = enum {
     sidebar,
     diff,
@@ -195,6 +192,9 @@ const OverlayKind = app_state.OverlayKind;
 
 const PageStates = struct {
     review: review_page.ReviewPageState = .{},
+    repository: page.LazyPlaceholder = .{},
+    history: page.LazyPlaceholder = .{},
+    config: page.LazyPlaceholder = .{},
 };
 
 pub const App = struct {
@@ -477,7 +477,7 @@ pub const App = struct {
     /// needed by Review-local cursor/search/selection logic. The controller
     /// deliberately cannot reach App, overlays, processes, or async effects.
     fn reviewNavigation(self: *App) review_navigation.Controller {
-        const size = app_view.shellContentSize(self.terminal_size);
+        const size = app_shell_layout.contentSize(self.terminal_size);
         return .{
             .page = &self.pages.review,
             .repo_root = self.activeRepoRoot(),
@@ -488,7 +488,7 @@ pub const App = struct {
     }
 
     fn reviewNavigationView(self: *const App) review_navigation.View {
-        const size = app_view.shellContentSize(self.terminal_size);
+        const size = app_shell_layout.contentSize(self.terminal_size);
         return .{
             .page = &self.pages.review,
             .repo_root = self.activeRepoRoot(),
@@ -914,11 +914,42 @@ pub const App = struct {
     }
 
     pub fn view(self: *const App, surface: *chasen.Surface) !void {
-        return app_view.view(self, surface);
+        return app_view.view(self.shellViewContext(), surface);
     }
 
-    pub fn emptyRemoteActionHints(self: *const App, fetch_key_buffer: []u8) EmptyRemoteActionHints {
-        var hints: EmptyRemoteActionHints = .{
+    fn shellViewContext(self: *const App) app_view.Context {
+        return .{
+            .review = self.reviewViewContext(),
+            .active_page = self.active_page,
+            .page_bar_visible = false,
+            .theme = self.theme,
+            .keymap = self.keymap,
+            .terminal_size = self.terminal_size,
+            .actions = &self.actions,
+            .status = &self.status,
+            .commit_panel = &self.commit_panel,
+            .repo_picker = &self.repo_picker,
+            .repo_picker_discovery = self.repo_picker_discovery,
+            .repo_picker_items = &self.repo_picker_items,
+            .recent_repos = &self.recent_repos,
+            .overlay = &self.overlay,
+            .repo_state = &self.repo_state,
+            .discard_confirmation = self.discard_confirmation,
+            .amend_confirmation = self.amend_confirmation,
+            .push_confirmation = self.push_confirmation,
+            .pull_confirmation = self.pull_confirmation,
+            .push_error_message = self.push_error_message,
+            .push_retry_target = self.push_retry_target,
+            .push_retry_credentials_available = self.push_retry_credentials_available,
+            .push_credential_prompt = self.push_credential_prompt,
+            .branch_switch = &self.branch_switch,
+            .git_action_spinner_tick = self.git_action_spinner_tick,
+            .staged_summary = self.stagedSummaryForActiveRepo(),
+        };
+    }
+
+    fn reviewEmptyRemoteActionHints(self: *const App) review_view.EmptyRemoteActionHints {
+        var hints: review_view.EmptyRemoteActionHints = .{
             .show_repo_picker = self.repo_state.workspaceRepos() != null,
         };
         // The empty-state hint is only a display projection, but `U` is still a
@@ -927,9 +958,22 @@ pub const App = struct {
         // advertised as safe pull capability.
         if (self.reviewOperations().pullTarget() == .ready) hints.show_pull = true;
         if (self.reviewOperations().fetchTarget() == .ready) {
-            hints.fetch_key = self.keymap.display(.fetch, fetch_key_buffer);
+            hints.show_fetch = true;
         }
         return hints;
+    }
+
+    pub fn reviewViewContext(self: *const App) review_view.Context {
+        return review_view.Context.init(
+            &self.pages.review,
+            self.reviewNavigationView(),
+            self.theme,
+            self.keymap,
+            self.config.sourceLabel(),
+            self.config.source,
+            self.activeRepoRoot(),
+            self.reviewEmptyRemoteActionHints(),
+        );
     }
 
     pub fn diffSelectionView(self: *const App) ?diff_selection.View {
@@ -1044,29 +1088,13 @@ pub const App = struct {
     /// resolves a deferred background source result after this becomes idle;
     /// deinit discards that result explicitly.
     fn bodyMousePoint(self: *const App, mouse: anytype) ?MousePoint {
-        const point = self.contentMousePoint(mouse) orelse return null;
-        if (point.row >= terminalBodyHeight(self.layoutSize().height)) return null;
-        return point;
+        const point = app_shell_layout.compute(self.terminal_size, .{}).terminalToBody(mouse.col, mouse.row) orelse return null;
+        return .{ .col = point.col, .row = point.row };
     }
 
     fn contentMousePoint(self: *const App, mouse: anytype) ?MousePoint {
-        if (mouse.col < 0 or mouse.row < 0) return null;
-
-        const raw_col: usize = @intCast(mouse.col);
-        const raw_row: usize = @intCast(mouse.row);
-        const rect = app_view.shellContentRect(self.terminal_size);
-        const rect_col: usize = rect.col;
-        const rect_row: usize = rect.row;
-        const rect_width: usize = rect.width;
-        const rect_height: usize = rect.height;
-
-        if (raw_col < rect_col or raw_row < rect_row) return null;
-        if (raw_col >= rect_col + rect_width or raw_row >= rect_row + rect_height) return null;
-
-        return .{
-            .col = @intCast(raw_col - rect_col),
-            .row = @intCast(raw_row - rect_row),
-        };
+        const point = app_shell_layout.compute(self.terminal_size, .{}).terminalToContent(mouse.col, mouse.row) orelse return null;
+        return .{ .col = point.col, .row = point.row };
     }
 
     fn keyContext(self: *const App) app_input.KeyContext {
@@ -1126,18 +1154,6 @@ pub const App = struct {
 
     fn clampPushErrorScroll(self: *App) void {
         self.overlay.push_error_scroll = @min(self.overlay.push_error_scroll, app_view.pushErrorMaxScroll(self.layoutSize(), self.push_error_message));
-    }
-
-    fn viewSidebar(self: *const App, surface: *chasen.Surface, loaded: LoadedDiff) !void {
-        return app_view.viewSidebar(self, surface, loaded);
-    }
-
-    fn viewDiffPane(self: *const App, surface: *chasen.Surface, loaded: LoadedDiff) !void {
-        return app_view.viewDiffPane(self, surface, loaded);
-    }
-
-    fn drawSearchMatchMarker(self: *const App, surface: *chasen.Surface) void {
-        app_view.drawSearchMatchMarker(self, surface);
     }
 
     fn startRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg), background_cycle_id: ?u64) !void {
@@ -4511,16 +4527,16 @@ pub const App = struct {
     }
 
     fn layoutSize(self: *const App) chasen.Size {
-        return app_view.shellContentSize(self.terminal_size);
+        return app_shell_layout.contentSize(self.terminal_size);
     }
 };
 
-const footer_rows: u16 = app_view.footer_rows;
-const sidebar_header_rows: u16 = app_view.sidebar_header_rows;
-const diff_body_start_row: u16 = app_view.diff_body_start_row;
+const footer_rows: u16 = app_shell_layout.footer_rows;
+const sidebar_header_rows: u16 = review_layout.sidebar_header_rows;
+const diff_body_start_row: u16 = review_layout.diff_body_start_row;
 
 fn terminalBodyHeight(terminal_height: u16) u16 {
-    return app_view.terminalBodyHeight(terminal_height);
+    return app_shell_layout.bodyHeight(terminal_height);
 }
 
 fn applySignedScroll(current: usize, delta: isize) usize {
@@ -4567,7 +4583,7 @@ fn branchSwitchInitialSelection(branches: []const app_state.BranchSwitchItem) us
 }
 
 fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
-    return app_view.sidebarWidth(total_width, preferred_width);
+    return review_layout.sidebarWidth(total_width, preferred_width);
 }
 
 fn pathLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
@@ -5258,7 +5274,7 @@ test "mouse click focuses sidebar and diff panes" {
         .terminal_size = .{ .width = 100, .height = 20 },
     };
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     const sidebar_event = app_test_support.mouseEvent(content.col + 1, content.row + 2, .left);
     const sidebar_msg = app.handleEvent(sidebar_event) orelse return error.ExpectedSidebarMouseMessage;
     try app.update(sidebar_msg, undefined);
@@ -5280,7 +5296,7 @@ test "mouse click selects sidebar file rows" {
         .terminal_size = .{ .width = 100, .height = 20 },
     };
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     const row = content.row + sidebar_header_rows + 1;
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedSidebarClickMessage;
     try app.update(msg, undefined);
@@ -5301,7 +5317,7 @@ test "mouse click toggles sidebar directory rows" {
     };
     defer app.reviewReload().clearLoadedDiff(app.allocator);
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     const row = content.row + sidebar_header_rows;
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedSidebarDirectoryClickMessage;
     try app.update(msg, undefined);
@@ -5322,7 +5338,7 @@ test "mouse click on sidebar header or blank body focuses only" {
         .terminal_size = .{ .width = 100, .height = 20 },
     };
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     const header_msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 1, .left)) orelse return error.ExpectedSidebarHeaderClickMessage;
     try app.update(header_msg, undefined);
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
@@ -5353,7 +5369,7 @@ test "mouse click uses filtered sidebar projection" {
     };
     defer app.reviewReload().clearLoadedDiff(app.allocator);
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     const row = content.row + sidebar_header_rows;
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedFilteredSidebarClickMessage;
     try app.update(msg, undefined);
@@ -5372,7 +5388,7 @@ test "mouse wheel scrolls the pane under the pointer" {
         .terminal_size = .{ .width = 100, .height = 8 },
     };
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     const sidebar_msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedSidebarWheelMessage;
     try app.update(sidebar_msg, undefined);
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
@@ -5398,7 +5414,7 @@ test "mouse uses full body as diff pane while sidebar is hidden" {
         .terminal_size = .{ .width = 100, .height = 8 },
     };
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) orelse return error.ExpectedHiddenSidebarMouseMessage;
     try app.update(msg, undefined);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
@@ -5413,7 +5429,7 @@ test "help overlay wheel scrolls help and ignores clicks" {
         .overlay = .{ .kind = .help },
     };
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedHelpWheelMessage;
     try std.testing.expectEqual(App.Msg.help_scroll_down, msg);
     try app.update(msg, undefined);
@@ -5436,7 +5452,7 @@ test "push error overlay wheel scrolls details and ignores clicks" {
     defer app.clearPushError(std.testing.allocator);
     app.overlay.openPushError();
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedPushErrorWheelMessage;
     try std.testing.expectEqual(App.Msg.push_error_scroll_down, msg);
     try app.update(msg, undefined);
@@ -5458,7 +5474,7 @@ test "confirmation overlay blocks mouse clicks and wheels" {
         .overlay = .{ .kind = .push_branch },
     };
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) == null);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
@@ -5493,7 +5509,7 @@ test "mouse horizontal wheel scrolls diff pane horizontally" {
         .terminal_size = .{ .width = 80, .height = 12 },
     };
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     const diff_col = content.col + sidebarWidth(app.layoutSize().width, app.pages.review.viewer.sidebar_width) + 1;
     const msg = app.handleEvent(app_test_support.mouseEvent(diff_col, content.row + 2, .wheel_right)) orelse return error.ExpectedHorizontalWheelMessage;
     try app.update(msg, undefined);
@@ -5512,7 +5528,7 @@ test "mouse events are ignored outside body and prompt modes" {
 
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(-1, 1, .left)) == null);
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     const footer_row: i16 = @intCast(content.row + terminalBodyHeight(app.layoutSize().height));
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, footer_row, .left)) == null);
 
@@ -5528,7 +5544,7 @@ test "mouse release and motion events are ignored" {
         .terminal_size = .{ .width = 100, .height = 8 },
     };
 
-    const content = app_view.shellContentRect(app.terminal_size);
+    const content = app_shell_layout.contentRect(app.terminal_size);
     try std.testing.expect(app.handleEvent(app_test_support.mouseEventTyped(content.col + 1, content.row + 1, .left, .release)) == null);
     try std.testing.expect(app.handleEvent(app_test_support.mouseEventTyped(content.col + 1, content.row + 1, .left, .motion)) == null);
 }
@@ -7311,156 +7327,6 @@ fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette 
     return theme.Palette.fromConfig(FakeConfig{ .role = role, .color = color });
 }
 
-test "sidebar renders file status badges" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(34, 8);
-    defer ts.deinit();
-
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
-        } },
-        .terminal_size = .{ .width = 80, .height = 9 },
-    };
-
-    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    try ts.expectCellText(2, sidebar_header_rows, "A");
-    try ts.expectCellText(2, sidebar_header_rows + 1, "D");
-}
-
-test "sidebar added status badge follows success role override" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(34, 8);
-    defer ts.deinit();
-
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
-        } },
-        .terminal_size = .{ .width = 80, .height = 9 },
-        .theme = paletteWithOverride(.success, .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } }),
-    };
-
-    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    try ts.expectCellText(2, sidebar_header_rows, "A");
-    try std.testing.expect(ts.surface.readCell(2, sidebar_header_rows).?.style.fg.eql(.{ .rgb = .{ 1, 2, 3 } }));
-}
-
-test "sidebar renders mode change badge next to file status" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(34, 8);
-    defer ts.deinit();
-
-    const nodes = [_]file_tree.Node{
-        .{
-            .kind = .file,
-            .name = "script.sh",
-            .path = "script.sh",
-            .depth = 0,
-            .target = .{ .diff_file = 0 },
-            .status = .modified,
-            .mode_changed = true,
-        },
-    };
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(.{
-                .text = "",
-                .document = .{ .files = &app_test_support.files_one },
-                .tree = .{ .nodes = &nodes },
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            }),
-        } },
-        .terminal_size = .{ .width = 80, .height = 9 },
-    };
-
-    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    try ts.expectCellText(2, sidebar_header_rows, "M");
-    try ts.expectCellText(4, sidebar_header_rows, "m");
-}
-
-test "sidebar horizontal scroll reveals deep file name" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(24, 8);
-    defer ts.deinit();
-
-    const nodes = [_]file_tree.Node{
-        .{
-            .kind = .file,
-            .name = "very_long_tail_file.zig",
-            .path = "a/b/c/d/e/f/very_long_tail_file.zig",
-            .depth = 6,
-            .target = .{ .diff_file = 0 },
-        },
-    };
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(.{
-                .text = "",
-                .document = .{ .files = &app_test_support.files_one },
-                .tree = .{ .nodes = &nodes },
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            }),
-            .viewer = .{ .sidebar_horizontal_scroll = 12 },
-        } },
-        .terminal_size = .{ .width = 80, .height = 9 },
-    };
-
-    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    const snapshot = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "very_long") != null);
-}
-
-test "sidebar title indicates active focus" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(34, 8);
-    defer ts.deinit();
-
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .focus = .sidebar },
-        } },
-        .terminal_size = .{ .width = 80, .height = 9 },
-    };
-
-    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    try ts.expectCellText(0, 2, " ");
-    try ts.expectCellText(1, 2, "F");
-    try std.testing.expect(ts.surface.readCell(1, 2).?.style.fg.eql(.{ .index = 14 }));
-    try std.testing.expect(!ts.surface.readCell(1, 2).?.style.reverse);
-}
-
-test "sidebar title follows accent role override" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(34, 8);
-    defer ts.deinit();
-
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .focus = .sidebar },
-        } },
-        .terminal_size = .{ .width = 80, .height = 9 },
-        .theme = paletteWithOverride(.accent, .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } }),
-    };
-
-    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    try ts.expectCellText(1, 2, "F");
-    try std.testing.expect(ts.surface.readCell(1, 2).?.style.fg.eql(.{ .rgb = .{ 4, 5, 6 } }));
-}
-
 test "amend confirmation chrome follows amend role override" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(100, 30);
@@ -7481,7 +7347,7 @@ test "amend confirmation chrome follows amend role override" {
 
     try app.view(&ts.surface);
 
-    const content_rect = app_view.shellContentRect(ts.surface.size());
+    const content_rect = app_shell_layout.contentRect(ts.surface.size());
     const dialog_rect = ui.Modal.dialogRectFor(content_rect, .{
         .dialog_width = @min(content_rect.width, @as(u16, 72)),
         .dialog_height = @min(content_rect.height, @as(u16, 9)),
@@ -7489,88 +7355,6 @@ test "amend confirmation chrome follows amend role override" {
 
     try ts.expectCellText(dialog_rect.col, dialog_rect.row, "╭");
     try std.testing.expect(ts.surface.readCell(dialog_rect.col, dialog_rect.row).?.style.fg.eql(.{ .rgb = .{ 7, 8, 9 } }));
-}
-
-test "inactive sidebar selected row is dim without reverse background" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(34, 8);
-    defer ts.deinit();
-
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .focus = .diff },
-        } },
-        .terminal_size = .{ .width = 80, .height = 9 },
-    };
-
-    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    const cell = ts.surface.readCell(0, sidebar_header_rows).?;
-    try ts.expectCellText(0, sidebar_header_rows, "▌");
-    try std.testing.expect(cell.style.dim);
-    try std.testing.expect(!cell.style.reverse);
-}
-
-test "active sidebar selected row keeps reverse background" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(34, 8);
-    defer ts.deinit();
-
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .focus = .sidebar },
-        } },
-        .terminal_size = .{ .width = 80, .height = 9 },
-    };
-
-    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    const cell = ts.surface.readCell(0, sidebar_header_rows).?;
-    try ts.expectCellText(0, sidebar_header_rows, "▌");
-    try std.testing.expect(!cell.style.dim);
-    try std.testing.expect(cell.style.reverse);
-}
-
-test "diff header detail row uses frame separator style when active" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(90, 10);
-    defer ts.deinit();
-
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .focus = .diff },
-        } },
-        .terminal_size = .{ .width = 90, .height = 11 },
-    };
-
-    try app.viewDiffPane(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    try ts.expectCellText(0, 1, "─");
-    try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.default));
-    try std.testing.expect(ts.surface.readCell(0, 1).?.style.dim);
-}
-
-test "diff header detail row dims separator when inactive" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(90, 10);
-    defer ts.deinit();
-
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .focus = .sidebar },
-        } },
-        .terminal_size = .{ .width = 90, .height = 11 },
-    };
-
-    try app.viewDiffPane(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    try ts.expectCellText(0, 1, "─");
-    try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.gray));
-    try std.testing.expect(ts.surface.readCell(0, 1).?.style.dim);
 }
 
 test "selectionContext keeps status-only selection while status load is pending" {
@@ -9105,28 +8889,6 @@ test "activeRootFromDiscovery rejects ambiguous workspace export" {
     } }));
 }
 
-test "diff search row keeps active focus style" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(90, 10);
-    defer ts.deinit();
-
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .focus = .diff },
-        } },
-        .terminal_size = .{ .width = 90, .height = 11 },
-    };
-    setDiffSearchQuery(&app, "missing");
-
-    try app.viewDiffPane(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    try ts.expectCellText(1, 1, "s");
-    const style = ts.surface.readCell(1, 1).?.style;
-    try std.testing.expect(style.bold);
-    try std.testing.expect(!style.reverse);
-}
-
 test "finishDiffLoad applies active changed file filter" {
     var app: App = .{
         .pages = .{ .review = .{
@@ -9592,117 +9354,6 @@ test "repo switch clears action selection restore" {
     try app.submitRepoPicker(&ctx);
 
     try std.testing.expect(app.pages.review.pending_selection_restore == null);
-}
-
-test "sidebar renders reviewed marker" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(34, 8);
-    defer ts.deinit();
-
-    var reviewed = [_]bool{ true, false };
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(.{
-                .text = "",
-                .document = .{ .files = &app_test_support.files_two_statuses },
-                .tree = .{ .nodes = &app_test_support.tree_two_status_nodes },
-                .reviewed_files = &reviewed,
-                .collapsed_dirs = .{},
-                .bytes = 0,
-                .lines = 0,
-            }),
-        } },
-        .terminal_size = .{ .width = 80, .height = 9 },
-    };
-
-    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    try ts.expectCellText(1, sidebar_header_rows, "✓");
-    try ts.expectCellText(2, sidebar_header_rows, "A");
-}
-
-test "search match marker is drawn on visible match row" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(80, 8);
-    defer ts.deinit();
-
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .search = .{ .match_offset = 4 },
-            .viewer = .{ .diff_scroll = 3 },
-        } },
-        .terminal_size = .{ .width = 80, .height = 9 },
-    };
-
-    app.drawSearchMatchMarker(&ts.surface);
-
-    try ts.expectCellText(0, diff_body_start_row + 1, "»");
-}
-
-test "search marker gutter does not overwrite diff content" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(90, 10);
-    defer ts.deinit();
-
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .search = .{ .match_offset = 0 },
-            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
-        } },
-        .terminal_size = .{ .width = 90, .height = 11 },
-    };
-
-    try app.viewDiffPane(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    try ts.expectCellText(0, diff_body_start_row, "»");
-    try ts.expectCellText(1, diff_body_start_row, "▌");
-    try ts.expectCellText(2, diff_body_start_row, "╭");
-    try ts.expectCellText(3, diff_body_start_row, "▾");
-}
-
-test "status mode label uses diff content width after marker gutter" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(72, 8);
-    defer ts.deinit();
-
-    const app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .display_mode = .side_by_side },
-        } },
-        .terminal_size = .{ .width = 72, .height = 9 },
-    };
-
-    try app.viewDiffPane(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    try ts.expectCellText(57, 0, "u");
-    try ts.expectCellText(58, 0, "n");
-    try ts.expectCellText(59, 0, "i");
-    try ts.expectCellText(65, 0, "(");
-    try ts.expectCellText(66, 0, "a");
-}
-
-test "search input header does not show no match before submit" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(90, 10);
-    defer ts.deinit();
-
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .search = .{ .mode = true },
-        } },
-        .terminal_size = .{ .width = 90, .height = 11 },
-    };
-    setDiffSearchInput(&app, "missing");
-
-    try app.viewDiffPane(&ts.surface, app.pages.review.load.state.loaded.loaded);
-
-    try ts.expectCellText(1, 1, "s");
-    try ts.expectCellText(9, 1, "m");
-    try ts.expectCellText(16, 1, " ");
 }
 
 test "load empty state shows actionable no changes message" {

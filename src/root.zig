@@ -32,13 +32,19 @@ test {
     _ = @import("app/git_requests.zig");
     _ = @import("app/git_ops.zig");
     _ = @import("app/input.zig");
+    _ = @import("app/key_input.zig");
     _ = @import("app/load.zig");
     _ = @import("app/load_state.zig");
+    _ = @import("app/page.zig");
+    _ = @import("app/shell_layout.zig");
     _ = @import("app/pages/review.zig");
+    _ = @import("app/pages/review/input.zig");
+    _ = @import("app/pages/review/layout.zig");
     _ = @import("app/pages/review/navigation.zig");
     _ = @import("app/pages/review/authority.zig");
     _ = @import("app/pages/review/operations.zig");
     _ = @import("app/pages/review/reload.zig");
+    _ = @import("app/pages/review/view.zig");
     _ = @import("app/prompt.zig");
     _ = @import("app/repo_picker.zig");
     _ = @import("app/review_projection.zig");
@@ -46,6 +52,7 @@ test {
     _ = @import("app/text_buffer.zig");
     _ = @import("app/text_edit.zig");
     _ = @import("app/view.zig");
+    _ = @import("app/view_primitives.zig");
     _ = @import("config.zig");
     _ = @import("context.zig");
     _ = @import("context_export.zig");

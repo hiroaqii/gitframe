@@ -11,7 +11,8 @@ const chasen = @import("chasen");
 const app_direction = @import("../../direction.zig");
 const app_load = @import("../../load.zig");
 const app_state = @import("../../state.zig");
-const app_view = @import("../../view.zig");
+const shell_layout = @import("../../shell_layout.zig");
+const review_layout = @import("layout.zig");
 const review_projection = @import("../../review_projection.zig");
 const app_review_projection = review_projection;
 const review_page = @import("../review.zig");
@@ -1793,15 +1794,15 @@ fn projectionSourceKind(source: diff_source.SourceMode) review_projection.Source
 }
 
 fn contentWidth(width: u16) u16 {
-    return app_view.contentWidth(width);
+    return review_layout.diffContentWidth(width);
 }
 
 fn terminalBodyHeight(content_height: u16) u16 {
-    return app_view.terminalBodyHeight(content_height);
+    return shell_layout.bodyHeight(content_height);
 }
 
 fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
-    return app_view.sidebarWidth(total_width, preferred_width);
+    return review_layout.sidebarWidth(total_width, preferred_width);
 }
 
 fn maxHorizontalScrollForBodyRow(body_row: diff_view_model.BodyRow, pane_width: u16, line_numbers: bool) usize {
@@ -1869,7 +1870,7 @@ const TestHarness = struct {
     }
 
     fn controller(self: *TestHarness) Controller {
-        const content_size = app_view.shellContentSize(self.terminal_size);
+        const content_size = shell_layout.contentSize(self.terminal_size);
         return .{
             .page = &self.pages.review,
             .repo_root = self.repo_root,
@@ -1880,7 +1881,7 @@ const TestHarness = struct {
     }
 
     fn view(self: *const TestHarness) View {
-        const content_size = app_view.shellContentSize(self.terminal_size);
+        const content_size = shell_layout.contentSize(self.terminal_size);
         return .{
             .page = &self.pages.review,
             .repo_root = self.repo_root,

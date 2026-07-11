@@ -1,35 +1,29 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const app_commit_panel = @import("commit_panel.zig");
 const app_repo_picker = @import("repo_picker.zig");
 const app_actions = @import("actions.zig");
-const app_auto_reload = @import("auto_reload.zig");
 const app_state = @import("state.zig");
+const shell_layout = @import("shell_layout.zig");
+const view_primitives = @import("view_primitives.zig");
+const review_view = @import("pages/review/view.zig");
+const app_prompt = @import("prompt.zig");
+const page = @import("page.zig");
 const draw = @import("draw");
-const diff_render = @import("../diff/render.zig");
-const git_branch_status = @import("../git/branch_status.zig");
-const git_status = @import("../git/status.zig");
 const keymap = @import("keymap");
-const loaded_diff = @import("../loaded_diff.zig");
-const file_tree = @import("../file_tree.zig");
-const sidebar_view_model = @import("../sidebar/view_model.zig");
+const repo_discovery = @import("../repo/discovery.zig");
+const repo_state = @import("../repo/state.zig");
 const theme = @import("theme");
+const review_page = if (builtin.is_test) @import("pages/review.zig") else struct {};
 
 /// Rendering-only helpers for App.
 ///
 /// This module intentionally does not own state transitions. It borrows the
 /// App state, projects it to terminal surfaces, and keeps layout constants
 /// shared with tests through small public helpers.
-pub const footer_rows: u16 = 1;
-pub const sidebar_header_rows: u16 = 3;
-pub const diff_body_start_row: u16 = diff_render.body_start_row;
-
-const search_marker_gutter_width: u16 = 1;
-const shell_frame_min_width: u16 = 30;
-const shell_frame_min_height: u16 = 6;
 const shell_frame_border = ui.Panel.Border.rounded;
-const shell_frame_padding: ui.layout.Insets = .{};
 const help_dialog_max_width: u16 = 108;
 const help_dialog_max_height: u16 = 34;
 const help_two_column_min_width: u16 = 96;
@@ -49,10 +43,6 @@ const confirmation_dialog_height: u16 = 9;
 const branch_switch_dialog_width: u16 = 72;
 const branch_switch_dialog_height: u16 = 18;
 
-fn scrollCells(scroll: usize) u16 {
-    return @intCast(@min(scroll, std.math.maxInt(u16)));
-}
-
 const StateTone = enum {
     muted,
     loading,
@@ -67,13 +57,42 @@ const StateMessage = struct {
     tone: StateTone = .muted,
 };
 
-pub fn view(app: anytype, surface: *chasen.Surface) !void {
+pub const Context = struct {
+    review: review_view.Context,
+    active_page: page.Id,
+    page_bar_visible: bool,
+    theme: theme.Palette,
+    keymap: keymap.Effective,
+    terminal_size: chasen.Size,
+    actions: *const app_actions.ActionState,
+    status: *const app_state.StatusMessage,
+    commit_panel: *const app_commit_panel.State,
+    repo_picker: *const app_prompt.RepoPickerState,
+    repo_picker_discovery: ?repo_discovery.DiscoveryResult,
+    repo_picker_items: *const app_repo_picker.ItemList,
+    recent_repos: *const repo_state.RecentStore,
+    overlay: *const app_state.OverlayState,
+    repo_state: *const repo_state.State,
+    discard_confirmation: ?app_state.DiscardFileConfirmation,
+    amend_confirmation: ?app_state.AmendConfirmation,
+    push_confirmation: ?app_state.PushConfirmation,
+    pull_confirmation: ?app_state.PullConfirmation,
+    push_error_message: ?[]const u8,
+    push_retry_target: ?app_state.PushRetryTarget,
+    push_retry_credentials_available: bool,
+    push_credential_prompt: ?*const app_state.PushCredentialPrompt,
+    branch_switch: *const app_state.BranchSwitchState,
+    git_action_spinner_tick: u8,
+    staged_summary: app_commit_panel.StagedSummary,
+};
+
+pub fn view(app: Context, surface: *chasen.Surface) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
     surface.hideCursor();
 
-    if (shellFrameEnabled(size)) {
+    if (shell_layout.frameEnabled(size)) {
         const frame = ui.Panel.frame(surface, shellFrameOptions(app.theme));
         frame.view();
         var content = frame.contentSurface();
@@ -84,25 +103,21 @@ pub fn view(app: anytype, surface: *chasen.Surface) !void {
     try viewContent(app, surface);
 }
 
-fn viewContent(app: anytype, surface: *chasen.Surface) !void {
+fn viewContent(app: Context, surface: *chasen.Surface) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    const footer_row = size.height - footer_rows;
-    var body = surface.child(.{
-        .col = 0,
-        .row = 0,
-        .width = size.width,
-        .height = footer_row,
+    const sections = shell_layout.partitionContent(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, .{
+        .page_bar_visible = app.page_bar_visible,
     });
+    if (sections.page_bar) |rect| {
+        var page_bar = surface.child(rect);
+        viewPageBar(app.active_page, app.theme, &page_bar);
+    }
+    var body = surface.child(sections.body);
     try viewBody(app, &body);
 
-    var footer = surface.child(.{
-        .col = 0,
-        .row = footer_row,
-        .width = size.width,
-        .height = footer_rows,
-    });
+    var footer = surface.child(sections.footer);
     viewFooter(app, &footer);
 
     if (app.repo_picker.mode) {
@@ -137,718 +152,55 @@ fn viewContent(app: anytype, surface: *chasen.Surface) !void {
     }
 }
 
-fn roleColor(palette: theme.Palette, role: theme.Role) chasen.Color {
-    return palette.color(role);
-}
-
-fn roleStyle(palette: theme.Palette, role: theme.Role) chasen.TextStyle {
-    return palette.style(role);
-}
-
-fn boldRoleStyle(palette: theme.Palette, role: theme.Role) chasen.TextStyle {
-    return .{ .bold = true, .fg = roleColor(palette, role) };
-}
-
 fn shellFrameOptions(palette: theme.Palette) ui.Panel.ViewOptions {
     return .{
         .title = "GitFrame",
-        .padding = shell_frame_padding,
+        .padding = shell_layout.frame_padding,
         .border = shell_frame_border,
         .border_style = .{ .dim = true },
-        .title_style = boldRoleStyle(palette, .muted),
+        .title_style = palette.boldStyle(.muted),
     };
 }
 
-pub fn shellFrameEnabled(size: chasen.Size) bool {
-    return size.width >= shell_frame_min_width and size.height >= shell_frame_min_height;
-}
-
-pub fn shellContentSize(terminal_size: chasen.Size) chasen.Size {
-    const rect = shellContentRect(terminal_size);
-    return .{ .width = rect.width, .height = rect.height };
-}
-
-pub fn shellContentRect(terminal_size: chasen.Size) chasen.Rect {
-    const root_rect: chasen.Rect = .{
-        .col = 0,
-        .row = 0,
-        .width = terminal_size.width,
-        .height = terminal_size.height,
+fn viewBody(app: Context, surface: *chasen.Surface) !void {
+    return switch (app.active_page) {
+        .review => review_view.view(app.review, surface),
+        .repository, .history, .config => viewPlaceholderPage(app.active_page, app.theme, surface),
     };
-    if (!shellFrameEnabled(terminal_size)) return root_rect;
-    return ui.Panel.contentRectFor(root_rect, shell_frame_padding);
 }
 
-fn viewBody(app: anytype, surface: *chasen.Surface) !void {
-    switch (app.pages.review.load.state) {
-        .loaded => |session| return viewLoadedDiff(app, surface, session.loaded),
-        .empty => |reason| if (reason == .no_changes) return viewNoChanges(app, surface),
-        else => {},
+fn viewPageBar(active: page.Id, palette: theme.Palette, surface: *chasen.Surface) void {
+    var col: u16 = 1;
+    for (page.all) |id| {
+        if (col >= surface.size().width) return;
+        const label = std.fmt.allocPrint(surface.frameAllocator(), " {s} ", .{id.label()}) catch id.label();
+        draw.copyClippedTextAt(surface, col, 0, label, if (id == active) palette.boldStyle(.accent) else palette.style(.muted)) catch {};
+        col +|= @intCast(@min(chasen.text.displayWidth(label) + 1, std.math.maxInt(u16)));
     }
-
-    const size = surface.size();
-    const title = "GitFrame";
-    const subtitle = "Read-only diff viewer shell";
-
-    var panel = surface.child(.{
-        .col = if (size.width > 60) (size.width - 60) / 2 else 0,
-        .row = if (size.height > 10) (size.height - 10) / 2 else 0,
-        .width = @min(size.width, 60),
-        .height = if (size.height > 10) 10 else size.height,
-    });
-    var col = panel.column(.{ .gap = 1 });
-    col.borrowText(title, boldRoleStyle(app.theme, .accent));
-    col.borrowText(subtitle, roleStyle(app.theme, .muted));
-    try col.print("Source: {s}", .{app.config.sourceLabel()});
-    viewLoadState(app, &col);
 }
 
-fn viewNoChanges(app: anytype, surface: *chasen.Surface) !void {
-    const message = noChangesMessage(app, surface.frameAllocator());
+fn viewPlaceholderPage(id: page.Id, palette: theme.Palette, surface: *chasen.Surface) void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
-
-    if (app.pages.review.viewer.sidebar_hidden) {
-        drawStateMessage(surface, message, app.theme);
-        return;
-    }
-
-    const sidebar_width = sidebarWidth(size.width, app.pages.review.viewer.sidebar_width);
-    var sidebar = surface.child(.{
-        .col = 0,
-        .row = 0,
-        .width = sidebar_width,
-        .height = size.height,
-    });
-    try viewEmptySidebarChrome(app, &sidebar);
-
-    if (size.width > sidebar_width) {
-        var row: u16 = 0;
-        while (row < size.height) : (row += 1) {
-            _ = surface.borrowTextAt(sidebar_width, row, "│", shellSeparatorStyle());
-        }
-    }
-
-    if (size.width <= sidebar_width + 1) return;
-    var diff_pane = surface.child(.{
-        .col = sidebar_width + 1,
-        .row = 0,
-        .width = size.width - sidebar_width - 1,
-        .height = size.height,
-    });
-    drawStateMessage(&diff_pane, message, app.theme);
+    const row = size.height / 2;
+    draw.copyClippedTextAt(surface, 1, row, id.label(), palette.boldStyle(.accent)) catch {};
+    if (row + 1 < size.height) draw.copyClippedTextAt(surface, 1, row + 1, id.placeholderDescription(), palette.style(.muted)) catch {};
 }
 
-fn viewEmptySidebarChrome(app: anytype, surface: *chasen.Surface) !void {
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0) return;
-
-    const active = app.pages.review.viewer.focus == .sidebar;
-    try drawSidebarDetailRow(app, surface, 0, active);
-
-    if (size.height <= 2) return;
-    _ = surface.borrowTextAt(0, 2, paneTitleText("Files", active), paneTitleStyle(active, app.theme));
-    const title_width = chasen.text.displayWidth(paneTitleText("Files", active));
-    const stats_col = title_width + 1;
-    if (stats_col < size.width) {
-        _ = try surface.printAt(stats_col, 2, roleStyle(app.theme, .muted), "0 files / 0 hunks", .{});
-    }
-}
-
-fn viewLoadedDiff(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0) return;
-
-    if (app.pages.review.viewer.sidebar_hidden) {
-        if (loaded.visibleNodeCount() == 0) {
-            drawStateMessage(surface, filterEmptyMessage(app), app.theme);
-            return;
-        }
-        try viewDiffPane(app, surface, loaded);
-        return;
-    }
-
-    const sidebar_width = sidebarWidth(size.width, app.pages.review.viewer.sidebar_width);
-    var sidebar = surface.child(.{
-        .col = 0,
-        .row = 0,
-        .width = sidebar_width,
-        .height = size.height,
-    });
-    try viewSidebar(app, &sidebar, loaded);
-
-    if (size.width > sidebar_width) {
-        var row: u16 = 0;
-        while (row < size.height) : (row += 1) {
-            _ = surface.borrowTextAt(sidebar_width, row, "│", shellSeparatorStyle());
-        }
-    }
-
-    if (size.width <= sidebar_width + 1) return;
-    var diff_pane = surface.child(.{
-        .col = sidebar_width + 1,
-        .row = 0,
-        .width = size.width - sidebar_width - 1,
-        .height = size.height,
-    });
-    if (loaded.visibleNodeCount() == 0) {
-        drawStateMessage(&diff_pane, filterEmptyMessage(app), app.theme);
-        return;
-    }
-    try viewDiffPane(app, &diff_pane, loaded);
-}
-
-/// Draw the file tree side pane from the materialized sidebar view-model.
-pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0) return;
-
-    const active = app.pages.review.viewer.focus == .sidebar;
-    try drawSidebarDetailRow(app, surface, 0, active);
-
-    if (size.height <= 2) return;
-    _ = surface.borrowTextAt(0, 2, paneTitleText("Files", active), paneTitleStyle(active, app.theme));
-    const title_width = chasen.text.displayWidth(paneTitleText("Files", active));
-    const stats_col = title_width + 1;
-    if (stats_col < size.width) {
-        _ = try surface.printAt(stats_col, 2, roleStyle(app.theme, .muted), "{d} files / {d} hunks", .{
-            loaded.document.files.len,
-            loaded.document.totalHunks(),
-        });
-    }
-
-    if (size.height <= sidebar_header_rows) return;
-
-    const visible_rows: usize = size.height - sidebar_header_rows;
-    // Sidebar has no independent scroll state; derive the visible window
-    // from the selected row each frame.
-    const range = loaded.sidebarVisibleRange(app.pages.review.viewer.selected_node, visible_rows);
-    var row: u16 = sidebar_header_rows;
-    var visible_index: usize = range.start;
-    while (visible_index < range.end) : ({
-        visible_index += 1;
-        row += 1;
-    }) {
-        const row_model = sidebar_view_model.rowAt(.{
-            .tree = loaded.tree,
-            .collapsed = &loaded.collapsed_dirs,
-            .reviewed_files = loaded.reviewed_files,
-            .visible_nodes = loaded.materializedVisibleNodes(),
-        }, visible_index, app.pages.review.viewer.selected_node) orelse continue;
-        try drawSidebarRow(surface, row, row_model, app.pages.review.viewer.focus == .sidebar, app.pages.review.viewer.sidebar_horizontal_scroll, app.theme);
-    }
-}
-
-fn drawSidebarDetailRow(app: anytype, surface: *chasen.Surface, row: u16, active: bool) !void {
-    const size = surface.size();
-    if (size.width <= 2 or row >= size.height) return;
-
-    if (app.pages.review.review_display.hide_reviewed_files and app.pages.review.review_display.changed_file_filter != .all) {
-        const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{app.pages.review.review_display.changed_file_filter.label()});
-        try draw.copyClippedTextAt(surface, 1, row, text, roleStyle(app.theme, .prompt));
-        return;
-    }
-    if (app.pages.review.review_display.hide_reviewed_files) {
-        try draw.copyClippedTextAt(surface, 1, row, "hiding reviewed", roleStyle(app.theme, .prompt));
-        return;
-    }
-    if (app.pages.review.review_display.changed_file_filter != .all) {
-        try draw.copyClippedTextAt(surface, 1, row, app.pages.review.review_display.changed_file_filter.label(), roleStyle(app.theme, .prompt));
-        return;
-    }
-
-    if (branchStatusSidebarText(app, surface.frameAllocator(), size.width - 1)) |text| {
-        try draw.copyClippedTextAt(surface, 1, row, text, paneBranchStyle(active, app.theme));
-    }
-}
-
-fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_model.Row, pane_active: bool, horizontal_scroll: usize, palette: theme.Palette) !void {
-    const width = surface.size().width;
-    const row_layout = sidebar_view_model.layout(row_model, width);
-    const style = sidebarRowStyle(row_model, pane_active, palette);
-    const marker = if (row_model.selected) "▌" else " ";
-
-    if (width > row_layout.marker_col) {
-        _ = surface.borrowTextAt(0, row, marker, style);
-    }
-
-    if (row_model.status) |status| {
-        if (row_layout.badge_col) |badge_col| {
-            if (width > badge_col) {
-                _ = surface.borrowTextAt(badge_col, row, status.badge(), statusStyle(row_model, status, pane_active, palette));
-            }
-        }
-    }
-
-    if (row_layout.mode_col) |mode_col| {
-        if (width > mode_col) {
-            _ = surface.borrowTextAt(mode_col, row, "m", modeBadgeStyle(row_model.selected, pane_active, palette));
-        }
-    }
-
-    if (row_layout.reviewed_col) |reviewed_col| {
-        if (width > reviewed_col) {
-            _ = surface.borrowTextAt(reviewed_col, row, "✓", reviewedStyle(row_model.selected, pane_active, palette));
-        }
-    }
-
-    if (row_layout.tree_content_width > 0) {
-        var path_area = surface.child(.{
-            .col = row_layout.tree_content_col,
-            .row = row,
-            .width = row_layout.tree_content_width,
-            .height = 1,
-        });
-        const content = try sidebarTreeContent(surface.frameAllocator(), row_model);
-        const effective_scroll = @min(horizontal_scroll, sidebar_view_model.maxHorizontalScroll(row_model, width));
-        const visible = chasen.text.dropToWidth(content, scrollCells(effective_scroll));
-        try draw.copyClippedTextAt(&path_area, 0, 0, visible, style);
-    }
-
-    if (row_layout.stats_col) |stats_col| {
-        var stats_area = surface.child(.{
-            .col = stats_col,
-            .row = row,
-            .width = row_layout.stats_width,
-            .height = 1,
-        });
-        try drawSidebarStats(&stats_area, row_model, pane_active, palette);
-    }
-}
-
-fn drawSidebarStats(surface: *chasen.Surface, row: sidebar_view_model.Row, pane_active: bool, palette: theme.Palette) !void {
-    const added_text = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{row.stats.added});
-    const removed_text = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{row.stats.removed});
-    const added_style = sidebarStatStyle(row, pane_active, roleColor(palette, .success));
-    const removed_style = sidebarStatStyle(row, pane_active, roleColor(palette, .danger));
-
-    try draw.copyClippedTextAt(surface, 0, 0, added_text, added_style);
-    const removed_col = chasen.text.displayWidth(added_text) + 1;
-    if (removed_col < surface.size().width) {
-        try draw.copyClippedTextAt(surface, removed_col, 0, removed_text, removed_style);
-    }
-}
-
-fn sidebarStatStyle(row: sidebar_view_model.Row, pane_active: bool, fg: chasen.Color) chasen.TextStyle {
-    return .{
-        .fg = fg,
-        .bold = true,
-        .dim = !pane_active,
-        .reverse = pane_active and row.selected,
-    };
-}
-
-fn sidebarTreeContent(allocator: std.mem.Allocator, row: sidebar_view_model.Row) ![]const u8 {
-    const indent = @as(usize, row.depth) * 2;
-    const fold_marker = switch (row.fold) {
-        .none => "",
-        .expanded => "▾ ",
-        .collapsed => "▸ ",
-    };
-    const len = indent + fold_marker.len + row.name.len;
-    const buf = try allocator.alloc(u8, len);
-    @memset(buf[0..indent], ' ');
-    @memcpy(buf[indent..][0..fold_marker.len], fold_marker);
-    @memcpy(buf[indent + fold_marker.len ..][0..row.name.len], row.name);
-    return buf;
-}
-
-fn sidebarRowStyle(row: sidebar_view_model.Row, pane_active: bool, palette: theme.Palette) chasen.TextStyle {
-    if (row.selected) return .{ .reverse = pane_active, .bold = true, .dim = !pane_active };
-    if (row.kind == .directory or row.kind == .repo_root) return .{ .bold = true, .dim = !pane_active };
-    return switch (row.stage_presence) {
-        .staged_only => .{ .fg = roleColor(palette, .staged), .dim = !pane_active },
-        .mixed => .{ .fg = roleColor(palette, .prompt), .dim = !pane_active },
-        .conflict => .{ .fg = roleColor(palette, .danger), .bold = true, .dim = !pane_active },
-        else => .{ .dim = !pane_active },
-    };
-}
-
-/// Draw the selected file's diff pane.
-///
-/// Diff rows are already backed by rendered-line indexes in LoadedDiff; this
-/// layer only chooses the visible file, mode, and current scroll offset.
-pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0) return;
-
-    if (app.selectedStatusEntry()) |entry| {
-        try viewStatusOnlyPane(app, surface, entry);
-        return;
-    }
-
-    if (loaded.document.files.len == 0) {
-        _ = surface.borrowTextAt(0, 0, "No parsed files.", roleStyle(app.theme, .muted));
-        return;
-    }
-
-    var diff_content = diffContentSurface(surface);
-    const mode = diff_render.effectiveMode(diff_render.bodyWidth(diff_content.size().width), app.pages.review.viewer.display_mode);
-    const active = app.pages.review.viewer.sidebar_hidden or app.pages.review.viewer.focus == .diff;
-    const display = (try app.activeDiffDisplay(surface.frameAllocator(), mode)) orelse return;
-    const display_file = display.file();
-    try diff_render.renderFile(&diff_content, display_file, .{
-        .requested_mode = app.pages.review.viewer.display_mode,
-        .scroll = app.pages.review.viewer.diff_scroll,
-        .horizontal_scroll = app.pages.review.viewer.diff_horizontal_scroll,
-        .pane_active = active,
-        .line_numbers = app.pages.review.viewer.view_options.line_numbers,
-        .highlighted_hunk = app.selectedHunkIndex(),
-        .cursor_offset = app.visibleDiffCursorOffset(),
-        .staged_hunks = display.stagedFlags(),
-        .line_index = display.lineIndex(),
-        .folded_hunks = display.foldedHunks(),
-        .palette = app.theme,
-        .file_index = display.loadedFileIndex() orelse 0,
-        .syntax_spans = if (display.loadedFileIndex() != null) loaded.syntax_spans else .empty(),
-        .selection = app.diffSelectionView(),
-        .header_selection = app.diffHeaderSelectionActive(),
-    });
-    drawDiffHeaderDetailRow(app, surface, active);
-    drawSearchMatchMarker(app, surface);
-}
-
-fn drawDiffHeaderDetailRow(app: anytype, surface: *chasen.Surface, active: bool) void {
-    const size = surface.size();
-    if (size.width == 0 or size.height <= 1) return;
-
-    surface.clear(.{ .col = 0, .row = 1, .width = size.width, .height = 1 });
-    if (!app.pages.review.search.mode and app.pages.review.search.query.len > 0) {
-        const label_col: u16 = 1;
-        const match_text = if (app.pages.review.search.match_offset) |offset|
-            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ app.pages.review.search.query.slice(), offset + 1 }) catch "search"
-        else
-            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{app.pages.review.search.query.slice()}) catch "search";
-        draw.copyClippedTextAt(surface, label_col, 1, match_text, paneSearchStyle(active, app.theme)) catch {};
-        return;
-    }
-
-    if (app.pages.review.search.mode) {
-        const label = "search: ";
-        const label_col: u16 = 1;
-        const style = paneSearchStyle(active, app.theme);
-        draw.copyClippedTextAt(surface, label_col, 1, label, style) catch {};
-        if (size.width > label_col + label.len) {
-            const input_col: u16 = label_col + @as(u16, @intCast(label.len));
-            drawCommitInputLine(surface, input_col, 1, app.pages.review.search.input.slice(), app.pages.review.search.input.cursor, style) catch {};
-            showInputCursor(surface, input_col, 1, app.pages.review.search.input.slice(), app.pages.review.search.input.cursor);
-        }
-        return;
-    }
-
-    drawPaneHeaderRule(surface, active, app.theme);
-}
-
-fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.StatusEntry) !void {
-    const active = app.pages.review.viewer.sidebar_hidden or app.pages.review.viewer.focus == .diff;
-
-    var content = diffContentSurface(surface);
-    const path = entry.canonicalPathKey() orelse entry.path;
-
-    if (app.activeCachedDiffProjection()) |bundle| {
-        if (bundle.loaded.document.files.len > 0) {
-            try diff_render.renderFile(&content, bundle.loaded.document.files[0], .{
-                .requested_mode = app.pages.review.viewer.display_mode,
-                .scroll = app.pages.review.viewer.diff_scroll,
-                .horizontal_scroll = app.pages.review.viewer.diff_horizontal_scroll,
-                .pane_active = active,
-                .line_numbers = app.pages.review.viewer.view_options.line_numbers,
-                .highlighted_hunk = app.selectedHunkIndex(),
-                .cursor_offset = app.visibleDiffCursorOffset(),
-                .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.pages.review.viewer.display_mode)),
-                .palette = app.theme,
-                .file_index = 0,
-                .syntax_spans = bundle.loaded.syntax_spans,
-                .header_selection = app.diffHeaderSelectionActive(),
-            });
-            drawPaneHeaderRule(surface, active, app.theme);
-            return;
-        }
-    }
-
-    if (app.activeGeneratedFileProjection()) |bundle| {
-        try diff_render.renderGeneratedAddedFile(&content, bundle.file.path, bundle.file.lines, bundle.file.truncated, .{
-            .requested_mode = app.pages.review.viewer.display_mode,
-            .scroll = app.pages.review.viewer.diff_scroll,
-            .horizontal_scroll = app.pages.review.viewer.diff_horizontal_scroll,
-            .pane_active = active,
-            .line_numbers = app.pages.review.viewer.view_options.line_numbers,
-            .cursor_offset = app.visibleDiffCursorOffset(),
-            .palette = app.theme,
-            .header_selection = app.diffHeaderSelectionActive(),
-        });
-        drawPaneHeaderRule(surface, active, app.theme);
-        return;
-    }
-
-    switch (app.pages.review.review_projection.displayed) {
-        .ready => |ready| {
-            switch (ready.value) {
-                .cached_diff, .generated_added_file => {},
-                .combined_hunks => {},
-                .status_body => |body| {
-                    try drawStatusBody(&content, body.path, body.message, app.selectedStatusLineStats(), active, app.theme);
-                    drawPaneHeaderRule(surface, active, app.theme);
-                    return;
-                },
-            }
-        },
-        .failed => |failed| {
-            try drawStatusBody(&content, failed.body.path, failed.body.message, app.selectedStatusLineStats(), active, app.theme);
-            drawPaneHeaderRule(surface, active, app.theme);
-            return;
-        },
-        .idle => {},
-    }
-
-    if (app.pages.review.review_projection.hasPending()) {
-        try drawStatusBody(&content, path, "Loading review projection...", app.selectedStatusLineStats(), active, app.theme);
-        drawPaneHeaderRule(surface, active, app.theme);
-        return;
-    }
-
-    try drawTitlePath(&content, path, app.selectedStatusLineStats(), paneTitleStyle(active, app.theme), active, app.theme);
-    const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "status: {s}{s}", .{ statusName(entry.index), statusSuffix(entry) });
-    try draw.copyClippedTextAt(&content, 0, 2, status_text, .{ .fg = roleColor(app.theme, .muted), .dim = !active });
-    switch (file_tree.stagePresenceFromEntry(entry)) {
-        .staged_only => {
-            try draw.copyClippedTextAt(&content, 0, 4, "This file is staged.", .{ .fg = roleColor(app.theme, .muted), .dim = !active });
-            try draw.copyClippedTextAt(&content, 0, 5, "Loading staged diff preview.", .{ .fg = roleColor(app.theme, .muted), .dim = !active });
-        },
-        else => {
-            try draw.copyClippedTextAt(&content, 0, 4, "No diff is available for this file yet.", .{ .fg = roleColor(app.theme, .muted), .dim = !active });
-            try draw.copyClippedTextAt(&content, 0, 5, "Loading generated review preview if available.", .{ .fg = roleColor(app.theme, .muted), .dim = !active });
-        },
-    }
-}
-
-fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool, palette: theme.Palette) void {
-    const size = surface.size();
-    if (size.width == 0 or size.height <= 1) return;
-
-    for (0..size.width) |col| {
-        _ = surface.borrowTextAt(@intCast(col), 1, "─", paneHeaderRuleStyle(active, palette));
-    }
-}
-
-fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u8, stats: ?file_tree.Stats, active: bool, palette: theme.Palette) !void {
-    try drawTitlePath(surface, path, stats, paneTitleStyle(active, palette), active, palette);
-    try draw.copyClippedTextAt(surface, 0, 2, message, .{ .fg = roleColor(palette, .muted), .dim = !active });
-}
-
-fn drawTitlePath(surface: *chasen.Surface, path: []const u8, stats: ?file_tree.Stats, style: chasen.TextStyle, active: bool, palette: theme.Palette) !void {
-    if (stats) |line_stats| {
-        if (line_stats.added != 0 or line_stats.removed != 0) {
-            const suffix = try std.fmt.allocPrint(surface.frameAllocator(), " +{d} -{d}", .{ line_stats.added, line_stats.removed });
-            const suffix_width = chasen.text.displayWidth(suffix);
-            const path_width = surface.size().width -| @as(u16, @intCast(@min(suffix_width, std.math.maxInt(u16))));
-            if (path_width > 8) {
-                var path_surface = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
-                try draw.copyTailClippedTextAt(&path_surface, 0, 0, path, style);
-                const suffix_col: u16 = @intCast(path_width);
-                try drawStatusLineStats(surface, suffix_col, line_stats, active, palette);
-                return;
-            }
-        }
-    }
-    try draw.copyTailClippedTextAt(surface, 0, 0, path, style);
-}
-
-fn drawStatusLineStats(surface: *chasen.Surface, col: u16, stats: file_tree.Stats, active: bool, palette: theme.Palette) !void {
-    var cursor = col;
-    try draw.copyClippedTextAt(surface, cursor, 0, " ", roleStyle(palette, .muted));
-    cursor +|= 1;
-    const added = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added});
-    try draw.copyClippedTextAt(surface, cursor, 0, added, .{ .fg = roleColor(palette, .success), .bold = true, .dim = !active });
-    cursor +|= @intCast(chasen.text.displayWidth(added));
-    if (cursor < surface.size().width) {
-        try draw.copyClippedTextAt(surface, cursor, 0, " ", roleStyle(palette, .muted));
-        cursor +|= 1;
-    }
-    const removed = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed});
-    try draw.copyClippedTextAt(surface, cursor, 0, removed, .{ .fg = roleColor(palette, .danger), .bold = true, .dim = !active });
-}
-
-fn statusName(status: git_status.StatusCode) []const u8 {
-    return switch (status) {
-        .unmodified => "unmodified",
-        .modified => "modified",
-        .added => "added",
-        .deleted => "deleted",
-        .renamed => "renamed",
-        .copied => "copied",
-        .untracked => "untracked",
-        .ignored => "ignored",
-        .unmerged => "unmerged",
-        .unknown => "unknown",
-    };
-}
-
-fn statusSuffix(entry: git_status.StatusEntry) []const u8 {
-    if (entry.isConflict()) return " (conflict)";
-    return "";
-}
-
-fn viewLoadState(app: anytype, col: *chasen.Column) void {
-    switch (app.pages.review.load.state) {
-        .idle => drawStateMessageColumn(col, .{
-            .title = "Waiting to load diff",
-            .body = "GitFrame is waiting for a load request.",
-            .hint = "Press q to quit.",
-        }, app.theme),
-        .loading => drawStateMessageColumn(col, .{
-            .title = "Loading diff",
-            .body = "Reading and parsing the current source.",
-            .hint = "Press q to quit.",
-            .tone = .loading,
-        }, app.theme),
-        .empty => |reason| drawStateMessageColumn(col, emptyLoadMessage(reason), app.theme),
-        .failed => |failed| drawStateMessageColumn(col, .{
-            .title = "Could not load diff",
-            .body = firstLine(failed.message),
-            .hint = "Press r to retry or q to quit.",
-            .tone = .failure,
-        }, app.theme),
-        .loaded => {},
-    }
-}
-
-fn emptyLoadMessage(reason: anytype) StateMessage {
-    return switch (reason) {
-        .no_changes => .{
-            // Normal no-changes rendering is intercepted by `viewNoChanges` so
-            // clean repos can keep branch chrome. Keep this fallback for any
-            // future generic empty-state path.
-            .title = "No changes",
-            .body = "Working tree has no diff for the current source.",
-            .hint = "Press r to reload or q to quit.",
-        },
-        .no_repository => .{
-            .title = "No Git repository",
-            .body = "Run GitFrame inside a repository or a workspace containing direct child repositories.",
-            .hint = "Press q to quit.",
-            .tone = .warning,
-        },
-    };
-}
-
-fn noChangesMessage(app: anytype, allocator: std.mem.Allocator) StateMessage {
-    return .{
-        .title = "No changes",
-        .body = "Working tree has no diff for the current source.",
-        .hint = noChangesHint(app, allocator),
-    };
-}
-
-fn noChangesHint(app: anytype, allocator: std.mem.Allocator) []const u8 {
-    var fetch_key_buffer: [16]u8 = undefined;
-    const hints = app.emptyRemoteActionHints(fetch_key_buffer[0..]);
-    const fetch_key = hints.fetch_key;
-
-    // The hint is capability-oriented: `U` refreshes first and may legitimately
-    // finish as "nothing to pull", so the text advertises the workflow rather
-    // than predicting remote state from a possibly stale ahead/behind count.
-    if (hints.show_repo_picker and hints.show_pull and fetch_key != null) {
-        return std.fmt.allocPrint(allocator, "Press R to switch repository, U to fetch + fast-forward, {s} to fetch, r to reload, or q to quit.", .{fetch_key.?}) catch "Press R to switch repository, U to fetch + fast-forward, r to reload, or q to quit.";
-    }
-    if (hints.show_repo_picker and hints.show_pull) {
-        return "Press R to switch repository, U to fetch + fast-forward, r to reload, or q to quit.";
-    }
-    if (hints.show_repo_picker and fetch_key != null) {
-        return std.fmt.allocPrint(allocator, "Press R to switch repository, {s} to fetch, r to reload, or q to quit.", .{fetch_key.?}) catch "Press R to switch repository, r to reload, or q to quit.";
-    }
-    if (hints.show_repo_picker) {
-        return "Press R to switch repository, r to reload, or q to quit.";
-    }
-    if (hints.show_pull and fetch_key != null) {
-        return std.fmt.allocPrint(allocator, "Press U to fetch + fast-forward, {s} to fetch, r to reload, or q to quit.", .{fetch_key.?}) catch "Press U to fetch + fast-forward, r to reload, or q to quit.";
-    }
-    if (hints.show_pull) {
-        return "Press U to fetch + fast-forward, r to reload, or q to quit.";
-    }
-    if (fetch_key != null) {
-        return std.fmt.allocPrint(allocator, "Press {s} to fetch, r to reload, or q to quit.", .{fetch_key.?}) catch "Press r to reload or q to quit.";
-    }
-    return "Press r to reload or q to quit.";
-}
-
-fn filterEmptyMessage(app: anytype) StateMessage {
-    const hint = if (app.pages.review.review_display.hide_reviewed_files and app.pages.review.review_display.changed_file_filter != .all)
-        "Press F to change filter, H to show reviewed files, or r to reload."
-    else if (app.pages.review.review_display.hide_reviewed_files)
-        "Press H to show reviewed files or r to reload."
-    else if (app.pages.review.review_display.changed_file_filter != .all)
-        "Press F to change filter or r to reload."
-    else
-        "Press r to reload.";
-
-    return .{
-        .title = "No files match current filters",
-        .body = "The diff is loaded, but the current sidebar filters hide every file.",
-        .hint = hint,
-    };
-}
-
-fn drawStateMessage(surface: *chasen.Surface, message: StateMessage, palette: theme.Palette) void {
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0) return;
-
-    const width = @min(size.width, 64);
-    const height: u16 = @min(size.height, 6);
-    var panel = surface.child(.{
-        .col = if (size.width > width) (size.width - width) / 2 else 0,
-        .row = if (size.height > height) (size.height - height) / 2 else 0,
-        .width = width,
-        .height = height,
-    });
-    var col = panel.column(.{ .gap = 1 });
-    drawStateMessageColumn(&col, message, palette);
-}
-
-fn drawStateMessageColumn(col: *chasen.Column, message: StateMessage, palette: theme.Palette) void {
-    col.borrowText(message.title, stateTitleStyle(message.tone, palette));
-    if (message.body.len > 0) col.borrowText(message.body, stateBodyStyle(message.tone, palette));
-    if (message.hint.len > 0) col.borrowText(message.hint, stateHintStyle(palette));
-}
-
-fn stateTitleStyle(tone: StateTone, palette: theme.Palette) chasen.TextStyle {
-    return switch (tone) {
-        .muted => boldRoleStyle(palette, .muted),
-        .loading => boldRoleStyle(palette, .prompt),
-        .warning => boldRoleStyle(palette, .warning),
-        .failure => boldRoleStyle(palette, .danger),
-    };
-}
-
-fn stateBodyStyle(tone: StateTone, palette: theme.Palette) chasen.TextStyle {
-    return switch (tone) {
-        .failure => roleStyle(palette, .danger),
-        else => roleStyle(palette, .muted),
-    };
-}
-
-fn stateHintStyle(palette: theme.Palette) chasen.TextStyle {
-    return .{ .fg = roleColor(palette, .muted), .dim = true };
-}
-
-fn firstLine(text: []const u8) []const u8 {
-    if (std.mem.indexOfAny(u8, text, "\r\n")) |end| return text[0..end];
-    return text;
-}
-
-fn viewFooter(app: anytype, surface: *chasen.Surface) void {
+fn viewFooter(app: Context, surface: *chasen.Surface) void {
     const width = surface.size().width;
     if (width == 0) return;
+    const review_footer = app.review.footer();
 
-    if (app.pages.review.file_search.mode) {
+    if (review_footer.file_search_mode) {
         const label = "file: ";
         const label_col: u16 = 1;
-        _ = surface.borrowTextAt(label_col, 0, label, boldRoleStyle(app.theme, .prompt));
+        _ = surface.borrowTextAt(label_col, 0, label, app.theme.boldStyle(.prompt));
         const input_col: u16 = label_col + @as(u16, @intCast(label.len));
-        _ = surface.copyTextAt(input_col, 0, app.pages.review.file_search.input.slice(), roleStyle(app.theme, .prompt)) catch {};
-        if (app.pages.review.file_search.no_match) {
-            const col: u16 = @intCast(@min(input_col + chasen.text.displayWidth(app.pages.review.file_search.input.slice()) + 1, std.math.maxInt(u16)));
-            if (surface.size().width > col) _ = surface.borrowTextAt(col, 0, "(no match)", roleStyle(app.theme, .danger));
+        _ = surface.copyTextAt(input_col, 0, review_footer.file_search_text, app.theme.style(.prompt)) catch {};
+        if (review_footer.file_search_no_match) {
+            const col: u16 = @intCast(@min(input_col + chasen.text.displayWidth(review_footer.file_search_text) + 1, std.math.maxInt(u16)));
+            if (surface.size().width > col) _ = surface.borrowTextAt(col, 0, "(no match)", app.theme.style(.danger));
         }
         return;
     }
@@ -866,26 +218,26 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
             app.terminal_size.width,
             app.terminal_size.height,
         }) catch return,
-        .style = roleStyle(app.theme, .muted),
+        .style = app.theme.style(.muted),
     });
-    if (sourceFooterLabel(app.config)) |label| footer_segments.append(.{
+    if (review_footer.source_label) |label| footer_segments.append(.{
         .text = label,
-        .style = roleStyle(app.theme, .prompt),
+        .style = app.theme.style(.prompt),
         .drop_priority = .source,
     });
-    if (app.pages.review.auto_reload.enabled()) footer_segments.append(.{
+    if (review_footer.auto_reload_enabled) footer_segments.append(.{
         .text = "auto",
-        .style = roleStyle(app.theme, .staged),
+        .style = app.theme.style(.staged),
         .drop_priority = .auto,
     });
     if (gitActionSpinnerText(app, surface.frameAllocator())) |spinner_text| {
         footer_segments.append(.{
             .text = spinner_text,
-            .style = roleStyle(app.theme, .prompt),
+            .style = app.theme.style(.prompt),
         });
     } else if (app.status.text().len > 0) footer_segments.append(.{
         .text = app.status.text(),
-        .style = roleStyle(app.theme, .prompt),
+        .style = app.theme.style(.prompt),
     });
 
     footer_segments.fit(left_limit);
@@ -980,7 +332,7 @@ const FooterSegments = struct {
     }
 };
 
-fn gitActionSpinnerText(app: anytype, allocator: std.mem.Allocator) ?[]const u8 {
+fn gitActionSpinnerText(app: Context, allocator: std.mem.Allocator) ?[]const u8 {
     const pending = app.actions.pending orelse return null;
     const label = if (app.status.text().len > 0)
         app.status.text()
@@ -990,7 +342,7 @@ fn gitActionSpinnerText(app: anytype, allocator: std.mem.Allocator) ?[]const u8 
     return std.fmt.allocPrint(allocator, "{s} {s}", .{ spinner.frameAt(app.git_action_spinner_tick), label }) catch label;
 }
 
-fn pendingActionFallbackLabel(kind: anytype) []const u8 {
+fn pendingActionFallbackLabel(kind: app_actions.ActionKind) []const u8 {
     return switch (kind) {
         .stage_file => "stage",
         .unstage_file => "unstage",
@@ -1007,164 +359,10 @@ fn pendingActionFallbackLabel(kind: anytype) []const u8 {
     };
 }
 
-fn branchStatusSidebarText(app: anytype, allocator: std.mem.Allocator, available_width: u16) ?[]const u8 {
-    const root = app.repo_state.activeRoot() orelse return null;
-    if (app.pages.review.branch_status_load.pending) |pending| {
-        const has_retained_snapshot = if (app.pages.review.branch_status.repo_root) |snapshot_root|
-            std.mem.eql(u8, root, snapshot_root)
-        else
-            false;
-        if (pending.origin == .foreground or !has_retained_snapshot) return "loading branch";
-    }
-
-    const snapshot_root = app.pages.review.branch_status.repo_root orelse return null;
-    if (!std.mem.eql(u8, root, snapshot_root)) return null;
-
-    return formatSidebarBranchStatus(allocator, app.pages.review.branch_status.status, available_width) catch "branch";
-}
-
-fn formatSidebarBranchStatus(allocator: std.mem.Allocator, status: git_branch_status.BranchStatus, available_width: u16) ![]const u8 {
-    const branch = switch (status.head) {
-        .branch => |name| name,
-        .detached => return "detached",
-        .unknown => return "unknown branch",
-    };
-    var allocated_suffix: ?[]const u8 = null;
-    defer if (allocated_suffix) |suffix| allocator.free(suffix);
-    const suffix = if (status.upstream == null)
-        " no upstream"
-    else blk: {
-        const ahead = if (status.ahead_behind) |ab| ab.ahead else 0;
-        allocated_suffix = try std.fmt.allocPrint(allocator, " ↑{d}", .{ahead});
-        break :blk allocated_suffix.?;
-    };
-    const reserved = chasen.text.displayWidth(suffix);
-    const branch_width = if (available_width > reserved) available_width - reserved else 0;
-    const display_branch = try branchPrefixTail(allocator, branch, branch_width);
-    defer allocator.free(display_branch);
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ display_branch, suffix });
-}
-
-fn branchPrefixTail(allocator: std.mem.Allocator, branch: []const u8, width: u16) ![]const u8 {
-    if (width == 0) return allocator.dupe(u8, "");
-    if (chasen.text.displayWidth(branch) <= width) return allocator.dupe(u8, branch);
-    const slash = std.mem.indexOfScalar(u8, branch, '/') orelse return markedClipToOwned(allocator, branch, width);
-    const prefix = branch[0 .. slash + 1];
-    const marker = "…";
-    const prefix_width = chasen.text.displayWidth(prefix);
-    const marker_width = chasen.text.displayWidth(marker);
-    if (width <= prefix_width + marker_width) return markedClipToOwned(allocator, branch, width);
-    // Keep branch class prefixes such as "feature/" while preserving the
-    // ticket/topic tail that usually disambiguates long branch names.
-    const tail_width = width - prefix_width - marker_width;
-    const tail_source = branch[slash + 1 ..];
-    const tail_source_width = chasen.text.displayWidth(tail_source);
-    const tail = chasen.text.dropToWidth(tail_source, tail_source_width - tail_width);
-    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, marker, tail });
-}
-
-fn markedClipToOwned(allocator: std.mem.Allocator, text: []const u8, width: u16) ![]const u8 {
-    const clipped = chasen.text.clipToWidthWithMarker(text, width, "…");
-    if (clipped.marker.len == 0) return allocator.dupe(u8, clipped.prefix);
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ clipped.prefix, clipped.marker });
-}
-
-test "formatSidebarBranchStatus distinguishes upstream state" {
-    const with_upstream = try formatSidebarBranchStatus(std.testing.allocator, .{
-        .head = .{ .branch = "feature/topic" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
-        .ahead_behind = .{ .ahead = 2, .behind = 1 },
-    }, 80);
-    defer std.testing.allocator.free(with_upstream);
-    try std.testing.expectEqualStrings("feature/topic ↑2", with_upstream);
-
-    const without_upstream = try formatSidebarBranchStatus(std.testing.allocator, .{
-        .head = .{ .branch = "feature/topic" },
-    }, 80);
-    defer std.testing.allocator.free(without_upstream);
-    try std.testing.expectEqualStrings("feature/topic no upstream", without_upstream);
-}
-
-test "formatSidebarBranchStatus keeps branch prefix and tail when clipped" {
-    const text = try formatSidebarBranchStatus(std.testing.allocator, .{
-        .head = .{ .branch = "feature/very-long-ticket-name" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
-        .ahead_behind = .{ .ahead = 0, .behind = 0 },
-    }, 22);
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.startsWith(u8, text, "feature/…"));
-    try std.testing.expect(std.mem.endsWith(u8, text, " ↑0"));
-}
-
-test "formatSidebarBranchStatus omits behind count" {
-    const text = try formatSidebarBranchStatus(std.testing.allocator, .{
-        .head = .{ .branch = "main" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
-        .ahead_behind = .{ .ahead = 0, .behind = 7 },
-    }, 80);
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expectEqualStrings("main ↑0", text);
-}
-
-test "branch sidebar retains background snapshot but shows foreground loading" {
-    const Repo = struct {
-        fn activeRoot(_: @This()) ?[]const u8 {
-            return "/repo";
-        }
-    };
-    var builder = git_branch_status.Builder.init(std.testing.allocator);
-    errdefer builder.deinit();
-    try builder.setBranchHead("main");
-    var bundle = builder.finish();
-    var branch_status: git_branch_status.State = .{};
-    try branch_status.replace("/repo", &bundle);
-
-    var app = struct {
-        repo_state: Repo = .{},
-        pages: struct {
-            review: struct {
-                branch_status: git_branch_status.State,
-                branch_status_load: app_auto_reload.AuxiliaryTracker,
-            },
-        },
-    }{
-        .pages = .{ .review = .{
-            .branch_status = branch_status,
-            .branch_status_load = .{
-                .generation = 1,
-                .pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 },
-                .freshness = .stale_refresh,
-            },
-        } },
-    };
-    defer app.pages.review.branch_status.deinit();
-
-    const retained = branchStatusSidebarText(&app, std.testing.allocator, 80).?;
-    defer std.testing.allocator.free(retained);
-    try std.testing.expectEqualStrings("main no upstream", retained);
-
-    app.pages.review.branch_status_load.pending.?.origin = .foreground;
-    try std.testing.expectEqualStrings("loading branch", branchStatusSidebarText(&app, std.testing.allocator, 80).?);
-}
-
-fn sourceFooterLabel(config: anytype) ?[]const u8 {
-    return switch (config.source) {
-        .unstaged => null,
-        .cached => "staged",
-        .stdin => "stdin",
-        .pager => "pager",
-        .patch_file => "patch",
-        .range => "range",
-        .no_index => "difftool",
-    };
-}
-
 fn footerKeyHintOptions(palette: theme.Palette) ui.key_hint.DrawOptions {
     return .{
-        .style = roleStyle(palette, .muted),
-        .key_style = boldRoleStyle(palette, .muted),
+        .style = palette.style(.muted),
+        .key_style = palette.boldStyle(.muted),
     };
 }
 
@@ -1195,14 +393,14 @@ fn repoPickerLayout(height: u16, has_path_status: bool) RepoPickerLayout {
     };
 }
 
-fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
+fn viewRepoPicker(app: Context, surface: *chasen.Surface) !void {
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, repo_picker_dialog_width),
         .dialog_height = @min(surface.size().height, 18),
         .title = "Switch repository",
         .backdrop = false,
         .border = .rounded,
-        .title_style = boldRoleStyle(app.theme, .accent),
+        .title_style = app.theme.boldStyle(.accent),
     };
     const frame = ui.Modal.frame(surface, opts) orelse return;
     fillModalDialog(frame);
@@ -1211,35 +409,35 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
     const size = content.size();
 
     switch (app.repo_picker.input_mode) {
-        .list => _ = content.borrowTextAt(0, 0, "Repository list", boldRoleStyle(app.theme, .prompt)),
+        .list => _ = content.borrowTextAt(0, 0, "Repository list", app.theme.boldStyle(.prompt)),
         .filter => {
-            _ = content.borrowTextAt(0, 0, "Filter: ", boldRoleStyle(app.theme, .prompt));
-            try drawCommitInputLine(&content, repo_picker_filter_input_col, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor, roleStyle(app.theme, .prompt));
-            showInputCursor(&content, repo_picker_filter_input_col, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor);
+            _ = content.borrowTextAt(0, 0, "Filter: ", app.theme.boldStyle(.prompt));
+            try drawCommitInputLine(&content, repo_picker_filter_input_col, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor, app.theme.style(.prompt));
+            view_primitives.showInputCursor(&content, repo_picker_filter_input_col, 0, app.repo_picker.list.input.slice(), app.repo_picker.list.input.cursor);
         },
         .path_input => {
-            _ = content.borrowTextAt(0, 0, "Repo path: ", boldRoleStyle(app.theme, .prompt));
-            try drawCommitInputLine(&content, repo_picker_path_input_col, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor, roleStyle(app.theme, .prompt));
-            showInputCursor(&content, repo_picker_path_input_col, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor);
+            _ = content.borrowTextAt(0, 0, "Repo path: ", app.theme.boldStyle(.prompt));
+            try drawCommitInputLine(&content, repo_picker_path_input_col, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor, app.theme.style(.prompt));
+            view_primitives.showInputCursor(&content, repo_picker_path_input_col, 0, app.repo_picker.path_input.slice(), app.repo_picker.path_input.cursor);
         },
     }
 
     const has_path_status = app.repo_picker.path_pending or app.repo_picker.path_error != null;
     if (size.height > 1 and has_path_status) {
         if (app.repo_picker.path_pending) {
-            _ = content.borrowTextAt(0, 1, "checking path...", roleStyle(app.theme, .muted));
+            _ = content.borrowTextAt(0, 1, "checking path...", app.theme.style(.muted));
         } else if (app.repo_picker.path_error) |err| {
-            try draw.copyClippedTextAt(&content, 0, 1, err.message(), roleStyle(app.theme, .danger));
+            try draw.copyClippedTextAt(&content, 0, 1, err.message(), app.theme.style(.danger));
         }
     }
 
     if (size.height <= 3) return;
     const layout = repoPickerLayout(size.height, has_path_status);
-    const list_title = try app_repo_picker.listTitle(content.frameAllocator(), app.repo_picker_discovery, app.repo_state.discovery, &app.recent_repos);
+    const list_title = try app_repo_picker.listTitle(content.frameAllocator(), app.repo_picker_discovery, app.repo_state.discovery, app.recent_repos);
     const list_title_style: chasen.TextStyle = if (app.repo_picker.input_mode == .path_input)
-        .{ .fg = roleColor(app.theme, .muted), .dim = true }
+        .{ .fg = app.theme.color(.muted), .dim = true }
     else
-        boldRoleStyle(app.theme, .accent);
+        app.theme.boldStyle(.accent);
     try draw.copyClippedTextAt(&content, 0, layout.list_title_row, list_title, list_title_style);
 
     defer {
@@ -1255,7 +453,7 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
                 "No matching repositories."
             else
                 "No recent repositories yet.";
-            _ = content.borrowTextAt(2, layout.list_start_row, empty_text, roleStyle(app.theme, .muted));
+            _ = content.borrowTextAt(2, layout.list_start_row, empty_text, app.theme.style(.muted));
         }
         return;
     }
@@ -1285,7 +483,7 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
         const style: chasen.TextStyle = if (focused_row)
             .{ .reverse = true, .bold = true }
         else if (active)
-            .{ .fg = roleColor(app.theme, .staged), .bold = true, .dim = !list_active }
+            .{ .fg = app.theme.color(.staged), .bold = true, .dim = !list_active }
         else
             .{ .dim = !list_active };
         const marker = if (focused_row) ">" else " ";
@@ -1324,16 +522,16 @@ fn viewRepoPicker(app: anytype, surface: *chasen.Surface) !void {
                     .width = detail_text_width,
                     .height = 1,
                 });
-                try draw.copyClippedTextAt(&detail_area, 0, 0, detail, roleStyle(app.theme, .muted));
+                try draw.copyClippedTextAt(&detail_area, 0, 0, detail, app.theme.style(.muted));
             }
         }
         if (position_width > 0 and size.width > position_width) {
-            try draw.copyClippedTextAt(&content, size.width - position_width, detail_row, position_text, roleStyle(app.theme, .muted));
+            try draw.copyClippedTextAt(&content, size.width - position_width, detail_row, position_text, app.theme.style(.muted));
         }
     }
 }
 
-fn drawRepoPickerFooter(surface: *chasen.Surface, row: u16, input_mode: anytype, has_row: bool, palette: theme.Palette) void {
+fn drawRepoPickerFooter(surface: *chasen.Surface, row: u16, input_mode: app_prompt.RepoPickerInputMode, has_row: bool, palette: theme.Palette) void {
     const Item = ui.key_hint.Item;
     const items: []const Item = switch (input_mode) {
         .path_input => &.{
@@ -1361,11 +559,11 @@ fn drawRepoPickerFooter(surface: *chasen.Surface, row: u16, input_mode: anytype,
     _ = ui.key_hint.draw(surface, 0, row, items, opts) catch {};
 }
 
-fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
+fn viewCommitPanel(app: Context, surface: *chasen.Surface) !void {
     const title_style: chasen.TextStyle = if (app.commit_panel.mode == .amend)
-        boldRoleStyle(app.theme, .amend)
+        app.theme.boldStyle(.amend)
     else
-        boldRoleStyle(app.theme, .accent);
+        app.theme.boldStyle(.accent);
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, commit_dialog_width),
         .dialog_height = @min(surface.size().height, commit_dialog_height),
@@ -1380,8 +578,8 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
     var content = frame.contentSurface();
     const size = content.size();
 
-    const staged_text = try stagedSummaryText(content.frameAllocator(), app.stagedSummaryForActiveRepo());
-    try draw.copyClippedTextAt(&content, 0, 0, staged_text, roleStyle(app.theme, .muted));
+    const staged_text = try stagedSummaryText(content.frameAllocator(), app.staged_summary);
+    try draw.copyClippedTextAt(&content, 0, 0, staged_text, app.theme.style(.muted));
 
     const help_rows = commitHelpRows(size.width);
     const help_start_row = if (size.height > help_rows) size.height - help_rows else 0;
@@ -1397,9 +595,9 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
         const input_col: u16 = @min(2, size.width);
         if (size.height > 3 and 3 < field_limit_row and size.width > input_col) {
             const cursor = if (active) app.commit_panel.subject.cursor else null;
-            const input_style: chasen.TextStyle = if (app.commit_panel.mode == .amend) .{} else roleStyle(app.theme, .prompt);
+            const input_style: chasen.TextStyle = if (app.commit_panel.mode == .amend) .{} else app.theme.style(.prompt);
             try drawCommitInputLine(&content, input_col, 3, app.commit_panel.subject.slice(), cursor, input_style);
-            if (active) showInputCursor(&content, input_col, 3, app.commit_panel.subject.slice(), app.commit_panel.subject.cursor);
+            if (active) view_primitives.showInputCursor(&content, input_col, 3, app.commit_panel.subject.slice(), app.commit_panel.subject.cursor);
         }
     }
 
@@ -1424,7 +622,7 @@ fn viewCommitPanel(app: anytype, surface: *chasen.Surface) !void {
 
     if (size.height > 2) {
         if (app.commit_panel.commit_error) |err| {
-            try draw.copyClippedTextAt(&content, 0, error_row, err.message(), roleStyle(app.theme, .danger));
+            try draw.copyClippedTextAt(&content, 0, error_row, err.message(), app.theme.style(.danger));
         }
     }
 
@@ -1443,7 +641,7 @@ fn drawCommitCounter(surface: *chasen.Surface, row: u16, len: usize, max: ?usize
     if (counter_width >= size.width) return;
 
     const col = size.width - counter_width;
-    try draw.copyClippedTextAt(surface, col, row, counter, roleStyle(palette, .muted));
+    try draw.copyClippedTextAt(surface, col, row, counter, palette.style(.muted));
 }
 
 fn commitHelpRows(width: u16) u16 {
@@ -1451,11 +649,11 @@ fn commitHelpRows(width: u16) u16 {
     return if (chasen.text.displayWidth(single_line) <= width) 1 else 2;
 }
 
-fn viewCommitHelp(app: anytype, surface: *chasen.Surface, start_row: u16, rows: u16) !void {
+fn viewCommitHelp(app: Context, surface: *chasen.Surface, start_row: u16, rows: u16) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0 or start_row >= size.height) return;
 
-    const style: chasen.TextStyle = roleStyle(app.theme, .muted);
+    const style: chasen.TextStyle = app.theme.style(.muted);
     const submit_label = app.commit_panel.submitLabel();
     if (rows <= 1) {
         const text = try std.fmt.allocPrint(surface.frameAllocator(), "Tab: field  Enter: newline  Ctrl+g: generate  Ctrl+y: copy  Ctrl+s/Ctrl+Enter: {s}  Esc: close", .{submit_label});
@@ -1470,9 +668,9 @@ fn viewCommitHelp(app: anytype, surface: *chasen.Surface, start_row: u16, rows: 
     }
 }
 
-fn commitFieldLabelStyle(app: anytype, active: bool) chasen.TextStyle {
-    if (active and app.commit_panel.mode == .amend) return boldRoleStyle(app.theme, .amend);
-    if (active) return boldRoleStyle(app.theme, .accent);
+fn commitFieldLabelStyle(app: Context, active: bool) chasen.TextStyle {
+    if (active and app.commit_panel.mode == .amend) return app.theme.boldStyle(.amend);
+    if (active) return app.theme.boldStyle(.accent);
     return .{ .bold = true };
 }
 
@@ -1495,11 +693,11 @@ fn viewCommitBody(body: *const app_commit_panel.BodyText, surface: *chasen.Surfa
     }
     if (overflow) {
         const indicator = try std.fmt.allocPrint(surface.frameAllocator(), "... {d}/{d}", .{ body.cursorLineIndex() + 1, total_lines });
-        try draw.copyClippedTextAt(surface, 0, size.height - 1, indicator, roleStyle(palette, .muted));
+        try draw.copyClippedTextAt(surface, 0, size.height - 1, indicator, palette.style(.muted));
     }
 }
 
-fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
+fn viewDiscardConfirmation(app: Context, surface: *chasen.Surface) !void {
     const confirmation = app.discard_confirmation orelse return;
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, confirmation_dialog_width),
@@ -1507,8 +705,8 @@ fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
         .title = "Discard file changes?",
         .backdrop = false,
         .border = .rounded,
-        .title_style = boldRoleStyle(app.theme, .danger),
-        .border_style = roleStyle(app.theme, .danger),
+        .title_style = app.theme.boldStyle(.danger),
+        .border_style = app.theme.style(.danger),
     };
     const frame = ui.Modal.frame(surface, opts) orelse return;
     fillModalDialog(frame);
@@ -1516,16 +714,16 @@ fn viewDiscardConfirmation(app: anytype, surface: *chasen.Surface) !void {
     var content = frame.contentSurface();
     const size = content.size();
 
-    try drawCenteredText(&content, 0, "This will discard unstaged tracked changes.", roleStyle(app.theme, .danger));
+    try drawCenteredText(&content, 0, "This will discard unstaged tracked changes.", app.theme.style(.danger));
     if (size.height > 2) {
         try drawCenteredLabelValue(&content, 2, "File:", confirmation.path, .{ .bold = true }, .{});
     }
     if (size.height > 4) {
-        try drawCenteredText(&content, 4, "Enter: discard    Esc/q: cancel", roleStyle(app.theme, .danger));
+        try drawCenteredText(&content, 4, "Enter: discard    Esc/q: cancel", app.theme.style(.danger));
     }
 }
 
-fn viewAmendConfirmation(app: anytype, surface: *chasen.Surface) !void {
+fn viewAmendConfirmation(app: Context, surface: *chasen.Surface) !void {
     _ = app.amend_confirmation orelse return;
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, confirmation_dialog_width),
@@ -1533,8 +731,8 @@ fn viewAmendConfirmation(app: anytype, surface: *chasen.Surface) !void {
         .title = "Amend last commit?",
         .backdrop = false,
         .border = .rounded,
-        .title_style = boldRoleStyle(app.theme, .amend),
-        .border_style = roleStyle(app.theme, .amend),
+        .title_style = app.theme.boldStyle(.amend),
+        .border_style = app.theme.style(.amend),
     };
     const frame = ui.Modal.frame(surface, opts) orelse return;
     fillModalDialog(frame);
@@ -1544,13 +742,13 @@ fn viewAmendConfirmation(app: anytype, surface: *chasen.Surface) !void {
 
     const line_count: u16 = 3;
     const start_row: u16 = if (size.height > line_count) (size.height - line_count) / 2 else 0;
-    try drawCenteredText(&content, start_row, "This rewrites the current branch history.", roleStyle(app.theme, .amend));
+    try drawCenteredText(&content, start_row, "This rewrites the current branch history.", app.theme.style(.amend));
     if (start_row + 2 < size.height) {
-        try drawCenteredText(&content, start_row + 2, "Enter: amend    Esc/q: cancel", roleStyle(app.theme, .amend));
+        try drawCenteredText(&content, start_row + 2, "Enter: amend    Esc/q: cancel", app.theme.style(.amend));
     }
 }
 
-fn viewPushConfirmation(app: anytype, surface: *chasen.Surface) !void {
+fn viewPushConfirmation(app: Context, surface: *chasen.Surface) !void {
     const confirmation = app.push_confirmation orelse return;
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, confirmation_dialog_width),
@@ -1558,8 +756,8 @@ fn viewPushConfirmation(app: anytype, surface: *chasen.Surface) !void {
         .title = "Push current branch?",
         .backdrop = false,
         .border = .rounded,
-        .title_style = boldRoleStyle(app.theme, .accent),
-        .border_style = roleStyle(app.theme, .accent),
+        .title_style = app.theme.boldStyle(.accent),
+        .border_style = app.theme.style(.accent),
     };
     const frame = ui.Modal.frame(surface, opts) orelse return;
     fillModalDialog(frame);
@@ -1577,16 +775,16 @@ fn viewPushConfirmation(app: anytype, surface: *chasen.Surface) !void {
     };
     const line_count: u16 = 5;
     const start_row: u16 = if (size.height > line_count) (size.height - line_count) / 2 else 0;
-    try drawCenteredText(&content, start_row, target, boldRoleStyle(app.theme, .accent));
+    try drawCenteredText(&content, start_row, target, app.theme.boldStyle(.accent));
     if (start_row + 2 < size.height) {
-        try drawCenteredText(&content, start_row + 2, detail, roleStyle(app.theme, .muted));
+        try drawCenteredText(&content, start_row + 2, detail, app.theme.style(.muted));
     }
     if (start_row + 4 < size.height) {
-        try drawCenteredText(&content, start_row + 4, "Enter: push    Esc/q: cancel", roleStyle(app.theme, .accent));
+        try drawCenteredText(&content, start_row + 4, "Enter: push    Esc/q: cancel", app.theme.style(.accent));
     }
 }
 
-fn viewPullConfirmation(app: anytype, surface: *chasen.Surface) !void {
+fn viewPullConfirmation(app: Context, surface: *chasen.Surface) !void {
     const confirmation = app.pull_confirmation orelse return;
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, confirmation_dialog_width),
@@ -1594,8 +792,8 @@ fn viewPullConfirmation(app: anytype, surface: *chasen.Surface) !void {
         .title = "Fetch, then fast-forward?",
         .backdrop = false,
         .border = .rounded,
-        .title_style = boldRoleStyle(app.theme, .accent),
-        .border_style = roleStyle(app.theme, .accent),
+        .title_style = app.theme.boldStyle(.accent),
+        .border_style = app.theme.style(.accent),
     };
     const frame = ui.Modal.frame(surface, opts) orelse return;
     fillModalDialog(frame);
@@ -1607,16 +805,16 @@ fn viewPullConfirmation(app: anytype, surface: *chasen.Surface) !void {
     const counts = try std.fmt.allocPrint(content.frameAllocator(), "ahead {d} / behind {d}", .{ confirmation.ahead, confirmation.behind });
     const line_count: u16 = 5;
     const start_row: u16 = if (size.height > line_count) (size.height - line_count) / 2 else 0;
-    try drawCenteredText(&content, start_row, target, boldRoleStyle(app.theme, .accent));
+    try drawCenteredText(&content, start_row, target, app.theme.boldStyle(.accent));
     if (start_row + 2 < size.height) {
-        try drawCenteredText(&content, start_row + 2, counts, roleStyle(app.theme, .muted));
+        try drawCenteredText(&content, start_row + 2, counts, app.theme.style(.muted));
     }
     if (start_row + 4 < size.height) {
-        try drawCenteredText(&content, start_row + 4, "Enter: fetch + ff-only    Esc/q: cancel", roleStyle(app.theme, .accent));
+        try drawCenteredText(&content, start_row + 4, "Enter: fetch + ff-only    Esc/q: cancel", app.theme.style(.accent));
     }
 }
 
-fn viewBranchSwitchPopup(app: anytype, surface: *chasen.Surface) !void {
+fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
     const state = app.branch_switch;
     if (!state.hasState()) return;
 
@@ -1626,8 +824,8 @@ fn viewBranchSwitchPopup(app: anytype, surface: *chasen.Surface) !void {
         .title = "Switch branch",
         .backdrop = false,
         .border = .rounded,
-        .title_style = boldRoleStyle(app.theme, .accent),
-        .border_style = roleStyle(app.theme, .accent),
+        .title_style = app.theme.boldStyle(.accent),
+        .border_style = app.theme.style(.accent),
     };
     const frame = ui.Modal.frame(surface, opts) orelse return;
     fillModalDialog(frame);
@@ -1637,13 +835,13 @@ fn viewBranchSwitchPopup(app: anytype, surface: *chasen.Surface) !void {
     if (size.height == 0) return;
 
     const subtitle = try std.fmt.allocPrint(content.frameAllocator(), "Current: {s}", .{state.current_branch});
-    try draw.copyClippedTextAt(&content, 0, 0, subtitle, roleStyle(app.theme, .muted));
+    try draw.copyClippedTextAt(&content, 0, 0, subtitle, app.theme.style(.muted));
     if (state.loading) {
-        if (size.height > 2) try draw.copyClippedTextAt(&content, 0, 2, "Loading local branches...", roleStyle(app.theme, .prompt));
+        if (size.height > 2) try draw.copyClippedTextAt(&content, 0, 2, "Loading local branches...", app.theme.style(.prompt));
         return;
     }
     if (state.branches.len == 0) {
-        if (size.height > 2) try draw.copyClippedTextAt(&content, 0, 2, "No local branches", roleStyle(app.theme, .muted));
+        if (size.height > 2) try draw.copyClippedTextAt(&content, 0, 2, "No local branches", app.theme.style(.muted));
         return;
     }
 
@@ -1664,7 +862,7 @@ fn viewBranchSwitchPopup(app: anytype, surface: *chasen.Surface) !void {
 
     if (size.height >= 2) {
         const hint_row = size.height - 1;
-        try draw.copyClippedTextAt(&content, 0, hint_row, "Enter: switch    Esc/q: cancel    j/k: move", roleStyle(app.theme, .accent));
+        try draw.copyClippedTextAt(&content, 0, hint_row, "Enter: switch    Esc/q: cancel    j/k: move", app.theme.style(.accent));
     }
 }
 
@@ -1677,7 +875,7 @@ fn listWindowStart(selected: usize, len: usize, rows: u16) usize {
     return @min(selected -| half, max_start);
 }
 
-fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
+fn viewPushError(app: Context, surface: *chasen.Surface) !void {
     const message = app.push_error_message orelse return;
     const opts = pushErrorModalOptions(surface.size(), message);
 
@@ -1687,8 +885,8 @@ fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
         .title = "Push failed",
         .backdrop = false,
         .border = .rounded,
-        .title_style = boldRoleStyle(app.theme, .danger),
-        .border_style = roleStyle(app.theme, .danger),
+        .title_style = app.theme.boldStyle(.danger),
+        .border_style = app.theme.style(.danger),
     };
     const frame = ui.Modal.frame(surface, opts_with_title) orelse return;
     fillModalDialog(frame);
@@ -1697,7 +895,7 @@ fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
     const size = content.size();
 
     if (size.height > 0) {
-        try draw.copyClippedTextAt(&content, 0, 0, "Git push failed. Details:", boldRoleStyle(app.theme, .danger));
+        try draw.copyClippedTextAt(&content, 0, 0, "Git push failed. Details:", app.theme.boldStyle(.danger));
     }
 
     if (size.height > 4) {
@@ -1717,11 +915,11 @@ fn viewPushError(app: anytype, surface: *chasen.Surface) !void {
             "i: interactive    Enter/Esc/q: close"
         else
             "Enter/Esc/q: close";
-        try draw.copyClippedTextAt(&content, 0, size.height - 1, footer, roleStyle(app.theme, .danger));
+        try draw.copyClippedTextAt(&content, 0, size.height - 1, footer, app.theme.style(.danger));
     }
 }
 
-fn viewPushCredentials(app: anytype, surface: *chasen.Surface) !void {
+fn viewPushCredentials(app: Context, surface: *chasen.Surface) !void {
     const prompt = app.push_credential_prompt orelse return;
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, confirmation_dialog_width),
@@ -1729,8 +927,8 @@ fn viewPushCredentials(app: anytype, surface: *chasen.Surface) !void {
         .title = "Push credentials",
         .backdrop = false,
         .border = .rounded,
-        .title_style = boldRoleStyle(app.theme, .accent),
-        .border_style = roleStyle(app.theme, .accent),
+        .title_style = app.theme.boldStyle(.accent),
+        .border_style = app.theme.style(.accent),
     };
     const frame = ui.Modal.frame(surface, opts) orelse return;
     fillModalDialog(frame);
@@ -1739,21 +937,21 @@ fn viewPushCredentials(app: anytype, surface: *chasen.Surface) !void {
     const size = content.size();
 
     const target = try std.fmt.allocPrint(content.frameAllocator(), "{s} -> {s}/{s}", .{ prompt.target.branch, prompt.target.remote, prompt.target.remote_branch });
-    if (size.height > 0) try draw.copyClippedTextAt(&content, 0, 0, target, boldRoleStyle(app.theme, .accent));
+    if (size.height > 0) try draw.copyClippedTextAt(&content, 0, 0, target, app.theme.boldStyle(.accent));
 
-    const username_style = if (prompt.active_field == .username) boldRoleStyle(app.theme, .accent) else roleStyle(app.theme, .prompt);
-    const password_style = if (prompt.active_field == .password) boldRoleStyle(app.theme, .accent) else roleStyle(app.theme, .prompt);
+    const username_style = if (prompt.active_field == .username) app.theme.boldStyle(.accent) else app.theme.style(.prompt);
+    const password_style = if (prompt.active_field == .password) app.theme.boldStyle(.accent) else app.theme.style(.prompt);
     if (size.height > 3) {
-        try draw.copyClippedTextAt(&content, 0, 3, "Username:", roleStyle(app.theme, .muted));
+        try draw.copyClippedTextAt(&content, 0, 3, "Username:", app.theme.style(.muted));
         try draw.copyClippedTextAt(&content, 11, 3, prompt.username.secret(), username_style);
     }
     if (size.height > 5) {
         const masked = try maskedSecret(content.frameAllocator(), prompt.password.len);
-        try draw.copyClippedTextAt(&content, 0, 5, "Token:", roleStyle(app.theme, .muted));
+        try draw.copyClippedTextAt(&content, 0, 5, "Token:", app.theme.style(.muted));
         try draw.copyClippedTextAt(&content, 11, 5, masked, password_style);
     }
     if (size.height > 0) {
-        try draw.copyClippedTextAt(&content, 0, size.height - 1, "Tab: field    Enter: submit    Esc: cancel", roleStyle(app.theme, .accent));
+        try draw.copyClippedTextAt(&content, 0, size.height - 1, "Tab: field    Enter: submit    Esc: cancel", app.theme.style(.accent));
     }
 }
 
@@ -1927,34 +1125,7 @@ fn drawCommitInputLine(surface: *chasen.Surface, col: u16, row: u16, text: []con
 }
 
 fn inputVisibleSlice(text: []const u8, cursor: usize, width: u16) []const u8 {
-    return text[inputVisibleStart(text, cursor, width)..];
-}
-
-fn inputVisibleStart(text: []const u8, cursor: usize, width: u16) usize {
-    const clamped_cursor = @min(cursor, text.len);
-    if (width == 0 or text.len == 0) return clamped_cursor;
-
-    const max_width_before_cursor = width - 1;
-    var iter = chasen.text.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        if (grapheme.start > clamped_cursor) break;
-        if (chasen.text.displayWidth(text[grapheme.start..clamped_cursor]) <= max_width_before_cursor) {
-            return grapheme.start;
-        }
-    }
-    return clamped_cursor;
-}
-
-fn showInputCursor(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, cursor: usize) void {
-    const size = surface.size();
-    if (col >= size.width or row >= size.height) return;
-
-    const width = size.width - col;
-    const clamped_cursor = @min(cursor, text.len);
-    const visible_start = inputVisibleStart(text, clamped_cursor, width);
-    const text_width = chasen.text.displayWidth(text[visible_start..clamped_cursor]);
-    const cursor_col = @min(size.width - 1, col +| text_width);
-    surface.showCursor(cursor_col, row);
+    return text[view_primitives.inputVisibleStart(text, cursor, width)..];
 }
 
 fn showBodyInputCursor(surface: *chasen.Surface, body: *const app_commit_panel.BodyText) void {
@@ -1968,7 +1139,7 @@ fn showBodyInputCursor(surface: *chasen.Surface, body: *const app_commit_panel.B
     const visible_line_index = bodyActiveLineIndex(body, start_line, text_rows) orelse return;
 
     const line = body.lineAt(start_line + visible_line_index) orelse "";
-    showInputCursor(surface, 0, @intCast(visible_line_index), line, body.cursorLinePrefix().len);
+    view_primitives.showInputCursor(surface, 0, @intCast(visible_line_index), line, body.cursorLinePrefix().len);
 }
 
 fn bodyVisibleStartLine(body: *const app_commit_panel.BodyText, text_rows: u16) u16 {
@@ -1995,9 +1166,9 @@ fn stagedSummaryText(allocator: std.mem.Allocator, summary: app_commit_panel.Sta
     };
 }
 
-fn footerItems(app: anytype, storage: *[4]ui.key_hint.Item, key_buffers: *[4][16]u8) []const ui.key_hint.Item {
+fn footerItems(app: Context, storage: *[4]ui.key_hint.Item, key_buffers: *[4][16]u8) []const ui.key_hint.Item {
     var len: usize = 0;
-    if (app.pages.review.viewer.sidebar_hidden) {
+    if (app.review.footer().sidebar_hidden) {
         appendFooterItem(app, storage, key_buffers, &len, .toggle_sidebar, "sidebar");
     } else {
         storage[len] = ui.key_hint.item("Tab", "focus");
@@ -2011,7 +1182,7 @@ fn footerItems(app: anytype, storage: *[4]ui.key_hint.Item, key_buffers: *[4][16
 }
 
 fn appendFooterItem(
-    app: anytype,
+    app: Context,
     storage: *[4]ui.key_hint.Item,
     key_buffers: *[4][16]u8,
     len: *usize,
@@ -2023,7 +1194,7 @@ fn appendFooterItem(
     len.* += 1;
 }
 
-fn viewHelpPopup(app: anytype, surface: *chasen.Surface) !void {
+fn viewHelpPopup(app: Context, surface: *chasen.Surface) !void {
     const opts = helpModalOptions(surface.size(), app.theme);
     const frame = ui.Modal.frame(surface, opts) orelse return;
     fillModalDialog(frame);
@@ -2099,7 +1270,7 @@ fn helpModalOptions(size: chasen.Size, palette: theme.Palette) ui.Modal.ViewOpti
         .title = "Shortcuts",
         .backdrop = false,
         .border = .rounded,
-        .title_style = boldRoleStyle(palette, .accent),
+        .title_style = palette.boldStyle(.accent),
     };
 }
 
@@ -2165,7 +1336,7 @@ fn rowsForSections(sections: []const HelpSection) usize {
     return rows;
 }
 
-fn drawHelpSections(app: anytype, surface: *chasen.Surface, sections: []const HelpSection, scroll: usize) !void {
+fn drawHelpSections(app: Context, surface: *chasen.Surface, sections: []const HelpSection, scroll: usize) !void {
     const height: usize = surface.size().height;
     var source_row: usize = 0;
     var drawn_rows: usize = 0;
@@ -2196,7 +1367,7 @@ const HelpLineKind = enum {
 };
 
 fn drawHelpLine(
-    app: anytype,
+    app: Context,
     surface: *chasen.Surface,
     scroll: usize,
     source_row: usize,
@@ -2211,14 +1382,14 @@ fn drawHelpLine(
 
     const row: u16 = @intCast(row_offset);
     switch (kind) {
-        .section_title => try draw.copyClippedTextAt(surface, 0, row, first, boldRoleStyle(app.theme, .prompt)),
+        .section_title => try draw.copyClippedTextAt(surface, 0, row, first, app.theme.boldStyle(.prompt)),
         .item => try drawHelpItem(app, surface, row, item),
         .blank => {},
     }
     drawn_rows.* = row_offset + 1;
 }
 
-fn drawHelpItem(app: anytype, surface: *chasen.Surface, row: u16, item: HelpItem) !void {
+fn drawHelpItem(app: Context, surface: *chasen.Surface, row: u16, item: HelpItem) !void {
     if (surface.size().width == 0) return;
     const key_width: u16 = @min(12, surface.size().width);
     var key_buffer: [16]u8 = undefined;
@@ -2248,122 +1419,7 @@ fn drawHelpScrollIndicator(surface: *chasen.Surface, scroll: usize, visible_rows
     const clipped = chasen.text.clipToWidth(text, surface.size().width);
     const text_width = chasen.text.displayWidth(clipped);
     const col: u16 = if (surface.size().width > text_width) surface.size().width - text_width else 0;
-    _ = try surface.copyTextAt(col, surface.size().height - 1, clipped, roleStyle(palette, .muted));
-}
-
-pub fn drawSearchMatchMarker(app: anytype, surface: *chasen.Surface) void {
-    const match_offset = app.pages.review.search.match_offset orelse return;
-    if (match_offset < app.pages.review.viewer.diff_scroll) return;
-
-    const visible_offset = match_offset - app.pages.review.viewer.diff_scroll;
-    const body_rows = diff_render.visibleBodyRows(surface.size().height);
-    if (visible_offset >= body_rows) return;
-
-    const row: u16 = @intCast(diff_body_start_row + visible_offset);
-    _ = surface.borrowTextAt(0, row, "»", .{ .bold = true, .reverse = true, .fg = roleColor(app.theme, .prompt) });
-}
-
-fn diffContentSurface(surface: *chasen.Surface) chasen.Surface {
-    const size = surface.size();
-    if (size.width <= search_marker_gutter_width) {
-        return surface.child(.{ .col = 0, .row = 0, .width = size.width, .height = size.height });
-    }
-    return surface.child(.{
-        .col = search_marker_gutter_width,
-        .row = 0,
-        .width = size.width - search_marker_gutter_width,
-        .height = size.height,
-    });
-}
-
-pub fn contentWidth(width: u16) u16 {
-    return if (width > search_marker_gutter_width) width - search_marker_gutter_width else width;
-}
-
-fn statusStyle(row: sidebar_view_model.Row, status: file_tree.Status, pane_active: bool, palette: theme.Palette) chasen.TextStyle {
-    const fg: chasen.Color = switch (row.stage_presence) {
-        .staged_only => roleColor(palette, .staged),
-        .mixed => roleColor(palette, .prompt),
-        .conflict => roleColor(palette, .danger),
-        else => switch (status) {
-            .modified => roleColor(palette, .prompt),
-            .added => roleColor(palette, .success),
-            .deleted => roleColor(palette, .danger),
-            .renamed => roleColor(palette, .accent),
-            .binary => roleColor(palette, .binary),
-        },
-    };
-    return .{ .fg = fg, .bold = true, .dim = !pane_active, .reverse = pane_active and row.selected };
-}
-
-fn reviewedStyle(selected: bool, pane_active: bool, palette: theme.Palette) chasen.TextStyle {
-    return .{ .fg = roleColor(palette, .success), .bold = true, .dim = !pane_active, .reverse = pane_active and selected };
-}
-
-fn modeBadgeStyle(selected: bool, pane_active: bool, palette: theme.Palette) chasen.TextStyle {
-    return .{ .fg = roleColor(palette, .info), .bold = true, .dim = !pane_active, .reverse = pane_active and selected };
-}
-
-fn paneTitleStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
-    return if (active)
-        boldRoleStyle(palette, .accent)
-    else
-        .{ .bold = true, .fg = roleColor(palette, .muted), .dim = true };
-}
-
-fn paneSearchStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
-    return if (active)
-        boldRoleStyle(palette, .prompt)
-    else
-        roleStyle(palette, .prompt);
-}
-
-fn paneBranchStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
-    return if (active)
-        roleStyle(palette, .info)
-    else
-        .{ .fg = roleColor(palette, .info), .dim = true };
-}
-
-fn paneHeaderRuleStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
-    return if (active)
-        .{ .dim = true }
-    else
-        .{ .fg = roleColor(palette, .muted), .dim = true };
-}
-
-fn shellSeparatorStyle() chasen.TextStyle {
-    return .{ .dim = true };
-}
-
-fn paneTitleText(label: []const u8, active: bool) []const u8 {
-    if (std.mem.eql(u8, label, "Files")) return " Files";
-    if (!active) return label;
-    if (std.mem.eql(u8, label, "Diff")) return "▸ Diff";
-    return label;
-}
-
-pub fn terminalBodyHeight(terminal_height: u16) u16 {
-    return if (terminal_height > footer_rows) terminal_height - footer_rows else 0;
-}
-
-pub fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
-    return clampSidebarWidth(total_width, preferred_width orelse defaultSidebarWidth(total_width));
-}
-
-pub fn defaultSidebarWidth(total_width: u16) u16 {
-    if (total_width < 50) return @min(total_width, 24);
-    if (total_width < 90) return 28;
-    return 34;
-}
-
-pub fn clampSidebarWidth(total_width: u16, width: u16) u16 {
-    const min_diff_pane_width: u16 = 24;
-    const hard_max_width: u16 = 48;
-    const max_available = if (total_width > min_diff_pane_width + 1) total_width - min_diff_pane_width - 1 else total_width;
-    const max_width = @min(hard_max_width, max_available);
-    const min_width = @min(@as(u16, 18), max_width);
-    return @min(@max(width, min_width), max_width);
+    _ = try surface.copyTextAt(col, surface.size().height - 1, clipped, palette.style(.muted));
 }
 
 test "footer segment fit includes left inset" {
@@ -2379,7 +1435,7 @@ test "footer segment fit includes left inset" {
 }
 
 test "footer shows pending spinner with current status label" {
-    var app: FooterSpinnerTestApp = .{};
+    var app: ShellViewTestHarness = .{};
     app.status.set("pushing: main -> origin/main", .{});
     app.actions.pending = .{ .generation = 1, .kind = .push };
     app.git_action_spinner_tick = 1;
@@ -2388,7 +1444,7 @@ test "footer shows pending spinner with current status label" {
     try ts.init(96, 1);
     defer ts.deinit();
 
-    viewFooter(app, &ts.surface);
+    viewFooter(app.context(), &ts.surface);
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
 
@@ -2396,14 +1452,14 @@ test "footer shows pending spinner with current status label" {
 }
 
 test "footer falls back to pending kind when status is empty" {
-    var app: FooterSpinnerTestApp = .{};
+    var app: ShellViewTestHarness = .{};
     app.actions.pending = .{ .generation = 1, .kind = .push };
 
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 1);
     defer ts.deinit();
 
-    viewFooter(app, &ts.surface);
+    viewFooter(app.context(), &ts.surface);
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
 
@@ -2411,69 +1467,92 @@ test "footer falls back to pending kind when status is empty" {
 }
 
 test "footer labels enabled automatic reload as auto" {
-    const app: FooterSpinnerTestApp = .{
-        .pages = .{ .review = .{
-            .auto_reload = .{ .activation = .automatic, .interval_ns = 3 * std.time.ns_per_s },
-        } },
-    };
+    var app: ShellViewTestHarness = .{};
+    app.review.auto_reload = .{ .activation = .automatic, .interval_ns = 3 * std.time.ns_per_s };
 
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 1);
     defer ts.deinit();
 
-    viewFooter(app, &ts.surface);
+    viewFooter(app.context(), &ts.surface);
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
 
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "auto") != null);
 }
 
-const FooterSpinnerTestApp = struct {
-    const Source = enum {
-        unstaged,
-        cached,
-        stdin,
-        pager,
-        patch_file,
-        range,
-        no_index,
-    };
-
-    const FileSearch = struct {
-        const Input = struct {
-            fn slice(_: @This()) []const u8 {
-                return "";
-            }
-        };
-
-        mode: bool = false,
-        input: Input = .{},
-        no_match: bool = false,
-    };
-
-    const Viewer = struct {
-        sidebar_hidden: bool = false,
-    };
-
-    const Config = struct {
-        source: Source = .unstaged,
-    };
-
-    pages: struct {
-        review: struct {
-            file_search: FileSearch = .{},
-            viewer: Viewer = .{},
-            auto_reload: app_auto_reload.State = .{},
-        } = .{},
-    } = .{},
+const ShellViewTestHarness = struct {
+    review: review_page.ReviewPageState = .{},
     keymap: keymap.Effective = .{},
     theme: theme.Palette = .default(),
     terminal_size: chasen.Size = .{ .width = 80, .height = 24 },
-    config: Config = .{},
     status: app_state.StatusMessage = .{},
     actions: app_actions.ActionState = .{},
+    commit_panel: app_commit_panel.State = .{},
+    repo_picker: app_prompt.RepoPickerState = .{},
+    repo_picker_items: app_repo_picker.ItemList = .empty,
+    recent_repos: repo_state.RecentStore = .{},
+    overlay: app_state.OverlayState = .{},
+    repo_state: repo_state.State = .{},
+    branch_switch: app_state.BranchSwitchState = .{},
+    push_confirmation: ?app_state.PushConfirmation = null,
     git_action_spinner_tick: u8 = 0,
+
+    fn context(self: *const ShellViewTestHarness) Context {
+        const navigation: @import("pages/review/navigation.zig").View = .{
+            .page = &self.review,
+            .repo_root = null,
+            .source = .unstaged,
+            .layout = .{ .width = self.terminal_size.width, .height = self.terminal_size.height },
+        };
+        const review = review_view.Context.init(&self.review, navigation, self.theme, self.keymap, "working tree", .unstaged, null, .{});
+        return .{
+            .review = review,
+            .active_page = .review,
+            .page_bar_visible = false,
+            .theme = self.theme,
+            .keymap = self.keymap,
+            .terminal_size = self.terminal_size,
+            .actions = &self.actions,
+            .status = &self.status,
+            .commit_panel = &self.commit_panel,
+            .repo_picker = &self.repo_picker,
+            .repo_picker_discovery = null,
+            .repo_picker_items = &self.repo_picker_items,
+            .recent_repos = &self.recent_repos,
+            .overlay = &self.overlay,
+            .repo_state = &self.repo_state,
+            .discard_confirmation = null,
+            .amend_confirmation = null,
+            .push_confirmation = self.push_confirmation,
+            .pull_confirmation = null,
+            .push_error_message = null,
+            .push_retry_target = null,
+            .push_retry_credentials_available = false,
+            .push_credential_prompt = null,
+            .branch_switch = &self.branch_switch,
+            .git_action_spinner_tick = self.git_action_spinner_tick,
+            .staged_summary = .unavailable,
+        };
+    }
 };
+
+test "page bar and placeholder dispatch remain available behind the visibility gate" {
+    var harness: ShellViewTestHarness = .{};
+    var context = harness.context();
+    context.active_page = .repository;
+    context.page_bar_visible = true;
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 12);
+    defer ts.deinit();
+
+    try viewContent(context, &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository browser is not initialized") != null);
+}
 
 test "shell content size matches panel content surface" {
     var ts: chasen.testing.TestSurface = undefined;
@@ -2481,7 +1560,7 @@ test "shell content size matches panel content surface" {
     defer ts.deinit();
 
     const frame = ui.Panel.frame(&ts.surface, shellFrameOptions(.default()));
-    const expected = shellContentSize(ts.surface.size());
+    const expected = shell_layout.contentSize(ts.surface.size());
     const content = frame.contentSurface();
 
     try std.testing.expectEqual(expected, content.size());
@@ -2491,8 +1570,8 @@ test "shell content size matches panel content surface" {
 test "shell content size falls back to terminal size on small surfaces" {
     const small = chasen.Size{ .width = 29, .height = 20 };
 
-    try std.testing.expect(!shellFrameEnabled(small));
-    try std.testing.expectEqual(small, shellContentSize(small));
+    try std.testing.expect(!shell_layout.frameEnabled(small));
+    try std.testing.expectEqual(small, shell_layout.contentSize(small));
 }
 
 test "help popup uses one column on narrow content" {
@@ -2575,21 +1654,19 @@ test "push confirmation renders ahead behind for upstream push" {
     try ts.init(80, 12);
     defer ts.deinit();
 
-    var app = .{
-        .theme = theme.Palette.default(),
-        .push_confirmation = @as(?app_state.PushConfirmation, .{
-            .mode = .upstream,
-            .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
-            .branch = try std.testing.allocator.dupe(u8, "feature"),
-            .remote = try std.testing.allocator.dupe(u8, "origin"),
-            .remote_branch = try std.testing.allocator.dupe(u8, "feature"),
-            .oid = try std.testing.allocator.dupe(u8, "abc123"),
-            .ahead_behind = .{ .ahead = 2, .behind = 0 },
-        }),
+    var app: ShellViewTestHarness = .{};
+    app.push_confirmation = .{
+        .mode = .upstream,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .branch = try std.testing.allocator.dupe(u8, "feature"),
+        .remote = try std.testing.allocator.dupe(u8, "origin"),
+        .remote_branch = try std.testing.allocator.dupe(u8, "feature"),
+        .oid = try std.testing.allocator.dupe(u8, "abc123"),
+        .ahead_behind = .{ .ahead = 2, .behind = 0 },
     };
     defer app.push_confirmation.?.deinit(std.testing.allocator);
 
-    try viewPushConfirmation(app, &ts.surface);
+    try viewPushConfirmation(app.context(), &ts.surface);
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
 
@@ -2603,21 +1680,19 @@ test "push confirmation renders set-upstream detail without fake ahead behind" {
     try ts.init(80, 12);
     defer ts.deinit();
 
-    var app = .{
-        .theme = theme.Palette.default(),
-        .push_confirmation = @as(?app_state.PushConfirmation, .{
-            .mode = .set_upstream,
-            .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
-            .branch = try std.testing.allocator.dupe(u8, "feature/topic"),
-            .remote = try std.testing.allocator.dupe(u8, "origin"),
-            .remote_branch = try std.testing.allocator.dupe(u8, "feature/topic"),
-            .oid = try std.testing.allocator.dupe(u8, "abc123"),
-            .ahead_behind = null,
-        }),
+    var app: ShellViewTestHarness = .{};
+    app.push_confirmation = .{
+        .mode = .set_upstream,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .branch = try std.testing.allocator.dupe(u8, "feature/topic"),
+        .remote = try std.testing.allocator.dupe(u8, "origin"),
+        .remote_branch = try std.testing.allocator.dupe(u8, "feature/topic"),
+        .oid = try std.testing.allocator.dupe(u8, "abc123"),
+        .ahead_behind = null,
     };
     defer app.push_confirmation.?.deinit(std.testing.allocator);
 
-    try viewPushConfirmation(app, &ts.surface);
+    try viewPushConfirmation(app.context(), &ts.surface);
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
 

@@ -146,6 +146,10 @@ pub const Palette = struct {
         return .{ .fg = self.color(role) };
     }
 
+    pub fn boldStyle(self: Palette, role: Role) chasen.TextStyle {
+        return .{ .bold = true, .fg = self.color(role) };
+    }
+
     fn set(self: *Palette, role: Role, color_value: chasen.Color) void {
         self.colors[roleIndex(role)] = color_value;
     }

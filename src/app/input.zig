@@ -1,8 +1,10 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const keymap = @import("keymap");
+const key_input = @import("key_input.zig");
 const app_prompt = @import("prompt.zig");
 const review_page = @import("pages/review.zig");
+const review_input = @import("pages/review/input.zig");
 
 /// Minimal snapshot needed to translate a terminal key into an App message.
 /// Keeping this small prevents input mapping from depending on full App state.
@@ -25,17 +27,21 @@ pub const KeyContext = struct {
     sidebar_hidden: bool = false,
     review_mode: bool = false,
     keymap: keymap.Effective = .{},
+
+    fn review(self: KeyContext) review_input.Context {
+        return .{
+            .search_mode = self.search_mode,
+            .file_search_mode = self.file_search_mode,
+            .search_query_len = self.search_query_len,
+            .focus = self.focus,
+            .sidebar_hidden = self.sidebar_hidden,
+            .review_mode = self.review_mode,
+            .keymap = self.keymap,
+        };
+    }
 };
 
 const Action = enum {
-    cancel_search,
-    submit_search,
-    search_backspace,
-    search_move_left,
-    search_move_right,
-    cancel_file_search,
-    submit_file_search,
-    file_search_backspace,
     cancel_commit_panel,
     submit_commit_panel,
     assist_commit_message,
@@ -59,32 +65,6 @@ const Action = enum {
     repo_picker_move_next,
     repo_picker_move_left,
     repo_picker_move_right,
-    toggle_focus,
-    page_diff_up,
-    page_diff_down,
-    select_first_file,
-    select_last_file,
-    clear_search,
-    toggle_directory,
-    toggle_hunk_fold,
-    expand_directory,
-    collapse_or_parent_directory,
-    scroll_diff_right,
-    scroll_diff_left,
-    scroll_sidebar_right,
-    scroll_sidebar_left,
-    scroll_diff_up,
-    select_previous_file,
-    scroll_diff_down,
-    select_next_file,
-    enter_search,
-    select_next_search_match,
-    select_next_hunk,
-    select_previous_search_match,
-    select_previous_hunk,
-    enter_file_search,
-    enter_repo_picker,
-    open_help,
     close_help,
     help_scroll_up,
     help_scroll_down,
@@ -101,33 +81,15 @@ const Action = enum {
     push_credential_backspace,
     push_credential_move_left,
     push_credential_move_right,
-    cycle_changed_file_filter,
-    toggle_reviewed_file,
-    toggle_hide_reviewed_files,
-    toggle_sidebar_visibility,
-    decrease_sidebar_width,
-    increase_sidebar_width,
     enter_commit_panel,
-    enter_amend_panel,
-    toggle_selected_file,
-    toggle_selected_hunk,
-    stage_selected_file,
-    stage_selected_hunk,
-    unstage_selected_file,
-    unstage_selected_hunk,
-    request_discard_selected_file,
     confirm_discard_file,
     cancel_discard_file,
     confirm_amend,
     cancel_amend,
-    request_push,
     confirm_push,
     cancel_push,
-    request_pull,
     confirm_pull,
     cancel_pull,
-    request_fetch,
-    request_branch_switch,
     branch_switch_move_previous,
     branch_switch_move_next,
     confirm_branch_switch,
@@ -135,16 +97,6 @@ const Action = enum {
     close_push_error,
     open_push_credentials,
     run_interactive_push,
-    open_selected_file_in_editor,
-    toggle_display_mode,
-    toggle_line_numbers,
-    copy_current_line,
-    copy_current_hunk,
-    finish_review_approved,
-    finish_review_needs_changes,
-    finish_review_canceled,
-    quit,
-    reload,
 };
 
 pub fn eventToMsg(comptime Msg: type, context: KeyContext, event: chasen.Event) ?Msg {
@@ -161,18 +113,23 @@ pub fn eventToMsg(comptime Msg: type, context: KeyContext, event: chasen.Event) 
 
 fn pasteToMsg(comptime Msg: type, context: KeyContext, text: []const u8) ?Msg {
     if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
-    if (context.search_mode) return payloadMsg(Msg, "search_paste", text);
-    if (context.file_search_mode) return payloadMsg(Msg, "file_search_paste", text);
+    if (context.search_mode or context.file_search_mode) {
+        const review_msg = review_input.pasteToMsg(context.review(), text) orelse return null;
+        return translateReviewMsg(Msg, review_msg);
+    }
     if (context.repo_picker_mode) return payloadMsg(Msg, "repo_picker_paste", text);
     if (context.push_credential_mode) return payloadMsg(Msg, "push_credential_paste", text);
     if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
     if (context.commit_panel_mode) return payloadMsg(Msg, "commit_panel_paste", text);
-    return null;
+    const review_msg = review_input.pasteToMsg(context.review(), text) orelse return null;
+    return translateReviewMsg(Msg, review_msg);
 }
 
 pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
-    if (context.search_mode) return searchKeyToMsg(Msg, key);
-    if (context.file_search_mode) return fileSearchKeyToMsg(Msg, key);
+    if (context.search_mode or context.file_search_mode) {
+        const review_msg = review_input.keyToMsg(context.review(), key) orelse return null;
+        return translateReviewMsg(Msg, review_msg);
+    }
     if (context.repo_picker_mode) return repoPickerKeyToMsg(Msg, context, key);
     if (context.help_mode) return helpKeyToMsg(Msg, context, key);
     if (context.discard_confirmation_mode) return discardConfirmationKeyToMsg(Msg, key);
@@ -183,25 +140,14 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.push_error_mode) return pushErrorKeyToMsg(Msg, key);
     if (context.push_credential_mode) return pushCredentialKeyToMsg(Msg, key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(Msg, key);
-    return viewerKeyToMsg(Msg, context, key);
+    const review_msg = review_input.keyToMsg(context.review(), key) orelse return null;
+    return translateReviewMsg(Msg, review_msg);
 }
 
-fn searchKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .cancel_search);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .submit_search);
-    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .search_backspace);
-    if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .search_move_left);
-    if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .search_move_right);
-    if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "search_insert", codepoint);
-    return null;
-}
-
-fn fileSearchKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .cancel_file_search);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .submit_file_search);
-    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .file_search_backspace);
-    if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "file_search_insert", codepoint);
-    return null;
+fn translateReviewMsg(comptime Msg: type, msg: review_input.Msg) Msg {
+    return switch (msg) {
+        inline else => |payload, tag| @unionInit(Msg, @tagName(tag), payload),
+    };
 }
 
 fn repoPickerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
@@ -210,11 +156,11 @@ fn repoPickerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) 
 
     switch (context.repo_picker_input_mode) {
         .list => {
-            if (key.codepoint == 'q' and !hasCommandModifier(key)) return actionToMsg(Msg, .close_repo_picker);
-            if (key.codepoint == '/' and !hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_enter_filter_input);
-            if (key.codepoint == 'p' and !hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_enter_path_input);
-            if (key.codepoint == 'b' and !hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_back);
-            if (key.codepoint == 'd' and !hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_remove_recent);
+            if (key.codepoint == 'q' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .close_repo_picker);
+            if (key.codepoint == '/' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_enter_filter_input);
+            if (key.codepoint == 'p' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_enter_path_input);
+            if (key.codepoint == 'b' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_back);
+            if (key.codepoint == 'd' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_remove_recent);
             if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .repo_picker_move_previous);
             if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .repo_picker_move_next);
         },
@@ -224,14 +170,14 @@ fn repoPickerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) 
             if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .repo_picker_move_right);
             if (key.matches(chasen.Key.up, .{})) return actionToMsg(Msg, .repo_picker_move_previous);
             if (key.matches(chasen.Key.down, .{})) return actionToMsg(Msg, .repo_picker_move_next);
-            if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
+            if (key_input.textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
         },
         .path_input => {
             if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .repo_picker_backspace);
             if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .repo_picker_move_left);
             if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .repo_picker_move_right);
             if (key.matches(chasen.Key.up, .{}) or key.matches(chasen.Key.down, .{})) return null;
-            if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
+            if (key_input.textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
         },
     }
     return null;
@@ -282,9 +228,9 @@ fn branchSwitchKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
 
 fn pushErrorKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .close_push_error);
-    if (key.codepoint == 'c' and !hasCommandModifier(key)) return actionToMsg(Msg, .open_push_credentials);
-    if (key.codepoint == 'i' and !hasCommandModifier(key)) return actionToMsg(Msg, .run_interactive_push);
-    if (key.codepoint == 'y' and !hasCommandModifier(key)) return actionToMsg(Msg, .copy_popup);
+    if (key.codepoint == 'c' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .open_push_credentials);
+    if (key.codepoint == 'i' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .run_interactive_push);
+    if (key.codepoint == 'y' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .copy_popup);
     if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .push_error_scroll_up);
     if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .push_error_scroll_down);
     if (key.matches(chasen.Key.page_up, .{})) return actionToMsg(Msg, .push_error_page_up);
@@ -299,7 +245,7 @@ fn pushCredentialKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .push_credential_backspace);
     if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .push_credential_move_left);
     if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .push_credential_move_right);
-    if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "push_credential_insert", codepoint);
+    if (key_input.textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "push_credential_insert", codepoint);
     return null;
 }
 
@@ -315,49 +261,8 @@ fn commitPanelKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .commit_panel_move_right);
     if (key.matches(chasen.Key.up, .{})) return actionToMsg(Msg, .commit_panel_move_up);
     if (key.matches(chasen.Key.down, .{})) return actionToMsg(Msg, .commit_panel_move_down);
-    if (textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "commit_panel_insert", codepoint);
+    if (key_input.textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "commit_panel_insert", codepoint);
     return null;
-}
-
-fn viewerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.tab, .{}) and !context.sidebar_hidden) return actionToMsg(Msg, .toggle_focus);
-    if (key.matches(chasen.Key.escape, .{}) and context.search_query_len > 0) return actionToMsg(Msg, .clear_search);
-    if (context.focus == .sidebar and key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .toggle_directory);
-    if (context.focus == .diff and key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .toggle_hunk_fold);
-    if (context.focus == .sidebar and key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .expand_directory);
-    if (context.focus == .sidebar and key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .collapse_or_parent_directory);
-    if (context.focus == .diff and key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .scroll_diff_right);
-    if (context.focus == .diff and key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .scroll_diff_left);
-    if (context.focus == .sidebar and key.matches('h', .{})) return actionToMsg(Msg, .scroll_sidebar_left);
-    if (context.focus == .sidebar and key.matches('l', .{})) return actionToMsg(Msg, .scroll_sidebar_right);
-    if (key.matches(chasen.Key.home, .{})) return actionToMsg(Msg, .select_first_file);
-    if (key.matches(chasen.Key.end, .{})) return actionToMsg(Msg, .select_last_file);
-
-    if (viewerActionForStaticKey(context.keymap, key)) |action| return actionToMsg(Msg, action);
-
-    if (matchesShiftedAscii(key, 'j', 'J')) {
-        return if (context.focus == .diff) actionToMsg(Msg, .select_next_hunk) else null;
-    }
-    if (matchesShiftedAscii(key, 'k', 'K')) {
-        return if (context.focus == .diff) actionToMsg(Msg, .select_previous_hunk) else null;
-    }
-    if (matchesShiftedAscii(key, 'n', 'N')) {
-        if (context.search_query_len > 0) return actionToMsg(Msg, .select_previous_search_match);
-        return if (context.review_mode) actionToMsg(Msg, .finish_review_needs_changes) else null;
-    }
-    if (matchesShiftedAscii(key, 's', 'S')) return null;
-    if (context.review_mode and key.matches('a', .{})) return actionToMsg(Msg, .finish_review_approved);
-    if (hasCommandModifier(key)) return null;
-
-    return switch (key.codepoint) {
-        'k', chasen.Key.up => if (context.focus == .diff) actionToMsg(Msg, .scroll_diff_up) else actionToMsg(Msg, .select_previous_file),
-        'j', chasen.Key.down => if (context.focus == .diff) actionToMsg(Msg, .scroll_diff_down) else actionToMsg(Msg, .select_next_file),
-        'n' => if (context.search_query_len > 0) actionToMsg(Msg, .select_next_search_match) else actionToMsg(Msg, .select_next_hunk),
-        'p' => if (context.search_query_len > 0) actionToMsg(Msg, .select_previous_search_match) else actionToMsg(Msg, .select_previous_hunk),
-        's' => if (context.focus == .diff) actionToMsg(Msg, .toggle_selected_hunk) else actionToMsg(Msg, .toggle_selected_file),
-        'q' => if (context.review_mode) actionToMsg(Msg, .finish_review_canceled) else actionToMsg(Msg, .quit),
-        else => null,
-    };
 }
 
 const KeyMatcher = union(enum) {
@@ -370,9 +275,9 @@ const KeyMatcher = union(enum) {
 
     fn matches(self: KeyMatcher, key: chasen.Key) bool {
         return switch (self) {
-            .plain_codepoint => |codepoint| !hasCommandModifier(key) and key.codepoint == codepoint,
+            .plain_codepoint => |codepoint| !key_input.hasCommandModifier(key) and key.codepoint == codepoint,
             .exact => |codepoint| key.matches(codepoint, .{}),
-            .shifted_ascii => |ascii| matchesShiftedAscii(key, ascii.lower, ascii.upper),
+            .shifted_ascii => |ascii| key_input.matchesShiftedAscii(key, ascii.lower, ascii.upper),
         };
     }
 };
@@ -393,14 +298,6 @@ const help_bindings = [_]KeyBinding{
     .{ .matcher = .{ .plain_codepoint = 'j' }, .action = .help_scroll_down },
 };
 
-// Static configurable bindings are safe to evaluate without focus/search state.
-// Context-dependent keys (s/S, n/N, q, Tab, Esc, Enter, arrows) stay in
-// viewerKeyToMsg and are deliberately not exposed by the first keymap slice.
-fn viewerActionForStaticKey(effective: keymap.Effective, key: chasen.Key) ?Action {
-    const public_action = effective.actionForKey(key) orelse return null;
-    return publicActionToAction(public_action);
-}
-
 fn helpActionForKey(key: chasen.Key) ?Action {
     return actionForKey(&help_bindings, key);
 }
@@ -412,96 +309,8 @@ fn actionForKey(bindings: []const KeyBinding, key: chasen.Key) ?Action {
     return null;
 }
 
-fn publicActionToAction(action: keymap.PublicAction) Action {
-    return switch (action) {
-        .help => .open_help,
-        .reload => .reload,
-        .search => .enter_search,
-        .file_search => .enter_file_search,
-        .repo_picker => .enter_repo_picker,
-        .open_editor => .open_selected_file_in_editor,
-        .commit => .enter_commit_panel,
-        .amend => .enter_amend_panel,
-        .push => .request_push,
-        .pull => .request_pull,
-        .fetch => .request_fetch,
-        .branch_switch => .request_branch_switch,
-        .discard => .request_discard_selected_file,
-        .toggle_display_mode => .toggle_display_mode,
-        .toggle_line_numbers => .toggle_line_numbers,
-        .toggle_sidebar => .toggle_sidebar_visibility,
-        .decrease_sidebar_width => .decrease_sidebar_width,
-        .increase_sidebar_width => .increase_sidebar_width,
-        .changed_file_filter => .cycle_changed_file_filter,
-        .mark_reviewed => .toggle_reviewed_file,
-        .hide_reviewed => .toggle_hide_reviewed_files,
-        .first_file => .select_first_file,
-        .last_file => .select_last_file,
-        .page_up => .page_diff_up,
-        .page_down => .page_diff_down,
-        .copy_current_line => .copy_current_line,
-        .copy_current_hunk => .copy_current_hunk,
-    };
-}
-
-/// Match an ASCII Shift-letter command across terminals that report either
-/// uppercase codepoints or lowercase codepoints with the shift modifier set.
-fn matchesShiftedAscii(key: chasen.Key, lower: u21, upper: u21) bool {
-    if (hasCommandModifier(key)) return false;
-    return key.matches(upper, .{}) or (key.codepoint == lower and key.mods.shift);
-}
-
-fn hasCommandModifier(key: chasen.Key) bool {
-    return key.mods.ctrl or key.mods.alt or key.mods.super or key.mods.hyper or key.mods.meta;
-}
-
-fn textInputCodepoint(key: chasen.Key) ?u21 {
-    if (key.isModifier()) return null;
-    if (hasCommandModifier(key)) return null;
-    if (keyTextCodepoint(key)) |codepoint| return codepoint;
-    if (key.mods.shift) {
-        if (key.shifted_codepoint) |codepoint| {
-            if (isPrintableCodepoint(codepoint)) return codepoint;
-        }
-    }
-    if (key.codepoint == chasen.Key.multicodepoint) return null;
-    if (isVaxisSpecialCodepoint(key.codepoint)) return null;
-    if (!isPrintableCodepoint(key.codepoint)) return null;
-    return key.codepoint;
-}
-
-fn keyTextCodepoint(key: chasen.Key) ?u21 {
-    const text = key.text orelse return null;
-    if (text.len == 0) return null;
-
-    const len = std.unicode.utf8ByteSequenceLength(text[0]) catch return null;
-    if (len != text.len) return null;
-
-    const codepoint = std.unicode.utf8Decode(text) catch return null;
-    if (!isPrintableCodepoint(codepoint)) return null;
-    return codepoint;
-}
-
-// Vaxis encodes non-text special keys in this private-use range. Treat them as
-// non-text unless the event also carries printable key.text.
-fn isVaxisSpecialCodepoint(codepoint: u21) bool {
-    return codepoint >= chasen.Key.insert and codepoint <= chasen.Key.iso_level_5_shift;
-}
-
-fn isPrintableCodepoint(codepoint: u21) bool {
-    return codepoint >= 0x20 and codepoint != 0x7f and !(codepoint >= 0x80 and codepoint <= 0x9f);
-}
-
 fn actionToMsg(comptime Msg: type, action: Action) Msg {
     return switch (action) {
-        .cancel_search => voidMsg(Msg, "cancel_search"),
-        .submit_search => voidMsg(Msg, "submit_search"),
-        .search_backspace => voidMsg(Msg, "search_backspace"),
-        .search_move_left => voidMsg(Msg, "search_move_left"),
-        .search_move_right => voidMsg(Msg, "search_move_right"),
-        .cancel_file_search => voidMsg(Msg, "cancel_file_search"),
-        .submit_file_search => voidMsg(Msg, "submit_file_search"),
-        .file_search_backspace => voidMsg(Msg, "file_search_backspace"),
         .cancel_commit_panel => voidMsg(Msg, "cancel_commit_panel"),
         .submit_commit_panel => voidMsg(Msg, "submit_commit_panel"),
         .assist_commit_message => voidMsg(Msg, "assist_commit_message"),
@@ -525,32 +334,6 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .repo_picker_move_next => voidMsg(Msg, "repo_picker_move_next"),
         .repo_picker_move_left => voidMsg(Msg, "repo_picker_move_left"),
         .repo_picker_move_right => voidMsg(Msg, "repo_picker_move_right"),
-        .toggle_focus => voidMsg(Msg, "toggle_focus"),
-        .page_diff_up => voidMsg(Msg, "page_diff_up"),
-        .page_diff_down => voidMsg(Msg, "page_diff_down"),
-        .select_first_file => voidMsg(Msg, "select_first_file"),
-        .select_last_file => voidMsg(Msg, "select_last_file"),
-        .clear_search => voidMsg(Msg, "clear_search"),
-        .toggle_directory => voidMsg(Msg, "toggle_directory"),
-        .toggle_hunk_fold => voidMsg(Msg, "toggle_hunk_fold"),
-        .expand_directory => voidMsg(Msg, "expand_directory"),
-        .collapse_or_parent_directory => voidMsg(Msg, "collapse_or_parent_directory"),
-        .scroll_diff_right => voidMsg(Msg, "scroll_diff_right"),
-        .scroll_diff_left => voidMsg(Msg, "scroll_diff_left"),
-        .scroll_sidebar_right => voidMsg(Msg, "scroll_sidebar_right"),
-        .scroll_sidebar_left => voidMsg(Msg, "scroll_sidebar_left"),
-        .scroll_diff_up => voidMsg(Msg, "scroll_diff_up"),
-        .select_previous_file => voidMsg(Msg, "select_previous_file"),
-        .scroll_diff_down => voidMsg(Msg, "scroll_diff_down"),
-        .select_next_file => voidMsg(Msg, "select_next_file"),
-        .enter_search => voidMsg(Msg, "enter_search"),
-        .select_next_search_match => voidMsg(Msg, "select_next_search_match"),
-        .select_next_hunk => voidMsg(Msg, "select_next_hunk"),
-        .select_previous_search_match => voidMsg(Msg, "select_previous_search_match"),
-        .select_previous_hunk => voidMsg(Msg, "select_previous_hunk"),
-        .enter_file_search => voidMsg(Msg, "enter_file_search"),
-        .enter_repo_picker => voidMsg(Msg, "enter_repo_picker"),
-        .open_help => voidMsg(Msg, "open_help"),
         .close_help => voidMsg(Msg, "close_help"),
         .help_scroll_up => voidMsg(Msg, "help_scroll_up"),
         .help_scroll_down => voidMsg(Msg, "help_scroll_down"),
@@ -567,33 +350,15 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .push_credential_backspace => voidMsg(Msg, "push_credential_backspace"),
         .push_credential_move_left => voidMsg(Msg, "push_credential_move_left"),
         .push_credential_move_right => voidMsg(Msg, "push_credential_move_right"),
-        .cycle_changed_file_filter => voidMsg(Msg, "cycle_changed_file_filter"),
-        .toggle_reviewed_file => voidMsg(Msg, "toggle_reviewed_file"),
-        .toggle_hide_reviewed_files => voidMsg(Msg, "toggle_hide_reviewed_files"),
-        .toggle_sidebar_visibility => voidMsg(Msg, "toggle_sidebar_visibility"),
-        .decrease_sidebar_width => voidMsg(Msg, "decrease_sidebar_width"),
-        .increase_sidebar_width => voidMsg(Msg, "increase_sidebar_width"),
         .enter_commit_panel => voidMsg(Msg, "enter_commit_panel"),
-        .enter_amend_panel => voidMsg(Msg, "enter_amend_panel"),
-        .toggle_selected_file => voidMsg(Msg, "toggle_selected_file"),
-        .toggle_selected_hunk => voidMsg(Msg, "toggle_selected_hunk"),
-        .stage_selected_file => voidMsg(Msg, "stage_selected_file"),
-        .stage_selected_hunk => voidMsg(Msg, "stage_selected_hunk"),
-        .unstage_selected_file => voidMsg(Msg, "unstage_selected_file"),
-        .unstage_selected_hunk => voidMsg(Msg, "unstage_selected_hunk"),
-        .request_discard_selected_file => voidMsg(Msg, "request_discard_selected_file"),
         .confirm_discard_file => voidMsg(Msg, "confirm_discard_file"),
         .cancel_discard_file => voidMsg(Msg, "cancel_discard_file"),
         .confirm_amend => voidMsg(Msg, "confirm_amend"),
         .cancel_amend => voidMsg(Msg, "cancel_amend"),
-        .request_push => voidMsg(Msg, "request_push"),
         .confirm_push => voidMsg(Msg, "confirm_push"),
         .cancel_push => voidMsg(Msg, "cancel_push"),
-        .request_pull => voidMsg(Msg, "request_pull"),
         .confirm_pull => voidMsg(Msg, "confirm_pull"),
         .cancel_pull => voidMsg(Msg, "cancel_pull"),
-        .request_fetch => voidMsg(Msg, "request_fetch"),
-        .request_branch_switch => voidMsg(Msg, "request_branch_switch"),
         .branch_switch_move_previous => voidMsg(Msg, "branch_switch_move_previous"),
         .branch_switch_move_next => voidMsg(Msg, "branch_switch_move_next"),
         .confirm_branch_switch => voidMsg(Msg, "confirm_branch_switch"),
@@ -601,16 +366,6 @@ fn actionToMsg(comptime Msg: type, action: Action) Msg {
         .close_push_error => voidMsg(Msg, "close_push_error"),
         .open_push_credentials => voidMsg(Msg, "open_push_credentials"),
         .run_interactive_push => voidMsg(Msg, "run_interactive_push"),
-        .open_selected_file_in_editor => voidMsg(Msg, "open_selected_file_in_editor"),
-        .toggle_display_mode => voidMsg(Msg, "toggle_display_mode"),
-        .toggle_line_numbers => voidMsg(Msg, "toggle_line_numbers"),
-        .copy_current_line => voidMsg(Msg, "copy_current_line"),
-        .copy_current_hunk => voidMsg(Msg, "copy_current_hunk"),
-        .finish_review_approved => voidMsg(Msg, "finish_review_approved"),
-        .finish_review_needs_changes => voidMsg(Msg, "finish_review_needs_changes"),
-        .finish_review_canceled => voidMsg(Msg, "finish_review_canceled"),
-        .quit => voidMsg(Msg, "quit"),
-        .reload => voidMsg(Msg, "reload"),
     };
 }
 
@@ -786,74 +541,9 @@ test "eventToMsg rejects invalid paste and ignores non-input modes" {
     try std.testing.expect(eventToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .paste = "ignored" }) == null);
 }
 
-test "keyToMsg routes text while search is active" {
-    const msg = keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = 'x' }).?;
-    try std.testing.expectEqual(TestMsg{ .search_insert = 'x' }, msg);
-}
-
-test "keyToMsg maps enter by focused pane" {
+test "shell translates Review void and payload messages without changing tags" {
     try std.testing.expectEqual(TestMsg.toggle_directory, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(TestMsg.toggle_hunk_fold, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = chasen.Key.enter }).?);
-}
-
-test "keyToMsg maps left and right by focused pane" {
-    try std.testing.expectEqual(TestMsg.expand_directory, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = chasen.Key.right }).?);
-    try std.testing.expectEqual(TestMsg.collapse_or_parent_directory, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = chasen.Key.left }).?);
-    try std.testing.expectEqual(TestMsg.scroll_diff_right, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = chasen.Key.right }).?);
-    try std.testing.expectEqual(TestMsg.scroll_diff_left, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = chasen.Key.left }).?);
-}
-
-test "keyToMsg maps sidebar h and l to horizontal scroll without stealing shifted toggles" {
-    try std.testing.expectEqual(TestMsg.scroll_sidebar_left, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'h' }).?);
-    try std.testing.expectEqual(TestMsg.scroll_sidebar_right, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'l' }).?);
-    try std.testing.expectEqual(TestMsg.toggle_hide_reviewed_files, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'H' }).?);
-    try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'L' }).?);
-}
-
-test "keyToMsg maps sidebar visibility and suppresses focus toggle while hidden" {
-    try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, .{ .codepoint = 'B' }).?);
-    try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, shiftedAscii('b', 'B')).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .sidebar_hidden = true }, .{ .codepoint = chasen.Key.tab }));
-}
-
-test "keyToMsg maps plain b to branch switch without stealing sidebar toggle" {
-    try std.testing.expectEqual(TestMsg.request_branch_switch, keyToMsg(TestMsg, .{}, .{ .codepoint = 'b' }).?);
-    try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, .{ .codepoint = 'B' }).?);
-    try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, shiftedAscii('b', 'B')).?);
-}
-
-test "keyToMsg maps sidebar width adjustment keys" {
-    try std.testing.expectEqual(TestMsg.decrease_sidebar_width, keyToMsg(TestMsg, .{}, .{ .codepoint = '[' }).?);
-    try std.testing.expectEqual(TestMsg.increase_sidebar_width, keyToMsg(TestMsg, .{}, .{ .codepoint = ']' }).?);
-}
-
-test "keyToMsg maps view option toggles" {
-    try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, .{ .codepoint = 'L' }).?);
-    try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, shiftedAscii('l', 'L')).?);
-}
-
-test "keyToMsg maps copy actions only in viewer mode" {
-    try std.testing.expectEqual(TestMsg.copy_current_line, keyToMsg(TestMsg, .{}, .{ .codepoint = 'y' }).?);
-    try std.testing.expectEqual(TestMsg.copy_current_hunk, keyToMsg(TestMsg, .{}, .{ .codepoint = 'Y' }).?);
-    try std.testing.expectEqual(TestMsg.copy_current_hunk, keyToMsg(TestMsg, .{}, shiftedAscii('y', 'Y')).?);
-    try std.testing.expectEqual(TestMsg{ .search_insert = 'y' }, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = 'y' }).?);
-    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'y' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'y' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'y' }));
-}
-
-test "keyToMsg maps stage action by focused pane" {
-    try std.testing.expectEqual(TestMsg.toggle_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 's' }).?);
-    try std.testing.expectEqual(TestMsg.toggle_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 's' }).?);
-    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'S' }) == null);
-    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 'S' }) == null);
-    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedAscii('s', 'S')) == null);
-    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .diff }, shiftedAscii('s', 'S')) == null);
-    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedLowerOnly('s')) == null);
-    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .diff }, shiftedLowerOnly('s')) == null);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'S', .mods = .{ .ctrl = true } }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'S', .mods = .{ .alt = true } }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 's', .mods = .{ .shift = true, .ctrl = true } }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 's', .mods = .{ .shift = true, .alt = true } }));
+    try std.testing.expectEqual(TestMsg{ .search_insert = 'x' }, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = 'x' }).?);
 }
 
 test "keyToMsg maps discard confirmation flow" {
@@ -892,20 +582,6 @@ test "keyToMsg maps commit panel command and routes panel input" {
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
 }
 
-test "keyToMsg uses configurable viewer bindings" {
-    var config: keymap.Config = .{};
-    config.set(.commit, .{ .plain_codepoint = 'm' });
-    config.set(.help, .{ .plain_codepoint = 'z' });
-    config.set(.fetch, .{ .ctrl = .s });
-    const effective = keymap.Effective.fromConfig(config);
-
-    try std.testing.expectEqual(TestMsg.enter_commit_panel, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'm' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'c' }));
-    try std.testing.expectEqual(TestMsg.open_help, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'z' }).?);
-    try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true, .keymap = effective }, .{ .codepoint = 'z' }).?);
-    try std.testing.expectEqual(TestMsg.request_fetch, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 's', .mods = .{ .ctrl = true } }).?);
-}
-
 test "keyToMsg uses configured keys inside help mode" {
     var config: keymap.Config = .{};
     config.set(.commit, .{ .plain_codepoint = 'm' });
@@ -920,15 +596,6 @@ test "keyToMsg uses configured keys inside help mode" {
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, context, .{ .codepoint = 'c' }));
     try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, context, .{ .codepoint = 'z' }).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, context, .{ .codepoint = '?' }));
-}
-
-test "keyToMsg keeps context-dependent keys outside configurable bindings" {
-    var config: keymap.Config = .{};
-    config.set(.commit, .{ .plain_codepoint = 'm' });
-    const effective = keymap.Effective.fromConfig(config);
-
-    try std.testing.expectEqual(TestMsg.toggle_selected_file, keyToMsg(TestMsg, .{ .focus = .sidebar, .keymap = effective }, .{ .codepoint = 's' }).?);
-    try std.testing.expectEqual(TestMsg.toggle_selected_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .keymap = effective }, .{ .codepoint = 's' }).?);
 }
 
 test "keyToMsg maps amend confirmation flow" {
@@ -1080,16 +747,6 @@ test "keyToMsg maps repo picker recent removal only in list mode" {
     try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'd' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = 'd' }).?);
 }
 
-test "keyToMsg maps search cursor movement" {
-    try std.testing.expectEqual(TestMsg.search_move_left, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = chasen.Key.left }).?);
-    try std.testing.expectEqual(TestMsg.search_move_right, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = chasen.Key.right }).?);
-}
-
-test "keyToMsg ignores modified search cursor movement" {
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = chasen.Key.left, .mods = .{ .ctrl = true } }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = chasen.Key.right, .mods = .{ .ctrl = true } }));
-}
-
 test "keyToMsg ignores ctrl printable in text input modes" {
     const ctrl_c: chasen.Key = .{ .codepoint = 'c', .mods = .{ .ctrl = true } };
 
@@ -1098,20 +755,6 @@ test "keyToMsg ignores ctrl printable in text input modes" {
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .commit_panel_mode = true }, ctrl_c));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, ctrl_c));
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, ctrl_c));
-}
-
-test "keyToMsg ignores command modifiers for static viewer bindings" {
-    const cases = [_]chasen.Key{
-        .{ .codepoint = '/', .mods = .{ .ctrl = true } },
-        .{ .codepoint = 'r', .mods = .{ .ctrl = true } },
-        .{ .codepoint = 'g', .mods = .{ .alt = true } },
-        .{ .codepoint = 'f', .mods = .{ .super = true } },
-        .{ .codepoint = 'e', .mods = .{ .meta = true } },
-    };
-
-    for (cases) |key| {
-        try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, key));
-    }
 }
 
 test "keyToMsg keeps printable text input modes working" {
@@ -1138,94 +781,9 @@ test "keyToMsg prefers generated text for printable text input" {
     try std.testing.expectEqual(TestMsg{ .repo_picker_insert = '1' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, keypad_one).?);
 }
 
-test "keyToMsg uses search query to disambiguate navigation" {
-    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{}, .{ .codepoint = 'n' }).?);
-    try std.testing.expectEqual(TestMsg.select_next_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, .{ .codepoint = 'n' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'N' }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, shiftedAscii('n', 'N')));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, shiftedLowerOnly('n')));
-    try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, .{ .codepoint = 'N' }).?);
-    try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, shiftedAscii('n', 'N')).?);
-    try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .search_query_len = 4 }, shiftedLowerOnly('n')).?);
-}
-
-test "keyToMsg maps review result commands only in review mode" {
-    try std.testing.expectEqual(TestMsg.finish_review_approved, keyToMsg(TestMsg, .{ .review_mode = true }, .{ .codepoint = 'a' }).?);
-    try std.testing.expectEqual(TestMsg.finish_review_needs_changes, keyToMsg(TestMsg, .{ .review_mode = true }, .{ .codepoint = 'N' }).?);
-    try std.testing.expectEqual(TestMsg.finish_review_needs_changes, keyToMsg(TestMsg, .{ .review_mode = true }, shiftedAscii('n', 'N')).?);
-    try std.testing.expectEqual(TestMsg.finish_review_needs_changes, keyToMsg(TestMsg, .{ .review_mode = true }, shiftedLowerOnly('n')).?);
-    try std.testing.expectEqual(TestMsg.finish_review_canceled, keyToMsg(TestMsg, .{ .review_mode = true }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .review_mode = true, .search_query_len = 4 }, .{ .codepoint = 'N' }).?);
-    try std.testing.expectEqual(TestMsg.select_previous_search_match, keyToMsg(TestMsg, .{ .review_mode = true, .search_query_len = 4 }, shiftedAscii('n', 'N')).?);
-    try std.testing.expectEqual(TestMsg.enter_amend_panel, keyToMsg(TestMsg, .{ .review_mode = true }, .{ .codepoint = 'A' }).?);
-
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'a' }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'N' }));
-    try std.testing.expectEqual(TestMsg.quit, keyToMsg(TestMsg, .{}, .{ .codepoint = 'q' }).?);
-}
-
-test "keyToMsg maps dedicated hunk jumps only in diff focus" {
-    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 'J' }).?);
-    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, .{ .codepoint = 'K' }).?);
-    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, shiftedAscii('j', 'J')).?);
-    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, shiftedAscii('k', 'K')).?);
-    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, shiftedLowerOnly('j')).?);
-    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff }, shiftedLowerOnly('k')).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'J' }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, .{ .codepoint = 'K' }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedAscii('j', 'J')));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedAscii('k', 'K')));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedLowerOnly('j')));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .focus = .sidebar }, shiftedLowerOnly('k')));
-}
-
-test "keyToMsg keeps dedicated hunk jumps independent from search query" {
-    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, .{ .codepoint = 'J' }).?);
-    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, .{ .codepoint = 'K' }).?);
-    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, shiftedAscii('j', 'J')).?);
-    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, shiftedAscii('k', 'K')).?);
-    try std.testing.expectEqual(TestMsg.select_next_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, shiftedLowerOnly('j')).?);
-    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{ .focus = .diff, .search_query_len = 4 }, shiftedLowerOnly('k')).?);
-}
-
 test "push credential prompt accepts q as text and uses escape to cancel" {
     try std.testing.expectEqual(TestMsg{ .push_credential_insert = 'q' }, keyToMsg(TestMsg, .{ .push_credential_mode = true }, .{ .codepoint = 'q' }).?);
     try std.testing.expectEqual(TestMsg.push_credential_cancel, keyToMsg(TestMsg, .{ .push_credential_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
-}
-
-test "keyToMsg maps shifted letter commands consistently" {
-    try std.testing.expectEqual(TestMsg.select_last_file, keyToMsg(TestMsg, .{}, .{ .codepoint = 'G' }).?);
-    try std.testing.expectEqual(TestMsg.select_last_file, keyToMsg(TestMsg, .{}, shiftedAscii('g', 'G')).?);
-    try std.testing.expectEqual(TestMsg.select_last_file, keyToMsg(TestMsg, .{}, shiftedLowerOnly('g')).?);
-    try std.testing.expectEqual(TestMsg.select_first_file, keyToMsg(TestMsg, .{}, .{ .codepoint = chasen.Key.home }).?);
-    try std.testing.expectEqual(TestMsg.select_last_file, keyToMsg(TestMsg, .{}, .{ .codepoint = chasen.Key.end }).?);
-    try std.testing.expectEqual(TestMsg.enter_repo_picker, keyToMsg(TestMsg, .{}, .{ .codepoint = 'R' }).?);
-    try std.testing.expectEqual(TestMsg.enter_repo_picker, keyToMsg(TestMsg, .{}, shiftedAscii('r', 'R')).?);
-    try std.testing.expectEqual(TestMsg.enter_repo_picker, keyToMsg(TestMsg, .{}, shiftedLowerOnly('r')).?);
-    try std.testing.expectEqual(TestMsg.cycle_changed_file_filter, keyToMsg(TestMsg, .{}, .{ .codepoint = 'F' }).?);
-    try std.testing.expectEqual(TestMsg.cycle_changed_file_filter, keyToMsg(TestMsg, .{}, shiftedAscii('f', 'F')).?);
-    try std.testing.expectEqual(TestMsg.cycle_changed_file_filter, keyToMsg(TestMsg, .{}, shiftedLowerOnly('f')).?);
-    try std.testing.expectEqual(TestMsg.toggle_hide_reviewed_files, keyToMsg(TestMsg, .{}, .{ .codepoint = 'H' }).?);
-    try std.testing.expectEqual(TestMsg.toggle_hide_reviewed_files, keyToMsg(TestMsg, .{}, shiftedAscii('h', 'H')).?);
-    try std.testing.expectEqual(TestMsg.toggle_hide_reviewed_files, keyToMsg(TestMsg, .{}, shiftedLowerOnly('h')).?);
-    try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{}, .{ .codepoint = 'P' }).?);
-    try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{}, shiftedAscii('p', 'P')).?);
-    try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{}, shiftedLowerOnly('p')).?);
-    try std.testing.expectEqual(TestMsg.request_pull, keyToMsg(TestMsg, .{}, .{ .codepoint = 'U' }).?);
-    try std.testing.expectEqual(TestMsg.request_pull, keyToMsg(TestMsg, .{}, shiftedAscii('u', 'U')).?);
-    try std.testing.expectEqual(TestMsg.request_pull, keyToMsg(TestMsg, .{}, shiftedLowerOnly('u')).?);
-    try std.testing.expectEqual(TestMsg.toggle_sidebar_visibility, keyToMsg(TestMsg, .{}, shiftedLowerOnly('b')).?);
-    try std.testing.expectEqual(TestMsg.toggle_line_numbers, keyToMsg(TestMsg, .{}, shiftedLowerOnly('l')).?);
-}
-
-test "keyToMsg keeps lowercase p as previous hunk while uppercase P pushes" {
-    try std.testing.expectEqual(TestMsg.select_previous_hunk, keyToMsg(TestMsg, .{}, .{ .codepoint = 'p' }).?);
-    try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{}, .{ .codepoint = 'P' }).?);
-}
-
-test "keyToMsg keeps lowercase u as display mode while uppercase U pulls" {
-    try std.testing.expectEqual(TestMsg.toggle_display_mode, keyToMsg(TestMsg, .{}, .{ .codepoint = 'u' }).?);
-    try std.testing.expectEqual(TestMsg.request_pull, keyToMsg(TestMsg, .{}, .{ .codepoint = 'U' }).?);
 }
 
 test "keyToMsg maps push confirmation keys" {
