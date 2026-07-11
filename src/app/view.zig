@@ -180,7 +180,7 @@ pub fn shellContentRect(terminal_size: chasen.Size) chasen.Rect {
 }
 
 fn viewBody(app: anytype, surface: *chasen.Surface) !void {
-    switch (app.load.state) {
+    switch (app.pages.review.load.state) {
         .loaded => |session| return viewLoadedDiff(app, surface, session.loaded),
         .empty => |reason| if (reason == .no_changes) return viewNoChanges(app, surface),
         else => {},
@@ -208,12 +208,12 @@ fn viewNoChanges(app: anytype, surface: *chasen.Surface) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    if (app.viewer.sidebar_hidden) {
+    if (app.pages.review.viewer.sidebar_hidden) {
         drawStateMessage(surface, message, app.theme);
         return;
     }
 
-    const sidebar_width = sidebarWidth(size.width, app.viewer.sidebar_width);
+    const sidebar_width = sidebarWidth(size.width, app.pages.review.viewer.sidebar_width);
     var sidebar = surface.child(.{
         .col = 0,
         .row = 0,
@@ -243,7 +243,7 @@ fn viewEmptySidebarChrome(app: anytype, surface: *chasen.Surface) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    const active = app.viewer.focus == .sidebar;
+    const active = app.pages.review.viewer.focus == .sidebar;
     try drawSidebarDetailRow(app, surface, 0, active);
 
     if (size.height <= 2) return;
@@ -259,7 +259,7 @@ fn viewLoadedDiff(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.Lo
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    if (app.viewer.sidebar_hidden) {
+    if (app.pages.review.viewer.sidebar_hidden) {
         if (loaded.visibleNodeCount() == 0) {
             drawStateMessage(surface, filterEmptyMessage(app), app.theme);
             return;
@@ -268,7 +268,7 @@ fn viewLoadedDiff(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.Lo
         return;
     }
 
-    const sidebar_width = sidebarWidth(size.width, app.viewer.sidebar_width);
+    const sidebar_width = sidebarWidth(size.width, app.pages.review.viewer.sidebar_width);
     var sidebar = surface.child(.{
         .col = 0,
         .row = 0,
@@ -303,7 +303,7 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    const active = app.viewer.focus == .sidebar;
+    const active = app.pages.review.viewer.focus == .sidebar;
     try drawSidebarDetailRow(app, surface, 0, active);
 
     if (size.height <= 2) return;
@@ -322,7 +322,7 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
     const visible_rows: usize = size.height - sidebar_header_rows;
     // Sidebar has no independent scroll state; derive the visible window
     // from the selected row each frame.
-    const range = loaded.sidebarVisibleRange(app.viewer.selected_node, visible_rows);
+    const range = loaded.sidebarVisibleRange(app.pages.review.viewer.selected_node, visible_rows);
     var row: u16 = sidebar_header_rows;
     var visible_index: usize = range.start;
     while (visible_index < range.end) : ({
@@ -334,8 +334,8 @@ pub fn viewSidebar(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.L
             .collapsed = &loaded.collapsed_dirs,
             .reviewed_files = loaded.reviewed_files,
             .visible_nodes = loaded.materializedVisibleNodes(),
-        }, visible_index, app.viewer.selected_node) orelse continue;
-        try drawSidebarRow(surface, row, row_model, app.viewer.focus == .sidebar, app.viewer.sidebar_horizontal_scroll, app.theme);
+        }, visible_index, app.pages.review.viewer.selected_node) orelse continue;
+        try drawSidebarRow(surface, row, row_model, app.pages.review.viewer.focus == .sidebar, app.pages.review.viewer.sidebar_horizontal_scroll, app.theme);
     }
 }
 
@@ -343,17 +343,17 @@ fn drawSidebarDetailRow(app: anytype, surface: *chasen.Surface, row: u16, active
     const size = surface.size();
     if (size.width <= 2 or row >= size.height) return;
 
-    if (app.review_display.hide_reviewed_files and app.review_display.changed_file_filter != .all) {
-        const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{app.review_display.changed_file_filter.label()});
+    if (app.pages.review.review_display.hide_reviewed_files and app.pages.review.review_display.changed_file_filter != .all) {
+        const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{app.pages.review.review_display.changed_file_filter.label()});
         try draw.copyClippedTextAt(surface, 1, row, text, roleStyle(app.theme, .prompt));
         return;
     }
-    if (app.review_display.hide_reviewed_files) {
+    if (app.pages.review.review_display.hide_reviewed_files) {
         try draw.copyClippedTextAt(surface, 1, row, "hiding reviewed", roleStyle(app.theme, .prompt));
         return;
     }
-    if (app.review_display.changed_file_filter != .all) {
-        try draw.copyClippedTextAt(surface, 1, row, app.review_display.changed_file_filter.label(), roleStyle(app.theme, .prompt));
+    if (app.pages.review.review_display.changed_file_filter != .all) {
+        try draw.copyClippedTextAt(surface, 1, row, app.pages.review.review_display.changed_file_filter.label(), roleStyle(app.theme, .prompt));
         return;
     }
 
@@ -483,16 +483,16 @@ pub fn viewDiffPane(app: anytype, surface: *chasen.Surface, loaded: loaded_diff.
     }
 
     var diff_content = diffContentSurface(surface);
-    const mode = diff_render.effectiveMode(diff_render.bodyWidth(diff_content.size().width), app.viewer.display_mode);
-    const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
+    const mode = diff_render.effectiveMode(diff_render.bodyWidth(diff_content.size().width), app.pages.review.viewer.display_mode);
+    const active = app.pages.review.viewer.sidebar_hidden or app.pages.review.viewer.focus == .diff;
     const display = (try app.activeDiffDisplay(surface.frameAllocator(), mode)) orelse return;
     const display_file = display.file();
     try diff_render.renderFile(&diff_content, display_file, .{
-        .requested_mode = app.viewer.display_mode,
-        .scroll = app.viewer.diff_scroll,
-        .horizontal_scroll = app.viewer.diff_horizontal_scroll,
+        .requested_mode = app.pages.review.viewer.display_mode,
+        .scroll = app.pages.review.viewer.diff_scroll,
+        .horizontal_scroll = app.pages.review.viewer.diff_horizontal_scroll,
         .pane_active = active,
-        .line_numbers = app.viewer.view_options.line_numbers,
+        .line_numbers = app.pages.review.viewer.view_options.line_numbers,
         .highlighted_hunk = app.selectedHunkIndex(),
         .cursor_offset = app.visibleDiffCursorOffset(),
         .staged_hunks = display.stagedFlags(),
@@ -513,25 +513,25 @@ fn drawDiffHeaderDetailRow(app: anytype, surface: *chasen.Surface, active: bool)
     if (size.width == 0 or size.height <= 1) return;
 
     surface.clear(.{ .col = 0, .row = 1, .width = size.width, .height = 1 });
-    if (!app.search.mode and app.search.query.len > 0) {
+    if (!app.pages.review.search.mode and app.pages.review.search.query.len > 0) {
         const label_col: u16 = 1;
-        const match_text = if (app.search.match_offset) |offset|
-            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ app.search.query.slice(), offset + 1 }) catch "search"
+        const match_text = if (app.pages.review.search.match_offset) |offset|
+            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ app.pages.review.search.query.slice(), offset + 1 }) catch "search"
         else
-            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{app.search.query.slice()}) catch "search";
+            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{app.pages.review.search.query.slice()}) catch "search";
         draw.copyClippedTextAt(surface, label_col, 1, match_text, paneSearchStyle(active, app.theme)) catch {};
         return;
     }
 
-    if (app.search.mode) {
+    if (app.pages.review.search.mode) {
         const label = "search: ";
         const label_col: u16 = 1;
         const style = paneSearchStyle(active, app.theme);
         draw.copyClippedTextAt(surface, label_col, 1, label, style) catch {};
         if (size.width > label_col + label.len) {
             const input_col: u16 = label_col + @as(u16, @intCast(label.len));
-            drawCommitInputLine(surface, input_col, 1, app.search.input.slice(), app.search.input.cursor, style) catch {};
-            showInputCursor(surface, input_col, 1, app.search.input.slice(), app.search.input.cursor);
+            drawCommitInputLine(surface, input_col, 1, app.pages.review.search.input.slice(), app.pages.review.search.input.cursor, style) catch {};
+            showInputCursor(surface, input_col, 1, app.pages.review.search.input.slice(), app.pages.review.search.input.cursor);
         }
         return;
     }
@@ -540,7 +540,7 @@ fn drawDiffHeaderDetailRow(app: anytype, surface: *chasen.Surface, active: bool)
 }
 
 fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.StatusEntry) !void {
-    const active = app.viewer.sidebar_hidden or app.viewer.focus == .diff;
+    const active = app.pages.review.viewer.sidebar_hidden or app.pages.review.viewer.focus == .diff;
 
     var content = diffContentSurface(surface);
     const path = entry.canonicalPathKey() orelse entry.path;
@@ -548,14 +548,14 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
     if (app.activeCachedDiffProjection()) |bundle| {
         if (bundle.loaded.document.files.len > 0) {
             try diff_render.renderFile(&content, bundle.loaded.document.files[0], .{
-                .requested_mode = app.viewer.display_mode,
-                .scroll = app.viewer.diff_scroll,
-                .horizontal_scroll = app.viewer.diff_horizontal_scroll,
+                .requested_mode = app.pages.review.viewer.display_mode,
+                .scroll = app.pages.review.viewer.diff_scroll,
+                .horizontal_scroll = app.pages.review.viewer.diff_horizontal_scroll,
                 .pane_active = active,
-                .line_numbers = app.viewer.view_options.line_numbers,
+                .line_numbers = app.pages.review.viewer.view_options.line_numbers,
                 .highlighted_hunk = app.selectedHunkIndex(),
                 .cursor_offset = app.visibleDiffCursorOffset(),
-                .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.viewer.display_mode)),
+                .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.pages.review.viewer.display_mode)),
                 .palette = app.theme,
                 .file_index = 0,
                 .syntax_spans = bundle.loaded.syntax_spans,
@@ -568,11 +568,11 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
 
     if (app.activeGeneratedFileProjection()) |bundle| {
         try diff_render.renderGeneratedAddedFile(&content, bundle.file.path, bundle.file.lines, bundle.file.truncated, .{
-            .requested_mode = app.viewer.display_mode,
-            .scroll = app.viewer.diff_scroll,
-            .horizontal_scroll = app.viewer.diff_horizontal_scroll,
+            .requested_mode = app.pages.review.viewer.display_mode,
+            .scroll = app.pages.review.viewer.diff_scroll,
+            .horizontal_scroll = app.pages.review.viewer.diff_horizontal_scroll,
             .pane_active = active,
-            .line_numbers = app.viewer.view_options.line_numbers,
+            .line_numbers = app.pages.review.viewer.view_options.line_numbers,
             .cursor_offset = app.visibleDiffCursorOffset(),
             .palette = app.theme,
             .header_selection = app.diffHeaderSelectionActive(),
@@ -581,7 +581,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
         return;
     }
 
-    switch (app.review_projection.displayed) {
+    switch (app.pages.review.review_projection.displayed) {
         .ready => |ready| {
             switch (ready.value) {
                 .cached_diff, .generated_added_file => {},
@@ -601,7 +601,7 @@ fn viewStatusOnlyPane(app: anytype, surface: *chasen.Surface, entry: git_status.
         .idle => {},
     }
 
-    if (app.review_projection.hasPending()) {
+    if (app.pages.review.review_projection.hasPending()) {
         try drawStatusBody(&content, path, "Loading review projection...", app.selectedStatusLineStats(), active, app.theme);
         drawPaneHeaderRule(surface, active, app.theme);
         return;
@@ -690,7 +690,7 @@ fn statusSuffix(entry: git_status.StatusEntry) []const u8 {
 }
 
 fn viewLoadState(app: anytype, col: *chasen.Column) void {
-    switch (app.load.state) {
+    switch (app.pages.review.load.state) {
         .idle => drawStateMessageColumn(col, .{
             .title = "Waiting to load diff",
             .body = "GitFrame is waiting for a load request.",
@@ -773,11 +773,11 @@ fn noChangesHint(app: anytype, allocator: std.mem.Allocator) []const u8 {
 }
 
 fn filterEmptyMessage(app: anytype) StateMessage {
-    const hint = if (app.review_display.hide_reviewed_files and app.review_display.changed_file_filter != .all)
+    const hint = if (app.pages.review.review_display.hide_reviewed_files and app.pages.review.review_display.changed_file_filter != .all)
         "Press F to change filter, H to show reviewed files, or r to reload."
-    else if (app.review_display.hide_reviewed_files)
+    else if (app.pages.review.review_display.hide_reviewed_files)
         "Press H to show reviewed files or r to reload."
-    else if (app.review_display.changed_file_filter != .all)
+    else if (app.pages.review.review_display.changed_file_filter != .all)
         "Press F to change filter or r to reload."
     else
         "Press r to reload.";
@@ -840,14 +840,14 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
     const width = surface.size().width;
     if (width == 0) return;
 
-    if (app.file_search.mode) {
+    if (app.pages.review.file_search.mode) {
         const label = "file: ";
         const label_col: u16 = 1;
         _ = surface.borrowTextAt(label_col, 0, label, boldRoleStyle(app.theme, .prompt));
         const input_col: u16 = label_col + @as(u16, @intCast(label.len));
-        _ = surface.copyTextAt(input_col, 0, app.file_search.input.slice(), roleStyle(app.theme, .prompt)) catch {};
-        if (app.file_search.no_match) {
-            const col: u16 = @intCast(@min(input_col + chasen.text.displayWidth(app.file_search.input.slice()) + 1, std.math.maxInt(u16)));
+        _ = surface.copyTextAt(input_col, 0, app.pages.review.file_search.input.slice(), roleStyle(app.theme, .prompt)) catch {};
+        if (app.pages.review.file_search.no_match) {
+            const col: u16 = @intCast(@min(input_col + chasen.text.displayWidth(app.pages.review.file_search.input.slice()) + 1, std.math.maxInt(u16)));
             if (surface.size().width > col) _ = surface.borrowTextAt(col, 0, "(no match)", roleStyle(app.theme, .danger));
         }
         return;
@@ -873,7 +873,7 @@ fn viewFooter(app: anytype, surface: *chasen.Surface) void {
         .style = roleStyle(app.theme, .prompt),
         .drop_priority = .source,
     });
-    if (app.auto_reload.enabled()) footer_segments.append(.{
+    if (app.pages.review.auto_reload.enabled()) footer_segments.append(.{
         .text = "auto",
         .style = roleStyle(app.theme, .staged),
         .drop_priority = .auto,
@@ -1009,18 +1009,18 @@ fn pendingActionFallbackLabel(kind: anytype) []const u8 {
 
 fn branchStatusSidebarText(app: anytype, allocator: std.mem.Allocator, available_width: u16) ?[]const u8 {
     const root = app.repo_state.activeRoot() orelse return null;
-    if (app.branch_status_load.pending) |pending| {
-        const has_retained_snapshot = if (app.branch_status.repo_root) |snapshot_root|
+    if (app.pages.review.branch_status_load.pending) |pending| {
+        const has_retained_snapshot = if (app.pages.review.branch_status.repo_root) |snapshot_root|
             std.mem.eql(u8, root, snapshot_root)
         else
             false;
         if (pending.origin == .foreground or !has_retained_snapshot) return "loading branch";
     }
 
-    const snapshot_root = app.branch_status.repo_root orelse return null;
+    const snapshot_root = app.pages.review.branch_status.repo_root orelse return null;
     if (!std.mem.eql(u8, root, snapshot_root)) return null;
 
-    return formatSidebarBranchStatus(allocator, app.branch_status.status, available_width) catch "branch";
+    return formatSidebarBranchStatus(allocator, app.pages.review.branch_status.status, available_width) catch "branch";
 }
 
 fn formatSidebarBranchStatus(allocator: std.mem.Allocator, status: git_branch_status.BranchStatus, available_width: u16) ![]const u8 {
@@ -1123,23 +1123,29 @@ test "branch sidebar retains background snapshot but shows foreground loading" {
 
     var app = struct {
         repo_state: Repo = .{},
-        branch_status: git_branch_status.State,
-        branch_status_load: app_auto_reload.AuxiliaryTracker,
-    }{
-        .branch_status = branch_status,
-        .branch_status_load = .{
-            .generation = 1,
-            .pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 },
-            .freshness = .stale_refresh,
+        pages: struct {
+            review: struct {
+                branch_status: git_branch_status.State,
+                branch_status_load: app_auto_reload.AuxiliaryTracker,
+            },
         },
+    }{
+        .pages = .{ .review = .{
+            .branch_status = branch_status,
+            .branch_status_load = .{
+                .generation = 1,
+                .pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 },
+                .freshness = .stale_refresh,
+            },
+        } },
     };
-    defer app.branch_status.deinit();
+    defer app.pages.review.branch_status.deinit();
 
     const retained = branchStatusSidebarText(&app, std.testing.allocator, 80).?;
     defer std.testing.allocator.free(retained);
     try std.testing.expectEqualStrings("main no upstream", retained);
 
-    app.branch_status_load.pending.?.origin = .foreground;
+    app.pages.review.branch_status_load.pending.?.origin = .foreground;
     try std.testing.expectEqualStrings("loading branch", branchStatusSidebarText(&app, std.testing.allocator, 80).?);
 }
 
@@ -1991,7 +1997,7 @@ fn stagedSummaryText(allocator: std.mem.Allocator, summary: app_commit_panel.Sta
 
 fn footerItems(app: anytype, storage: *[4]ui.key_hint.Item, key_buffers: *[4][16]u8) []const ui.key_hint.Item {
     var len: usize = 0;
-    if (app.viewer.sidebar_hidden) {
+    if (app.pages.review.viewer.sidebar_hidden) {
         appendFooterItem(app, storage, key_buffers, &len, .toggle_sidebar, "sidebar");
     } else {
         storage[len] = ui.key_hint.item("Tab", "focus");
@@ -2246,10 +2252,10 @@ fn drawHelpScrollIndicator(surface: *chasen.Surface, scroll: usize, visible_rows
 }
 
 pub fn drawSearchMatchMarker(app: anytype, surface: *chasen.Surface) void {
-    const match_offset = app.search.match_offset orelse return;
-    if (match_offset < app.viewer.diff_scroll) return;
+    const match_offset = app.pages.review.search.match_offset orelse return;
+    if (match_offset < app.pages.review.viewer.diff_scroll) return;
 
-    const visible_offset = match_offset - app.viewer.diff_scroll;
+    const visible_offset = match_offset - app.pages.review.viewer.diff_scroll;
     const body_rows = diff_render.visibleBodyRows(surface.size().height);
     if (visible_offset >= body_rows) return;
 
@@ -2406,7 +2412,9 @@ test "footer falls back to pending kind when status is empty" {
 
 test "footer labels enabled automatic reload as auto" {
     const app: FooterSpinnerTestApp = .{
-        .auto_reload = .{ .activation = .automatic, .interval_ns = 3 * std.time.ns_per_s },
+        .pages = .{ .review = .{
+            .auto_reload = .{ .activation = .automatic, .interval_ns = 3 * std.time.ns_per_s },
+        } },
     };
 
     var ts: chasen.testing.TestSurface = undefined;
@@ -2451,13 +2459,17 @@ const FooterSpinnerTestApp = struct {
         source: Source = .unstaged,
     };
 
-    file_search: FileSearch = .{},
-    viewer: Viewer = .{},
+    pages: struct {
+        review: struct {
+            file_search: FileSearch = .{},
+            viewer: Viewer = .{},
+            auto_reload: app_auto_reload.State = .{},
+        } = .{},
+    } = .{},
     keymap: keymap.Effective = .{},
     theme: theme.Palette = .default(),
     terminal_size: chasen.Size = .{ .width = 80, .height = 24 },
     config: Config = .{},
-    auto_reload: app_auto_reload.State = .{},
     status: app_state.StatusMessage = .{},
     actions: app_actions.ActionState = .{},
     git_action_spinner_tick: u8 = 0,

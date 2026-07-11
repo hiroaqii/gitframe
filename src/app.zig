@@ -9,6 +9,8 @@ const app_direction = @import("app/direction.zig");
 const app_input = @import("app/input.zig");
 const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
+const page = @import("app/page.zig");
+const review_page = @import("app/pages/review.zig");
 const app_prompt = @import("app/prompt.zig");
 const app_repo_picker = @import("app/repo_picker.zig");
 const app_review_projection = @import("app/review_projection.zig");
@@ -67,7 +69,6 @@ const HunkStageTargetResult = git_ops.HunkStageTargetResult;
 const HunkUnstageTargetResult = git_ops.HunkUnstageTargetResult;
 const HorizontalDirection = app_direction.Horizontal;
 const LoadedSession = app_load_state.LoadedSession;
-const Focus = app_input.Focus;
 const LoadedDiff = loaded_diff.LoadedDiff;
 const LoadRuntimeState = app_load_state.LoadRuntimeState;
 const PendingLoad = app_load_state.PendingLoad;
@@ -109,7 +110,6 @@ const UnstageFileFinished = app_actions.UnstageFileFinished;
 const UnstageHunkFinished = app_actions.UnstageHunkFinished;
 const UnstageTargetResult = git_ops.UnstageTargetResult;
 const VerticalDirection = app_direction.Vertical;
-
 pub const EmptyRemoteActionHints = struct {
     show_repo_picker: bool = false,
     show_pull: bool = false,
@@ -215,90 +215,10 @@ const ActionFinishedMsg = union(enum) {
     editor: chasen.ForegroundCommandResult,
 };
 
-const ViewerState = struct {
-    /// Sticky target shown in the diff pane or used by file actions.
-    ///
-    /// Directory sidebar rows can be selected without changing this value.
-    selected_target: ?context.SelectedTarget = .{ .diff_file = 0 },
-    /// Transitional cache for older tests and helpers. Runtime reads should go
-    /// through selectedFileIndex().
-    /// TODO(phase8): remove after status-only targets replace diff-file-only
-    /// assumptions across the app.
-    selected_file: usize = 0,
-    /// Sidebar cursor. This may point at a directory, diff file, or later a
-    /// status-only row; it is not necessarily the action target.
-    selected_node: usize = 0,
-    focus: Focus = .sidebar,
-    sidebar_hidden: bool = false,
-    sidebar_width: ?u16 = null,
-    sidebar_horizontal_scroll: usize = 0,
-    diff_scroll: usize = 0,
-    diff_horizontal_scroll: usize = 0,
-    diff_cursor: diff_view_model.BodyCoordinate = .{ .metadata = 0 },
-    display_mode: diff_render.DisplayMode = .side_by_side,
-    view_options: ViewOptions = .{},
-};
-
-const ReloadKind = enum {
-    initial,
-    manual,
-    watch,
-    action_result,
-    repo_switch,
-};
-
 const DiffLoadStartOptions = struct {
     clear_visible_state: bool,
-    kind: ReloadKind,
+    kind: review_page.ReloadKind,
     background_cycle_id: ?u64 = null,
-};
-
-const ReloadAnchor = struct {
-    path_key: []u8,
-    selected_target_tag: std.meta.Tag(context.SelectedTarget),
-    visible_sidebar_row: usize,
-    diff_cursor: diff_view_model.BodyCoordinate,
-    diff_cursor_offset: ?usize,
-    diff_scroll: usize,
-    diff_horizontal_scroll: usize,
-    sidebar_horizontal_scroll: usize,
-    search_coordinate: ?diff_view_model.BodyCoordinate,
-
-    fn deinit(self: *ReloadAnchor, allocator: std.mem.Allocator) void {
-        allocator.free(self.path_key);
-        self.* = undefined;
-    }
-};
-
-const PendingReload = struct {
-    generation: u64,
-    kind: ReloadKind,
-    anchor: ?ReloadAnchor = null,
-
-    fn deinit(self: *PendingReload, allocator: std.mem.Allocator) void {
-        if (self.anchor) |*anchor| anchor.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-const PendingDisplayNavigationRestore = struct {
-    repo_root: []u8,
-    source_kind: app_review_projection.SourceKind,
-    source_session_revision: u64,
-    original: ReloadAnchor,
-    override: ?ReloadAnchor = null,
-    captured_input_revision: u64,
-
-    fn deinit(self: *PendingDisplayNavigationRestore, allocator: std.mem.Allocator) void {
-        allocator.free(self.repo_root);
-        self.original.deinit(allocator);
-        if (self.override) |*anchor| anchor.deinit(allocator);
-        self.* = undefined;
-    }
-
-    fn authoritative(self: *const PendingDisplayNavigationRestore) *const ReloadAnchor {
-        return if (self.override) |*anchor| anchor else &self.original;
-    }
 };
 
 const DisplayNavigationSnapshot = struct {
@@ -311,24 +231,6 @@ const DisplayNavigationSnapshot = struct {
     search_coordinate: ?diff_view_model.BodyCoordinate,
     search_match_offset: ?usize,
     display_mode: diff_render.DisplayMode,
-};
-
-const DeferredSourceApply = struct {
-    finished: DiffLoadFinished,
-    cycle_id: u64,
-
-    fn deinit(self: *DeferredSourceApply, allocator: std.mem.Allocator) void {
-        self.finished.result.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-const ViewOptions = struct {
-    line_numbers: bool = true,
-
-    fn toggleLineNumbers(self: *ViewOptions) void {
-        self.line_numbers = !self.line_numbers;
-    }
 };
 
 const PushForegroundState = struct {
@@ -351,20 +253,17 @@ fn expandUserPath(allocator: std.mem.Allocator, path: []const u8, home: ?[]const
     return allocator.dupe(u8, path);
 }
 
-const DiffSearchState = struct {
-    mode: bool = false,
-    input: app_prompt.TextInput = .{},
-    query: app_prompt.TextInput = .{},
-    match: ?diff_search.Match = null,
-    /// Rendered body-line offset cache for match. Recomputed when display
-    /// mode, fold state, or selected file changes.
-    match_offset: ?usize = null,
-};
-
 const ChangedFileFilter = loaded_diff.ChangedFileFilter;
 const OverlayKind = app_state.OverlayKind;
 
+const PageStates = struct {
+    review: review_page.ReviewPageState = .{},
+};
+
 pub const App = struct {
+    active_page: page.Id = .review,
+    repo_epoch: u64 = 0,
+    pages: PageStates = .{},
     config: CliConfig = .{},
     user_config: config_mod.Config = .{},
     state_path: ?[]const u8 = null,
@@ -377,15 +276,8 @@ pub const App = struct {
     actions: app_actions.ActionState = .{},
     git_action_spinner_tick: u8 = 0,
     git_action_spinner_timer_running: bool = false,
-    load: LoadRuntimeState = .{},
-    auto_reload: app_auto_reload.State = .{},
-    deferred_source_apply: ?DeferredSourceApply = null,
     status: app_state.StatusMessage = .{},
-    viewer: ViewerState = .{},
-    search: DiffSearchState = .{},
     commit_panel: app_commit_panel.State = .{},
-    file_search: app_prompt.FilterPromptState = .{},
-    file_search_return_focus: Focus = .sidebar,
     repo_picker: app_prompt.RepoPickerState = .{},
     /// Workspace discovered from path input but not yet selected.
     ///
@@ -396,28 +288,7 @@ pub const App = struct {
     recent_repos: repo_state.RecentStore = .{},
     pending_repo_path_recent_source: ?PendingRecentPathDiscovery = null,
     overlay: app_state.OverlayState = .{},
-    review_display: app_state.ReviewDisplayState = .{},
-    staged_hunks: app_state.StagedHunkMarks = .{},
-    review_projection: app_review_projection.State = .{},
-    review_projection_next_id: u64 = 0,
-    source_session_revision: u64 = 0,
-    status_snapshot_revision: u64 = 0,
-    pending_display_navigation_restore: ?PendingDisplayNavigationRestore = null,
-    display_navigation_input_revision: u64 = 0,
     repo_state: repo_state.State = .{},
-    git_status: git_status.GitStatusState = .{},
-    status_load: app_auto_reload.AuxiliaryTracker = .{},
-    pending_reload: ?PendingReload = null,
-    branch_status: git_branch_status.State = .{},
-    branch_status_load: app_auto_reload.AuxiliaryTracker = .{},
-    /// One-shot startup selection intent used when diff finishes before status.
-    pending_initial_first_visible_selection: bool = false,
-    tree_order: file_tree.StableOrder = .{},
-    tree_order_scope: ?[]u8 = null,
-    pending_selection_restore: ?app_state.PendingSelectionRestore = null,
-    /// Session-level source of truth for reviewed files. The active LoadedDiff
-    /// keeps a materialized bool slice so hide-reviewed hot paths stay O(1).
-    reviewed_store: review_state.Store = .{},
     discard_confirmation: ?app_state.DiscardFileConfirmation = null,
     amend_confirmation: ?app_state.AmendConfirmation = null,
     push_confirmation: ?app_state.PushConfirmation = null,
@@ -430,7 +301,6 @@ pub const App = struct {
     branch_switch: app_state.BranchSwitchState = .{},
     branch_switch_load_generation: u64 = 0,
     branch_switch_load_pending: ?u64 = null,
-    selection_owner: diff_selection.Owner = .none,
 
     const ClipboardCopyOutcome = union(enum) {
         sent,
@@ -617,9 +487,9 @@ pub const App = struct {
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         self.allocator = ctx.allocator();
         self.commit_panel = app_commit_panel.State.init(ctx.allocator());
-        self.auto_reload = .init(self.config.auto_reload, self.user_config.reload, self.config.source);
-        if (self.auto_reload.enabled()) {
-            try ctx.timer().every(auto_reload_timer_id, self.auto_reload.interval_ns, .auto_reload_tick);
+        self.pages.review.init(self.config.auto_reload, self.user_config.reload, self.config.source);
+        if (self.pages.review.auto_reload.enabled()) {
+            try ctx.timer().every(auto_reload_timer_id, self.pages.review.auto_reload.interval_ns, .auto_reload_tick);
         }
         if (diff_source.sourceRequiresRepo(self.config.source)) {
             try self.startRepoDiscovery(ctx, null);
@@ -630,20 +500,13 @@ pub const App = struct {
 
     pub fn deinit(self: *App, deinit_ctx: chasen.AppDeinitContext) void {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
-        self.terminateDiffSelection();
-        self.clearSourceDisplay();
+        self.pages.review.deinit(deinit_ctx.allocator);
         self.repo_state.deinit(deinit_ctx.allocator);
-        self.git_status.deinit();
-        self.branch_status.deinit();
-        self.file_search.deinit(deinit_ctx.allocator);
         self.commit_panel.deinit();
         self.repo_picker.deinit(deinit_ctx.allocator);
         self.clearRepoPickerDiscovery(deinit_ctx.allocator);
         self.deinitRepoPickerItems(deinit_ctx.allocator);
         self.recent_repos.deinit(deinit_ctx.allocator);
-        self.reviewed_store.deinit(deinit_ctx.allocator);
-        self.staged_hunks.deinit(deinit_ctx.allocator);
-        self.review_projection.deinit(deinit_ctx.allocator);
         self.cancelDiscardConfirmation(deinit_ctx.allocator);
         self.cancelAmendConfirmation(deinit_ctx.allocator);
         self.cancelPushConfirmation(deinit_ctx.allocator);
@@ -652,12 +515,6 @@ pub const App = struct {
         self.clearPushForeground(deinit_ctx.allocator);
         self.clearPushError(deinit_ctx.allocator);
         self.clearBranchSwitch(deinit_ctx.allocator);
-        self.tree_order.deinit(deinit_ctx.allocator);
-        if (self.tree_order_scope) |scope| deinit_ctx.allocator.free(scope);
-        if (self.pending_selection_restore) |*restore| restore.deinit(deinit_ctx.allocator);
-        self.clearPendingReload(deinit_ctx.allocator);
-        self.clearDeferredSourceApply(deinit_ctx.allocator);
-        self.clearPendingDisplayNavigationRestore(deinit_ctx.allocator);
     }
 
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
@@ -702,38 +559,38 @@ pub const App = struct {
             .select_first_file => self.selectFileAbsolute(0),
             .select_last_file => self.selectLastFile(),
             .toggle_focus => {
-                if (!self.viewer.sidebar_hidden) self.viewer.focus = self.viewer.focus.toggled();
+                if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = self.pages.review.viewer.focus.toggled();
             },
             .toggle_sidebar_visibility => self.toggleSidebarVisibility(),
             .decrease_sidebar_width => self.adjustSidebarWidth(.shrink),
             .increase_sidebar_width => self.adjustSidebarWidth(.grow),
             .focus_sidebar => {
-                if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
+                if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .sidebar;
             },
-            .focus_diff => self.viewer.focus = .diff,
+            .focus_diff => self.pages.review.viewer.focus = .diff,
             .sidebar_click_node => |node_index| try self.clickSidebarNode(node_index),
             .mouse_sidebar_wheel_up => {
-                if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
+                if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .sidebar;
                 self.selectFileDelta(-1);
             },
             .mouse_sidebar_wheel_down => {
-                if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
+                if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .sidebar;
                 self.selectFileDelta(1);
             },
             .mouse_diff_wheel_up => {
-                self.viewer.focus = .diff;
+                self.pages.review.viewer.focus = .diff;
                 self.scrollDiff(.up);
             },
             .mouse_diff_wheel_down => {
-                self.viewer.focus = .diff;
+                self.pages.review.viewer.focus = .diff;
                 self.scrollDiff(.down);
             },
             .mouse_diff_wheel_left => {
-                self.viewer.focus = .diff;
+                self.pages.review.viewer.focus = .diff;
                 self.scrollDiffHorizontal(.left);
             },
             .mouse_diff_wheel_right => {
-                self.viewer.focus = .diff;
+                self.pages.review.viewer.focus = .diff;
                 self.scrollDiffHorizontal(.right);
             },
             .mouse_diff_press => |point| self.pressDiffMouse(point),
@@ -742,10 +599,10 @@ pub const App = struct {
             .toggle_display_mode => {
                 self.clearDiffSelection();
                 const old_mode = self.effectiveDisplayMode();
-                const old_scroll = self.viewer.diff_scroll;
-                self.viewer.display_mode = self.viewer.display_mode.toggled();
+                const old_scroll = self.pages.review.viewer.diff_scroll;
+                self.pages.review.viewer.display_mode = self.pages.review.viewer.display_mode.toggled();
                 const new_mode = self.effectiveDisplayMode();
-                self.viewer.diff_scroll = self.remapDiffScrollForModeChange(old_mode, new_mode, old_scroll);
+                self.pages.review.viewer.diff_scroll = self.remapDiffScrollForModeChange(old_mode, new_mode, old_scroll);
                 self.resetDiffHorizontalScroll();
                 self.updateSearchMatchOffset();
                 self.scrollSearchMatchIntoView();
@@ -753,42 +610,42 @@ pub const App = struct {
                 self.clampDiffNavigation();
             },
             .toggle_line_numbers => {
-                self.viewer.view_options.toggleLineNumbers();
+                self.pages.review.viewer.view_options.toggleLineNumbers();
                 self.clampDiffHorizontalScrollToVisibleRows();
             },
             .enter_search => self.enterSearchMode(),
             .cancel_search => self.cancelSearchMode(),
             .clear_search => self.clearSearch(),
             .submit_search => self.submitSearch(),
-            .search_insert => |codepoint| self.search.input.insert(codepoint) catch {
+            .search_insert => |codepoint| self.pages.review.search.input.insert(codepoint) catch {
                 self.setStatus("search query is too long", .{});
             },
-            .search_paste => |text| self.search.input.insertSlice(text) catch {
+            .search_paste => |text| self.pages.review.search.input.insertSlice(text) catch {
                 self.setStatus("search query is too long", .{});
             },
-            .search_backspace => self.search.input.backspace(),
-            .search_move_left => self.search.input.moveLeft(),
-            .search_move_right => self.search.input.moveRight(),
+            .search_backspace => self.pages.review.search.input.backspace(),
+            .search_move_left => self.pages.review.search.input.moveLeft(),
+            .search_move_right => self.pages.review.search.input.moveRight(),
             .select_next_search_match => self.selectSearchMatch(.forward),
             .select_previous_search_match => self.selectSearchMatch(.backward),
             .enter_file_search => self.enterFileSearchMode(),
             .cancel_file_search => self.cancelFileSearchMode(ctx.allocator()),
             .submit_file_search => try self.submitFileSearch(ctx.allocator()),
             .file_search_insert => |codepoint| {
-                self.file_search.resetNoMatch();
-                self.file_search.input.insert(codepoint) catch {
+                self.pages.review.file_search.resetNoMatch();
+                self.pages.review.file_search.input.insert(codepoint) catch {
                     self.setStatus("file search query is too long", .{});
                 };
             },
             .file_search_paste => |text| {
-                self.file_search.resetNoMatch();
-                self.file_search.input.insertSlice(text) catch {
+                self.pages.review.file_search.resetNoMatch();
+                self.pages.review.file_search.input.insertSlice(text) catch {
                     self.setStatus("file search query is too long", .{});
                 };
             },
             .file_search_backspace => {
-                self.file_search.resetNoMatch();
-                self.file_search.input.backspace();
+                self.pages.review.file_search.resetNoMatch();
+                self.pages.review.file_search.input.backspace();
             },
             .enter_commit_panel => self.enterCommitPanelMode(.commit),
             .enter_amend_panel => self.enterCommitPanelMode(.amend),
@@ -902,13 +759,13 @@ pub const App = struct {
         if (tracks_display_navigation) {
             const navigation_after = self.displayNavigationSnapshot();
             if (!std.meta.eql(navigation_before, navigation_after)) {
-                self.display_navigation_input_revision +%= 1;
-                if (self.pending_display_navigation_restore != null) {
+                self.pages.review.display_navigation_input_revision +%= 1;
+                if (self.pages.review.pending_display_navigation_restore != null) {
                     try self.capturePendingDisplayNavigationOverride(ctx.allocator());
                 }
             }
         }
-        if (!self.selection_owner.activeMouseSelection() and self.deferred_source_apply != null) {
+        if (!self.pages.review.selection_owner.activeMouseSelection() and self.pages.review.deferred_source_apply != null) {
             try self.applyDeferredSource(ctx);
         }
         try self.ensureReviewProjection(ctx);
@@ -955,15 +812,15 @@ pub const App = struct {
 
     fn displayNavigationSnapshot(self: *const App) DisplayNavigationSnapshot {
         return .{
-            .selected_target = self.viewer.selected_target,
-            .selected_node = self.viewer.selected_node,
-            .diff_cursor = self.viewer.diff_cursor,
-            .diff_scroll = self.viewer.diff_scroll,
-            .diff_horizontal_scroll = self.viewer.diff_horizontal_scroll,
-            .sidebar_horizontal_scroll = self.viewer.sidebar_horizontal_scroll,
-            .search_coordinate = if (self.search.match) |match| match.coordinate else null,
-            .search_match_offset = self.search.match_offset,
-            .display_mode = self.viewer.display_mode,
+            .selected_target = self.pages.review.viewer.selected_target,
+            .selected_node = self.pages.review.viewer.selected_node,
+            .diff_cursor = self.pages.review.viewer.diff_cursor,
+            .diff_scroll = self.pages.review.viewer.diff_scroll,
+            .diff_horizontal_scroll = self.pages.review.viewer.diff_horizontal_scroll,
+            .sidebar_horizontal_scroll = self.pages.review.viewer.sidebar_horizontal_scroll,
+            .search_coordinate = if (self.pages.review.search.match) |match| match.coordinate else null,
+            .search_match_offset = self.pages.review.search.match_offset,
+            .display_mode = self.pages.review.viewer.display_mode,
         };
     }
 
@@ -1070,13 +927,13 @@ pub const App = struct {
     }
 
     pub fn diffSelectionView(self: *const App) ?diff_selection.View {
-        const selection = self.selection_owner.activeDiff() orelse return null;
+        const selection = self.pages.review.selection_owner.activeDiff() orelse return null;
         _ = self.normalLoadedDiffSelectionTarget(selection.identity) orelse return null;
         return selection.view();
     }
 
     pub fn diffHeaderSelectionActive(self: *const App) bool {
-        const selection = self.selection_owner.activeHeader() orelse return false;
+        const selection = self.pages.review.selection_owner.activeHeader() orelse return false;
         _ = self.displayedDiffHeaderTarget(selection.identity) orelse return false;
         return true;
     }
@@ -1090,7 +947,7 @@ pub const App = struct {
     }
 
     fn mouseToMsg(self: *const App, mouse: anytype) ?Msg {
-        if (self.selection_owner.activeMouseSelection()) {
+        if (self.pages.review.selection_owner.activeMouseSelection()) {
             switch (mouse.type) {
                 .drag => return .{ .mouse_diff_drag = self.bodyMousePoint(mouse) },
                 .release => return .{ .mouse_diff_release = self.bodyMousePoint(mouse) },
@@ -1098,7 +955,7 @@ pub const App = struct {
             }
         }
 
-        if (self.search.mode or self.file_search.mode or self.commit_panel.is_open or self.repo_picker.mode) return null;
+        if (self.pages.review.search.mode or self.pages.review.file_search.mode or self.commit_panel.is_open or self.repo_picker.mode) return null;
         if (mouse.type != .press) return null;
 
         switch (self.overlay.mouseMode()) {
@@ -1147,9 +1004,9 @@ pub const App = struct {
 
         const point = self.bodyMousePoint(mouse) orelse return null;
         const size = self.layoutSize();
-        if (self.viewer.sidebar_hidden) return .diff;
+        if (self.pages.review.viewer.sidebar_hidden) return .diff;
 
-        const sidebar_width = sidebarWidth(size.width, self.viewer.sidebar_width);
+        const sidebar_width = sidebarWidth(size.width, self.pages.review.viewer.sidebar_width);
         if (point.col < sidebar_width) return .sidebar;
         if (point.col == sidebar_width) return null;
         return .diff;
@@ -1163,26 +1020,26 @@ pub const App = struct {
         const loaded = self.activeLoadedDiffConst() orelse return .focus_sidebar;
         const visible_rows: usize = body_height - sidebar_header_rows;
         const body_row: usize = point.row - sidebar_header_rows;
-        const node_index = loaded.sidebarNodeAtBodyRow(self.viewer.selected_node, visible_rows, body_row) orelse return .focus_sidebar;
+        const node_index = loaded.sidebarNodeAtBodyRow(self.pages.review.viewer.selected_node, visible_rows, body_row) orelse return .focus_sidebar;
         return .{ .sidebar_click_node = node_index };
     }
 
     fn pressDiffMouse(self: *App, point: MousePoint) void {
-        self.viewer.focus = .diff;
+        self.pages.review.viewer.focus = .diff;
         if (self.diffHeaderMouseHit(point)) |hit| {
-            self.selection_owner = .{ .diff_header = .{ .identity = hit.identity } };
+            self.pages.review.selection_owner = .{ .diff_header = .{ .identity = hit.identity } };
             return;
         }
         const hit = self.diffMouseHit(point) orelse {
             self.clearDiffSelection();
             return;
         };
-        self.selection_owner = .{ .diff = diff_selection.DragSelection.init(hit.identity, hit.side, hit.point) };
+        self.pages.review.selection_owner = .{ .diff = diff_selection.DragSelection.init(hit.identity, hit.side, hit.point) };
     }
 
     fn dragDiffMouse(self: *App, point_opt: ?MousePoint) void {
         const point = point_opt orelse return;
-        switch (self.selection_owner) {
+        switch (self.pages.review.selection_owner) {
             .none => return,
             .diff_header => |*selection| selection.update(),
             .diff => |*selection| {
@@ -1195,7 +1052,7 @@ pub const App = struct {
 
     fn releaseDiffMouse(self: *App, ctx: *chasen.Ctx(Msg), point_opt: ?MousePoint) !void {
         _ = point_opt;
-        const owner = self.selection_owner;
+        const owner = self.pages.review.selection_owner;
         self.clearDiffSelection();
         switch (owner) {
             .none => return,
@@ -1215,7 +1072,7 @@ pub const App = struct {
     /// resolves a deferred background source result after this becomes idle;
     /// deinit discards that result explicitly.
     fn terminateDiffSelection(self: *App) void {
-        self.selection_owner = .none;
+        self.pages.review.selection_owner = .none;
     }
 
     const NormalLoadedDiffSelectionTarget = struct {
@@ -1320,10 +1177,10 @@ pub const App = struct {
     fn displayedDiffHeaderLayout(self: *const App, content_width: u16, display_path: []const u8) ?diff_render.HeaderLayout {
         const mode_width = diff_render.bodyWidth(content_width);
         if (self.activeGeneratedFileProjection()) |bundle| {
-            return diff_render.generatedHeaderLayout(content_width, display_path, bundle.file.lines.len, bundle.file.truncated, self.viewer.display_mode, mode_width);
+            return diff_render.generatedHeaderLayout(content_width, display_path, bundle.file.lines.len, bundle.file.truncated, self.pages.review.viewer.display_mode, mode_width);
         }
         const file = self.displayedDiffFile() orelse return null;
-        return diff_render.fileHeaderLayout(content_width, display_path, file, self.viewer.display_mode, mode_width);
+        return diff_render.fileHeaderLayout(content_width, display_path, file, self.pages.review.viewer.display_mode, mode_width);
     }
 
     fn diffMouseHit(self: *const App, point: MousePoint) ?DiffMouseHit {
@@ -1340,7 +1197,7 @@ pub const App = struct {
         if (render_col >= content_width or render_col < diff_render.cursor_gutter_width) return null;
 
         const body_width = diff_render.bodyWidth(content_width);
-        if (diff_render.effectiveMode(body_width, self.viewer.display_mode) != .side_by_side) return null;
+        if (diff_render.effectiveMode(body_width, self.pages.review.viewer.display_mode) != .side_by_side) return null;
 
         const body_col = render_col - diff_render.cursor_gutter_width;
         const geometry = diff_render.sideBySideGeometry(body_width);
@@ -1348,7 +1205,7 @@ pub const App = struct {
 
         const visible_body_row: usize = point.row - diff_render.body_start_row;
         if (visible_body_row >= self.diffVisibleRows()) return null;
-        const offset = self.viewer.diff_scroll + visible_body_row;
+        const offset = self.pages.review.viewer.diff_scroll + visible_body_row;
         const coordinate = diff_view_model.coordinateAtOffset(target.file, .side_by_side, offset, target.folded_hunks, target.line_index) orelse return null;
         const hunk_line = switch (coordinate) {
             .hunk_line => |line| line,
@@ -1370,9 +1227,9 @@ pub const App = struct {
     fn rawDiffPaneGeometry(self: *const App) ?RawDiffPaneGeometry {
         const size = self.layoutSize();
         if (size.width == 0) return null;
-        if (self.viewer.sidebar_hidden) return .{ .col = 0, .width = size.width };
+        if (self.pages.review.viewer.sidebar_hidden) return .{ .col = 0, .width = size.width };
 
-        const sidebar_width = sidebarWidth(size.width, self.viewer.sidebar_width);
+        const sidebar_width = sidebarWidth(size.width, self.pages.review.viewer.sidebar_width);
         if (size.width <= sidebar_width + 1) return null;
         return .{
             .col = sidebar_width + 1,
@@ -1408,8 +1265,8 @@ pub const App = struct {
 
     fn keyContext(self: *const App) app_input.KeyContext {
         return .{
-            .search_mode = self.search.mode,
-            .file_search_mode = self.file_search.mode,
+            .search_mode = self.pages.review.search.mode,
+            .file_search_mode = self.pages.review.file_search.mode,
             .commit_panel_mode = self.commit_panel.is_open,
             .repo_picker_mode = self.repo_picker.mode,
             .repo_picker_input_mode = self.repo_picker.input_mode,
@@ -1421,9 +1278,9 @@ pub const App = struct {
             .branch_switch_mode = self.overlay.isSwitchBranch(),
             .push_error_mode = self.overlay.isPushError(),
             .push_credential_mode = self.overlay.isPushCredentials(),
-            .search_query_len = self.search.query.len,
-            .focus = self.viewer.focus,
-            .sidebar_hidden = self.viewer.sidebar_hidden,
+            .search_query_len = self.pages.review.search.query.len,
+            .focus = self.pages.review.viewer.focus,
+            .sidebar_hidden = self.pages.review.viewer.sidebar_hidden,
             .review_mode = self.config.review_mode,
             .keymap = self.keymap,
         };
@@ -1481,26 +1338,26 @@ pub const App = struct {
         const task = try ctx.allocator().create(RepoDiscoveryTask);
         errdefer ctx.allocator().destroy(task);
 
-        const generation = self.load.beginRepoDiscovery();
+        const generation = self.pages.review.load.beginRepoDiscovery();
         task.* = .{ .generation = generation, .background_cycle_id = background_cycle_id };
         self.clearPendingReload(ctx.allocator());
         self.clearSourceDisplay();
-        self.load.state = .loading;
+        self.pages.review.load.state = .loading;
         ctx.task().spawnWith(.{ .ctx = task, .run = RepoDiscoveryTask.run, .failed = RepoDiscoveryTask.failed }) catch |err| {
-            _ = self.load.clearPendingIfCurrent(.{ .repo_discovery = generation });
+            _ = self.pages.review.load.clearPendingIfCurrent(.{ .repo_discovery = generation });
             try self.storeFailedMessage(ctx.allocator(), "Could not start repo discovery task");
             return err;
         };
-        if (background_cycle_id) |cycle_id| _ = self.auto_reload.markMemberStarted(cycle_id, .source);
+        if (background_cycle_id) |cycle_id| _ = self.pages.review.auto_reload.markMemberStarted(cycle_id, .source);
     }
 
     fn finishRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg), finished: RepoDiscoveryFinished) !void {
-        self.auto_reload.finishMember(finished.background_cycle_id, .source);
+        self.pages.review.auto_reload.finishMember(finished.background_cycle_id, .source);
         var result = finished.result;
         defer result.deinit(ctx.allocator());
 
-        _ = self.load.finishPending(.{ .repo_discovery = finished.generation });
-        if (!self.load.isCurrent(finished.generation)) return;
+        _ = self.pages.review.load.finishPending(.{ .repo_discovery = finished.generation });
+        if (!self.pages.review.load.isCurrent(finished.generation)) return;
 
         switch (result) {
             .empty => unreachable,
@@ -1512,7 +1369,7 @@ pub const App = struct {
 
                 if (self.activeRepoRoot() == null) {
                     self.clearSourceDisplay();
-                    self.load.replaceEmpty(ctx.allocator(), .no_repository);
+                    self.pages.review.load.replaceEmpty(ctx.allocator(), .no_repository);
                     return;
                 }
 
@@ -1527,10 +1384,10 @@ pub const App = struct {
         }
     }
 
-    fn startDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), kind: ReloadKind) !void {
+    fn startDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), kind: review_page.ReloadKind) !void {
         const repo_root = self.repoRootForCurrentSource() catch |err| {
             self.clearSourceDisplay();
-            self.load.replaceEmpty(ctx.allocator(), switch (err) {
+            self.pages.review.load.replaceEmpty(ctx.allocator(), switch (err) {
                 error.MissingRepoRoot => .no_repository,
             });
             return;
@@ -1541,7 +1398,7 @@ pub const App = struct {
 
     fn startDiffLoadWithRepoRoot(self: *App, ctx: *chasen.Ctx(Msg), repo_root: ?[]const u8, options: DiffLoadStartOptions) !void {
         if (options.kind != .watch) self.clearDeferredSourceApply(ctx.allocator());
-        if (options.kind == .repo_switch) self.auto_reload.clearAcceptedSource();
+        if (options.kind == .repo_switch) self.pages.review.auto_reload.clearAcceptedSource();
         if (repo_root) |root| {
             self.startStatusLoad(ctx, root, if (options.kind == .watch) .background else .foreground, options.background_cycle_id);
             self.startBranchStatusLoad(ctx, root, options.background_cycle_id);
@@ -1559,8 +1416,8 @@ pub const App = struct {
         });
         errdefer diff_source.freeLoadRequest(ctx.allocator(), request);
 
-        const generation = self.load.beginDiffLoad();
-        errdefer _ = self.load.clearPendingIfCurrent(.{ .diff_load = generation });
+        const generation = self.pages.review.load.beginDiffLoad();
+        errdefer _ = self.pages.review.load.clearPendingIfCurrent(.{ .diff_load = generation });
         try self.beginPendingReload(ctx.allocator(), generation, options.kind);
         task.* = .{
             // Source payloads come from process args, so clone the request
@@ -1568,7 +1425,7 @@ pub const App = struct {
             .request = request,
             .generation = generation,
             .expected_fingerprint = if (options.kind == .watch and !options.clear_visible_state)
-                if (self.auto_reload.accepted_source) |accepted| accepted.fingerprint else null
+                if (self.pages.review.auto_reload.accepted_source) |accepted| accepted.fingerprint else null
             else
                 null,
             .background_cycle_id = options.background_cycle_id,
@@ -1576,15 +1433,15 @@ pub const App = struct {
 
         if (options.clear_visible_state) {
             self.clearSourceDisplay();
-            self.load.state = .loading;
+            self.pages.review.load.state = .loading;
         }
         ctx.task().spawnWith(.{ .ctx = task, .run = DiffLoadTask.run, .failed = DiffLoadTask.failed }) catch |err| {
-            _ = self.load.clearPendingIfCurrent(.{ .diff_load = generation });
+            _ = self.pages.review.load.clearPendingIfCurrent(.{ .diff_load = generation });
             self.clearPendingReloadIfGeneration(ctx.allocator(), generation);
             try self.storeFailedMessage(ctx.allocator(), "Could not start diff load task");
             return err;
         };
-        if (options.background_cycle_id) |cycle_id| _ = self.auto_reload.markMemberStarted(cycle_id, .source);
+        if (options.background_cycle_id) |cycle_id| _ = self.pages.review.auto_reload.markMemberStarted(cycle_id, .source);
     }
 
     fn startStatusLoad(
@@ -1594,7 +1451,7 @@ pub const App = struct {
         origin: git_backend.ReadOrigin,
         background_cycle_id: ?u64,
     ) void {
-        if (self.git_status.repo_root) |current_root| {
+        if (self.pages.review.git_status.repo_root) |current_root| {
             if (std.mem.eql(u8, current_root, repo_root)) {
                 self.invalidateStatusSnapshot();
             } else {
@@ -1619,11 +1476,11 @@ pub const App = struct {
 
         task.* = .{
             .repo_root = owned_root,
-            .generation = self.status_load.generation,
+            .generation = self.pages.review.status_load.generation,
             .origin = origin,
             .background_cycle_id = background_cycle_id,
         };
-        self.status_load.begin(background_cycle_id);
+        self.pages.review.status_load.begin(background_cycle_id);
 
         ctx.task().spawnWith(.{ .ctx = task, .run = StatusLoadTask.run, .failed = StatusLoadTask.failed }) catch {
             // Status is auxiliary data. Keep the diff load going even if this
@@ -1632,18 +1489,18 @@ pub const App = struct {
             ctx.allocator().free(owned_root);
             ctx.allocator().destroy(task);
             self.clearPendingSelectionRestore(ctx.allocator());
-            self.status_load.pending = null;
-            self.status_load.markFailure(background_cycle_id != null and self.git_status.repo_root != null);
+            self.pages.review.status_load.pending = null;
+            self.pages.review.status_load.markFailure(background_cycle_id != null and self.pages.review.git_status.repo_root != null);
             self.setStatus("could not start status load task", .{});
             return;
         };
-        if (background_cycle_id) |cycle_id| _ = self.auto_reload.markMemberStarted(cycle_id, .status);
+        if (background_cycle_id) |cycle_id| _ = self.pages.review.auto_reload.markMemberStarted(cycle_id, .status);
     }
 
     fn startBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), repo_root: []const u8, background_cycle_id: ?u64) void {
-        if (self.branch_status.repo_root) |current_root| {
+        if (self.pages.review.branch_status.repo_root) |current_root| {
             if (std.mem.eql(u8, current_root, repo_root)) {
-                _ = self.branch_status_load.prepare(true);
+                _ = self.pages.review.branch_status_load.prepare(true);
             } else {
                 self.invalidateBranchStatusSnapshot();
             }
@@ -1664,78 +1521,78 @@ pub const App = struct {
 
         task.* = .{
             .repo_root = owned_root,
-            .generation = self.branch_status_load.generation,
+            .generation = self.pages.review.branch_status_load.generation,
             .background_cycle_id = background_cycle_id,
         };
-        self.branch_status_load.begin(background_cycle_id);
+        self.pages.review.branch_status_load.begin(background_cycle_id);
 
         ctx.task().spawnWith(.{ .ctx = task, .run = BranchStatusLoadTask.run, .failed = BranchStatusLoadTask.failed }) catch {
             ctx.allocator().free(owned_root);
             ctx.allocator().destroy(task);
-            self.branch_status_load.pending = null;
-            self.branch_status_load.markFailure(background_cycle_id != null and self.branch_status.repo_root != null);
+            self.pages.review.branch_status_load.pending = null;
+            self.pages.review.branch_status_load.markFailure(background_cycle_id != null and self.pages.review.branch_status.repo_root != null);
             self.setStatus("could not start branch status load task", .{});
             return;
         };
-        if (background_cycle_id) |cycle_id| _ = self.auto_reload.markMemberStarted(cycle_id, .branch);
+        if (background_cycle_id) |cycle_id| _ = self.pages.review.auto_reload.markMemberStarted(cycle_id, .branch);
     }
 
     fn invalidateStatusSnapshot(self: *App) void {
-        _ = self.status_load.prepare(true);
-        self.pending_initial_first_visible_selection = false;
+        _ = self.pages.review.status_load.prepare(true);
+        self.pages.review.pending_initial_first_visible_selection = false;
     }
 
     fn dropStatusSnapshot(self: *App) void {
-        _ = self.status_load.prepare(false);
-        self.pending_initial_first_visible_selection = false;
-        if (self.git_status.repo_root != null or self.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
-        self.git_status.clear();
+        _ = self.pages.review.status_load.prepare(false);
+        self.pages.review.pending_initial_first_visible_selection = false;
+        if (self.pages.review.git_status.repo_root != null or self.pages.review.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
+        self.pages.review.git_status.clear();
     }
 
     fn invalidateBranchStatusSnapshot(self: *App) void {
-        _ = self.branch_status_load.prepare(false);
-        self.branch_status.clear();
+        _ = self.pages.review.branch_status_load.prepare(false);
+        self.pages.review.branch_status.clear();
     }
 
-    fn beginPendingReload(self: *App, allocator: std.mem.Allocator, generation: u64, kind: ReloadKind) !void {
+    fn beginPendingReload(self: *App, allocator: std.mem.Allocator, generation: u64, kind: review_page.ReloadKind) !void {
         self.clearPendingReload(allocator);
         const anchor = switch (kind) {
             .manual, .watch => try self.captureReloadAnchor(allocator),
             .initial, .action_result, .repo_switch => null,
         };
         errdefer if (anchor) |*captured| captured.deinit(allocator);
-        self.pending_reload = .{
+        self.pages.review.pending_reload = .{
             .generation = generation,
             .kind = kind,
             .anchor = anchor,
         };
     }
 
-    fn captureReloadAnchor(self: *const App, allocator: std.mem.Allocator) !?ReloadAnchor {
+    fn captureReloadAnchor(self: *const App, allocator: std.mem.Allocator) !?review_page.ReloadAnchor {
         const loaded = self.activeLoadedDiffConst() orelse return null;
         const path_key = self.selectedStagePathKey() orelse return null;
-        const selected_target = self.viewer.selected_target orelse return null;
+        const selected_target = self.pages.review.viewer.selected_target orelse return null;
 
-        const visible_row = loaded.visibleRowOfNode(self.viewer.selected_node) orelse 0;
+        const visible_row = loaded.visibleRowOfNode(self.pages.review.viewer.selected_node) orelse 0;
         return .{
             .path_key = try allocator.dupe(u8, path_key),
             .selected_target_tag = std.meta.activeTag(selected_target),
             .visible_sidebar_row = visible_row,
-            .diff_cursor = self.viewer.diff_cursor,
+            .diff_cursor = self.pages.review.viewer.diff_cursor,
             .diff_cursor_offset = self.selectedDiffCursorOffset(),
-            .diff_scroll = self.viewer.diff_scroll,
-            .diff_horizontal_scroll = self.viewer.diff_horizontal_scroll,
-            .sidebar_horizontal_scroll = self.viewer.sidebar_horizontal_scroll,
-            .search_coordinate = if (self.search.match) |match| match.coordinate else null,
+            .diff_scroll = self.pages.review.viewer.diff_scroll,
+            .diff_horizontal_scroll = self.pages.review.viewer.diff_horizontal_scroll,
+            .sidebar_horizontal_scroll = self.pages.review.viewer.sidebar_horizontal_scroll,
+            .search_coordinate = if (self.pages.review.search.match) |match| match.coordinate else null,
         };
     }
 
-    fn takePendingReloadIfGeneration(self: *App, generation: u64) ?PendingReload {
-        const pending_generation = if (self.pending_reload) |pending| pending.generation else null;
+    fn takePendingReloadIfGeneration(self: *App, generation: u64) ?review_page.PendingReload {
+        const pending_generation = if (self.pages.review.pending_reload) |pending| pending.generation else null;
         switch (app_load_state.pendingReloadConsumption(pending_generation, generation)) {
             .consume_generation_match => {
-                const pending = self.pending_reload.?;
-                self.pending_reload = null;
+                const pending = self.pages.review.pending_reload.?;
+                self.pages.review.pending_reload = null;
                 return pending;
             },
             .no_pending_reload,
@@ -1750,11 +1607,11 @@ pub const App = struct {
     }
 
     fn clearPendingReload(self: *App, allocator: std.mem.Allocator) void {
-        if (self.pending_reload) |*pending| pending.deinit(allocator);
-        self.pending_reload = null;
+        if (self.pages.review.pending_reload) |*pending| pending.deinit(allocator);
+        self.pages.review.pending_reload = null;
     }
 
-    fn capturePendingDisplayNavigationRestore(self: *const App, allocator: std.mem.Allocator) !?PendingDisplayNavigationRestore {
+    fn capturePendingDisplayNavigationRestore(self: *const App, allocator: std.mem.Allocator) !?review_page.PendingDisplayNavigationRestore {
         const repo_root = self.activeRepoRoot() orelse return null;
         var anchor = try self.captureReloadAnchor(allocator) orelse return null;
         errdefer anchor.deinit(allocator);
@@ -1762,33 +1619,33 @@ pub const App = struct {
         return .{
             .repo_root = owned_root,
             .source_kind = reviewProjectionSourceKind(self.config.source),
-            .source_session_revision = self.source_session_revision,
+            .source_session_revision = self.pages.review.source_session_revision,
             .original = anchor,
-            .captured_input_revision = self.display_navigation_input_revision,
+            .captured_input_revision = self.pages.review.display_navigation_input_revision,
         };
     }
 
-    fn installPendingDisplayNavigationRestore(self: *App, allocator: std.mem.Allocator, restore: PendingDisplayNavigationRestore) void {
+    fn installPendingDisplayNavigationRestore(self: *App, allocator: std.mem.Allocator, restore: review_page.PendingDisplayNavigationRestore) void {
         self.clearPendingDisplayNavigationRestore(allocator);
-        self.pending_display_navigation_restore = restore;
-        self.pending_display_navigation_restore.?.source_session_revision = self.source_session_revision;
+        self.pages.review.pending_display_navigation_restore = restore;
+        self.pages.review.pending_display_navigation_restore.?.source_session_revision = self.pages.review.source_session_revision;
     }
 
     fn clearPendingDisplayNavigationRestore(self: *App, allocator: std.mem.Allocator) void {
-        if (self.pending_display_navigation_restore) |*restore| restore.deinit(allocator);
-        self.pending_display_navigation_restore = null;
+        if (self.pages.review.pending_display_navigation_restore) |*restore| restore.deinit(allocator);
+        self.pages.review.pending_display_navigation_restore = null;
     }
 
     fn capturePendingDisplayNavigationOverride(self: *App, allocator: std.mem.Allocator) !void {
-        const captured_revision = if (self.pending_display_navigation_restore) |restore| restore.captured_input_revision else return;
-        if (captured_revision == self.display_navigation_input_revision) return;
+        const captured_revision = if (self.pages.review.pending_display_navigation_restore) |restore| restore.captured_input_revision else return;
+        if (captured_revision == self.pages.review.display_navigation_input_revision) return;
 
         const repo_root = self.activeRepoRoot() orelse {
             self.clearPendingDisplayNavigationRestore(allocator);
             return;
         };
-        const restore_identity_matches = if (self.pending_display_navigation_restore) |restore|
-            restore.source_session_revision == self.source_session_revision and
+        const restore_identity_matches = if (self.pages.review.pending_display_navigation_restore) |restore|
+            restore.source_session_revision == self.pages.review.source_session_revision and
                 restore.source_kind == reviewProjectionSourceKind(self.config.source) and
                 std.mem.eql(u8, restore.repo_root, repo_root)
         else
@@ -1804,30 +1661,30 @@ pub const App = struct {
         };
         errdefer latest.deinit(allocator);
 
-        const restore = &self.pending_display_navigation_restore.?;
+        const restore = &self.pages.review.pending_display_navigation_restore.?;
         if (restore.override) |*previous| previous.deinit(allocator);
         restore.override = latest;
-        restore.captured_input_revision = self.display_navigation_input_revision;
+        restore.captured_input_revision = self.pages.review.display_navigation_input_revision;
     }
 
     fn clearDeferredSourceApply(self: *App, allocator: std.mem.Allocator) void {
-        var deferred = self.deferred_source_apply orelse return;
-        self.deferred_source_apply = null;
-        _ = self.load.clearPendingIfCurrent(.{ .diff_load = deferred.finished.generation });
+        var deferred = self.pages.review.deferred_source_apply orelse return;
+        self.pages.review.deferred_source_apply = null;
+        _ = self.pages.review.load.clearPendingIfCurrent(.{ .diff_load = deferred.finished.generation });
         self.clearPendingReloadIfGeneration(allocator, deferred.finished.generation);
-        self.auto_reload.finishMember(deferred.cycle_id, .deferred_source_apply);
+        self.pages.review.auto_reload.finishMember(deferred.cycle_id, .deferred_source_apply);
         deferred.deinit(allocator);
     }
 
     fn applyDeferredSource(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        const deferred = self.deferred_source_apply orelse return;
-        self.deferred_source_apply = null;
-        defer self.auto_reload.finishMember(deferred.cycle_id, .deferred_source_apply);
+        const deferred = self.pages.review.deferred_source_apply orelse return;
+        self.pages.review.deferred_source_apply = null;
+        defer self.pages.review.auto_reload.finishMember(deferred.cycle_id, .deferred_source_apply);
 
         var finished = deferred.finished;
         if (self.backgroundAcceptanceBlocked(deferred.cycle_id)) {
             defer finished.result.deinit(ctx.allocator());
-            _ = self.load.finishPending(.{ .diff_load = finished.generation });
+            _ = self.pages.review.load.finishPending(.{ .diff_load = finished.generation });
             self.clearPendingReloadIfGeneration(ctx.allocator(), finished.generation);
             return;
         }
@@ -1838,63 +1695,63 @@ pub const App = struct {
     fn ensureReviewProjection(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         const target = self.reviewProjectionTarget() orelse {
             if (self.canRetainDisplayedProjection()) return;
-            if (self.pending_display_navigation_restore != null and !self.status_load.isFresh()) return;
-            if (self.pending_display_navigation_restore != null) {
+            if (self.pages.review.pending_display_navigation_restore != null and !self.pages.review.status_load.isFresh()) return;
+            if (self.pages.review.pending_display_navigation_restore != null) {
                 self.clearPendingDisplayNavigationRestore(self.allocator orelse ctx.allocator());
             }
-            if (self.review_projection.hasPending() or self.review_projection.hasDisplayed()) {
-                self.review_projection.deinit(self.allocator orelse ctx.allocator());
+            if (self.pages.review.review_projection.hasPending() or self.pages.review.review_projection.hasDisplayed()) {
+                self.pages.review.review_projection.deinit(self.allocator orelse ctx.allocator());
             }
             return;
         };
 
-        if (self.pending_display_navigation_restore != null and !self.pendingDisplayRestoreMatchesTarget(target)) {
+        if (self.pages.review.pending_display_navigation_restore != null and !self.pendingDisplayRestoreMatchesTarget(target)) {
             self.clearPendingDisplayNavigationRestore(self.allocator orelse ctx.allocator());
         }
 
-        if (self.review_projection.displayedMatches(
+        if (self.pages.review.review_projection.displayedMatches(
             target.repo_root,
             target.path_key,
             target.kind,
             target.source_kind,
-            self.source_session_revision,
-            self.status_snapshot_revision,
+            self.pages.review.source_session_revision,
+            self.pages.review.status_snapshot_revision,
         )) return;
-        if (self.review_projection.pendingMatches(
+        if (self.pages.review.review_projection.pendingMatches(
             target.repo_root,
             target.path_key,
             target.kind,
             target.source_kind,
-            self.source_session_revision,
-            self.status_snapshot_revision,
+            self.pages.review.source_session_revision,
+            self.pages.review.status_snapshot_revision,
         )) return;
 
-        self.review_projection.clearPending(ctx.allocator());
+        self.pages.review.review_projection.clearPending(ctx.allocator());
         if (!self.displayedProjectionMatchesStableIdentity(target.repo_root, target.path_key, target.source_kind)) {
-            self.review_projection.clearDisplayed(ctx.allocator());
+            self.pages.review.review_projection.clearDisplayed(ctx.allocator());
         }
-        self.review_projection_next_id +%= 1;
+        self.pages.review.review_projection_next_id +%= 1;
         var state_request = try app_review_projection.cloneRequest(
             ctx.allocator(),
-            self.review_projection_next_id,
+            self.pages.review.review_projection_next_id,
             target.repo_root,
             target.path_key,
             target.kind,
             target.source_kind,
-            self.source_session_revision,
-            self.status_snapshot_revision,
+            self.pages.review.source_session_revision,
+            self.pages.review.status_snapshot_revision,
         );
         errdefer state_request.deinit(ctx.allocator());
 
         var task_request = try app_review_projection.cloneRequest(
             ctx.allocator(),
-            self.review_projection_next_id,
+            self.pages.review.review_projection_next_id,
             target.repo_root,
             target.path_key,
             target.kind,
             target.source_kind,
-            self.source_session_revision,
-            self.status_snapshot_revision,
+            self.pages.review.source_session_revision,
+            self.pages.review.status_snapshot_revision,
         );
         var task_request_moved = false;
         errdefer if (!task_request_moved) task_request.deinit(ctx.allocator());
@@ -1910,29 +1767,29 @@ pub const App = struct {
             return err;
         };
 
-        self.review_projection.pending = state_request;
+        self.pages.review.review_projection.pending = state_request;
     }
 
     fn displayedProjectionMatchesStableIdentity(self: *const App, repo_root: []const u8, path_key: []const u8, source_kind: app_review_projection.SourceKind) bool {
-        const request = self.review_projection.displayed.request() orelse return false;
-        return request.matchesDisplayIdentity(repo_root, path_key, source_kind, self.source_session_revision);
+        const request = self.pages.review.review_projection.displayed.request() orelse return false;
+        return request.matchesDisplayIdentity(repo_root, path_key, source_kind, self.pages.review.source_session_revision);
     }
 
     fn canRetainDisplayedProjection(self: *const App) bool {
-        const request = self.review_projection.displayed.request() orelse return false;
+        const request = self.pages.review.review_projection.displayed.request() orelse return false;
         const repo_root = self.activeRepoRoot() orelse return false;
         const path_key = self.selectedStagePathKey() orelse return false;
         return request.matchesDisplayIdentity(
             repo_root,
             path_key,
             reviewProjectionSourceKind(self.config.source),
-            self.source_session_revision,
-        ) and !self.status_load.isFresh();
+            self.pages.review.source_session_revision,
+        ) and !self.pages.review.status_load.isFresh();
     }
 
     fn pendingDisplayRestoreMatchesTarget(self: *const App, target: ProjectionTarget) bool {
-        const restore = self.pending_display_navigation_restore orelse return false;
-        return restore.source_session_revision == self.source_session_revision and
+        const restore = self.pages.review.pending_display_navigation_restore orelse return false;
+        return restore.source_session_revision == self.pages.review.source_session_revision and
             restore.source_kind == target.source_kind and
             std.mem.eql(u8, restore.repo_root, target.repo_root) and
             std.mem.eql(u8, restore.authoritative().path_key, target.path_key);
@@ -2235,7 +2092,7 @@ pub const App = struct {
         const can_stage = diff_source.sourceAllowsStageAction(self.config.source);
         const can_unstage = diff_source.sourceAllowsUnstageAction(self.config.source);
         if (!can_stage and !can_unstage) return .unavailable_source;
-        if (!self.auto_reload.sourceIsActionable()) return .stale_source;
+        if (!self.pages.review.auto_reload.sourceIsActionable()) return .stale_source;
 
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
         if (self.currentCombinedProjection()) |bundle| {
@@ -2259,7 +2116,7 @@ pub const App = struct {
             return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
         }
 
-        if (self.staged_hunks.contains(repo_root, path, hunk_index)) {
+        if (self.pages.review.staged_hunks.contains(repo_root, path, hunk_index)) {
             return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
         }
         return if (can_stage) .{ .operation = .stage } else .unavailable_source;
@@ -2267,7 +2124,7 @@ pub const App = struct {
 
     fn selectedHunkStageTarget(self: *const App, allocator: std.mem.Allocator) HunkStageTargetResult {
         if (!diff_source.sourceAllowsStageAction(self.config.source)) return .unavailable_source;
-        if (!self.auto_reload.sourceIsActionable()) return .stale_source;
+        if (!self.pages.review.auto_reload.sourceIsActionable()) return .stale_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
         if (self.currentCombinedProjection()) |bundle| {
             return self.selectedProjectedHunkStageTarget(allocator, repo_root, bundle);
@@ -2282,7 +2139,7 @@ pub const App = struct {
         if (entry.isConflict()) return .conflict_unsupported;
         if (file.is_binary) return .binary_unsupported;
         if (diff_file.status(file) != .modified or diff_file.hasModeChange(file)) return .unsupported_file_state;
-        if (self.staged_hunks.contains(repo_root, path, hunk_index)) return .already_staged_hunk;
+        if (self.pages.review.staged_hunks.contains(repo_root, path, hunk_index)) return .already_staged_hunk;
 
         const patch = diff_patch.formatSingleHunkPatch(allocator, file, hunk_index) catch |err| switch (err) {
             error.BinaryFile => return .binary_unsupported,
@@ -2301,7 +2158,7 @@ pub const App = struct {
 
     fn selectedHunkUnstageTarget(self: *const App, allocator: std.mem.Allocator) HunkUnstageTargetResult {
         if (!diff_source.sourceAllowsUnstageAction(self.config.source)) return .unavailable_source;
-        if (!self.auto_reload.sourceIsActionable()) return .stale_source;
+        if (!self.pages.review.auto_reload.sourceIsActionable()) return .stale_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
         if (self.currentCombinedProjection()) |bundle| {
             return self.selectedProjectedHunkUnstageTarget(allocator, repo_root, bundle);
@@ -2314,7 +2171,7 @@ pub const App = struct {
         if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
         if (file.is_binary) return .binary_unsupported;
         if (diff_file.status(file) != .modified or diff_file.hasModeChange(file)) return .unsupported_file_state;
-        if (!sourceIsCached(self.config.source) and !self.staged_hunks.contains(repo_root, path, hunk_index)) return .not_staged_hunk;
+        if (!sourceIsCached(self.config.source) and !self.pages.review.staged_hunks.contains(repo_root, path, hunk_index)) return .not_staged_hunk;
 
         // This reverses a session-staged hunk from the same loaded FileDiff.
         // finishStageHunk intentionally avoids a full diff reload, and
@@ -3552,10 +3409,10 @@ pub const App = struct {
             .source = self.config.source,
             .repo_root = self.activeRepoRoot(),
             .branch_status = .{
-                .repo_root = self.branch_status.repo_root,
-                .loading = self.branch_status_load.isPending(),
-                .fresh = self.branch_status_load.isFresh(),
-                .status = self.branch_status.status,
+                .repo_root = self.pages.review.branch_status.repo_root,
+                .loading = self.pages.review.branch_status_load.isPending(),
+                .fresh = self.pages.review.branch_status_load.isFresh(),
+                .status = self.pages.review.branch_status.status,
             },
         });
     }
@@ -3565,16 +3422,16 @@ pub const App = struct {
             .source = self.config.source,
             .repo_root = self.activeRepoRoot(),
             .branch_status = .{
-                .repo_root = self.branch_status.repo_root,
-                .loading = self.branch_status_load.isPending(),
-                .fresh = self.branch_status_load.isFresh(),
-                .status = self.branch_status.status,
+                .repo_root = self.pages.review.branch_status.repo_root,
+                .loading = self.pages.review.branch_status_load.isPending(),
+                .fresh = self.pages.review.branch_status_load.isFresh(),
+                .status = self.pages.review.branch_status.status,
             },
             .status = .{
-                .repo_root = self.git_status.repo_root,
-                .loading = self.status_load.isPending(),
-                .fresh = self.status_load.isFresh(),
-                .entries = self.git_status.document.entries,
+                .repo_root = self.pages.review.git_status.repo_root,
+                .loading = self.pages.review.status_load.isPending(),
+                .fresh = self.pages.review.status_load.isFresh(),
+                .entries = self.pages.review.git_status.document.entries,
             },
         });
     }
@@ -3584,10 +3441,10 @@ pub const App = struct {
             .source = self.config.source,
             .repo_root = self.activeRepoRoot(),
             .branch_status = .{
-                .repo_root = self.branch_status.repo_root,
-                .loading = self.branch_status_load.isPending(),
-                .fresh = self.branch_status_load.isFresh(),
-                .status = self.branch_status.status,
+                .repo_root = self.pages.review.branch_status.repo_root,
+                .loading = self.pages.review.branch_status_load.isPending(),
+                .fresh = self.pages.review.branch_status_load.isFresh(),
+                .status = self.pages.review.branch_status.status,
             },
         });
     }
@@ -3597,16 +3454,16 @@ pub const App = struct {
             .source = self.config.source,
             .repo_root = self.activeRepoRoot(),
             .branch_status = .{
-                .repo_root = self.branch_status.repo_root,
-                .loading = self.branch_status_load.isPending(),
-                .fresh = self.branch_status_load.isFresh(),
-                .status = self.branch_status.status,
+                .repo_root = self.pages.review.branch_status.repo_root,
+                .loading = self.pages.review.branch_status_load.isPending(),
+                .fresh = self.pages.review.branch_status_load.isFresh(),
+                .status = self.pages.review.branch_status.status,
             },
             .status = .{
-                .repo_root = self.git_status.repo_root,
-                .loading = self.status_load.isPending(),
-                .fresh = self.status_load.isFresh(),
-                .entries = self.git_status.document.entries,
+                .repo_root = self.pages.review.git_status.repo_root,
+                .loading = self.pages.review.status_load.isPending(),
+                .fresh = self.pages.review.status_load.isFresh(),
+                .entries = self.pages.review.git_status.document.entries,
             },
         });
     }
@@ -3678,15 +3535,15 @@ pub const App = struct {
 
     pub fn stagedSummaryForActiveRepo(self: *const App) app_commit_panel.StagedSummary {
         if (!diff_source.sourceAllowsStageProjection(self.config.source)) return .unavailable;
-        if (!self.auto_reload.sourceIsActionable()) return .loading_or_stale;
+        if (!self.pages.review.auto_reload.sourceIsActionable()) return .loading_or_stale;
 
         const active_root = self.activeRepoRoot() orelse return .unavailable;
-        if (!self.status_load.isFresh()) return .loading_or_stale;
-        const snapshot_root = self.git_status.repo_root orelse return .unavailable;
+        if (!self.pages.review.status_load.isFresh()) return .loading_or_stale;
+        const snapshot_root = self.pages.review.git_status.repo_root orelse return .unavailable;
         if (!std.mem.eql(u8, active_root, snapshot_root)) return .loading_or_stale;
 
         var count: usize = 0;
-        for (self.git_status.document.entries) |entry| {
+        for (self.pages.review.git_status.document.entries) |entry| {
             if (entry.isStaged()) count += 1;
         }
         return .{ .ready = .{ .count = count } };
@@ -3719,7 +3576,7 @@ pub const App = struct {
         self.setStatus("staged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
         if (active_matches) {
             if (result.mark_source == .session) {
-                try self.staged_hunks.add(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
+                try self.pages.review.staged_hunks.add(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
             }
             self.startStatusLoad(ctx, result.repo_root, .foreground, null);
         }
@@ -3756,7 +3613,7 @@ pub const App = struct {
                 return;
             }
             if (result.mark_source == .session) {
-                _ = self.staged_hunks.remove(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
+                _ = self.pages.review.staged_hunks.remove(ctx.allocator(), result.repo_root, result.path, result.hunk_index);
             }
             self.startStatusLoad(ctx, result.repo_root, .foreground, null);
         }
@@ -3773,7 +3630,7 @@ pub const App = struct {
             return;
         }
 
-        self.reviewed_store.clearPathKey(ctx.allocator(), result.repo_root, result.path) catch {
+        self.pages.review.reviewed_store.clearPathKey(ctx.allocator(), result.repo_root, result.path) catch {
             self.setStatus("discarded: {s}; could not clear reviewed mark", .{result.path});
             try self.reloadAfterGitAction(ctx);
             return;
@@ -3799,7 +3656,7 @@ pub const App = struct {
 
         switch (result.result) {
             .ok, .ok_static => {
-                const reviewed_clear_failed = if (self.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
+                const reviewed_clear_failed = if (self.pages.review.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
                 const active_matches = self.activeRepoMatches(result.repo_root);
                 self.commit_panel.close();
 
@@ -3879,7 +3736,7 @@ pub const App = struct {
 
         switch (result.result) {
             .ok, .ok_static => {
-                const reviewed_clear_failed = if (self.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
+                const reviewed_clear_failed = if (self.pages.review.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
                 const active_matches = self.activeRepoMatches(result.repo_root);
                 self.commit_panel.close();
                 self.cancelAmendConfirmation(ctx.allocator());
@@ -4013,8 +3870,8 @@ pub const App = struct {
 
         switch (result.result) {
             .ok, .ok_static => {
-                const reviewed_clear_failed = if (self.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
-                self.staged_hunks.clearRepo(ctx.allocator(), result.repo_root);
+                const reviewed_clear_failed = if (self.pages.review.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
+                self.pages.review.staged_hunks.clearRepo(ctx.allocator(), result.repo_root);
                 if (active_matches) {
                     self.clearPendingSelectionRestore(ctx.allocator());
                     self.clearSearch();
@@ -4274,7 +4131,7 @@ pub const App = struct {
         // sidebar. Do not derive this from the rendered diff/projection, which
         // can represent staged or synthetic content for the same file.
         if (!diff_source.sourceAllowsEditorAction(self.config.source)) return .unavailable_source;
-        if (!self.auto_reload.sourceIsActionable()) return .stale_source;
+        if (!self.pages.review.auto_reload.sourceIsActionable()) return .stale_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
         const action_target = self.selectedSidebarActionTarget() orelse return .no_path;
 
@@ -4300,7 +4157,7 @@ pub const App = struct {
 
     fn editorTargetLine(self: *const App) ?u32 {
         const file = self.selectedFile() orelse return null;
-        return switch (self.viewer.diff_cursor) {
+        return switch (self.pages.review.viewer.diff_cursor) {
             .hunk_line => |line| worktreeLineForHunkLine(file, line.hunk_index, line.line_index),
             .hunk_header => |hunk_index| worktreeLineForHunkLine(file, hunk_index, 0),
             else => null,
@@ -4355,7 +4212,7 @@ pub const App = struct {
             try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
                 ctx.redraw().skip();
                 return;
-            }, .{ .clear_visible_state = self.load.state == .idle, .kind = .action_result });
+            }, .{ .clear_visible_state = self.pages.review.load.state == .idle, .kind = .action_result });
         }
     }
 
@@ -4540,7 +4397,7 @@ pub const App = struct {
     }
 
     fn currentDiffLineCopyText(self: *const App) ?[]const u8 {
-        const coordinate = switch (self.viewer.diff_cursor) {
+        const coordinate = switch (self.pages.review.viewer.diff_cursor) {
             .hunk_line => |line| line,
             .metadata, .binary_marker, .hunk_header => return null,
         };
@@ -4735,49 +4592,49 @@ pub const App = struct {
     }
 
     fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (!self.auto_reload.enabled()) return;
+        if (!self.pages.review.auto_reload.enabled()) return;
         if (diff_source.sourceIsOneShotInput(self.config.source)) return;
-        if (self.repo_picker.mode or self.search.mode or self.file_search.mode or self.commit_panel.is_open or
-            self.selection_owner.activeMouseSelection() or app_git_requests.hasPendingAction(self.actions))
+        if (self.repo_picker.mode or self.pages.review.search.mode or self.pages.review.file_search.mode or self.commit_panel.is_open or
+            self.pages.review.selection_owner.activeMouseSelection() or app_git_requests.hasPendingAction(self.actions))
         {
             ctx.redraw().skip();
             return;
         }
-        if (self.auto_reload.background_cycle != null or self.load.hasPending() or self.load.state == .loading or
-            self.status_load.isPending() or self.branch_status_load.isPending() or self.review_projection.hasPending())
+        if (self.pages.review.auto_reload.background_cycle != null or self.pages.review.load.hasPending() or self.pages.review.load.state == .loading or
+            self.pages.review.status_load.isPending() or self.pages.review.branch_status_load.isPending() or self.pages.review.review_projection.hasPending())
         {
             ctx.redraw().skip();
             return;
         }
 
         if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
-            if (self.auto_reload.activation != .forced) {
+            if (self.pages.review.auto_reload.activation != .forced) {
                 ctx.redraw().skip();
                 return;
             }
-            const cycle_id = self.auto_reload.beginCycle() orelse {
+            const cycle_id = self.pages.review.auto_reload.beginCycle() orelse {
                 ctx.redraw().skip();
                 return;
             };
-            errdefer self.auto_reload.discardEmptyCycle(cycle_id);
+            errdefer self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
             try self.startRepoDiscovery(ctx, cycle_id);
-            self.auto_reload.discardEmptyCycle(cycle_id);
+            self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
         } else {
-            const cycle_id = self.auto_reload.beginCycle() orelse {
+            const cycle_id = self.pages.review.auto_reload.beginCycle() orelse {
                 ctx.redraw().skip();
                 return;
             };
-            errdefer self.auto_reload.discardEmptyCycle(cycle_id);
+            errdefer self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
             try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
-                self.auto_reload.discardEmptyCycle(cycle_id);
+                self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
                 ctx.redraw().skip();
                 return;
             }, .{
-                .clear_visible_state = self.load.state == .idle,
+                .clear_visible_state = self.pages.review.load.state == .idle,
                 .kind = .watch,
                 .background_cycle_id = cycle_id,
             });
-            self.auto_reload.discardEmptyCycle(cycle_id);
+            self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
         }
         ctx.redraw().skip();
     }
@@ -4809,25 +4666,25 @@ pub const App = struct {
     fn finishDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: DiffLoadFinished) !void {
         if (self.allocator == null) self.allocator = ctx.allocator();
         if (self.backgroundAcceptanceBlocked(finished.background_cycle_id)) {
-            self.auto_reload.finishMember(finished.background_cycle_id, .source);
+            self.pages.review.auto_reload.finishMember(finished.background_cycle_id, .source);
             var blocked_result = finished.result;
             defer blocked_result.deinit(ctx.allocator());
-            _ = self.load.finishPending(.{ .diff_load = finished.generation });
+            _ = self.pages.review.load.finishPending(.{ .diff_load = finished.generation });
             self.clearPendingReloadIfGeneration(ctx.allocator(), finished.generation);
             return;
         }
-        if ((finished.result == .loaded or finished.result == .empty) and self.selection_owner.activeMouseSelection() and
-            self.load.isCurrent(finished.generation) and self.deferred_source_apply == null)
+        if ((finished.result == .loaded or finished.result == .empty) and self.pages.review.selection_owner.activeMouseSelection() and
+            self.pages.review.load.isCurrent(finished.generation) and self.pages.review.deferred_source_apply == null)
         {
             if (finished.background_cycle_id) |cycle_id| {
-                if (self.auto_reload.moveMember(cycle_id, .source, .deferred_source_apply)) {
-                    self.deferred_source_apply = .{ .finished = finished, .cycle_id = cycle_id };
+                if (self.pages.review.auto_reload.moveMember(cycle_id, .source, .deferred_source_apply)) {
+                    self.pages.review.deferred_source_apply = .{ .finished = finished, .cycle_id = cycle_id };
                     ctx.redraw().skip();
                     return;
                 }
             }
         }
-        self.auto_reload.finishMember(finished.background_cycle_id, .source);
+        self.pages.review.auto_reload.finishMember(finished.background_cycle_id, .source);
 
         var result = finished.result;
         defer result.deinit(ctx.allocator());
@@ -4835,15 +4692,15 @@ pub const App = struct {
 
         // Multiple reloads can be in flight. Only the newest generation is
         // allowed to update visible state.
-        _ = self.load.finishPending(.{ .diff_load = finished.generation });
-        if (!self.load.isCurrent(finished.generation)) return;
+        _ = self.pages.review.load.finishPending(.{ .diff_load = finished.generation });
+        if (!self.pages.review.load.isCurrent(finished.generation)) return;
         var pending_reload = self.takePendingReloadIfGeneration(finished.generation);
         defer if (pending_reload) |*pending| pending.deinit(ctx.allocator());
 
         // Capture this before clearLoadedDiff(): the previous loaded session is
         // what distinguishes first load from reload/restore paths.
         const had_loaded_before = self.activeLoadedDiffConst() != null;
-        const had_pending_restore = self.pending_selection_restore != null;
+        const had_pending_restore = self.pages.review.pending_selection_restore != null;
 
         switch (result) {
             .empty => {
@@ -4853,7 +4710,7 @@ pub const App = struct {
                     null;
                 errdefer if (acceptance_restore) |*restore| restore.deinit(ctx.allocator());
                 self.clearSourceDisplayForReplacement();
-                self.load.replaceEmpty(ctx.allocator(), .no_changes);
+                self.pages.review.load.replaceEmpty(ctx.allocator(), .no_changes);
                 if (acceptance_restore) |restore| {
                     self.installPendingDisplayNavigationRestore(ctx.allocator(), restore);
                     acceptance_restore = null;
@@ -4881,8 +4738,8 @@ pub const App = struct {
                     .skip_rebuild_identical_text => {
                         _ = self.acceptSourceFingerprint(bundle.fingerprint);
                         const prefer_first_visible_file = !had_loaded_before and !had_pending_restore;
-                        if (prefer_first_visible_file and self.status_load.isPending()) {
-                            self.pending_initial_first_visible_selection = true;
+                        if (prefer_first_visible_file and self.pages.review.status_load.isPending()) {
+                            self.pages.review.pending_initial_first_visible_selection = true;
                         }
                         try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
                         return;
@@ -4906,14 +4763,14 @@ pub const App = struct {
                 try self.materializeReviewedFiles(ctx.allocator(), &loaded);
                 errdefer ctx.allocator().free(loaded.reviewed_files);
 
-                if (self.review_display.hide_reviewed_files or self.review_display.changed_file_filter != .all) {
-                    try loaded.rebuildVisibleNodes(arena.allocator(), self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
+                if (self.pages.review.review_display.hide_reviewed_files or self.pages.review.review_display.changed_file_filter != .all) {
+                    try loaded.rebuildVisibleNodes(arena.allocator(), self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
                 }
 
                 // Keep all fallible setup above this point. After assigning a
                 // LoadedSession, LoadRuntimeState owns both the arena and the
                 // materialized reviewed slice.
-                self.load.replaceLoaded(ctx.allocator(), .{
+                self.pages.review.load.replaceLoaded(ctx.allocator(), .{
                     .arena = arena,
                     .loaded = loaded,
                     .reviewed_files_owned = true,
@@ -4925,7 +4782,7 @@ pub const App = struct {
                 _ = self.acceptSourceFingerprint(bundle.fingerprint);
 
                 const active_loaded = self.activeLoadedDiff().?;
-                const restored_from_anchor = if (self.pending_display_navigation_restore) |*restore|
+                const restored_from_anchor = if (self.pages.review.pending_display_navigation_restore) |*restore|
                     self.restoreReloadAnchor(active_loaded, restore.authoritative())
                 else if (pending_reload) |*pending|
                     if (pending.anchor) |*anchor| self.restoreReloadAnchor(active_loaded, anchor) else false
@@ -4941,7 +4798,7 @@ pub const App = struct {
                         self.syncSidebarNodeToSelectedFile(active_loaded);
                     }
                     self.clampSelection(active_loaded.document.files.len);
-                    if (self.review_display.hide_reviewed_files) {
+                    if (self.pages.review.review_display.hide_reviewed_files) {
                         self.reconcileSelectionAfterVisibleNodeChange(active_loaded);
                     }
                     self.clampDiffNavigation();
@@ -4952,9 +4809,9 @@ pub const App = struct {
             .failed => |message| {
                 if (pending_reload != null and pending_reload.?.kind == .watch) {
                     const trimmed = git_ops.trimGitOutput(message);
-                    if (self.auto_reload.markSourceFailure(trimmed)) {
+                    if (self.pages.review.auto_reload.markSourceFailure(trimmed)) {
                         self.status.setSourceReloadFailure(
-                            self.auto_reload.last_failure.?.digest,
+                            self.pages.review.auto_reload.last_failure.?.digest,
                             "auto reload failed: {s}",
                             .{trimmed},
                         );
@@ -4969,9 +4826,9 @@ pub const App = struct {
             },
             .failed_static => |message| {
                 if (pending_reload != null and pending_reload.?.kind == .watch) {
-                    if (self.auto_reload.markSourceFailure(message)) {
+                    if (self.pages.review.auto_reload.markSourceFailure(message)) {
                         self.status.setSourceReloadFailure(
-                            self.auto_reload.last_failure.?.digest,
+                            self.pages.review.auto_reload.last_failure.?.digest,
                             "auto reload failed: {s}",
                             .{message},
                         );
@@ -4990,45 +4847,45 @@ pub const App = struct {
         // here so the final sidebar does not depend on which task finished
         // first.
         const prefer_first_visible_file = !had_loaded_before and !had_pending_restore;
-        if (prefer_first_visible_file and self.status_load.isPending()) {
-            self.pending_initial_first_visible_selection = true;
+        if (prefer_first_visible_file and self.pages.review.status_load.isPending()) {
+            self.pages.review.pending_initial_first_visible_selection = true;
         }
         if (can_project_status) try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
     }
 
     fn acceptSourceFingerprint(self: *App, fingerprint: app_auto_reload.SourceFingerprint) bool {
-        const recovered_failure = self.auto_reload.last_failure;
-        self.auto_reload.acceptSource(fingerprint);
+        const recovered_failure = self.pages.review.auto_reload.last_failure;
+        self.pages.review.auto_reload.acceptSource(fingerprint);
         const failure = recovered_failure orelse return false;
         return self.status.clearSourceReloadFailure(failure.digest);
     }
 
     fn finishStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: StatusLoadFinished) !void {
-        self.auto_reload.finishMember(finished.background_cycle_id, .status);
+        self.pages.review.auto_reload.finishMember(finished.background_cycle_id, .status);
         var result = finished;
         defer result.deinit(ctx.allocator());
 
         if (self.backgroundAcceptanceBlocked(result.background_cycle_id)) {
-            _ = self.status_load.accept(result.generation);
+            _ = self.pages.review.status_load.accept(result.generation);
             return;
         }
 
-        if (!self.status_load.accept(result.generation)) return;
+        if (!self.pages.review.status_load.accept(result.generation)) return;
 
         switch (result.result) {
             .empty => {
-                const same_root = if (self.git_status.repo_root) |root| std.mem.eql(u8, root, result.repo_root) else false;
-                if (!same_root or self.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
-                self.status_load.markSuccess();
-                self.git_status.clear();
-                const prefer_first_visible_file = self.pending_initial_first_visible_selection;
-                self.pending_initial_first_visible_selection = false;
+                const same_root = if (self.pages.review.git_status.repo_root) |root| std.mem.eql(u8, root, result.repo_root) else false;
+                if (!same_root or self.pages.review.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
+                self.pages.review.status_load.markSuccess();
+                self.pages.review.git_status.clear();
+                const prefer_first_visible_file = self.pages.review.pending_initial_first_visible_selection;
+                self.pages.review.pending_initial_first_visible_selection = false;
                 try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
             },
             .loaded => |*bundle| {
                 switch (self.canSkipStatusSnapshotReplace(result.repo_root, bundle.document)) {
                     .skip_identical => {
-                        self.status_load.markSuccess();
+                        self.pages.review.status_load.markSuccess();
                         ctx.redraw().skip();
                         return;
                     },
@@ -5040,32 +4897,32 @@ pub const App = struct {
                     => {},
                 }
                 self.advanceStatusSnapshotRevision();
-                try self.git_status.replace(result.repo_root, bundle);
-                self.status_load.markSuccess();
+                try self.pages.review.git_status.replace(result.repo_root, bundle);
+                self.pages.review.status_load.markSuccess();
                 result.result = .empty;
-                const prefer_first_visible_file = self.pending_initial_first_visible_selection;
-                self.pending_initial_first_visible_selection = false;
+                const prefer_first_visible_file = self.pages.review.pending_initial_first_visible_selection;
+                self.pages.review.pending_initial_first_visible_selection = false;
                 try self.applyStatusProjection(ctx.allocator(), prefer_first_visible_file);
             },
             .failed => |message| {
-                const retain = result.background_cycle_id != null and self.git_status.repo_root != null;
-                self.status_load.markFailure(retain);
+                const retain = result.background_cycle_id != null and self.pages.review.git_status.repo_root != null;
+                self.pages.review.status_load.markFailure(retain);
                 if (!retain) {
-                    if (self.git_status.repo_root != null or self.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
-                    self.git_status.clear();
+                    if (self.pages.review.git_status.repo_root != null or self.pages.review.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
+                    self.pages.review.git_status.clear();
                 }
-                self.pending_initial_first_visible_selection = false;
+                self.pages.review.pending_initial_first_visible_selection = false;
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
-                const retain = result.background_cycle_id != null and self.git_status.repo_root != null;
-                self.status_load.markFailure(retain);
+                const retain = result.background_cycle_id != null and self.pages.review.git_status.repo_root != null;
+                self.pages.review.status_load.markFailure(retain);
                 if (!retain) {
-                    if (self.git_status.repo_root != null or self.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
-                    self.git_status.clear();
+                    if (self.pages.review.git_status.repo_root != null or self.pages.review.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
+                    self.pages.review.git_status.clear();
                 }
-                self.pending_initial_first_visible_selection = false;
+                self.pages.review.pending_initial_first_visible_selection = false;
                 self.clearPendingSelectionRestore(ctx.allocator());
                 self.setStatus("status load failed: {s}", .{message});
             },
@@ -5074,61 +4931,61 @@ pub const App = struct {
 
     fn canSkipStatusSnapshotReplace(self: *const App, repo_root: []const u8, document: git_status.StatusDocument) app_load_state.StatusSnapshotReplaceDecision {
         return app_load_state.statusSnapshotReplaceDecision(
-            self.pending_selection_restore != null,
-            self.pending_initial_first_visible_selection,
-            self.git_status.repo_root,
+            self.pages.review.pending_selection_restore != null,
+            self.pages.review.pending_initial_first_visible_selection,
+            self.pages.review.git_status.repo_root,
             repo_root,
-            self.git_status.document.eql(document),
+            self.pages.review.git_status.document.eql(document),
         );
     }
 
     fn branchStatusSnapshotEquals(self: *const App, repo_root: []const u8, status: git_branch_status.BranchStatus) bool {
-        const current_root = self.branch_status.repo_root orelse return false;
-        return std.mem.eql(u8, current_root, repo_root) and self.branch_status.status.eql(status);
+        const current_root = self.pages.review.branch_status.repo_root orelse return false;
+        return std.mem.eql(u8, current_root, repo_root) and self.pages.review.branch_status.status.eql(status);
     }
 
     fn finishBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: BranchStatusLoadFinished) void {
-        self.auto_reload.finishMember(finished.background_cycle_id, .branch);
+        self.pages.review.auto_reload.finishMember(finished.background_cycle_id, .branch);
         var result = finished;
         defer result.deinit(ctx.allocator());
 
         if (self.backgroundAcceptanceBlocked(result.background_cycle_id)) {
-            _ = self.branch_status_load.accept(result.generation);
+            _ = self.pages.review.branch_status_load.accept(result.generation);
             return;
         }
 
-        if (!self.branch_status_load.accept(result.generation)) return;
+        if (!self.pages.review.branch_status_load.accept(result.generation)) return;
 
         switch (result.result) {
             .empty => {
-                self.branch_status.clear();
-                self.branch_status_load.markSuccess();
+                self.pages.review.branch_status.clear();
+                self.pages.review.branch_status_load.markSuccess();
             },
             .loaded => |*bundle| {
                 if (self.branchStatusSnapshotEquals(result.repo_root, bundle.status)) {
-                    self.branch_status_load.markSuccess();
+                    self.pages.review.branch_status_load.markSuccess();
                     ctx.redraw().skip();
                     return;
                 }
-                self.branch_status.replace(result.repo_root, bundle) catch {
-                    self.branch_status.clear();
-                    self.branch_status_load.markFailure(false);
+                self.pages.review.branch_status.replace(result.repo_root, bundle) catch {
+                    self.pages.review.branch_status.clear();
+                    self.pages.review.branch_status_load.markFailure(false);
                     self.setStatus("branch status parse failed", .{});
                     return;
                 };
-                self.branch_status_load.markSuccess();
+                self.pages.review.branch_status_load.markSuccess();
                 result.result = .empty;
             },
             .failed => |message| {
-                const retain = result.background_cycle_id != null and self.branch_status.repo_root != null;
-                self.branch_status_load.markFailure(retain);
-                if (!retain) self.branch_status.clear();
+                const retain = result.background_cycle_id != null and self.pages.review.branch_status.repo_root != null;
+                self.pages.review.branch_status_load.markFailure(retain);
+                if (!retain) self.pages.review.branch_status.clear();
                 self.setStatus("branch status load failed: {s}", .{git_ops.trimGitOutput(message)});
             },
             .failed_static => |message| {
-                const retain = result.background_cycle_id != null and self.branch_status.repo_root != null;
-                self.branch_status_load.markFailure(retain);
-                if (!retain) self.branch_status.clear();
+                const retain = result.background_cycle_id != null and self.pages.review.branch_status.repo_root != null;
+                self.pages.review.branch_status_load.markFailure(retain);
+                if (!retain) self.pages.review.branch_status.clear();
                 self.setStatus("branch status load failed: {s}", .{message});
             },
         }
@@ -5139,7 +4996,7 @@ pub const App = struct {
         var consumed = false;
         defer if (!consumed) result.deinit(ctx.allocator());
 
-        const pending_id = if (self.review_projection.pending) |request| request.id else return;
+        const pending_id = if (self.pages.review.review_projection.pending) |request| request.id else return;
         if (pending_id != result.request.id) return;
 
         const current = self.reviewProjectionTarget() orelse return;
@@ -5148,25 +5005,25 @@ pub const App = struct {
             current.path_key,
             current.kind,
             current.source_kind,
-            self.source_session_revision,
-            self.status_snapshot_revision,
+            self.pages.review.source_session_revision,
+            self.pages.review.status_snapshot_revision,
         )) return;
 
-        var local_navigation = if (self.pending_display_navigation_restore == null)
+        var local_navigation = if (self.pages.review.pending_display_navigation_restore == null)
             try self.captureReloadAnchor(ctx.allocator())
         else
             null;
         defer if (local_navigation) |*anchor| anchor.deinit(ctx.allocator());
 
-        self.review_projection.clearPending(ctx.allocator());
-        self.review_projection.clearDisplayed(ctx.allocator());
+        self.pages.review.review_projection.clearPending(ctx.allocator());
+        self.pages.review.review_projection.clearDisplayed(ctx.allocator());
         switch (result.result) {
             .ready => |ready| {
-                self.review_projection.displayed = .{ .ready = .{
+                self.pages.review.review_projection.displayed = .{ .ready = .{
                     .request = result.request,
                     .value = ready,
                 } };
-                if (self.pending_display_navigation_restore) |*restore| {
+                if (self.pages.review.pending_display_navigation_restore) |*restore| {
                     self.restoreDisplayedNavigation(restore.authoritative());
                     self.clearPendingDisplayNavigationRestore(ctx.allocator());
                 } else if (local_navigation) |*anchor| {
@@ -5177,7 +5034,7 @@ pub const App = struct {
                 consumed = true;
             },
             .failed => |body| {
-                self.review_projection.displayed = .{ .failed = .{
+                self.pages.review.review_projection.displayed = .{ .failed = .{
                     .request = result.request,
                     .body = body,
                 } };
@@ -5200,7 +5057,7 @@ pub const App = struct {
                 var body = try app_review_projection.statusBodyAlloc(ctx.allocator(), result.request.path_key, "{s}", .{message});
                 errdefer body.deinit(ctx.allocator());
 
-                self.review_projection.displayed = .{ .failed = .{
+                self.pages.review.review_projection.displayed = .{ .failed = .{
                     .request = request,
                     .body = body,
                 } };
@@ -5209,20 +5066,20 @@ pub const App = struct {
         }
     }
 
-    fn restoreDisplayedNavigation(self: *App, anchor: *const ReloadAnchor) void {
-        self.viewer.diff_cursor = anchor.diff_cursor;
+    fn restoreDisplayedNavigation(self: *App, anchor: *const review_page.ReloadAnchor) void {
+        self.pages.review.viewer.diff_cursor = anchor.diff_cursor;
         if (self.selectedDiffCursorOffset() == null) {
             if (anchor.diff_cursor_offset) |offset| {
                 const line_count = self.displayedDiffLineCount();
                 if (line_count > 0) {
-                    self.viewer.diff_cursor = self.selectedCoordinateAtOffset(@min(offset, line_count - 1)) orelse self.viewer.diff_cursor;
+                    self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(@min(offset, line_count - 1)) orelse self.pages.review.viewer.diff_cursor;
                 }
             }
         }
         if (self.selectedDiffCursorOffset() == null) self.initializeDiffCursorForSelectedFile();
-        self.viewer.diff_scroll = anchor.diff_scroll;
-        self.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
-        self.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
+        self.pages.review.viewer.diff_scroll = anchor.diff_scroll;
+        self.pages.review.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
+        self.pages.review.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
         self.clampDiffNavigation();
         self.keepDiffCursorVisible();
         self.restoreSearchFromReloadAnchor(anchor);
@@ -5234,14 +5091,14 @@ pub const App = struct {
         if (self.allocator == null) self.allocator = allocator;
         if (!diff_source.sourceAllowsStageProjection(self.config.source)) return;
 
-        const status_document = self.git_status.document;
+        const status_document = self.pages.review.git_status.document;
         if (status_document.entries.len == 0) {
-            if (self.pending_selection_restore != null and
-                (self.load.hasPending() or self.status_load.isPending())) return;
+            if (self.pages.review.pending_selection_restore != null and
+                (self.pages.review.load.hasPending() or self.pages.review.status_load.isPending())) return;
             if (self.activeLoadedDiff()) |loaded| {
                 if (loadedDiffIsStatusOnly(loaded)) {
                     self.clearLoadedDiff();
-                    self.load.replaceEmpty(allocator, .no_changes);
+                    self.pages.review.load.replaceEmpty(allocator, .no_changes);
                     self.clearPendingSelectionRestore(allocator);
                     return;
                 }
@@ -5256,7 +5113,7 @@ pub const App = struct {
             return;
         }
 
-        switch (self.load.state) {
+        switch (self.pages.review.load.state) {
             .empty => |reason| if (reason == .no_changes and
                 file_tree.statusOnlyEntryCount(status_document, .{ .files = &.{} }) > 0)
             {
@@ -5274,15 +5131,15 @@ pub const App = struct {
         const allocator = self.loadArenaAllocator() orelse return;
         const previous_path_key = self.selectedStagePathKey();
         try self.ensureTreeOrderScope(app_allocator);
-        loaded.tree = try file_tree.buildWithOptions(allocator, loaded.document, self.git_status.document, .{
+        loaded.tree = try file_tree.buildWithOptions(allocator, loaded.document, self.pages.review.git_status.document, .{
             .root = self.fileTreeRootOptions(),
             .stable_order = self.stableOrderOptions(app_allocator),
         });
-        try loaded.rebuildVisibleNodes(allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
+        try loaded.rebuildVisibleNodes(allocator, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
         // Status can finish before the diff reload triggered by a Git action.
         // In that case this projection is over the old diff, so keep the
         // pending path restore for the incoming loaded diff.
-        if (self.pending_selection_restore != null and self.load.hasPending()) return;
+        if (self.pages.review.pending_selection_restore != null and self.pages.review.load.hasPending()) return;
         if (prefer_first_visible_file) {
             self.selectFirstVisibleFile(loaded);
         } else if (!self.restorePendingSelectionOrFallback(app_allocator, loaded)) {
@@ -5316,13 +5173,13 @@ pub const App = struct {
             .bytes = 0,
             .lines = 0,
         };
-        try loaded.rebuildVisibleNodes(arena_allocator, false, self.review_display.changed_file_filter);
+        try loaded.rebuildVisibleNodes(arena_allocator, false, self.pages.review.review_display.changed_file_filter);
 
         self.advanceSourceSessionRevision();
-        if (self.pending_display_navigation_restore) |*restore| {
-            restore.source_session_revision = self.source_session_revision;
+        if (self.pages.review.pending_display_navigation_restore) |*restore| {
+            restore.source_session_revision = self.pages.review.source_session_revision;
         }
-        self.load.replaceLoaded(allocator, .{
+        self.pages.review.load.replaceLoaded(allocator, .{
             .arena = arena,
             .loaded = loaded,
             .reviewed_files_owned = false,
@@ -5333,51 +5190,51 @@ pub const App = struct {
         while (visible_index < active_loaded.visibleNodeCount()) : (visible_index += 1) {
             const node_index = active_loaded.visibleNodeAt(visible_index) orelse continue;
             if (active_loaded.tree.nodes[node_index].target == .directory or active_loaded.tree.nodes[node_index].target == .repo_root) continue;
-            self.viewer.selected_node = node_index;
+            self.pages.review.viewer.selected_node = node_index;
             self.selectSidebarNode(active_loaded, node_index);
             break;
         }
         _ = self.restorePendingSelectionOrFallback(allocator, active_loaded);
-        if (self.pending_display_navigation_restore) |*restore| {
+        if (self.pages.review.pending_display_navigation_restore) |*restore| {
             _ = self.restoreReloadAnchor(active_loaded, restore.authoritative());
         }
     }
 
     fn storeFailedMessage(self: *App, allocator: std.mem.Allocator, message: []const u8) !void {
-        try self.load.replaceFailed(allocator, message);
+        try self.pages.review.load.replaceFailed(allocator, message);
     }
 
     fn clearLoadedDiff(self: *App) void {
         self.advanceSourceSessionRevision();
         self.clearDiffSelection();
-        self.load.clearCurrent(self.allocator);
+        self.pages.review.load.clearCurrent(self.allocator);
         // allocator is null only before App.init has completed; deinit paths can
         // still call this while no owned projection/session state exists.
         if (self.allocator) |allocator| {
-            self.review_projection.deinit(allocator);
-            self.staged_hunks.clear(allocator);
+            self.pages.review.review_projection.deinit(allocator);
+            self.pages.review.staged_hunks.clear(allocator);
             self.clearPendingDisplayNavigationRestore(allocator);
         }
-        self.viewer.diff_scroll = 0;
-        self.viewer.diff_horizontal_scroll = 0;
-        self.viewer.sidebar_horizontal_scroll = 0;
-        self.viewer.diff_cursor = .{ .metadata = 0 };
+        self.pages.review.viewer.diff_scroll = 0;
+        self.pages.review.viewer.diff_horizontal_scroll = 0;
+        self.pages.review.viewer.sidebar_horizontal_scroll = 0;
+        self.pages.review.viewer.diff_cursor = .{ .metadata = 0 };
         self.clearSearchMatch();
     }
 
     fn advanceSourceSessionRevision(self: *App) void {
-        self.source_session_revision +%= 1;
+        self.pages.review.source_session_revision +%= 1;
     }
 
     fn advanceStatusSnapshotRevision(self: *App) void {
-        self.status_snapshot_revision +%= 1;
+        self.pages.review.status_snapshot_revision +%= 1;
     }
 
     /// Destructive source transition: invalidate source authority and tear
     /// down its visible session. Projection-only teardown must call
     /// clearLoadedDiff() so an accepted empty/loaded source remains authoritative.
     fn clearSourceDisplay(self: *App) void {
-        self.auto_reload.clearAcceptedSource();
+        self.pages.review.auto_reload.clearAcceptedSource();
         self.clearLoadedDiff();
     }
 
@@ -5385,7 +5242,7 @@ pub const App = struct {
     /// used while the new display is materialized, but retain source-failure
     /// provenance until acceptSourceFingerprint() can clear its owned status.
     fn clearSourceDisplayForReplacement(self: *App) void {
-        self.auto_reload.invalidateAcceptedSnapshot();
+        self.pages.review.auto_reload.invalidateAcceptedSnapshot();
         self.clearLoadedDiff();
     }
 
@@ -5394,10 +5251,10 @@ pub const App = struct {
         if (loaded.tree.nodes.len == 0 or loaded.visibleNodeCount() == 0) return;
 
         if (delta < 0) {
-            if (loaded.previousVisibleNodeIndex(self.viewer.selected_node)) |previous| {
+            if (loaded.previousVisibleNodeIndex(self.pages.review.viewer.selected_node)) |previous| {
                 self.selectSidebarNode(loaded, previous);
             }
-        } else if (loaded.nextVisibleNodeIndex(self.viewer.selected_node)) |next| {
+        } else if (loaded.nextVisibleNodeIndex(self.pages.review.viewer.selected_node)) |next| {
             self.selectSidebarNode(loaded, next);
         }
         self.clampSelection(loaded.document.files.len);
@@ -5434,7 +5291,7 @@ pub const App = struct {
     fn selectSidebarNode(self: *App, loaded: *LoadedDiff, node_index: usize) void {
         if (node_index >= loaded.tree.nodes.len) return;
         const previous_file = self.selectedDiffFileTarget();
-        self.viewer.selected_node = node_index;
+        self.pages.review.viewer.selected_node = node_index;
         // File rows change the active diff pane file. Directory rows only move
         // the sidebar cursor and keep the previous selected target visible.
         switch (loaded.tree.nodes[node_index].target) {
@@ -5447,7 +5304,7 @@ pub const App = struct {
             },
             .status_entry => |status_index| {
                 self.clearDiffSelection();
-                self.viewer.selected_target = .{ .status_only = status_index };
+                self.pages.review.viewer.selected_target = .{ .status_only = status_index };
                 self.resetDiffPosition();
                 self.clearSearchMatch();
             },
@@ -5463,22 +5320,22 @@ pub const App = struct {
 
     fn toggleSelectedDirectory(self: *App) !void {
         const loaded = self.activeLoadedDiff() orelse return;
-        if (self.viewer.selected_node >= loaded.tree.nodes.len) return;
-        const node = loaded.tree.nodes[self.viewer.selected_node];
+        if (self.pages.review.viewer.selected_node >= loaded.tree.nodes.len) return;
+        const node = loaded.tree.nodes[self.pages.review.viewer.selected_node];
         if (node.kind != .directory) return;
         const allocator = self.loadArenaAllocator() orelse return;
         try file_tree.toggle(allocator, &loaded.collapsed_dirs, node.path);
-        try loaded.rebuildVisibleNodes(allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
+        try loaded.rebuildVisibleNodes(allocator, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
         self.clampSelection(loaded.document.files.len);
         self.clampSidebarHorizontalScroll();
     }
 
     fn clickSidebarNode(self: *App, node_index: usize) !void {
-        if (self.viewer.sidebar_hidden) return;
+        if (self.pages.review.viewer.sidebar_hidden) return;
         const loaded = self.activeLoadedDiff() orelse return;
         if (node_index >= loaded.tree.nodes.len) return;
 
-        self.viewer.focus = .sidebar;
+        self.pages.review.viewer.focus = .sidebar;
         self.selectSidebarNode(loaded, node_index);
 
         const node = loaded.tree.nodes[node_index];
@@ -5490,39 +5347,39 @@ pub const App = struct {
 
     fn expandSelectedDirectory(self: *App) !void {
         const loaded = self.activeLoadedDiff() orelse return;
-        if (self.viewer.selected_node >= loaded.tree.nodes.len) return;
-        const node = loaded.tree.nodes[self.viewer.selected_node];
+        if (self.pages.review.viewer.selected_node >= loaded.tree.nodes.len) return;
+        const node = loaded.tree.nodes[self.pages.review.viewer.selected_node];
         if (node.kind != .directory) return;
         file_tree.expand(&loaded.collapsed_dirs, node.path);
-        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
+        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
         self.clampSelection(loaded.document.files.len);
         self.clampSidebarHorizontalScroll();
     }
 
     fn collapseOrSelectParentDirectory(self: *App) !void {
         const loaded = self.activeLoadedDiff() orelse return;
-        if (self.viewer.selected_node >= loaded.tree.nodes.len) return;
-        const node = loaded.tree.nodes[self.viewer.selected_node];
+        if (self.pages.review.viewer.selected_node >= loaded.tree.nodes.len) return;
+        const node = loaded.tree.nodes[self.pages.review.viewer.selected_node];
         if (node.kind == .directory and !file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) {
             const allocator = self.loadArenaAllocator() orelse return;
             try file_tree.collapse(allocator, &loaded.collapsed_dirs, node.path);
-            try loaded.rebuildVisibleNodes(allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
+            try loaded.rebuildVisibleNodes(allocator, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
             self.clampSelection(loaded.document.files.len);
             self.clampSidebarHorizontalScroll();
             return;
         }
-        if (loaded.tree.parentDirectoryNodeIndex(self.viewer.selected_node)) |parent| {
-            self.viewer.selected_node = parent;
+        if (loaded.tree.parentDirectoryNodeIndex(self.pages.review.viewer.selected_node)) |parent| {
+            self.pages.review.viewer.selected_node = parent;
             self.clampSelection(loaded.document.files.len);
         }
     }
 
     fn scrollDiff(self: *App, direction: VerticalDirection) void {
-        const old_scroll = self.viewer.diff_scroll;
+        const old_scroll = self.pages.review.viewer.diff_scroll;
         const old_cursor_offset = self.selectedDiffCursorOffset();
         switch (direction) {
-            .up => self.viewer.diff_scroll -|= 1,
-            .down => self.viewer.diff_scroll += 1,
+            .up => self.pages.review.viewer.diff_scroll -|= 1,
+            .down => self.pages.review.viewer.diff_scroll += 1,
         }
         self.clampDiffNavigation();
         self.syncDiffCursorAfterViewportScroll(direction, old_scroll, old_cursor_offset);
@@ -5531,9 +5388,9 @@ pub const App = struct {
     fn scrollDiffHorizontal(self: *App, direction: HorizontalDirection) void {
         const step: usize = 8;
         switch (direction) {
-            .left => self.viewer.diff_horizontal_scroll -|= step,
+            .left => self.pages.review.viewer.diff_horizontal_scroll -|= step,
             .right => {
-                self.viewer.diff_horizontal_scroll += step;
+                self.pages.review.viewer.diff_horizontal_scroll += step;
                 self.clampDiffHorizontalScrollToVisibleRows();
             },
         }
@@ -5542,9 +5399,9 @@ pub const App = struct {
     fn scrollSidebarHorizontal(self: *App, direction: HorizontalDirection) void {
         const step: usize = 4;
         switch (direction) {
-            .left => self.viewer.sidebar_horizontal_scroll -|= step,
+            .left => self.pages.review.viewer.sidebar_horizontal_scroll -|= step,
             .right => {
-                self.viewer.sidebar_horizontal_scroll += step;
+                self.pages.review.viewer.sidebar_horizontal_scroll += step;
                 self.clampSidebarHorizontalScroll();
             },
         }
@@ -5552,14 +5409,14 @@ pub const App = struct {
 
     fn clampSidebarHorizontalScroll(self: *App) void {
         const max_scroll = self.visibleSidebarMaxHorizontalScroll();
-        if (self.viewer.sidebar_horizontal_scroll > max_scroll) {
-            self.viewer.sidebar_horizontal_scroll = max_scroll;
+        if (self.pages.review.viewer.sidebar_horizontal_scroll > max_scroll) {
+            self.pages.review.viewer.sidebar_horizontal_scroll = max_scroll;
         }
     }
 
     fn visibleSidebarMaxHorizontalScroll(self: *const App) usize {
         const loaded = self.activeLoadedDiffConst() orelse return 0;
-        const width = sidebarWidth(self.layoutSize().width, self.viewer.sidebar_width);
+        const width = sidebarWidth(self.layoutSize().width, self.pages.review.viewer.sidebar_width);
         const source = sidebar_view_model.Source{
             .tree = loaded.tree,
             .collapsed = &loaded.collapsed_dirs,
@@ -5570,7 +5427,7 @@ pub const App = struct {
         var max_scroll: usize = 0;
         var visible_index: usize = 0;
         while (visible_index < loaded.visibleNodeCount()) : (visible_index += 1) {
-            const row = sidebar_view_model.rowAt(source, visible_index, self.viewer.selected_node) orelse continue;
+            const row = sidebar_view_model.rowAt(source, visible_index, self.pages.review.viewer.selected_node) orelse continue;
             max_scroll = @max(max_scroll, sidebar_view_model.maxHorizontalScroll(row, width));
         }
         return max_scroll;
@@ -5578,8 +5435,8 @@ pub const App = struct {
 
     fn clampDiffHorizontalScrollToVisibleRows(self: *App) void {
         const max_scroll = self.visibleBodyTextMaxHorizontalScroll();
-        if (self.viewer.diff_horizontal_scroll > max_scroll) {
-            self.viewer.diff_horizontal_scroll = max_scroll;
+        if (self.pages.review.viewer.diff_horizontal_scroll > max_scroll) {
+            self.pages.review.viewer.diff_horizontal_scroll = max_scroll;
         }
     }
 
@@ -5593,19 +5450,19 @@ pub const App = struct {
         const line_index = self.selectedFileCachedLineIndex(mode);
         var max_scroll: usize = 0;
         var rows = if (line_index) |index|
-            diff_view_model.BodyRowIterator.initAtWithFolded(file, mode, index, self.viewer.diff_scroll, self.selectedFoldedHunks())
+            diff_view_model.BodyRowIterator.initAtWithFolded(file, mode, index, self.pages.review.viewer.diff_scroll, self.selectedFoldedHunks())
         else
             diff_view_model.BodyRowIterator.initWithFolded(file, mode, self.selectedFoldedHunks());
-        var skipped: usize = if (line_index != null) self.viewer.diff_scroll else 0;
+        var skipped: usize = if (line_index != null) self.pages.review.viewer.diff_scroll else 0;
         var visible: usize = 0;
         while (rows.next()) |body_row| {
-            if (skipped < self.viewer.diff_scroll) {
+            if (skipped < self.pages.review.viewer.diff_scroll) {
                 skipped += 1;
                 continue;
             }
             if (visible >= visible_rows) break;
             visible += 1;
-            max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(body_row, pane_width, self.viewer.view_options.line_numbers));
+            max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(body_row, pane_width, self.pages.review.viewer.view_options.line_numbers));
         }
         return max_scroll;
     }
@@ -5614,8 +5471,8 @@ pub const App = struct {
         const rows = self.diffVisibleRows();
         const step: usize = @max(rows, 1);
         switch (direction) {
-            .up => self.viewer.diff_scroll -|= step,
-            .down => self.viewer.diff_scroll += step,
+            .up => self.pages.review.viewer.diff_scroll -|= step,
+            .down => self.pages.review.viewer.diff_scroll += step,
         }
         self.clampDiffNavigation();
     }
@@ -5632,7 +5489,7 @@ pub const App = struct {
             .up => current -| 1,
             .down => @min(current + 1, line_count - 1),
         };
-        self.viewer.diff_cursor = self.selectedCoordinateAtOffset(target) orelse self.viewer.diff_cursor;
+        self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(target) orelse self.pages.review.viewer.diff_cursor;
         self.applyDiffCursorScrolloff();
     }
 
@@ -5649,7 +5506,7 @@ pub const App = struct {
             .up => current -| step,
             .down => @min(current + step, line_count - 1),
         };
-        self.viewer.diff_cursor = self.selectedCoordinateAtOffset(target) orelse self.viewer.diff_cursor;
+        self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(target) orelse self.pages.review.viewer.diff_cursor;
         self.applyDiffCursorScrolloff();
     }
 
@@ -5660,7 +5517,7 @@ pub const App = struct {
         const current = self.selectedHunkIndex();
         const target = if (delta < 0) blk: {
             if (current) |hunk_index| {
-                if (self.viewer.diff_cursor == .hunk_line) break :blk hunk_index;
+                if (self.pages.review.viewer.diff_cursor == .hunk_line) break :blk hunk_index;
                 break :blk hunk_index -| 1;
             }
             break :blk 0;
@@ -5668,7 +5525,7 @@ pub const App = struct {
             if (current) |hunk_index| break :blk @min(hunk_index + 1, file.hunks.len - 1);
             break :blk 0;
         };
-        self.viewer.diff_cursor = .{ .hunk_header = target };
+        self.pages.review.viewer.diff_cursor = .{ .hunk_header = target };
         self.applyDiffCursorScrolloff();
     }
 
@@ -5693,9 +5550,9 @@ pub const App = struct {
         const folding = !loaded.isHunkFolded(file_index, hunk_index);
         loaded.toggleHunkFold(file_index, hunk_index);
         if (folding) {
-            switch (self.viewer.diff_cursor) {
+            switch (self.pages.review.viewer.diff_cursor) {
                 .hunk_line => |line| if (line.hunk_index == hunk_index) {
-                    self.viewer.diff_cursor = .{ .hunk_header = hunk_index };
+                    self.pages.review.viewer.diff_cursor = .{ .hunk_header = hunk_index };
                 },
                 else => {},
             }
@@ -5710,10 +5567,10 @@ pub const App = struct {
         const hunk_index = self.selectedHunkIndex() orelse return;
         const target = self.selectedHunkOffset(mode, hunk_index);
         const visible_rows = self.diffVisibleRows();
-        if (target < self.viewer.diff_scroll) {
-            self.viewer.diff_scroll = target;
-        } else if (visible_rows > 0 and target >= self.viewer.diff_scroll + visible_rows) {
-            self.viewer.diff_scroll = target + 1 - visible_rows;
+        if (target < self.pages.review.viewer.diff_scroll) {
+            self.pages.review.viewer.diff_scroll = target;
+        } else if (visible_rows > 0 and target >= self.pages.review.viewer.diff_scroll + visible_rows) {
+            self.pages.review.viewer.diff_scroll = target + 1 - visible_rows;
         }
     }
 
@@ -5722,7 +5579,7 @@ pub const App = struct {
             const line_count = self.selectedProjectionLineCount();
             const visible_rows = self.diffVisibleRows();
             const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
-            if (self.viewer.diff_scroll > max_scroll) self.viewer.diff_scroll = max_scroll;
+            if (self.pages.review.viewer.diff_scroll > max_scroll) self.pages.review.viewer.diff_scroll = max_scroll;
             return;
         }
 
@@ -5734,12 +5591,12 @@ pub const App = struct {
         const line_count = self.selectedFileLineIndex(mode).lineCount();
         const visible_rows = self.diffVisibleRows();
         const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
-        if (self.viewer.diff_scroll > max_scroll) self.viewer.diff_scroll = max_scroll;
+        if (self.pages.review.viewer.diff_scroll > max_scroll) self.pages.review.viewer.diff_scroll = max_scroll;
     }
 
     fn selectedProjectionLineCount(self: *const App) usize {
         if (self.selectedStatusEntry() == null) return 0;
-        return switch (self.review_projection.displayed) {
+        return switch (self.pages.review.review_projection.displayed) {
             .ready => |ready| switch (ready.value) {
                 .cached_diff => |bundle| if (bundle.loaded.document.files.len > 0)
                     if (bundle.loaded.cachedRenderedLineIndex(0, self.effectiveDisplayMode())) |index| index.lineCount() else 0
@@ -5791,7 +5648,7 @@ pub const App = struct {
     }
 
     fn resetDiffPosition(self: *App) void {
-        self.viewer.diff_scroll = 0;
+        self.pages.review.viewer.diff_scroll = 0;
         self.initializeDiffCursorForSelectedFile();
         self.clearSearchMatch();
     }
@@ -5799,34 +5656,34 @@ pub const App = struct {
     fn enterSearchMode(self: *App) void {
         if (self.blockUnsupportedSearchTarget()) return;
         self.clearDiffSelection();
-        self.search.input = self.search.query;
-        self.search.mode = true;
+        self.pages.review.search.input = self.pages.review.search.query;
+        self.pages.review.search.mode = true;
     }
 
     fn cancelSearchMode(self: *App) void {
-        self.search.input = self.search.query;
-        self.search.mode = false;
+        self.pages.review.search.input = self.pages.review.search.query;
+        self.pages.review.search.mode = false;
     }
 
     fn clearSearch(self: *App) void {
-        self.search.mode = false;
-        self.search.input = .{};
-        self.search.query = .{};
+        self.pages.review.search.mode = false;
+        self.pages.review.search.input = .{};
+        self.pages.review.search.query = .{};
         self.clearSearchMatch();
     }
 
     fn enterFileSearchMode(self: *App) void {
         self.clearDiffSelection();
-        self.file_search_return_focus = if (self.viewer.sidebar_hidden) .diff else self.viewer.focus;
-        if (!self.viewer.sidebar_hidden) self.viewer.focus = .sidebar;
-        self.file_search.mode = true;
-        self.file_search.input = .{};
-        self.file_search.resetNoMatch();
+        self.pages.review.file_search_return_focus = if (self.pages.review.viewer.sidebar_hidden) .diff else self.pages.review.viewer.focus;
+        if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .sidebar;
+        self.pages.review.file_search.mode = true;
+        self.pages.review.file_search.input = .{};
+        self.pages.review.file_search.resetNoMatch();
     }
 
     fn cancelFileSearchMode(self: *App, allocator: std.mem.Allocator) void {
-        self.file_search.deinit(allocator);
-        self.viewer.focus = if (self.viewer.sidebar_hidden) .diff else self.file_search_return_focus;
+        self.pages.review.file_search.deinit(allocator);
+        self.pages.review.viewer.focus = if (self.pages.review.viewer.sidebar_hidden) .diff else self.pages.review.file_search_return_focus;
     }
 
     fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
@@ -6052,7 +5909,7 @@ pub const App = struct {
 
     fn resetViewAfterRepoSwitch(self: *App) void {
         self.setSelectedDiffFile(0);
-        self.viewer.selected_node = 0;
+        self.pages.review.viewer.selected_node = 0;
         self.clearSearch();
     }
 
@@ -6240,7 +6097,7 @@ pub const App = struct {
 
     fn toggleReviewedFile(self: *App, allocator: std.mem.Allocator) !void {
         const loaded = self.activeLoadedDiff() orelse return;
-        if (self.viewer.selected_node >= loaded.tree.nodes.len) return;
+        if (self.pages.review.viewer.selected_node >= loaded.tree.nodes.len) return;
 
         const file_index = self.selectedFileIndex(loaded) orelse return;
         if (file_index >= loaded.reviewed_files.len) return;
@@ -6248,10 +6105,10 @@ pub const App = struct {
         if (self.activeRepoRoot() != null and diff_file.canonicalPathKey(file) == null) return;
 
         const reviewed = !loaded.reviewed_files[file_index];
-        try self.reviewed_store.set(allocator, self.activeRepoRoot(), file, reviewed);
+        try self.pages.review.reviewed_store.set(allocator, self.activeRepoRoot(), file, reviewed);
         loaded.reviewed_files[file_index] = reviewed;
-        if (self.review_display.hide_reviewed_files) {
-            try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, true, self.review_display.changed_file_filter);
+        if (self.pages.review.review_display.hide_reviewed_files) {
+            try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, true, self.pages.review.review_display.changed_file_filter);
             self.reconcileSelectionAfterVisibleNodeChange(loaded);
             self.clampSidebarHorizontalScroll();
             self.clampDiffNavigation();
@@ -6259,37 +6116,37 @@ pub const App = struct {
     }
 
     fn toggleHideReviewedFiles(self: *App) !void {
-        self.review_display.hide_reviewed_files = !self.review_display.hide_reviewed_files;
+        self.pages.review.review_display.hide_reviewed_files = !self.pages.review.review_display.hide_reviewed_files;
         const loaded = self.activeLoadedDiff() orelse return;
-        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
+        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
         self.reconcileSelectionAfterVisibleNodeChange(loaded);
         self.clampSidebarHorizontalScroll();
         self.clampDiffNavigation();
     }
 
     fn cycleChangedFileFilter(self: *App) !void {
-        self.review_display.changed_file_filter = self.review_display.changed_file_filter.next();
+        self.pages.review.review_display.changed_file_filter = self.pages.review.review_display.changed_file_filter.next();
         const loaded = self.activeLoadedDiff() orelse return;
-        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter);
+        try loaded.rebuildVisibleNodes(self.loadArenaAllocator() orelse return, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter);
         self.reconcileSelectionAfterVisibleNodeChange(loaded);
         self.clampSidebarHorizontalScroll();
         self.clampDiffNavigation();
     }
 
     fn submitFileSearch(self: *App, allocator: std.mem.Allocator) !void {
-        const query = std.mem.trim(u8, self.file_search.input.slice(), " \t\r\n");
+        const query = std.mem.trim(u8, self.pages.review.file_search.input.slice(), " \t\r\n");
         if (query.len == 0) {
             self.cancelFileSearchMode(allocator);
             return;
         }
 
         const loaded = self.activeLoadedDiff() orelse {
-            self.file_search.no_match = true;
+            self.pages.review.file_search.no_match = true;
             return;
         };
         const node_index = try self.findFileNodeWithFilter(allocator, loaded, query) orelse {
-            self.file_search.clearFilter(allocator);
-            self.file_search.no_match = true;
+            self.pages.review.file_search.clearFilter(allocator);
+            self.pages.review.file_search.no_match = true;
             return;
         };
 
@@ -6297,12 +6154,12 @@ pub const App = struct {
         // parent directory that hides the matched path.
         file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
         const load_allocator = self.loadArenaAllocator() orelse {
-            self.file_search.clearFilter(allocator);
+            self.pages.review.file_search.clearFilter(allocator);
             return;
         };
-        loaded.rebuildVisibleNodes(load_allocator, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter) catch {
-            self.file_search.clearFilter(allocator);
-            self.file_search.no_match = true;
+        loaded.rebuildVisibleNodes(load_allocator, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter) catch {
+            self.pages.review.file_search.clearFilter(allocator);
+            self.pages.review.file_search.no_match = true;
             return;
         };
         self.selectSidebarNode(loaded, node_index);
@@ -6312,11 +6169,11 @@ pub const App = struct {
     }
 
     fn submitSearch(self: *App) void {
-        self.search.mode = false;
+        self.pages.review.search.mode = false;
         if (self.blockUnsupportedSearchTarget()) return;
-        self.search.query = self.search.input;
+        self.pages.review.search.query = self.pages.review.search.input;
         self.clearSearchMatch();
-        if (self.search.query.len == 0) {
+        if (self.pages.review.search.query.len == 0) {
             return;
         }
         self.selectSearchMatch(.forward);
@@ -6326,18 +6183,18 @@ pub const App = struct {
         if (self.blockUnsupportedSearchTarget()) return;
         const mode = self.effectiveDisplayMode();
         const target = self.displayedSearchTarget(mode) orelse return;
-        if (self.search.query.len == 0) return;
+        if (self.pages.review.search.query.len == 0) return;
 
         const line_count = target.line_index.lineCount();
         if (line_count == 0) return;
-        const base = if (self.search.match) |match| match.coordinate else null;
-        const next = diff_search.findMatch(target.file, mode, self.search.query.slice(), base, direction) orelse {
+        const base = if (self.pages.review.search.match) |match| match.coordinate else null;
+        const next = diff_search.findMatch(target.file, mode, self.pages.review.search.query.slice(), base, direction) orelse {
             self.clearSearchMatch();
             return;
         };
         self.unfoldSearchMatchIfNeeded(next);
         self.setSearchMatch(next);
-        self.viewer.diff_cursor = next.coordinate;
+        self.pages.review.viewer.diff_cursor = next.coordinate;
         self.resetDiffHorizontalScroll();
         self.applyDiffCursorScrolloff();
         self.clampDiffNavigation();
@@ -6345,34 +6202,34 @@ pub const App = struct {
 
     fn refreshSearchForSelectedFile(self: *App) void {
         self.clearSearchMatch();
-        if (self.search.query.len == 0) return;
+        if (self.pages.review.search.query.len == 0) return;
         if (self.unsupportedSearchMessage() != null) return;
         const mode = self.effectiveDisplayMode();
         const target = self.displayedSearchTarget(mode) orelse return;
-        const next = diff_search.findMatch(target.file, mode, self.search.query.slice(), null, .forward) orelse return;
+        const next = diff_search.findMatch(target.file, mode, self.pages.review.search.query.slice(), null, .forward) orelse return;
         self.unfoldSearchMatchIfNeeded(next);
         self.setSearchMatch(next);
-        self.viewer.diff_cursor = next.coordinate;
+        self.pages.review.viewer.diff_cursor = next.coordinate;
         self.applyDiffCursorScrolloff();
     }
 
     fn clearSearchMatch(self: *App) void {
-        self.search.match = null;
-        self.search.match_offset = null;
+        self.pages.review.search.match = null;
+        self.pages.review.search.match_offset = null;
     }
 
     fn setSearchMatch(self: *App, match: diff_search.Match) void {
-        self.search.match = match;
+        self.pages.review.search.match = match;
         self.updateSearchMatchOffset();
     }
 
     fn updateSearchMatchOffset(self: *App) void {
-        self.search.match_offset = null;
+        self.pages.review.search.match_offset = null;
         if (self.unsupportedSearchMessage() != null) {
             self.clearSearchMatch();
             return;
         }
-        const match = self.search.match orelse return;
+        const match = self.pages.review.search.match orelse return;
         const mode = self.effectiveDisplayMode();
         const target = self.displayedSearchTarget(mode) orelse {
             self.clearSearchMatch();
@@ -6382,7 +6239,7 @@ pub const App = struct {
             self.clearSearchMatch();
             return;
         };
-        self.search.match_offset = offset;
+        self.pages.review.search.match_offset = offset;
     }
 
     fn blockUnsupportedSearchTarget(self: *App) bool {
@@ -6427,7 +6284,7 @@ pub const App = struct {
     }
 
     fn currentSearchMatchInHunkBody(self: *const App, hunk_index: usize) bool {
-        const match = self.search.match orelse return false;
+        const match = self.pages.review.search.match orelse return false;
         return switch (match.coordinate) {
             .hunk_line => |line| line.hunk_index == hunk_index,
             else => false,
@@ -6435,12 +6292,12 @@ pub const App = struct {
     }
 
     fn scrollSearchMatchIntoView(self: *App) void {
-        const offset = self.search.match_offset orelse return;
+        const offset = self.pages.review.search.match_offset orelse return;
         const visible_rows = self.diffVisibleRows();
-        if (offset < self.viewer.diff_scroll) {
-            self.viewer.diff_scroll = offset;
-        } else if (visible_rows > 0 and offset >= self.viewer.diff_scroll + visible_rows) {
-            self.viewer.diff_scroll = offset + 1 - visible_rows;
+        if (offset < self.pages.review.viewer.diff_scroll) {
+            self.pages.review.viewer.diff_scroll = offset;
+        } else if (visible_rows > 0 and offset >= self.pages.review.viewer.diff_scroll + visible_rows) {
+            self.pages.review.viewer.diff_scroll = offset + 1 - visible_rows;
         }
     }
 
@@ -6457,7 +6314,7 @@ pub const App = struct {
 
         var reviewed_paths: std.ArrayList([]const u8) = .empty;
         defer reviewed_paths.deinit(ctx.allocator());
-        self.reviewed_store.appendPathKeysForRepo(ctx.allocator(), self.activeRepoRoot(), &reviewed_paths) catch {
+        self.pages.review.reviewed_store.appendPathKeysForRepo(ctx.allocator(), self.activeRepoRoot(), &reviewed_paths) catch {
             self.setStatus("could not finalize review result", .{});
             return;
         };
@@ -6500,7 +6357,7 @@ pub const App = struct {
     }
 
     fn currentSelection(self: *const App) ?context.Selection {
-        const target = self.viewer.selected_target orelse return null;
+        const target = self.pages.review.viewer.selected_target orelse return null;
         return switch (target) {
             .diff_file => |file_index| if (self.activeLoadedDiffConst()) |loaded|
                 self.diffFileSelection(loaded, file_index)
@@ -6523,11 +6380,11 @@ pub const App = struct {
             const path = self.selectedStagePathKey() orelse return null;
             return .{ .path = path, .kind = .file };
         };
-        if (self.viewer.selected_node >= loaded.tree.nodes.len) return null;
+        if (self.pages.review.viewer.selected_node >= loaded.tree.nodes.len) return null;
 
         // Directory rows intentionally do not update selected_target; actions
         // must use the sidebar cursor so they do not hit the previous file.
-        const node = loaded.tree.nodes[self.viewer.selected_node];
+        const node = loaded.tree.nodes[self.pages.review.viewer.selected_node];
         return switch (node.target) {
             .repo_root => .{ .path = "", .kind = .repository },
             .directory => |path| .{ .path = if (path.len > 0) path else node.path, .kind = .directory },
@@ -6544,17 +6401,17 @@ pub const App = struct {
             .repo_root = self.activeRepoRoot(),
             .action_target = self.selectedSidebarActionTarget(),
             .status = .{
-                .repo_root = self.git_status.repo_root,
-                .loading = self.status_load.isPending(),
-                .fresh = self.status_load.isFresh(),
-                .entries = self.git_status.document.entries,
+                .repo_root = self.pages.review.git_status.repo_root,
+                .loading = self.pages.review.status_load.isPending(),
+                .fresh = self.pages.review.status_load.isFresh(),
+                .entries = self.pages.review.git_status.document.entries,
             },
-            .source_fresh = self.auto_reload.sourceIsActionable(),
+            .source_fresh = self.pages.review.auto_reload.sourceIsActionable(),
         };
     }
 
     fn statusEntryForPathKey(self: *const App, path_key: []const u8) ?git_status.StatusEntry {
-        for (self.git_status.document.entries) |entry| {
+        for (self.pages.review.git_status.document.entries) |entry| {
             const entry_key = entry.canonicalPathKey() orelse continue;
             if (std.mem.eql(u8, entry_key, path_key)) return entry;
         }
@@ -6562,8 +6419,8 @@ pub const App = struct {
     }
 
     fn freshStatusEntryForPathKey(self: *const App, repo_root: []const u8, path_key: []const u8) ?git_status.StatusEntry {
-        if (!self.status_load.isFresh()) return null;
-        const snapshot_root = self.git_status.repo_root orelse return null;
+        if (!self.pages.review.status_load.isFresh()) return null;
+        const snapshot_root = self.pages.review.git_status.repo_root orelse return null;
         if (!std.mem.eql(u8, snapshot_root, repo_root)) return null;
         return self.statusEntryForPathKey(path_key);
     }
@@ -6576,22 +6433,22 @@ pub const App = struct {
     fn setPendingSelectionRestore(self: *App, allocator: std.mem.Allocator, path_key: []const u8) !void {
         self.clearPendingSelectionRestore(allocator);
         const visible_row = if (self.activeLoadedDiffConst()) |loaded|
-            loaded.visibleRowOfNode(self.viewer.selected_node) orelse 0
+            loaded.visibleRowOfNode(self.pages.review.viewer.selected_node) orelse 0
         else
             0;
-        self.pending_selection_restore = .{
+        self.pages.review.pending_selection_restore = .{
             .path_key = try allocator.dupe(u8, path_key),
             .visible_row = visible_row,
         };
     }
 
     fn clearPendingSelectionRestore(self: *App, allocator: std.mem.Allocator) void {
-        if (self.pending_selection_restore) |*restore| restore.deinit(allocator);
-        self.pending_selection_restore = null;
+        if (self.pages.review.pending_selection_restore) |*restore| restore.deinit(allocator);
+        self.pages.review.pending_selection_restore = null;
     }
 
     fn restorePendingSelectionOrFallback(self: *App, allocator: std.mem.Allocator, loaded: *LoadedDiff) bool {
-        const restore = self.pending_selection_restore orelse return false;
+        const restore = self.pages.review.pending_selection_restore orelse return false;
         defer self.clearPendingSelectionRestore(allocator);
 
         if (findNodeByPathKey(loaded, restore.path_key)) |node_index| {
@@ -6600,8 +6457,8 @@ pub const App = struct {
         }
 
         if (loaded.visibleNodeCount() == 0) {
-            self.viewer.selected_target = null;
-            self.viewer.selected_node = 0;
+            self.pages.review.viewer.selected_target = null;
+            self.pages.review.viewer.selected_node = 0;
             return true;
         }
 
@@ -6615,7 +6472,7 @@ pub const App = struct {
     }
 
     fn restorePendingSelectionByPath(self: *App, allocator: std.mem.Allocator, loaded: *LoadedDiff) bool {
-        const restore = self.pending_selection_restore orelse return false;
+        const restore = self.pages.review.pending_selection_restore orelse return false;
         if (findNodeByPathKey(loaded, restore.path_key)) |node_index| {
             defer self.clearPendingSelectionRestore(allocator);
             self.selectSidebarNode(loaded, node_index);
@@ -6624,14 +6481,14 @@ pub const App = struct {
         return false;
     }
 
-    fn restoreReloadAnchor(self: *App, loaded: *LoadedDiff, anchor: *const ReloadAnchor) bool {
+    fn restoreReloadAnchor(self: *App, loaded: *LoadedDiff, anchor: *const review_page.ReloadAnchor) bool {
         const selected_same_path = if (findNodeByPathKey(loaded, anchor.path_key)) |node_index| blk: {
             self.selectSidebarNode(loaded, node_index);
             break :blk true;
         } else blk: {
             if (loaded.visibleNodeCount() == 0) {
-                self.viewer.selected_target = null;
-                self.viewer.selected_node = 0;
+                self.pages.review.viewer.selected_target = null;
+                self.pages.review.viewer.selected_node = 0;
                 self.resetDiffPosition();
                 self.clearSearchMatch();
                 return true;
@@ -6644,25 +6501,25 @@ pub const App = struct {
             return false;
         };
 
-        self.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
-        self.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
+        self.pages.review.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
+        self.pages.review.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
 
-        if (selected_same_path and std.meta.activeTag(self.viewer.selected_target.?) == anchor.selected_target_tag) {
-            self.viewer.diff_cursor = anchor.diff_cursor;
+        if (selected_same_path and std.meta.activeTag(self.pages.review.viewer.selected_target.?) == anchor.selected_target_tag) {
+            self.pages.review.viewer.diff_cursor = anchor.diff_cursor;
             if (self.selectedDiffCursorOffset() == null) {
                 if (anchor.diff_cursor_offset) |offset| {
-                    self.viewer.diff_cursor = self.selectedCoordinateAtOffset(offset) orelse self.viewer.diff_cursor;
+                    self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(offset) orelse self.pages.review.viewer.diff_cursor;
                 }
             }
         } else if (anchor.diff_cursor_offset) |offset| {
-            self.viewer.diff_cursor = self.selectedCoordinateAtOffset(offset) orelse self.viewer.diff_cursor;
+            self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(offset) orelse self.pages.review.viewer.diff_cursor;
         }
 
         if (self.selectedDiffCursorOffset() == null) {
             self.initializeDiffCursorForSelectedFile();
         }
 
-        self.viewer.diff_scroll = anchor.diff_scroll;
+        self.pages.review.viewer.diff_scroll = anchor.diff_scroll;
         self.clampDiffNavigation();
         self.keepDiffCursorVisible();
         self.restoreSearchFromReloadAnchor(anchor);
@@ -6674,22 +6531,22 @@ pub const App = struct {
     fn keepDiffCursorVisible(self: *App) void {
         const offset = self.selectedDiffCursorOffset() orelse return;
         const visible_rows = self.diffVisibleRows();
-        if (offset < self.viewer.diff_scroll) {
-            self.viewer.diff_scroll = offset;
-        } else if (visible_rows > 0 and offset >= self.viewer.diff_scroll + visible_rows) {
-            self.viewer.diff_scroll = offset + 1 - visible_rows;
+        if (offset < self.pages.review.viewer.diff_scroll) {
+            self.pages.review.viewer.diff_scroll = offset;
+        } else if (visible_rows > 0 and offset >= self.pages.review.viewer.diff_scroll + visible_rows) {
+            self.pages.review.viewer.diff_scroll = offset + 1 - visible_rows;
         }
         self.clampDiffNavigation();
     }
 
-    fn restoreSearchFromReloadAnchor(self: *App, anchor: *const ReloadAnchor) void {
+    fn restoreSearchFromReloadAnchor(self: *App, anchor: *const review_page.ReloadAnchor) void {
         self.clearSearchMatch();
-        if (self.search.query.len == 0) return;
+        if (self.pages.review.search.query.len == 0) return;
 
         if (anchor.search_coordinate) |coordinate| {
-            self.search.match = .{ .coordinate = coordinate };
+            self.pages.review.search.match = .{ .coordinate = coordinate };
             self.updateSearchMatchOffset();
-            if (self.search.match != null) return;
+            if (self.pages.review.search.match != null) return;
         }
 
         self.refreshSearchForSelectedFile();
@@ -6745,10 +6602,10 @@ pub const App = struct {
 
     fn statusOnlySelection(self: *const App, status_index: usize) ?context.Selection {
         const repo_root = self.activeRepoRoot() orelse return null;
-        const status_root = self.git_status.repo_root orelse return null;
+        const status_root = self.pages.review.git_status.repo_root orelse return null;
         if (!std.mem.eql(u8, repo_root, status_root)) return null;
-        if (status_index >= self.git_status.document.entries.len) return null;
-        const entry = self.git_status.document.entries[status_index];
+        if (status_index >= self.pages.review.git_status.document.entries.len) return null;
+        const entry = self.pages.review.git_status.document.entries[status_index];
         const path_key = entry.canonicalPathKey() orelse return null;
         return .{ .status_only = .{
             .status_index = status_index,
@@ -6757,19 +6614,19 @@ pub const App = struct {
     }
 
     pub fn selectedStatusEntry(self: *const App) ?git_status.StatusEntry {
-        const target = self.viewer.selected_target orelse return null;
+        const target = self.pages.review.viewer.selected_target orelse return null;
         const status_index = switch (target) {
             .status_only => |index| index,
             else => return null,
         };
-        if (status_index >= self.git_status.document.entries.len) return null;
-        return self.git_status.document.entries[status_index];
+        if (status_index >= self.pages.review.git_status.document.entries.len) return null;
+        return self.pages.review.git_status.document.entries[status_index];
     }
 
     pub fn selectedStatusLineStats(self: *const App) ?file_tree.Stats {
         const entry = self.selectedStatusEntry() orelse return null;
         const path_key = entry.canonicalPathKey() orelse return null;
-        for (self.git_status.document.line_stats) |line_stats| {
+        for (self.pages.review.git_status.document.line_stats) |line_stats| {
             if (std.mem.eql(u8, line_stats.path_key, path_key)) return line_stats.stats;
         }
         return null;
@@ -6779,14 +6636,14 @@ pub const App = struct {
         const scope = try self.treeOrderScopeText(allocator);
         defer allocator.free(scope);
 
-        if (self.tree_order_scope) |current| {
+        if (self.pages.review.tree_order_scope) |current| {
             if (std.mem.eql(u8, current, scope)) return;
             allocator.free(current);
-            self.tree_order_scope = null;
-            self.tree_order.reset(allocator);
+            self.pages.review.tree_order_scope = null;
+            self.pages.review.tree_order.reset(allocator);
         }
 
-        self.tree_order_scope = try allocator.dupe(u8, scope);
+        self.pages.review.tree_order_scope = try allocator.dupe(u8, scope);
     }
 
     fn treeOrderScopeText(self: *const App, allocator: std.mem.Allocator) ![]u8 {
@@ -6805,7 +6662,7 @@ pub const App = struct {
     fn stableOrderOptions(self: *App, allocator: std.mem.Allocator) ?file_tree.StableOrderOptions {
         return .{
             .allocator = allocator,
-            .order = &self.tree_order,
+            .order = &self.pages.review.tree_order,
         };
     }
 
@@ -6891,7 +6748,7 @@ pub const App = struct {
     }
 
     pub fn activeGeneratedFileProjection(self: *const App) ?*const app_review_projection.GeneratedFileBundle {
-        return switch (self.review_projection.displayed) {
+        return switch (self.pages.review.review_projection.displayed) {
             .ready => |*ready| blk: {
                 if (ready.request.kind != .generated_added_file or !self.displayedProjectionRequestIsActive(ready.request)) break :blk null;
                 break :blk switch (ready.value) {
@@ -6904,7 +6761,7 @@ pub const App = struct {
     }
 
     pub fn activeCachedDiffProjection(self: *const App) ?*const app_load.LoadedDiffBundle {
-        return switch (self.review_projection.displayed) {
+        return switch (self.pages.review.review_projection.displayed) {
             .ready => |*ready| blk: {
                 if (ready.request.kind != .cached_diff or !self.displayedProjectionRequestIsActive(ready.request)) break :blk null;
                 break :blk switch (ready.value) {
@@ -6917,7 +6774,7 @@ pub const App = struct {
     }
 
     fn activeCombinedProjection(self: *const App) ?*const app_review_projection.CombinedHunkBundle {
-        return switch (self.review_projection.displayed) {
+        return switch (self.pages.review.review_projection.displayed) {
             .ready => |*ready| blk: {
                 if (ready.request.kind != .combined_hunks or !self.displayedProjectionRequestIsActive(ready.request)) break :blk null;
                 break :blk switch (ready.value) {
@@ -6936,20 +6793,20 @@ pub const App = struct {
             repo_root,
             path_key,
             reviewProjectionSourceKind(self.config.source),
-            self.source_session_revision,
+            self.pages.review.source_session_revision,
         );
     }
 
     fn currentCombinedProjection(self: *const App) ?*const app_review_projection.CombinedHunkBundle {
         const target = self.reviewProjectionTarget() orelse return null;
         if (target.kind != .combined_hunks) return null;
-        if (!self.review_projection.displayedMatches(
+        if (!self.pages.review.review_projection.displayedMatches(
             target.repo_root,
             target.path_key,
             target.kind,
             target.source_kind,
-            self.source_session_revision,
-            self.status_snapshot_revision,
+            self.pages.review.source_session_revision,
+            self.pages.review.status_snapshot_revision,
         )) return null;
         return self.activeCombinedProjection();
     }
@@ -6988,7 +6845,7 @@ pub const App = struct {
     }
 
     pub fn selectedHunkIndex(self: *const App) ?usize {
-        return switch (self.viewer.diff_cursor) {
+        return switch (self.pages.review.viewer.diff_cursor) {
             .hunk_header => |hunk_index| hunk_index,
             .hunk_line => |line| line.hunk_index,
             .metadata, .binary_marker => null,
@@ -6996,13 +6853,13 @@ pub const App = struct {
     }
 
     pub fn stagedHunkFlagsForFile(self: *const App, allocator: std.mem.Allocator, file: diff_parser.FileDiff) ![]const bool {
-        if (self.staged_hunks.items.items.len == 0 or file.hunks.len == 0) return &.{};
+        if (self.pages.review.staged_hunks.items.items.len == 0 or file.hunks.len == 0) return &.{};
         const repo_root = self.activeRepoRoot() orelse return &.{};
         const path = diff_file.canonicalPathKey(file) orelse return &.{};
 
         var marked_count: usize = 0;
         for (0..file.hunks.len) |hunk_index| {
-            if (self.staged_hunks.contains(repo_root, path, hunk_index)) marked_count += 1;
+            if (self.pages.review.staged_hunks.contains(repo_root, path, hunk_index)) marked_count += 1;
         }
 
         if (marked_count == 0) return &.{};
@@ -7011,14 +6868,14 @@ pub const App = struct {
         const flags = try allocator.alloc(bool, file.hunks.len);
         @memset(flags, false);
         for (flags, 0..) |*flag, hunk_index| {
-            flag.* = self.staged_hunks.contains(repo_root, path, hunk_index);
+            flag.* = self.pages.review.staged_hunks.contains(repo_root, path, hunk_index);
         }
         return flags;
     }
 
     fn selectedDiffCursorOffset(self: *const App) ?usize {
         if (self.displayedGeneratedLineCount()) |line_count| {
-            return switch (self.viewer.diff_cursor) {
+            return switch (self.pages.review.viewer.diff_cursor) {
                 .metadata => |offset| if (offset < line_count) offset else null,
                 else => null,
             };
@@ -7027,7 +6884,7 @@ pub const App = struct {
         const mode = self.effectiveDisplayMode();
         const file = self.displayedDiffFile() orelse return null;
         const index = self.displayedDiffLineIndex(mode) orelse self.selectedFileCachedLineIndex(mode);
-        return diff_view_model.renderedOffsetForCoordinate(file, mode, self.viewer.diff_cursor, index);
+        return diff_view_model.renderedOffsetForCoordinate(file, mode, self.pages.review.viewer.diff_cursor, index);
     }
 
     fn selectedCoordinateAtOffset(self: *const App, offset: usize) ?diff_view_model.BodyCoordinate {
@@ -7043,14 +6900,14 @@ pub const App = struct {
     }
 
     fn initializeDiffCursorForSelectedFile(self: *App) void {
-        self.viewer.diff_cursor = self.selectedCoordinateAtOffset(0) orelse .{ .metadata = 0 };
+        self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(0) orelse .{ .metadata = 0 };
     }
 
     pub fn visibleDiffCursorOffset(self: *const App) ?usize {
         const offset = self.selectedDiffCursorOffset() orelse return null;
         const visible_rows = self.diffVisibleRows();
-        if (offset < self.viewer.diff_scroll) return null;
-        if (visible_rows == 0 or offset >= self.viewer.diff_scroll + visible_rows) return null;
+        if (offset < self.pages.review.viewer.diff_scroll) return null;
+        if (visible_rows == 0 or offset >= self.pages.review.viewer.diff_scroll + visible_rows) return null;
         return offset;
     }
 
@@ -7069,12 +6926,12 @@ pub const App = struct {
             return;
         }
         const margin = @min(@as(usize, 8), visible_rows / 3);
-        if (cursor_offset < self.viewer.diff_scroll + margin) {
-            self.viewer.diff_scroll = cursor_offset -| margin;
+        if (cursor_offset < self.pages.review.viewer.diff_scroll + margin) {
+            self.pages.review.viewer.diff_scroll = cursor_offset -| margin;
         } else {
-            const lower_edge = self.viewer.diff_scroll + visible_rows -| margin;
+            const lower_edge = self.pages.review.viewer.diff_scroll + visible_rows -| margin;
             if (cursor_offset >= lower_edge) {
-                self.viewer.diff_scroll = cursor_offset + margin + 1 - visible_rows;
+                self.pages.review.viewer.diff_scroll = cursor_offset + margin + 1 - visible_rows;
             }
         }
         self.clampDiffNavigation();
@@ -7092,20 +6949,20 @@ pub const App = struct {
         const margin = @min(@as(usize, 8), visible_rows / 3);
         const target = if (old_cursor_offset) |offset| blk: {
             if (offset >= old_scroll and offset < old_scroll + visible_rows) {
-                break :blk self.viewer.diff_scroll + (offset - old_scroll);
+                break :blk self.pages.review.viewer.diff_scroll + (offset - old_scroll);
             }
             break :blk switch (direction) {
-                .up => self.viewer.diff_scroll + margin,
-                .down => self.viewer.diff_scroll + visible_rows - 1 -| margin,
+                .up => self.pages.review.viewer.diff_scroll + margin,
+                .down => self.pages.review.viewer.diff_scroll + visible_rows - 1 -| margin,
             };
         } else blk: {
             break :blk switch (direction) {
-                .up => self.viewer.diff_scroll + margin,
-                .down => self.viewer.diff_scroll + visible_rows - 1 -| margin,
+                .up => self.pages.review.viewer.diff_scroll + margin,
+                .down => self.pages.review.viewer.diff_scroll + visible_rows - 1 -| margin,
             };
         };
 
-        self.viewer.diff_cursor = self.selectedCoordinateAtOffset(@min(target, line_count - 1)) orelse self.viewer.diff_cursor;
+        self.pages.review.viewer.diff_cursor = self.selectedCoordinateAtOffset(@min(target, line_count - 1)) orelse self.pages.review.viewer.diff_cursor;
     }
 
     fn loadedFileCount(self: *const App) ?usize {
@@ -7114,7 +6971,7 @@ pub const App = struct {
     }
 
     fn effectiveDisplayMode(self: *const App) diff_render.DisplayMode {
-        return diff_render.effectiveMode(diff_render.bodyWidth(self.diffPaneWidth()), self.viewer.display_mode);
+        return diff_render.effectiveMode(diff_render.bodyWidth(self.diffPaneWidth()), self.pages.review.viewer.display_mode);
     }
 
     fn layoutSize(self: *const App) chasen.Size {
@@ -7127,8 +6984,8 @@ pub const App = struct {
 
     fn diffPaneWidth(self: *const App) u16 {
         const width = self.layoutSize().width;
-        if (self.viewer.sidebar_hidden) return contentWidth(width);
-        const sidebar_width = sidebarWidth(width, self.viewer.sidebar_width);
+        if (self.pages.review.viewer.sidebar_hidden) return contentWidth(width);
+        const sidebar_width = sidebarWidth(width, self.pages.review.viewer.sidebar_width);
         if (width <= sidebar_width + 1) return 0;
         return contentWidth(width - sidebar_width - 1);
     }
@@ -7136,8 +6993,8 @@ pub const App = struct {
     fn toggleSidebarVisibility(self: *App) void {
         const previous_width = self.diffPaneWidth();
         const previous_mode = self.effectiveDisplayMode();
-        self.viewer.sidebar_hidden = !self.viewer.sidebar_hidden;
-        if (self.viewer.sidebar_hidden) self.viewer.focus = .diff;
+        self.pages.review.viewer.sidebar_hidden = !self.pages.review.viewer.sidebar_hidden;
+        if (self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .diff;
         self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
         if (previous_mode != self.effectiveDisplayMode()) self.clearDiffSelection();
         self.clampDiffNavigationKeepingHunkVisible();
@@ -7150,14 +7007,14 @@ pub const App = struct {
         const total_width = self.layoutSize().width;
         const previous_width = self.diffPaneWidth();
         const previous_mode = self.effectiveDisplayMode();
-        const current = sidebarWidth(total_width, self.viewer.sidebar_width);
+        const current = sidebarWidth(total_width, self.pages.review.viewer.sidebar_width);
         const step: u16 = 4;
         const next = switch (direction) {
             .shrink => if (current > step) current - step else 0,
             .grow => current +| step,
         };
 
-        self.viewer.sidebar_width = sidebarWidth(total_width, next);
+        self.pages.review.viewer.sidebar_width = sidebarWidth(total_width, next);
         self.clampSidebarHorizontalScroll();
         self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
         if (previous_mode != self.effectiveDisplayMode()) self.clearDiffSelection();
@@ -7168,7 +7025,7 @@ pub const App = struct {
     }
 
     fn resetDiffHorizontalScroll(self: *App) void {
-        self.viewer.diff_horizontal_scroll = 0;
+        self.pages.review.viewer.diff_horizontal_scroll = 0;
     }
 
     fn resetDiffHorizontalScrollIfPaneWidthChanged(self: *App, previous_width: u16) void {
@@ -7179,27 +7036,27 @@ pub const App = struct {
         if (file_count == 0) {
             if (self.activeLoadedDiff()) |loaded| {
                 if (loaded.tree.nodes.len > 0) {
-                    self.viewer.selected_node = @min(self.viewer.selected_node, loaded.tree.nodes.len - 1);
-                    const node = loaded.tree.nodes[self.viewer.selected_node];
-                    self.viewer.selected_target = switch (node.target) {
+                    self.pages.review.viewer.selected_node = @min(self.pages.review.viewer.selected_node, loaded.tree.nodes.len - 1);
+                    const node = loaded.tree.nodes[self.pages.review.viewer.selected_node];
+                    self.pages.review.viewer.selected_target = switch (node.target) {
                         .status_entry => |status_index| .{ .status_only = status_index },
                         .diff_file => |file_index| .{ .diff_file = file_index },
-                        .repo_root, .directory => self.viewer.selected_target,
+                        .repo_root, .directory => self.pages.review.viewer.selected_target,
                     };
                     return;
                 }
             }
-            self.viewer.selected_target = null;
-            self.viewer.selected_file = 0;
-            self.viewer.selected_node = 0;
+            self.pages.review.viewer.selected_target = null;
+            self.pages.review.viewer.selected_file = 0;
+            self.pages.review.viewer.selected_node = 0;
             return;
         }
-        if (self.viewer.selected_target) |target| {
+        if (self.pages.review.viewer.selected_target) |target| {
             switch (target) {
                 .diff_file => |file_index| if (file_index >= file_count) {
                     self.setSelectedDiffFile(file_count - 1);
                 },
-                .status_only => |status_index| if (status_index >= self.git_status.document.entries.len) {
+                .status_only => |status_index| if (status_index >= self.pages.review.git_status.document.entries.len) {
                     self.setSelectedDiffFile(file_count - 1);
                 },
             }
@@ -7207,21 +7064,21 @@ pub const App = struct {
             self.setSelectedDiffFile(file_count - 1);
         }
         if (self.activeLoadedDiff()) |loaded| {
-            if (self.viewer.selected_node >= loaded.tree.nodes.len) {
+            if (self.pages.review.viewer.selected_node >= loaded.tree.nodes.len) {
                 self.syncSidebarNodeToSelectedFile(loaded);
             }
-            if (loaded.visibleAncestorOrSelf(self.viewer.selected_node)) |visible_node| {
-                self.viewer.selected_node = visible_node;
+            if (loaded.visibleAncestorOrSelf(self.pages.review.viewer.selected_node)) |visible_node| {
+                self.pages.review.viewer.selected_node = visible_node;
             } else if (self.selectedFileIndex(loaded)) |file_index| {
                 if (loaded.tree.selectedNodeIndex(file_index)) |file_node| {
-                    self.viewer.selected_node = file_node;
+                    self.pages.review.viewer.selected_node = file_node;
                 }
             }
         }
     }
 
     fn reconcileSelectionAfterVisibleNodeChange(self: *App, loaded: *LoadedDiff) void {
-        if (loaded.visibleRowOfNode(self.viewer.selected_node) != null) {
+        if (loaded.visibleRowOfNode(self.pages.review.viewer.selected_node) != null) {
             return;
         }
 
@@ -7230,13 +7087,13 @@ pub const App = struct {
             return;
         }
 
-        if (loaded.visibleAncestorOrSelf(self.viewer.selected_node)) |visible_node| {
+        if (loaded.visibleAncestorOrSelf(self.pages.review.viewer.selected_node)) |visible_node| {
             self.selectSidebarNode(loaded, visible_node);
             return;
         }
 
         if (loaded.visibleNodeAt(0)) |node_index| {
-            self.viewer.selected_node = node_index;
+            self.pages.review.viewer.selected_node = node_index;
         }
     }
 
@@ -7247,26 +7104,26 @@ pub const App = struct {
     }
 
     fn selectedDiffFileTarget(self: *const App) ?usize {
-        const target = self.viewer.selected_target orelse return null;
+        const target = self.pages.review.viewer.selected_target orelse return null;
         return target.diffFileIndex();
     }
 
     fn setSelectedDiffFile(self: *App, file_index: usize) void {
-        const same_target = if (self.viewer.selected_target) |target|
+        const same_target = if (self.pages.review.viewer.selected_target) |target|
             if (target.diffFileIndex()) |current| current == file_index else false
         else
             false;
         if (!same_target) self.clearDiffSelection();
-        self.viewer.selected_target = .{ .diff_file = file_index };
-        self.viewer.selected_file = file_index;
+        self.pages.review.viewer.selected_target = .{ .diff_file = file_index };
+        self.pages.review.viewer.selected_file = file_index;
     }
 
     fn syncSidebarNodeToSelectedFile(self: *App, loaded: *const LoadedDiff) void {
         const file_index = self.selectedFileIndex(loaded) orelse {
-            self.viewer.selected_node = 0;
+            self.pages.review.viewer.selected_node = 0;
             return;
         };
-        self.viewer.selected_node = loaded.tree.selectedNodeIndex(file_index) orelse 0;
+        self.pages.review.viewer.selected_node = loaded.tree.selectedNodeIndex(file_index) orelse 0;
     }
 
     fn selectFirstVisibleFile(self: *App, loaded: *LoadedDiff) void {
@@ -7283,7 +7140,7 @@ pub const App = struct {
         errdefer allocator.free(reviewed_files);
 
         for (loaded.document.files, 0..) |file, index| {
-            reviewed_files[index] = try self.reviewed_store.containsFile(allocator, self.activeRepoRoot(), file);
+            reviewed_files[index] = try self.pages.review.reviewed_store.containsFile(allocator, self.activeRepoRoot(), file);
         }
         loaded.reviewed_files = reviewed_files;
     }
@@ -7296,15 +7153,15 @@ pub const App = struct {
 
         for (loaded.tree.nodes, 0..) |node, index| {
             if (node.kind != .file) continue;
-            if (!loaded.shouldIncludeFileNode(index, self.review_display.hide_reviewed_files, self.review_display.changed_file_filter)) continue;
+            if (!loaded.shouldIncludeFileNode(index, self.pages.review.review_display.hide_reviewed_files, self.pages.review.review_display.changed_file_filter)) continue;
             try labels.append(allocator, node.path);
             try node_indexes.append(allocator, index);
         }
 
         // ListFilter owns the filtered index arrays, while file path labels
         // remain borrowed from the active LoadedDiff.
-        try self.file_search.filter.applyWithSourceIndexes(allocator, labels.items, node_indexes.items, query);
-        return self.file_search.filter.sourceIndex(0);
+        try self.pages.review.file_search.filter.applyWithSourceIndexes(allocator, labels.items, node_indexes.items, query);
+        return self.pages.review.file_search.filter.sourceIndex(0);
     }
 
     fn loadedDiff(self: *App) ?*LoadedDiff {
@@ -7312,21 +7169,21 @@ pub const App = struct {
     }
 
     fn activeLoadedDiff(self: *App) ?*LoadedDiff {
-        return switch (self.load.state) {
+        return switch (self.pages.review.load.state) {
             .loaded => |*session| &session.loaded,
             else => null,
         };
     }
 
     fn activeLoadedDiffConst(self: *const App) ?*const LoadedDiff {
-        return switch (self.load.state) {
+        return switch (self.pages.review.load.state) {
             .loaded => |*session| &session.loaded,
             else => null,
         };
     }
 
     fn loadArenaAllocator(self: *App) ?std.mem.Allocator {
-        return switch (self.load.state) {
+        return switch (self.pages.review.load.state) {
             .loaded => |*session| session.arena.allocator(),
             .failed => |*failed| failed.arena.allocator(),
             else => null,
@@ -7451,178 +7308,194 @@ test "countLines handles empty and trailing newline inputs" {
 
 test "file selection boundary does not reset diff position" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .diff_scroll = 4,
+                .diff_cursor = .{ .hunk_header = 1 },
+            },
+        } },
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .diff_scroll = 4,
-            .diff_cursor = .{ .hunk_header = 1 },
-        },
     };
 
     app.selectFileDelta(-1);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
-    try std.testing.expectEqual(@as(usize, 4), app.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 4), app.pages.review.viewer.diff_scroll);
     try std.testing.expectEqual(@as(?usize, 1), app.selectedHunkIndex());
 
     app.selectFileAbsolute(0);
-    try std.testing.expectEqual(@as(usize, 4), app.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 4), app.pages.review.viewer.diff_scroll);
     try std.testing.expectEqual(@as(?usize, 1), app.selectedHunkIndex());
 }
 
 test "mode toggle keeps selected hunk visible" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .unified,
+                .diff_cursor = .{ .hunk_header = 1 },
+            },
+        } },
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .unified,
-            .diff_cursor = .{ .hunk_header = 1 },
-        },
     };
 
     app.scrollSelectedHunkIntoView();
-    try std.testing.expect(app.viewer.diff_scroll > 0);
+    try std.testing.expect(app.pages.review.viewer.diff_scroll > 0);
 
-    app.viewer.display_mode = .side_by_side;
+    app.pages.review.viewer.display_mode = .side_by_side;
     app.clampDiffNavigationKeepingHunkVisible();
 
     const file = app_test_support.file_with_hunks;
     const target = diff_render.hunkBodyLineOffset(file, app.effectiveDisplayMode(), app.selectedHunkIndex().?);
     const visible_rows = app.diffVisibleRows();
-    try std.testing.expect(target >= app.viewer.diff_scroll);
-    try std.testing.expect(visible_rows == 0 or target < app.viewer.diff_scroll + visible_rows);
+    try std.testing.expect(target >= app.pages.review.viewer.diff_scroll);
+    try std.testing.expect(visible_rows == 0 or target < app.pages.review.viewer.diff_scroll + visible_rows);
 }
 
 test "sidebar visibility toggle uses full diff width and keeps selection" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .focus = .sidebar,
+                .selected_file = 0,
+                .selected_node = 1,
+                .display_mode = .side_by_side,
+            },
+        } },
         .terminal_size = .{ .width = 80, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .focus = .sidebar,
-            .selected_file = 0,
-            .selected_node = 1,
-            .display_mode = .side_by_side,
-        },
     };
 
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
 
     app.toggleSidebarVisibility();
 
-    try std.testing.expect(app.viewer.sidebar_hidden);
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
+    try std.testing.expect(app.pages.review.viewer.sidebar_hidden);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
 
     app.toggleSidebarVisibility();
 
-    try std.testing.expect(!app.viewer.sidebar_hidden);
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expect(!app.pages.review.viewer.sidebar_hidden);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
 }
 
 test "sidebar width adjustment clamps and affects effective mode" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .display_mode = .side_by_side },
+        } },
         .terminal_size = .{ .width = 104, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .display_mode = .side_by_side },
     };
 
-    try std.testing.expectEqual(@as(?u16, null), app.viewer.sidebar_width);
+    try std.testing.expectEqual(@as(?u16, null), app.pages.review.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
 
     app.adjustSidebarWidth(.shrink);
-    try std.testing.expectEqual(@as(?u16, 30), app.viewer.sidebar_width);
+    try std.testing.expectEqual(@as(?u16, 30), app.pages.review.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
 
     app.adjustSidebarWidth(.shrink);
-    try std.testing.expectEqual(@as(?u16, 26), app.viewer.sidebar_width);
+    try std.testing.expectEqual(@as(?u16, 26), app.pages.review.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
 
     app.adjustSidebarWidth(.grow);
-    try std.testing.expectEqual(@as(?u16, 30), app.viewer.sidebar_width);
+    try std.testing.expectEqual(@as(?u16, 30), app.pages.review.viewer.sidebar_width);
 }
 
 test "sidebar width remains stored while sidebar is hidden" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .display_mode = .side_by_side },
+        } },
         .terminal_size = .{ .width = 104, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .display_mode = .side_by_side },
     };
 
     app.adjustSidebarWidth(.shrink);
     app.toggleSidebarVisibility();
     app.adjustSidebarWidth(.shrink);
 
-    try std.testing.expect(app.viewer.sidebar_hidden);
-    try std.testing.expectEqual(@as(?u16, 26), app.viewer.sidebar_width);
+    try std.testing.expect(app.pages.review.viewer.sidebar_hidden);
+    try std.testing.expectEqual(@as(?u16, 26), app.pages.review.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
 
     app.toggleSidebarVisibility();
 
-    try std.testing.expect(!app.viewer.sidebar_hidden);
-    try std.testing.expectEqual(@as(?u16, 26), app.viewer.sidebar_width);
+    try std.testing.expect(!app.pages.review.viewer.sidebar_hidden);
+    try std.testing.expectEqual(@as(?u16, 26), app.pages.review.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
 }
 
 test "horizontal scroll uses diff focus arrows and clamps to visible text" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
+            .viewer = .{ .focus = .diff, .display_mode = .unified },
+        } },
         .terminal_size = .{ .width = 80, .height = 12 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
-        .viewer = .{ .focus = .diff, .display_mode = .unified },
     };
 
     app.scrollDiffHorizontal(.right);
-    try std.testing.expectEqual(@as(usize, 8), app.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 8), app.pages.review.viewer.diff_horizontal_scroll);
 
     for (0..20) |_| app.scrollDiffHorizontal(.right);
-    try std.testing.expect(app.viewer.diff_horizontal_scroll > 0);
-    try std.testing.expect(app.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
+    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll > 0);
+    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
 
     app.scrollDiffHorizontal(.left);
-    try std.testing.expect(app.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
+    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
 }
 
 test "layout changes reset horizontal scroll only when diff pane width changes" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
+            .viewer = .{
+                .display_mode = .side_by_side,
+                .diff_horizontal_scroll = 16,
+            },
+        } },
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
-        .viewer = .{
-            .display_mode = .side_by_side,
-            .diff_horizontal_scroll = 16,
-        },
     };
 
     app.toggleSidebarVisibility();
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_horizontal_scroll);
 
-    app.viewer.diff_horizontal_scroll = 16;
+    app.pages.review.viewer.diff_horizontal_scroll = 16;
     app.adjustSidebarWidth(.shrink);
-    try std.testing.expectEqual(@as(usize, 16), app.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 16), app.pages.review.viewer.diff_horizontal_scroll);
 
     app.toggleSidebarVisibility();
-    app.viewer.diff_horizontal_scroll = 16;
+    app.pages.review.viewer.diff_horizontal_scroll = 16;
     app.adjustSidebarWidth(.shrink);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_horizontal_scroll);
 }
 
 test "search resync without pane width change keeps horizontal scroll" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
+            .viewer = .{
+                .display_mode = .side_by_side,
+                .sidebar_hidden = true,
+            },
+        } },
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
-        .viewer = .{
-            .display_mode = .side_by_side,
-            .sidebar_hidden = true,
-        },
     };
 
     setDiffSearchQuery(&app, "wide");
     app.submitSearch();
-    app.viewer.diff_horizontal_scroll = 16;
+    app.pages.review.viewer.diff_horizontal_scroll = 16;
 
     app.adjustSidebarWidth(.shrink);
 
-    try std.testing.expectEqual(@as(usize, 16), app.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 16), app.pages.review.viewer.diff_horizontal_scroll);
 }
 
 test "side-by-side context horizontal clamp checks both columns" {
@@ -7645,54 +7518,60 @@ test "side-by-side context horizontal clamp checks both columns" {
 
 test "display mode and search navigation reset horizontal scroll" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
+            .viewer = .{
+                .display_mode = .unified,
+                .diff_horizontal_scroll = 16,
+            },
+        } },
         .terminal_size = .{ .width = 120, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
-        .viewer = .{
-            .display_mode = .unified,
-            .diff_horizontal_scroll = 16,
-        },
     };
 
     try app.update(.toggle_display_mode, undefined);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_horizontal_scroll);
 
-    app.viewer.diff_horizontal_scroll = 16;
+    app.pages.review.viewer.diff_horizontal_scroll = 16;
     setDiffSearchQuery(&app, "wide");
     app.submitSearch();
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_horizontal_scroll);
 }
 
 test "line number toggle clamps horizontal scroll without changing vertical scroll" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
+            .viewer = .{
+                .display_mode = .unified,
+                .sidebar_hidden = true,
+                .diff_scroll = 2,
+                .diff_horizontal_scroll = 999,
+            },
+        } },
         .terminal_size = .{ .width = 80, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
-        .viewer = .{
-            .display_mode = .unified,
-            .sidebar_hidden = true,
-            .diff_scroll = 2,
-            .diff_horizontal_scroll = 999,
-        },
     };
 
-    const old_scroll = app.viewer.diff_scroll;
+    const old_scroll = app.pages.review.viewer.diff_scroll;
     try app.update(.toggle_line_numbers, undefined);
 
-    try std.testing.expect(!app.viewer.view_options.line_numbers);
-    try std.testing.expectEqual(old_scroll, app.viewer.diff_scroll);
-    try std.testing.expect(app.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
+    try std.testing.expect(!app.pages.review.viewer.view_options.line_numbers);
+    try std.testing.expectEqual(old_scroll, app.pages.review.viewer.diff_scroll);
+    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll <= app.visibleBodyTextMaxHorizontalScroll());
 }
 
 test "current line copy text uses side-by-side paired new side" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .side_by_side,
+                .sidebar_hidden = true,
+                .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } },
+                .diff_horizontal_scroll = 99,
+                .view_options = .{ .line_numbers = false },
+            },
+        } },
         .terminal_size = .{ .width = 140, .height = 24 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .side_by_side,
-            .sidebar_hidden = true,
-            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } },
-            .diff_horizontal_scroll = 99,
-            .view_options = .{ .line_numbers = false },
-        },
     };
 
     try std.testing.expectEqualStrings("new", app.currentDiffLineCopyText().?);
@@ -7850,33 +7729,37 @@ test "copyCommitMessage reports empty draft and closed panel" {
 
 test "display mode toggle keeps nearby vertical scroll position" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .unified,
+                .diff_scroll = 8,
+                .sidebar_hidden = true,
+            },
+        } },
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .unified,
-            .diff_scroll = 8,
-            .sidebar_hidden = true,
-        },
     };
-    app.viewer.diff_cursor = app.selectedCoordinateAtOffset(app.viewer.diff_scroll) orelse app.viewer.diff_cursor;
+    app.pages.review.viewer.diff_cursor = app.selectedCoordinateAtOffset(app.pages.review.viewer.diff_scroll) orelse app.pages.review.viewer.diff_cursor;
 
     try app.update(.toggle_display_mode, undefined);
 
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
-    try std.testing.expect(app.viewer.diff_scroll > 0);
-    try std.testing.expect(app.viewer.diff_scroll <= app.selectedFileLineIndex(app.effectiveDisplayMode()).lineCount());
+    try std.testing.expect(app.pages.review.viewer.diff_scroll > 0);
+    try std.testing.expect(app.pages.review.viewer.diff_scroll <= app.selectedFileLineIndex(app.effectiveDisplayMode()).lineCount());
 }
 
 test "display mode toggle brings cursor back into view after wheel scroll" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .unified,
+                .sidebar_hidden = true,
+                .diff_scroll = 12,
+                .diff_cursor = .{ .hunk_header = 0 },
+            },
+        } },
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .unified,
-            .sidebar_hidden = true,
-            .diff_scroll = 12,
-            .diff_cursor = .{ .hunk_header = 0 },
-        },
     };
 
     try std.testing.expect(app.visibleDiffCursorOffset() == null);
@@ -7888,14 +7771,16 @@ test "display mode toggle brings cursor back into view after wheel scroll" {
 
 test "mouse diff scroll keeps cursor in the viewport" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .unified,
+                .sidebar_hidden = true,
+                .diff_scroll = 12,
+                .diff_cursor = .{ .hunk_header = 0 },
+            },
+        } },
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .unified,
-            .sidebar_hidden = true,
-            .diff_scroll = 12,
-            .diff_cursor = .{ .hunk_header = 0 },
-        },
     };
 
     try std.testing.expect(app.visibleDiffCursorOffset() == null);
@@ -7907,84 +7792,94 @@ test "mouse diff scroll keeps cursor in the viewport" {
 
 test "diff cursor initialization skips hidden metadata rows" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffMetadataOnly()),
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffMetadataOnly()),
     };
 
     app.initializeDiffCursorForSelectedFile();
 
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.viewer.diff_cursor);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.review.viewer.diff_cursor);
     try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
 }
 
 test "diff cursor initialization selects binary marker after hidden metadata" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffBinaryOnly()),
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffBinaryOnly()),
     };
 
     app.initializeDiffCursorForSelectedFile();
 
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate.binary_marker, app.viewer.diff_cursor);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate.binary_marker, app.pages.review.viewer.diff_cursor);
     try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
 }
 
 test "diff scroll keeps visible cursor screen position stable" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .unified,
+                .sidebar_hidden = true,
+                .diff_scroll = 3,
+            },
+        } },
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .unified,
-            .sidebar_hidden = true,
-            .diff_scroll = 3,
-        },
     };
-    const old_scroll = app.viewer.diff_scroll;
+    const old_scroll = app.pages.review.viewer.diff_scroll;
     const old_offset = old_scroll + 1;
-    app.viewer.diff_cursor = app.selectedCoordinateAtOffset(old_offset) orelse return error.ExpectedCoordinate;
+    app.pages.review.viewer.diff_cursor = app.selectedCoordinateAtOffset(old_offset) orelse return error.ExpectedCoordinate;
 
     app.scrollDiff(.down);
 
     const new_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
-    try std.testing.expectEqual(old_offset - old_scroll, new_offset - app.viewer.diff_scroll);
+    try std.testing.expectEqual(old_offset - old_scroll, new_offset - app.pages.review.viewer.diff_scroll);
 }
 
 test "diff scroll syncs invisible cursor to scrolloff margin" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .unified,
+                .sidebar_hidden = true,
+            },
+        } },
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .unified,
-            .sidebar_hidden = true,
-        },
     };
     const line_count = app.selectedFileLineIndex(app.effectiveDisplayMode()).lineCount();
     const visible_rows = app.diffVisibleRows();
     const margin = @min(@as(usize, 8), visible_rows / 3);
 
-    app.viewer.diff_scroll = 0;
-    app.viewer.diff_cursor = app.selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
+    app.pages.review.viewer.diff_scroll = 0;
+    app.pages.review.viewer.diff_cursor = app.selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
     app.scrollDiff(.up);
-    try std.testing.expectEqual(app.viewer.diff_scroll + margin, app.selectedDiffCursorOffset().?);
+    try std.testing.expectEqual(app.pages.review.viewer.diff_scroll + margin, app.selectedDiffCursorOffset().?);
 
-    app.viewer.diff_scroll = line_count - visible_rows;
-    app.viewer.diff_cursor = app.selectedCoordinateAtOffset(0) orelse return error.ExpectedCoordinate;
+    app.pages.review.viewer.diff_scroll = line_count - visible_rows;
+    app.pages.review.viewer.diff_cursor = app.selectedCoordinateAtOffset(0) orelse return error.ExpectedCoordinate;
     app.scrollDiff(.down);
-    try std.testing.expectEqual(app.viewer.diff_scroll + visible_rows - 1 -| margin, app.selectedDiffCursorOffset().?);
+    try std.testing.expectEqual(app.pages.review.viewer.diff_scroll + visible_rows - 1 -| margin, app.selectedDiffCursorOffset().?);
 }
 
 test "diff row movement continues from wheel-synced visible cursor" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .unified,
+                .sidebar_hidden = true,
+            },
+        } },
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .unified,
-            .sidebar_hidden = true,
-        },
     };
     const line_count = app.selectedFileLineIndex(app.effectiveDisplayMode()).lineCount();
-    app.viewer.diff_scroll = 0;
-    app.viewer.diff_cursor = app.selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
+    app.pages.review.viewer.diff_scroll = 0;
+    app.pages.review.viewer.diff_cursor = app.selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
 
     app.scrollDiff(.up);
     const synced_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
@@ -7995,31 +7890,35 @@ test "diff row movement continues from wheel-synced visible cursor" {
 
 test "mouse wheel routes through diff scroll cursor sync" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .unified,
+                .sidebar_hidden = true,
+                .focus = .sidebar,
+                .diff_scroll = 12,
+                .diff_cursor = .{ .hunk_header = 0 },
+            },
+        } },
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .unified,
-            .sidebar_hidden = true,
-            .focus = .sidebar,
-            .diff_scroll = 12,
-            .diff_cursor = .{ .hunk_header = 0 },
-        },
     };
 
     try app.update(.mouse_diff_wheel_down, undefined);
 
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
     try std.testing.expect(app.visibleDiffCursorOffset() != null);
 }
 
 test "diff mouse drag starts on selected side and updates on drag only" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .side_by_side,
+                .sidebar_hidden = true,
+            },
+        } },
         .terminal_size = .{ .width = 140, .height = 10 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .side_by_side,
-            .sidebar_hidden = true,
-        },
     };
 
     const old_point: MousePoint = .{
@@ -8027,14 +7926,14 @@ test "diff mouse drag starts on selected side and updates on drag only" {
         .row = diff_render.body_start_row + 1,
     };
     app.pressDiffMouse(old_point);
-    const started = app.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const started = app.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Side.old, started.side);
     try std.testing.expectEqual(@as(usize, 0), started.focus.hunk_index);
     try std.testing.expectEqual(@as(usize, 0), started.focus.line_index);
 
     const motion_msg = app.handleEvent(app_test_support.mouseEventTyped(4, diff_render.body_start_row + 2, .none, .motion));
     try std.testing.expect(motion_msg == null);
-    const after_motion = app.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const after_motion = app.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(@as(usize, 0), after_motion.focus.line_index);
 
     const new_side_point: MousePoint = .{
@@ -8042,7 +7941,7 @@ test "diff mouse drag starts on selected side and updates on drag only" {
         .row = diff_render.body_start_row + 3,
     };
     app.dragDiffMouse(new_side_point);
-    const dragged = app.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const dragged = app.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Side.old, dragged.side);
     try std.testing.expectEqual(@as(usize, 2), dragged.focus.line_index);
     try std.testing.expect(dragged.moved);
@@ -8050,114 +7949,124 @@ test "diff mouse drag starts on selected side and updates on drag only" {
 
 test "diff header mouse press starts header path owner only on path target" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .side_by_side,
+                .sidebar_hidden = true,
+            },
+        } },
         .terminal_size = .{ .width = 140, .height = 10 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .side_by_side,
-            .sidebar_hidden = true,
-        },
     };
 
     app.pressDiffMouse(.{ .col = 1, .row = 0 });
-    const header = app.selection_owner.activeHeader() orelse return error.ExpectedHeaderSelection;
+    const header = app.pages.review.selection_owner.activeHeader() orelse return error.ExpectedHeaderSelection;
     try std.testing.expectEqual(diff_selection.HeaderKind.loaded_file, header.identity.kind);
     try std.testing.expectEqualStrings("a", header.identity.path_key);
 
     app.dragDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.selection_owner.activeHeader() != null);
-    try std.testing.expect(app.selection_owner.activeDiff() == null);
+    try std.testing.expect(app.pages.review.selection_owner.activeHeader() != null);
+    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
 
     app.clearDiffSelection();
     app.pressDiffMouse(.{ .col = 120, .row = 0 });
-    try std.testing.expect(app.selection_owner.activeHeader() == null);
-    try std.testing.expect(app.selection_owner.activeDiff() == null);
+    try std.testing.expect(app.pages.review.selection_owner.activeHeader() == null);
+    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
 }
 
 test "diff mouse drag rejects unified fallback and clears on invalidation" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .side_by_side,
+                .sidebar_hidden = true,
+            },
+        } },
         .terminal_size = .{ .width = 50, .height = 10 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .side_by_side,
-            .sidebar_hidden = true,
-        },
     };
 
     app.pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.selection_owner.activeDiff() == null);
+    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
 
     app.terminal_size.width = 140;
     app.pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.selection_owner.activeDiff() != null);
+    try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
 
     try app.update(.toggle_display_mode, undefined);
-    try std.testing.expect(app.selection_owner.activeDiff() == null);
+    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
 
-    app.viewer.display_mode = .side_by_side;
+    app.pages.review.viewer.display_mode = .side_by_side;
     app.pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.selection_owner.activeDiff() != null);
+    try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
     app.clearLoadedDiff();
-    try std.testing.expect(app.selection_owner.activeDiff() == null);
+    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
 }
 
 test "sidebar layout fallback clears active diff mouse drag" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .side_by_side,
+                .sidebar_hidden = true,
+            },
+        } },
         .terminal_size = .{ .width = 90, .height = 10 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .side_by_side,
-            .sidebar_hidden = true,
-        },
     };
 
     app.pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.selection_owner.activeDiff() != null);
+    try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
 
     app.toggleSidebarVisibility();
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
-    try std.testing.expect(app.selection_owner.activeDiff() == null);
+    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
 }
 
 test "sidebar width growth fallback clears active diff mouse drag" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .side_by_side,
+                .sidebar_hidden = false,
+                .sidebar_width = 31,
+            },
+        } },
         .terminal_size = .{ .width = 110, .height = 10 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .side_by_side,
-            .sidebar_hidden = false,
-            .sidebar_width = 31,
-        },
     };
 
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.effectiveDisplayMode());
     app.pressDiffMouse(.{ .col = 37, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.selection_owner.activeDiff() != null);
+    try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
 
     app.adjustSidebarWidth(.grow);
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.effectiveDisplayMode());
-    try std.testing.expect(app.selection_owner.activeDiff() == null);
+    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
 }
 
 test "diff scroll cursor sync keeps search state" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .unified,
+                .sidebar_hidden = true,
+                .diff_scroll = 12,
+                .diff_cursor = .{ .hunk_header = 0 },
+            },
+        } },
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .display_mode = .unified,
-            .sidebar_hidden = true,
-            .diff_scroll = 12,
-            .diff_cursor = .{ .hunk_header = 0 },
-        },
     };
     setDiffSearchQuery(&app, "late new");
     app.submitSearch();
-    const old_match = app.search.match orelse return error.ExpectedSearchMatch;
-    const old_match_offset = app.search.match_offset;
+    const old_match = app.pages.review.search.match orelse return error.ExpectedSearchMatch;
+    const old_match_offset = app.pages.review.search.match_offset;
 
     app.scrollDiff(.down);
 
-    try std.testing.expect(std.meta.eql(old_match, app.search.match.?));
-    try std.testing.expectEqual(old_match_offset, app.search.match_offset);
+    try std.testing.expect(std.meta.eql(old_match, app.pages.review.search.match.?));
+    try std.testing.expectEqual(old_match_offset, app.pages.review.search.match_offset);
 }
 
 test "display mode scroll remap preserves hunk-local ratio" {
@@ -8168,12 +8077,14 @@ test "display mode scroll remap preserves hunk-local ratio" {
     loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(loaded),
+            .viewer = .{
+                .display_mode = .unified,
+                .sidebar_hidden = true,
+            },
+        } },
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = app_test_support.loadState(loaded),
-        .viewer = .{
-            .display_mode = .unified,
-            .sidebar_hidden = true,
-        },
     };
 
     const old_index = app.selectedFileLineIndex(.unified);
@@ -8189,15 +8100,17 @@ test "display mode scroll remap preserves hunk-local ratio" {
 
 test "hidden sidebar keeps tab from changing focus" {
     var app: App = .{
-        .viewer = .{
-            .focus = .diff,
-            .sidebar_hidden = true,
-        },
+        .pages = .{ .review = .{
+            .viewer = .{
+                .focus = .diff,
+                .sidebar_hidden = true,
+            },
+        } },
     };
 
     try app.update(.toggle_focus, undefined);
 
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
 
 test "user actions clear previous ephemeral status" {
@@ -8347,41 +8260,47 @@ test "canceling amend confirmation keeps commit panel draft" {
 
 test "prompt input stays above help overlay" {
     var app: App = .{
-        .search = .{ .mode = true },
+        .pages = .{ .review = .{
+            .search = .{ .mode = true },
+        } },
     };
 
     const msg = app.handleEvent(.{ .key_press = .{ .codepoint = '?' } }) orelse return error.ExpectedPromptInput;
     try app.update(msg, undefined);
 
     try std.testing.expectEqual(OverlayKind.none, app.overlay.kind);
-    try std.testing.expectEqualStrings("?", app.search.input.slice());
+    try std.testing.expectEqualStrings("?", app.pages.review.search.input.slice());
 }
 
 test "mouse click focuses sidebar and diff panes" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .focus = .diff },
+        } },
         .terminal_size = .{ .width = 100, .height = 20 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .focus = .diff },
     };
 
     const content = app_view.shellContentRect(app.terminal_size);
     const sidebar_event = app_test_support.mouseEvent(content.col + 1, content.row + 2, .left);
     const sidebar_msg = app.handleEvent(sidebar_event) orelse return error.ExpectedSidebarMouseMessage;
     try app.update(sidebar_msg, undefined);
-    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
+    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
 
-    const diff_col = content.col + sidebarWidth(app.layoutSize().width, app.viewer.sidebar_width) + 1;
+    const diff_col = content.col + sidebarWidth(app.layoutSize().width, app.pages.review.viewer.sidebar_width) + 1;
     const diff_event = app_test_support.mouseEvent(diff_col, content.row + 2, .left);
     const diff_msg = app.handleEvent(diff_event) orelse return error.ExpectedDiffMouseMessage;
     try app.update(diff_msg, undefined);
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
 
 test "mouse click selects sidebar file rows" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+            .viewer = .{ .focus = .diff },
+        } },
         .terminal_size = .{ .width = 100, .height = 20 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
-        .viewer = .{ .focus = .diff },
     };
 
     const content = app_view.shellContentRect(app.terminal_size);
@@ -8389,17 +8308,19 @@ test "mouse click selects sidebar file rows" {
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedSidebarClickMessage;
     try app.update(msg, undefined);
 
-    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
+    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
 }
 
 test "mouse click toggles sidebar directory rows" {
     const arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, app_test_support.loadedDiffNested()),
+            .viewer = .{ .focus = .diff, .selected_node = 1, .selected_file = 0 },
+        } },
         .terminal_size = .{ .width = 100, .height = 20 },
-        .load = app_test_support.loadStateWithArena(arena, app_test_support.loadedDiffNested()),
-        .viewer = .{ .focus = .diff, .selected_node = 1, .selected_file = 0 },
     };
     defer app.clearLoadedDiff();
 
@@ -8409,31 +8330,33 @@ test "mouse click toggles sidebar directory rows" {
     try app.update(msg, undefined);
 
     const loaded = app.loadedDiff().?;
-    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
+    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
 }
 
 test "mouse click on sidebar header or blank body focuses only" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .focus = .diff },
+        } },
         .terminal_size = .{ .width = 100, .height = 20 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .focus = .diff },
     };
 
     const content = app_view.shellContentRect(app.terminal_size);
     const header_msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 1, .left)) orelse return error.ExpectedSidebarHeaderClickMessage;
     try app.update(header_msg, undefined);
-    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
+    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
 
-    app.viewer.focus = .diff;
+    app.pages.review.viewer.focus = .diff;
     const blank_row = content.row + sidebar_header_rows + 2;
     const blank_msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, blank_row, .left)) orelse return error.ExpectedSidebarBlankClickMessage;
     try app.update(blank_msg, undefined);
-    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
+    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
 }
 
 test "mouse click uses filtered sidebar projection" {
@@ -8444,10 +8367,12 @@ test "mouse click uses filtered sidebar projection" {
     try loaded.rebuildVisibleNodes(arena.allocator(), false, .deleted);
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, loaded),
+            .viewer = .{ .focus = .diff, .selected_node = 0, .selected_file = 0 },
+            .review_display = .{ .changed_file_filter = .deleted },
+        } },
         .terminal_size = .{ .width = 100, .height = 20 },
-        .load = app_test_support.loadStateWithArena(arena, loaded),
-        .viewer = .{ .focus = .diff, .selected_node = 0, .selected_file = 0 },
-        .review_display = .{ .changed_file_filter = .deleted },
     };
     defer app.clearLoadedDiff();
 
@@ -8456,52 +8381,58 @@ test "mouse click uses filtered sidebar projection" {
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedFilteredSidebarClickMessage;
     try app.update(msg, undefined);
 
-    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
+    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
 }
 
 test "mouse wheel scrolls the pane under the pointer" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+            .viewer = .{ .focus = .diff },
+        } },
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
-        .viewer = .{ .focus = .diff },
     };
 
     const content = app_view.shellContentRect(app.terminal_size);
     const sidebar_msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedSidebarWheelMessage;
     try app.update(sidebar_msg, undefined);
-    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
+    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
 
     app.selectFileAbsolute(0);
-    const diff_col = content.col + sidebarWidth(app.layoutSize().width, app.viewer.sidebar_width) + 1;
+    const diff_col = content.col + sidebarWidth(app.layoutSize().width, app.pages.review.viewer.sidebar_width) + 1;
     const diff_msg = app.handleEvent(app_test_support.mouseEvent(diff_col, content.row + 2, .wheel_down)) orelse return error.ExpectedDiffWheelMessage;
     try app.update(diff_msg, undefined);
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
-    try std.testing.expect(app.viewer.diff_scroll > 0);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expect(app.pages.review.viewer.diff_scroll > 0);
 }
 
 test "mouse uses full body as diff pane while sidebar is hidden" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .focus = .sidebar,
+                .sidebar_hidden = true,
+            },
+        } },
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .focus = .sidebar,
-            .sidebar_hidden = true,
-        },
     };
 
     const content = app_view.shellContentRect(app.terminal_size);
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) orelse return error.ExpectedHiddenSidebarMouseMessage;
     try app.update(msg, undefined);
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
 
 test "help overlay wheel scrolls help and ignores clicks" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         .overlay = .{ .kind = .help },
     };
 
@@ -8519,8 +8450,10 @@ test "push error overlay wheel scrolls details and ignores clicks" {
         "line 1\nline 2\nline 3\nline 4\nline 5\n" ++
         "line 6\nline 7\nline 8\nline 9\nline 10\n";
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         .push_error_message = try std.testing.allocator.dupe(u8, long_message),
     };
     defer app.clearPushError(std.testing.allocator);
@@ -8537,20 +8470,22 @@ test "push error overlay wheel scrolls details and ignores clicks" {
 
 test "confirmation overlay blocks mouse clicks and wheels" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+            .viewer = .{
+                .focus = .diff,
+                .selected_file = 0,
+            },
+        } },
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
-        .viewer = .{
-            .focus = .diff,
-            .selected_file = 0,
-        },
         .overlay = .{ .kind = .push_branch },
     };
 
     const content = app_view.shellContentRect(app.terminal_size);
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) == null);
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
 }
 
 test "terminal resize clamps push error scroll" {
@@ -8571,27 +8506,31 @@ test "terminal resize clamps push error scroll" {
 
 test "mouse horizontal wheel scrolls diff pane horizontally" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
+            .viewer = .{
+                .focus = .sidebar,
+                .display_mode = .unified,
+            },
+        } },
         .terminal_size = .{ .width = 80, .height = 12 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
-        .viewer = .{
-            .focus = .sidebar,
-            .display_mode = .unified,
-        },
     };
 
     const content = app_view.shellContentRect(app.terminal_size);
-    const diff_col = content.col + sidebarWidth(app.layoutSize().width, app.viewer.sidebar_width) + 1;
+    const diff_col = content.col + sidebarWidth(app.layoutSize().width, app.pages.review.viewer.sidebar_width) + 1;
     const msg = app.handleEvent(app_test_support.mouseEvent(diff_col, content.row + 2, .wheel_right)) orelse return error.ExpectedHorizontalWheelMessage;
     try app.update(msg, undefined);
 
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
-    try std.testing.expect(app.viewer.diff_horizontal_scroll > 0);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll > 0);
 }
 
 test "mouse events are ignored outside body and prompt modes" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
     };
 
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(-1, 1, .left)) == null);
@@ -8600,14 +8539,16 @@ test "mouse events are ignored outside body and prompt modes" {
     const footer_row: i16 = @intCast(content.row + terminalBodyHeight(app.layoutSize().height));
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, footer_row, .left)) == null);
 
-    app.search.mode = true;
+    app.pages.review.search.mode = true;
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 1, .left)) == null);
 }
 
 test "mouse release and motion events are ignored" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
         .terminal_size = .{ .width = 100, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
     };
 
     const content = app_view.shellContentRect(app.terminal_size);
@@ -8616,10 +8557,12 @@ test "mouse release and motion events are ignored" {
 }
 
 test "search overflow reports query status for insert and paste" {
-    var app: App = .{ .search = .{ .mode = true } };
-    @memset(&app.search.input.buffer, 'x');
-    app.search.input.len = app.search.input.buffer.len;
-    app.search.input.cursor = app.search.input.buffer.len;
+    var app: App = .{
+        .pages = .{ .review = .{ .search = .{ .mode = true } } },
+    };
+    @memset(&app.pages.review.search.input.buffer, 'x');
+    app.pages.review.search.input.len = app.pages.review.search.input.buffer.len;
+    app.pages.review.search.input.cursor = app.pages.review.search.input.buffer.len;
 
     try app.update(.{ .search_insert = 'y' }, undefined);
     try std.testing.expectEqualStrings("search query is too long", app.status.text());
@@ -8630,10 +8573,12 @@ test "search overflow reports query status for insert and paste" {
 }
 
 test "file search overflow reports query status for insert and paste" {
-    var app: App = .{ .file_search = .{ .mode = true } };
-    @memset(&app.file_search.input.buffer, 'x');
-    app.file_search.input.len = app.file_search.input.buffer.len;
-    app.file_search.input.cursor = app.file_search.input.buffer.len;
+    var app: App = .{
+        .pages = .{ .review = .{ .file_search = .{ .mode = true } } },
+    };
+    @memset(&app.pages.review.file_search.input.buffer, 'x');
+    app.pages.review.file_search.input.len = app.pages.review.file_search.input.buffer.len;
+    app.pages.review.file_search.input.cursor = app.pages.review.file_search.input.buffer.len;
 
     try app.update(.{ .file_search_insert = 'y' }, undefined);
     try std.testing.expectEqualStrings("file search query is too long", app.status.text());
@@ -8665,47 +8610,51 @@ test "repo picker filter overflow reports status for insert and paste" {
 
 test "mode change resyncs search match to rendered body offsets" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .display_mode = .unified },
+        } },
         .terminal_size = .{ .width = 140, .height = 14 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .display_mode = .unified },
     };
     setDiffSearchQuery(&app, "late new");
 
     app.submitSearch();
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 9), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 9), app.pages.review.search.match_offset);
 
-    app.viewer.display_mode = .side_by_side;
+    app.pages.review.viewer.display_mode = .side_by_side;
     app.clampDiffNavigationKeepingHunkVisible();
     app.updateSearchMatchOffset();
 
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 7), app.search.match_offset);
-    try std.testing.expect(app.search.match_offset.? >= app.viewer.diff_scroll);
-    try std.testing.expect(app.search.match_offset.? < app.viewer.diff_scroll + app.diffVisibleRows());
+    try std.testing.expectEqual(@as(?usize, 7), app.pages.review.search.match_offset);
+    try std.testing.expect(app.pages.review.search.match_offset.? >= app.pages.review.viewer.diff_scroll);
+    try std.testing.expect(app.pages.review.search.match_offset.? < app.pages.review.viewer.diff_scroll + app.diffVisibleRows());
 }
 
 test "mode change keeps search near later matches" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .display_mode = .unified },
+        } },
         .terminal_size = .{ .width = 140, .height = 8 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .display_mode = .unified },
     };
     setDiffSearchQuery(&app, "new");
 
     app.submitSearch();
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 4), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
     app.selectSearchMatch(.forward);
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 9), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 9), app.pages.review.search.match_offset);
 
-    app.viewer.display_mode = .side_by_side;
+    app.pages.review.viewer.display_mode = .side_by_side;
     app.clampDiffNavigationKeepingHunkVisible();
     app.updateSearchMatchOffset();
 
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 7), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 7), app.pages.review.search.match_offset);
 }
 
 test "toggle selected hunk fold updates active rendered line cache" {
@@ -8717,9 +8666,11 @@ test "toggle selected hunk fold updates active rendered line cache" {
     loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, loaded),
+            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadStateWithArena(arena, loaded),
-        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
     defer app.clearLoadedDiff();
 
@@ -8744,8 +8695,10 @@ test "search unfolds folded hunk body matches before setting offset" {
     loaded.setHunkFolded(0, 0, true);
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, loaded),
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadStateWithArena(arena, loaded),
     };
     defer app.clearLoadedDiff();
     setDiffSearchQuery(&app, "new");
@@ -8755,7 +8708,7 @@ test "search unfolds folded hunk body matches before setting offset" {
     const active = app.loadedDiff().?;
     try std.testing.expect(!active.isHunkFolded(0, 0));
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 4), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
 }
 
 test "manual fold keeps hunk open when it contains active search match" {
@@ -8767,8 +8720,10 @@ test "manual fold keeps hunk open when it contains active search match" {
     loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, loaded),
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadStateWithArena(arena, loaded),
     };
     defer app.clearLoadedDiff();
     setDiffSearchQuery(&app, "new");
@@ -8779,64 +8734,70 @@ test "manual fold keeps hunk open when it contains active search match" {
     const active = app.loadedDiff().?;
     try std.testing.expect(!active.isHunkFolded(0, 0));
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 4), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
 }
 
 test "file change resyncs retained search query to selected file" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+            .viewer = .{ .display_mode = .unified },
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
-        .viewer = .{ .display_mode = .unified },
     };
     setDiffSearchQuery(&app, "target");
 
     app.selectFileAbsolute(1);
 
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
     try expectSearchCoordinate(&app, .{ .metadata = 0 });
-    try std.testing.expectEqual(@as(?usize, 0), app.search.match_offset);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(?usize, 0), app.pages.review.search.match_offset);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
 }
 
 test "sidebar navigation can select directories without changing selected file" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .viewer = .{
+                .selected_file = 0,
+                .selected_node = 1,
+            },
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-        .viewer = .{
-            .selected_file = 0,
-            .selected_node = 1,
-        },
     };
 
     app.selectFileDelta(-1);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
 
     app.selectFileDelta(1);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
 
     app.selectFileDelta(1);
-    try std.testing.expectEqual(@as(usize, 2), app.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
 }
 
 test "sidebar navigation keeps status-only target through clamp" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .selected_file = 0,
+                .selected_node = 0,
+            },
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .selected_file = 0,
-            .selected_node = 0,
-        },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/status-only.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
     try app.applyStatusProjection(std.testing.allocator, false);
 
     const loaded = app.loadedDiff().?;
@@ -8853,7 +8814,7 @@ test "sidebar navigation keeps status-only target through clamp" {
     app.selectSidebarNode(loaded, status_node);
     app.clampSelection(loaded.document.files.len);
 
-    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target.?);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expect(app.selectedFileIndex(loaded) == null);
     try std.testing.expect(app.selectedStatusEntry() != null);
 }
@@ -8864,58 +8825,60 @@ test "sidebar navigation moves between status-only nodes" {
         .terminal_size = .{ .width = 100, .height = 12 },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? a.zig\x00?? b.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
-    try app.createStatusOnlyLoadedSession(std.testing.allocator, app.git_status.document);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.createStatusOnlyLoadedSession(std.testing.allocator, app.pages.review.git_status.document);
 
-    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target.?);
-    const first_node = app.viewer.selected_node;
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
+    const first_node = app.pages.review.viewer.selected_node;
 
     app.selectFileDelta(1);
-    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 1 }, app.viewer.selected_target.?);
-    try std.testing.expect(app.viewer.selected_node != first_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expect(app.pages.review.viewer.selected_node != first_node);
 
     app.selectFileDelta(-1);
-    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target.?);
-    try std.testing.expectEqual(first_node, app.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(first_node, app.pages.review.viewer.selected_node);
 }
 
 test "pending selection restore waits for status projection after stage" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_file = 0,
+                .selected_node = 0,
+            },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 0 },
-            .selected_file = 0,
-            .selected_node = 0,
-        },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     defer app.clearPendingSelectionRestore(std.testing.allocator);
 
     try app.setPendingSelectionRestore(std.testing.allocator, "b");
-    app.status_load.pending = .{ .generation = 1 };
+    app.pages.review.status_load.pending = .{ .generation = 1 };
 
     // Diff reload can finish before the status reload. In that intermediate
     // tree the staged file is absent, so do not consume the pending restore yet.
     try app.applyStatusProjection(std.testing.allocator, false);
-    try std.testing.expect(app.pending_selection_restore != null);
+    try std.testing.expect(app.pages.review.pending_selection_restore != null);
 
-    app.status_load.pending = null;
+    app.pages.review.status_load.pending = null;
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
     try app.applyStatusProjection(std.testing.allocator, false);
 
-    try std.testing.expect(app.pending_selection_restore == null);
-    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target.?);
+    try std.testing.expect(app.pages.review.pending_selection_restore == null);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "staged summary distinguishes pending missing and ready status snapshots" {
@@ -8926,17 +8889,17 @@ test "staged summary distinguishes pending missing and ready status snapshots" {
             .canonical_root = "/repo",
         } } },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     acceptTestSource(&app);
 
     try std.testing.expectEqual(app_commit_panel.StagedSummary.unavailable, app.stagedSummaryForActiveRepo());
 
-    app.status_load.pending = .{ .generation = 1 };
+    app.pages.review.status_load.pending = .{ .generation = 1 };
     try std.testing.expectEqual(app_commit_panel.StagedSummary.loading_or_stale, app.stagedSummaryForActiveRepo());
 
-    app.status_load.pending = null;
+    app.pages.review.status_load.pending = null;
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  staged.zig\x00 M unstaged.zig\x00?? new.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     try std.testing.expectEqual(app_commit_panel.StagedSummary{ .ready = .{ .count = 1 } }, app.stagedSummaryForActiveRepo());
 }
@@ -9235,44 +9198,48 @@ test "resolveCommitMessageAction reports missing and multiple configs" {
 
 test "pending selection restore survives status projection while diff reload is pending" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffTwo()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 1,
+            },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffTwo()),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 1 },
-            .selected_file = 1,
-            .selected_node = 1,
-        },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     defer app.clearPendingSelectionRestore(std.testing.allocator);
 
     try app.setPendingSelectionRestore(std.testing.allocator, "b");
-    app.load.pending = .{ .diff_load = app.load.generation + 1 };
+    app.pages.review.load.pending = .{ .diff_load = app.pages.review.load.generation + 1 };
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
     try app.applyStatusProjection(std.testing.allocator, false);
 
-    try std.testing.expect(app.pending_selection_restore != null);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.viewer.selected_target.?);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
+    try std.testing.expect(app.pages.review.pending_selection_restore != null);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
 }
 
 test "pending selection restore clears when status finishes empty after reload" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_file = 0,
+                .selected_node = 0,
+            },
+            .status_load = .{ .generation = 7 },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffOne()),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 0 },
-            .selected_file = 0,
-            .selected_node = 0,
-        },
-        .status_load = .{ .generation = 7 },
     };
     defer app.clearLoadedDiff();
     defer app.clearPendingSelectionRestore(std.testing.allocator);
@@ -9286,7 +9253,7 @@ test "pending selection restore clears when status finishes empty after reload" 
         .result = .empty,
     });
 
-    try std.testing.expect(app.pending_selection_restore == null);
+    try std.testing.expect(app.pages.review.pending_selection_restore == null);
 }
 
 const BranchStatusBundleSpec = struct {
@@ -9366,10 +9333,12 @@ fn appGitOutputAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir, 
 
 test "stale branch status result is ignored" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .branch_status_load = .{ .generation = 2, .pending = .{ .generation = 2 } },
+        } },
         .allocator = std.testing.allocator,
-        .branch_status_load = .{ .generation = 2, .pending = .{ .generation = 2 } },
     };
-    defer app.branch_status.deinit();
+    defer app.pages.review.branch_status.deinit();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     const bundle = try branchStatusBundleForTest(std.testing.allocator, .{
@@ -9385,14 +9354,14 @@ test "stale branch status result is ignored" {
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expect(app.branch_status.repo_root == null);
-    try std.testing.expect(std.meta.eql(git_branch_status.Head.unknown, app.branch_status.status.head));
-    try std.testing.expectEqual(@as(?u64, 2), if (app.branch_status_load.pending) |pending| pending.generation else null);
+    try std.testing.expect(app.pages.review.branch_status.repo_root == null);
+    try std.testing.expect(std.meta.eql(git_branch_status.Head.unknown, app.pages.review.branch_status.status.head));
+    try std.testing.expectEqual(@as(?u64, 2), if (app.pages.review.branch_status_load.pending) |pending| pending.generation else null);
 }
 
 test "background branch failure retains display and identical recovery restores freshness" {
     var app: App = .{ .allocator = std.testing.allocator };
-    defer app.branch_status.deinit();
+    defer app.pages.review.branch_status.deinit();
     var current = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc",
         .branch = "main",
@@ -9400,14 +9369,14 @@ test "background branch failure retains display and identical recovery restores 
         .ahead = 1,
         .behind = 0,
     });
-    try app.branch_status.replace("/repo", &current);
-    const root_ptr = app.branch_status.repo_root.?.ptr;
+    try app.pages.review.branch_status.replace("/repo", &current);
+    const root_ptr = app.pages.review.branch_status.repo_root.?.ptr;
 
-    app.auto_reload = .init(.inherit, .{}, .unstaged);
-    const cycle_id = app.auto_reload.beginCycle().?;
-    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .branch));
-    const generation = app.branch_status_load.prepare(true);
-    app.branch_status_load.begin(cycle_id);
+    app.pages.review.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.pages.review.auto_reload.beginCycle().?;
+    try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .branch));
+    const generation = app.pages.review.branch_status_load.prepare(true);
+    app.pages.review.branch_status_load.begin(cycle_id);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     app.finishBranchStatusLoad(&ctx, .{
         .generation = generation,
@@ -9416,12 +9385,12 @@ test "background branch failure retains display and identical recovery restores 
         .result = .{ .failed_static = "transient branch failure" },
     });
 
-    try std.testing.expectEqualStrings("/repo", app.branch_status.repo_root.?);
-    try std.testing.expect(!app.branch_status_load.isFresh());
-    try std.testing.expect(app.auto_reload.background_cycle == null);
+    try std.testing.expectEqualStrings("/repo", app.pages.review.branch_status.repo_root.?);
+    try std.testing.expect(!app.pages.review.branch_status_load.isFresh());
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 
-    const recovery_generation = app.branch_status_load.prepare(true);
-    app.branch_status_load.begin(null);
+    const recovery_generation = app.pages.review.branch_status_load.prepare(true);
+    app.pages.review.branch_status_load.begin(null);
     const same = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc",
         .branch = "main",
@@ -9434,24 +9403,24 @@ test "background branch failure retains display and identical recovery restores 
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = same },
     });
-    try std.testing.expect(app.branch_status_load.isFresh());
-    try std.testing.expectEqual(root_ptr, app.branch_status.repo_root.?.ptr);
+    try std.testing.expect(app.pages.review.branch_status_load.isFresh());
+    try std.testing.expectEqual(root_ptr, app.pages.review.branch_status.repo_root.?.ptr);
 }
 
 test "background branch completion during repository action is discarded and releases cycle" {
     var app: App = .{ .allocator = std.testing.allocator };
-    defer app.branch_status.deinit();
+    defer app.pages.review.branch_status.deinit();
     var current = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "old-oid",
         .branch = "old-branch",
     });
-    try app.branch_status.replace("/repo", &current);
+    try app.pages.review.branch_status.replace("/repo", &current);
 
-    app.auto_reload = .init(.inherit, .{}, .unstaged);
-    const cycle_id = app.auto_reload.beginCycle().?;
-    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .branch));
-    const generation = app.branch_status_load.prepare(true);
-    app.branch_status_load.begin(cycle_id);
+    app.pages.review.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.pages.review.auto_reload.beginCycle().?;
+    try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .branch));
+    const generation = app.pages.review.branch_status_load.prepare(true);
+    app.pages.review.branch_status_load.begin(cycle_id);
     _ = app.actions.begin(.stage_file);
     const changed = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "new-oid",
@@ -9466,10 +9435,10 @@ test "background branch completion during repository action is discarded and rel
         .result = .{ .loaded = changed },
     });
 
-    try std.testing.expectEqualStrings("old-branch", app.branch_status.status.branchName().?);
-    try std.testing.expect(!app.branch_status_load.isPending());
-    try std.testing.expectEqual(app_auto_reload.AuxiliaryFreshness.stale_refresh, app.branch_status_load.freshness);
-    try std.testing.expect(app.auto_reload.background_cycle == null);
+    try std.testing.expectEqualStrings("old-branch", app.pages.review.branch_status.status.branchName().?);
+    try std.testing.expect(!app.pages.review.branch_status_load.isPending());
+    try std.testing.expectEqual(app_auto_reload.AuxiliaryFreshness.stale_refresh, app.pages.review.branch_status_load.freshness);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 }
 
 test "requestPush snapshots the active branch target" {
@@ -9481,7 +9450,7 @@ test "requestPush snapshots the active branch target" {
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
+    defer app.pages.review.branch_status.deinit();
     defer app.cancelPushConfirmation(std.testing.allocator);
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
@@ -9491,7 +9460,7 @@ test "requestPush snapshots the active branch target" {
         .ahead = 2,
         .behind = 0,
     });
-    try app.branch_status.replace("/repo", &bundle);
+    try app.pages.review.branch_status.replace("/repo", &bundle);
 
     try app.requestPush(std.testing.allocator);
 
@@ -9515,14 +9484,14 @@ test "requestPush snapshots set-upstream target for branch without upstream" {
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
+    defer app.pages.review.branch_status.deinit();
     defer app.cancelPushConfirmation(std.testing.allocator);
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "feature/topic",
     });
-    try app.branch_status.replace("/repo", &bundle);
+    try app.pages.review.branch_status.replace("/repo", &bundle);
 
     try app.requestPush(std.testing.allocator);
 
@@ -9546,8 +9515,8 @@ test "requestPull snapshots the active branch target" {
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
-    defer app.git_status.deinit();
+    defer app.pages.review.branch_status.deinit();
+    defer app.pages.review.git_status.deinit();
     defer app.cancelPullConfirmation(std.testing.allocator);
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
@@ -9557,9 +9526,9 @@ test "requestPull snapshots the active branch target" {
         .ahead = 0,
         .behind = 2,
     });
-    try app.branch_status.replace("/repo", &bundle);
+    try app.pages.review.branch_status.replace("/repo", &bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     try app.requestPull(std.testing.allocator);
 
@@ -9583,8 +9552,8 @@ test "requestPull opens confirmation before remote refresh regardless of stale a
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
-    defer app.git_status.deinit();
+    defer app.pages.review.branch_status.deinit();
+    defer app.pages.review.git_status.deinit();
     defer app.cancelPullConfirmation(std.testing.allocator);
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
@@ -9594,9 +9563,9 @@ test "requestPull opens confirmation before remote refresh regardless of stale a
         .ahead = 1,
         .behind = 0,
     });
-    try app.branch_status.replace("/repo", &bundle);
+    try app.pages.review.branch_status.replace("/repo", &bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     try app.requestPull(std.testing.allocator);
 
@@ -9616,17 +9585,17 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
-    defer app.git_status.deinit();
+    defer app.pages.review.branch_status.deinit();
+    defer app.pages.review.git_status.deinit();
     defer app.clearBranchSwitch(std.testing.allocator);
 
     var branch_bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "main",
     });
-    try app.branch_status.replace("/repo", &branch_bundle);
+    try app.pages.review.branch_status.replace("/repo", &branch_bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer clearPendingBranchListTasks(&ctx, std.testing.allocator);
@@ -9650,16 +9619,16 @@ test "requestBranchSwitch rejects untracked-only status distinctly" {
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
-    defer app.git_status.deinit();
+    defer app.pages.review.branch_status.deinit();
+    defer app.pages.review.git_status.deinit();
 
     var branch_bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "main",
     });
-    try app.branch_status.replace("/repo", &branch_bundle);
+    try app.pages.review.branch_status.replace("/repo", &branch_bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? new.txt\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.requestBranchSwitch(&ctx);
@@ -9728,16 +9697,16 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
         .overlay = .{ .kind = .switch_branch },
     };
     defer app.clearBranchSwitch(std.testing.allocator);
-    defer app.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
 
-    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.confirmBranchSwitch(&ctx);
 
     try std.testing.expect(!app.overlay.isSwitchBranch());
     try std.testing.expect(app.branch_switch.branches.len == 0);
-    try std.testing.expect(app.staged_hunks.contains("/repo", "a", 0));
+    try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 0));
     try std.testing.expectEqualStrings("already on branch: main", app.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(app.actions.pending == null);
@@ -9754,14 +9723,14 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
             .canonical_root = "/repo",
         } } },
     };
-    defer app.reviewed_store.deinit(allocator);
-    defer app.staged_hunks.deinit(allocator);
+    defer app.pages.review.reviewed_store.deinit(allocator);
+    defer app.pages.review.staged_hunks.deinit(allocator);
     defer app.clearPendingSelectionRestore(allocator);
-    defer app.tree_order.deinit(allocator);
-    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+    defer app.pages.review.tree_order.deinit(allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
 
-    try app.reviewed_store.set(allocator, app.activeRepoRoot(), app_test_support.files_two[0], true);
-    try app.staged_hunks.add(allocator, "/repo", "a", 0);
+    try app.pages.review.reviewed_store.set(allocator, app.activeRepoRoot(), app_test_support.files_two[0], true);
+    try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 0);
     try app.setPendingSelectionRestore(allocator, "a");
     setDiffSearchQuery(&app, "needle");
 
@@ -9778,10 +9747,10 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
     });
 
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(!try app.reviewed_store.containsFile(allocator, app.activeRepoRoot(), app_test_support.files_two[0]));
-    try std.testing.expectEqual(@as(usize, 0), app.staged_hunks.items.items.len);
-    try std.testing.expect(app.pending_selection_restore == null);
-    try std.testing.expectEqual(@as(usize, 0), app.search.query.len);
+    try std.testing.expect(!try app.pages.review.reviewed_store.containsFile(allocator, app.activeRepoRoot(), app_test_support.files_two[0]));
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.staged_hunks.items.items.len);
+    try std.testing.expect(app.pages.review.pending_selection_restore == null);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.search.query.len);
     try std.testing.expectEqualStrings("switched branch: main -> feature", app.status.text());
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
 }
@@ -9799,13 +9768,13 @@ test "finishSwitchBranch success clears completed repo marks when active repo ch
             .repos = &repos,
         } }, .active_index = 1 },
     };
-    defer app.reviewed_store.deinit(allocator);
-    defer app.staged_hunks.deinit(allocator);
+    defer app.pages.review.reviewed_store.deinit(allocator);
+    defer app.pages.review.staged_hunks.deinit(allocator);
 
-    try app.reviewed_store.set(allocator, "/repo", app_test_support.files_two[0], true);
-    try app.reviewed_store.set(allocator, "/other", app_test_support.files_two[1], true);
-    try app.staged_hunks.add(allocator, "/repo", "a", 0);
-    try app.staged_hunks.add(allocator, "/other", "b", 1);
+    try app.pages.review.reviewed_store.set(allocator, "/repo", app_test_support.files_two[0], true);
+    try app.pages.review.reviewed_store.set(allocator, "/other", app_test_support.files_two[1], true);
+    try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 0);
+    try app.pages.review.staged_hunks.add(allocator, "/other", "b", 1);
 
     const pending = app.actions.begin(.switch_branch);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
@@ -9819,10 +9788,10 @@ test "finishSwitchBranch success clears completed repo marks when active repo ch
     });
 
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(!try app.reviewed_store.containsFile(allocator, "/repo", app_test_support.files_two[0]));
-    try std.testing.expect(try app.reviewed_store.containsFile(allocator, "/other", app_test_support.files_two[1]));
-    try std.testing.expect(!app.staged_hunks.contains("/repo", "a", 0));
-    try std.testing.expect(app.staged_hunks.contains("/other", "b", 1));
+    try std.testing.expect(!try app.pages.review.reviewed_store.containsFile(allocator, "/repo", app_test_support.files_two[0]));
+    try std.testing.expect(try app.pages.review.reviewed_store.containsFile(allocator, "/other", app_test_support.files_two[1]));
+    try std.testing.expect(!app.pages.review.staged_hunks.contains("/repo", "a", 0));
+    try std.testing.expect(app.pages.review.staged_hunks.contains("/other", "b", 1));
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expectEqualStrings("switched branch: /repo", app.status.text());
 }
@@ -9836,7 +9805,7 @@ test "requestPush clears previous push error details" {
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
+    defer app.pages.review.branch_status.deinit();
     defer app.cancelPushConfirmation(std.testing.allocator);
     defer app.clearPushError(std.testing.allocator);
 
@@ -9847,7 +9816,7 @@ test "requestPush clears previous push error details" {
         .ahead = 2,
         .behind = 0,
     });
-    try app.branch_status.replace("/repo", &bundle);
+    try app.pages.review.branch_status.replace("/repo", &bundle);
     try app.setPushError(std.testing.allocator, "old push failure");
 
     try app.requestPush(std.testing.allocator);
@@ -10078,7 +10047,7 @@ test "finishPush does not reload a stale active repository" {
     });
 
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(app.load.pending == null);
+    try std.testing.expect(app.pages.review.load.pending == null);
     try std.testing.expectEqualStrings("pushed: /repo", app.status.text());
 }
 
@@ -10105,7 +10074,7 @@ test "finishPull does not reload a stale active repository" {
     });
 
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(app.load.pending == null);
+    try std.testing.expect(app.pages.review.load.pending == null);
     try std.testing.expectEqualStrings("pulled: /repo", app.status.text());
 }
 
@@ -10133,7 +10102,7 @@ test "finishPull reloads matching active repo after up-to-date success" {
     });
 
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(app.load.pending != null);
+    try std.testing.expect(app.pages.review.load.pending != null);
     try std.testing.expectEqualStrings("nothing to pull", app.status.text());
 }
 
@@ -10161,7 +10130,7 @@ test "finishPull reloads matching active repo after failure" {
     });
 
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(app.load.pending != null);
+    try std.testing.expect(app.pages.review.load.pending != null);
     try std.testing.expectEqualStrings("pull failed: remote unavailable", app.status.text());
 }
 
@@ -10185,7 +10154,7 @@ test "finishFetch does not reload a stale active repository" {
     });
 
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(app.load.pending == null);
+    try std.testing.expect(app.pages.review.load.pending == null);
     try std.testing.expectEqualStrings("fetched: /repo", app.status.text());
 }
 
@@ -10210,7 +10179,7 @@ test "finishFetch reloads matching active repo after failure" {
     });
 
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(app.load.pending != null);
+    try std.testing.expect(app.pages.review.load.pending != null);
     try std.testing.expectEqualStrings("fetch failed: remote unavailable", app.status.text());
 }
 
@@ -10520,40 +10489,44 @@ test "manual reload clears action selection restore" {
 
     try app.update(.reload, &ctx);
 
-    try std.testing.expect(app.pending_selection_restore == null);
+    try std.testing.expect(app.pages.review.pending_selection_restore == null);
 }
 
 test "toggling selected directory collapses visible descendants" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
+            .viewer = .{
+                .selected_file = 0,
+                .selected_node = 0,
+            },
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
-        .viewer = .{
-            .selected_file = 0,
-            .selected_node = 0,
-        },
     };
     defer app.clearLoadedDiff();
 
     try app.toggleSelectedDirectory();
 
-    const loaded = app.load.state.loaded.loaded;
+    const loaded = app.pages.review.load.state.loaded.loaded;
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 1), loaded.tree.visibleNodeCount(&loaded.collapsed_dirs));
     try std.testing.expect(loaded.visible_nodes.len >= loaded.tree.nodes.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
 }
 
 test "file search selects matching file and expands ancestors" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
+            .viewer = .{
+                .selected_file = 0,
+                .selected_node = 0,
+            },
+            .file_search = .{ .mode = true },
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
-        .viewer = .{
-            .selected_file = 0,
-            .selected_node = 0,
-        },
-        .file_search = .{ .mode = true },
     };
     defer app.clearLoadedDiff();
 
@@ -10565,42 +10538,46 @@ test "file search selects matching file and expands ancestors" {
 
     loaded = app.loadedDiff().?;
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
-    try std.testing.expectEqual(@as(usize, 2), app.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
-    try std.testing.expect(!app.file_search.mode);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expect(!app.pages.review.file_search.mode);
 }
 
 test "file search keeps prompt open on no match" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .file_search = .{ .mode = true },
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-        .file_search = .{ .mode = true },
     };
     setFileSearchInput(&app, "missing");
 
-    defer app.file_search.deinit(std.testing.allocator);
+    defer app.pages.review.file_search.deinit(std.testing.allocator);
 
     try app.submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(app.file_search.mode);
-    try std.testing.expect(app.file_search.no_match);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
+    try std.testing.expect(app.pages.review.file_search.mode);
+    try std.testing.expect(app.pages.review.file_search.no_match);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
 }
 
 test "file search skips hidden reviewed matches" {
     var reviewed = [_]bool{ true, false };
     var app: App = .{
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
-            .text = "",
-            .document = .{ .files = &app_test_support.files_two },
-            .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
-            .reviewed_files = &reviewed,
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
-        .file_search = .{ .mode = true },
-        .review_display = .{ .hide_reviewed_files = true },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .file_search = .{ .mode = true },
+            .review_display = .{ .hide_reviewed_files = true },
+        } },
     };
     defer app.clearLoadedDiff();
     try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, true, .all);
@@ -10608,55 +10585,59 @@ test "file search skips hidden reviewed matches" {
 
     try app.submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(!app.file_search.mode);
-    try std.testing.expect(!app.file_search.no_match);
-    try std.testing.expectEqual(@as(usize, 2), app.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
+    try std.testing.expect(!app.pages.review.file_search.mode);
+    try std.testing.expect(!app.pages.review.file_search.no_match);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
 }
 
 test "file search trims empty input and restores focus on cancel" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .viewer = .{ .focus = .diff },
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-        .viewer = .{ .focus = .diff },
     };
 
     app.enterFileSearchMode();
-    try std.testing.expectEqual(Focus.sidebar, app.viewer.focus);
+    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
     setFileSearchInput(&app, "   ");
 
     try app.submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(!app.file_search.mode);
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
+    try std.testing.expect(!app.pages.review.file_search.mode);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
 }
 
 test "file search keeps diff focus while sidebar is hidden" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
+            .viewer = .{ .focus = .diff, .sidebar_hidden = true },
+        } },
         .terminal_size = .{ .width = 100, .height = 12 },
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
-        .viewer = .{ .focus = .diff, .sidebar_hidden = true },
     };
     defer app.clearLoadedDiff();
 
     app.enterFileSearchMode();
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
     setFileSearchInput(&app, "   ");
 
     try app.submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(!app.file_search.mode);
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
+    try std.testing.expect(!app.pages.review.file_search.mode);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 
     app.enterFileSearchMode();
     setFileSearchInput(&app, "src/b");
 
     try app.submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(!app.file_search.mode);
-    try std.testing.expectEqual(Focus.diff, app.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
+    try std.testing.expect(!app.pages.review.file_search.mode);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
 }
 
 fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette {
@@ -10679,11 +10660,13 @@ test "sidebar renders file status badges" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+        } },
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     try ts.expectCellText(2, sidebar_header_rows, "A");
     try ts.expectCellText(2, sidebar_header_rows + 1, "D");
@@ -10695,12 +10678,14 @@ test "sidebar added status badge follows success role override" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+        } },
         .terminal_size = .{ .width = 80, .height = 9 },
         .theme = paletteWithOverride(.success, .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } }),
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     try ts.expectCellText(2, sidebar_header_rows, "A");
     try std.testing.expect(ts.surface.readCell(2, sidebar_header_rows).?.style.fg.eql(.{ .rgb = .{ 1, 2, 3 } }));
@@ -10723,18 +10708,20 @@ test "sidebar renders mode change badge next to file status" {
         },
     };
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_one },
+                .tree = .{ .nodes = &nodes },
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+        } },
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = app_test_support.loadState(.{
-            .text = "",
-            .document = .{ .files = &app_test_support.files_one },
-            .tree = .{ .nodes = &nodes },
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     try ts.expectCellText(2, sidebar_header_rows, "M");
     try ts.expectCellText(4, sidebar_header_rows, "m");
@@ -10755,19 +10742,21 @@ test "sidebar horizontal scroll reveals deep file name" {
         },
     };
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_one },
+                .tree = .{ .nodes = &nodes },
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{ .sidebar_horizontal_scroll = 12 },
+        } },
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = app_test_support.loadState(.{
-            .text = "",
-            .document = .{ .files = &app_test_support.files_one },
-            .tree = .{ .nodes = &nodes },
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
-        .viewer = .{ .sidebar_horizontal_scroll = 12 },
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
@@ -10780,12 +10769,14 @@ test "sidebar title indicates active focus" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .focus = .sidebar },
+        } },
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .focus = .sidebar },
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     try ts.expectCellText(0, 2, " ");
     try ts.expectCellText(1, 2, "F");
@@ -10799,13 +10790,15 @@ test "sidebar title follows accent role override" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .focus = .sidebar },
+        } },
         .terminal_size = .{ .width = 80, .height = 9 },
         .theme = paletteWithOverride(.accent, .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } }),
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .focus = .sidebar },
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     try ts.expectCellText(1, 2, "F");
     try std.testing.expect(ts.surface.readCell(1, 2).?.style.fg.eql(.{ .rgb = .{ 4, 5, 6 } }));
@@ -10847,12 +10840,14 @@ test "inactive sidebar selected row is dim without reverse background" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .focus = .diff },
+        } },
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .focus = .diff },
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     const cell = ts.surface.readCell(0, sidebar_header_rows).?;
     try ts.expectCellText(0, sidebar_header_rows, "▌");
@@ -10866,12 +10861,14 @@ test "active sidebar selected row keeps reverse background" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .focus = .sidebar },
+        } },
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .focus = .sidebar },
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     const cell = ts.surface.readCell(0, sidebar_header_rows).?;
     try ts.expectCellText(0, sidebar_header_rows, "▌");
@@ -10885,12 +10882,14 @@ test "diff header detail row uses frame separator style when active" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .focus = .diff },
+        } },
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .focus = .diff },
     };
 
-    try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewDiffPane(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     try ts.expectCellText(0, 1, "─");
     try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.default));
@@ -10903,12 +10902,14 @@ test "diff header detail row dims separator when inactive" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .focus = .sidebar },
+        } },
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .focus = .sidebar },
     };
 
-    try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewDiffPane(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     try ts.expectCellText(0, 1, "─");
     try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.gray));
@@ -10917,40 +10918,44 @@ test "diff header detail row dims separator when inactive" {
 
 test "selectedStagePathKey accepts diff and status-only selections" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        } },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
-        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
     defer app.clearLoadedDiff();
 
     try std.testing.expectEqualStrings("src/added.zig", app.selectedStagePathKey().?);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    defer app.git_status.deinit();
-    try app.git_status.replace("/repo", &status_bundle);
-    app.viewer.selected_target = .{ .status_only = 0 };
+    defer app.pages.review.git_status.deinit();
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    app.pages.review.viewer.selected_target = .{ .status_only = 0 };
 
     try std.testing.expectEqualStrings("src/new.zig", app.selectedStagePathKey().?);
 }
 
 test "selectionContext keeps status-only selection while status load is pending" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .viewer = .{ .selected_target = .{ .status_only = 0 } },
+            .status_load = .{ .generation = 9, .pending = .{ .generation = 9 } },
+        } },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .viewer = .{ .selected_target = .{ .status_only = 0 } },
-        .status_load = .{ .generation = 9, .pending = .{ .generation = 9 } },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     const selection = app.selectionContext();
     const status = selection.selected.?.status_only;
@@ -10960,39 +10965,43 @@ test "selectionContext keeps status-only selection while status load is pending"
 
 test "selectionContext rejects stale status-only identities" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .viewer = .{ .selected_target = .{ .status_only = 0 } },
+        } },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.git_status.replace("/other", &status_bundle);
+    try app.pages.review.git_status.replace("/other", &status_bundle);
     try std.testing.expect(app.selectionContext().selected == null);
 
-    app.git_status.deinit();
+    app.pages.review.git_status.deinit();
     var matching = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.git_status.replace("/repo", &matching);
-    app.viewer.selected_target = .{ .status_only = 1 };
+    try app.pages.review.git_status.replace("/repo", &matching);
+    app.pages.review.viewer.selected_target = .{ .status_only = 1 };
     try std.testing.expect(app.selectionContext().selected == null);
 }
 
 test "selectedSidebarActionTarget resolves status-only path without loaded diff" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .viewer = .{ .selected_target = .{ .status_only = 0 } },
+        } },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     const target = app.selectedSidebarActionTarget() orelse return error.ExpectedActionTarget;
     try std.testing.expectEqual(git_ops.TargetKind.file, target.kind);
@@ -11011,30 +11020,32 @@ test "selectedEditorTarget accepts status-only file rows" {
         },
     };
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &.{} },
+                .tree = .{ .nodes = &status_nodes },
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{
+                .selected_node = 0,
+                .selected_target = .{ .status_only = 0 },
+            },
+        } },
         .config = .{ .source = .cached },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(.{
-            .text = "",
-            .document = .{ .files = &.{} },
-            .tree = .{ .nodes = &status_nodes },
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
-        .viewer = .{
-            .selected_node = 0,
-            .selected_target = .{ .status_only = 0 },
-        },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     acceptTestSource(&app);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/staged.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     switch (app.selectedEditorTarget()) {
         .ready => |target| {
@@ -11047,17 +11058,19 @@ test "selectedEditorTarget accepts status-only file rows" {
 
 test "selectedEditorTarget rejects deleted and historical sources" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+            .viewer = .{
+                .selected_node = 1,
+                .selected_target = .{ .diff_file = 1 },
+            },
+        } },
         .config = .{ .source = .cached },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
-        .viewer = .{
-            .selected_node = 1,
-            .selected_target = .{ .diff_file = 1 },
-        },
     };
     acceptTestSource(&app);
 
@@ -11079,6 +11092,20 @@ test "selectedEditorTarget rejects deleted status-only file rows from fresh stat
         },
     };
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &.{} },
+                .tree = .{ .nodes = &status_nodes },
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{
+                .selected_node = 0,
+                .selected_target = .{ .status_only = 0 },
+            },
+        } },
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -11086,32 +11113,22 @@ test "selectedEditorTarget rejects deleted status-only file rows from fresh stat
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(.{
-            .text = "",
-            .document = .{ .files = &.{} },
-            .tree = .{ .nodes = &status_nodes },
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
-        .viewer = .{
-            .selected_node = 0,
-            .selected_target = .{ .status_only = 0 },
-        },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     acceptTestSource(&app);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " D src/deleted.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     try std.testing.expectEqual(App.EditorTargetResult.deleted_file, app.selectedEditorTarget());
 }
 
 test "selectedEditorTarget rejects live sources without active repo" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
         .config = .{ .source = .unstaged },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
     };
     acceptTestSource(&app);
 
@@ -11120,6 +11137,10 @@ test "selectedEditorTarget rejects live sources without active repo" {
 
 test "selectedEditorTarget rejects directory rows" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .viewer = .{ .selected_node = 0 },
+        } },
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -11127,8 +11148,6 @@ test "selectedEditorTarget rejects directory rows" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-        .viewer = .{ .selected_node = 0 },
     };
     acceptTestSource(&app);
 
@@ -11137,27 +11156,29 @@ test "selectedEditorTarget rejects directory rows" {
 
 test "selectedStageTarget skips only fresh staged-only files" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        } },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
-        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     acceptTestSource(&app);
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
-    try app.git_status.replace("/repo", &staged_bundle);
+    try app.pages.review.git_status.replace("/repo", &staged_bundle);
     switch (app.selectedStageTarget()) {
         .already_staged => |path| try std.testing.expectEqualStrings("src/added.zig", path),
         else => return error.ExpectedAlreadyStagedTarget,
     }
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "AM src/added.zig\x00");
-    try app.git_status.replace("/repo", &mixed_bundle);
+    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
     switch (app.selectedStageTarget()) {
         .ready => |target| {
             try std.testing.expectEqualStrings("/repo", target.repo_root);
@@ -11167,21 +11188,21 @@ test "selectedStageTarget skips only fresh staged-only files" {
     }
 
     var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "UU src/added.zig\x00");
-    try app.git_status.replace("/repo", &conflict_bundle);
+    try app.pages.review.git_status.replace("/repo", &conflict_bundle);
     switch (app.selectedStageTarget()) {
         .ready => {},
         else => return error.ExpectedConflictStageTarget,
     }
 
-    app.status_load.pending = .{ .generation = 1 };
+    app.pages.review.status_load.pending = .{ .generation = 1 };
     switch (app.selectedStageTarget()) {
         .ready => {},
         else => return error.ExpectedStaleStatusStageTarget,
     }
-    app.status_load.pending = null;
+    app.pages.review.status_load.pending = null;
 
     var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
-    try app.git_status.replace("/other", &other_repo_bundle);
+    try app.pages.review.git_status.replace("/other", &other_repo_bundle);
     switch (app.selectedStageTarget()) {
         .ready => {},
         else => return error.ExpectedMismatchedStatusStageTarget,
@@ -11196,41 +11217,43 @@ test "selectedStageTarget skips only fresh staged-only files" {
 
 test "selectedStageToggleOperation resolves file operation from fresh status" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        } },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
-        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     acceptTestSource(&app);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "AM src/added.zig\x00");
-    try app.git_status.replace("/repo", &mixed_bundle);
+    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
     switch (app.selectedStageToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
         else => return error.ExpectedToggleStageOperation,
     }
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
-    try app.git_status.replace("/repo", &staged_bundle);
+    try app.pages.review.git_status.replace("/repo", &staged_bundle);
     switch (app.selectedStageToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.unstage, operation),
         else => return error.ExpectedToggleUnstageOperation,
     }
 
-    app.status_load.pending = .{ .generation = 1 };
+    app.pages.review.status_load.pending = .{ .generation = 1 };
     switch (app.selectedStageToggleOperation()) {
         .stale_status => {},
         else => return error.ExpectedToggleStaleStatus,
     }
-    app.status_load.pending = null;
+    app.pages.review.status_load.pending = null;
 
     var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "UU src/added.zig\x00");
-    try app.git_status.replace("/repo", &conflict_bundle);
+    try app.pages.review.git_status.replace("/repo", &conflict_bundle);
     switch (app.selectedStageToggleOperation()) {
         .conflict_unsupported => |target| {
             try std.testing.expectEqual(TargetKind.file, target.kind);
@@ -11241,7 +11264,7 @@ test "selectedStageToggleOperation resolves file operation from fresh status" {
 
     app.config.source = .cached;
     var cached_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
-    try app.git_status.replace("/repo", &cached_bundle);
+    try app.pages.review.git_status.replace("/repo", &cached_bundle);
     switch (app.selectedStageToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.unstage, operation),
         else => return error.ExpectedCachedToggleUnstage,
@@ -11256,34 +11279,36 @@ test "selectedStageToggleOperation resolves file operation from fresh status" {
 
 test "selectedStageToggleOperation resolves directory operation from descendants" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .viewer = .{ .selected_node = 0 },
+        } },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-        .viewer = .{ .selected_node = 0 },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     acceptTestSource(&app);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00A  src/b\x00");
-    try app.git_status.replace("/repo", &mixed_bundle);
+    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
     switch (app.selectedStageToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
         else => return error.ExpectedDirectoryToggleStage,
     }
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/a\x00M  src/b\x00");
-    try app.git_status.replace("/repo", &staged_bundle);
+    try app.pages.review.git_status.replace("/repo", &staged_bundle);
     switch (app.selectedStageToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.unstage, operation),
         else => return error.ExpectedDirectoryToggleUnstage,
     }
 
     var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "UU src/a\x00");
-    try app.git_status.replace("/repo", &conflict_bundle);
+    try app.pages.review.git_status.replace("/repo", &conflict_bundle);
     switch (app.selectedStageToggleOperation()) {
         .conflict_unsupported => |target| {
             try std.testing.expectEqual(TargetKind.directory, target.kind);
@@ -11295,20 +11320,22 @@ test "selectedStageToggleOperation resolves directory operation from descendants
 
 test "selectedUnstageTarget requires fresh staged status" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        } },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
-        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     acceptTestSource(&app);
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
-    try app.git_status.replace("/repo", &staged_bundle);
+    try app.pages.review.git_status.replace("/repo", &staged_bundle);
 
     switch (app.selectedUnstageTarget()) {
         .ready => |target| {
@@ -11331,29 +11358,29 @@ test "selectedUnstageTarget requires fresh staged status" {
     }
     app.config.source = .unstaged;
 
-    app.status_load.pending = .{ .generation = 1 };
+    app.pages.review.status_load.pending = .{ .generation = 1 };
     switch (app.selectedUnstageTarget()) {
         .stale_status => {},
         else => return error.ExpectedStaleUnstageStatus,
     }
-    app.status_load.pending = null;
+    app.pages.review.status_load.pending = null;
 
     var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
-    try app.git_status.replace("/other", &other_repo_bundle);
+    try app.pages.review.git_status.replace("/other", &other_repo_bundle);
     switch (app.selectedUnstageTarget()) {
         .stale_status => {},
         else => return error.ExpectedMismatchedUnstageStatus,
     }
 
     var unstaged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/added.zig\x00");
-    try app.git_status.replace("/repo", &unstaged_bundle);
+    try app.pages.review.git_status.replace("/repo", &unstaged_bundle);
     switch (app.selectedUnstageTarget()) {
         .no_staged_content => {},
         else => return error.ExpectedNoStagedContent,
     }
 
     var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "UU src/added.zig\x00");
-    try app.git_status.replace("/repo", &conflict_bundle);
+    try app.pages.review.git_status.replace("/repo", &conflict_bundle);
     switch (app.selectedUnstageTarget()) {
         .conflict_unsupported => |target| {
             try std.testing.expectEqualStrings("src/added.zig", target.path);
@@ -11365,6 +11392,10 @@ test "selectedUnstageTarget requires fresh staged status" {
 
 test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
@@ -11373,10 +11404,8 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
-    defer app.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
     acceptTestSource(&app);
 
     switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
@@ -11384,7 +11413,7 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
         else => return error.ExpectedNotStagedHunk,
     }
 
-    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
     switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
@@ -11396,7 +11425,7 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
         else => return error.ExpectedReadyHunkUnstageTarget,
     }
 
-    app.viewer.diff_scroll = 100;
+    app.pages.review.viewer.diff_scroll = 100;
     switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
         .offscreen_cursor => {},
         else => return error.ExpectedOffscreenHunkUnstageTarget,
@@ -11405,6 +11434,10 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
 
 test "selectedHunkUnstageTarget supports cached source without session mark" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .cached },
@@ -11413,8 +11446,6 @@ test "selectedHunkUnstageTarget supports cached source without session mark" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
     acceptTestSource(&app);
 
@@ -11432,6 +11463,10 @@ test "selectedHunkUnstageTarget supports cached source without session mark" {
 
 test "selectedHunkToggleOperation resolves source and session staged state" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
@@ -11440,10 +11475,8 @@ test "selectedHunkToggleOperation resolves source and session staged state" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
-    defer app.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
     acceptTestSource(&app);
 
     switch (app.selectedHunkToggleOperation()) {
@@ -11451,7 +11484,7 @@ test "selectedHunkToggleOperation resolves source and session staged state" {
         else => return error.ExpectedHunkToggleStage,
     }
 
-    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
     switch (app.selectedHunkToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.unstage, operation),
         else => return error.ExpectedHunkToggleUnstage,
@@ -11472,19 +11505,21 @@ test "selectedHunkToggleOperation resolves source and session staged state" {
 
 test "combined projection target is requested for mixed modified unstaged files" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        } },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.git_status.replace("/repo", &mixed_bundle);
+    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
 
     const target = app.reviewProjectionTarget() orelse return error.ExpectedCombinedProjectionTarget;
     try std.testing.expectEqual(app_review_projection.Kind.combined_hunks, target.kind);
@@ -11498,21 +11533,23 @@ test "combined projection target is requested for mixed modified unstaged files"
 
 test "active diff display uses ready combined projection by identity" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+            .status_load = .{ .generation = 3 },
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        } },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
-        .status_load = .{ .generation = 3 },
-        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
-    defer app.git_status.deinit();
-    defer app.review_projection.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.review_projection.deinit(std.testing.allocator);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.git_status.replace("/repo", &mixed_bundle);
+    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -11521,10 +11558,10 @@ test "active diff display uses ready combined projection by identity" {
         "a",
         .combined_hunks,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
@@ -11541,6 +11578,12 @@ test "active diff display uses ready combined projection by identity" {
 
 test "background status refresh retains combined projection while cursor moves" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+            .source_session_revision = 11,
+            .status_snapshot_revision = 13,
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 } },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
@@ -11549,16 +11592,12 @@ test "background status refresh retains combined projection while cursor moves" 
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
-        .source_session_revision = 11,
-        .status_snapshot_revision = 13,
-        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 } },
     };
-    defer app.git_status.deinit();
-    defer app.review_projection.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.review_projection.deinit(std.testing.allocator);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.git_status.replace("/repo", &mixed_bundle);
+    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
         1,
@@ -11566,10 +11605,10 @@ test "background status refresh retains combined projection while cursor moves" 
         "a",
         .combined_hunks,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
@@ -11580,8 +11619,8 @@ test "background status refresh retains combined projection while cursor moves" 
     const cursor_before = app.selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
     try std.testing.expect(cursor_before > 0);
 
-    _ = app.status_load.prepare(true);
-    app.load.generation +%= 1;
+    _ = app.pages.review.status_load.prepare(true);
+    app.pages.review.load.generation +%= 1;
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.ensureReviewProjection(&ctx);
 
@@ -11599,6 +11638,12 @@ test "background status refresh retains combined projection while cursor moves" 
 
 test "unchanged full cycle preserves projection semantic identity" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+            .source_session_revision = 17,
+            .status_snapshot_revision = 19,
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 }, .diff_scroll = 2 },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
@@ -11607,16 +11652,12 @@ test "unchanged full cycle preserves projection semantic identity" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
-        .source_session_revision = 17,
-        .status_snapshot_revision = 19,
-        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 }, .diff_scroll = 2 },
     };
-    defer app.git_status.deinit();
-    defer app.review_projection.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.review_projection.deinit(std.testing.allocator);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.git_status.replace("/repo", &mixed_bundle);
+    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
         1,
@@ -11624,39 +11665,45 @@ test "unchanged full cycle preserves projection semantic identity" {
         "a",
         .combined_hunks,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
 
     const projection_before = app.activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
     const hunks_before = projection_before.projection.file.hunks.ptr;
-    const cursor_before = app.viewer.diff_cursor;
-    const scroll_before = app.viewer.diff_scroll;
+    const cursor_before = app.pages.review.viewer.diff_cursor;
+    const scroll_before = app.pages.review.viewer.diff_scroll;
 
-    const status_generation = app.status_load.prepare(true);
-    app.status_load.begin(1);
-    app.load.generation +%= 1;
-    try std.testing.expect(app.status_load.accept(status_generation));
-    app.status_load.markSuccess();
+    const status_generation = app.pages.review.status_load.prepare(true);
+    app.pages.review.status_load.begin(1);
+    app.pages.review.load.generation +%= 1;
+    try std.testing.expect(app.pages.review.status_load.accept(status_generation));
+    app.pages.review.status_load.markSuccess();
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.ensureReviewProjection(&ctx);
 
     const projection_after = app.activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
     try std.testing.expectEqual(hunks_before, projection_after.projection.file.hunks.ptr);
-    try std.testing.expect(!app.review_projection.hasPending());
-    try std.testing.expectEqual(@as(u64, 17), app.source_session_revision);
-    try std.testing.expectEqual(@as(u64, 19), app.status_snapshot_revision);
-    try std.testing.expectEqual(cursor_before, app.viewer.diff_cursor);
-    try std.testing.expectEqual(scroll_before, app.viewer.diff_scroll);
+    try std.testing.expect(!app.pages.review.review_projection.hasPending());
+    try std.testing.expectEqual(@as(u64, 17), app.pages.review.source_session_revision);
+    try std.testing.expectEqual(@as(u64, 19), app.pages.review.status_snapshot_revision);
+    try std.testing.expectEqual(cursor_before, app.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(scroll_before, app.pages.review.viewer.diff_scroll);
 }
 
 test "final projection prefers explicit interim navigation override" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+            .source_session_revision = 23,
+            .status_snapshot_revision = 29,
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
@@ -11665,16 +11712,12 @@ test "final projection prefers explicit interim navigation override" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
-        .source_session_revision = 23,
-        .status_snapshot_revision = 29,
-        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.git_status.replace("/repo", &mixed_bundle);
+    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
 
     const state_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -11683,14 +11726,14 @@ test "final projection prefers explicit interim navigation override" {
         "a",
         .combined_hunks,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.pending = state_request;
-    app.pending_display_navigation_restore = .{
+    app.pages.review.review_projection.pending = state_request;
+    app.pages.review.pending_display_navigation_restore = .{
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .source_kind = .unstaged,
-        .source_session_revision = app.source_session_revision,
+        .source_session_revision = app.pages.review.source_session_revision,
         .original = .{
             .path_key = try std.testing.allocator.dupe(u8, "a"),
             .selected_target_tag = .diff_file,
@@ -11723,8 +11766,8 @@ test "final projection prefers explicit interim navigation override" {
         "a",
         .combined_hunks,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.finishReviewProjectionLoad(&ctx, .{
@@ -11732,13 +11775,21 @@ test "final projection prefers explicit interim navigation override" {
         .result = .{ .ready = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) } },
     });
 
-    try std.testing.expect(app.pending_display_navigation_restore == null);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 0 }, app.viewer.diff_cursor);
+    try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 0 }, app.pages.review.viewer.diff_cursor);
     try std.testing.expectEqual(@as(?usize, 0), app.selectedDiffCursorOffset());
 }
 
 test "empty watch source carries combined navigation into cached projection" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 2, .pending = .{ .diff_load = 2 }, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+            .status_load = .{ .generation = 7, .pending = .{ .generation = 7, .origin = .background, .background_cycle_id = 1 } },
+            .source_session_revision = 37,
+            .status_snapshot_revision = 41,
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 }, .diff_scroll = 3 },
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
@@ -11747,21 +11798,15 @@ test "empty watch source carries combined navigation into cached projection" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 2, .pending = .{ .diff_load = 2 }, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
-        .status_load = .{ .generation = 7, .pending = .{ .generation = 7, .origin = .background, .background_cycle_id = 1 } },
-        .source_session_revision = 37,
-        .status_snapshot_revision = 41,
-        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 }, .diff_scroll = 3 },
-        .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
 
     var mixed_status = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.git_status.replace("/repo", &mixed_status);
+    try app.pages.review.git_status.replace("/repo", &mixed_status);
     const displayed_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
         1,
@@ -11769,10 +11814,10 @@ test "empty watch source carries combined navigation into cached projection" {
         "a",
         .combined_hunks,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = displayed_request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
@@ -11784,7 +11829,7 @@ test "empty watch source carries combined navigation into cached projection" {
         .generation = 2,
         .result = .empty,
     });
-    try std.testing.expect(app.pending_display_navigation_restore != null);
+    try std.testing.expect(app.pages.review.pending_display_navigation_restore != null);
     try std.testing.expect(app.activeLoadedDiffConst() != null);
     try std.testing.expectEqual(@as(usize, 0), app.activeLoadedDiffConst().?.document.files.len);
 
@@ -11798,15 +11843,15 @@ test "empty watch source carries combined navigation into cached projection" {
     const target = app.reviewProjectionTarget() orelse return error.ExpectedCachedProjectionTarget;
     try std.testing.expectEqual(app_review_projection.Kind.cached_diff, target.kind);
 
-    app.review_projection.pending = try app_review_projection.cloneRequest(
+    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
         std.testing.allocator,
         2,
         target.repo_root,
         target.path_key,
         target.kind,
         target.source_kind,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
     const result_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -11815,15 +11860,15 @@ test "empty watch source carries combined navigation into cached projection" {
         target.path_key,
         target.kind,
         target.source_kind,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
     try app.finishReviewProjectionLoad(&ctx, .{
         .request = result_request,
         .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) } },
     });
 
-    try std.testing.expect(app.pending_display_navigation_restore == null);
+    try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
     try std.testing.expect(app.activeCachedDiffProjection() != null);
     const final_offset = app.selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
     try std.testing.expect(final_offset > 0);
@@ -11832,6 +11877,10 @@ test "empty watch source carries combined navigation into cached projection" {
 
 test "empty watch source carries generated navigation into generated projection" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .source_session_revision = 43,
+            .status_snapshot_revision = 47,
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
@@ -11840,23 +11889,21 @@ test "empty watch source carries generated navigation into generated projection"
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .source_session_revision = 43,
-        .status_snapshot_revision = 47,
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
 
     var untracked = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? a\x00");
-    try app.git_status.replace("/repo", &untracked);
-    try app.createStatusOnlyLoadedSession(std.testing.allocator, app.git_status.document);
-    app.viewer.diff_cursor = .{ .metadata = 2 };
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.status_load = .{ .generation = 7, .pending = .{ .generation = 7, .origin = .background, .background_cycle_id = 1 } };
-    app.pending_reload = .{ .generation = 2, .kind = .watch };
+    try app.pages.review.git_status.replace("/repo", &untracked);
+    try app.createStatusOnlyLoadedSession(std.testing.allocator, app.pages.review.git_status.document);
+    app.pages.review.viewer.diff_cursor = .{ .metadata = 2 };
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.status_load = .{ .generation = 7, .pending = .{ .generation = 7, .origin = .background, .background_cycle_id = 1 } };
+    app.pages.review.pending_reload = .{ .generation = 2, .kind = .watch };
 
     const displayed_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -11865,10 +11912,10 @@ test "empty watch source carries generated navigation into generated projection"
         "a",
         .generated_added_file,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = displayed_request,
         .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "a", "one\ntwo\nthree\nfour\n", false) },
     } };
@@ -11880,7 +11927,7 @@ test "empty watch source carries generated navigation into generated projection"
         .generation = 2,
         .result = .empty,
     });
-    try std.testing.expect(app.pending_display_navigation_restore != null);
+    try std.testing.expect(app.pages.review.pending_display_navigation_restore != null);
 
     const same_untracked = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? a\x00");
     try app.finishStatusLoad(&ctx, .{
@@ -11892,15 +11939,15 @@ test "empty watch source carries generated navigation into generated projection"
     const target = app.reviewProjectionTarget() orelse return error.ExpectedGeneratedProjectionTarget;
     try std.testing.expectEqual(app_review_projection.Kind.generated_added_file, target.kind);
 
-    app.review_projection.pending = try app_review_projection.cloneRequest(
+    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
         std.testing.allocator,
         2,
         target.repo_root,
         target.path_key,
         target.kind,
         target.source_kind,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
     const result_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -11909,21 +11956,29 @@ test "empty watch source carries generated navigation into generated projection"
         target.path_key,
         target.kind,
         target.source_kind,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
     try app.finishReviewProjectionLoad(&ctx, .{
         .request = result_request,
         .result = .{ .ready = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "a", "one\ntwo\nthree\nfour\nfive\n", false) } },
     });
 
-    try std.testing.expect(app.pending_display_navigation_restore == null);
+    try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
     try std.testing.expect(app.activeGeneratedFileProjection() != null);
     try std.testing.expectEqual(@as(?usize, 2), app.selectedDiffCursorOffset());
 }
 
 test "fresh empty status consumes pending display restore at raw terminal" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 2, .pending = .{ .diff_load = 2 }, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+            .status_load = .{ .generation = 7, .pending = .{ .generation = 7, .origin = .background, .background_cycle_id = 1 } },
+            .source_session_revision = 53,
+            .status_snapshot_revision = 59,
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 } },
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+        } },
         .allocator = std.testing.allocator,
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -11931,21 +11986,15 @@ test "fresh empty status consumes pending display restore at raw terminal" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 2, .pending = .{ .diff_load = 2 }, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
-        .status_load = .{ .generation = 7, .pending = .{ .generation = 7, .origin = .background, .background_cycle_id = 1 } },
-        .source_session_revision = 53,
-        .status_snapshot_revision = 59,
-        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 } },
-        .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
 
     var mixed_status = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.git_status.replace("/repo", &mixed_status);
+    try app.pages.review.git_status.replace("/repo", &mixed_status);
     const displayed_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
         1,
@@ -11953,17 +12002,17 @@ test "fresh empty status consumes pending display restore at raw terminal" {
         "a",
         .combined_hunks,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = displayed_request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.finishDiffLoad(&ctx, .{ .generation = 2, .result = .empty });
-    try std.testing.expect(app.pending_display_navigation_restore != null);
+    try std.testing.expect(app.pages.review.pending_display_navigation_restore != null);
 
     try app.finishStatusLoad(&ctx, .{
         .generation = 7,
@@ -11972,13 +12021,19 @@ test "fresh empty status consumes pending display restore at raw terminal" {
         .result = .empty,
     });
 
-    try std.testing.expect(app.pending_display_navigation_restore == null);
+    try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
     try std.testing.expect(app.activeLoadedDiffConst() == null);
-    try std.testing.expect(app.load.state == .empty);
+    try std.testing.expect(app.pages.review.load.state == .empty);
 }
 
 test "explicit interim navigation creates override but automatic state does not" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+            .source_session_revision = 31,
+            .status_load = .{ .freshness = .stale_refresh },
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .metadata = 0 } },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
@@ -11987,20 +12042,16 @@ test "explicit interim navigation creates override but automatic state does not"
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
-        .source_session_revision = 31,
-        .status_load = .{ .freshness = .stale_refresh },
-        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .metadata = 0 } },
     };
     defer app.clearLoadedDiff();
 
     app.initializeDiffCursorForSelectedFile();
     try std.testing.expectEqual(@as(?usize, 0), app.selectedDiffCursorOffset());
 
-    app.pending_display_navigation_restore = .{
+    app.pages.review.pending_display_navigation_restore = .{
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .source_kind = .unstaged,
-        .source_session_revision = app.source_session_revision,
+        .source_session_revision = app.pages.review.source_session_revision,
         .original = .{
             .path_key = try std.testing.allocator.dupe(u8, "a"),
             .selected_target_tag = .diff_file,
@@ -12017,31 +12068,35 @@ test "explicit interim navigation creates override but automatic state does not"
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.update(.scroll_diff_up, &ctx);
-    try std.testing.expectEqual(@as(u64, 0), app.display_navigation_input_revision);
-    try std.testing.expect(app.pending_display_navigation_restore.?.override == null);
+    try std.testing.expectEqual(@as(u64, 0), app.pages.review.display_navigation_input_revision);
+    try std.testing.expect(app.pages.review.pending_display_navigation_restore.?.override == null);
 
     try app.update(.scroll_diff_down, &ctx);
 
-    try std.testing.expectEqual(@as(u64, 1), app.display_navigation_input_revision);
-    var restore = app.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
+    try std.testing.expectEqual(@as(u64, 1), app.pages.review.display_navigation_input_revision);
+    var restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
     var override = restore.override orelse return error.ExpectedNavigationOverride;
-    try std.testing.expectEqual(app.viewer.diff_cursor, override.diff_cursor);
+    try std.testing.expectEqual(app.pages.review.viewer.diff_cursor, override.diff_cursor);
     try std.testing.expectEqual(app.selectedDiffCursorOffset(), override.diff_cursor_offset);
 
     try app.update(.scroll_diff_down, &ctx);
-    try std.testing.expectEqual(@as(u64, 2), app.display_navigation_input_revision);
-    restore = app.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
+    try std.testing.expectEqual(@as(u64, 2), app.pages.review.display_navigation_input_revision);
+    restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
     override = restore.override orelse return error.ExpectedNavigationOverride;
-    try std.testing.expectEqual(app.viewer.diff_cursor, override.diff_cursor);
+    try std.testing.expectEqual(app.pages.review.viewer.diff_cursor, override.diff_cursor);
     try std.testing.expectEqual(app.selectedDiffCursorOffset(), override.diff_cursor_offset);
 
-    const revision_before_clamp = app.display_navigation_input_revision;
+    const revision_before_clamp = app.pages.review.display_navigation_input_revision;
     app.clampDiffNavigation();
-    try std.testing.expectEqual(revision_before_clamp, app.display_navigation_input_revision);
+    try std.testing.expectEqual(revision_before_clamp, app.pages.review.display_navigation_input_revision);
 }
 
 test "selected path change supersedes pending display restore" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .source_session_revision = 61,
+            .status_snapshot_revision = 67,
+        } },
         .allocator = std.testing.allocator,
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -12049,22 +12104,20 @@ test "selected path change supersedes pending display restore" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .source_session_revision = 61,
-        .status_snapshot_revision = 67,
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00M  b\x00");
-    try app.git_status.replace("/repo", &status_bundle);
-    try app.createStatusOnlyLoadedSession(std.testing.allocator, app.git_status.document);
-    app.viewer.selected_target = .{ .status_only = 1 };
-    app.pending_display_navigation_restore = .{
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.createStatusOnlyLoadedSession(std.testing.allocator, app.pages.review.git_status.document);
+    app.pages.review.viewer.selected_target = .{ .status_only = 1 };
+    app.pages.review.pending_display_navigation_restore = .{
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .source_kind = .unstaged,
-        .source_session_revision = app.source_session_revision,
+        .source_session_revision = app.pages.review.source_session_revision,
         .original = .{
             .path_key = try std.testing.allocator.dupe(u8, "a"),
             .selected_target_tag = .status_only,
@@ -12078,27 +12131,31 @@ test "selected path change supersedes pending display restore" {
         },
         .captured_input_revision = 0,
     };
-    app.review_projection.pending = try app_review_projection.cloneRequest(
+    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
         std.testing.allocator,
         2,
         "/repo",
         "b",
         .cached_diff,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.ensureReviewProjection(&ctx);
 
-    try std.testing.expect(app.pending_display_navigation_restore == null);
-    try std.testing.expect(app.review_projection.pending != null);
-    try std.testing.expectEqualStrings("b", app.review_projection.pending.?.path_key);
+    try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
+    try std.testing.expect(app.pages.review.review_projection.pending != null);
+    try std.testing.expectEqualStrings("b", app.pages.review.review_projection.pending.?.path_key);
 }
 
 test "superseded projection completion cannot replace display" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .source_session_revision = 71,
+            .status_snapshot_revision = 73,
+        } },
         .allocator = std.testing.allocator,
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -12106,26 +12163,24 @@ test "superseded projection completion cannot replace display" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .source_session_revision = 71,
-        .status_snapshot_revision = 73,
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.git_status.replace("/repo", &status_bundle);
-    try app.createStatusOnlyLoadedSession(std.testing.allocator, app.git_status.document);
-    const stale_status_revision = app.status_snapshot_revision - 1;
-    app.review_projection.pending = try app_review_projection.cloneRequest(
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.createStatusOnlyLoadedSession(std.testing.allocator, app.pages.review.git_status.document);
+    const stale_status_revision = app.pages.review.status_snapshot_revision - 1;
+    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
         std.testing.allocator,
         1,
         "/repo",
         "a",
         .cached_diff,
         .unstaged,
-        app.source_session_revision,
+        app.pages.review.source_session_revision,
         stale_status_revision,
     );
     const result_request = try app_review_projection.cloneRequest(
@@ -12135,7 +12190,7 @@ test "superseded projection completion cannot replace display" {
         "a",
         .cached_diff,
         .unstaged,
-        app.source_session_revision,
+        app.pages.review.source_session_revision,
         stale_status_revision,
     );
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -12145,13 +12200,18 @@ test "superseded projection completion cannot replace display" {
         .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) } },
     });
 
-    try std.testing.expect(app.review_projection.pending != null);
-    try std.testing.expect(!app.review_projection.hasDisplayed());
-    try std.testing.expectEqual(stale_status_revision, app.review_projection.pending.?.status_snapshot_revision);
+    try std.testing.expect(app.pages.review.review_projection.pending != null);
+    try std.testing.expect(!app.pages.review.review_projection.hasDisplayed());
+    try std.testing.expectEqual(stale_status_revision, app.pages.review.review_projection.pending.?.status_snapshot_revision);
 }
 
 test "cached preview uses displayed diff for cursor movement" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 7 },
+            .status_load = .{ .generation = 3 },
+            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -12159,15 +12219,12 @@ test "cached preview uses displayed diff for cursor movement" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 7 },
-        .status_load = .{ .generation = 3 },
-        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
-    defer app.git_status.deinit();
-    defer app.review_projection.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.review_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -12176,10 +12233,10 @@ test "cached preview uses displayed diff for cursor movement" {
         "a",
         .cached_diff,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
@@ -12188,11 +12245,16 @@ test "cached preview uses displayed diff for cursor movement" {
     app.moveDiffCursorRows(.down);
     try std.testing.expectEqual(@as(?usize, 1), app.visibleDiffCursorOffset());
     app.selectHunkDelta(1);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 0 }, app.viewer.diff_cursor);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 0 }, app.pages.review.viewer.diff_cursor);
 }
 
 test "cached preview supports diff search" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 7 },
+            .status_load = .{ .generation = 3 },
+            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -12200,15 +12262,12 @@ test "cached preview supports diff search" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 7 },
-        .status_load = .{ .generation = 3 },
-        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
-    defer app.git_status.deinit();
-    defer app.review_projection.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.review_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -12217,10 +12276,10 @@ test "cached preview supports diff search" {
         "a",
         .cached_diff,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
@@ -12228,16 +12287,21 @@ test "cached preview supports diff search" {
     setDiffSearchInput(&app, "staged");
     app.submitSearch();
 
-    try std.testing.expect(app.search.match != null);
+    try std.testing.expect(app.pages.review.search.match != null);
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{
         .hunk_line = .{ .hunk_index = 0, .line_index = 1 },
-    }, app.search.match.?.coordinate);
-    try std.testing.expectEqual(@as(?usize, 2), app.search.match_offset);
-    try std.testing.expectEqual(app.search.match.?.coordinate, app.viewer.diff_cursor);
+    }, app.pages.review.search.match.?.coordinate);
+    try std.testing.expectEqual(@as(?usize, 2), app.pages.review.search.match_offset);
+    try std.testing.expectEqual(app.pages.review.search.match.?.coordinate, app.pages.review.viewer.diff_cursor);
 }
 
 test "cached preview keeps search input while projection is pending" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 7 },
+            .status_load = .{ .generation = 3 },
+            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -12245,15 +12309,12 @@ test "cached preview keeps search input while projection is pending" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 7 },
-        .status_load = .{ .generation = 3 },
-        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
-    defer app.git_status.deinit();
-    defer app.review_projection.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.review_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -12262,18 +12323,18 @@ test "cached preview keeps search input while projection is pending" {
         "a",
         .cached_diff,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.pending = request;
+    app.pages.review.review_projection.pending = request;
 
     app.enterSearchMode();
-    try std.testing.expect(app.search.mode);
+    try std.testing.expect(app.pages.review.search.mode);
     setDiffSearchInput(&app, "staged");
     app.submitSearch();
-    try std.testing.expect(!app.search.mode);
-    try std.testing.expect(app.search.match == null);
-    try std.testing.expectEqualStrings("staged", app.search.query.slice());
+    try std.testing.expect(!app.pages.review.search.mode);
+    try std.testing.expect(app.pages.review.search.match == null);
+    try std.testing.expectEqualStrings("staged", app.pages.review.search.query.slice());
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     const ready_request = try app_review_projection.cloneRequest(
@@ -12283,20 +12344,25 @@ test "cached preview keeps search input while projection is pending" {
         "a",
         .cached_diff,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
     try app.finishReviewProjectionLoad(&ctx, .{
         .request = ready_request,
         .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) } },
     });
 
-    try std.testing.expect(app.search.match != null);
-    try std.testing.expectEqual(@as(?usize, 2), app.search.match_offset);
+    try std.testing.expect(app.pages.review.search.match != null);
+    try std.testing.expectEqual(@as(?usize, 2), app.pages.review.search.match_offset);
 }
 
 test "generated preview uses metadata cursor rows and ignores hunk movement" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 7 },
+            .status_load = .{ .generation = 3 },
+            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
+        } },
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -12304,15 +12370,12 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 7 },
-        .status_load = .{ .generation = 3 },
-        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
     };
-    defer app.git_status.deinit();
-    defer app.review_projection.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.review_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -12321,24 +12384,29 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
         "src/new.zig",
         .generated_added_file,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n", false) },
     } };
 
     try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
     app.moveDiffCursorRows(.down);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.viewer.diff_cursor);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.review.viewer.diff_cursor);
     try std.testing.expectEqual(@as(?usize, 1), app.visibleDiffCursorOffset());
     app.selectHunkDelta(1);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.viewer.diff_cursor);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.review.viewer.diff_cursor);
 }
 
 test "generated preview blocks diff search" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 7 },
+            .status_load = .{ .generation = 3 },
+            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
+        } },
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -12346,15 +12414,12 @@ test "generated preview blocks diff search" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 7 },
-        .status_load = .{ .generation = 3 },
-        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
     };
-    defer app.git_status.deinit();
-    defer app.review_projection.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.review_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -12363,27 +12428,32 @@ test "generated preview blocks diff search" {
         "src/new.zig",
         .generated_added_file,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n", false) },
     } };
 
     app.enterSearchMode();
-    try std.testing.expect(!app.search.mode);
+    try std.testing.expect(!app.pages.review.search.mode);
     try std.testing.expectEqualStrings("search is unavailable for generated file preview", app.status.text());
 
     setDiffSearchInput(&app, "two");
     app.submitSearch();
-    try std.testing.expect(app.search.match == null);
-    try std.testing.expect(app.search.match_offset == null);
+    try std.testing.expect(app.pages.review.search.match == null);
+    try std.testing.expect(app.pages.review.search.match_offset == null);
     try std.testing.expectEqualStrings("search is unavailable for generated file preview", app.status.text());
 }
 
 test "staged new file preview blocks diff search" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 7 },
+            .status_load = .{ .generation = 3 },
+            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -12391,15 +12461,12 @@ test "staged new file preview blocks diff search" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 7 },
-        .status_load = .{ .generation = 3 },
-        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
-    defer app.git_status.deinit();
-    defer app.review_projection.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.review_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/new.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -12408,27 +12475,32 @@ test "staged new file preview blocks diff search" {
         "src/new.zig",
         .cached_diff,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
 
     app.enterSearchMode();
-    try std.testing.expect(!app.search.mode);
+    try std.testing.expect(!app.pages.review.search.mode);
     try std.testing.expectEqualStrings("search is unavailable for staged new file preview", app.status.text());
 
     setDiffSearchInput(&app, "staged");
     app.submitSearch();
-    try std.testing.expect(app.search.match == null);
-    try std.testing.expect(app.search.match_offset == null);
+    try std.testing.expect(app.pages.review.search.match == null);
+    try std.testing.expect(app.pages.review.search.match_offset == null);
     try std.testing.expectEqualStrings("search is unavailable for staged new file preview", app.status.text());
 }
 
 test "staged new file preview does not refresh existing search query" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 7 },
+            .status_load = .{ .generation = 3 },
+            .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -12436,15 +12508,12 @@ test "staged new file preview does not refresh existing search query" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 7 },
-        .status_load = .{ .generation = 3 },
-        .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
-    defer app.git_status.deinit();
-    defer app.review_projection.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.review_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/new.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -12453,23 +12522,28 @@ test "staged new file preview does not refresh existing search query" {
         "src/new.zig",
         .cached_diff,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
 
-    app.search.query.insertSlice("staged") catch unreachable;
+    app.pages.review.search.query.insertSlice("staged") catch unreachable;
     app.refreshSearchForSelectedFile();
 
-    try std.testing.expect(app.search.match == null);
-    try std.testing.expect(app.search.match_offset == null);
+    try std.testing.expect(app.pages.review.search.match == null);
+    try std.testing.expect(app.pages.review.search.match_offset == null);
 }
 
 test "projected hunk actions route through original cached and unstaged origins" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+            .status_load = .{ .generation = 3 },
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 40 },
         .config = .{ .source = .unstaged },
@@ -12478,16 +12552,13 @@ test "projected hunk actions route through original cached and unstaged origins"
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
-        .status_load = .{ .generation = 3 },
-        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
-    defer app.git_status.deinit();
-    defer app.review_projection.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.review_projection.deinit(std.testing.allocator);
     acceptTestSource(&app);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.git_status.replace("/repo", &mixed_bundle);
+    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
@@ -12496,10 +12567,10 @@ test "projected hunk actions route through original cached and unstaged origins"
         "a",
         .combined_hunks,
         .unstaged,
-        app.source_session_revision,
-        app.status_snapshot_revision,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
     );
-    app.review_projection.displayed = .{ .ready = .{
+    app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
@@ -12521,7 +12592,7 @@ test "projected hunk actions route through original cached and unstaged origins"
         else => return error.ExpectedReadyProjectedUnstage,
     }
 
-    app.viewer.diff_cursor = .{ .hunk_header = 1 };
+    app.pages.review.viewer.diff_cursor = .{ .hunk_header = 1 };
     switch (app.selectedHunkToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
         else => return error.ExpectedProjectedToggleStage,
@@ -12545,20 +12616,22 @@ test "stagedHunkFlagsForFile keeps partial staged display flags" {
     defer arena.deinit();
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
         .allocator = std.testing.allocator,
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
     };
-    defer app.staged_hunks.deinit(std.testing.allocator);
-    defer app.git_status.deinit();
+    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.git_status.replace("/repo", &status_bundle);
-    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
 
     const flags = try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
     try std.testing.expectEqual(@as(usize, 2), flags.len);
@@ -12571,40 +12644,42 @@ test "stagedHunkFlagsForFile normalizes all staged hunks only when status is sta
     defer arena.deinit();
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
         .allocator = std.testing.allocator,
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
     };
-    defer app.staged_hunks.deinit(std.testing.allocator);
-    defer app.git_status.deinit();
+    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
 
-    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
-    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 1);
+    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 1);
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.git_status.replace("/repo", &staged_bundle);
+    try app.pages.review.git_status.replace("/repo", &staged_bundle);
     try std.testing.expectEqual(@as(usize, 0), (try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks)).len);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.git_status.replace("/repo", &mixed_bundle);
+    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
     const mixed_flags = try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
     try std.testing.expectEqual(@as(usize, 2), mixed_flags.len);
     try std.testing.expect(mixed_flags[0]);
     try std.testing.expect(mixed_flags[1]);
 
-    app.status_load.pending = .{ .generation = 1 };
+    app.pages.review.status_load.pending = .{ .generation = 1 };
     const stale_flags = try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
     try std.testing.expectEqual(@as(usize, 2), stale_flags.len);
     try std.testing.expect(stale_flags[0]);
     try std.testing.expect(stale_flags[1]);
 
-    app.status_load.pending = null;
+    app.pages.review.status_load.pending = null;
     var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.git_status.replace("/other", &other_repo_bundle);
+    try app.pages.review.git_status.replace("/other", &other_repo_bundle);
     const missing_flags = try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
     try std.testing.expectEqual(@as(usize, 2), missing_flags.len);
     try std.testing.expect(missing_flags[0]);
@@ -12616,6 +12691,10 @@ test "stagedHunkFlagsForFile display normalization does not clear hunk action ma
     defer arena.deinit();
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 10 },
         .config = .{ .source = .unstaged },
@@ -12624,18 +12703,16 @@ test "stagedHunkFlagsForFile display normalization does not clear hunk action ma
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
-    defer app.staged_hunks.deinit(std.testing.allocator);
-    defer app.git_status.deinit();
+    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.review.git_status.deinit();
     acceptTestSource(&app);
 
-    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
-    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 1);
+    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 1);
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.git_status.replace("/repo", &staged_bundle);
+    try app.pages.review.git_status.replace("/repo", &staged_bundle);
     try std.testing.expectEqual(@as(usize, 0), (try app.stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks)).len);
 
     switch (app.selectedHunkUnstageTarget(std.testing.allocator)) {
@@ -12652,6 +12729,9 @@ test "stagedHunkFlagsForFile display normalization does not clear hunk action ma
 test "hunk action results mutate session staged marks" {
     const allocator = std.testing.allocator;
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
         .allocator = allocator,
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -12659,9 +12739,8 @@ test "hunk action results mutate session staged marks" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
     };
-    defer app.staged_hunks.deinit(allocator);
+    defer app.pages.review.staged_hunks.deinit(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusTasks(&ctx, allocator);
 
@@ -12674,8 +12753,8 @@ test "hunk action results mutate session staged marks" {
         .result = .ok,
     });
 
-    try std.testing.expect(app.staged_hunks.contains("/repo", "a", 1));
-    try std.testing.expectEqual(@as(usize, 1), app.staged_hunks.items.items.len);
+    try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 1));
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.staged_hunks.items.items.len);
 
     const unstage_pending = app.actions.begin(.unstage_hunk);
     try app.finishUnstageHunk(&ctx, .{
@@ -12686,13 +12765,16 @@ test "hunk action results mutate session staged marks" {
         .result = .ok,
     });
 
-    try std.testing.expect(!app.staged_hunks.contains("/repo", "a", 1));
-    try std.testing.expectEqual(@as(usize, 0), app.staged_hunks.items.items.len);
+    try std.testing.expect(!app.pages.review.staged_hunks.contains("/repo", "a", 1));
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.staged_hunks.items.items.len);
 }
 
 test "projection hunk action results reload status without mutating session marks" {
     const allocator = std.testing.allocator;
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
         .allocator = allocator,
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -12700,9 +12782,8 @@ test "projection hunk action results reload status without mutating session mark
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
     };
-    defer app.staged_hunks.deinit(allocator);
+    defer app.pages.review.staged_hunks.deinit(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusTasks(&ctx, allocator);
 
@@ -12716,12 +12797,12 @@ test "projection hunk action results reload status without mutating session mark
         .result = .ok,
     });
 
-    try std.testing.expect(!app.staged_hunks.contains("/repo", "a", 1));
-    try std.testing.expectEqual(@as(usize, 0), app.staged_hunks.items.items.len);
-    try std.testing.expect(app.status_load.isPending());
+    try std.testing.expect(!app.pages.review.staged_hunks.contains("/repo", "a", 1));
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.staged_hunks.items.items.len);
+    try std.testing.expect(app.pages.review.status_load.isPending());
     clearPendingStatusTasks(&ctx, allocator);
 
-    try app.staged_hunks.add(allocator, "/repo", "a", 1);
+    try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 1);
     const unstage_pending = app.actions.begin(.unstage_hunk);
     try app.finishUnstageHunk(&ctx, .{
         .pending = unstage_pending,
@@ -12732,14 +12813,17 @@ test "projection hunk action results reload status without mutating session mark
         .result = .ok,
     });
 
-    try std.testing.expect(app.staged_hunks.contains("/repo", "a", 1));
-    try std.testing.expectEqual(@as(usize, 1), app.staged_hunks.items.items.len);
-    try std.testing.expect(app.status_load.isPending());
+    try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 1));
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.staged_hunks.items.items.len);
+    try std.testing.expect(app.pages.review.status_load.isPending());
 }
 
 test "cached source hunk unstage reload decision travels with task result" {
     const allocator = std.testing.allocator;
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
         .allocator = allocator,
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
@@ -12747,13 +12831,12 @@ test "cached source hunk unstage reload decision travels with task result" {
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
     };
-    defer app.staged_hunks.deinit(allocator);
+    defer app.pages.review.staged_hunks.deinit(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    try app.staged_hunks.add(allocator, "/repo", "a", 1);
+    try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 1);
     const unstage_pending = app.actions.begin(.unstage_hunk);
     try app.finishUnstageHunk(&ctx, .{
         .pending = unstage_pending,
@@ -12765,8 +12848,8 @@ test "cached source hunk unstage reload decision travels with task result" {
         .result = .ok,
     });
 
-    try std.testing.expect(app.staged_hunks.contains("/repo", "a", 1));
-    switch (app.load.pending orelse return error.ExpectedReloadAfterCachedHunkUnstage) {
+    try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 1));
+    switch (app.pages.review.load.pending orelse return error.ExpectedReloadAfterCachedHunkUnstage) {
         .diff_load => {},
         .repo_discovery => return error.ExpectedReloadAfterCachedHunkUnstage,
     }
@@ -12776,45 +12859,51 @@ test "cached source hunk unstage reload decision travels with task result" {
 test "clearLoadedDiff clears session staged hunk marks" {
     const allocator = std.testing.allocator;
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
         .allocator = allocator,
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
     };
-    defer app.staged_hunks.deinit(allocator);
+    defer app.pages.review.staged_hunks.deinit(allocator);
 
-    try app.staged_hunks.add(allocator, "/repo", "a", 0);
-    try std.testing.expect(app.staged_hunks.contains("/repo", "a", 0));
+    try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 0);
+    try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 0));
 
     app.clearLoadedDiff();
 
-    try std.testing.expectEqual(@as(usize, 0), app.staged_hunks.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.staged_hunks.items.items.len);
 }
 
 test "directory stage target uses sidebar cursor and status subtree" {
     var app: App = .{
+        .pages = .{
+            .review = .{
+                .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+                .viewer = .{
+                    // The diff pane still points at a file, but the sidebar cursor is
+                    // on the directory. Directory actions must use the cursor target.
+                    .selected_target = .{ .diff_file = 1 },
+                    .selected_node = 0,
+                },
+            },
+        },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-        .viewer = .{
-            // The diff pane still points at a file, but the sidebar cursor is
-            // on the directory. Directory actions must use the cursor target.
-            .selected_target = .{ .diff_file = 1 },
-            .selected_node = 0,
-        },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     acceptTestSource(&app);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00?? src/b\x00M  other.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     switch (app.selectedStageTarget()) {
         .ready => |target| {
@@ -12826,14 +12915,14 @@ test "directory stage target uses sidebar cursor and status subtree" {
     }
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/a\x00");
-    try app.git_status.replace("/repo", &staged_bundle);
+    try app.pages.review.git_status.replace("/repo", &staged_bundle);
     switch (app.selectedStageTarget()) {
         .no_stageable_content => |path| try std.testing.expectEqualStrings("src", path),
         else => return error.ExpectedNoDirectoryStageableContent,
     }
 
     var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00UU src/b\x00");
-    try app.git_status.replace("/repo", &conflict_bundle);
+    try app.pages.review.git_status.replace("/repo", &conflict_bundle);
     switch (app.selectedStageTarget()) {
         .conflict_unsupported => |path| try std.testing.expectEqualStrings("src", path),
         else => return error.ExpectedDirectoryConflictStageReject,
@@ -12842,23 +12931,25 @@ test "directory stage target uses sidebar cursor and status subtree" {
 
 test "directory unstage target scans staged subtree" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_node = 0,
+            },
+        } },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 1 },
-            .selected_node = 0,
-        },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     acceptTestSource(&app);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/a\x00AM src/b\x00 M other.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     switch (app.selectedUnstageTarget()) {
         .ready => |target| {
@@ -12870,7 +12961,7 @@ test "directory unstage target scans staged subtree" {
     }
 
     var unstaged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00?? src/b\x00");
-    try app.git_status.replace("/repo", &unstaged_bundle);
+    try app.pages.review.git_status.replace("/repo", &unstaged_bundle);
     switch (app.selectedUnstageTarget()) {
         .no_staged_content => |target| {
             try std.testing.expectEqualStrings("src", target.path);
@@ -12880,7 +12971,7 @@ test "directory unstage target scans staged subtree" {
     }
 
     var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/a\x00UU src/b\x00");
-    try app.git_status.replace("/repo", &conflict_bundle);
+    try app.pages.review.git_status.replace("/repo", &conflict_bundle);
     switch (app.selectedUnstageTarget()) {
         .conflict_unsupported => |target| {
             try std.testing.expectEqualStrings("src", target.path);
@@ -12892,11 +12983,13 @@ test "directory unstage target scans staged subtree" {
 
 test "pending selection restore can restore directory nodes" {
     var app: App = .{
-        .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 1 },
-            .selected_node = 1,
-        },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_node = 1,
+            },
+        } },
     };
     defer app.clearPendingSelectionRestore(std.testing.allocator);
 
@@ -12904,8 +12997,8 @@ test "pending selection restore can restore directory nodes" {
     var loaded = app_test_support.loadedDiffNested();
 
     try std.testing.expect(app.restorePendingSelectionOrFallback(std.testing.allocator, &loaded));
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "pending selection restore can restore repository root node" {
@@ -12924,18 +13017,20 @@ test "pending selection restore can restore repository root node" {
         .lines = 0,
     };
     var app: App = .{
-        .viewer = .{
-            .selected_target = .{ .diff_file = 0 },
-            .selected_node = 1,
-        },
+        .pages = .{ .review = .{
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_node = 1,
+            },
+        } },
     };
     defer app.clearPendingSelectionRestore(std.testing.allocator);
 
     try app.setPendingSelectionRestore(std.testing.allocator, "");
 
     try std.testing.expect(app.restorePendingSelectionOrFallback(std.testing.allocator, &loaded));
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "initialSelectionContext selects first diff file and hunk" {
@@ -13018,13 +13113,15 @@ test "diff search row keeps active focus style" {
     defer ts.deinit();
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .focus = .diff },
+        } },
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .focus = .diff },
     };
     setDiffSearchQuery(&app, "missing");
 
-    try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewDiffPane(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     try ts.expectCellText(1, 1, "s");
     const style = ts.surface.readCell(1, 1).?.style;
@@ -13034,17 +13131,19 @@ test "diff search row keeps active focus style" {
 
 test "changed file filter keeps only matching status rows" {
     var app: App = .{
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffTwoWithStatuses()),
-        .review_display = .{ .changed_file_filter = .added },
-        .viewer = .{
-            .selected_node = 1,
-            .selected_target = .{ .diff_file = 1 },
-            .selected_file = 1,
-        },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffTwoWithStatuses()),
+            .review_display = .{ .changed_file_filter = .added },
+            .viewer = .{
+                .selected_node = 1,
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+            },
+        } },
     };
     defer app.clearLoadedDiff();
 
-    try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, false, app.review_display.changed_file_filter);
+    try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, false, app.pages.review.review_display.changed_file_filter);
 
     const loaded = app.loadedDiff().?;
     try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
@@ -13053,11 +13152,13 @@ test "changed file filter keeps only matching status rows" {
 
 test "finishDiffLoad applies active changed file filter" {
     var app: App = .{
-        .load = .{ .generation = 1 },
-        .review_display = .{ .changed_file_filter = .added },
+        .pages = .{ .review = .{
+            .load = .{ .generation = 1 },
+            .review_display = .{ .changed_file_filter = .added },
+        } },
     };
     defer app.clearLoadedDiff();
-    defer app.reviewed_store.deinit(std.testing.allocator);
+    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_added_deleted);
@@ -13076,63 +13177,69 @@ test "finishDiffLoad applies active changed file filter" {
 
 test "cycling changed file filter rebuilds visible nodes and reconciles selection" {
     var app: App = .{
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffTwoWithStatuses()),
-        .viewer = .{
-            .selected_node = 1,
-            .selected_target = .{ .diff_file = 1 },
-            .selected_file = 1,
-        },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffTwoWithStatuses()),
+            .viewer = .{
+                .selected_node = 1,
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+            },
+        } },
     };
     defer app.clearLoadedDiff();
 
     try app.cycleChangedFileFilter();
 
     const loaded = app.loadedDiff().?;
-    try std.testing.expectEqual(ChangedFileFilter.modified, app.review_display.changed_file_filter);
+    try std.testing.expectEqual(ChangedFileFilter.modified, app.pages.review.review_display.changed_file_filter);
     try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
 }
 
 test "file search skips files outside active changed filter" {
     var app: App = .{
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
-        .file_search = .{ .mode = true },
-        .review_display = .{ .changed_file_filter = .added },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+            .file_search = .{ .mode = true },
+            .review_display = .{ .changed_file_filter = .added },
+        } },
     };
     setFileSearchInput(&app, "deleted");
-    defer app.file_search.deinit(std.testing.allocator);
+    defer app.pages.review.file_search.deinit(std.testing.allocator);
 
     try app.submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(app.file_search.mode);
-    try std.testing.expect(app.file_search.no_match);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_file);
+    try std.testing.expect(app.pages.review.file_search.mode);
+    try std.testing.expect(app.pages.review.file_search.no_match);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
 }
 
 test "toggleReviewedFile toggles selected diff target" {
     var reviewed = [_]bool{ false, false };
     var app: App = .{
-        .load = app_test_support.loadState(.{
-            .text = "",
-            .document = .{ .files = &app_test_support.files_two },
-            .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
-            .reviewed_files = &reviewed,
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
-        .viewer = .{
-            .selected_node = 0,
-            .selected_file = 0,
-        },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{
+                .selected_node = 0,
+                .selected_file = 0,
+            },
+        } },
     };
-    defer app.reviewed_store.deinit(std.testing.allocator);
+    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
 
     try app.toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
 
-    app.viewer.selected_node = 1;
+    app.pages.review.viewer.selected_node = 1;
     try app.toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
 
@@ -13143,22 +13250,24 @@ test "toggleReviewedFile toggles selected diff target" {
 test "toggleReviewedFile uses selected target while cursor is on directory" {
     var reviewed = [_]bool{ false, false };
     var app: App = .{
-        .load = app_test_support.loadState(.{
-            .text = "",
-            .document = .{ .files = &app_test_support.files_two },
-            .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
-            .reviewed_files = &reviewed,
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
-        .viewer = .{
-            .selected_node = 0,
-            .selected_target = .{ .diff_file = 1 },
-            .selected_file = 1,
-        },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{
+                .selected_node = 0,
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+            },
+        } },
     };
-    defer app.reviewed_store.deinit(std.testing.allocator);
+    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
 
     try app.toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ false, true }, &reviewed);
@@ -13177,15 +13286,17 @@ test "toggleReviewedFile ignores unkeyable files in repository input" {
     };
     var reviewed = [_]bool{false};
     var app: App = .{
-        .load = app_test_support.loadState(.{
-            .text = "",
-            .document = .{ .files = &unkeyable_files },
-            .tree = .{ .nodes = &nodes },
-            .reviewed_files = &reviewed,
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &unkeyable_files },
+                .tree = .{ .nodes = &nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+        } },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "repo",
@@ -13199,28 +13310,30 @@ test "toggleReviewedFile ignores unkeyable files in repository input" {
 
 test "raw reviewed state stays in active load only" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+            .viewer = .{
+                .selected_node = 0,
+                .selected_file = 0,
+            },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
-        .viewer = .{
-            .selected_node = 0,
-            .selected_file = 0,
-        },
     };
     defer app.clearLoadedDiff();
-    defer app.reviewed_store.deinit(std.testing.allocator);
+    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
 
     var loaded = app.loadedDiff().?;
     try app.materializeReviewedFiles(std.testing.allocator, loaded);
-    app.load.state.loaded.reviewed_files_owned = true;
+    app.pages.review.load.state.loaded.reviewed_files_owned = true;
 
     try app.toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded.reviewed_files);
 
     app.clearLoadedDiff();
-    app.load.state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffTwo()) };
+    app.pages.review.load.state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffTwo()) };
     loaded = app.loadedDiff().?;
     try app.materializeReviewedFiles(std.testing.allocator, loaded);
-    app.load.state.loaded.reviewed_files_owned = true;
+    app.pages.review.load.state.loaded.reviewed_files_owned = true;
 
     try std.testing.expectEqualSlices(bool, &.{ false, false }, loaded.reviewed_files);
 }
@@ -13247,9 +13360,9 @@ test "reviewed state is scoped by active repository root" {
         } } },
     };
     defer app.repo_state.deinit(allocator);
-    defer app.reviewed_store.deinit(allocator);
+    defer app.pages.review.reviewed_store.deinit(allocator);
 
-    try app.reviewed_store.set(allocator, app.activeRepoRoot(), app_test_support.files_two[0], true);
+    try app.pages.review.reviewed_store.set(allocator, app.activeRepoRoot(), app_test_support.files_two[0], true);
 
     var loaded_one = app_test_support.loadedDiffTwo();
     try app.materializeReviewedFiles(allocator, &loaded_one);
@@ -13702,7 +13815,7 @@ test "repo switch clears action selection restore" {
 
     try app.submitRepoPicker(&ctx);
 
-    try std.testing.expect(app.pending_selection_restore == null);
+    try std.testing.expect(app.pages.review.pending_selection_restore == null);
 }
 
 test "sidebar renders reviewed marker" {
@@ -13712,19 +13825,21 @@ test "sidebar renders reviewed marker" {
 
     var reviewed = [_]bool{ true, false };
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two_statuses },
+                .tree = .{ .nodes = &app_test_support.tree_two_status_nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+        } },
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = app_test_support.loadState(.{
-            .text = "",
-            .document = .{ .files = &app_test_support.files_two_statuses },
-            .tree = .{ .nodes = &app_test_support.tree_two_status_nodes },
-            .reviewed_files = &reviewed,
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
     };
 
-    try app.viewSidebar(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewSidebar(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     try ts.expectCellText(1, sidebar_header_rows, "✓");
     try ts.expectCellText(2, sidebar_header_rows, "A");
@@ -13733,49 +13848,53 @@ test "sidebar renders reviewed marker" {
 test "hide reviewed files removes reviewed file rows from visible list" {
     var reviewed = [_]bool{ true, false };
     var app: App = .{
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
-            .text = "",
-            .document = .{ .files = &app_test_support.files_two },
-            .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
-            .reviewed_files = &reviewed,
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
-        .viewer = .{
-            .selected_node = 1,
-            .selected_file = 0,
-        },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{
+                .selected_node = 1,
+                .selected_file = 0,
+            },
+        } },
     };
     defer app.clearLoadedDiff();
 
     try app.toggleHideReviewedFiles();
 
     const loaded = app.loadedDiff().?;
-    try std.testing.expect(app.review_display.hide_reviewed_files);
+    try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
-    try std.testing.expectEqual(@as(usize, 2), app.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
 }
 
 test "hide reviewed files removes directories with no visible file descendants" {
     var reviewed = [_]bool{ true, true };
     var app: App = .{
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
-            .text = "",
-            .document = .{ .files = &app_test_support.files_two },
-            .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
-            .reviewed_files = &reviewed,
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
-        .viewer = .{
-            .selected_node = 1,
-            .selected_file = 0,
-        },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{
+                .selected_node = 1,
+                .selected_file = 0,
+            },
+        } },
     };
     defer app.clearLoadedDiff();
 
@@ -13788,19 +13907,21 @@ test "hide reviewed files removes directories with no visible file descendants" 
 test "hide reviewed files keeps directories for non-contiguous unreviewed descendants" {
     var reviewed = [_]bool{ true, false };
     var app: App = .{
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
-            .text = "",
-            .document = .{ .files = &app_test_support.files_two },
-            .tree = .{ .nodes = &app_test_support.tree_non_contiguous_nodes },
-            .reviewed_files = &reviewed,
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
-        .viewer = .{
-            .selected_node = 1,
-            .selected_file = 0,
-        },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .tree = .{ .nodes = &app_test_support.tree_non_contiguous_nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{
+                .selected_node = 1,
+                .selected_file = 0,
+            },
+        } },
     };
     defer app.clearLoadedDiff();
 
@@ -13815,23 +13936,25 @@ test "hide reviewed files keeps directories for non-contiguous unreviewed descen
 test "marking a visible file as reviewed while hidden moves selection" {
     var reviewed = [_]bool{ false, false };
     var app: App = .{
-        .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
-            .text = "",
-            .document = .{ .files = &app_test_support.files_two },
-            .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
-            .reviewed_files = &reviewed,
-            .collapsed_dirs = .{},
-            .bytes = 0,
-            .lines = 0,
-        }),
-        .viewer = .{
-            .selected_node = 1,
-            .selected_file = 0,
-        },
-        .review_display = .{ .hide_reviewed_files = true },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{
+                .selected_node = 1,
+                .selected_file = 0,
+            },
+            .review_display = .{ .hide_reviewed_files = true },
+        } },
     };
     defer app.clearLoadedDiff();
-    defer app.reviewed_store.deinit(std.testing.allocator);
+    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
     try app.loadedDiff().?.rebuildVisibleNodes(app.loadArenaAllocator().?, true, .all);
 
     try app.toggleReviewedFile(std.testing.allocator);
@@ -13841,8 +13964,8 @@ test "marking a visible file as reviewed while hidden moves selection" {
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
-    try std.testing.expectEqual(@as(usize, 2), app.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
 }
 
 test "search match marker is drawn on visible match row" {
@@ -13851,10 +13974,12 @@ test "search match marker is drawn on visible match row" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .search = .{ .match_offset = 4 },
+            .viewer = .{ .diff_scroll = 3 },
+        } },
         .terminal_size = .{ .width = 80, .height = 9 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .search = .{ .match_offset = 4 },
-        .viewer = .{ .diff_scroll = 3 },
     };
 
     app.drawSearchMatchMarker(&ts.surface);
@@ -13868,13 +13993,15 @@ test "search marker gutter does not overwrite diff content" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .search = .{ .match_offset = 0 },
+            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+        } },
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .search = .{ .match_offset = 0 },
-        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
 
-    try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewDiffPane(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     try ts.expectCellText(0, diff_body_start_row, "»");
     try ts.expectCellText(1, diff_body_start_row, "▌");
@@ -13888,12 +14015,14 @@ test "status mode label uses diff content width after marker gutter" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .display_mode = .side_by_side },
+        } },
         .terminal_size = .{ .width = 72, .height = 9 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .viewer = .{ .display_mode = .side_by_side },
     };
 
-    try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewDiffPane(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     try ts.expectCellText(57, 0, "u");
     try ts.expectCellText(58, 0, "n");
@@ -13908,13 +14037,15 @@ test "search input header does not show no match before submit" {
     defer ts.deinit();
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .search = .{ .mode = true },
+        } },
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .search = .{ .mode = true },
     };
     setDiffSearchInput(&app, "missing");
 
-    try app.viewDiffPane(&ts.surface, app.load.state.loaded.loaded);
+    try app.viewDiffPane(&ts.surface, app.pages.review.load.state.loaded.loaded);
 
     try ts.expectCellText(1, 1, "s");
     try ts.expectCellText(9, 1, "m");
@@ -13923,24 +14054,26 @@ test "search input header does not show no match before submit" {
 
 test "canceling edited search restores committed query and match" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .search = .{
+                .match = .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } },
+                .match_offset = 4,
+            },
+        } },
         .terminal_size = .{ .width = 90, .height = 11 },
-        .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-        .search = .{
-            .match = .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } },
-            .match_offset = 4,
-        },
     };
     setDiffSearchQuery(&app, "new");
 
     app.enterSearchMode();
-    app.search.input.backspace();
-    try app.search.input.insert('x');
+    app.pages.review.search.input.backspace();
+    try app.pages.review.search.input.insert('x');
     app.cancelSearchMode();
 
-    try std.testing.expectEqualStrings("new", app.search.query.slice());
-    try std.testing.expectEqualStrings("new", app.search.input.slice());
+    try std.testing.expectEqualStrings("new", app.pages.review.search.query.slice());
+    try std.testing.expectEqualStrings("new", app.pages.review.search.input.slice());
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 4), app.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
 }
 
 test "load empty state shows actionable no changes message" {
@@ -13949,8 +14082,10 @@ test "load empty state shows actionable no changes message" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .state = .{ .empty = .no_changes } },
+        } },
         .terminal_size = .{ .width = 82, .height = 18 },
-        .load = .{ .state = .{ .empty = .no_changes } },
     };
 
     try app.view(&ts.surface);
@@ -13965,15 +14100,17 @@ test "clean empty state shows branch status chrome" {
     defer ts.deinit();
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .state = .{ .empty = .no_changes } },
+        } },
         .terminal_size = .{ .width = 100, .height = 18 },
-        .load = .{ .state = .{ .empty = .no_changes } },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
+    defer app.pages.review.branch_status.deinit();
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -13982,7 +14119,7 @@ test "clean empty state shows branch status chrome" {
         .ahead = 0,
         .behind = 0,
     });
-    try app.branch_status.replace("/repo", &bundle);
+    try app.pages.review.branch_status.replace("/repo", &bundle);
 
     try app.view(&ts.surface);
 
@@ -13996,15 +14133,17 @@ test "clean empty state hides stale branch status chrome" {
     defer ts.deinit();
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .state = .{ .empty = .no_changes } },
+        } },
         .terminal_size = .{ .width = 100, .height = 18 },
-        .load = .{ .state = .{ .empty = .no_changes } },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
+    defer app.pages.review.branch_status.deinit();
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -14013,7 +14152,7 @@ test "clean empty state hides stale branch status chrome" {
         .ahead = 0,
         .behind = 0,
     });
-    try app.branch_status.replace("/other", &bundle);
+    try app.pages.review.branch_status.replace("/other", &bundle);
 
     try app.view(&ts.surface);
 
@@ -14027,16 +14166,18 @@ test "clean empty state advertises pull only when clean status snapshot is fresh
     defer ts.deinit();
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .state = .{ .empty = .no_changes } },
+        } },
         .terminal_size = .{ .width = 110, .height = 18 },
-        .load = .{ .state = .{ .empty = .no_changes } },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
-    defer app.git_status.deinit();
+    defer app.pages.review.branch_status.deinit();
+    defer app.pages.review.git_status.deinit();
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -14045,13 +14186,13 @@ test "clean empty state advertises pull only when clean status snapshot is fresh
         .ahead = 0,
         .behind = 0,
     });
-    try app.branch_status.replace("/repo", &bundle);
+    try app.pages.review.branch_status.replace("/repo", &bundle);
 
     try app.view(&ts.surface);
     try app_test_support.expectSnapshotNotContains(&ts, "U to fetch + fast-forward");
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     var ts_ready: chasen.testing.TestSurface = undefined;
     try ts_ready.init(110, 18);
@@ -14068,8 +14209,10 @@ test "clean empty state shows bound fetch key from effective keymap" {
     var fetch_config: keymap.Config = .{};
     fetch_config.set(.fetch, .{ .ctrl = .s });
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .state = .{ .empty = .no_changes } },
+        } },
         .terminal_size = .{ .width = 120, .height = 18 },
-        .load = .{ .state = .{ .empty = .no_changes } },
         .keymap = keymap.Effective.fromConfig(fetch_config),
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
@@ -14077,7 +14220,7 @@ test "clean empty state shows bound fetch key from effective keymap" {
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
+    defer app.pages.review.branch_status.deinit();
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -14086,7 +14229,7 @@ test "clean empty state shows bound fetch key from effective keymap" {
         .ahead = 0,
         .behind = 0,
     });
-    try app.branch_status.replace("/repo", &bundle);
+    try app.pages.review.branch_status.replace("/repo", &bundle);
 
     try app.view(&ts.surface);
 
@@ -14099,15 +14242,17 @@ test "clean empty state omits fetch hint when unbound or target is not ready" {
     defer ts.deinit();
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .state = .{ .empty = .no_changes } },
+        } },
         .terminal_size = .{ .width = 120, .height = 18 },
-        .load = .{ .state = .{ .empty = .no_changes } },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
+    defer app.pages.review.branch_status.deinit();
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -14116,12 +14261,12 @@ test "clean empty state omits fetch hint when unbound or target is not ready" {
         .ahead = 0,
         .behind = 0,
     });
-    try app.branch_status.replace("/repo", &bundle);
+    try app.pages.review.branch_status.replace("/repo", &bundle);
 
     try app.view(&ts.surface);
     try app_test_support.expectSnapshotNotContains(&ts, "Ctrl+s to fetch");
 
-    app.branch_status.clear();
+    app.pages.review.branch_status.clear();
     var fetch_config: keymap.Config = .{};
     fetch_config.set(.fetch, .{ .ctrl = .s });
     app.keymap = keymap.Effective.fromConfig(fetch_config);
@@ -14141,9 +14286,11 @@ test "clean empty stdin source does not advertise remote actions" {
     var fetch_config: keymap.Config = .{};
     fetch_config.set(.fetch, .{ .ctrl = .s });
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .state = .{ .empty = .no_changes } },
+        } },
         .terminal_size = .{ .width = 120, .height = 18 },
         .config = .{ .source = .stdin },
-        .load = .{ .state = .{ .empty = .no_changes } },
         .keymap = keymap.Effective.fromConfig(fetch_config),
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
@@ -14151,8 +14298,8 @@ test "clean empty stdin source does not advertise remote actions" {
             .canonical_root = "/repo",
         } } },
     };
-    defer app.branch_status.deinit();
-    defer app.git_status.deinit();
+    defer app.pages.review.branch_status.deinit();
+    defer app.pages.review.git_status.deinit();
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -14161,9 +14308,9 @@ test "clean empty stdin source does not advertise remote actions" {
         .ahead = 0,
         .behind = 0,
     });
-    try app.branch_status.replace("/repo", &bundle);
+    try app.pages.review.branch_status.replace("/repo", &bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     try app.view(&ts.surface);
 
@@ -14178,8 +14325,10 @@ test "load empty state distinguishes missing repository" {
     defer ts.deinit();
 
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .state = .{ .empty = .no_repository } },
+        } },
         .terminal_size = .{ .width = 90, .height = 18 },
-        .load = .{ .state = .{ .empty = .no_repository } },
     };
 
     try app.view(&ts.surface);
@@ -14198,7 +14347,7 @@ test "load failed state shows first error line and retry hint" {
         .terminal_size = .{ .width = 90, .height = 18 },
     };
     defer app.clearLoadedDiff();
-    try app.load.replaceFailed(std.testing.allocator, "git diff failed\nsecond line");
+    try app.pages.review.load.replaceFailed(std.testing.allocator, "git diff failed\nsecond line");
 
     try app.view(&ts.surface);
 
@@ -14218,9 +14367,11 @@ test "loaded diff with empty visible filter shows local empty state" {
     try loaded.rebuildVisibleNodes(arena.allocator(), false, .binary);
 
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, loaded),
+            .review_display = .{ .changed_file_filter = .binary },
+        } },
         .terminal_size = .{ .width = 100, .height = 18 },
-        .load = app_test_support.loadStateWithArena(arena, loaded),
-        .review_display = .{ .changed_file_filter = .binary },
     };
     defer app.clearLoadedDiff();
 
@@ -14262,7 +14413,9 @@ test "load runtime keeps newer pending when stale task finishes" {
 }
 
 test "finishDiffLoad takes current loaded bundle ownership" {
-    var app: App = .{ .load = .{ .generation = 1 } };
+    var app: App = .{
+        .pages = .{ .review = .{ .load = .{ .generation = 1 } } },
+    };
     defer app.clearLoadedDiff();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -14272,13 +14425,15 @@ test "finishDiffLoad takes current loaded bundle ownership" {
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expect(app.load.state == .loaded);
-    try std.testing.expect(app.load.state.loaded.loaded.document.files.len > 0);
-    try std.testing.expectEqual(@as(usize, 1), app.load.state.loaded.loaded.document.files.len);
+    try std.testing.expect(app.pages.review.load.state == .loaded);
+    try std.testing.expect(app.pages.review.load.state.loaded.loaded.document.files.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.load.state.loaded.loaded.document.files.len);
 }
 
 test "finishDiffLoad initially selects first visible file node" {
-    var app: App = .{ .load = .{ .generation = 1 } };
+    var app: App = .{
+        .pages = .{ .review = .{ .load = .{ .generation = 1 } } },
+    };
     defer app.clearLoadedDiff();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -14291,20 +14446,22 @@ test "finishDiffLoad initially selects first visible file node" {
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.viewer.selected_target.?);
-    try std.testing.expectEqual(@as(usize, 0), app.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
 }
 
 test "finishDiffLoad initially selects first visible file after status projection" {
-    var app: App = .{ .load = .{ .generation = 1 } };
+    var app: App = .{
+        .pages = .{ .review = .{ .load = .{ .generation = 1 } } },
+    };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     const bundle = app_load.LoadedDiffBundle{
         .arena = .init(std.testing.allocator),
@@ -14325,19 +14482,21 @@ test "finishDiffLoad initially selects first visible file after status projectio
         .directory => return error.ExpectedVisibleFileNode,
     };
 
-    try std.testing.expectEqual(first_node_index, app.viewer.selected_node);
-    try std.testing.expectEqual(expected_target, app.viewer.selected_target.?);
+    try std.testing.expectEqual(first_node_index, app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(expected_target, app.pages.review.viewer.selected_target.?);
 }
 
 test "finishDiffLoad keeps initial visible selection intent for later status projection" {
     var app: App = .{
-        .load = .{ .generation = 1 },
-        .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
+        .pages = .{ .review = .{
+            .load = .{ .generation = 1 },
+            .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
+        } },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     const bundle = app_load.LoadedDiffBundle{
@@ -14349,7 +14508,7 @@ test "finishDiffLoad keeps initial visible selection intent for later status pro
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expect(app.pending_initial_first_visible_selection);
+    try std.testing.expect(app.pages.review.pending_initial_first_visible_selection);
 
     const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
     try app.finishStatusLoad(&ctx, .{
@@ -14358,7 +14517,7 @@ test "finishDiffLoad keeps initial visible selection intent for later status pro
         .result = .{ .loaded = status_bundle },
     });
 
-    try std.testing.expect(!app.pending_initial_first_visible_selection);
+    try std.testing.expect(!app.pages.review.pending_initial_first_visible_selection);
 
     const loaded = app.activeLoadedDiffConst().?;
     const first_node_index = loaded.firstVisibleFileNode() orelse return error.ExpectedVisibleFileNode;
@@ -14370,25 +14529,27 @@ test "finishDiffLoad keeps initial visible selection intent for later status pro
         .directory => return error.ExpectedVisibleFileNode,
     };
 
-    try std.testing.expectEqual(first_node_index, app.viewer.selected_node);
-    try std.testing.expectEqual(expected_target, app.viewer.selected_target.?);
+    try std.testing.expectEqual(first_node_index, app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(expected_target, app.pages.review.viewer.selected_target.?);
 }
 
 test "status projection rebuild keeps selected node on same path key" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 1,
+            },
+            .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 1 },
-            .selected_file = 1,
-            .selected_node = 1,
-        },
-        .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     const before_path = app.selectedStagePathKey() orelse return error.ExpectedSelectedPath;
@@ -14407,16 +14568,18 @@ test "status projection rebuild keeps selected node on same path key" {
 
 test "status load skips identical snapshot without rebuilding active tree" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+            .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
-        .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
-    try app.git_status.replace("/repo", &current);
+    try app.pages.review.git_status.replace("/repo", &current);
     const tree_ptr = app.activeLoadedDiffConst().?.tree.nodes.ptr;
 
     const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
@@ -14431,25 +14594,27 @@ test "status load skips identical snapshot without rebuilding active tree" {
 
 test "status refresh path skips identical snapshot without rebuilding active tree" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
-    try app.git_status.replace("/repo", &current);
+    try app.pages.review.git_status.replace("/repo", &current);
     const tree_ptr = app.activeLoadedDiffConst().?.tree.nodes.ptr;
 
     app.startStatusLoad(&ctx, "/repo", .foreground, null);
-    try std.testing.expect(app.git_status.repo_root != null);
+    try std.testing.expect(app.pages.review.git_status.repo_root != null);
     try std.testing.expectEqual(@as(usize, 1), ctx._pending_tasks_with[0..ctx._pending_tasks_with_len].len);
     clearPendingStatusTasks(&ctx, std.testing.allocator);
 
     const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
     try app.finishStatusLoad(&ctx, .{
-        .generation = app.status_load.generation,
+        .generation = app.pages.review.status_load.generation,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = same },
     });
@@ -14459,24 +14624,26 @@ test "status refresh path skips identical snapshot without rebuilding active tre
 
 test "status refresh drops snapshot when repo root changes" {
     var app: App = .{};
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? old.zig\x00");
-    try app.git_status.replace("/old", &current);
+    try app.pages.review.git_status.replace("/old", &current);
 
     app.startStatusLoad(&ctx, "/new", .foreground, null);
     defer clearPendingStatusTasks(&ctx, std.testing.allocator);
 
-    try std.testing.expect(app.git_status.repo_root == null);
-    try std.testing.expectEqual(@as(usize, 0), app.git_status.document.entries.len);
+    try std.testing.expect(app.pages.review.git_status.repo_root == null);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.git_status.document.entries.len);
 }
 
 test "finishStatusLoad keeps clean repository snapshot fresh" {
     var app: App = .{
-        .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
+        .pages = .{ .review = .{
+            .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
+        } },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     const clean = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
@@ -14486,22 +14653,22 @@ test "finishStatusLoad keeps clean repository snapshot fresh" {
         .result = .{ .loaded = clean },
     });
 
-    try std.testing.expect(!app.status_load.isPending());
-    try std.testing.expectEqualStrings("/repo", app.git_status.repo_root.?);
-    try std.testing.expectEqual(@as(usize, 0), app.git_status.document.entries.len);
+    try std.testing.expect(!app.pages.review.status_load.isPending());
+    try std.testing.expectEqualStrings("/repo", app.pages.review.git_status.repo_root.?);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.git_status.document.entries.len);
 }
 
 test "background status failure retains display snapshot and marks action freshness stale" {
     var app: App = .{ .allocator = std.testing.allocator };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a.zig\x00");
-    try app.git_status.replace("/repo", &current);
+    try app.pages.review.git_status.replace("/repo", &current);
 
-    app.auto_reload = .init(.inherit, .{}, .unstaged);
-    const cycle_id = app.auto_reload.beginCycle().?;
-    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .status));
-    const generation = app.status_load.prepare(true);
-    app.status_load.begin(cycle_id);
+    app.pages.review.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.pages.review.auto_reload.beginCycle().?;
+    try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .status));
+    const generation = app.pages.review.status_load.prepare(true);
+    app.pages.review.status_load.begin(cycle_id);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishStatusLoad(&ctx, .{
@@ -14511,33 +14678,33 @@ test "background status failure retains display snapshot and marks action freshn
         .result = .{ .failed_static = "transient status failure" },
     });
 
-    try std.testing.expectEqualStrings("/repo", app.git_status.repo_root.?);
-    try std.testing.expectEqual(@as(usize, 1), app.git_status.document.entries.len);
-    try std.testing.expect(!app.status_load.isFresh());
-    try std.testing.expect(app.auto_reload.background_cycle == null);
+    try std.testing.expectEqualStrings("/repo", app.pages.review.git_status.repo_root.?);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.git_status.document.entries.len);
+    try std.testing.expect(!app.pages.review.status_load.isFresh());
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 
-    const recovery_generation = app.status_load.prepare(true);
-    app.status_load.begin(null);
+    const recovery_generation = app.pages.review.status_load.prepare(true);
+    app.pages.review.status_load.begin(null);
     const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a.zig\x00");
     try app.finishStatusLoad(&ctx, .{
         .generation = recovery_generation,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = same },
     });
-    try std.testing.expect(app.status_load.isFresh());
+    try std.testing.expect(app.pages.review.status_load.isFresh());
 }
 
 test "background status completion during repository action is discarded and releases cycle" {
     var app: App = .{ .allocator = std.testing.allocator };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M old.zig\x00");
-    try app.git_status.replace("/repo", &current);
+    try app.pages.review.git_status.replace("/repo", &current);
 
-    app.auto_reload = .init(.inherit, .{}, .unstaged);
-    const cycle_id = app.auto_reload.beginCycle().?;
-    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .status));
-    const generation = app.status_load.prepare(true);
-    app.status_load.begin(cycle_id);
+    app.pages.review.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.pages.review.auto_reload.beginCycle().?;
+    try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .status));
+    const generation = app.pages.review.status_load.prepare(true);
+    app.pages.review.status_load.begin(cycle_id);
     _ = app.actions.begin(.stage_file);
     const changed = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M new.zig\x00");
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -14549,14 +14716,16 @@ test "background status completion during repository action is discarded and rel
         .result = .{ .loaded = changed },
     });
 
-    try std.testing.expectEqualStrings("old.zig", app.git_status.document.entries[0].path);
-    try std.testing.expect(!app.status_load.isPending());
-    try std.testing.expectEqual(app_auto_reload.AuxiliaryFreshness.stale_refresh, app.status_load.freshness);
-    try std.testing.expect(app.auto_reload.background_cycle == null);
+    try std.testing.expectEqualStrings("old.zig", app.pages.review.git_status.document.entries[0].path);
+    try std.testing.expect(!app.pages.review.status_load.isPending());
+    try std.testing.expectEqual(app_auto_reload.AuxiliaryFreshness.stale_refresh, app.pages.review.status_load.freshness);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 }
 
 test "finishDiffLoad frees stale loaded bundle" {
-    var app: App = .{ .load = .{ .generation = 2 } };
+    var app: App = .{
+        .pages = .{ .review = .{ .load = .{ .generation = 2 } } },
+    };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
@@ -14565,27 +14734,27 @@ test "finishDiffLoad frees stale loaded bundle" {
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expect(app.load.state == .idle);
+    try std.testing.expect(app.pages.review.load.state == .idle);
 }
 
 test "auto reload tick skips while auxiliary cycle members or mouse selection are pending" {
     var app: App = .{};
-    app.auto_reload = .init(.inherit, .{}, .unstaged);
-    app.status_load.pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 };
+    app.pages.review.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.review.status_load.pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 };
     var status_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.autoReloadTick(&status_ctx);
     try std.testing.expectEqual(@as(usize, 0), status_ctx._pending_tasks_with_len);
     try std.testing.expect(status_ctx._redraw_suppressed);
 
-    app.status_load.pending = null;
-    app.branch_status_load.pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 };
+    app.pages.review.status_load.pending = null;
+    app.pages.review.branch_status_load.pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 };
     var branch_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.autoReloadTick(&branch_ctx);
     try std.testing.expectEqual(@as(usize, 0), branch_ctx._pending_tasks_with_len);
     try std.testing.expect(branch_ctx._redraw_suppressed);
 
-    app.branch_status_load.pending = null;
-    app.review_projection.pending = try app_review_projection.cloneRequest(
+    app.pages.review.branch_status_load.pending = null;
+    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
         std.testing.allocator,
         1,
         "/repo",
@@ -14599,15 +14768,15 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     try app.autoReloadTick(&projection_ctx);
     try std.testing.expectEqual(@as(usize, 0), projection_ctx._pending_tasks_with_len);
     try std.testing.expect(projection_ctx._redraw_suppressed);
-    app.review_projection.clearPending(std.testing.allocator);
+    app.pages.review.review_projection.clearPending(std.testing.allocator);
 
-    app.selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } };
+    app.pages.review.selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } };
     var selection_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.autoReloadTick(&selection_ctx);
     try std.testing.expectEqual(@as(usize, 0), selection_ctx._pending_tasks_with_len);
     try std.testing.expect(selection_ctx._redraw_suppressed);
 
-    app.selection_owner = .none;
+    app.pages.review.selection_owner = .none;
     _ = app.actions.begin(.stage_file);
     var action_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.autoReloadTick(&action_ctx);
@@ -14616,11 +14785,13 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
 }
 
 test "stale diff result does not clear newer pending reload metadata" {
-    var app: App = .{ .load = .{ .generation = 2 } };
+    var app: App = .{
+        .pages = .{ .review = .{ .load = .{ .generation = 2 } } },
+    };
     defer app.clearPendingReload(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    app.pending_reload = .{
+    app.pages.review.pending_reload = .{
         .generation = 2,
         .kind = .watch,
         .anchor = .{
@@ -14642,34 +14813,36 @@ test "stale diff result does not clear newer pending reload metadata" {
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expect(app.pending_reload != null);
-    try std.testing.expectEqual(@as(u64, 2), app.pending_reload.?.generation);
+    try std.testing.expect(app.pages.review.pending_reload != null);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.review.pending_reload.?.generation);
 }
 
 test "watch no-op diff load preserves session view state and staged hunk marks" {
     var current = app_test_support.loadedDiffOne();
     current.text = app_test_support.diff_one;
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_file = 0,
+                .selected_node = 0,
+                .diff_cursor = .{ .hunk_header = 1 },
+                .diff_scroll = 3,
+                .diff_horizontal_scroll = 4,
+                .sidebar_horizontal_scroll = 2,
+            },
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 0 },
-            .selected_file = 0,
-            .selected_node = 0,
-            .diff_cursor = .{ .hunk_header = 1 },
-            .diff_scroll = 3,
-            .diff_horizontal_scroll = 4,
-            .sidebar_horizontal_scroll = 2,
-        },
-        .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearPendingReload(std.testing.allocator);
-    defer app.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
     defer app.clearLoadedDiff();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
-    app.load.generation = 2;
+    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    app.pages.review.load.generation = 2;
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
 
     try app.finishDiffLoad(&ctx, .{
@@ -14677,51 +14850,53 @@ test "watch no-op diff load preserves session view state and staged hunk marks" 
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 1 }, app.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(usize, 3), app.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 4), app.viewer.diff_horizontal_scroll);
-    try std.testing.expectEqual(@as(usize, 2), app.viewer.sidebar_horizontal_scroll);
-    try std.testing.expect(app.staged_hunks.contains("/repo", "a", 0));
-    try std.testing.expect(app.pending_reload == null);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 1 }, app.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 4), app.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.sidebar_horizontal_scroll);
+    try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 0));
+    try std.testing.expect(app.pages.review.pending_reload == null);
 }
 
 test "changed watch reload restores acceptance-time navigation instead of launch anchor" {
     var current = app_test_support.loadedDiffOne();
     current.text = "old";
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_node = 0,
+                .diff_cursor = .{ .hunk_header = 0 },
+            },
+            .pending_reload = .{
+                .generation = 2,
+                .kind = .watch,
+                .anchor = .{
+                    .path_key = try std.testing.allocator.dupe(u8, "a"),
+                    .selected_target_tag = .diff_file,
+                    .visible_sidebar_row = 0,
+                    .diff_cursor = .{ .metadata = 0 },
+                    .diff_cursor_offset = 0,
+                    .diff_scroll = 0,
+                    .diff_horizontal_scroll = 0,
+                    .sidebar_horizontal_scroll = 0,
+                    .search_coordinate = null,
+                },
+            },
+        } },
         .allocator = std.testing.allocator,
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(current),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 0 },
-            .selected_node = 0,
-            .diff_cursor = .{ .hunk_header = 0 },
-        },
-        .pending_reload = .{
-            .generation = 2,
-            .kind = .watch,
-            .anchor = .{
-                .path_key = try std.testing.allocator.dupe(u8, "a"),
-                .selected_target_tag = .diff_file,
-                .visible_sidebar_row = 0,
-                .diff_cursor = .{ .metadata = 0 },
-                .diff_cursor_offset = 0,
-                .diff_scroll = 0,
-                .diff_horizontal_scroll = 0,
-                .sidebar_horizontal_scroll = 0,
-                .search_coordinate = null,
-            },
-        },
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    const acceptance_cursor = app.viewer.diff_cursor;
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    const acceptance_cursor = app.pages.review.viewer.diff_cursor;
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -14730,9 +14905,9 @@ test "changed watch reload restores acceptance-time navigation instead of launch
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expectEqual(acceptance_cursor, app.viewer.diff_cursor);
-    try std.testing.expect(app.pending_reload == null);
-    const restore = app.pending_display_navigation_restore orelse return error.ExpectedAcceptanceTimeRestore;
+    try std.testing.expectEqual(acceptance_cursor, app.pages.review.viewer.diff_cursor);
+    try std.testing.expect(app.pages.review.pending_reload == null);
+    const restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedAcceptanceTimeRestore;
     try std.testing.expectEqual(acceptance_cursor, restore.original.diff_cursor);
 }
 
@@ -14741,31 +14916,33 @@ test "unchanged recovery clears its source failure and redraws" {
     current.text = app_test_support.diff_one;
     const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
     var app: App = .{
-        .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .pending_reload = .{
-            .generation = 2,
-            .kind = .watch,
-            .anchor = .{
-                .path_key = try std.testing.allocator.dupe(u8, "a"),
-                .selected_target_tag = .diff_file,
-                .visible_sidebar_row = 0,
-                .diff_cursor = .{ .hunk_header = 0 },
-                .diff_cursor_offset = 0,
-                .diff_scroll = 0,
-                .diff_horizontal_scroll = 0,
-                .sidebar_horizontal_scroll = 0,
-                .search_coordinate = null,
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .pending_reload = .{
+                .generation = 2,
+                .kind = .watch,
+                .anchor = .{
+                    .path_key = try std.testing.allocator.dupe(u8, "a"),
+                    .selected_target_tag = .diff_file,
+                    .visible_sidebar_row = 0,
+                    .diff_cursor = .{ .hunk_header = 0 },
+                    .diff_cursor_offset = 0,
+                    .diff_scroll = 0,
+                    .diff_horizontal_scroll = 0,
+                    .sidebar_horizontal_scroll = 0,
+                    .search_coordinate = null,
+                },
             },
-        },
+        } },
+        .allocator = std.testing.allocator,
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload.acceptSource(fingerprint);
-    _ = app.auto_reload.markSourceFailure("transient");
-    app.status.setSourceReloadFailure(app.auto_reload.last_failure.?.digest, "auto reload failed: transient", .{});
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload.acceptSource(fingerprint);
+    _ = app.pages.review.auto_reload.markSourceFailure("transient");
+    app.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "auto reload failed: transient", .{});
     const before = app.activeLoadedDiffConst().?.text.ptr;
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -14774,8 +14951,8 @@ test "unchanged recovery clears its source failure and redraws" {
         .result = .{ .unchanged = fingerprint },
     });
 
-    try std.testing.expect(app.pending_reload == null);
-    try std.testing.expect(app.auto_reload.sourceIsFresh());
+    try std.testing.expect(app.pages.review.pending_reload == null);
+    try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
     try std.testing.expectEqual(before, app.activeLoadedDiffConst().?.text.ptr);
     try std.testing.expectEqualStrings("", app.status.text());
     try std.testing.expect(!ctx._redraw_suppressed);
@@ -14786,17 +14963,19 @@ test "unchanged source recovery preserves a newer auxiliary failure" {
     current.text = app_test_support.diff_one;
     const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload.acceptSource(fingerprint);
-    _ = app.auto_reload.markSourceFailure("source transient");
-    app.status.setSourceReloadFailure(app.auto_reload.last_failure.?.digest, "source failed", .{});
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload.acceptSource(fingerprint);
+    _ = app.pages.review.auto_reload.markSourceFailure("source transient");
+    app.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "source failed", .{});
     app.setStatus("status load failed: auxiliary transient", .{});
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -14814,14 +14993,16 @@ test "auxiliary failure followed by source failure clears only the recovered sou
     current.text = app_test_support.diff_one;
     const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
-        .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishStatusLoad(&ctx, .{
@@ -14831,18 +15012,18 @@ test "auxiliary failure followed by source failure clears only the recovered sou
     });
     try std.testing.expectEqualStrings("status load failed: auxiliary transient", app.status.text());
 
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload.acceptSource(fingerprint);
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload.acceptSource(fingerprint);
     try app.finishDiffLoad(&ctx, .{
         .generation = 2,
         .result = .{ .failed_static = "source transient" },
     });
     try std.testing.expectEqualStrings("auto reload failed: source transient", app.status.text());
 
-    app.load.generation = 3;
-    app.load.pending = .{ .diff_load = 3 };
-    app.pending_reload = .{ .generation = 3, .kind = .watch };
+    app.pages.review.load.generation = 3;
+    app.pages.review.load.pending = .{ .diff_load = 3 };
+    app.pages.review.pending_reload = .{ .generation = 3, .kind = .watch };
     try app.finishDiffLoad(&ctx, .{
         .generation = 3,
         .result = .{ .unchanged = fingerprint },
@@ -14856,15 +15037,17 @@ test "ordinary unchanged source completion suppresses redraw" {
     current.text = app_test_support.diff_one;
     const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload.acceptSource(fingerprint);
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload.acceptSource(fingerprint);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
@@ -14880,17 +15063,19 @@ test "changed loaded recovery clears its matching source failure and redraws" {
     current.text = "old";
     const old_fingerprint = app_auto_reload.SourceFingerprint.init("old");
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload.acceptSource(old_fingerprint);
-    _ = app.auto_reload.markSourceFailure("source transient");
-    app.status.setSourceReloadFailure(app.auto_reload.last_failure.?.digest, "auto reload failed: source transient", .{});
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload.acceptSource(old_fingerprint);
+    _ = app.pages.review.auto_reload.markSourceFailure("source transient");
+    app.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "auto reload failed: source transient", .{});
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -14899,7 +15084,7 @@ test "changed loaded recovery clears its matching source failure and redraws" {
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expect(app.auto_reload.sourceIsFresh());
+    try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
     try std.testing.expectEqualStrings("", app.status.text());
     try std.testing.expect(!ctx._redraw_suppressed);
 }
@@ -14909,17 +15094,19 @@ test "empty recovery clears its matching source failure and redraws" {
     current.text = "old";
     const old_fingerprint = app_auto_reload.SourceFingerprint.init("old");
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload.acceptSource(old_fingerprint);
-    _ = app.auto_reload.markSourceFailure("source transient");
-    app.status.setSourceReloadFailure(app.auto_reload.last_failure.?.digest, "auto reload failed: source transient", .{});
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload.acceptSource(old_fingerprint);
+    _ = app.pages.review.auto_reload.markSourceFailure("source transient");
+    app.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "auto reload failed: source transient", .{});
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
@@ -14927,8 +15114,8 @@ test "empty recovery clears its matching source failure and redraws" {
         .result = .empty,
     });
 
-    try std.testing.expect(app.load.state == .empty);
-    try std.testing.expect(app.auto_reload.sourceIsFresh());
+    try std.testing.expect(app.pages.review.load.state == .empty);
+    try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
     try std.testing.expectEqualStrings("", app.status.text());
     try std.testing.expect(!ctx._redraw_suppressed);
 }
@@ -14938,34 +15125,36 @@ test "destructive action-result failure invalidates accepted source before ident
     current.text = app_test_support.diff_one;
     const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .pending_reload = .{ .generation = 2, .kind = .action_result },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .pending_reload = .{ .generation = 2, .kind = .action_result },
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload.acceptSource(fingerprint);
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload.acceptSource(fingerprint);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
         .generation = 2,
         .result = .{ .failed_static = "foreground failed" },
     });
-    try std.testing.expect(app.auto_reload.accepted_source == null);
+    try std.testing.expect(app.pages.review.auto_reload.accepted_source == null);
     try std.testing.expect(app.activeLoadedDiffConst() == null);
 
-    app.load.generation = 3;
-    app.load.pending = .{ .diff_load = 3 };
-    app.pending_reload = .{ .generation = 3, .kind = .watch };
+    app.pages.review.load.generation = 3;
+    app.pages.review.load.pending = .{ .diff_load = 3 };
+    app.pages.review.pending_reload = .{ .generation = 3, .kind = .watch };
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
         .generation = 3,
         .result = .{ .loaded = bundle },
     });
     try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
-    try std.testing.expect(app.auto_reload.accepted_source.?.fingerprint.eql(fingerprint));
+    try std.testing.expect(app.pages.review.auto_reload.accepted_source.?.fingerprint.eql(fingerprint));
 }
 
 test "destructive manual failure invalidates accepted source before identical success" {
@@ -14973,34 +15162,36 @@ test "destructive manual failure invalidates accepted source before identical su
     current.text = app_test_support.diff_one;
     const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .pending_reload = .{ .generation = 2, .kind = .manual },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .pending_reload = .{ .generation = 2, .kind = .manual },
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload.acceptSource(fingerprint);
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload.acceptSource(fingerprint);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
         .generation = 2,
         .result = .{ .failed_static = "manual failed" },
     });
-    try std.testing.expect(app.auto_reload.accepted_source == null);
-    try std.testing.expect(app.load.state == .failed);
+    try std.testing.expect(app.pages.review.auto_reload.accepted_source == null);
+    try std.testing.expect(app.pages.review.load.state == .failed);
 
-    app.load.generation = 3;
-    app.load.pending = .{ .diff_load = 3 };
-    app.pending_reload = .{ .generation = 3, .kind = .watch };
+    app.pages.review.load.generation = 3;
+    app.pages.review.load.pending = .{ .diff_load = 3 };
+    app.pages.review.pending_reload = .{ .generation = 3, .kind = .watch };
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
         .generation = 3,
         .result = .{ .loaded = bundle },
     });
     try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
-    try std.testing.expect(app.auto_reload.accepted_source.?.fingerprint.eql(fingerprint));
+    try std.testing.expect(app.pages.review.auto_reload.accepted_source.?.fingerprint.eql(fingerprint));
 }
 
 test "diff task start failure invalidates accepted source and next watch cannot return unchanged" {
@@ -15008,13 +15199,15 @@ test "diff task start failure invalidates accepted source and next watch cannot 
     current.text = app_test_support.diff_one;
     const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+        } },
         .allocator = std.testing.allocator,
         .config = .{ .source = .stdin },
-        .load = app_test_support.loadState(current),
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.auto_reload.acceptSource(fingerprint);
+    app.pages.review.auto_reload.acceptSource(fingerprint);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     ctx._pending_tasks_with_len = 16;
 
@@ -15022,8 +15215,8 @@ test "diff task start failure invalidates accepted source and next watch cannot 
         .clear_visible_state = true,
         .kind = .manual,
     }));
-    try std.testing.expect(app.auto_reload.accepted_source == null);
-    try std.testing.expect(app.load.state == .failed);
+    try std.testing.expect(app.pages.review.auto_reload.accepted_source == null);
+    try std.testing.expect(app.pages.review.load.state == .failed);
 
     ctx._pending_tasks_with_len = 0;
     try app.startDiffLoadWithRepoRoot(&ctx, null, .{
@@ -15051,15 +15244,17 @@ test "watch failure retains display and blocks source-derived actions until succ
     current.text = app_test_support.diff_one;
     const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload.acceptSource(fingerprint);
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload.acceptSource(fingerprint);
     const before = app.activeLoadedDiffConst().?.text.ptr;
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -15068,16 +15263,16 @@ test "watch failure retains display and blocks source-derived actions until succ
         .result = .{ .failed_static = "transient failure" },
     });
     try std.testing.expectEqual(before, app.activeLoadedDiffConst().?.text.ptr);
-    try std.testing.expect(!app.auto_reload.sourceIsActionable());
+    try std.testing.expect(!app.pages.review.auto_reload.sourceIsActionable());
 
-    app.load.generation = 3;
-    app.load.pending = .{ .diff_load = 3 };
-    app.pending_reload = .{ .generation = 3, .kind = .watch };
+    app.pages.review.load.generation = 3;
+    app.pages.review.load.pending = .{ .diff_load = 3 };
+    app.pages.review.pending_reload = .{ .generation = 3, .kind = .watch };
     try app.finishDiffLoad(&ctx, .{
         .generation = 3,
         .result = .{ .unchanged = fingerprint },
     });
-    try std.testing.expect(app.auto_reload.sourceIsActionable());
+    try std.testing.expect(app.pages.review.auto_reload.sourceIsActionable());
     try std.testing.expectEqual(before, app.activeLoadedDiffConst().?.text.ptr);
 }
 
@@ -15085,19 +15280,21 @@ test "changed watch result arriving during mouse selection defers apply until re
     var current = app_test_support.loadedDiffOne();
     current.text = "old";
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+            .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .pending_reload = .{ .generation = 2, .kind = .watch },
-        .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
     };
     defer app.clearDeferredSourceApply(std.testing.allocator);
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload = .init(.inherit, .{}, .unstaged);
-    const cycle_id = app.auto_reload.beginCycle().?;
-    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .source));
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.pages.review.auto_reload.beginCycle().?;
+    try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .source));
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -15106,15 +15303,15 @@ test "changed watch result arriving during mouse selection defers apply until re
         .background_cycle_id = cycle_id,
         .result = .{ .loaded = bundle },
     });
-    try std.testing.expect(app.deferred_source_apply != null);
+    try std.testing.expect(app.pages.review.deferred_source_apply != null);
     try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
-    try std.testing.expect(app.auto_reload.background_cycle.?.pending.deferred_source_apply);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle.?.pending.deferred_source_apply);
 
     app.clearDiffSelection();
     try app.applyDeferredSource(&ctx);
-    try std.testing.expect(app.deferred_source_apply == null);
+    try std.testing.expect(app.pages.review.deferred_source_apply == null);
     try std.testing.expectEqualStrings(app_test_support.diff_one, app.activeLoadedDiffConst().?.text);
-    try std.testing.expect(app.auto_reload.background_cycle == null);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 }
 
 test "background source completion during repository action is discarded and releases cycle" {
@@ -15122,18 +15319,20 @@ test "background source completion during repository action is discarded and rel
     current.text = "old";
     const accepted = app_auto_reload.SourceFingerprint.init("old");
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload = .init(.inherit, .{}, .unstaged);
-    app.auto_reload.acceptSource(accepted);
-    const cycle_id = app.auto_reload.beginCycle().?;
-    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .source));
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.review.auto_reload.acceptSource(accepted);
+    const cycle_id = app.pages.review.auto_reload.beginCycle().?;
+    try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .source));
     _ = app.actions.begin(.stage_file);
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -15145,15 +15344,15 @@ test "background source completion during repository action is discarded and rel
     });
 
     try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
-    try std.testing.expect(app.auto_reload.accepted_source.?.fingerprint.eql(accepted));
-    try std.testing.expect(app.load.pending == null);
-    try std.testing.expect(app.pending_reload == null);
-    try std.testing.expect(app.auto_reload.background_cycle == null);
+    try std.testing.expect(app.pages.review.auto_reload.accepted_source.?.fingerprint.eql(accepted));
+    try std.testing.expect(app.pages.review.load.pending == null);
+    try std.testing.expect(app.pages.review.pending_reload == null);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 
     app.actions.clear();
-    app.load.generation = 3;
-    app.load.pending = .{ .diff_load = 3 };
-    app.pending_reload = .{ .generation = 3, .kind = .action_result };
+    app.pages.review.load.generation = 3;
+    app.pages.review.load.pending = .{ .diff_load = 3 };
+    app.pages.review.pending_reload = .{ .generation = 3, .kind = .action_result };
     const authoritative = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
         .generation = 3,
@@ -15166,19 +15365,21 @@ test "deferred background source is discarded when a repository action starts" {
     var current = app_test_support.loadedDiffOne();
     current.text = "old";
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+            .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .pending_reload = .{ .generation = 2, .kind = .watch },
-        .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
     };
     defer app.clearDeferredSourceApply(std.testing.allocator);
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload = .init(.inherit, .{}, .unstaged);
-    const cycle_id = app.auto_reload.beginCycle().?;
-    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .source));
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.pages.review.auto_reload.beginCycle().?;
+    try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .source));
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -15187,45 +15388,47 @@ test "deferred background source is discarded when a repository action starts" {
         .background_cycle_id = cycle_id,
         .result = .{ .loaded = bundle },
     });
-    try std.testing.expect(app.deferred_source_apply != null);
+    try std.testing.expect(app.pages.review.deferred_source_apply != null);
 
     _ = app.actions.begin(.stage_file);
     app.clearDiffSelection();
     try app.applyDeferredSource(&ctx);
 
     try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
-    try std.testing.expect(app.deferred_source_apply == null);
-    try std.testing.expect(app.pending_reload == null);
-    try std.testing.expect(app.auto_reload.background_cycle == null);
+    try std.testing.expect(app.pages.review.deferred_source_apply == null);
+    try std.testing.expect(app.pages.review.pending_reload == null);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 }
 
 test "deferred changed watch captures navigation when selection ends" {
     var current = app_test_support.loadedDiffOne();
     current.text = "old";
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_node = 0,
+                .diff_cursor = .{ .metadata = 0 },
+            },
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+            .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
+        } },
         .allocator = std.testing.allocator,
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .load = app_test_support.loadState(current),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 0 },
-            .selected_node = 0,
-            .diff_cursor = .{ .metadata = 0 },
-        },
-        .pending_reload = .{ .generation = 2, .kind = .watch },
-        .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
     };
     defer app.clearDeferredSourceApply(std.testing.allocator);
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload = .init(.inherit, .{}, .unstaged);
-    const cycle_id = app.auto_reload.beginCycle().?;
-    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .source));
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.pages.review.auto_reload.beginCycle().?;
+    try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .source));
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -15234,38 +15437,40 @@ test "deferred changed watch captures navigation when selection ends" {
         .background_cycle_id = cycle_id,
         .result = .{ .loaded = bundle },
     });
-    try std.testing.expect(app.deferred_source_apply != null);
-    try std.testing.expect(app.pending_display_navigation_restore == null);
+    try std.testing.expect(app.pages.review.deferred_source_apply != null);
+    try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
 
-    app.viewer.diff_cursor = .{ .hunk_header = 0 };
-    const navigation_at_apply = app.viewer.diff_cursor;
+    app.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
+    const navigation_at_apply = app.pages.review.viewer.diff_cursor;
     app.clearDiffSelection();
     try app.applyDeferredSource(&ctx);
 
-    try std.testing.expect(app.deferred_source_apply == null);
-    try std.testing.expectEqual(navigation_at_apply, app.viewer.diff_cursor);
-    const restore = app.pending_display_navigation_restore orelse return error.ExpectedAcceptanceTimeRestore;
+    try std.testing.expect(app.pages.review.deferred_source_apply == null);
+    try std.testing.expectEqual(navigation_at_apply, app.pages.review.viewer.diff_cursor);
+    const restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedAcceptanceTimeRestore;
     try std.testing.expectEqual(navigation_at_apply, restore.original.diff_cursor);
-    try std.testing.expect(app.auto_reload.background_cycle == null);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 }
 
 test "empty watch result defers during selection and focus loss applies it" {
     var current = app_test_support.loadedDiffOne();
     current.text = "old";
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+            .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .pending_reload = .{ .generation = 2, .kind = .watch },
-        .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
     };
     defer app.clearDeferredSourceApply(std.testing.allocator);
     defer app.clearPendingReload(std.testing.allocator);
     defer app.clearLoadedDiff();
-    app.load.generation = 2;
-    app.load.pending = .{ .diff_load = 2 };
-    app.auto_reload = .init(.inherit, .{}, .unstaged);
-    const cycle_id = app.auto_reload.beginCycle().?;
-    try std.testing.expect(app.auto_reload.markMemberStarted(cycle_id, .source));
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.pages.review.auto_reload.beginCycle().?;
+    try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .source));
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
@@ -15273,28 +15478,30 @@ test "empty watch result defers during selection and focus loss applies it" {
         .background_cycle_id = cycle_id,
         .result = .empty,
     });
-    try std.testing.expect(app.deferred_source_apply != null);
+    try std.testing.expect(app.pages.review.deferred_source_apply != null);
     try std.testing.expectEqualStrings("old", app.activeLoadedDiffConst().?.text);
 
     try app.update(.focus_lost, &ctx);
-    try std.testing.expect(!app.selection_owner.activeMouseSelection());
-    try std.testing.expect(app.deferred_source_apply == null);
-    try std.testing.expect(app.load.state == .empty);
-    try std.testing.expect(app.auto_reload.background_cycle == null);
+    try std.testing.expect(!app.pages.review.selection_owner.activeMouseSelection());
+    try std.testing.expect(app.pages.review.deferred_source_apply == null);
+    try std.testing.expect(app.pages.review.load.state == .empty);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 }
 
 test "focus loss terminates selection without a deferred result" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
+        } },
         .config = .{ .source = .{ .no_index = .{ .left = "left", .right = "right" } } },
-        .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
     };
-    app.auto_reload = .init(.inherit, .{}, app.config.source);
+    app.pages.review.auto_reload = .init(.inherit, .{}, app.config.source);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try std.testing.expectEqual(App.Msg.focus_lost, app.handleEvent(.focus_out).?);
     try app.update(.focus_lost, &ctx);
-    try std.testing.expect(!app.selection_owner.activeMouseSelection());
-    try std.testing.expect(app.deferred_source_apply == null);
+    try std.testing.expect(!app.pages.review.selection_owner.activeMouseSelection());
+    try std.testing.expect(app.pages.review.deferred_source_apply == null);
 
     try app.autoReloadTick(&ctx);
     const entries = ctx.takePendingTasksWith();
@@ -15304,34 +15511,36 @@ test "focus loss terminates selection without a deferred result" {
     const generation = task.generation;
     diff_source.freeLoadRequest(std.testing.allocator, task.request);
     std.testing.allocator.destroy(task);
-    _ = app.load.clearPendingIfCurrent(.{ .diff_load = generation });
+    _ = app.pages.review.load.clearPendingIfCurrent(.{ .diff_load = generation });
     app.clearPendingReloadIfGeneration(std.testing.allocator, generation);
-    app.auto_reload.finishMember(cycle_id, .source);
-    try std.testing.expect(app.auto_reload.background_cycle == null);
+    app.pages.review.auto_reload.finishMember(cycle_id, .source);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 }
 
 test "anchored reload keeps cursor when search query is present" {
     var current = app_test_support.loadedDiffOne();
     current.text = "old";
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_file = 0,
+                .selected_node = 0,
+                .diff_cursor = .{ .hunk_header = 1 },
+                .diff_scroll = 2,
+            },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 0 },
-            .selected_file = 0,
-            .selected_node = 0,
-            .diff_cursor = .{ .hunk_header = 1 },
-            .diff_scroll = 2,
-        },
     };
     defer app.clearLoadedDiff();
     defer app.clearPendingReload(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     setDiffSearchQuery(&app, "new");
-    app.search.match = .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } };
-    app.search.match_offset = 4;
-    app.load.generation = 2;
+    app.pages.review.search.match = .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } };
+    app.pages.review.search.match_offset = 4;
+    app.pages.review.load.generation = 2;
     try app.beginPendingReload(std.testing.allocator, 2, .manual);
 
     var changed = app_test_support.loadedDiffOne();
@@ -15346,33 +15555,35 @@ test "anchored reload keeps cursor when search query is present" {
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 1 }, app.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(usize, 2), app.viewer.diff_scroll);
-    try std.testing.expect(app.search.match != null);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 1 }, app.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.diff_scroll);
+    try std.testing.expect(app.pages.review.search.match != null);
 }
 
 test "manual reload restores anchor after visible state is cleared" {
     var current = app_test_support.loadedDiffTwo();
     current.text = "old";
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 1,
+                .diff_cursor = .{ .metadata = 0 },
+                .diff_scroll = 2,
+            },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 1 },
-            .selected_file = 1,
-            .selected_node = 1,
-            .diff_cursor = .{ .metadata = 0 },
-            .diff_scroll = 2,
-        },
     };
     defer app.clearLoadedDiff();
     defer app.clearPendingReload(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    app.load.generation = 2;
+    app.pages.review.load.generation = 2;
     try app.beginPendingReload(std.testing.allocator, 2, .manual);
     app.clearLoadedDiff();
-    app.load.state = .loading;
+    app.pages.review.load.state = .loading;
 
     var changed = app_test_support.loadedDiffTwo();
     changed.text = "changed";
@@ -15386,29 +15597,31 @@ test "manual reload restores anchor after visible state is cleared" {
         .result = .{ .loaded = bundle },
     });
 
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.viewer.selected_target.?);
-    try std.testing.expectEqual(@as(usize, 1), app.viewer.selected_node);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, app.viewer.diff_cursor);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, app.pages.review.viewer.diff_cursor);
 }
 
 test "watch no-op preserves selected path when status finishes before diff" {
     var current = app_test_support.loadedDiffTwo();
     current.text = app_test_support.diff_one;
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 1,
+            },
+            .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 1 },
-            .selected_file = 1,
-            .selected_node = 1,
-        },
-        .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
-        .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     defer app.clearPendingReload(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -15419,7 +15632,7 @@ test "watch no-op preserves selected path when status finishes before diff" {
         .result = .{ .loaded = status_bundle },
     });
 
-    app.load.generation = 2;
+    app.pages.review.load.generation = 2;
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
         .generation = 2,
@@ -15434,24 +15647,26 @@ test "watch no-op preserves selected path when status finishes after diff" {
     var current = app_test_support.loadedDiffTwo();
     current.text = app_test_support.diff_one;
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(current),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 1,
+            },
+            .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
+            .pending_reload = .{ .generation = 2, .kind = .watch },
+        } },
         .allocator = std.testing.allocator,
-        .load = app_test_support.loadState(current),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 1 },
-            .selected_file = 1,
-            .selected_node = 1,
-        },
-        .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
-        .pending_reload = .{ .generation = 2, .kind = .watch },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     defer app.clearPendingReload(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    app.load.generation = 2;
+    app.pages.review.load.generation = 2;
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
         .generation = 2,
@@ -15471,31 +15686,35 @@ test "watch no-op preserves selected path when status finishes after diff" {
 
 test "repo switch clears pending reload anchor" {
     var app: App = .{
-        .pending_reload = .{
-            .generation = 9,
-            .kind = .manual,
-            .anchor = .{
-                .path_key = try std.testing.allocator.dupe(u8, "a"),
-                .selected_target_tag = .diff_file,
-                .visible_sidebar_row = 0,
-                .diff_cursor = .{ .metadata = 0 },
-                .diff_cursor_offset = 0,
-                .diff_scroll = 0,
-                .diff_horizontal_scroll = 0,
-                .sidebar_horizontal_scroll = 0,
-                .search_coordinate = null,
+        .pages = .{ .review = .{
+            .pending_reload = .{
+                .generation = 9,
+                .kind = .manual,
+                .anchor = .{
+                    .path_key = try std.testing.allocator.dupe(u8, "a"),
+                    .selected_target_tag = .diff_file,
+                    .visible_sidebar_row = 0,
+                    .diff_cursor = .{ .metadata = 0 },
+                    .diff_cursor_offset = 0,
+                    .diff_scroll = 0,
+                    .diff_horizontal_scroll = 0,
+                    .sidebar_horizontal_scroll = 0,
+                    .search_coordinate = null,
+                },
             },
-        },
+        } },
     };
     defer app.clearPendingReload(std.testing.allocator);
 
     app.closeRepoPickerForSwitch(std.testing.allocator);
 
-    try std.testing.expect(app.pending_reload == null);
+    try std.testing.expect(app.pages.review.pending_reload == null);
 }
 
 test "finishDiffLoad records empty diff as no changes" {
-    var app: App = .{ .load = .{ .generation = 1 } };
+    var app: App = .{
+        .pages = .{ .review = .{ .load = .{ .generation = 1 } } },
+    };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
@@ -15503,21 +15722,23 @@ test "finishDiffLoad records empty diff as no changes" {
         .result = .empty,
     });
 
-    try std.testing.expect(app.load.state == .empty);
-    try std.testing.expectEqual(EmptyReason.no_changes, app.load.state.empty);
-    try std.testing.expectEqual(@as(u64, 1), app.load.generation);
+    try std.testing.expect(app.pages.review.load.state == .empty);
+    try std.testing.expectEqual(EmptyReason.no_changes, app.pages.review.load.state.empty);
+    try std.testing.expectEqual(@as(u64, 1), app.pages.review.load.generation);
 }
 
 test "finishDiffLoad projects earlier status snapshot into empty diff" {
-    var app: App = .{ .load = .{ .generation = 1 } };
+    var app: App = .{
+        .pages = .{ .review = .{ .load = .{ .generation = 1 } } },
+    };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(std.testing.allocator);
-    defer if (app.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.git_status.replace("/tmp/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/tmp/repo", &status_bundle);
 
     try app.finishDiffLoad(&ctx, .{
         .generation = 1,
@@ -15529,25 +15750,27 @@ test "finishDiffLoad projects earlier status snapshot into empty diff" {
     try std.testing.expectEqual(@as(usize, 2), loaded.tree.nodes.len);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(usize, 0), loaded.tree.nodes[1].target.status_entry);
-    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.viewer.selected_target);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target);
 }
 
 test "clean loaded status tears down status-only session after empty diff" {
     const allocator = std.testing.allocator;
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 2 },
+            .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
+        } },
         .allocator = allocator,
-        .load = .{ .generation = 2 },
-        .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(allocator);
-    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
     var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
-    try app.git_status.replace("/repo", &current);
-    try app.createStatusOnlyLoadedSession(allocator, app.git_status.document);
+    try app.pages.review.git_status.replace("/repo", &current);
+    try app.createStatusOnlyLoadedSession(allocator, app.pages.review.git_status.document);
 
     try app.finishDiffLoad(&ctx, .{
         .generation = 2,
@@ -15557,7 +15780,7 @@ test "clean loaded status tears down status-only session after empty diff" {
 
     try std.testing.expect(app.loadedDiff() != null);
     try std.testing.expectEqual(@as(usize, 0), app.loadedDiff().?.document.files.len);
-    try std.testing.expect(app.auto_reload.accepted_source.?.fingerprint.eql(empty_fingerprint));
+    try std.testing.expect(app.pages.review.auto_reload.accepted_source.?.fingerprint.eql(empty_fingerprint));
 
     const clean = try git_status.StatusBundle.parseOwned(allocator, "");
     try app.finishStatusLoad(&ctx, .{
@@ -15566,12 +15789,12 @@ test "clean loaded status tears down status-only session after empty diff" {
         .result = .{ .loaded = clean },
     });
 
-    try std.testing.expectEqual(@as(usize, 0), app.git_status.document.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.git_status.document.entries.len);
     try std.testing.expect(app.loadedDiff() == null);
-    try std.testing.expect(app.load.state == .empty);
-    try std.testing.expectEqual(EmptyReason.no_changes, app.load.state.empty);
-    try std.testing.expect(app.auto_reload.accepted_source.?.fingerprint.eql(empty_fingerprint));
-    try std.testing.expect(app.auto_reload.sourceIsFresh());
+    try std.testing.expect(app.pages.review.load.state == .empty);
+    try std.testing.expectEqual(EmptyReason.no_changes, app.pages.review.load.state.empty);
+    try std.testing.expect(app.pages.review.auto_reload.accepted_source.?.fingerprint.eql(empty_fingerprint));
+    try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
 
     try app.startDiffLoadWithRepoRoot(&ctx, null, .{
         .clear_visible_state = false,
@@ -15589,37 +15812,39 @@ test "clean loaded status tears down status-only session after empty diff" {
         .generation = generation,
         .result = .{ .unchanged = empty_fingerprint },
     });
-    try std.testing.expect(app.load.state == .empty);
-    try std.testing.expect(app.auto_reload.sourceIsFresh());
+    try std.testing.expect(app.pages.review.load.state == .empty);
+    try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
 }
 
 test "source failure before clean status-only teardown remains stale" {
     const allocator = std.testing.allocator;
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 2 },
+            .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
+        } },
         .allocator = allocator,
-        .load = .{ .generation = 2 },
-        .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
     };
     defer app.clearLoadedDiff();
     defer app.clearPendingReload(allocator);
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(allocator);
-    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
     var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
-    try app.git_status.replace("/repo", &current);
+    try app.pages.review.git_status.replace("/repo", &current);
     try app.finishDiffLoad(&ctx, .{ .generation = 2, .result = .empty });
     try std.testing.expect(app.loadedDiff() != null);
 
-    app.load.generation = 3;
-    app.load.pending = .{ .diff_load = 3 };
-    app.pending_reload = .{ .generation = 3, .kind = .watch };
+    app.pages.review.load.generation = 3;
+    app.pages.review.load.pending = .{ .diff_load = 3 };
+    app.pages.review.pending_reload = .{ .generation = 3, .kind = .watch };
     try app.finishDiffLoad(&ctx, .{
         .generation = 3,
         .result = .{ .failed_static = "source transient" },
     });
-    try std.testing.expect(!app.auto_reload.sourceIsActionable());
+    try std.testing.expect(!app.pages.review.auto_reload.sourceIsActionable());
 
     const clean = try git_status.StatusBundle.parseOwned(allocator, "");
     try app.finishStatusLoad(&ctx, .{
@@ -15629,27 +15854,29 @@ test "source failure before clean status-only teardown remains stale" {
     });
 
     try std.testing.expect(app.loadedDiff() == null);
-    try std.testing.expect(!app.auto_reload.sourceIsActionable());
-    try std.testing.expect(app.auto_reload.last_failure != null);
+    try std.testing.expect(!app.pages.review.auto_reload.sourceIsActionable());
+    try std.testing.expect(app.pages.review.auto_reload.last_failure != null);
     try std.testing.expectEqualStrings("auto reload failed: source transient", app.status.text());
 }
 
 test "source failure after clean status-only teardown remains stale" {
     const allocator = std.testing.allocator;
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 2 },
+            .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
+        } },
         .allocator = allocator,
-        .load = .{ .generation = 2 },
-        .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
     };
     defer app.clearLoadedDiff();
     defer app.clearPendingReload(allocator);
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(allocator);
-    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
     var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
-    try app.git_status.replace("/repo", &current);
+    try app.pages.review.git_status.replace("/repo", &current);
     try app.finishDiffLoad(&ctx, .{ .generation = 2, .result = .empty });
     const clean = try git_status.StatusBundle.parseOwned(allocator, "");
     try app.finishStatusLoad(&ctx, .{
@@ -15657,18 +15884,18 @@ test "source failure after clean status-only teardown remains stale" {
         .repo_root = try allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = clean },
     });
-    try std.testing.expect(app.auto_reload.sourceIsFresh());
+    try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
 
-    app.load.generation = 3;
-    app.load.pending = .{ .diff_load = 3 };
-    app.pending_reload = .{ .generation = 3, .kind = .watch };
+    app.pages.review.load.generation = 3;
+    app.pages.review.load.pending = .{ .diff_load = 3 };
+    app.pages.review.pending_reload = .{ .generation = 3, .kind = .watch };
     try app.finishDiffLoad(&ctx, .{
         .generation = 3,
         .result = .{ .failed_static = "later source transient" },
     });
 
-    try std.testing.expect(!app.auto_reload.sourceIsActionable());
-    try std.testing.expect(app.auto_reload.last_failure != null);
+    try std.testing.expect(!app.pages.review.auto_reload.sourceIsActionable());
+    try std.testing.expect(app.pages.review.auto_reload.last_failure != null);
 }
 
 test "fresh status-only targets fail closed without accepted source" {
@@ -15683,14 +15910,14 @@ test "fresh status-only targets fail closed without accepted source" {
         } } },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(allocator);
-    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "AM src/main.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
-    try app.createStatusOnlyLoadedSession(allocator, app.git_status.document);
-    try std.testing.expect(app.auto_reload.accepted_source == null);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.createStatusOnlyLoadedSession(allocator, app.pages.review.git_status.document);
+    try std.testing.expect(app.pages.review.auto_reload.accepted_source == null);
 
     try std.testing.expectEqual(StageTargetResult.stale_source, app.selectedStageTarget());
     try std.testing.expectEqual(UnstageTargetResult.stale_source, app.selectedUnstageTarget());
@@ -15700,19 +15927,21 @@ test "fresh status-only targets fail closed without accepted source" {
 test "empty status result tears down status-only session after empty diff" {
     const allocator = std.testing.allocator;
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 2 },
+            .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
+        } },
         .allocator = allocator,
-        .load = .{ .generation = 2 },
-        .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(allocator);
-    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
     var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
-    try app.git_status.replace("/repo", &current);
-    try app.createStatusOnlyLoadedSession(allocator, app.git_status.document);
+    try app.pages.review.git_status.replace("/repo", &current);
+    try app.createStatusOnlyLoadedSession(allocator, app.pages.review.git_status.document);
 
     try app.finishDiffLoad(&ctx, .{
         .generation = 2,
@@ -15727,28 +15956,30 @@ test "empty status result tears down status-only session after empty diff" {
         .result = .empty,
     });
 
-    try std.testing.expectEqual(@as(usize, 0), app.git_status.document.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.git_status.document.entries.len);
     try std.testing.expect(app.loadedDiff() == null);
-    try std.testing.expect(app.load.state == .empty);
-    try std.testing.expectEqual(EmptyReason.no_changes, app.load.state.empty);
+    try std.testing.expect(app.pages.review.load.state == .empty);
+    try std.testing.expectEqual(EmptyReason.no_changes, app.pages.review.load.state.empty);
 }
 
 test "identical staged-only status keeps status-only session after empty diff" {
     const allocator = std.testing.allocator;
     var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .generation = 2 },
+            .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
+        } },
         .allocator = allocator,
-        .load = .{ .generation = 2 },
-        .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
     };
     defer app.clearLoadedDiff();
-    defer app.git_status.deinit();
-    defer app.tree_order.deinit(allocator);
-    defer if (app.tree_order_scope) |scope| allocator.free(scope);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
     var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
-    try app.git_status.replace("/repo", &current);
-    try app.createStatusOnlyLoadedSession(allocator, app.git_status.document);
+    try app.pages.review.git_status.replace("/repo", &current);
+    try app.createStatusOnlyLoadedSession(allocator, app.pages.review.git_status.document);
 
     try app.finishDiffLoad(&ctx, .{
         .generation = 2,
@@ -15757,7 +15988,7 @@ test "identical staged-only status keeps status-only session after empty diff" {
 
     const loaded_after_diff = app.loadedDiff() orelse return error.ExpectedLoadedDiff;
     try std.testing.expectEqual(@as(usize, 0), loaded_after_diff.document.files.len);
-    try std.testing.expectEqual(@as(usize, 1), app.git_status.document.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.git_status.document.entries.len);
 
     const same = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
     try app.finishStatusLoad(&ctx, .{
@@ -15769,11 +16000,13 @@ test "identical staged-only status keeps status-only session after empty diff" {
     const loaded_after_status = app.loadedDiff() orelse return error.ExpectedLoadedDiff;
     try std.testing.expectEqual(@as(usize, 0), loaded_after_status.document.files.len);
     try std.testing.expect(loaded_after_status.visibleNodeCount() > 0);
-    try std.testing.expectEqual(@as(usize, 1), app.git_status.document.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.git_status.document.entries.len);
 }
 
 test "finishRepoDiscovery records no repository as empty state" {
-    var app: App = .{ .load = .{ .generation = 1 } };
+    var app: App = .{
+        .pages = .{ .review = .{ .load = .{ .generation = 1 } } },
+    };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer app.repo_state.deinit(std.testing.allocator);
 
@@ -15784,12 +16017,14 @@ test "finishRepoDiscovery records no repository as empty state" {
         } } },
     });
 
-    try std.testing.expect(app.load.state == .empty);
-    try std.testing.expectEqual(EmptyReason.no_repository, app.load.state.empty);
+    try std.testing.expect(app.pages.review.load.state == .empty);
+    try std.testing.expectEqual(EmptyReason.no_repository, app.pages.review.load.state.empty);
 }
 
 test "finishDiffLoad copies and frees current failed message" {
-    var app: App = .{ .load = .{ .generation = 1 } };
+    var app: App = .{
+        .pages = .{ .review = .{ .load = .{ .generation = 1 } } },
+    };
     defer app.clearLoadedDiff();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -15799,12 +16034,15 @@ test "finishDiffLoad copies and frees current failed message" {
         .result = .{ .failed = message },
     });
 
-    try std.testing.expect(app.load.state == .failed);
-    try std.testing.expectEqualStrings("failed", app.load.state.failed.message);
+    try std.testing.expect(app.pages.review.load.state == .failed);
+    try std.testing.expectEqualStrings("failed", app.pages.review.load.state.failed.message);
 }
 
 test "finishDiffLoad failure clears pending selection restore" {
-    var app: App = .{ .allocator = std.testing.allocator, .load = .{ .generation = 1 } };
+    var app: App = .{
+        .pages = .{ .review = .{ .load = .{ .generation = 1 } } },
+        .allocator = std.testing.allocator,
+    };
     defer app.clearLoadedDiff();
     defer app.clearPendingSelectionRestore(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -15816,7 +16054,7 @@ test "finishDiffLoad failure clears pending selection restore" {
         .result = .{ .failed_static = "failed" },
     });
 
-    try std.testing.expect(app.pending_selection_restore == null);
+    try std.testing.expect(app.pages.review.pending_selection_restore == null);
 }
 
 test "saveRecentRepositoriesState writes reloadable state atomically" {
@@ -15847,31 +16085,31 @@ test "saveRecentRepositoriesState writes reloadable state atomically" {
 }
 
 fn expectSearchCoordinate(app: *const App, expected: diff_view_model.BodyCoordinate) !void {
-    try std.testing.expect(app.search.match != null);
-    try std.testing.expect(std.meta.eql(expected, app.search.match.?.coordinate));
+    try std.testing.expect(app.pages.review.search.match != null);
+    try std.testing.expect(std.meta.eql(expected, app.pages.review.search.match.?.coordinate));
 }
 
 fn setDiffSearchQuery(app: *App, query: []const u8) void {
-    @memcpy(app.search.query.buffer[0..query.len], query);
-    app.search.query.len = query.len;
-    app.search.query.cursor = query.len;
+    @memcpy(app.pages.review.search.query.buffer[0..query.len], query);
+    app.pages.review.search.query.len = query.len;
+    app.pages.review.search.query.cursor = query.len;
     setDiffSearchInput(app, query);
 }
 
 fn setDiffSearchInput(app: *App, query: []const u8) void {
-    @memcpy(app.search.input.buffer[0..query.len], query);
-    app.search.input.len = query.len;
-    app.search.input.cursor = query.len;
+    @memcpy(app.pages.review.search.input.buffer[0..query.len], query);
+    app.pages.review.search.input.len = query.len;
+    app.pages.review.search.input.cursor = query.len;
 }
 
 fn setFileSearchInput(app: *App, query: []const u8) void {
-    @memcpy(app.file_search.input.buffer[0..query.len], query);
-    app.file_search.input.len = query.len;
-    app.file_search.input.cursor = query.len;
+    @memcpy(app.pages.review.file_search.input.buffer[0..query.len], query);
+    app.pages.review.file_search.input.len = query.len;
+    app.pages.review.file_search.input.cursor = query.len;
 }
 
 fn acceptTestSource(app: *App) void {
-    app.auto_reload.acceptSource(app_auto_reload.SourceFingerprint.init("test source"));
+    app.pages.review.auto_reload.acceptSource(app_auto_reload.SourceFingerprint.init("test source"));
 }
 
 fn clearPendingStatusTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {

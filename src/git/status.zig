@@ -25,7 +25,7 @@ pub const StatusCode = enum {
 ///
 /// `parse` allocates the entries slice, but each path slice borrows from the
 /// input text. Use `StatusBundle.parseOwned` when the document must outlive the
-/// input buffer, such as async task results stored in app state.
+/// input buffer, such as async task results stored in Review page state.
 pub const StatusDocument = struct {
     entries: []const StatusEntry,
     line_stats: []const StatusLineStats = &.{},
@@ -153,10 +153,10 @@ pub const StatusBundle = struct {
     }
 };
 
-/// Active repository status snapshot owned by the app.
+/// Active repository status snapshot owned by the Review page.
 ///
 /// `StatusBundle` is a task-result payload. `GitStatusState` is the long-lived
-/// app state form: it owns the arena backing status paths and the copied repo
+/// Review state form: it owns the arena backing status paths and the copied repo
 /// root that identifies which repository the snapshot belongs to.
 pub const GitStatusState = struct {
     arena: ?std.heap.ArenaAllocator = null,
@@ -188,7 +188,7 @@ pub const GitStatusState = struct {
 ///
 /// The returned entries slice must be freed by the caller. Do not store the
 /// resulting StatusDocument beyond the lifetime of `text`; use
-/// StatusBundle.parseOwned for app state or async task payloads.
+/// StatusBundle.parseOwned for Review state or async task payloads.
 pub fn parse(allocator: std.mem.Allocator, text: []const u8) ParseError!StatusDocument {
     var parser: Parser = .{ .allocator = allocator };
     return parser.parse(text);

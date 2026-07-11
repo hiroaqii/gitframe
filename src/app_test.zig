@@ -1,21 +1,32 @@
 const std = @import("std");
 
 const app_module = @import("app.zig");
+const page = @import("app/page.zig");
 const context = @import("context.zig");
 const git_status = @import("git/status.zig");
 const test_support = @import("app/test_support.zig");
 
 const App = app_module.App;
 
+test "App starts with Review as the only reachable page" {
+    const app: App = .{};
+
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqual(@as(u64, 0), app.repo_epoch);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+}
+
 test "selectionContext exposes selected diff file model coordinate" {
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = test_support.loadState(test_support.loadedDiffTwo()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_file = 0,
+                .diff_cursor = .{ .hunk_header = 1 },
+            },
+        } },
         .config = .{ .source = .{ .range = "main...HEAD" } },
-        .load = test_support.loadState(test_support.loadedDiffTwo()),
-        .viewer = .{
-            .selected_target = .{ .diff_file = 0 },
-            .selected_file = 0,
-            .diff_cursor = .{ .hunk_header = 1 },
-        },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "gitframe",
             .display_path = ".",
@@ -37,9 +48,11 @@ test "selectionContext exposes selected diff file model coordinate" {
 
 test "selectionContext returns null for unresolved status-only target" {
     const app: App = .{
+        .pages = .{ .review = .{
+            .load = test_support.loadState(test_support.loadedDiffOne()),
+            .viewer = .{ .selected_target = .{ .status_only = 2 } },
+        } },
         .config = .{ .source = .stdin },
-        .load = test_support.loadState(test_support.loadedDiffOne()),
-        .viewer = .{ .selected_target = .{ .status_only = 2 } },
     };
 
     const selection = app.selectionContext();
@@ -50,18 +63,20 @@ test "selectionContext returns null for unresolved status-only target" {
 
 test "selectionContext resolves status-only target without loaded diff" {
     var app: App = .{
+        .pages = .{ .review = .{
+            .viewer = .{ .selected_target = .{ .status_only = 0 } },
+        } },
         .config = .{ .source = .unstaged },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
             .canonical_root = "/repo",
         } } },
-        .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
-    defer app.git_status.deinit();
+    defer app.pages.review.git_status.deinit();
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
 
     const selection = app.selectionContext();
     try std.testing.expectEqualStrings("/repo", selection.repo_root.?);
@@ -88,8 +103,10 @@ test "selectionContext keeps no-index source paths" {
 
 test "selectionContext returns null selected without a target" {
     const app: App = .{
+        .pages = .{ .review = .{
+            .viewer = .{ .selected_target = null },
+        } },
         .config = .{ .source = .unstaged },
-        .viewer = .{ .selected_target = null },
     };
 
     const selection = app.selectionContext();

@@ -2,20 +2,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const keymap = @import("keymap");
 const app_prompt = @import("prompt.zig");
-
-/// App focus state used by key mapping. The state lives on App, but the
-/// transition vocabulary belongs with input handling.
-pub const Focus = enum {
-    sidebar,
-    diff,
-
-    pub fn toggled(self: Focus) Focus {
-        return switch (self) {
-            .sidebar => .diff,
-            .diff => .sidebar,
-        };
-    }
-};
+const review_page = @import("pages/review.zig");
 
 /// Minimal snapshot needed to translate a terminal key into an App message.
 /// Keeping this small prevents input mapping from depending on full App state.
@@ -34,7 +21,7 @@ pub const KeyContext = struct {
     push_error_mode: bool = false,
     push_credential_mode: bool = false,
     search_query_len: usize = 0,
-    focus: Focus = .sidebar,
+    focus: review_page.Focus = .sidebar,
     sidebar_hidden: bool = false,
     review_mode: bool = false,
     keymap: keymap.Effective = .{},
