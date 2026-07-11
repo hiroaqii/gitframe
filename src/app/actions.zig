@@ -96,14 +96,17 @@ test "ActionKind background acceptance policy distinguishes reads from mutations
 
 pub const StageFileFinished = struct {
     pending: PendingAction,
+    repo_root: []u8 = &.{},
     path: []u8,
     result: FileActionTaskResult,
 
     pub fn deinit(self: *StageFileFinished, allocator: std.mem.Allocator) void {
+        if (self.repo_root.len > 0) allocator.free(self.repo_root);
         allocator.free(self.path);
         self.result.deinit(allocator);
         self.* = .{
             .pending = .{ .generation = 0, .kind = .stage_file },
+            .repo_root = &.{},
             .path = &.{},
             .result = .ok,
         };
@@ -112,14 +115,17 @@ pub const StageFileFinished = struct {
 
 pub const UnstageFileFinished = struct {
     pending: PendingAction,
+    repo_root: []u8 = &.{},
     path: []u8,
     result: FileActionTaskResult,
 
     pub fn deinit(self: *UnstageFileFinished, allocator: std.mem.Allocator) void {
+        if (self.repo_root.len > 0) allocator.free(self.repo_root);
         allocator.free(self.path);
         self.result.deinit(allocator);
         self.* = .{
             .pending = .{ .generation = 0, .kind = .unstage_file },
+            .repo_root = &.{},
             .path = &.{},
             .result = .ok,
         };
@@ -448,7 +454,7 @@ pub fn StageFileTask(comptime Msg: type) type {
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer {
-                allocator.free(task.repo_root);
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 if (task.label.len > 0) allocator.free(task.label);
                 allocator.destroy(task);
@@ -457,9 +463,12 @@ pub fn StageFileTask(comptime Msg: type) type {
             const result = runStageTarget(task.repo_root, task.path, task.target_kind, allocator, io);
             const path = task.label;
             task.label = &.{};
+            const repo_root = task.repo_root;
+            task.repo_root = &.{};
 
             return Msg.actionFinished(.{ .stage_file = StageFileFinished{
                 .pending = task.pending,
+                .repo_root = repo_root,
                 .path = path,
                 .result = result,
             } });
@@ -468,7 +477,7 @@ pub fn StageFileTask(comptime Msg: type) type {
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer {
-                allocator.free(task.repo_root);
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 if (task.label.len > 0) allocator.free(task.label);
                 allocator.destroy(task);
@@ -476,9 +485,12 @@ pub fn StageFileTask(comptime Msg: type) type {
 
             const path = task.label;
             task.label = &.{};
+            const repo_root = task.repo_root;
+            task.repo_root = &.{};
 
             return Msg.actionFinished(.{ .stage_file = StageFileFinished{
                 .pending = task.pending,
+                .repo_root = repo_root,
                 .path = path,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
@@ -502,7 +514,7 @@ pub fn UnstageFileTask(comptime Msg: type) type {
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer {
-                allocator.free(task.repo_root);
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 if (task.label.len > 0) allocator.free(task.label);
                 allocator.destroy(task);
@@ -511,9 +523,12 @@ pub fn UnstageFileTask(comptime Msg: type) type {
             const result = runUnstageTarget(task.repo_root, task.path, task.target_kind, allocator, io);
             const path = task.label;
             task.label = &.{};
+            const repo_root = task.repo_root;
+            task.repo_root = &.{};
 
             return Msg.actionFinished(.{ .unstage_file = UnstageFileFinished{
                 .pending = task.pending,
+                .repo_root = repo_root,
                 .path = path,
                 .result = result,
             } });
@@ -522,7 +537,7 @@ pub fn UnstageFileTask(comptime Msg: type) type {
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer {
-                allocator.free(task.repo_root);
+                if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 if (task.label.len > 0) allocator.free(task.label);
                 allocator.destroy(task);
@@ -530,9 +545,12 @@ pub fn UnstageFileTask(comptime Msg: type) type {
 
             const path = task.label;
             task.label = &.{};
+            const repo_root = task.repo_root;
+            task.repo_root = &.{};
 
             return Msg.actionFinished(.{ .unstage_file = UnstageFileFinished{
                 .pending = task.pending,
+                .repo_root = repo_root,
                 .path = path,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
@@ -1668,6 +1686,7 @@ test "StageFileTask run frees borrowed command path and moves label" {
 
     try std.testing.expectEqual(@as(u64, 11), finished.pending.generation);
     try std.testing.expectEqual(ActionKind.stage_file, finished.pending.kind);
+    try std.testing.expectEqualStrings("/__gitframe_missing_repo__", finished.repo_root);
     try std.testing.expectEqualStrings("src/main.zig", finished.path);
     try std.testing.expectEqual(FileActionTaskResult.failed, std.meta.activeTag(finished.result));
 }
@@ -1682,6 +1701,7 @@ test "StageFileTask failed frees borrowed command path and moves label" {
 
     try std.testing.expectEqual(@as(u64, 12), finished.pending.generation);
     try std.testing.expectEqual(ActionKind.stage_file, finished.pending.kind);
+    try std.testing.expectEqualStrings("/__gitframe_missing_repo__", finished.repo_root);
     try std.testing.expectEqualStrings("src/main.zig", finished.path);
     try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
         .failed_static => |message| message,
@@ -1699,6 +1719,7 @@ test "UnstageFileTask run frees borrowed command path and moves label" {
 
     try std.testing.expectEqual(@as(u64, 13), finished.pending.generation);
     try std.testing.expectEqual(ActionKind.unstage_file, finished.pending.kind);
+    try std.testing.expectEqualStrings("/__gitframe_missing_repo__", finished.repo_root);
     try std.testing.expectEqualStrings("src/main.zig", finished.path);
     try std.testing.expectEqual(FileActionTaskResult.failed, std.meta.activeTag(finished.result));
 }
@@ -1713,6 +1734,7 @@ test "UnstageFileTask failed frees borrowed command path and moves label" {
 
     try std.testing.expectEqual(@as(u64, 14), finished.pending.generation);
     try std.testing.expectEqual(ActionKind.unstage_file, finished.pending.kind);
+    try std.testing.expectEqualStrings("/__gitframe_missing_repo__", finished.repo_root);
     try std.testing.expectEqualStrings("src/main.zig", finished.path);
     try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
         .failed_static => |message| message,
