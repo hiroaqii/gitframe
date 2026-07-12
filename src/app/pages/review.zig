@@ -2,9 +2,11 @@ const std = @import("std");
 const auto_reload = @import("../auto_reload.zig");
 const load = @import("../load.zig");
 const load_state = @import("../load_state.zig");
+const page = @import("../page.zig");
 const prompt = @import("../prompt.zig");
 const review_projection = @import("../review_projection.zig");
 const app_state = @import("../state.zig");
+const authority = @import("review/authority.zig");
 const config = @import("../../config.zig");
 const context = @import("../../context.zig");
 const diff_render = @import("../../diff/render.zig");
@@ -138,6 +140,8 @@ pub const DeferredSourceApply = struct {
 };
 
 pub const ReviewPageState = struct {
+    activation: authority.Lifecycle = .{},
+    status: app_state.StatusMessage = .{},
     load: load_state.LoadRuntimeState = .{},
     auto_reload: auto_reload.State = .{},
     deferred_source_apply: ?DeferredSourceApply = null,
@@ -202,6 +206,7 @@ test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
 
     state.deferred_source_apply = .{
         .finished = .{
+            .identity = page.RequestIdentity.review(0, 1),
             .generation = 5,
             .result = .{ .failed = try allocator.dupe(u8, "deferred failure") },
         },
@@ -320,6 +325,7 @@ test "ReviewPageState deinit releases stores projection and stable order" {
 
     state.review_projection.pending = try review_projection.cloneRequest(
         allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "src/pending.zig",
@@ -330,6 +336,7 @@ test "ReviewPageState deinit releases stores projection and stable order" {
     );
     var displayed_request = try review_projection.cloneRequest(
         allocator,
+        page.RequestIdentity.review(0, 1),
         2,
         "/repo",
         "src/displayed.zig",

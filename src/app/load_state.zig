@@ -158,6 +158,15 @@ pub const LoadRuntimeState = struct {
         return self.pending != null;
     }
 
+    /// Invalidates an outstanding source read after a repository commitment.
+    /// The task still owns and eventually frees its result, but its generation
+    /// can no longer mutate the newly committed repository session.
+    pub fn supersedePending(self: *LoadRuntimeState) void {
+        if (self.pending == null) return;
+        _ = self.nextGeneration();
+        self.pending = null;
+    }
+
     pub fn replaceLoaded(self: *LoadRuntimeState, allocator: std.mem.Allocator, session: LoadedSession) void {
         self.clearCurrent(allocator);
         self.state = .{ .loaded = session };

@@ -10,10 +10,12 @@ const app_input = @import("app/input.zig");
 const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
 const page = @import("app/page.zig");
+const page_transition = @import("app/page_transition.zig");
 const app_shell_layout = @import("app/shell_layout.zig");
 const review_page = @import("app/pages/review.zig");
 const review_layout = @import("app/pages/review/layout.zig");
 const review_navigation = @import("app/pages/review/navigation.zig");
+const review_authority = @import("app/pages/review/authority.zig");
 const review_operations = @import("app/pages/review/operations.zig");
 const review_reload = @import("app/pages/review/reload.zig");
 const review_view = @import("app/pages/review/view.zig");
@@ -190,6 +192,11 @@ fn expandUserPath(allocator: std.mem.Allocator, path: []const u8, home: ?[]const
 const ChangedFileFilter = loaded_diff.ChangedFileFilter;
 const OverlayKind = app_state.OverlayKind;
 
+const RepoCommitOrigin = enum {
+    discovery_completion,
+    external_selection,
+};
+
 const PageStates = struct {
     review: review_page.ReviewPageState = .{},
     repository: page.LazyPlaceholder = .{},
@@ -208,6 +215,10 @@ pub const App = struct {
     theme: theme.Palette = .default(),
     env_map: ?*std.process.Environ.Map = null,
     review_output: ?*review_session.Output = null,
+    /// Set immediately before handing terminal ownership to Chasen teardown.
+    /// The event loop normally stops at once; retaining the bit also makes the
+    /// transition matrix total for direct/future Session API requests.
+    teardown_requested: bool = false,
     allocator: ?std.mem.Allocator = null,
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
     actions: app_actions.ActionState = .{},
@@ -235,6 +246,7 @@ pub const App = struct {
     push_retry_credentials_available: bool = false,
     push_credential_prompt: ?*app_state.PushCredentialPrompt = null,
     push_foreground: ?PushForegroundState = null,
+    editor_foreground_request: ?chasen.ForegroundCommandRequestId = null,
     branch_switch: app_state.BranchSwitchState = .{},
     branch_switch_load_generation: u64 = 0,
     branch_switch_load_pending: ?u64 = null,
@@ -264,6 +276,7 @@ pub const App = struct {
         pub const undelivered_policy = .deinit;
 
         terminal_resized: chasen.Size,
+        switch_page: page.Id,
         load_finished: LoadFinishedMsg,
         action_finished: ActionFinishedMsg,
         clipboard_copy_finished: ClipboardCopyFinished,
@@ -444,6 +457,7 @@ pub const App = struct {
         self.allocator = ctx.allocator();
         self.commit_panel = app_commit_panel.State.init(ctx.allocator());
         self.pages.review.init(self.config.auto_reload, self.user_config.reload, self.config.source);
+        _ = self.activateReview();
         if (self.pages.review.auto_reload.enabled()) {
             try ctx.timer().every(auto_reload_timer_id, self.pages.review.auto_reload.interval_ns, .auto_reload_tick);
         }
@@ -477,18 +491,18 @@ pub const App = struct {
     /// needed by Review-local cursor/search/selection logic. The controller
     /// deliberately cannot reach App, overlays, processes, or async effects.
     fn reviewNavigation(self: *App) review_navigation.Controller {
-        const size = app_shell_layout.contentSize(self.terminal_size);
+        const size = self.shellLayout().bodySize();
         return .{
             .page = &self.pages.review,
             .repo_root = self.activeRepoRoot(),
             .source = self.config.source,
             .layout = .{ .width = size.width, .height = size.height },
-            .diagnostics = .{ .target = &self.status },
+            .diagnostics = .{ .target = &self.pages.review.status },
         };
     }
 
     fn reviewNavigationView(self: *const App) review_navigation.View {
-        const size = app_shell_layout.contentSize(self.terminal_size);
+        const size = self.shellLayout().bodySize();
         return .{
             .page = &self.pages.review,
             .repo_root = self.activeRepoRoot(),
@@ -503,7 +517,7 @@ pub const App = struct {
             .navigation = self.reviewNavigationView(),
             .source = self.config.source,
             .repo_root = self.activeRepoRoot(),
-            .repo_epoch = self.repo_epoch,
+            .activation_state = self.pages.review.activation.state,
         };
     }
 
@@ -521,6 +535,7 @@ pub const App = struct {
             .navigation = self.reviewNavigation(),
             .source = self.config.source,
             .repo_root = self.activeRepoRoot(),
+            .repo_epoch = self.repo_epoch,
         };
     }
 
@@ -539,6 +554,7 @@ pub const App = struct {
         const navigation_before = if (tracks_display_navigation) self.displayNavigationSnapshot() else undefined;
 
         switch (msg) {
+            .switch_page => |target| try self.requestPageSwitch(ctx, target),
             .terminal_resized => |size| {
                 const previous_width = self.reviewNavigationView().diffPaneWidth();
                 const previous_mode = self.reviewNavigationView().effectiveDisplayMode();
@@ -555,7 +571,7 @@ pub const App = struct {
             },
             .load_finished => |finished| try self.finishLoadResult(ctx, finished),
             .action_finished => |finished| try self.finishActionResult(ctx, finished),
-            .clipboard_copy_finished => |finished| self.finishClipboardCopy(finished),
+            .clipboard_copy_finished => |finished| self.finishClipboardCopy(ctx, finished),
             .select_previous_file => self.reviewNavigation().selectFileDelta(-1),
             .select_next_file => self.reviewNavigation().selectFileDelta(1),
             .toggle_directory => try self.reviewNavigation().toggleSelectedDirectory(),
@@ -634,10 +650,10 @@ pub const App = struct {
             .clear_search => self.reviewNavigation().clearSearch(),
             .submit_search => self.reviewNavigation().submitSearch(),
             .search_insert => |codepoint| self.pages.review.search.input.insert(codepoint) catch {
-                self.setStatus("search query is too long", .{});
+                self.setReviewStatus("search query is too long", .{});
             },
             .search_paste => |text| self.pages.review.search.input.insertSlice(text) catch {
-                self.setStatus("search query is too long", .{});
+                self.setReviewStatus("search query is too long", .{});
             },
             .search_backspace => self.pages.review.search.input.backspace(),
             .search_move_left => self.pages.review.search.input.moveLeft(),
@@ -650,13 +666,13 @@ pub const App = struct {
             .file_search_insert => |codepoint| {
                 self.pages.review.file_search.resetNoMatch();
                 self.pages.review.file_search.input.insert(codepoint) catch {
-                    self.setStatus("file search query is too long", .{});
+                    self.setReviewStatus("file search query is too long", .{});
                 };
             },
             .file_search_paste => |text| {
                 self.pages.review.file_search.resetNoMatch();
                 self.pages.review.file_search.input.insertSlice(text) catch {
-                    self.setStatus("file search query is too long", .{});
+                    self.setReviewStatus("file search query is too long", .{});
                 };
             },
             .file_search_backspace => {
@@ -700,8 +716,8 @@ pub const App = struct {
             .repo_picker_move_left => self.moveRepoPickerCursorLeft(),
             .repo_picker_move_right => self.moveRepoPickerCursorRight(),
             .open_help => {
-                self.reviewNavigation().clearDiffSelection();
-                self.overlay.openHelp();
+                if (self.active_page == .review) self.reviewNavigation().clearDiffSelection();
+                self.overlay.openHelpForPage(self.active_page);
             },
             .close_help => self.overlay.close(),
             .help_scroll_up => self.scrollHelp(-1),
@@ -756,7 +772,11 @@ pub const App = struct {
             .finish_review_approved => try self.finishReview(ctx, .approved),
             .finish_review_needs_changes => try self.finishReview(ctx, .needs_changes),
             .finish_review_canceled => try self.finishReview(ctx, .canceled),
-            .reload => {
+            .reload => reload: {
+                if (self.active_page != .review) {
+                    self.status.set("reload is not available on this page yet", .{});
+                    break :reload;
+                }
                 self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
                 self.clearBranchSwitch(ctx.allocator());
                 if (diff_source.sourceIsOneShotInput(self.config.source)) {
@@ -784,7 +804,8 @@ pub const App = struct {
         if (!self.pages.review.selection_owner.activeMouseSelection() and self.pages.review.deferred_source_apply != null) {
             try self.applyDeferredSource(ctx);
         }
-        try self.ensureReviewProjection(ctx);
+        try self.maybeStartQueuedReviewRevalidation(ctx);
+        if (self.active_page == .review) try self.ensureReviewProjection(ctx);
         self.reconcileGitActionSpinnerTimer(ctx);
     }
 
@@ -835,6 +856,7 @@ pub const App = struct {
             self.setStatus("finish current git action before quitting", .{});
             return;
         }
+        self.teardown_requested = true;
         ctx.quit();
     }
 
@@ -872,6 +894,7 @@ pub const App = struct {
     fn clearEphemeralStatusForUserAction(self: *App, msg: Msg) void {
         if (msgKeepsEphemeralStatus(msg)) return;
         self.status.clearIfEphemeral();
+        if (self.active_page == .review) self.pages.review.status.clearIfEphemeral();
     }
 
     fn msgKeepsEphemeralStatus(msg: Msg) bool {
@@ -921,12 +944,13 @@ pub const App = struct {
         return .{
             .review = self.reviewViewContext(),
             .active_page = self.active_page,
-            .page_bar_visible = false,
+            .page_bar_visible = true,
             .theme = self.theme,
             .keymap = self.keymap,
             .terminal_size = self.terminal_size,
             .actions = &self.actions,
             .status = &self.status,
+            .page_status = self.activePageStatus(),
             .commit_panel = &self.commit_panel,
             .repo_picker = &self.repo_picker,
             .repo_picker_discovery = self.repo_picker_discovery,
@@ -1019,6 +1043,25 @@ pub const App = struct {
             },
         }
 
+        if (mouse.button == .left) {
+            const layout = self.shellLayout();
+            if (layout.page_bar) |bar| {
+                if (layout.terminalToContent(mouse.col, mouse.row)) |point| {
+                    if (point.row == 0) {
+                        const compact = layout.body.height == 0 or layout.footer.height == 0;
+                        const target = if (compact)
+                            if (point.col >= 1 and point.col < @min(bar.width, self.active_page.label().len + 3)) self.active_page else null
+                        else
+                            page.tabAtColumn(bar.width, point.col);
+                        if (target) |id| return .{ .switch_page = id };
+                        return null;
+                    }
+                }
+            }
+        }
+
+        if (self.active_page != .review) return null;
+
         const pane = self.mousePane(mouse) orelse return null;
         return switch (mouse.button) {
             .left => switch (pane) {
@@ -1060,7 +1103,7 @@ pub const App = struct {
 
     fn sidebarClickToMsg(self: *const App, mouse: anytype) Msg {
         const point = self.bodyMousePoint(mouse) orelse return .focus_sidebar;
-        const body_height = terminalBodyHeight(self.layoutSize().height);
+        const body_height = self.shellLayout().body.height;
         if (point.row < sidebar_header_rows or body_height <= sidebar_header_rows) return .focus_sidebar;
 
         const loaded = self.reviewNavigationView().activeLoadedDiffConst() orelse return .focus_sidebar;
@@ -1088,17 +1131,18 @@ pub const App = struct {
     /// resolves a deferred background source result after this becomes idle;
     /// deinit discards that result explicitly.
     fn bodyMousePoint(self: *const App, mouse: anytype) ?MousePoint {
-        const point = app_shell_layout.compute(self.terminal_size, .{}).terminalToBody(mouse.col, mouse.row) orelse return null;
+        const point = self.shellLayout().terminalToBody(mouse.col, mouse.row) orelse return null;
         return .{ .col = point.col, .row = point.row };
     }
 
     fn contentMousePoint(self: *const App, mouse: anytype) ?MousePoint {
-        const point = app_shell_layout.compute(self.terminal_size, .{}).terminalToContent(mouse.col, mouse.row) orelse return null;
+        const point = self.shellLayout().terminalToContent(mouse.col, mouse.row) orelse return null;
         return .{ .col = point.col, .row = point.row };
     }
 
     fn keyContext(self: *const App) app_input.KeyContext {
         return .{
+            .active_page = self.active_page,
             .search_mode = self.pages.review.search.mode,
             .file_search_mode = self.pages.review.file_search.mode,
             .commit_panel_mode = self.commit_panel.is_open,
@@ -1118,6 +1162,127 @@ pub const App = struct {
             .review_mode = self.config.review_mode,
             .keymap = self.keymap,
         };
+    }
+
+    fn shellLayout(self: *const App) app_shell_layout.Layout {
+        return app_shell_layout.compute(self.terminal_size, .{ .page_bar_visible = true });
+    }
+
+    fn activePageStatus(self: *const App) ?*const app_state.StatusMessage {
+        return switch (self.active_page) {
+            .review => &self.pages.review.status,
+            .repository, .history, .config => null,
+        };
+    }
+
+    fn activateReview(self: *App) u64 {
+        const source_member: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(self.config.source))
+            switch (self.pages.review.load.state) {
+                .loaded, .empty => .immutable,
+                .loading => .pending,
+                .failed => .failed,
+                .idle => .pending,
+            }
+        else
+            .pending;
+        const has_repo = self.activeRepoRoot() != null;
+        const auxiliary: review_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(self.config.source) and has_repo)
+            .pending
+        else
+            .unavailable;
+        return self.pages.review.activation.activate(self.repo_epoch, source_member, auxiliary, auxiliary);
+    }
+
+    fn pageTransitionSnapshot(self: *const App) page_transition.Snapshot {
+        return .{
+            .review_mouse_selection = self.pages.review.selection_owner.activeMouseSelection(),
+            .review_deferred_apply = self.pages.review.deferred_source_apply != null,
+            .review_search = self.pages.review.search.mode,
+            .review_file_search = self.pages.review.file_search.mode,
+            .repo_picker = self.repo_picker.mode,
+            .help = self.overlay.isHelp(),
+            .commit_input = self.commit_panel.is_open,
+            .confirmation = self.overlay.isDiscardFile() or self.overlay.isAmendCommit() or
+                self.overlay.isPushBranch() or self.overlay.isPullBranch(),
+            .credential_input = self.overlay.isPushCredentials(),
+            .branch_switch = self.overlay.isSwitchBranch(),
+            .push_error = self.overlay.isPushError(),
+            .git_action = app_git_requests.hasPendingAction(self.actions),
+            .foreground_command = self.push_foreground != null or self.editor_foreground_request != null,
+            .live_review_waiter = if (self.review_output) |output| !output.ready else false,
+            .teardown = self.teardown_requested,
+        };
+    }
+
+    /// Single page-transition entry point for keyboard, mouse, and future
+    /// Session API requests. It applies the policy before mutating either page.
+    fn requestPageSwitch(self: *App, ctx: *chasen.Ctx(Msg), target: page.Id) !void {
+        switch (page_transition.disposition(self.active_page, target, self.pageTransitionSnapshot())) {
+            .unchanged => {
+                self.status.clearIfEphemeral();
+                return;
+            },
+            .blocked => |blocker| {
+                self.status.set("{s}", .{blocker.message()});
+                return;
+            },
+            .allowed => {},
+        }
+
+        self.status.clearIfEphemeral();
+        if (self.active_page == .review) self.pages.review.activation.deactivate();
+        self.active_page = target;
+        switch (target) {
+            .review => {
+                _ = self.activateReview();
+                try self.requestReviewRevalidation(ctx);
+            },
+            .repository => self.pages.repository.ensureInitialized(),
+            .history => self.pages.history.ensureInitialized(),
+            .config => self.pages.config.ensureInitialized(),
+        }
+    }
+
+    fn reviewReadBusy(self: *const App) bool {
+        return self.pages.review.auto_reload.background_cycle != null or
+            self.pages.review.load.hasPending() or self.pages.review.load.state == .loading or
+            self.pages.review.status_load.isPending() or self.pages.review.branch_status_load.isPending() or
+            self.pages.review.deferred_source_apply != null;
+    }
+
+    fn requestReviewRevalidation(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.active_page != .review) return;
+        if (diff_source.sourceIsOneShotInput(self.config.source)) return;
+        if (self.reviewReadBusy()) {
+            self.pages.review.activation.queueRevalidation();
+            return;
+        }
+        try self.startReviewRevalidation(ctx);
+    }
+
+    fn startReviewRevalidation(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.active_page != .review) return;
+        if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
+            try self.startRepoDiscovery(ctx, null);
+            return;
+        }
+        const cycle_id = self.pages.review.auto_reload.beginCycle();
+        errdefer if (cycle_id) |id| self.pages.review.auto_reload.discardEmptyCycle(id);
+        try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
+            if (cycle_id) |id| self.pages.review.auto_reload.discardEmptyCycle(id);
+            return;
+        }, .{
+            .clear_visible_state = self.pages.review.load.state == .idle,
+            .kind = .watch,
+            .background_cycle_id = cycle_id,
+        });
+        if (cycle_id) |id| self.pages.review.auto_reload.discardEmptyCycle(id);
+    }
+
+    fn maybeStartQueuedReviewRevalidation(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.active_page != .review or self.reviewReadBusy()) return;
+        if (!self.pages.review.activation.takeQueuedRevalidation()) return;
+        try self.startReviewRevalidation(ctx);
     }
 
     fn scrollHelp(self: *App, delta: isize) void {
@@ -1157,11 +1322,12 @@ pub const App = struct {
     }
 
     fn startRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg), background_cycle_id: ?u64) !void {
+        const identity = self.pages.review.activation.currentIdentity() orelse return;
         const task = try ctx.allocator().create(RepoDiscoveryTask);
         errdefer ctx.allocator().destroy(task);
 
         const generation = self.pages.review.load.beginRepoDiscovery();
-        task.* = .{ .generation = generation, .background_cycle_id = background_cycle_id };
+        task.* = .{ .identity = identity, .generation = generation, .background_cycle_id = background_cycle_id };
         self.reviewReload().clearPendingReload(ctx.allocator());
         self.reviewReload().clearSourceDisplay(self.allocator);
         self.pages.review.load.state = .loading;
@@ -1174,9 +1340,12 @@ pub const App = struct {
     }
 
     fn finishRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg), finished: RepoDiscoveryFinished) !void {
-        self.pages.review.auto_reload.finishMember(finished.background_cycle_id, .source);
+        defer if (self.active_page != .review) ctx.redraw().skip();
         var result = finished.result;
         defer result.deinit(ctx.allocator());
+
+        if (!self.pages.review.activation.acceptsRepoEpoch(finished.identity, self.repo_epoch)) return;
+        self.pages.review.auto_reload.finishMember(finished.background_cycle_id, .source);
 
         _ = self.pages.review.load.finishPending(.{ .repo_discovery = finished.generation });
         if (!self.pages.review.load.isCurrent(finished.generation)) return;
@@ -1187,7 +1356,7 @@ pub const App = struct {
                 try self.recent_repos.rememberDiscovery(ctx.allocator(), discovery);
                 self.persistRecentRepositories(ctx);
                 result = .empty;
-                self.repo_state.replace(ctx.allocator(), discovery);
+                _ = self.commitRepoDiscovery(ctx.allocator(), discovery, 0, .discovery_completion);
 
                 if (self.activeRepoRoot() == null) {
                     self.reviewReload().clearSourceDisplay(self.allocator);
@@ -1195,7 +1364,12 @@ pub const App = struct {
                     return;
                 }
 
-                try self.startDiffLoad(ctx, .initial);
+                if (self.active_page == .review) {
+                    try self.startDiffLoad(ctx, .initial);
+                } else {
+                    self.pages.review.load.state = .idle;
+                    ctx.redraw().skip();
+                }
             },
             .failed => |message| {
                 try self.reviewReload().storeFailedMessage(ctx.allocator(), git_ops.trimGitOutput(message));
@@ -1227,7 +1401,10 @@ pub const App = struct {
             self.reviewReload().invalidateBranchStatusSnapshot();
         }
 
-        var review_update = try self.reviewReload().prepareSourceLoad(ctx.allocator(), repo_root, options);
+        var review_update = self.reviewReload().prepareSourceLoad(ctx.allocator(), repo_root, options) catch |err| {
+            self.reviewReload().failActiveMember(.source);
+            return err;
+        };
         defer review_update.deinit(ctx.allocator());
         var command = review_update.takeCommand() orelse unreachable;
         var command_consumed = false;
@@ -1239,6 +1416,7 @@ pub const App = struct {
             return err;
         };
         task.* = .{
+            .identity = source.identity,
             .request = source.request,
             .generation = source.generation,
             .expected_fingerprint = source.expected_fingerprint,
@@ -1268,7 +1446,8 @@ pub const App = struct {
             origin,
             background_cycle_id,
         ) catch {
-            self.setStatus("could not allocate status repo root", .{});
+            self.reviewReload().failActiveMember(.status);
+            self.setReviewStatus("could not allocate status repo root", .{});
             return;
         };
         defer review_update.deinit(ctx.allocator());
@@ -1278,10 +1457,11 @@ pub const App = struct {
         const status_read = &command.status_load;
         const task = ctx.allocator().create(StatusLoadTask) catch {
             self.reviewReload().rejectStatusSpawn(ctx.allocator(), background_cycle_id);
-            self.setStatus("could not allocate status load task", .{});
+            self.setReviewStatus("could not allocate status load task", .{});
             return;
         };
         task.* = .{
+            .identity = status_read.identity,
             .repo_root = status_read.repo_root,
             .generation = status_read.generation,
             .origin = status_read.origin,
@@ -1296,7 +1476,7 @@ pub const App = struct {
             ctx.allocator().free(task.repo_root);
             ctx.allocator().destroy(task);
             self.reviewReload().rejectStatusSpawn(ctx.allocator(), background_cycle_id);
-            self.setStatus("could not start status load task", .{});
+            self.setReviewStatus("could not start status load task", .{});
             return;
         };
         self.reviewReload().acceptStatusSpawn(background_cycle_id);
@@ -1308,7 +1488,8 @@ pub const App = struct {
             repo_root,
             background_cycle_id,
         ) catch {
-            self.setStatus("could not allocate branch status repo root", .{});
+            self.reviewReload().failActiveMember(.branch);
+            self.setReviewStatus("could not allocate branch status repo root", .{});
             return;
         };
         defer review_update.deinit(ctx.allocator());
@@ -1318,10 +1499,11 @@ pub const App = struct {
         const branch_read = &command.branch_status_load;
         const task = ctx.allocator().create(BranchStatusLoadTask) catch {
             self.reviewReload().rejectBranchStatusSpawn(background_cycle_id);
-            self.setStatus("could not allocate branch status load task", .{});
+            self.setReviewStatus("could not allocate branch status load task", .{});
             return;
         };
         task.* = .{
+            .identity = branch_read.identity,
             .repo_root = branch_read.repo_root,
             .generation = branch_read.generation,
             .background_cycle_id = branch_read.background_cycle_id,
@@ -1332,7 +1514,7 @@ pub const App = struct {
             ctx.allocator().free(task.repo_root);
             ctx.allocator().destroy(task);
             self.reviewReload().rejectBranchStatusSpawn(background_cycle_id);
-            self.setStatus("could not start branch status load task", .{});
+            self.setReviewStatus("could not start branch status load task", .{});
             return;
         };
         self.reviewReload().acceptBranchStatusSpawn(background_cycle_id);
@@ -1380,37 +1562,37 @@ pub const App = struct {
 
     fn stageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
         const target = switch (self.reviewOperations().stageTarget()) {
             .ready => |target| target,
             .already_staged => |path| {
-                self.setStatus("already staged: {s}", .{path});
+                self.setReviewStatus("already staged: {s}", .{path});
                 return;
             },
             .stale_status => {
-                self.setStatus("status is still loading", .{});
+                self.setReviewStatus("status is still loading", .{});
                 return;
             },
             .stale_source => {
-                self.setStatus("source is stale; press r to reload", .{});
+                self.setReviewStatus("source is stale; press r to reload", .{});
                 return;
             },
             .conflict_unsupported => |path| {
-                self.setStatus("conflict under selection: {s}", .{path});
+                self.setReviewStatus("conflict under selection: {s}", .{path});
                 return;
             },
             .no_stageable_content => |path| {
-                self.setStatus("no stageable files under: {s}", .{path});
+                self.setReviewStatus("no stageable files under: {s}", .{path});
                 return;
             },
             .unavailable_source, .no_repo => {
-                self.setStatus("stage unavailable for this source", .{});
+                self.setReviewStatus("stage unavailable for this source", .{});
                 return;
             },
             .no_path => {
-                self.setStatus("no stageable file selected", .{});
+                self.setReviewStatus("no stageable file selected", .{});
                 return;
             },
         };
@@ -1426,15 +1608,15 @@ pub const App = struct {
             .kind = owned.kind,
             .label = owned.label,
         }) catch |err| {
-            self.setStatus("could not start stage task", .{});
+            self.setReviewStatus("could not start stage task", .{});
             return err;
         };
-        self.setStatus("staging: {s}", .{owned.label});
+        self.setReviewStatus("staging: {s}", .{owned.label});
     }
 
     fn toggleSelectedFileStage(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
@@ -1443,22 +1625,22 @@ pub const App = struct {
                 .stage => try self.stageSelectedFile(ctx),
                 .unstage => try self.unstageSelectedFile(ctx),
             },
-            .unavailable_source, .no_repo => self.setStatus("stage toggle unavailable for this source", .{}),
-            .no_path => self.setStatus("no file selected", .{}),
-            .stale_status => self.setStatus("status is still loading", .{}),
-            .stale_source => self.setStatus("source is stale; press r to reload", .{}),
+            .unavailable_source, .no_repo => self.setReviewStatus("stage toggle unavailable for this source", .{}),
+            .no_path => self.setReviewStatus("no file selected", .{}),
+            .stale_status => self.setReviewStatus("status is still loading", .{}),
+            .stale_source => self.setReviewStatus("source is stale; press r to reload", .{}),
             .conflict_unsupported => |target| {
                 if (target.kind == .directory) {
-                    self.setStatus("conflict under directory: {s}", .{target.path});
+                    self.setReviewStatus("conflict under directory: {s}", .{target.path});
                 } else {
-                    self.setStatus("conflict stage toggle is not supported yet", .{});
+                    self.setReviewStatus("conflict stage toggle is not supported yet", .{});
                 }
             },
             .no_content => |target| {
                 if (target.kind == .directory) {
-                    self.setStatus("no stageable or staged files under: {s}", .{target.path});
+                    self.setReviewStatus("no stageable or staged files under: {s}", .{target.path});
                 } else {
-                    self.setStatus("no stageable or staged content selected", .{});
+                    self.setReviewStatus("no stageable or staged content selected", .{});
                 }
             },
         }
@@ -1466,57 +1648,57 @@ pub const App = struct {
 
     fn stageSelectedHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
         var target = switch (self.reviewOperations().selectedHunkStageTarget(ctx.allocator())) {
             .ready => |target| target,
             .unavailable_source, .no_repo => {
-                self.setStatus("hunk stage unavailable for this source", .{});
+                self.setReviewStatus("hunk stage unavailable for this source", .{});
                 return;
             },
             .no_file => {
-                self.setStatus("no file selected", .{});
+                self.setReviewStatus("no file selected", .{});
                 return;
             },
             .no_path => {
-                self.setStatus("hunk stage unavailable for status-only file", .{});
+                self.setReviewStatus("hunk stage unavailable for status-only file", .{});
                 return;
             },
             .no_hunk => {
-                self.setStatus("no hunk selected", .{});
+                self.setReviewStatus("no hunk selected", .{});
                 return;
             },
             .offscreen_cursor => {
-                self.setStatus("cursor is offscreen; move cursor first", .{});
+                self.setReviewStatus("cursor is offscreen; move cursor first", .{});
                 return;
             },
             .stale_status => {
-                self.setStatus("status is still loading", .{});
+                self.setReviewStatus("status is still loading", .{});
                 return;
             },
             .stale_source => {
-                self.setStatus("source is stale; press r to reload", .{});
+                self.setReviewStatus("source is stale; press r to reload", .{});
                 return;
             },
             .conflict_unsupported => {
-                self.setStatus("conflict hunk stage is not supported yet", .{});
+                self.setReviewStatus("conflict hunk stage is not supported yet", .{});
                 return;
             },
             .binary_unsupported => {
-                self.setStatus("binary hunk stage is not supported", .{});
+                self.setReviewStatus("binary hunk stage is not supported", .{});
                 return;
             },
             .unsupported_file_state => {
-                self.setStatus("hunk stage supports modified files only", .{});
+                self.setReviewStatus("hunk stage supports modified files only", .{});
                 return;
             },
             .already_staged_hunk => {
-                self.setStatus("hunk already staged", .{});
+                self.setReviewStatus("hunk already staged", .{});
                 return;
             },
             .patch_failed => {
-                self.setStatus("could not build hunk patch", .{});
+                self.setReviewStatus("could not build hunk patch", .{});
                 return;
             },
         };
@@ -1534,15 +1716,15 @@ pub const App = struct {
         };
         owned.patch = &.{};
         app_git_requests.startStageHunk(Msg, ctx, &self.actions, &task_target) catch |err| {
-            self.setStatus("could not start hunk stage task", .{});
+            self.setReviewStatus("could not start hunk stage task", .{});
             return err;
         };
-        self.setStatus("staging hunk: {s}", .{owned.path});
+        self.setReviewStatus("staging hunk: {s}", .{owned.path});
     }
 
     fn toggleSelectedHunkStage(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
@@ -1551,65 +1733,65 @@ pub const App = struct {
                 .stage => try self.stageSelectedHunk(ctx),
                 .unstage => try self.unstageSelectedHunk(ctx),
             },
-            .unavailable_source, .no_repo => self.setStatus("hunk stage toggle unavailable for this source", .{}),
-            .no_file => self.setStatus("no file selected", .{}),
-            .no_path => self.setStatus("hunk stage toggle unavailable for status-only file", .{}),
-            .no_hunk => self.setStatus("no hunk selected", .{}),
-            .offscreen_cursor => self.setStatus("cursor is offscreen; move cursor first", .{}),
-            .stale_status => self.setStatus("status is still loading", .{}),
-            .stale_source => self.setStatus("source is stale; press r to reload", .{}),
+            .unavailable_source, .no_repo => self.setReviewStatus("hunk stage toggle unavailable for this source", .{}),
+            .no_file => self.setReviewStatus("no file selected", .{}),
+            .no_path => self.setReviewStatus("hunk stage toggle unavailable for status-only file", .{}),
+            .no_hunk => self.setReviewStatus("no hunk selected", .{}),
+            .offscreen_cursor => self.setReviewStatus("cursor is offscreen; move cursor first", .{}),
+            .stale_status => self.setReviewStatus("status is still loading", .{}),
+            .stale_source => self.setReviewStatus("source is stale; press r to reload", .{}),
         }
     }
 
     fn unstageSelectedHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
         var target = switch (self.reviewOperations().selectedHunkUnstageTarget(ctx.allocator())) {
             .ready => |target| target,
             .unavailable_source, .no_repo => {
-                self.setStatus("hunk unstage unavailable for this source", .{});
+                self.setReviewStatus("hunk unstage unavailable for this source", .{});
                 return;
             },
             .no_file => {
-                self.setStatus("no file selected", .{});
+                self.setReviewStatus("no file selected", .{});
                 return;
             },
             .no_path => {
-                self.setStatus("hunk unstage unavailable for status-only file", .{});
+                self.setReviewStatus("hunk unstage unavailable for status-only file", .{});
                 return;
             },
             .no_hunk => {
-                self.setStatus("no hunk selected", .{});
+                self.setReviewStatus("no hunk selected", .{});
                 return;
             },
             .offscreen_cursor => {
-                self.setStatus("cursor is offscreen; move cursor first", .{});
+                self.setReviewStatus("cursor is offscreen; move cursor first", .{});
                 return;
             },
             .not_staged_hunk => {
-                self.setStatus("hunk is not staged", .{});
+                self.setReviewStatus("hunk is not staged", .{});
                 return;
             },
             .binary_unsupported => {
-                self.setStatus("binary hunk unstage is not supported", .{});
+                self.setReviewStatus("binary hunk unstage is not supported", .{});
                 return;
             },
             .unsupported_file_state => {
-                self.setStatus("hunk unstage supports modified files only", .{});
+                self.setReviewStatus("hunk unstage supports modified files only", .{});
                 return;
             },
             .patch_failed => {
-                self.setStatus("could not build hunk patch", .{});
+                self.setReviewStatus("could not build hunk patch", .{});
                 return;
             },
             .stale_status => {
-                self.setStatus("status is still loading", .{});
+                self.setReviewStatus("status is still loading", .{});
                 return;
             },
             .stale_source => {
-                self.setStatus("source is stale; press r to reload", .{});
+                self.setReviewStatus("source is stale; press r to reload", .{});
                 return;
             },
         };
@@ -1627,48 +1809,48 @@ pub const App = struct {
         };
         owned.patch = &.{};
         app_git_requests.startUnstageHunk(Msg, ctx, &self.actions, &task_target) catch |err| {
-            self.setStatus("could not start hunk unstage task", .{});
+            self.setReviewStatus("could not start hunk unstage task", .{});
             return err;
         };
-        self.setStatus("unstaging hunk: {s}", .{owned.path});
+        self.setReviewStatus("unstaging hunk: {s}", .{owned.path});
     }
 
     fn unstageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
         const target = switch (self.reviewOperations().unstageTarget()) {
             .ready => |target| target,
             .unavailable_source, .no_repo => {
-                self.setStatus("unstage unavailable for this source", .{});
+                self.setReviewStatus("unstage unavailable for this source", .{});
                 return;
             },
             .no_path => {
-                self.setStatus("no file selected", .{});
+                self.setReviewStatus("no file selected", .{});
                 return;
             },
             .stale_status => {
-                self.setStatus("status is still loading", .{});
+                self.setReviewStatus("status is still loading", .{});
                 return;
             },
             .stale_source => {
-                self.setStatus("source is stale; press r to reload", .{});
+                self.setReviewStatus("source is stale; press r to reload", .{});
                 return;
             },
             .conflict_unsupported => |target_path| {
                 if (target_path.kind == .directory or target_path.kind == .repository) {
-                    self.setStatus("conflict under selection: {s}", .{target_path.path});
+                    self.setReviewStatus("conflict under selection: {s}", .{target_path.path});
                 } else {
-                    self.setStatus("conflict unstage is not supported yet", .{});
+                    self.setReviewStatus("conflict unstage is not supported yet", .{});
                 }
                 return;
             },
             .no_staged_content => |target_path| {
                 if (target_path.kind == .directory or target_path.kind == .repository) {
-                    self.setStatus("no staged files under: {s}", .{target_path.path});
+                    self.setReviewStatus("no staged files under: {s}", .{target_path.path});
                 } else {
-                    self.setStatus("no staged content selected", .{});
+                    self.setReviewStatus("no staged content selected", .{});
                 }
                 return;
             },
@@ -1686,50 +1868,50 @@ pub const App = struct {
             .kind = owned.kind,
             .label = owned.label,
         }) catch |err| {
-            self.setStatus("could not start unstage task", .{});
+            self.setReviewStatus("could not start unstage task", .{});
             return err;
         };
-        self.setStatus("unstaging: {s}", .{owned.label});
+        self.setReviewStatus("unstaging: {s}", .{owned.label});
     }
 
     fn requestDiscardSelectedFile(self: *App, allocator: std.mem.Allocator) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
         const target = switch (self.reviewOperations().discardTarget()) {
             .ready => |target| target,
             .unavailable_source, .no_repo => {
-                self.setStatus("discard unavailable for this source", .{});
+                self.setReviewStatus("discard unavailable for this source", .{});
                 return;
             },
             .no_path => {
-                self.setStatus("no file selected", .{});
+                self.setReviewStatus("no file selected", .{});
                 return;
             },
             .stale_status => {
-                self.setStatus("status is still loading", .{});
+                self.setReviewStatus("status is still loading", .{});
                 return;
             },
             .stale_source => {
-                self.setStatus("source is stale; press r to reload", .{});
+                self.setReviewStatus("source is stale; press r to reload", .{});
                 return;
             },
             .directory_unsupported => {
-                self.setStatus("directory discard is not supported yet", .{});
+                self.setReviewStatus("directory discard is not supported yet", .{});
                 return;
             },
             .conflict_unsupported => {
-                self.setStatus("conflict discard is not supported yet", .{});
+                self.setReviewStatus("conflict discard is not supported yet", .{});
                 return;
             },
             .untracked_unsupported => {
-                self.setStatus("untracked discard is not supported yet", .{});
+                self.setReviewStatus("untracked discard is not supported yet", .{});
                 return;
             },
             .no_unstaged_content => {
-                self.setStatus("no unstaged changes selected", .{});
+                self.setReviewStatus("no unstaged changes selected", .{});
                 return;
             },
         };
@@ -1751,7 +1933,7 @@ pub const App = struct {
     fn confirmDiscardFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         const confirmation = self.discard_confirmation orelse return;
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
@@ -1759,11 +1941,11 @@ pub const App = struct {
         errdefer self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
 
         app_git_requests.startDiscardFile(Msg, ctx, &self.actions, confirmation.repo_root, confirmation.path) catch |err| {
-            self.setStatus("could not start discard task", .{});
+            self.setReviewStatus("could not start discard task", .{});
             return err;
         };
 
-        self.setStatus("discarding: {s}", .{confirmation.path});
+        self.setReviewStatus("discarding: {s}", .{confirmation.path});
         self.cancelDiscardConfirmation(ctx.allocator());
     }
 
@@ -1775,11 +1957,11 @@ pub const App = struct {
 
     fn enterCommitPanelMode(self: *App, mode: app_commit_panel.Mode) void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("finish current git action before committing", .{});
+            self.setReviewStatus("finish current git action before committing", .{});
             return;
         }
         if (!self.reviewOperations().canOpenCommitPanel()) {
-            self.setStatus("commit unavailable for this source", .{});
+            self.setReviewStatus("commit unavailable for this source", .{});
             return;
         }
 
@@ -1802,7 +1984,7 @@ pub const App = struct {
     fn submitCommitPanel(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
             self.commit_panel.commit_error = .action_pending;
-            self.setStatus("finish current git action before committing", .{});
+            self.setReviewStatus("finish current git action before committing", .{});
             return;
         }
 
@@ -1813,7 +1995,7 @@ pub const App = struct {
 
         const repo_root = self.activeRepoRoot() orelse {
             self.commit_panel.commit_error = .status_unavailable;
-            self.setStatus("commit unavailable for this source", .{});
+            self.setReviewStatus("commit unavailable for this source", .{});
             return;
         };
 
@@ -1828,11 +2010,11 @@ pub const App = struct {
     fn assistCommitMessage(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
             self.commit_panel.commit_error = .action_pending;
-            self.setStatus("finish current git action before assisting commit message", .{});
+            self.setReviewStatus("finish current git action before assisting commit message", .{});
             return;
         }
         if (!self.commit_panel.is_open or self.commit_panel.mode != .commit) {
-            self.setStatus("commit message assist is only available in commit mode", .{});
+            self.setReviewStatus("commit message assist is only available in commit mode", .{});
             return;
         }
         switch (self.stagedSummaryForActiveRepo()) {
@@ -1858,12 +2040,12 @@ pub const App = struct {
         const draft_empty = self.commit_panel.draftIsEmpty();
         const action = if (draft_empty)
             self.resolveGenerateCommitMessageAction() catch |err| {
-                self.setStatus("{s}", .{commitMessageActionResolveMessage(.generate, err)});
+                self.setReviewStatus("{s}", .{commitMessageActionResolveMessage(.generate, err)});
                 return;
             }
         else
             self.resolveImproveCommitMessageAction() catch |err| {
-                self.setStatus("{s}", .{commitMessageActionResolveMessage(.improve, err)});
+                self.setReviewStatus("{s}", .{commitMessageActionResolveMessage(.improve, err)});
                 return;
             };
 
@@ -1872,26 +2054,26 @@ pub const App = struct {
         else
             app_actions.CommitMessageAssistMode{ .improve = self.buildDraftSnapshot(ctx.allocator()) catch |err| {
                 self.commit_panel.commit_error = .input_allocation_failed;
-                self.setStatus("could not snapshot commit message draft: {s}", .{@errorName(err)});
+                self.setReviewStatus("could not snapshot commit message draft: {s}", .{@errorName(err)});
                 return err;
             } };
 
         var request = self.buildCommitMessageAssistRequest(ctx.allocator(), repo_root, action, mode) catch |err| {
             self.commit_panel.commit_error = .input_allocation_failed;
-            self.setStatus("could not prepare commit message action: {s}", .{@errorName(err)});
+            self.setReviewStatus("could not prepare commit message action: {s}", .{@errorName(err)});
             return err;
         };
 
         app_git_requests.startCommitMessageAssist(Msg, ctx, &self.actions, &request) catch |err| {
             self.commit_panel.commit_error = .assist_failed;
-            self.setStatus("could not start commit message action", .{});
+            self.setReviewStatus("could not start commit message action", .{});
             return err;
         };
 
         if (draft_empty) {
-            self.setStatus("generating commit message...", .{});
+            self.setReviewStatus("generating commit message...", .{});
         } else {
-            self.setStatus("improving commit message...", .{});
+            self.setReviewStatus("improving commit message...", .{});
         }
     }
 
@@ -2019,11 +2201,11 @@ pub const App = struct {
 
         app_git_requests.startCommit(Msg, ctx, &self.actions, &request) catch |err| {
             self.commit_panel.commit_error = .commit_failed;
-            self.setStatus("could not start commit task", .{});
+            self.setReviewStatus("could not start commit task", .{});
             return err;
         };
 
-        self.setStatus("committing...", .{});
+        self.setReviewStatus("committing...", .{});
     }
 
     fn openAmendConfirmation(self: *App, allocator: std.mem.Allocator, repo_root: []const u8) !void {
@@ -2052,7 +2234,7 @@ pub const App = struct {
 
     fn confirmAmend(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
         var confirmation = self.amend_confirmation orelse return;
@@ -2061,12 +2243,12 @@ pub const App = struct {
         app_git_requests.startAmend(Msg, ctx, &self.actions, &confirmation) catch |err| {
             if (self.overlay.isAmendCommit()) self.overlay.close();
             self.commit_panel.commit_error = .amend_failed;
-            self.setStatus("could not start amend task", .{});
+            self.setReviewStatus("could not start amend task", .{});
             return err;
         };
 
         self.overlay.close();
-        self.setStatus("amending...", .{});
+        self.setReviewStatus("amending...", .{});
     }
 
     fn cancelAmendConfirmation(self: *App, allocator: std.mem.Allocator) void {
@@ -2077,50 +2259,50 @@ pub const App = struct {
 
     fn requestPush(self: *App, allocator: std.mem.Allocator) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
         const target = switch (self.reviewOperations().pushTarget()) {
             .ready => |target| target,
             .unavailable_source => {
-                self.setStatus("push unavailable for this source", .{});
+                self.setReviewStatus("push unavailable for this source", .{});
                 return;
             },
             .no_repo => {
-                self.setStatus("push unavailable: no repository", .{});
+                self.setReviewStatus("push unavailable: no repository", .{});
                 return;
             },
             .loading_branch_status => {
-                self.setStatus("branch status is still loading", .{});
+                self.setReviewStatus("branch status is still loading", .{});
                 return;
             },
             .detached_head => {
-                self.setStatus("push unavailable on detached HEAD", .{});
+                self.setReviewStatus("push unavailable on detached HEAD", .{});
                 return;
             },
             .branch_unavailable => {
-                self.setStatus("push unavailable: branch is unknown", .{});
+                self.setReviewStatus("push unavailable: branch is unknown", .{});
                 return;
             },
             .no_upstream => {
-                self.setStatus("push unavailable: no upstream branch", .{});
+                self.setReviewStatus("push unavailable: no upstream branch", .{});
                 return;
             },
             .upstream_not_remote_branch => {
-                self.setStatus("push unavailable: unsupported upstream", .{});
+                self.setReviewStatus("push unavailable: unsupported upstream", .{});
                 return;
             },
             .branch_status_unavailable => {
-                self.setStatus("push unavailable: branch status is incomplete", .{});
+                self.setReviewStatus("push unavailable: branch status is incomplete", .{});
                 return;
             },
             .pull_first => {
-                self.setStatus("push blocked: pull/rebase remote changes first", .{});
+                self.setReviewStatus("push blocked: pull/rebase remote changes first", .{});
                 return;
             },
             .nothing_to_push => {
-                self.setStatus("nothing to push", .{});
+                self.setReviewStatus("nothing to push", .{});
                 return;
             },
         };
@@ -2151,17 +2333,17 @@ pub const App = struct {
 
     fn confirmPush(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
         var confirmation = self.push_confirmation orelse return;
         self.push_confirmation = null;
 
-        self.setStatus("pushing: {s} -> {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
+        self.setReviewStatus("pushing: {s} -> {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
 
         app_git_requests.startPush(Msg, ctx, &self.actions, self.env_map, &confirmation) catch |err| {
-            self.setStatus("could not start push task", .{});
+            self.setReviewStatus("could not start push task", .{});
             if (self.overlay.isPushBranch()) self.overlay.close();
             return err;
         };
@@ -2177,58 +2359,58 @@ pub const App = struct {
 
     fn requestPull(self: *App, allocator: std.mem.Allocator) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
         const target = switch (self.reviewOperations().pullTarget()) {
             .ready => |target| target,
             .unavailable_source => {
-                self.setStatus("pull unavailable for this source", .{});
+                self.setReviewStatus("pull unavailable for this source", .{});
                 return;
             },
             .no_repo => {
-                self.setStatus("pull unavailable: no repository", .{});
+                self.setReviewStatus("pull unavailable: no repository", .{});
                 return;
             },
             .loading_branch_status => {
-                self.setStatus("branch status is still loading", .{});
+                self.setReviewStatus("branch status is still loading", .{});
                 return;
             },
             .detached_head => {
-                self.setStatus("pull unavailable on detached HEAD", .{});
+                self.setReviewStatus("pull unavailable on detached HEAD", .{});
                 return;
             },
             .branch_unavailable => {
-                self.setStatus("pull unavailable: branch is unknown", .{});
+                self.setReviewStatus("pull unavailable: branch is unknown", .{});
                 return;
             },
             .no_upstream => {
-                self.setStatus("pull unavailable: no upstream branch", .{});
+                self.setReviewStatus("pull unavailable: no upstream branch", .{});
                 return;
             },
             .upstream_not_remote_branch => {
-                self.setStatus("pull unavailable: unsupported upstream", .{});
+                self.setReviewStatus("pull unavailable: unsupported upstream", .{});
                 return;
             },
             .branch_status_unavailable => {
-                self.setStatus("pull unavailable: branch status is incomplete", .{});
+                self.setReviewStatus("pull unavailable: branch status is incomplete", .{});
                 return;
             },
             .status_loading => {
-                self.setStatus("status is still loading", .{});
+                self.setReviewStatus("status is still loading", .{});
                 return;
             },
             .status_stale => {
-                self.setStatus("pull unavailable: status is stale", .{});
+                self.setReviewStatus("pull unavailable: status is stale", .{});
                 return;
             },
             .dirty_worktree => {
-                self.setStatus("pull blocked: commit, stage, or discard local changes first", .{});
+                self.setReviewStatus("pull blocked: commit, stage, or discard local changes first", .{});
                 return;
             },
             .untracked_files_present => {
-                self.setStatus("pull blocked: untracked files present", .{});
+                self.setReviewStatus("pull blocked: untracked files present", .{});
                 return;
             },
         };
@@ -2259,17 +2441,17 @@ pub const App = struct {
 
     fn confirmPull(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
         var confirmation = self.pull_confirmation orelse return;
         self.pull_confirmation = null;
 
-        self.setStatus("pulling: {s} <- {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
+        self.setReviewStatus("pulling: {s} <- {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
 
         app_git_requests.startPull(Msg, ctx, &self.actions, self.env_map, &confirmation) catch |err| {
-            self.setStatus("could not start pull task", .{});
+            self.setReviewStatus("could not start pull task", .{});
             if (self.overlay.isPullBranch()) self.overlay.close();
             return err;
         };
@@ -2285,38 +2467,38 @@ pub const App = struct {
 
     fn requestFetch(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
         const target = switch (self.reviewOperations().fetchTarget()) {
             .ready => |target| target,
             .unavailable_source => {
-                self.setStatus("fetch unavailable for this source", .{});
+                self.setReviewStatus("fetch unavailable for this source", .{});
                 return;
             },
             .no_repo => {
-                self.setStatus("fetch unavailable: no repository", .{});
+                self.setReviewStatus("fetch unavailable: no repository", .{});
                 return;
             },
             .loading_branch_status => {
-                self.setStatus("branch status is still loading", .{});
+                self.setReviewStatus("branch status is still loading", .{});
                 return;
             },
             .detached_head => {
-                self.setStatus("fetch unavailable on detached HEAD", .{});
+                self.setReviewStatus("fetch unavailable on detached HEAD", .{});
                 return;
             },
             .branch_unavailable => {
-                self.setStatus("fetch unavailable: branch is unknown", .{});
+                self.setReviewStatus("fetch unavailable: branch is unknown", .{});
                 return;
             },
             .no_upstream => {
-                self.setStatus("fetch unavailable: no upstream remote", .{});
+                self.setReviewStatus("fetch unavailable: no upstream remote", .{});
                 return;
             },
             .upstream_not_remote => {
-                self.setStatus("fetch unavailable: unsupported upstream", .{});
+                self.setReviewStatus("fetch unavailable: unsupported upstream", .{});
                 return;
             },
         };
@@ -2331,59 +2513,59 @@ pub const App = struct {
         };
         proposal_consumed = true;
 
-        self.setStatus("fetching: {s}", .{target.remote});
+        self.setReviewStatus("fetching: {s}", .{target.remote});
         app_git_requests.startFetch(Msg, ctx, &self.actions, self.env_map, &request) catch |err| {
-            self.setStatus("could not start fetch task", .{});
+            self.setReviewStatus("could not start fetch task", .{});
             return err;
         };
     }
 
     fn requestBranchSwitch(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
         const target = switch (self.reviewOperations().branchSwitchTarget()) {
             .ready => |target| target,
             .unavailable_source => {
-                self.setStatus("branch switch unavailable for this source", .{});
+                self.setReviewStatus("branch switch unavailable for this source", .{});
                 return;
             },
             .no_repo => {
-                self.setStatus("branch switch unavailable: no repository", .{});
+                self.setReviewStatus("branch switch unavailable: no repository", .{});
                 return;
             },
             .loading_branch_status => {
-                self.setStatus("branch status is still loading", .{});
+                self.setReviewStatus("branch status is still loading", .{});
                 return;
             },
             .detached_head => {
-                self.setStatus("branch switch unavailable on detached HEAD", .{});
+                self.setReviewStatus("branch switch unavailable on detached HEAD", .{});
                 return;
             },
             .branch_unavailable => {
-                self.setStatus("branch switch unavailable: branch is unknown", .{});
+                self.setReviewStatus("branch switch unavailable: branch is unknown", .{});
                 return;
             },
             .branch_status_unavailable => {
-                self.setStatus("branch switch unavailable: branch status is incomplete", .{});
+                self.setReviewStatus("branch switch unavailable: branch status is incomplete", .{});
                 return;
             },
             .status_loading => {
-                self.setStatus("status is still loading", .{});
+                self.setReviewStatus("status is still loading", .{});
                 return;
             },
             .status_stale => {
-                self.setStatus("branch switch unavailable: status is stale", .{});
+                self.setReviewStatus("branch switch unavailable: status is stale", .{});
                 return;
             },
             .dirty_worktree => {
-                self.setStatus("branch switch blocked: commit, stage, or discard local changes first", .{});
+                self.setReviewStatus("branch switch blocked: commit, stage, or discard local changes first", .{});
                 return;
             },
             .untracked_files_present => {
-                self.setStatus("branch switch blocked: untracked files present", .{});
+                self.setReviewStatus("branch switch blocked: untracked files present", .{});
                 return;
             },
         };
@@ -2431,21 +2613,21 @@ pub const App = struct {
     fn confirmBranchSwitch(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (!self.branch_switch.hasState()) return;
         if (self.branch_switch.loading) {
-            self.setStatus("branch list is still loading", .{});
+            self.setReviewStatus("branch list is still loading", .{});
             return;
         }
         if (self.branch_switch.branches.len == 0) {
-            self.setStatus("branch switch unavailable: no local branches", .{});
+            self.setReviewStatus("branch switch unavailable: no local branches", .{});
             return;
         }
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
         const selected = self.branch_switch.branches[self.branch_switch.selected_index];
         if (selected.current or std.mem.eql(u8, selected.name, self.branch_switch.current_branch)) {
-            self.setStatus("already on branch: {s}", .{self.branch_switch.current_branch});
+            self.setReviewStatus("already on branch: {s}", .{self.branch_switch.current_branch});
             self.clearBranchSwitch(ctx.allocator());
             return;
         }
@@ -2464,9 +2646,9 @@ pub const App = struct {
         request.target_branch = try ctx.allocator().dupe(u8, selected.name);
         request.target_oid = try ctx.allocator().dupe(u8, selected.oid);
 
-        self.setStatus("switching branch: {s} -> {s}", .{ self.branch_switch.current_branch, selected.name });
+        self.setReviewStatus("switching branch: {s} -> {s}", .{ self.branch_switch.current_branch, selected.name });
         app_git_requests.startSwitchBranch(Msg, ctx, &self.actions, &request) catch |err| {
-            self.setStatus("could not start branch switch task", .{});
+            self.setReviewStatus("could not start branch switch task", .{});
             return err;
         };
 
@@ -2526,12 +2708,12 @@ pub const App = struct {
 
     fn runInteractivePush(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
         const current_target = self.push_retry_target orelse {
-            self.setStatus("interactive push retry is not available for this failure", .{});
+            self.setReviewStatus("interactive push retry is not available for this failure", .{});
             return;
         };
 
@@ -2539,17 +2721,17 @@ pub const App = struct {
         // control to Git so an old push-error popup cannot target a branch that
         // has already moved.
         const snapshot_ok = verifyPushRetrySnapshot(ctx.allocator(), ctx.io(), current_target) catch {
-            self.setStatus("could not verify push retry target", .{});
+            self.setReviewStatus("could not verify push retry target", .{});
             return;
         };
         if (!snapshot_ok) {
-            self.setStatus("push retry unavailable: branch changed; reload and try again", .{});
+            self.setReviewStatus("push retry unavailable: branch changed; reload and try again", .{});
             return;
         }
 
         const credentials_available = self.push_retry_credentials_available;
         const target = self.takePushRetryTarget() orelse {
-            self.setStatus("interactive push retry target is no longer available", .{});
+            self.setReviewStatus("interactive push retry target is no longer available", .{});
             return;
         };
 
@@ -2579,8 +2761,8 @@ pub const App = struct {
             // push snapshot available for another retry instead of dropping it.
             self.restorePushRetryTarget(ctx.allocator(), target, credentials_available);
             switch (err) {
-                error.ForegroundCommandLimitExceeded => self.setStatus("interactive push already queued", .{}),
-                error.ForegroundCommandEmptyArgv => self.setStatus("interactive push command is empty", .{}),
+                error.ForegroundCommandLimitExceeded => self.setReviewStatus("interactive push already queued", .{}),
+                error.ForegroundCommandEmptyArgv => self.setReviewStatus("interactive push command is empty", .{}),
                 error.OutOfMemory => return err,
             }
             return;
@@ -2592,30 +2774,30 @@ pub const App = struct {
             .target = target,
         };
         self.clearPushError(ctx.allocator());
-        self.setStatus("running interactive push: {s} -> {s}/{s}", .{ target.branch, target.remote, target.remote_branch });
+        self.setReviewStatus("running interactive push: {s} -> {s}/{s}", .{ target.branch, target.remote, target.remote_branch });
     }
 
     fn openPushCredentialPrompt(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (!self.push_retry_credentials_available) {
-            self.setStatus("credential retry is not available for this push failure", .{});
+            self.setReviewStatus("credential retry is not available for this push failure", .{});
             return;
         }
 
         var target = self.takePushRetryTarget() orelse {
-            self.setStatus("credential retry target is no longer available", .{});
+            self.setReviewStatus("credential retry target is no longer available", .{});
             return;
         };
         errdefer target.deinit(ctx.allocator());
 
         const remote_url = getRemoteUrl(ctx.allocator(), ctx.io(), target.repo_root, target.remote) catch {
-            self.setStatus("could not read push remote URL", .{});
+            self.setReviewStatus("could not read push remote URL", .{});
             target.deinit(ctx.allocator());
             return;
         };
         errdefer ctx.allocator().free(remote_url);
 
         if (!isHttpRemoteUrl(remote_url)) {
-            self.setStatus("credential prompt is only available for HTTPS remotes", .{});
+            self.setReviewStatus("credential prompt is only available for HTTPS remotes", .{});
             ctx.allocator().free(remote_url);
             target.deinit(ctx.allocator());
             return;
@@ -2661,14 +2843,14 @@ pub const App = struct {
     fn insertPushCredential(self: *App, codepoint: u21) void {
         const input = self.activePushCredentialInput() orelse return;
         input.insert(codepoint) catch {
-            self.setStatus("credential field is too long", .{});
+            self.setReviewStatus("credential field is too long", .{});
         };
     }
 
     fn pastePushCredential(self: *App, text: []const u8) void {
         const input = self.activePushCredentialInput() orelse return;
         input.insertSlice(text) catch {
-            self.setStatus("credential field is too long", .{});
+            self.setReviewStatus("credential field is too long", .{});
         };
     }
 
@@ -2694,17 +2876,17 @@ pub const App = struct {
             return;
         }
         if (prompt.username.len == 0) {
-            self.setStatus("Username is required", .{});
+            self.setReviewStatus("Username is required", .{});
             prompt.active_field = .username;
             return;
         }
         if (prompt.password.len == 0) {
-            self.setStatus("Password or token is required", .{});
+            self.setReviewStatus("Password or token is required", .{});
             prompt.active_field = .password;
             return;
         }
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("another git action is running", .{});
+            self.setReviewStatus("another git action is running", .{});
             return;
         }
 
@@ -2733,7 +2915,7 @@ pub const App = struct {
             .remote_url = prompt.target.remote_url,
         };
         prompt.target.remote_url = null;
-        self.setStatus("retrying push with credentials: {s} -> {s}/{s}", .{ target.branch, target.remote, target.remote_branch });
+        self.setReviewStatus("retrying push with credentials: {s} -> {s}/{s}", .{ target.branch, target.remote, target.remote_branch });
         self.cancelPushCredentialPrompt(ctx.allocator());
         self.clearPushError(ctx.allocator());
 
@@ -2827,7 +3009,7 @@ pub const App = struct {
             return;
         }
 
-        self.setStatus("staged: {s}", .{result.path});
+        self.setReviewStatus("staged: {s}", .{result.path});
         const applied = try self.reviewOperationController().applyAcceptedOutcome(
             ctx.allocator(),
             .stage_file,
@@ -2845,7 +3027,7 @@ pub const App = struct {
         if (self.setActionFailureStatus("hunk stage", result.result)) return;
 
         const active_matches = self.activeRepoMatches(result.repo_root);
-        self.setStatus("staged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
+        self.setReviewStatus("staged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
         const applied = try self.reviewOperationController().applyAcceptedOutcome(ctx.allocator(), .{ .stage_hunk = .{
             .repo_root = result.repo_root,
             .path = result.path,
@@ -2866,7 +3048,7 @@ pub const App = struct {
             return;
         }
 
-        self.setStatus("unstaged: {s}", .{result.path});
+        self.setReviewStatus("unstaged: {s}", .{result.path});
         const applied = try self.reviewOperationController().applyAcceptedOutcome(
             ctx.allocator(),
             .unstage_file,
@@ -2884,7 +3066,7 @@ pub const App = struct {
         if (self.setActionFailureStatus("hunk unstage", result.result)) return;
 
         const active_matches = self.activeRepoMatches(result.repo_root);
-        self.setStatus("unstaged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
+        self.setReviewStatus("unstaged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
         const applied = try self.reviewOperationController().applyAcceptedOutcome(ctx.allocator(), .{ .unstage_hunk = .{
             .repo_root = result.repo_root,
             .path = result.path,
@@ -2911,19 +3093,19 @@ pub const App = struct {
             .path = result.path,
         } }, self.activeRepoMatches(result.repo_root));
         if (applied.reviewed_clear_failed) {
-            self.setStatus("discarded: {s}; could not clear reviewed mark", .{result.path});
+            self.setReviewStatus("discarded: {s}; could not clear reviewed mark", .{result.path});
             try self.applyReviewReloadIntent(ctx, applied.reload);
             return;
         }
-        self.setStatus("discarded: {s}", .{result.path});
+        self.setReviewStatus("discarded: {s}", .{result.path});
         try self.applyReviewReloadIntent(ctx, applied.reload);
     }
 
     fn setActionFailureStatus(self: *App, comptime prefix: []const u8, result: app_actions.FileActionTaskResult) bool {
         switch (result) {
             .ok, .ok_static => return false,
-            .failed => |message| self.setStatus(prefix ++ " failed: {s}", .{git_ops.trimGitOutput(message)}),
-            .failed_static => |message| self.setStatus(prefix ++ " failed: {s}", .{message}),
+            .failed => |message| self.setReviewStatus(prefix ++ " failed: {s}", .{git_ops.trimGitOutput(message)}),
+            .failed_static => |message| self.setReviewStatus(prefix ++ " failed: {s}", .{message}),
         }
         return true;
     }
@@ -2946,16 +3128,16 @@ pub const App = struct {
 
                 if (active_matches) {
                     if (applied.reviewed_clear_failed) {
-                        self.setStatus("committed; could not clear reviewed marks", .{});
+                        self.setReviewStatus("committed; could not clear reviewed marks", .{});
                     } else {
-                        self.setStatus("committed", .{});
+                        self.setReviewStatus("committed", .{});
                     }
                     try self.applyReviewReloadIntent(ctx, applied.reload);
                 } else {
                     if (applied.reviewed_clear_failed) {
-                        self.setStatus("committed: {s}; could not clear reviewed marks", .{result.repo_root});
+                        self.setReviewStatus("committed: {s}; could not clear reviewed marks", .{result.repo_root});
                     } else {
-                        self.setStatus("committed: {s}", .{result.repo_root});
+                        self.setReviewStatus("committed: {s}", .{result.repo_root});
                     }
                 }
             },
@@ -2978,36 +3160,36 @@ pub const App = struct {
             .ok => |message| {
                 if (self.commit_panel.draft_revision != result.launch_revision) {
                     switch (result.mode) {
-                        .generate => self.setStatus("generated commit message ignored; draft changed", .{}),
-                        .improve => self.setStatus("improved commit message ignored; draft changed", .{}),
+                        .generate => self.setReviewStatus("generated commit message ignored; draft changed", .{}),
+                        .improve => self.setReviewStatus("improved commit message ignored; draft changed", .{}),
                     }
                     return;
                 }
                 self.commit_panel.replaceDraft(message.subject, message.body);
                 if (self.commit_panel.commit_error) |_| {
-                    self.setStatus("commit message could not be inserted", .{});
+                    self.setReviewStatus("commit message could not be inserted", .{});
                     return;
                 }
                 switch (result.mode) {
                     .generate => if (message.truncated) {
-                        self.setStatus("generated commit message from truncated staged diff", .{});
+                        self.setReviewStatus("generated commit message from truncated staged diff", .{});
                     } else {
-                        self.setStatus("generated commit message", .{});
+                        self.setReviewStatus("generated commit message", .{});
                     },
                     .improve => if (message.truncated) {
-                        self.setStatus("improved commit message from truncated staged diff", .{});
+                        self.setReviewStatus("improved commit message from truncated staged diff", .{});
                     } else {
-                        self.setStatus("improved commit message", .{});
+                        self.setReviewStatus("improved commit message", .{});
                     },
                 }
             },
             .failed => |message| {
                 self.commit_panel.commit_error = .assist_failed;
-                self.setStatus("{s}", .{message});
+                self.setReviewStatus("{s}", .{message});
             },
             .failed_static => |message| {
                 self.commit_panel.commit_error = .assist_failed;
-                self.setStatus("{s}", .{message});
+                self.setReviewStatus("{s}", .{message});
             },
         }
     }
@@ -3027,16 +3209,16 @@ pub const App = struct {
 
                 if (active_matches) {
                     if (reviewed_clear_failed) {
-                        self.setStatus("amended; could not clear reviewed marks", .{});
+                        self.setReviewStatus("amended; could not clear reviewed marks", .{});
                     } else {
-                        self.setStatus("amended", .{});
+                        self.setReviewStatus("amended", .{});
                     }
                     try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
                 } else {
                     if (reviewed_clear_failed) {
-                        self.setStatus("amended: {s}; could not clear reviewed marks", .{result.repo_root});
+                        self.setReviewStatus("amended: {s}; could not clear reviewed marks", .{result.repo_root});
                     } else {
-                        self.setStatus("amended: {s}", .{result.repo_root});
+                        self.setReviewStatus("amended: {s}", .{result.repo_root});
                     }
                 }
             },
@@ -3058,16 +3240,16 @@ pub const App = struct {
         switch (result.result) {
             .ok, .ok_static => {
                 if (active_matches) {
-                    self.setStatus("pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
+                    self.setReviewStatus("pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
                     try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
                 } else {
-                    self.setStatus("pushed: {s}", .{result.repo_root});
+                    self.setReviewStatus("pushed: {s}", .{result.repo_root});
                 }
             },
             .failed => |message| {
                 const detail = git_ops.trimGitOutput(message);
                 const status_message = git_ops.pushFailureHint(detail) orelse detail;
-                self.setStatus("push failed: {s}", .{status_message});
+                self.setReviewStatus("push failed: {s}", .{status_message});
                 const retry_target = try pushRetryTargetFromFinished(ctx.allocator(), result);
                 errdefer {
                     var target = retry_target;
@@ -3076,7 +3258,7 @@ pub const App = struct {
                 try self.setPushErrorWithRetry(ctx.allocator(), detail, retry_target, pushCredentialFailureLikely(detail));
             },
             .failed_static => |message| {
-                self.setStatus("push failed: {s}", .{message});
+                self.setReviewStatus("push failed: {s}", .{message});
                 try self.setPushError(ctx.allocator(), message);
             },
         }
@@ -3093,18 +3275,18 @@ pub const App = struct {
         switch (result.result) {
             .ok => {
                 if (active_matches) {
-                    self.setStatus("pulled: {s} <- {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
+                    self.setReviewStatus("pulled: {s} <- {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
                     try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
                 } else {
-                    self.setStatus("pulled: {s}", .{result.repo_root});
+                    self.setReviewStatus("pulled: {s}", .{result.repo_root});
                 }
             },
             .ok_static => |message| {
                 if (active_matches) {
-                    self.setStatus("{s}", .{message});
+                    self.setReviewStatus("{s}", .{message});
                     try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
                 } else {
-                    self.setStatus("{s}: {s}", .{ message, result.repo_root });
+                    self.setReviewStatus("{s}: {s}", .{ message, result.repo_root });
                 }
             },
             .failed, .failed_static => {
@@ -3128,10 +3310,10 @@ pub const App = struct {
         switch (result.result) {
             .ok, .ok_static => {
                 if (active_matches) {
-                    self.setStatus("fetched: {s}", .{result.remote});
+                    self.setReviewStatus("fetched: {s}", .{result.remote});
                     try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
                 } else {
-                    self.setStatus("fetched: {s}", .{result.repo_root});
+                    self.setReviewStatus("fetched: {s}", .{result.repo_root});
                 }
             },
             .failed, .failed_static => {
@@ -3159,11 +3341,11 @@ pub const App = struct {
                 if (active_matches) {
                     self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
                     self.reviewNavigation().clearSearch();
-                    self.setStatus("switched branch: {s} -> {s}", .{ result.old_branch, result.new_branch });
-                    if (reviewed_clear_failed) self.setStatus("switched branch: {s} -> {s}; could not clear reviewed marks", .{ result.old_branch, result.new_branch });
+                    self.setReviewStatus("switched branch: {s} -> {s}", .{ result.old_branch, result.new_branch });
+                    if (reviewed_clear_failed) self.setReviewStatus("switched branch: {s} -> {s}; could not clear reviewed marks", .{ result.old_branch, result.new_branch });
                     try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = true, .kind = .action_result });
                 } else {
-                    self.setStatus("switched branch: {s}", .{result.repo_root});
+                    self.setReviewStatus("switched branch: {s}", .{result.repo_root});
                 }
             },
             .failed, .failed_static => {
@@ -3203,15 +3385,15 @@ pub const App = struct {
                 self.branch_switch.selected_index = branchSwitchInitialSelection(branches);
             },
             .failed => |message| {
-                self.setStatus("branch list load failed: {s}", .{git_ops.trimGitOutput(message)});
+                self.setReviewStatus("branch list load failed: {s}", .{git_ops.trimGitOutput(message)});
                 self.clearBranchSwitch(ctx.allocator());
             },
             .failed_static => |message| {
-                self.setStatus("branch list load failed: {s}", .{message});
+                self.setReviewStatus("branch list load failed: {s}", .{message});
                 self.clearBranchSwitch(ctx.allocator());
             },
             .empty => {
-                self.setStatus("branch list load failed", .{});
+                self.setReviewStatus("branch list load failed", .{});
                 self.clearBranchSwitch(ctx.allocator());
             },
         }
@@ -3231,37 +3413,37 @@ pub const App = struct {
             .exited => |code| {
                 if (code == 0) {
                     if (active_matches) {
-                        self.setStatus("pushed interactively: {s} -> {s}/{s}", .{ foreground.target.branch, foreground.target.remote, foreground.target.remote_branch });
+                        self.setReviewStatus("pushed interactively: {s} -> {s}/{s}", .{ foreground.target.branch, foreground.target.remote, foreground.target.remote_branch });
                     } else {
-                        self.setStatus("pushed interactively: {s}", .{foreground.target.repo_root});
+                        self.setReviewStatus("pushed interactively: {s}", .{foreground.target.repo_root});
                     }
                 } else {
                     if (active_matches) {
-                        self.setStatus("interactive push exited: {d}", .{code});
+                        self.setReviewStatus("interactive push exited: {d}", .{code});
                     } else {
-                        self.setStatus("interactive push exited for {s}: {d}", .{ foreground.target.repo_root, code });
+                        self.setReviewStatus("interactive push exited for {s}: {d}", .{ foreground.target.repo_root, code });
                     }
                 }
             },
             .signaled => |signal| {
                 if (active_matches) {
-                    self.setStatus("interactive push signal: {d}", .{signal});
+                    self.setReviewStatus("interactive push signal: {d}", .{signal});
                 } else {
-                    self.setStatus("interactive push signal for {s}: {d}", .{ foreground.target.repo_root, signal });
+                    self.setReviewStatus("interactive push signal for {s}: {d}", .{ foreground.target.repo_root, signal });
                 }
             },
             .spawn_failed => |err| {
                 if (active_matches) {
-                    self.setStatus("interactive push spawn failed: {s}", .{err});
+                    self.setReviewStatus("interactive push spawn failed: {s}", .{err});
                 } else {
-                    self.setStatus("interactive push spawn failed for {s}: {s}", .{ foreground.target.repo_root, err });
+                    self.setReviewStatus("interactive push spawn failed for {s}: {s}", .{ foreground.target.repo_root, err });
                 }
             },
             .wait_failed => |err| {
                 if (active_matches) {
-                    self.setStatus("interactive push wait failed: {s}", .{err});
+                    self.setReviewStatus("interactive push wait failed: {s}", .{err});
                 } else {
-                    self.setStatus("interactive push wait failed for {s}: {s}", .{ foreground.target.repo_root, err });
+                    self.setReviewStatus("interactive push wait failed for {s}: {s}", .{ foreground.target.repo_root, err });
                 }
             },
         }
@@ -3337,30 +3519,30 @@ pub const App = struct {
 
     fn openSelectedFileInEditor(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("finish current git action before opening editor", .{});
+            self.setReviewStatus("finish current git action before opening editor", .{});
             return;
         }
 
         const target = switch (self.selectedEditorTarget()) {
             .ready => |target| target,
             .unavailable_source, .no_repo => {
-                self.setStatus("editor unavailable for this source", .{});
+                self.setReviewStatus("editor unavailable for this source", .{});
                 return;
             },
             .no_path => {
-                self.setStatus("no file selected", .{});
+                self.setReviewStatus("no file selected", .{});
                 return;
             },
             .stale_source => {
-                self.setStatus("source is stale; press r to reload", .{});
+                self.setReviewStatus("source is stale; press r to reload", .{});
                 return;
             },
             .directory_unsupported => {
-                self.setStatus("directories cannot be opened in editor", .{});
+                self.setReviewStatus("directories cannot be opened in editor", .{});
                 return;
             },
             .deleted_file => {
-                self.setStatus("deleted files cannot be opened", .{});
+                self.setReviewStatus("deleted files cannot be opened", .{});
                 return;
             },
         };
@@ -3373,36 +3555,37 @@ pub const App = struct {
         }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             error.EmptyArgv => {
-                self.setStatus("editor command is empty", .{});
+                self.setReviewStatus("editor command is empty", .{});
                 return;
             },
             error.MissingPathPlaceholder, error.UnknownPlaceholder, error.TooManyArguments => {
-                self.setStatus("editor config invalid: {s}", .{@errorName(err)});
+                self.setReviewStatus("editor config invalid: {s}", .{@errorName(err)});
                 return;
             },
         };
         defer argv.deinit(ctx.allocator());
         if (argv.argv.len == 0) {
-            self.setStatus("editor command is empty", .{});
+            self.setReviewStatus("editor command is empty", .{});
             return;
         }
 
-        _ = ctx.terminal().runForegroundCommand(.{
+        const request_id = ctx.terminal().runForegroundCommand(.{
             .argv = argv.argv,
             .cwd = target.repo_root,
             .finished = editorDone,
         }) catch |err| switch (err) {
             error.ForegroundCommandLimitExceeded => {
-                self.setStatus("editor command already queued", .{});
+                self.setReviewStatus("editor command already queued", .{});
                 return;
             },
             error.ForegroundCommandEmptyArgv => {
-                self.setStatus("editor command is empty", .{});
+                self.setReviewStatus("editor command is empty", .{});
                 return;
             },
             error.OutOfMemory => return err,
         };
-        self.setStatus("opening editor: {s}", .{target.path});
+        self.editor_foreground_request = request_id;
+        self.setReviewStatus("opening editor: {s}", .{target.path});
     }
 
     const EditorTarget = struct {
@@ -3425,7 +3608,7 @@ pub const App = struct {
         // sidebar. Do not derive this from the rendered diff/projection, which
         // can represent staged or synthetic content for the same file.
         if (!diff_source.sourceAllowsEditorAction(self.config.source)) return .unavailable_source;
-        if (!self.pages.review.auto_reload.sourceIsActionable()) return .stale_source;
+        if (!self.pages.review.activation.state.satisfiesAction(.read_diff)) return .stale_source;
         const repo_root = self.activeRepoRoot() orelse return .no_repo;
         const action_target = self.reviewOperations().selectedSidebarActionTarget() orelse return .no_path;
 
@@ -3483,17 +3666,21 @@ pub const App = struct {
     }
 
     fn finishEditorCommand(self: *App, ctx: *chasen.Ctx(Msg), result: chasen.ForegroundCommandResult) !void {
+        if (self.editor_foreground_request) |request| {
+            if (request.id != result.request_id.id) return;
+            self.editor_foreground_request = null;
+        }
         switch (result.outcome) {
             .exited => |code| {
                 if (code == 0) {
-                    self.setStatus("editor closed", .{});
+                    self.setReviewStatus("editor closed", .{});
                 } else {
-                    self.setStatus("editor exited: {d}", .{code});
+                    self.setReviewStatus("editor exited: {d}", .{code});
                 }
             },
-            .signaled => |signal| self.setStatus("editor signal: {d}", .{signal}),
-            .spawn_failed => |err| self.setStatus("editor spawn failed: {s}", .{err}),
-            .wait_failed => |err| self.setStatus("editor wait failed: {s}", .{err}),
+            .signaled => |signal| self.setReviewStatus("editor signal: {d}", .{signal}),
+            .spawn_failed => |err| self.setReviewStatus("editor spawn failed: {s}", .{err}),
+            .wait_failed => |err| self.setReviewStatus("editor wait failed: {s}", .{err}),
         }
 
         if (diff_source.sourceIsOneShotInput(self.config.source)) {
@@ -3570,7 +3757,7 @@ pub const App = struct {
 
     fn copyCurrentLine(self: *App, ctx: *chasen.Ctx(Msg)) void {
         const text = self.currentDiffLineCopyText() orelse {
-            self.setStatus("no diff line selected", .{});
+            self.setReviewStatus("no diff line selected", .{});
             return;
         };
         self.queueClipboardCopy(ctx, .{
@@ -3581,22 +3768,22 @@ pub const App = struct {
 
     fn copyCurrentHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         const hunk_index = self.selectedHunkIndex() orelse {
-            self.setStatus("no hunk selected", .{});
+            self.setReviewStatus("no hunk selected", .{});
             return;
         };
         const file = self.reviewNavigationView().displayedDiffFile() orelse {
-            self.setStatus("no hunk selected", .{});
+            self.setReviewStatus("no hunk selected", .{});
             return;
         };
         if (hunk_index >= file.hunks.len) {
-            self.setStatus("no hunk selected", .{});
+            self.setReviewStatus("no hunk selected", .{});
             return;
         }
 
         const text = try newSideHunkCopyText(ctx.allocator(), file.hunks[hunk_index]);
         defer ctx.allocator().free(text);
         if (text.len == 0) {
-            self.setStatus("no new-side text in selected hunk", .{});
+            self.setReviewStatus("no new-side text in selected hunk", .{});
             return;
         }
         self.queueClipboardCopy(ctx, .{
@@ -3625,7 +3812,7 @@ pub const App = struct {
 
     fn copyPopup(self: *App, ctx: *chasen.Ctx(Msg)) void {
         const target = self.popupCopyTarget() orelse {
-            self.setStatus("nothing to copy: popup", .{});
+            self.setReviewStatus("nothing to copy: popup", .{});
             return;
         };
         self.queueClipboardCopy(ctx, .{
@@ -3647,12 +3834,12 @@ pub const App = struct {
 
     fn copyCommitMessage(self: *App, ctx: *chasen.Ctx(Msg)) void {
         if (!self.commit_panel.is_open) {
-            self.setStatus("nothing to copy: commit message", .{});
+            self.setReviewStatus("nothing to copy: commit message", .{});
             return;
         }
         const text = self.commit_panel.formatMessage(ctx.allocator()) catch {
             self.commit_panel.commit_error = .input_allocation_failed;
-            self.setStatus("could not prepare commit message copy", .{});
+            self.setReviewStatus("could not prepare commit message copy", .{});
             return;
         };
         defer ctx.allocator().free(text);
@@ -3670,24 +3857,25 @@ pub const App = struct {
         finished: chasen.Ctx(Msg).ClipboardCopyFinishedFn,
     ) void {
         if (request.text.len == 0) {
-            self.setStatus("nothing to copy: {s}", .{request.label});
+            self.setReviewStatus("nothing to copy: {s}", .{request.label});
             return;
         }
         ctx.terminal().copyToClipboard(.{
             .text = request.text,
             .finished = finished,
         }) catch |err| switch (err) {
-            error.OutOfMemory => self.setStatus("could not prepare clipboard copy", .{}),
-            error.ClipboardCopyLimitExceeded => self.setStatus("clipboard copy already queued", .{}),
+            error.OutOfMemory => self.setReviewStatus("could not prepare clipboard copy", .{}),
+            error.ClipboardCopyLimitExceeded => self.setReviewStatus("clipboard copy already queued", .{}),
         };
     }
 
-    fn finishClipboardCopy(self: *App, finished: ClipboardCopyFinished) void {
+    fn finishClipboardCopy(self: *App, ctx: *chasen.Ctx(Msg), finished: ClipboardCopyFinished) void {
         switch (finished.outcome) {
-            .sent => self.setStatus("clipboard copy sent: {s}", .{finished.label}),
-            .unsupported_runtime => self.setStatus("clipboard copy unavailable: {s}", .{finished.label}),
-            .write_failed => |err| self.setStatus("clipboard copy failed: {s}: {s}", .{ finished.label, err }),
+            .sent => self.setReviewStatus("clipboard copy sent: {s}", .{finished.label}),
+            .unsupported_runtime => self.setReviewStatus("clipboard copy unavailable: {s}", .{finished.label}),
+            .write_failed => |err| self.setReviewStatus("clipboard copy failed: {s}: {s}", .{ finished.label, err }),
         }
+        if (self.active_page != .review) ctx.redraw().skip();
     }
 
     fn currentDiffLineCopyText(self: *const App) ?[]const u8 {
@@ -3743,6 +3931,10 @@ pub const App = struct {
 
     fn setStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
         self.status.set(fmt, args);
+    }
+
+    fn setReviewStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
+        self.pages.review.status.set(fmt, args);
     }
 
     fn persistRecentRepositories(self: *App, ctx: *chasen.Ctx(Msg)) void {
@@ -3886,6 +4078,10 @@ pub const App = struct {
     }
 
     fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.active_page != .review) {
+            ctx.redraw().skip();
+            return;
+        }
         if (!self.pages.review.auto_reload.enabled()) return;
         if (diff_source.sourceIsOneShotInput(self.config.source)) return;
         if (self.repo_picker.mode or self.pages.review.search.mode or self.pages.review.file_search.mode or self.commit_panel.is_open or
@@ -3952,6 +4148,97 @@ pub const App = struct {
         return self.repo_state.activeRoot();
     }
 
+    fn sameRepoIdentity(left: ?[]const u8, right: ?[]const u8) bool {
+        if (left == null or right == null) return left == null and right == null;
+        return std.mem.eql(u8, left.?, right.?);
+    }
+
+    fn discoveryRootAt(discovery: repo_discovery.DiscoveryResult, active_index: usize) ?[]const u8 {
+        return switch (discovery) {
+            .single_repo => |entry| entry.canonical_root,
+            .workspace => |workspace| if (active_index < workspace.repos.len) workspace.repos[active_index].canonical_root else null,
+            .none => null,
+        };
+    }
+
+    /// The only mutation boundary for committed active-repository identity.
+    /// The epoch advances before old page work can observe the new state.
+    fn commitRepoDiscovery(
+        self: *App,
+        allocator: std.mem.Allocator,
+        discovery: repo_discovery.DiscoveryResult,
+        active_index: usize,
+        origin: RepoCommitOrigin,
+    ) bool {
+        const changed = !sameRepoIdentity(self.activeRepoRoot(), discoveryRootAt(discovery, active_index));
+        // An explicit picker/path selection is a repository-state commitment
+        // even when its canonical root is unchanged. Supersede older discovery
+        // generations so an earlier same-epoch result cannot restore stale
+        // workspace metadata after the user's later selection.
+        if (changed or origin == .external_selection) self.supersedeRepoBoundReads(allocator);
+        if (changed) self.invalidateReviewForRepoChange(allocator);
+        if (changed) self.advanceRepoEpoch();
+        self.repo_state.replace(allocator, discovery);
+        self.repo_state.active_index = active_index;
+        if (changed) self.finishRepoIdentityCommit();
+        return changed;
+    }
+
+    fn commitWorkspaceRepoIndex(self: *App, active_index: usize) bool {
+        const repos = self.repo_state.workspaceRepos() orelse return false;
+        const new_root = if (active_index < repos.len) repos[active_index].canonical_root else null;
+        const changed = !sameRepoIdentity(self.activeRepoRoot(), new_root);
+        if (changed) {
+            self.supersedeRepoBoundReads(self.allocator);
+            self.invalidateReviewForRepoChange(self.allocator);
+        }
+        if (changed) self.advanceRepoEpoch();
+        self.repo_state.active_index = active_index;
+        if (changed) self.finishRepoIdentityCommit();
+        return changed;
+    }
+
+    fn advanceRepoEpoch(self: *App) void {
+        self.repo_epoch +%= 1;
+        if (self.repo_epoch == 0) self.repo_epoch = 1;
+    }
+
+    fn finishRepoIdentityCommit(self: *App) void {
+        self.pages.review.status.clear();
+        if (self.active_page == .review) {
+            _ = self.activateReview();
+        } else {
+            self.pages.review.activation.deactivate();
+        }
+    }
+
+    fn supersedeRepoBoundReads(self: *App, allocator: ?std.mem.Allocator) void {
+        self.pages.review.load.supersedePending();
+        _ = self.pages.review.status_load.prepare(false);
+        _ = self.pages.review.branch_status_load.prepare(false);
+        self.pages.review.auto_reload.supersedeCycle();
+        if (allocator) |owner| {
+            self.pages.review.review_projection.clearPending(owner);
+        } else std.debug.assert(!self.pages.review.review_projection.hasPending());
+    }
+
+    /// A repository identity change is destructive source supersession, not a
+    /// page deactivation. Retaining the old document/fingerprint would let an
+    /// equal fingerprint in the new repository return `unchanged` and grant
+    /// fresh authority to the old display.
+    fn invalidateReviewForRepoChange(self: *App, allocator: ?std.mem.Allocator) void {
+        if (allocator) |owner| {
+            self.reviewReload().clearPendingReload(owner);
+            self.reviewNavigation().clearPendingSelectionRestore(owner);
+        } else {
+            std.debug.assert(self.pages.review.pending_reload == null);
+            std.debug.assert(self.pages.review.pending_selection_restore == null);
+        }
+        self.reviewReload().clearSourceDisplay(allocator);
+        self.reviewReload().dropStatusSnapshot();
+        self.reviewReload().invalidateBranchStatusSnapshot();
+    }
+
     fn activeRepoMatches(self: *const App, repo_root: []const u8) bool {
         const active_root = self.activeRepoRoot() orelse return false;
         return std.mem.eql(u8, active_root, repo_root);
@@ -3980,14 +4267,18 @@ pub const App = struct {
     fn applySourceShellOutcome(self: *App, ctx: *chasen.Ctx(Msg), applied: review_reload.SourceApply) void {
         var recovered_failure_cleared = false;
         if (applied.recovered_failure) |failure| {
-            recovered_failure_cleared = self.status.clearSourceReloadFailure(failure.digest);
+            recovered_failure_cleared = self.pages.review.status.clearSourceReloadFailure(failure.digest);
         }
         if (applied.auto_reload_failure) |failure| {
-            self.status.setSourceReloadFailure(
+            self.pages.review.status.setSourceReloadFailure(
                 failure.identity.digest,
                 "auto reload failed: {s}",
                 .{failure.message},
             );
+        }
+        if (self.active_page != .review) {
+            ctx.redraw().skip();
+            return;
         }
         switch (applied.redraw) {
             .normal => {},
@@ -4006,10 +4297,10 @@ pub const App = struct {
         );
         if (applied.project_status) |prefer_first| try self.reviewReload().applyStatusProjection(ctx.allocator(), prefer_first);
         if (applied.diagnostic) |diagnostic| switch (diagnostic) {
-            .status_load_failed => |message| self.setStatus("status load failed: {s}", .{message}),
+            .status_load_failed => |message| self.setReviewStatus("status load failed: {s}", .{message}),
             else => unreachable,
         };
-        if (applied.skip_redraw) ctx.redraw().skip();
+        if (applied.skip_redraw or self.active_page != .review) ctx.redraw().skip();
     }
 
     fn finishBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: BranchStatusLoadFinished) void {
@@ -4020,11 +4311,11 @@ pub const App = struct {
             self.backgroundAcceptanceBlocked(result.background_cycle_id),
         );
         if (applied.diagnostic) |diagnostic| switch (diagnostic) {
-            .branch_status_load_failed => |message| self.setStatus("branch status load failed: {s}", .{message}),
-            .branch_status_parse_failed => self.setStatus("branch status parse failed", .{}),
+            .branch_status_load_failed => |message| self.setReviewStatus("branch status load failed: {s}", .{message}),
+            .branch_status_parse_failed => self.setReviewStatus("branch status parse failed", .{}),
             else => unreachable,
         };
-        if (applied.skip_redraw) ctx.redraw().skip();
+        if (applied.skip_redraw or self.active_page != .review) ctx.redraw().skip();
     }
 
     fn finishReviewProjectionLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: ReviewProjectionFinished) !void {
@@ -4032,6 +4323,7 @@ pub const App = struct {
         var result_transferred = false;
         defer if (!result_transferred) result.deinit(ctx.allocator());
         result_transferred = (try self.reviewReload().applyProjectionFinished(ctx.allocator(), &result)).result_transferred;
+        if (self.active_page != .review) ctx.redraw().skip();
     }
 
     fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
@@ -4041,7 +4333,7 @@ pub const App = struct {
         }
 
         self.clearBranchSwitch(allocator);
-        self.reviewNavigation().clearDiffSelection();
+        if (self.active_page == .review) self.reviewNavigation().clearDiffSelection();
         self.repo_picker.mode = true;
         self.repo_picker.input_mode = .list;
         self.repo_picker.list.mode = true;
@@ -4117,8 +4409,8 @@ pub const App = struct {
                 self.persistRecentRepositories(ctx);
                 if (repo_index == self.repo_state.active_index) return;
 
-                try self.startDiffLoadWithRepoRoot(ctx, repos[repo_index].canonical_root, .{ .clear_visible_state = true, .kind = .repo_switch });
-                self.repo_state.active_index = repo_index;
+                _ = self.commitWorkspaceRepoIndex(repo_index);
+                if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
                 self.resetViewAfterRepoSwitch();
             },
             .pending_workspace_repo => |repo_index| {
@@ -4380,10 +4672,9 @@ pub const App = struct {
                 self.persistRecentRepositories(ctx);
                 self.closeRepoPickerForSwitch(ctx.allocator());
                 self.clearRepoPickerDiscovery(ctx.allocator());
-                self.repo_state.replace(ctx.allocator(), owned_discovery);
+                _ = self.commitRepoDiscovery(ctx.allocator(), owned_discovery, 0, .external_selection);
                 owned_discovery = .{ .none = .{ .current_root = "" } };
-                self.repo_state.active_index = 0;
-                try self.startDiffLoad(ctx, .repo_switch);
+                if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
                 self.resetViewAfterRepoSwitch();
             },
             .workspace => |workspace| {
@@ -4423,10 +4714,9 @@ pub const App = struct {
         try self.recent_repos.rememberRepo(ctx.allocator(), workspace.repos[repo_index].canonical_root);
         self.persistRecentRepositories(ctx);
         self.closeRepoPickerForSwitch(ctx.allocator());
-        self.repo_state.replace(ctx.allocator(), discovery);
+        _ = self.commitRepoDiscovery(ctx.allocator(), discovery, repo_index, .external_selection);
         discovery = .{ .none = .{ .current_root = "" } };
-        self.repo_state.active_index = repo_index;
-        try self.startDiffLoad(ctx, .repo_switch);
+        if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
         self.resetViewAfterRepoSwitch();
     }
 
@@ -4445,19 +4735,26 @@ pub const App = struct {
 
     fn finishReview(self: *App, ctx: *chasen.Ctx(Msg), decision: review_session.Decision) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
-            self.setStatus("finish current git action before finishing review", .{});
+            self.setReviewStatus("finish current git action before finishing review", .{});
+            return;
+        }
+
+        if (decision != .canceled and
+            (self.active_page != .review or !self.pages.review.activation.state.satisfiesAction(.read_diff)))
+        {
+            self.setReviewStatus("review source is still being validated", .{});
             return;
         }
 
         const output = self.review_output orelse {
-            self.setStatus("review output is not configured", .{});
+            self.setReviewStatus("review output is not configured", .{});
             return;
         };
 
         var reviewed_paths: std.ArrayList([]const u8) = .empty;
         defer reviewed_paths.deinit(ctx.allocator());
         self.pages.review.reviewed_store.appendPathKeysForRepo(ctx.allocator(), self.activeRepoRoot(), &reviewed_paths) catch {
-            self.setStatus("could not finalize review result", .{});
+            self.setReviewStatus("could not finalize review result", .{});
             return;
         };
         std.mem.sort([]const u8, reviewed_paths.items, {}, pathLessThan);
@@ -4465,9 +4762,10 @@ pub const App = struct {
         // Quit only after serialization succeeds; otherwise the TUI remains
         // open and stdout never receives a partial machine-readable result.
         output.set(ctx.allocator(), decision, self.selectionContext(), reviewed_paths.items) catch {
-            self.setStatus("could not finalize review result", .{});
+            self.setReviewStatus("could not finalize review result", .{});
             return;
         };
+        self.teardown_requested = true;
         ctx.quit();
     }
 
@@ -4632,18 +4930,20 @@ test "read task spawn failure rejects status branch and projection page state" {
     const allocator = std.testing.allocator;
 
     var status_app: App = .{ .allocator = allocator };
+    _ = status_app.activateReview();
     var status_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._pending_tasks_with_len = 16 };
     status_app.startStatusLoad(&status_ctx, "/repo", .foreground, null);
     status_ctx._pending_tasks_with_len = 0;
     try std.testing.expect(status_app.pages.review.status_load.pending == null);
-    try std.testing.expectEqualStrings("could not start status load task", status_app.status.text());
+    try std.testing.expectEqualStrings("could not start status load task", status_app.pages.review.status.text());
 
     var branch_app: App = .{ .allocator = allocator };
+    _ = branch_app.activateReview();
     var branch_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._pending_tasks_with_len = 16 };
     branch_app.startBranchStatusLoad(&branch_ctx, "/repo", null);
     branch_ctx._pending_tasks_with_len = 0;
     try std.testing.expect(branch_app.pages.review.branch_status_load.pending == null);
-    try std.testing.expectEqualStrings("could not start branch status load task", branch_app.status.text());
+    try std.testing.expectEqualStrings("could not start branch status load task", branch_app.pages.review.status.text());
 
     var projection_app: App = .{
         .allocator = allocator,
@@ -4658,6 +4958,7 @@ test "read task spawn failure rejects status branch and projection page state" {
             .canonical_root = "/repo",
         } } },
     };
+    _ = projection_app.activateReview();
     defer projection_app.reviewReload().clearLoadedDiff(projection_app.allocator);
     defer projection_app.pages.review.git_status.deinit();
     var staged = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
@@ -4676,6 +4977,7 @@ test "read task allocation failure rejects source status branch and projection p
         .allocator = source_failing.allocator(),
         .config = .{ .source = .stdin },
     };
+    _ = source_app.activateReview();
     var source_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = source_failing.allocator() };
     try std.testing.expectError(error.OutOfMemory, source_app.startDiffLoadWithRepoRoot(
         &source_ctx,
@@ -4687,17 +4989,19 @@ test "read task allocation failure rejects source status branch and projection p
 
     var status_failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 1 });
     var status_app: App = .{ .allocator = status_failing.allocator() };
+    _ = status_app.activateReview();
     var status_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = status_failing.allocator() };
     status_app.startStatusLoad(&status_ctx, "/repo", .foreground, null);
     try std.testing.expect(status_app.pages.review.status_load.pending == null);
-    try std.testing.expectEqualStrings("could not allocate status load task", status_app.status.text());
+    try std.testing.expectEqualStrings("could not allocate status load task", status_app.pages.review.status.text());
 
     var branch_failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 1 });
     var branch_app: App = .{ .allocator = branch_failing.allocator() };
+    _ = branch_app.activateReview();
     var branch_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = branch_failing.allocator() };
     branch_app.startBranchStatusLoad(&branch_ctx, "/repo", null);
     try std.testing.expect(branch_app.pages.review.branch_status_load.pending == null);
-    try std.testing.expectEqualStrings("could not allocate branch status load task", branch_app.status.text());
+    try std.testing.expectEqualStrings("could not allocate branch status load task", branch_app.pages.review.status.text());
 
     var projection_failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 4 });
     var projection_app: App = .{
@@ -4713,6 +5017,7 @@ test "read task allocation failure rejects source status branch and projection p
             .canonical_root = "/repo",
         } } },
     };
+    _ = projection_app.activateReview();
     defer projection_app.reviewReload().clearLoadedDiff(projection_app.allocator);
     defer projection_app.pages.review.git_status.deinit();
     var mixed = try git_status.StatusBundle.parseOwned(backing, "MM a\x00");
@@ -4827,15 +5132,27 @@ test "new side hunk copy text is empty for removed-only hunk" {
 
 test "clipboard copy result status uses best-effort wording" {
     var app: App = .{};
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    app.finishClipboardCopy(.{ .label = "current line", .outcome = .sent });
-    try std.testing.expectEqualStrings("clipboard copy sent: current line", app.status.text());
+    app.finishClipboardCopy(&ctx, .{ .label = "current line", .outcome = .sent });
+    try std.testing.expectEqualStrings("clipboard copy sent: current line", app.pages.review.status.text());
 
-    app.finishClipboardCopy(.{ .label = "current hunk", .outcome = .unsupported_runtime });
-    try std.testing.expectEqualStrings("clipboard copy unavailable: current hunk", app.status.text());
+    app.finishClipboardCopy(&ctx, .{ .label = "current hunk", .outcome = .unsupported_runtime });
+    try std.testing.expectEqualStrings("clipboard copy unavailable: current hunk", app.pages.review.status.text());
 
-    app.finishClipboardCopy(.{ .label = "current line", .outcome = .{ .write_failed = "BrokenPipe" } });
-    try std.testing.expectEqualStrings("clipboard copy failed: current line: BrokenPipe", app.status.text());
+    app.finishClipboardCopy(&ctx, .{ .label = "current line", .outcome = .{ .write_failed = "BrokenPipe" } });
+    try std.testing.expectEqualStrings("clipboard copy failed: current line: BrokenPipe", app.pages.review.status.text());
+}
+
+test "inactive Review clipboard completion retains diagnostic without redraw" {
+    var app: App = .{ .active_page = .repository };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    app.finishClipboardCopy(&ctx, .{ .label = "current line", .outcome = .sent });
+
+    try std.testing.expectEqualStrings("clipboard copy sent: current line", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expect(ctx._redraw_suppressed);
 }
 
 test "copyPopup queues push error message text" {
@@ -4864,7 +5181,7 @@ test "copyPopup reports empty target outside copyable popup" {
     app.copyPopup(&ctx);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings("nothing to copy: popup", app.status.text());
+    try std.testing.expectEqualStrings("nothing to copy: popup", app.pages.review.status.text());
 }
 
 test "copyCommitMessage queues formatted commit message text" {
@@ -4931,13 +5248,13 @@ test "copyCommitMessage reports empty draft and closed panel" {
     app.copyCommitMessage(&ctx);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings("nothing to copy: commit message", app.status.text());
+    try std.testing.expectEqualStrings("nothing to copy: commit message", app.pages.review.status.text());
 
     app.commit_panel.open(.commit);
     app.copyCommitMessage(&ctx);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings("nothing to copy: commit message", app.status.text());
+    try std.testing.expectEqualStrings("nothing to copy: commit message", app.pages.review.status.text());
 }
 
 test "display mode toggle keeps nearby vertical scroll position" {
@@ -5120,12 +5437,14 @@ test "undelivered action result releases owned payloads" {
 
 test "undelivered diff and status loads release owned payloads" {
     var diff_msg = App.Msg.loadFinished(.{ .diff_loaded = .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .loaded = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one) },
     } });
     diff_msg.deinitUndelivered(std.testing.allocator);
 
     var status_msg = App.Msg.loadFinished(.{ .status_loaded = .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .failed = try std.testing.allocator.dupe(u8, "status failed") },
@@ -5135,6 +5454,7 @@ test "undelivered diff and status loads release owned payloads" {
 
 test "undelivered repo and projection loads release owned payloads" {
     var repo_msg = App.Msg.loadFinished(.{ .repos_discovered = .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .failed = try std.testing.allocator.dupe(u8, "discovery failed") },
     } });
@@ -5142,6 +5462,7 @@ test "undelivered repo and projection loads release owned payloads" {
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         7,
         "/repo",
         "src/app.zig",
@@ -5297,7 +5618,7 @@ test "mouse click selects sidebar file rows" {
     };
 
     const content = app_shell_layout.contentRect(app.terminal_size);
-    const row = content.row + sidebar_header_rows + 1;
+    const row = content.row + app_shell_layout.page_bar_rows + sidebar_header_rows + 1;
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedSidebarClickMessage;
     try app.update(msg, undefined);
 
@@ -5318,7 +5639,7 @@ test "mouse click toggles sidebar directory rows" {
     defer app.reviewReload().clearLoadedDiff(app.allocator);
 
     const content = app_shell_layout.contentRect(app.terminal_size);
-    const row = content.row + sidebar_header_rows;
+    const row = content.row + app_shell_layout.page_bar_rows + sidebar_header_rows;
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedSidebarDirectoryClickMessage;
     try app.update(msg, undefined);
 
@@ -5370,7 +5691,7 @@ test "mouse click uses filtered sidebar projection" {
     defer app.reviewReload().clearLoadedDiff(app.allocator);
 
     const content = app_shell_layout.contentRect(app.terminal_size);
-    const row = content.row + sidebar_header_rows;
+    const row = content.row + app_shell_layout.page_bar_rows + sidebar_header_rows;
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedFilteredSidebarClickMessage;
     try app.update(msg, undefined);
 
@@ -5558,11 +5879,11 @@ test "search overflow reports query status for insert and paste" {
     app.pages.review.search.input.cursor = app.pages.review.search.input.buffer.len;
 
     try app.update(.{ .search_insert = 'y' }, undefined);
-    try std.testing.expectEqualStrings("search query is too long", app.status.text());
+    try std.testing.expectEqualStrings("search query is too long", app.pages.review.status.text());
 
     app.status.clear();
     try app.update(.{ .search_paste = "y" }, undefined);
-    try std.testing.expectEqualStrings("search query is too long", app.status.text());
+    try std.testing.expectEqualStrings("search query is too long", app.pages.review.status.text());
 }
 
 test "file search overflow reports query status for insert and paste" {
@@ -5574,11 +5895,11 @@ test "file search overflow reports query status for insert and paste" {
     app.pages.review.file_search.input.cursor = app.pages.review.file_search.input.buffer.len;
 
     try app.update(.{ .file_search_insert = 'y' }, undefined);
-    try std.testing.expectEqualStrings("file search query is too long", app.status.text());
+    try std.testing.expectEqualStrings("file search query is too long", app.pages.review.status.text());
 
     app.status.clear();
     try app.update(.{ .file_search_paste = "y" }, undefined);
-    try std.testing.expectEqualStrings("file search query is too long", app.status.text());
+    try std.testing.expectEqualStrings("file search query is too long", app.pages.review.status.text());
 }
 
 test "repo picker filter overflow reports status for insert and paste" {
@@ -5716,9 +6037,11 @@ test "staged summary distinguishes pending missing and ready status snapshots" {
     try std.testing.expectEqual(app_commit_panel.StagedSummary.unavailable, app.stagedSummaryForActiveRepo());
 
     app.pages.review.status_load.pending = .{ .generation = 1 };
+    syncTestActivation(&app);
     try std.testing.expectEqual(app_commit_panel.StagedSummary.loading_or_stale, app.stagedSummaryForActiveRepo());
 
     app.pages.review.status_load.pending = null;
+    syncTestActivation(&app);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  staged.zig\x00 M unstaged.zig\x00?? new.zig\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
 
@@ -5775,7 +6098,7 @@ test "finishCommitMessageAssist inserts generated editable draft and truncated w
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expectEqualStrings("Generated subject", app.commit_panel.subject.slice());
     try std.testing.expectEqualStrings("Generated body", app.commit_panel.body.slice());
-    try std.testing.expectEqualStrings("generated commit message from truncated staged diff", app.status.text());
+    try std.testing.expectEqualStrings("generated commit message from truncated staged diff", app.pages.review.status.text());
 }
 
 test "finishCommitMessageAssist ignores stale result after popup close" {
@@ -5819,7 +6142,7 @@ test "finishCommitMessageAssist ignores generated draft after user edit" {
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expectEqualStrings("x", app.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("generated commit message ignored; draft changed", app.status.text());
+    try std.testing.expectEqualStrings("generated commit message ignored; draft changed", app.pages.review.status.text());
 }
 
 test "finishCommitMessageAssist failure keeps draft unchanged" {
@@ -5839,7 +6162,7 @@ test "finishCommitMessageAssist failure keeps draft unchanged" {
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expectEqual(app_commit_panel.CommitError.assist_failed, app.commit_panel.commit_error.?);
     try std.testing.expectEqualStrings("", app.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("commit-message: failed", app.status.text());
+    try std.testing.expectEqualStrings("commit-message: failed", app.pages.review.status.text());
 }
 
 test "finishCommitMessageAssist rejects long subject without mutating draft" {
@@ -5886,7 +6209,7 @@ test "finishCommitMessageAssist replaces unchanged improved draft" {
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expectEqualStrings("Improved subject", app.commit_panel.subject.slice());
     try std.testing.expectEqualStrings("Improved body", app.commit_panel.body.slice());
-    try std.testing.expectEqualStrings("improved commit message", app.status.text());
+    try std.testing.expectEqualStrings("improved commit message", app.pages.review.status.text());
 }
 
 test "finishCommitMessageAssist ignores improved draft after user edit" {
@@ -5910,7 +6233,7 @@ test "finishCommitMessageAssist ignores improved draft after user edit" {
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expectEqualStrings("Draft subject edited", app.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.status.text());
+    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.review.status.text());
 }
 
 test "finishCommitMessageAssist ignores generated draft after edit then clear" {
@@ -5934,7 +6257,7 @@ test "finishCommitMessageAssist ignores generated draft after edit then clear" {
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expectEqualStrings("", app.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("generated commit message ignored; draft changed", app.status.text());
+    try std.testing.expectEqualStrings("generated commit message ignored; draft changed", app.pages.review.status.text());
 }
 
 test "finishCommitMessageAssist ignores improved draft after edit then restore" {
@@ -5960,7 +6283,7 @@ test "finishCommitMessageAssist ignores improved draft after edit then restore" 
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expectEqualStrings("Draft subject", app.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.status.text());
+    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.review.status.text());
 }
 
 test "finishCommitMessageAssist ignores improved draft after close and reopen" {
@@ -5986,7 +6309,7 @@ test "finishCommitMessageAssist ignores improved draft after close and reopen" {
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expectEqualStrings("Draft subject", app.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.status.text());
+    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.review.status.text());
 }
 
 test "resolveCommitMessageAction reports missing and multiple configs" {
@@ -6069,6 +6392,7 @@ test "pending selection restore clears when status finishes empty after reload" 
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 7,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .empty,
@@ -6170,6 +6494,7 @@ test "stale branch status result is ignored" {
     });
 
     app.finishBranchStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = bundle },
@@ -6200,6 +6525,7 @@ test "background branch failure retains display and identical recovery restores 
     app.pages.review.branch_status_load.begin(cycle_id);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     app.finishBranchStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = generation,
         .background_cycle_id = cycle_id,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
@@ -6220,6 +6546,7 @@ test "background branch failure retains display and identical recovery restores 
         .behind = 0,
     });
     app.finishBranchStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = recovery_generation,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = same },
@@ -6250,6 +6577,7 @@ test "background branch completion during repository action is discarded and rel
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     app.finishBranchStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = generation,
         .background_cycle_id = cycle_id,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
@@ -6282,6 +6610,7 @@ test "requestPush snapshots the active branch target" {
         .behind = 0,
     });
     try app.pages.review.branch_status.replace("/repo", &bundle);
+    syncTestActivation(&app);
 
     try app.requestPush(std.testing.allocator);
 
@@ -6313,6 +6642,7 @@ test "requestPush snapshots set-upstream target for branch without upstream" {
         .branch = "feature/topic",
     });
     try app.pages.review.branch_status.replace("/repo", &bundle);
+    syncTestActivation(&app);
 
     try app.requestPush(std.testing.allocator);
 
@@ -6350,6 +6680,7 @@ test "requestPull snapshots the active branch target" {
     try app.pages.review.branch_status.replace("/repo", &bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
+    syncTestActivation(&app);
 
     try app.requestPull(std.testing.allocator);
 
@@ -6387,6 +6718,7 @@ test "requestPull opens confirmation before remote refresh regardless of stale a
     try app.pages.review.branch_status.replace("/repo", &bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
+    syncTestActivation(&app);
 
     try app.requestPull(std.testing.allocator);
 
@@ -6417,6 +6749,7 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     try app.pages.review.branch_status.replace("/repo", &branch_bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
+    syncTestActivation(&app);
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer clearPendingBranchListTasks(&ctx, std.testing.allocator);
@@ -6450,12 +6783,13 @@ test "requestBranchSwitch rejects untracked-only status distinctly" {
     try app.pages.review.branch_status.replace("/repo", &branch_bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? new.txt\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
+    syncTestActivation(&app);
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.requestBranchSwitch(&ctx);
 
     try std.testing.expect(!app.overlay.isSwitchBranch());
-    try std.testing.expectEqualStrings("branch switch blocked: untracked files present", app.status.text());
+    try std.testing.expectEqualStrings("branch switch blocked: untracked files present", app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
@@ -6528,7 +6862,7 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
     try std.testing.expect(!app.overlay.isSwitchBranch());
     try std.testing.expect(app.branch_switch.branches.len == 0);
     try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 0));
-    try std.testing.expectEqualStrings("already on branch: main", app.status.text());
+    try std.testing.expectEqualStrings("already on branch: main", app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(app.actions.pending == null);
 }
@@ -6544,6 +6878,7 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
             .canonical_root = "/repo",
         } } },
     };
+    _ = app.activateReview();
     defer app.pages.review.reviewed_store.deinit(allocator);
     defer app.pages.review.staged_hunks.deinit(allocator);
     defer app.reviewNavigation().clearPendingSelectionRestore(allocator);
@@ -6572,7 +6907,7 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.staged_hunks.items.items.len);
     try std.testing.expect(app.pages.review.pending_selection_restore == null);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.search.query.len);
-    try std.testing.expectEqualStrings("switched branch: main -> feature", app.status.text());
+    try std.testing.expectEqualStrings("switched branch: main -> feature", app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
 }
 
@@ -6614,7 +6949,7 @@ test "finishSwitchBranch success clears completed repo marks when active repo ch
     try std.testing.expect(!app.pages.review.staged_hunks.contains("/repo", "a", 0));
     try std.testing.expect(app.pages.review.staged_hunks.contains("/other", "b", 1));
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
-    try std.testing.expectEqualStrings("switched branch: /repo", app.status.text());
+    try std.testing.expectEqualStrings("switched branch: /repo", app.pages.review.status.text());
 }
 
 test "requestPush clears previous push error details" {
@@ -6638,6 +6973,7 @@ test "requestPush clears previous push error details" {
         .behind = 0,
     });
     try app.pages.review.branch_status.replace("/repo", &bundle);
+    syncTestActivation(&app);
     try app.setPushError(std.testing.allocator, "old push failure");
 
     try app.requestPush(std.testing.allocator);
@@ -6672,7 +7008,7 @@ test "requestPush rejects while another action is pending" {
     try std.testing.expectEqualStrings("old-feature", confirmation.branch);
     try std.testing.expect(app.overlay.isPushBranch());
     try std.testing.expect(app.actions.pending != null);
-    try std.testing.expectEqualStrings("another git action is running", app.status.text());
+    try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
 }
 
 test "requestPull rejects while another action is pending" {
@@ -6700,7 +7036,7 @@ test "requestPull rejects while another action is pending" {
     try std.testing.expectEqualStrings("old-feature", confirmation.branch);
     try std.testing.expect(app.overlay.isPullBranch());
     try std.testing.expect(app.actions.pending != null);
-    try std.testing.expectEqualStrings("another git action is running", app.status.text());
+    try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
 }
 
 test "requestFetch rejects while another action is pending" {
@@ -6712,7 +7048,7 @@ test "requestFetch rejects while another action is pending" {
     try app.requestFetch(&ctx);
 
     try std.testing.expect(app.actions.pending != null);
-    try std.testing.expectEqualStrings("another git action is running", app.status.text());
+    try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
 }
 
 test "confirmPush keeps confirmation when another action is pending" {
@@ -6739,7 +7075,7 @@ test "confirmPush keeps confirmation when another action is pending" {
     try std.testing.expect(app.push_confirmation != null);
     try std.testing.expect(app.overlay.isPushBranch());
     try std.testing.expect(app.actions.pending != null);
-    try std.testing.expectEqualStrings("another git action is running", app.status.text());
+    try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
 }
 
 test "confirmPull keeps confirmation when another action is pending" {
@@ -6766,7 +7102,7 @@ test "confirmPull keeps confirmation when another action is pending" {
     try std.testing.expect(app.pull_confirmation != null);
     try std.testing.expect(app.overlay.isPullBranch());
     try std.testing.expect(app.actions.pending != null);
-    try std.testing.expectEqualStrings("another git action is running", app.status.text());
+    try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
 }
 
 test "openSelectedFileInEditor blocks while git action is pending" {
@@ -6779,7 +7115,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
 
     try app.openSelectedFileInEditor(&ctx);
 
-    try std.testing.expectEqualStrings("finish current git action before opening editor", app.status.text());
+    try std.testing.expectEqualStrings("finish current git action before opening editor", app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     const pending = app.actions.pending orelse return error.ExpectedPendingAction;
     try std.testing.expectEqual(@as(u64, 7), pending.generation);
@@ -6808,6 +7144,336 @@ test "quit exits when no git action is pending" {
     try std.testing.expect(ctx.shouldQuit());
 }
 
+test "keyboard and page bar mouse share the page switch transition" {
+    var app: App = .{
+        .config = .{ .source = .stdin },
+        .terminal_size = .{ .width = 100, .height = 20 },
+        .pages = .{ .review = .{ .load = .{ .state = .{ .empty = .no_changes } } } },
+    };
+    _ = app.activateReview();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    const keyboard = app.handleEvent(.{ .key_press = .{ .codepoint = '2' } }) orelse return error.ExpectedPageSwitch;
+    try std.testing.expectEqual(App.Msg{ .switch_page = .repository }, keyboard);
+    try app.update(keyboard, &ctx);
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+    try std.testing.expect(app.pages.repository.initialized);
+    try std.testing.expect(app.pages.review.activation.state == .inactive);
+
+    try app.update(.reload, &ctx);
+    try std.testing.expectEqualStrings("reload is not available on this page yet", app.status.text());
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+
+    const layout = app.shellLayout();
+    const review_tab = page.tab(.review);
+    const bar = layout.page_bar orelse return error.ExpectedPageBar;
+    const mouse = app.handleEvent(app_test_support.mouseEvent(
+        bar.col + review_tab.col,
+        bar.row,
+        .left,
+    )) orelse return error.ExpectedPageSwitch;
+    try std.testing.expectEqual(App.Msg{ .switch_page = .review }, mouse);
+    try app.update(mouse, &ctx);
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expect(app.pages.review.activation.state.satisfiesAction(.read_diff));
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+}
+
+test "page transition blocker leaves page and Review state unchanged" {
+    var app: App = .{};
+    app.pages.review.search.mode = true;
+    const activation_id = app.activateReview();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.update(.{ .switch_page = .history }, &ctx);
+
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expect(app.pages.review.search.mode);
+    try std.testing.expectEqual(activation_id, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqualStrings("finish search before switching pages", app.status.text());
+    try std.testing.expect(!app.pages.history.initialized);
+}
+
+test "live review waiter blocks direct keyboard and mouse page switches with one reason" {
+    var output: review_session.Output = .{};
+    var app: App = .{
+        .review_output = &output,
+        .terminal_size = .{ .width = 100, .height = 20 },
+    };
+    _ = app.activateReview();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.update(.{ .switch_page = .repository }, &ctx);
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqualStrings("finish review session before switching pages", app.status.text());
+
+    app.status.clear();
+    const keyboard = app.handleEvent(.{ .key_press = .{ .codepoint = '3' } }) orelse return error.ExpectedPageSwitch;
+    try app.update(keyboard, &ctx);
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqualStrings("finish review session before switching pages", app.status.text());
+
+    app.status.clear();
+    const layout = app.shellLayout();
+    const config_tab = page.tab(.config);
+    const bar = layout.page_bar orelse return error.ExpectedPageBar;
+    const mouse = app.handleEvent(app_test_support.mouseEvent(bar.col + config_tab.col, bar.row, .left)) orelse
+        return error.ExpectedPageSwitch;
+    try app.update(mouse, &ctx);
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqualStrings("finish review session before switching pages", app.status.text());
+}
+
+test "inactive page timer starts no Review work" {
+    var app: App = .{
+        .active_page = .repository,
+        .pages = .{ .review = .{ .auto_reload = .{
+            .activation = .automatic,
+            .interval_ns = 3 * std.time.ns_per_s,
+        } } },
+    };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.autoReloadTick(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "Review re-entry queues one revalidation behind an older read and leaving cancels it" {
+    var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .state = .loading, .generation = 1, .pending = .{ .diff_load = 1 } },
+        } },
+    };
+    const first_activation = app.activateReview();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.requestPageSwitch(&ctx, .repository);
+    try app.requestPageSwitch(&ctx, .review);
+    const second_activation = app.pages.review.activation.state.active.activation_id;
+    try std.testing.expect(first_activation != second_activation);
+    try std.testing.expectEqual(@as(?u64, second_activation), app.pages.review.activation.revalidation_requested);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+
+    try app.requestPageSwitch(&ctx, .config);
+    try std.testing.expect(app.pages.review.activation.state == .inactive);
+    try std.testing.expect(app.pages.review.activation.revalidation_requested == null);
+}
+
+test "Review re-entry starts immediate fingerprint revalidation even when polling is disabled" {
+    var app: App = .{
+        .active_page = .repository,
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .pages = .{ .review = .{ .load = .{ .state = .{ .empty = .no_changes } } } },
+    };
+    app.pages.review.auto_reload.acceptSource(app_auto_reload.SourceFingerprint.init("retained"));
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
+
+    try app.requestPageSwitch(&ctx, .review);
+
+    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
+    const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
+    const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
+    const branch_task: *BranchStatusLoadTask = @ptrCast(@alignCast(entries[1].ctx));
+    const diff_task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
+    const active = app.pages.review.activation.state.active;
+    try std.testing.expectEqual(active.activation_id, status_task.identity.activation_id);
+    try std.testing.expectEqual(active.activation_id, branch_task.identity.activation_id);
+    try std.testing.expectEqual(active.activation_id, diff_task.identity.activation_id);
+    try std.testing.expect(diff_task.expected_fingerprint != null);
+}
+
+test "workspace repository commitments advance one authoritative epoch" {
+    var repos = [_]repo_discovery.RepoEntry{
+        .{ .label = "a", .display_path = "/a", .canonical_root = "/a" },
+        .{ .label = "b", .display_path = "/b", .canonical_root = "/b" },
+    };
+    var app: App = .{ .repo_state = .{ .discovery = .{ .workspace = .{
+        .current_root = "/workspace",
+        .repos = &repos,
+    } } } };
+    _ = app.activateReview();
+
+    try std.testing.expect(!app.commitWorkspaceRepoIndex(0));
+    try std.testing.expectEqual(@as(u64, 0), app.repo_epoch);
+    try std.testing.expect(app.commitWorkspaceRepoIndex(1));
+    try std.testing.expectEqual(@as(u64, 1), app.repo_epoch);
+    try std.testing.expectEqualStrings("/b", app.activeRepoRoot().?);
+    try std.testing.expect(app.commitWorkspaceRepoIndex(0));
+    try std.testing.expectEqual(@as(u64, 2), app.repo_epoch);
+    try std.testing.expectEqualStrings("/a", app.activeRepoRoot().?);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.review.activation.state.active.repo_epoch);
+}
+
+fn testSingleRepoDiscovery(allocator: std.mem.Allocator, root: []const u8) !repo_discovery.DiscoveryResult {
+    return testNamedSingleRepoDiscovery(allocator, std.fs.path.basename(root), root);
+}
+
+fn testNamedSingleRepoDiscovery(allocator: std.mem.Allocator, label: []const u8, root: []const u8) !repo_discovery.DiscoveryResult {
+    return .{ .single_repo = .{
+        .label = try allocator.dupe(u8, label),
+        .display_path = try allocator.dupe(u8, root),
+        .canonical_root = try allocator.dupe(u8, root),
+    } };
+}
+
+test "repo discovery completion cannot overwrite a newer repository commitment" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .active_page = .repository };
+    defer app.repo_state.deinit(allocator);
+    defer app.recent_repos.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    const first_activation = app.pages.review.activation.activate(0, .pending, .unavailable, .unavailable);
+    const first_generation = app.pages.review.load.beginRepoDiscovery();
+    try app.finishRepoDiscovery(&ctx, .{
+        .identity = page.RequestIdentity.review(0, first_activation),
+        .generation = first_generation,
+        .result = .{ .discovered = try testSingleRepoDiscovery(allocator, "/repo/a") },
+    });
+    try std.testing.expectEqualStrings("/repo/a", app.activeRepoRoot().?);
+    try std.testing.expectEqual(@as(u64, 1), app.repo_epoch);
+
+    const same_activation = app.pages.review.activation.activate(app.repo_epoch, .pending, .pending, .pending);
+    const same_generation = app.pages.review.load.beginRepoDiscovery();
+    try app.finishRepoDiscovery(&ctx, .{
+        .identity = page.RequestIdentity.review(1, same_activation),
+        .generation = same_generation,
+        .result = .{ .discovered = try testSingleRepoDiscovery(allocator, "/repo/a") },
+    });
+    try std.testing.expectEqual(@as(u64, 1), app.repo_epoch);
+
+    const same_epoch_stale_activation = app.pages.review.activation.activate(app.repo_epoch, .pending, .pending, .pending);
+    const same_epoch_stale_generation = app.pages.review.load.beginRepoDiscovery();
+    try std.testing.expect(!app.commitRepoDiscovery(
+        allocator,
+        try testNamedSingleRepoDiscovery(allocator, "fresh selection", "/repo/a"),
+        0,
+        .external_selection,
+    ));
+    try std.testing.expect(!app.pages.review.load.hasPending());
+    try app.finishRepoDiscovery(&ctx, .{
+        .identity = page.RequestIdentity.review(1, same_epoch_stale_activation),
+        .generation = same_epoch_stale_generation,
+        .result = .{ .discovered = try testNamedSingleRepoDiscovery(allocator, "stale completion", "/repo/a") },
+    });
+    const committed = app.repo_state.discovery orelse return error.ExpectedSingleRepository;
+    switch (committed) {
+        .single_repo => |entry| try std.testing.expectEqualStrings("fresh selection", entry.label),
+        else => return error.ExpectedSingleRepository,
+    }
+    try std.testing.expectEqual(@as(u64, 1), app.repo_epoch);
+
+    const stale_activation = app.pages.review.activation.activate(app.repo_epoch, .pending, .pending, .pending);
+    const stale_generation = app.pages.review.load.beginRepoDiscovery();
+    try std.testing.expect(app.commitRepoDiscovery(allocator, try testSingleRepoDiscovery(allocator, "/repo/b"), 0, .external_selection));
+    try std.testing.expectEqual(@as(u64, 2), app.repo_epoch);
+    try std.testing.expect(!app.pages.review.load.hasPending());
+
+    try app.finishRepoDiscovery(&ctx, .{
+        .identity = page.RequestIdentity.review(1, stale_activation),
+        .generation = stale_generation,
+        .result = .{ .discovered = try testSingleRepoDiscovery(allocator, "/repo/a") },
+    });
+    try std.testing.expectEqualStrings("/repo/b", app.activeRepoRoot().?);
+    try std.testing.expectEqual(@as(u64, 2), app.repo_epoch);
+
+    try std.testing.expect(app.commitRepoDiscovery(allocator, try testSingleRepoDiscovery(allocator, "/repo/a"), 0, .external_selection));
+    try std.testing.expectEqualStrings("/repo/a", app.activeRepoRoot().?);
+    try std.testing.expectEqual(@as(u64, 3), app.repo_epoch);
+}
+
+test "inactive repository change invalidates retained source before equal-fingerprint re-entry" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .active_page = .repository, .allocator = allocator };
+    defer app.repo_state.deinit(allocator);
+
+    try std.testing.expect(app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, "/repo/a"),
+        0,
+        .external_selection,
+    ));
+
+    var retained = app_test_support.loadedDiffOne();
+    retained.text = app_test_support.diff_one;
+    app.pages.review.load = app_test_support.loadState(retained);
+    const shared_fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    app.pages.review.auto_reload.acceptSource(shared_fingerprint);
+
+    try std.testing.expect(app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, "/repo/b"),
+        0,
+        .external_selection,
+    ));
+    try std.testing.expectEqualStrings("/repo/b", app.activeRepoRoot().?);
+    try std.testing.expect(app.pages.review.auto_reload.accepted_source == null);
+    try std.testing.expect(app.pages.review.load.state == .idle);
+    try std.testing.expect(app.reviewNavigation().loadedDiff() == null);
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    try app.requestPageSwitch(&ctx, .review);
+
+    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
+    const diff_task: *DiffLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[2].ctx));
+    try std.testing.expect(diff_task.expected_fingerprint == null);
+    try std.testing.expectEqual(app.repo_epoch, diff_task.identity.repo_epoch);
+}
+
+test "inactive Review failure stays page scoped and skips redraw" {
+    var app: App = .{
+        .active_page = .repository,
+        .repo_epoch = 5,
+        .pages = .{ .review = .{ .status_load = .{
+            .generation = 1,
+            .pending = .{ .generation = 1 },
+        } } },
+    };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(5, 1),
+        .generation = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .failed_static = "offline" },
+    }) catch unreachable;
+
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expectEqualStrings("status load failed: offline", app.pages.review.status.text());
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "review cancel remains available when source validation failed" {
+    var output: review_session.Output = .{};
+    defer output.deinit(std.testing.allocator);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .review_output = &output,
+    };
+    _ = app.pages.review.activation.activate(0, .failed, .unavailable, .unavailable);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.finishReview(&ctx, .approved);
+    try std.testing.expect(!ctx.shouldQuit());
+    try std.testing.expect(!output.ready);
+    try std.testing.expectEqualStrings("review source is still being validated", app.pages.review.status.text());
+
+    try app.finishReview(&ctx, .canceled);
+    try std.testing.expect(ctx.shouldQuit());
+    try std.testing.expect(output.ready);
+    try std.testing.expectEqual(@as(u8, 130), output.exit_code);
+}
+
 test "finishReview waits for pending git action before writing output" {
     var output: review_session.Output = .{};
     defer output.deinit(std.testing.allocator);
@@ -6824,7 +7490,7 @@ test "finishReview waits for pending git action before writing output" {
     try std.testing.expect(!ctx.shouldQuit());
     try std.testing.expect(!output.ready);
     try std.testing.expect(app.actions.pending != null);
-    try std.testing.expectEqualStrings("finish current git action before finishing review", app.status.text());
+    try std.testing.expectEqualStrings("finish current git action before finishing review", app.pages.review.status.text());
 }
 
 test "finishReview writes output and quits when no git action is pending" {
@@ -6834,6 +7500,7 @@ test "finishReview writes output and quits when no git action is pending" {
         .allocator = std.testing.allocator,
         .review_output = &output,
     };
+    _ = app.pages.review.activation.activate(0, .fresh, .unavailable, .unavailable);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishReview(&ctx, .approved);
@@ -6869,7 +7536,7 @@ test "finishPush does not reload a stale active repository" {
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.pages.review.load.pending == null);
-    try std.testing.expectEqualStrings("pushed: /repo", app.status.text());
+    try std.testing.expectEqualStrings("pushed: /repo", app.pages.review.status.text());
 }
 
 test "finishPull does not reload a stale active repository" {
@@ -6896,7 +7563,7 @@ test "finishPull does not reload a stale active repository" {
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.pages.review.load.pending == null);
-    try std.testing.expectEqualStrings("pulled: /repo", app.status.text());
+    try std.testing.expectEqualStrings("pulled: /repo", app.pages.review.status.text());
 }
 
 test "finishPull reloads matching active repo after up-to-date success" {
@@ -6908,6 +7575,7 @@ test "finishPull reloads matching active repo after up-to-date success" {
             .canonical_root = "/repo",
         } } },
     };
+    _ = app.activateReview();
     const pending = app.actions.begin(.pull);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
@@ -6924,7 +7592,7 @@ test "finishPull reloads matching active repo after up-to-date success" {
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.pages.review.load.pending != null);
-    try std.testing.expectEqualStrings("nothing to pull", app.status.text());
+    try std.testing.expectEqualStrings("nothing to pull", app.pages.review.status.text());
 }
 
 test "finishPull reloads matching active repo after failure" {
@@ -6936,6 +7604,7 @@ test "finishPull reloads matching active repo after failure" {
             .canonical_root = "/repo",
         } } },
     };
+    _ = app.activateReview();
     const pending = app.actions.begin(.pull);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
@@ -6952,7 +7621,7 @@ test "finishPull reloads matching active repo after failure" {
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.pages.review.load.pending != null);
-    try std.testing.expectEqualStrings("pull failed: remote unavailable", app.status.text());
+    try std.testing.expectEqualStrings("pull failed: remote unavailable", app.pages.review.status.text());
 }
 
 test "finishFetch does not reload a stale active repository" {
@@ -6976,7 +7645,7 @@ test "finishFetch does not reload a stale active repository" {
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.pages.review.load.pending == null);
-    try std.testing.expectEqualStrings("fetched: /repo", app.status.text());
+    try std.testing.expectEqualStrings("fetched: /repo", app.pages.review.status.text());
 }
 
 test "finishFetch reloads matching active repo after failure" {
@@ -6988,6 +7657,7 @@ test "finishFetch reloads matching active repo after failure" {
             .canonical_root = "/repo",
         } } },
     };
+    _ = app.activateReview();
     const pending = app.actions.begin(.fetch);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
@@ -7001,7 +7671,7 @@ test "finishFetch reloads matching active repo after failure" {
 
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.pages.review.load.pending != null);
-    try std.testing.expectEqualStrings("fetch failed: remote unavailable", app.status.text());
+    try std.testing.expectEqualStrings("fetch failed: remote unavailable", app.pages.review.status.text());
 }
 
 test "finishPush failed preserves retry target oid for credential prompt" {
@@ -7067,7 +7737,7 @@ test "runInteractivePush rejects while another action is pending" {
     try std.testing.expectEqual(app_actions.ActionKind.stage_file, pending.kind);
     try std.testing.expect(app.push_retry_target != null);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
-    try std.testing.expectEqualStrings("another git action is running", app.status.text());
+    try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
 }
 
 test "runInteractivePush queues foreground oid refspec and owns retry target" {
@@ -7155,7 +7825,7 @@ test "runInteractivePush keeps retry target when foreground queue is full" {
     try std.testing.expect(app.push_retry_target != null);
     try std.testing.expect(app.push_retry_credentials_available);
     try std.testing.expect(app.overlay.isPushError());
-    try std.testing.expectEqualStrings("interactive push already queued", app.status.text());
+    try std.testing.expectEqualStrings("interactive push already queued", app.pages.review.status.text());
 }
 
 test "runInteractivePush stale snapshot does not queue foreground command" {
@@ -7185,7 +7855,7 @@ test "runInteractivePush stale snapshot does not queue foreground command" {
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.push_retry_target != null);
-    try std.testing.expectEqualStrings("push retry unavailable: branch changed; reload and try again", app.status.text());
+    try std.testing.expectEqualStrings("push retry unavailable: branch changed; reload and try again", app.pages.review.status.text());
 }
 
 test "finishPushForeground reloads matching active repo after failure" {
@@ -7198,6 +7868,7 @@ test "finishPushForeground reloads matching active repo after failure" {
             .canonical_root = "/repo",
         } } },
     };
+    _ = app.activateReview();
     const pending = app.actions.begin(.push);
     app.push_foreground = .{
         .request_id = .{ .id = 9 },
@@ -7222,7 +7893,7 @@ test "finishPushForeground reloads matching active repo after failure" {
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(app.push_foreground == null);
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
-    try std.testing.expectEqualStrings("interactive push exited: 1", app.status.text());
+    try std.testing.expectEqualStrings("interactive push exited: 1", app.pages.review.status.text());
 }
 
 test "finishPushForeground ignores stale request id" {
@@ -7295,7 +7966,7 @@ test "openPushCredentialPrompt rejects non-HTTPS remote and frees retry target" 
 
     try std.testing.expect(app.push_retry_target == null);
     try std.testing.expect(app.push_credential_prompt == null);
-    try std.testing.expectEqualStrings("credential prompt is only available for HTTPS remotes", app.status.text());
+    try std.testing.expectEqualStrings("credential prompt is only available for HTTPS remotes", app.pages.review.status.text());
 }
 
 test "manual reload clears action selection restore" {
@@ -7733,6 +8404,7 @@ test "active diff display uses ready combined projection by identity" {
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -7780,6 +8452,7 @@ test "background status refresh retains combined projection while cursor moves" 
     try app.pages.review.git_status.replace("/repo", &mixed_bundle);
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -7800,6 +8473,7 @@ test "background status refresh retains combined projection while cursor moves" 
     try std.testing.expect(cursor_before > 0);
 
     _ = app.pages.review.status_load.prepare(true);
+    syncTestActivation(&app);
     app.pages.review.load.generation +%= 1;
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.ensureReviewProjection(&ctx);
@@ -7840,6 +8514,7 @@ test "unchanged full cycle preserves projection semantic identity" {
     try app.pages.review.git_status.replace("/repo", &mixed_bundle);
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -7901,6 +8576,7 @@ test "final projection prefers explicit interim navigation override" {
 
     const state_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -7941,6 +8617,7 @@ test "final projection prefers explicit interim navigation override" {
 
     const result_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -7989,6 +8666,7 @@ test "empty watch source carries combined navigation into cached projection" {
     try app.pages.review.git_status.replace("/repo", &mixed_status);
     const displayed_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -8006,6 +8684,7 @@ test "empty watch source carries combined navigation into cached projection" {
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .empty,
     });
@@ -8015,6 +8694,7 @@ test "empty watch source carries combined navigation into cached projection" {
 
     const staged_only = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 7,
         .background_cycle_id = 1,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
@@ -8025,6 +8705,7 @@ test "empty watch source carries combined navigation into cached projection" {
 
     app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         2,
         target.repo_root,
         target.path_key,
@@ -8035,6 +8716,7 @@ test "empty watch source carries combined navigation into cached projection" {
     );
     const result_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         2,
         target.repo_root,
         target.path_key,
@@ -8087,6 +8769,7 @@ test "empty watch source carries generated navigation into generated projection"
 
     const displayed_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -8104,6 +8787,7 @@ test "empty watch source carries generated navigation into generated projection"
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .empty,
     });
@@ -8111,6 +8795,7 @@ test "empty watch source carries generated navigation into generated projection"
 
     const same_untracked = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? a\x00");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 7,
         .background_cycle_id = 1,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
@@ -8121,6 +8806,7 @@ test "empty watch source carries generated navigation into generated projection"
 
     app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         2,
         target.repo_root,
         target.path_key,
@@ -8131,6 +8817,7 @@ test "empty watch source carries generated navigation into generated projection"
     );
     const result_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         2,
         target.repo_root,
         target.path_key,
@@ -8177,6 +8864,7 @@ test "fresh empty status consumes pending display restore at raw terminal" {
     try app.pages.review.git_status.replace("/repo", &mixed_status);
     const displayed_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -8191,10 +8879,11 @@ test "fresh empty status consumes pending display restore at raw terminal" {
     } };
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    try app.finishDiffLoad(&ctx, .{ .generation = 2, .result = .empty });
+    try app.finishDiffLoad(&ctx, .{ .identity = page.RequestIdentity.review(0, 1), .generation = 2, .result = .empty });
     try std.testing.expect(app.pages.review.pending_display_navigation_restore != null);
 
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 7,
         .background_cycle_id = 1,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
@@ -8313,6 +9002,7 @@ test "selected path change supersedes pending display restore" {
     };
     app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         2,
         "/repo",
         "b",
@@ -8355,6 +9045,7 @@ test "superseded projection completion cannot replace display" {
     const stale_status_revision = app.pages.review.status_snapshot_revision - 1;
     app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -8365,6 +9056,7 @@ test "superseded projection completion cannot replace display" {
     );
     const result_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -8408,6 +9100,7 @@ test "cached preview keeps search input while projection is pending" {
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -8429,6 +9122,7 @@ test "cached preview keeps search input while projection is pending" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     const ready_request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -8471,6 +9165,7 @@ test "projected hunk actions route through original cached and unstaged origins"
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -8617,6 +9312,7 @@ test "projection hunk action results reload status without mutating session mark
             .canonical_root = "/repo",
         } } },
     };
+    _ = app.activateReview();
     defer app.pages.review.staged_hunks.deinit(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusTasks(&ctx, allocator);
@@ -8666,6 +9362,7 @@ test "cached source hunk unstage reload decision travels with task result" {
             .canonical_root = "/repo",
         } } },
     };
+    _ = app.activateReview();
     defer app.pages.review.staged_hunks.deinit(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
@@ -8902,6 +9599,7 @@ test "finishDiffLoad applies active changed file filter" {
 
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_added_deleted);
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .loaded = bundle },
     });
@@ -9400,6 +10098,7 @@ test "clean empty state shows branch status chrome" {
         .behind = 0,
     });
     try app.pages.review.branch_status.replace("/repo", &bundle);
+    syncTestActivation(&app);
 
     try app.view(&ts.surface);
 
@@ -9467,6 +10166,7 @@ test "clean empty state advertises pull only when clean status snapshot is fresh
         .behind = 0,
     });
     try app.pages.review.branch_status.replace("/repo", &bundle);
+    syncTestActivation(&app);
 
     try app.view(&ts.surface);
     try app_test_support.expectSnapshotNotContains(&ts, "U to fetch + fast-forward");
@@ -9510,6 +10210,7 @@ test "clean empty state shows bound fetch key from effective keymap" {
         .behind = 0,
     });
     try app.pages.review.branch_status.replace("/repo", &bundle);
+    syncTestActivation(&app);
 
     try app.view(&ts.surface);
 
@@ -9701,6 +10402,7 @@ test "finishDiffLoad takes current loaded bundle ownership" {
 
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .loaded = bundle },
     });
@@ -9722,6 +10424,7 @@ test "finishDiffLoad initially selects first visible file node" {
         .loaded = app_test_support.loadedDiffFileOneFirst(),
     };
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .loaded = bundle },
     });
@@ -9748,6 +10451,7 @@ test "finishDiffLoad initially selects first visible file after status projectio
         .loaded = app_test_support.loadedDiffFileOneFirst(),
     };
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .loaded = bundle },
     });
@@ -9784,6 +10488,7 @@ test "finishDiffLoad keeps initial visible selection intent for later status pro
         .loaded = app_test_support.loadedDiffFileOneFirst(),
     };
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .loaded = bundle },
     });
@@ -9792,6 +10497,7 @@ test "finishDiffLoad keeps initial visible selection intent for later status pro
 
     const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 7,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = status_bundle },
@@ -9837,6 +10543,7 @@ test "status projection rebuild keeps selected node on same path key" {
 
     const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = status_bundle },
@@ -9864,6 +10571,7 @@ test "status load skips identical snapshot without rebuilding active tree" {
 
     const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = same },
@@ -9879,6 +10587,7 @@ test "status refresh path skips identical snapshot without rebuilding active tre
         } },
         .allocator = std.testing.allocator,
     };
+    _ = app.activateReview();
     defer app.reviewReload().clearLoadedDiff(app.allocator);
     defer app.pages.review.git_status.deinit();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -9894,6 +10603,7 @@ test "status refresh path skips identical snapshot without rebuilding active tre
 
     const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = app.pages.review.status_load.generation,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = same },
@@ -9904,6 +10614,7 @@ test "status refresh path skips identical snapshot without rebuilding active tre
 
 test "status refresh drops snapshot when repo root changes" {
     var app: App = .{};
+    _ = app.activateReview();
     defer app.pages.review.git_status.deinit();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -9928,6 +10639,7 @@ test "finishStatusLoad keeps clean repository snapshot fresh" {
 
     const clean = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = clean },
@@ -9952,6 +10664,7 @@ test "background status failure retains display snapshot and marks action freshn
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = generation,
         .background_cycle_id = cycle_id,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
@@ -9967,6 +10680,7 @@ test "background status failure retains display snapshot and marks action freshn
     app.pages.review.status_load.begin(null);
     const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a.zig\x00");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = recovery_generation,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = same },
@@ -9990,6 +10704,7 @@ test "background status completion during repository action is discarded and rel
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = generation,
         .background_cycle_id = cycle_id,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
@@ -10010,6 +10725,7 @@ test "finishDiffLoad frees stale loaded bundle" {
 
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .loaded = bundle },
     });
@@ -10036,6 +10752,7 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     app.pages.review.branch_status_load.pending = null;
     app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -10089,6 +10806,7 @@ test "stale diff result does not clear newer pending reload metadata" {
 
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .loaded = bundle },
     });
@@ -10126,6 +10844,7 @@ test "watch no-op diff load preserves session view state and staged hunk marks" 
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .loaded = bundle },
     });
@@ -10181,6 +10900,7 @@ test "changed watch reload restores acceptance-time navigation instead of launch
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .loaded = bundle },
     });
@@ -10222,11 +10942,12 @@ test "unchanged recovery clears its source failure and redraws" {
     app.pages.review.load.pending = .{ .diff_load = 2 };
     app.pages.review.auto_reload.acceptSource(fingerprint);
     _ = app.pages.review.auto_reload.markSourceFailure("transient");
-    app.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "auto reload failed: transient", .{});
+    app.pages.review.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "auto reload failed: transient", .{});
     const before = app.reviewNavigationView().activeLoadedDiffConst().?.text.ptr;
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .unchanged = fingerprint },
     });
@@ -10234,7 +10955,7 @@ test "unchanged recovery clears its source failure and redraws" {
     try std.testing.expect(app.pages.review.pending_reload == null);
     try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
     try std.testing.expectEqual(before, app.reviewNavigationView().activeLoadedDiffConst().?.text.ptr);
-    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expectEqualStrings("", app.pages.review.status.text());
     try std.testing.expect(!ctx._redraw_suppressed);
 }
 
@@ -10255,16 +10976,17 @@ test "unchanged source recovery preserves a newer auxiliary failure" {
     app.pages.review.load.pending = .{ .diff_load = 2 };
     app.pages.review.auto_reload.acceptSource(fingerprint);
     _ = app.pages.review.auto_reload.markSourceFailure("source transient");
-    app.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "source failed", .{});
-    app.setStatus("status load failed: auxiliary transient", .{});
+    app.pages.review.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "source failed", .{});
+    app.setReviewStatus("status load failed: auxiliary transient", .{});
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .unchanged = fingerprint },
     });
 
-    try std.testing.expectEqualStrings("status load failed: auxiliary transient", app.status.text());
+    try std.testing.expectEqualStrings("status load failed: auxiliary transient", app.pages.review.status.text());
     try std.testing.expect(ctx._redraw_suppressed);
 }
 
@@ -10286,29 +11008,32 @@ test "auxiliary failure followed by source failure clears only the recovered sou
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .failed_static = "auxiliary transient" },
     });
-    try std.testing.expectEqualStrings("status load failed: auxiliary transient", app.status.text());
+    try std.testing.expectEqualStrings("status load failed: auxiliary transient", app.pages.review.status.text());
 
     app.pages.review.load.generation = 2;
     app.pages.review.load.pending = .{ .diff_load = 2 };
     app.pages.review.auto_reload.acceptSource(fingerprint);
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .failed_static = "source transient" },
     });
-    try std.testing.expectEqualStrings("auto reload failed: source transient", app.status.text());
+    try std.testing.expectEqualStrings("auto reload failed: source transient", app.pages.review.status.text());
 
     app.pages.review.load.generation = 3;
     app.pages.review.load.pending = .{ .diff_load = 3 };
     app.pages.review.pending_reload = .{ .generation = 3, .kind = .watch };
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 3,
         .result = .{ .unchanged = fingerprint },
     });
-    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expectEqualStrings("", app.pages.review.status.text());
     try std.testing.expect(!ctx._redraw_suppressed);
 }
 
@@ -10331,6 +11056,7 @@ test "ordinary unchanged source completion suppresses redraw" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .unchanged = fingerprint },
     });
@@ -10355,17 +11081,18 @@ test "changed loaded recovery clears its matching source failure and redraws" {
     app.pages.review.load.pending = .{ .diff_load = 2 };
     app.pages.review.auto_reload.acceptSource(old_fingerprint);
     _ = app.pages.review.auto_reload.markSourceFailure("source transient");
-    app.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "auto reload failed: source transient", .{});
+    app.pages.review.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "auto reload failed: source transient", .{});
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .loaded = bundle },
     });
 
     try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
-    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expectEqualStrings("", app.pages.review.status.text());
     try std.testing.expect(!ctx._redraw_suppressed);
 }
 
@@ -10386,17 +11113,18 @@ test "empty recovery clears its matching source failure and redraws" {
     app.pages.review.load.pending = .{ .diff_load = 2 };
     app.pages.review.auto_reload.acceptSource(old_fingerprint);
     _ = app.pages.review.auto_reload.markSourceFailure("source transient");
-    app.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "auto reload failed: source transient", .{});
+    app.pages.review.status.setSourceReloadFailure(app.pages.review.auto_reload.last_failure.?.digest, "auto reload failed: source transient", .{});
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .empty,
     });
 
     try std.testing.expect(app.pages.review.load.state == .empty);
     try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
-    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expectEqualStrings("", app.pages.review.status.text());
     try std.testing.expect(!ctx._redraw_suppressed);
 }
 
@@ -10419,6 +11147,7 @@ test "destructive action-result failure invalidates accepted source before ident
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .failed_static = "foreground failed" },
     });
@@ -10430,6 +11159,7 @@ test "destructive action-result failure invalidates accepted source before ident
     app.pages.review.pending_reload = .{ .generation = 3, .kind = .watch };
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 3,
         .result = .{ .loaded = bundle },
     });
@@ -10456,6 +11186,7 @@ test "destructive manual failure invalidates accepted source before identical su
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .failed_static = "manual failed" },
     });
@@ -10467,6 +11198,7 @@ test "destructive manual failure invalidates accepted source before identical su
     app.pages.review.pending_reload = .{ .generation = 3, .kind = .watch };
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 3,
         .result = .{ .loaded = bundle },
     });
@@ -10485,6 +11217,7 @@ test "diff task start failure invalidates accepted source and next watch cannot 
         .allocator = std.testing.allocator,
         .config = .{ .source = .stdin },
     };
+    _ = app.activateReview();
     defer app.reviewReload().clearPendingReload(std.testing.allocator);
     defer app.reviewReload().clearLoadedDiff(app.allocator);
     app.pages.review.auto_reload.acceptSource(fingerprint);
@@ -10513,6 +11246,7 @@ test "diff task start failure invalidates accepted source and next watch cannot 
 
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = generation,
         .result = .{ .loaded = bundle },
     });
@@ -10539,6 +11273,7 @@ test "watch failure retains display and blocks source-derived actions until succ
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .failed_static = "transient failure" },
     });
@@ -10549,6 +11284,7 @@ test "watch failure retains display and blocks source-derived actions until succ
     app.pages.review.load.pending = .{ .diff_load = 3 };
     app.pages.review.pending_reload = .{ .generation = 3, .kind = .watch };
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 3,
         .result = .{ .unchanged = fingerprint },
     });
@@ -10579,6 +11315,7 @@ test "changed watch result arriving during mouse selection defers apply until re
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .background_cycle_id = cycle_id,
         .result = .{ .loaded = bundle },
@@ -10618,6 +11355,7 @@ test "background source completion during repository action is discarded and rel
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .background_cycle_id = cycle_id,
         .result = .{ .loaded = bundle },
@@ -10635,6 +11373,7 @@ test "background source completion during repository action is discarded and rel
     app.pages.review.pending_reload = .{ .generation = 3, .kind = .action_result };
     const authoritative = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 3,
         .result = .{ .loaded = authoritative },
     });
@@ -10664,6 +11403,7 @@ test "deferred background source is discarded when a repository action starts" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .background_cycle_id = cycle_id,
         .result = .{ .loaded = bundle },
@@ -10713,6 +11453,7 @@ test "deferred changed watch captures navigation when selection ends" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .background_cycle_id = cycle_id,
         .result = .{ .loaded = bundle },
@@ -10754,6 +11495,7 @@ test "empty watch result defers during selection and focus loss applies it" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .background_cycle_id = cycle_id,
         .result = .empty,
@@ -10775,6 +11517,7 @@ test "focus loss terminates selection without a deferred result" {
         } },
         .config = .{ .source = .{ .no_index = .{ .left = "left", .right = "right" } } },
     };
+    _ = app.activateReview();
     app.pages.review.auto_reload = .init(.inherit, .{}, app.config.source);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -10831,6 +11574,7 @@ test "anchored reload keeps cursor when search query is present" {
     };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .loaded = bundle },
     });
@@ -10873,6 +11617,7 @@ test "manual reload restores anchor after visible state is cleared" {
     };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .loaded = bundle },
     });
@@ -10907,6 +11652,7 @@ test "watch no-op preserves selected path when status finishes before diff" {
 
     const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = status_bundle },
@@ -10915,6 +11661,7 @@ test "watch no-op preserves selected path when status finishes before diff" {
     app.pages.review.load.generation = 2;
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .loaded = bundle },
     });
@@ -10949,12 +11696,14 @@ test "watch no-op preserves selected path when status finishes after diff" {
     app.pages.review.load.generation = 2;
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .{ .loaded = bundle },
     });
 
     const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = status_bundle },
@@ -10998,6 +11747,7 @@ test "finishDiffLoad records empty diff as no changes" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .empty,
     });
@@ -11021,6 +11771,7 @@ test "finishDiffLoad projects earlier status snapshot into empty diff" {
     try app.pages.review.git_status.replace("/tmp/repo", &status_bundle);
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .empty,
     });
@@ -11042,6 +11793,7 @@ test "clean loaded status tears down status-only session after empty diff" {
         } },
         .allocator = allocator,
     };
+    _ = app.activateReview();
     defer app.reviewReload().clearLoadedDiff(app.allocator);
     defer app.pages.review.git_status.deinit();
     defer app.pages.review.tree_order.deinit(allocator);
@@ -11053,6 +11805,7 @@ test "clean loaded status tears down status-only session after empty diff" {
     try app.reviewReload().createStatusOnlyLoadedSession(allocator, app.pages.review.git_status.document);
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .empty,
     });
@@ -11064,6 +11817,7 @@ test "clean loaded status tears down status-only session after empty diff" {
 
     const clean = try git_status.StatusBundle.parseOwned(allocator, "");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 7,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = clean },
@@ -11089,6 +11843,7 @@ test "clean loaded status tears down status-only session after empty diff" {
     allocator.destroy(task);
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = generation,
         .result = .{ .unchanged = empty_fingerprint },
     });
@@ -11114,13 +11869,14 @@ test "source failure before clean status-only teardown remains stale" {
 
     var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
     try app.pages.review.git_status.replace("/repo", &current);
-    try app.finishDiffLoad(&ctx, .{ .generation = 2, .result = .empty });
+    try app.finishDiffLoad(&ctx, .{ .identity = page.RequestIdentity.review(0, 1), .generation = 2, .result = .empty });
     try std.testing.expect(app.reviewNavigation().loadedDiff() != null);
 
     app.pages.review.load.generation = 3;
     app.pages.review.load.pending = .{ .diff_load = 3 };
     app.pages.review.pending_reload = .{ .generation = 3, .kind = .watch };
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 3,
         .result = .{ .failed_static = "source transient" },
     });
@@ -11128,6 +11884,7 @@ test "source failure before clean status-only teardown remains stale" {
 
     const clean = try git_status.StatusBundle.parseOwned(allocator, "");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 7,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = clean },
@@ -11136,7 +11893,7 @@ test "source failure before clean status-only teardown remains stale" {
     try std.testing.expect(app.reviewNavigation().loadedDiff() == null);
     try std.testing.expect(!app.pages.review.auto_reload.sourceIsActionable());
     try std.testing.expect(app.pages.review.auto_reload.last_failure != null);
-    try std.testing.expectEqualStrings("auto reload failed: source transient", app.status.text());
+    try std.testing.expectEqualStrings("auto reload failed: source transient", app.pages.review.status.text());
 }
 
 test "source failure after clean status-only teardown remains stale" {
@@ -11157,9 +11914,10 @@ test "source failure after clean status-only teardown remains stale" {
 
     var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
     try app.pages.review.git_status.replace("/repo", &current);
-    try app.finishDiffLoad(&ctx, .{ .generation = 2, .result = .empty });
+    try app.finishDiffLoad(&ctx, .{ .identity = page.RequestIdentity.review(0, 1), .generation = 2, .result = .empty });
     const clean = try git_status.StatusBundle.parseOwned(allocator, "");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 7,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = clean },
@@ -11170,6 +11928,7 @@ test "source failure after clean status-only teardown remains stale" {
     app.pages.review.load.pending = .{ .diff_load = 3 };
     app.pages.review.pending_reload = .{ .generation = 3, .kind = .watch };
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 3,
         .result = .{ .failed_static = "later source transient" },
     });
@@ -11224,6 +11983,7 @@ test "empty status result tears down status-only session after empty diff" {
     try app.reviewReload().createStatusOnlyLoadedSession(allocator, app.pages.review.git_status.document);
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .empty,
     });
@@ -11231,6 +11991,7 @@ test "empty status result tears down status-only session after empty diff" {
     try std.testing.expect(app.reviewNavigation().loadedDiff() != null);
 
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 7,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .result = .empty,
@@ -11262,6 +12023,7 @@ test "identical staged-only status keeps status-only session after empty diff" {
     try app.reviewReload().createStatusOnlyLoadedSession(allocator, app.pages.review.git_status.document);
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .result = .empty,
     });
@@ -11272,6 +12034,7 @@ test "identical staged-only status keeps status-only session after empty diff" {
 
     const same = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
     try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 7,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = same },
@@ -11291,6 +12054,7 @@ test "finishRepoDiscovery records no repository as empty state" {
     defer app.repo_state.deinit(std.testing.allocator);
 
     try app.finishRepoDiscovery(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .discovered = .{ .none = .{
             .current_root = try std.testing.allocator.dupe(u8, "/work"),
@@ -11310,6 +12074,7 @@ test "finishDiffLoad copies and frees current failed message" {
 
     const message = try std.testing.allocator.dupe(u8, " failed \n");
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .failed = message },
     });
@@ -11330,6 +12095,7 @@ test "finishDiffLoad failure clears pending selection restore" {
     try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "src/main.zig");
 
     try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .failed_static = "failed" },
     });
@@ -11390,6 +12156,24 @@ fn setFileSearchInput(app: *App, query: []const u8) void {
 
 fn acceptTestSource(app: *App) void {
     app.pages.review.auto_reload.acceptSource(app_auto_reload.SourceFingerprint.init("test source"));
+    syncTestActivation(app);
+}
+
+fn syncTestActivation(app: *App) void {
+    const source: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
+        .immutable
+    else if (app.pages.review.auto_reload.sourceIsActionable())
+        .fresh
+    else if (app.pages.review.load.hasPending())
+        .pending
+    else
+        .unavailable;
+    _ = app.pages.review.activation.activate(
+        app.repo_epoch,
+        source,
+        review_authority.auxiliaryMember(app.pages.review.status_load),
+        review_authority.auxiliaryMember(app.pages.review.branch_status_load),
+    );
 }
 
 fn clearPendingStatusTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {

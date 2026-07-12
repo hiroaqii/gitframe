@@ -8,9 +8,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const auto_reload = @import("../../auto_reload.zig");
 const app_load = @import("../../load.zig");
+const app_page = @import("../../page.zig");
 const load_state = @import("../../load_state.zig");
 const review_projection = @import("../../review_projection.zig");
 const review_page = @import("../review.zig");
+const authority = @import("authority.zig");
 const navigation = @import("navigation.zig");
 const diff_file = @import("../../../diff/file.zig");
 const diff_parser = @import("../../../diff/parser.zig");
@@ -78,6 +80,7 @@ pub const SourceLoadOptions = struct {
 };
 
 pub const OwnedSourceRead = struct {
+    identity: app_page.RequestIdentity,
     request: diff_source.LoadRequest,
     generation: u64,
     expected_fingerprint: ?auto_reload.SourceFingerprint,
@@ -90,6 +93,7 @@ pub const OwnedSourceRead = struct {
 };
 
 pub const OwnedStatusRead = struct {
+    identity: app_page.RequestIdentity,
     repo_root: []u8,
     generation: u64,
     origin: git_backend.ReadOrigin,
@@ -102,6 +106,7 @@ pub const OwnedStatusRead = struct {
 };
 
 pub const OwnedBranchStatusRead = struct {
+    identity: app_page.RequestIdentity,
     repo_root: []u8,
     generation: u64,
     background_cycle_id: ?u64,
@@ -257,6 +262,16 @@ pub const Controller = struct {
     navigation: navigation.Controller,
     source: diff_source.SourceMode,
     repo_root: ?[]const u8,
+    repo_epoch: u64 = 0,
+
+    fn acceptsIdentity(self: Controller, identity: app_page.RequestIdentity) bool {
+        return self.page.activation.acceptsRepoEpoch(identity, self.repo_epoch);
+    }
+
+    pub fn failActiveMember(self: Controller, member: authority.Member) void {
+        const identity = self.page.activation.currentIdentity() orelse return;
+        _ = self.page.activation.finishMember(identity, member, .failed);
+    }
 
     pub fn view(self: Controller) View {
         return .{
@@ -413,6 +428,7 @@ pub const Controller = struct {
         repo_root: ?[]const u8,
         options: SourceLoadOptions,
     ) !ReviewUpdate {
+        const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
         if (options.kind != .watch) self.clearDeferredSourceApply(allocator);
         if (options.kind == .repo_switch) self.page.auto_reload.clearAcceptedSource();
 
@@ -435,8 +451,10 @@ pub const Controller = struct {
             self.clearSourceDisplay(allocator);
             self.page.load.state = .loading;
         }
+        self.page.activation.markPending(.source);
 
         return .{ .command = .{ .source_load = .{
+            .identity = identity,
             .request = request,
             .generation = generation,
             .expected_fingerprint = expected_fingerprint,
@@ -455,6 +473,7 @@ pub const Controller = struct {
         origin: git_backend.ReadOrigin,
         background_cycle_id: ?u64,
     ) !ReviewUpdate {
+        const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
         if (self.page.git_status.repo_root) |current_root| {
             if (std.mem.eql(u8, current_root, repo_root)) {
                 self.invalidateStatusSnapshot();
@@ -467,7 +486,9 @@ pub const Controller = struct {
         errdefer self.navigation.clearPendingSelectionRestore(allocator);
         const owned_root = try allocator.dupe(u8, repo_root);
         self.page.status_load.begin(background_cycle_id);
+        self.page.activation.markPending(.status);
         return .{ .command = .{ .status_load = .{
+            .identity = identity,
             .repo_root = owned_root,
             .generation = self.page.status_load.generation,
             .origin = origin,
@@ -483,6 +504,7 @@ pub const Controller = struct {
         self.navigation.clearPendingSelectionRestore(allocator);
         self.page.status_load.pending = null;
         self.page.status_load.markFailure(background_cycle_id != null and self.page.git_status.repo_root != null);
+        self.failActiveMember(.status);
     }
 
     pub fn prepareBranchStatusLoad(
@@ -491,6 +513,7 @@ pub const Controller = struct {
         repo_root: []const u8,
         background_cycle_id: ?u64,
     ) !ReviewUpdate {
+        const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
         if (self.page.branch_status.repo_root) |current_root| {
             if (std.mem.eql(u8, current_root, repo_root)) {
                 _ = self.page.branch_status_load.prepare(true);
@@ -502,7 +525,9 @@ pub const Controller = struct {
         }
         const owned_root = try allocator.dupe(u8, repo_root);
         self.page.branch_status_load.begin(background_cycle_id);
+        self.page.activation.markPending(.branch);
         return .{ .command = .{ .branch_status_load = .{
+            .identity = identity,
             .repo_root = owned_root,
             .generation = self.page.branch_status_load.generation,
             .background_cycle_id = background_cycle_id,
@@ -516,11 +541,13 @@ pub const Controller = struct {
     pub fn rejectBranchStatusSpawn(self: Controller, background_cycle_id: ?u64) void {
         self.page.branch_status_load.pending = null;
         self.page.branch_status_load.markFailure(background_cycle_id != null and self.page.branch_status.repo_root != null);
+        self.failActiveMember(.branch);
     }
 
     pub fn rejectSourceSpawn(self: Controller, allocator: std.mem.Allocator, generation: u64) void {
         _ = self.page.load.clearPendingIfCurrent(.{ .diff_load = generation });
         self.clearPendingReloadIfGeneration(allocator, generation);
+        self.failActiveMember(.source);
     }
 
     /// Reconciles projection identity and, only when a read is required,
@@ -571,9 +598,11 @@ pub const Controller = struct {
         }
         self.page.review_projection_next_id +%= 1;
         const request_id = self.page.review_projection_next_id;
+        const identity = self.page.activation.currentIdentity() orelse return .{};
 
         var state_request = try review_projection.cloneRequest(
             allocator,
+            identity,
             request_id,
             target.repo_root,
             target.path_key,
@@ -586,6 +615,7 @@ pub const Controller = struct {
 
         var task_request = try review_projection.cloneRequest(
             allocator,
+            identity,
             request_id,
             target.repo_root,
             target.path_key,
@@ -619,6 +649,10 @@ pub const Controller = struct {
         background_blocked: bool,
     ) !CompletionApply {
         self.page.auto_reload.finishMember(result.background_cycle_id, .status);
+        if (!self.acceptsIdentity(result.identity)) {
+            _ = self.page.status_load.accept(result.generation);
+            return .{};
+        }
         if (background_blocked) {
             _ = self.page.status_load.accept(result.generation);
             return .{};
@@ -633,6 +667,7 @@ pub const Controller = struct {
                     false;
                 if (!same_root or self.page.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
                 self.page.status_load.markSuccess();
+                _ = self.page.activation.finishMember(result.identity, .status, .fresh);
                 self.page.git_status.clear();
                 const prefer_first = self.page.pending_initial_first_visible_selection;
                 self.page.pending_initial_first_visible_selection = false;
@@ -648,6 +683,7 @@ pub const Controller = struct {
                 )) {
                     .skip_identical => {
                         self.page.status_load.markSuccess();
+                        _ = self.page.activation.finishMember(result.identity, .status, .fresh);
                         return .{ .skip_redraw = true };
                     },
                     .replace_pending_selection_restore,
@@ -660,19 +696,21 @@ pub const Controller = struct {
                 self.advanceStatusSnapshotRevision();
                 try self.page.git_status.replace(result.repo_root, bundle);
                 self.page.status_load.markSuccess();
+                _ = self.page.activation.finishMember(result.identity, .status, .fresh);
                 result.result = .empty;
                 const prefer_first = self.page.pending_initial_first_visible_selection;
                 self.page.pending_initial_first_visible_selection = false;
                 return .{ .project_status = prefer_first };
             },
-            .failed => |message| return self.applyStatusFailure(allocator, result.background_cycle_id, std.mem.trim(u8, message, " \t\r\n")),
-            .failed_static => |message| return self.applyStatusFailure(allocator, result.background_cycle_id, message),
+            .failed => |message| return self.applyStatusFailure(allocator, result.identity, result.background_cycle_id, std.mem.trim(u8, message, " \t\r\n")),
+            .failed_static => |message| return self.applyStatusFailure(allocator, result.identity, result.background_cycle_id, message),
         }
     }
 
-    fn applyStatusFailure(self: Controller, allocator: std.mem.Allocator, background_cycle_id: ?u64, message: []const u8) CompletionApply {
+    fn applyStatusFailure(self: Controller, allocator: std.mem.Allocator, identity: app_page.RequestIdentity, background_cycle_id: ?u64, message: []const u8) CompletionApply {
         const retain = background_cycle_id != null and self.page.git_status.repo_root != null;
         self.page.status_load.markFailure(retain);
+        _ = self.page.activation.finishMember(identity, .status, .failed);
         if (!retain) {
             if (self.page.git_status.repo_root != null or self.page.git_status.document.entries.len != 0) {
                 self.advanceStatusSnapshotRevision();
@@ -690,6 +728,10 @@ pub const Controller = struct {
         background_blocked: bool,
     ) CompletionApply {
         self.page.auto_reload.finishMember(result.background_cycle_id, .branch);
+        if (!self.acceptsIdentity(result.identity)) {
+            _ = self.page.branch_status_load.accept(result.generation);
+            return .{};
+        }
         if (background_blocked) {
             _ = self.page.branch_status_load.accept(result.generation);
             return .{};
@@ -700,6 +742,7 @@ pub const Controller = struct {
             .empty => {
                 self.page.branch_status.clear();
                 self.page.branch_status_load.markSuccess();
+                _ = self.page.activation.finishMember(result.identity, .branch, .fresh);
             },
             .loaded => |*bundle| {
                 const same_root = if (self.page.branch_status.repo_root) |root|
@@ -708,25 +751,29 @@ pub const Controller = struct {
                     false;
                 if (same_root) {
                     self.page.branch_status_load.markSuccess();
+                    _ = self.page.activation.finishMember(result.identity, .branch, .fresh);
                     return .{ .skip_redraw = true };
                 }
                 self.page.branch_status.replace(result.repo_root, bundle) catch {
                     self.page.branch_status.clear();
                     self.page.branch_status_load.markFailure(false);
+                    _ = self.page.activation.finishMember(result.identity, .branch, .failed);
                     return .{ .diagnostic = .branch_status_parse_failed };
                 };
                 self.page.branch_status_load.markSuccess();
+                _ = self.page.activation.finishMember(result.identity, .branch, .fresh);
                 result.result = .empty;
             },
-            .failed => |message| return self.applyBranchFailure(result.background_cycle_id, std.mem.trim(u8, message, " \t\r\n")),
-            .failed_static => |message| return self.applyBranchFailure(result.background_cycle_id, message),
+            .failed => |message| return self.applyBranchFailure(result.identity, result.background_cycle_id, std.mem.trim(u8, message, " \t\r\n")),
+            .failed_static => |message| return self.applyBranchFailure(result.identity, result.background_cycle_id, message),
         }
         return .{};
     }
 
-    fn applyBranchFailure(self: Controller, background_cycle_id: ?u64, message: []const u8) CompletionApply {
+    fn applyBranchFailure(self: Controller, identity: app_page.RequestIdentity, background_cycle_id: ?u64, message: []const u8) CompletionApply {
         const retain = background_cycle_id != null and self.page.branch_status.repo_root != null;
         self.page.branch_status_load.markFailure(retain);
+        _ = self.page.activation.finishMember(identity, .branch, .failed);
         if (!retain) self.page.branch_status.clear();
         return .{ .diagnostic = .{ .branch_status_load_failed = message } };
     }
@@ -739,6 +786,7 @@ pub const Controller = struct {
         allocator: std.mem.Allocator,
         result: *app_load.ReviewProjectionFinished,
     ) !ProjectionApply {
+        if (!self.acceptsIdentity(result.request.identity)) return .{};
         const pending_id = if (self.page.review_projection.pending) |request| request.id else return .{};
         if (pending_id != result.request.id) return .{};
 
@@ -787,6 +835,7 @@ pub const Controller = struct {
             .failed_static => |message| {
                 var request = try review_projection.cloneRequest(
                     allocator,
+                    result.request.identity,
                     result.request.id,
                     result.request.repo_root,
                     result.request.path_key,
@@ -829,6 +878,10 @@ pub const Controller = struct {
         }
         self.page.auto_reload.finishMember(finished.background_cycle_id, .source);
         _ = self.page.load.finishPending(.{ .diff_load = finished.generation });
+        if (!self.acceptsIdentity(finished.identity)) {
+            self.clearPendingReloadIfGeneration(allocator, finished.generation);
+            return .{};
+        }
         if (!self.page.load.isCurrent(finished.generation)) return .{};
         var pending_reload = self.takePendingReloadIfGeneration(finished.generation);
         defer if (pending_reload) |*pending| pending.deinit(allocator);
@@ -852,10 +905,12 @@ pub const Controller = struct {
                     acceptance_restore = null;
                 }
                 outcome.recovered_failure = self.acceptSourceFingerprint(auto_reload.SourceFingerprint.init(""));
+                _ = self.page.activation.finishMember(finished.identity, .source, self.acceptedSourceMember());
                 can_project_status = true;
             },
             .unchanged => |fingerprint| {
                 outcome.recovered_failure = self.acceptSourceFingerprint(fingerprint);
+                _ = self.page.activation.finishMember(finished.identity, .source, self.acceptedSourceMember());
                 outcome.redraw = .skip_unless_recovered_failure_cleared;
                 return outcome;
             },
@@ -869,6 +924,7 @@ pub const Controller = struct {
                 switch (load_state.watchReloadRebuildDecision(consumed_pending_is_watch, current_loaded != null, texts_equal)) {
                     .skip_rebuild_identical_text => {
                         outcome.recovered_failure = self.acceptSourceFingerprint(bundle.fingerprint);
+                        _ = self.page.activation.finishMember(finished.identity, .source, self.acceptedSourceMember());
                         const prefer_first = !had_loaded_before and !had_pending_restore;
                         if (prefer_first and self.page.status_load.isPending()) {
                             self.page.pending_initial_first_visible_selection = true;
@@ -903,6 +959,7 @@ pub const Controller = struct {
                     acceptance_restore = null;
                 }
                 outcome.recovered_failure = self.acceptSourceFingerprint(bundle.fingerprint);
+                _ = self.page.activation.finishMember(finished.identity, .source, self.acceptedSourceMember());
 
                 const active_loaded = self.navigation.activeLoadedDiff().?;
                 const restored_from_anchor = if (self.page.pending_display_navigation_restore) |*restore|
@@ -929,8 +986,14 @@ pub const Controller = struct {
                 }
                 can_project_status = true;
             },
-            .failed => |message| return try self.applySourceFailure(allocator, pending_reload, std.mem.trim(u8, message, " \t\r\n")),
-            .failed_static => |message| return try self.applySourceFailure(allocator, pending_reload, message),
+            .failed => |message| {
+                _ = self.page.activation.finishMember(finished.identity, .source, .failed);
+                return try self.applySourceFailure(allocator, pending_reload, std.mem.trim(u8, message, " \t\r\n"));
+            },
+            .failed_static => |message| {
+                _ = self.page.activation.finishMember(finished.identity, .source, .failed);
+                return try self.applySourceFailure(allocator, pending_reload, message);
+            },
         }
 
         const prefer_first = !had_loaded_before and !had_pending_restore;
@@ -964,6 +1027,10 @@ pub const Controller = struct {
         const recovered_failure = self.page.auto_reload.last_failure;
         self.page.auto_reload.acceptSource(fingerprint);
         return recovered_failure;
+    }
+
+    fn acceptedSourceMember(self: Controller) authority.MemberFreshness {
+        return if (diff_source.sourceIsOneShotInput(self.source)) .immutable else .fresh;
     }
 
     pub fn restoreDisplayedNavigation(self: Controller, anchor: *const review_page.ReloadAnchor) void {
@@ -1173,6 +1240,9 @@ fn testController(
     status_message: *@import("../../state.zig").StatusMessage,
     source: diff_source.SourceMode,
 ) Controller {
+    if (page.activation.currentIdentity() == null) {
+        _ = page.activation.activate(0, .pending, .pending, .pending);
+    }
     return .{
         .page = page,
         .navigation = .{
@@ -1216,6 +1286,7 @@ test "owned Review update consumes command exactly once" {
     const allocator = std.testing.allocator;
     var request = try review_projection.cloneRequest(
         allocator,
+        app_page.RequestIdentity.review(0, 1),
         4,
         "/repo",
         "src/main.zig",
@@ -1235,6 +1306,7 @@ test "owned read command variants release every payload" {
     const allocator = std.testing.allocator;
 
     var source_update: ReviewUpdate = .{ .command = .{ .source_load = .{
+        .identity = app_page.RequestIdentity.review(0, 1),
         .request = try diff_source.cloneLoadRequest(allocator, .{ .source = .{ .range = "main...HEAD" }, .repo_root = "/repo" }),
         .generation = 1,
         .expected_fingerprint = null,
@@ -1243,6 +1315,7 @@ test "owned read command variants release every payload" {
     source_update.deinit(allocator);
 
     var status_update: ReviewUpdate = .{ .command = .{ .status_load = .{
+        .identity = app_page.RequestIdentity.review(0, 1),
         .repo_root = try allocator.dupe(u8, "/repo"),
         .generation = 2,
         .origin = .foreground,
@@ -1251,6 +1324,7 @@ test "owned read command variants release every payload" {
     status_update.deinit(allocator);
 
     var branch_update: ReviewUpdate = .{ .command = .{ .branch_status_load = .{
+        .identity = app_page.RequestIdentity.review(0, 1),
         .repo_root = try allocator.dupe(u8, "/repo"),
         .generation = 3,
         .background_cycle_id = null,
@@ -1259,6 +1333,7 @@ test "owned read command variants release every payload" {
 
     var projection_update: ReviewUpdate = .{ .command = .{ .review_projection = try review_projection.cloneRequest(
         allocator,
+        app_page.RequestIdentity.review(0, 1),
         4,
         "/repo",
         "src/main.zig",
@@ -1361,6 +1436,7 @@ test "read command reject terminals clear only matching page state" {
 
     page.review_projection.pending = try review_projection.cloneRequest(
         allocator,
+        app_page.RequestIdentity.review(0, 1),
         9,
         "/repo",
         "a",
@@ -1397,7 +1473,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
     blocked_page.pending_reload = .{ .generation = 1, .kind = .watch };
     blocked_page.deferred_source_apply = .{
         .cycle_id = blocked_cycle,
-        .finished = .{ .generation = 1, .result = .{ .failed_static = "blocked" } },
+        .finished = .{ .identity = app_page.RequestIdentity.review(0, 1), .generation = 1, .result = .{ .failed_static = "blocked" } },
     };
     const blocked_controller = testController(&blocked_page, &status_message, .unstaged);
     var blocked_applied = (try blocked_controller.applyDeferredSource(allocator, true)) orelse return error.ExpectedDeferredApply;
@@ -1419,6 +1495,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
     accepted_page.deferred_source_apply = .{
         .cycle_id = accepted_cycle,
         .finished = .{
+            .identity = app_page.RequestIdentity.review(0, 1),
             .generation = 2,
             .result = .{ .unchanged = auto_reload.SourceFingerprint.init("same") },
         },
@@ -1441,6 +1518,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
     accepted_page.deferred_source_apply = .{
         .cycle_id = failure_cycle,
         .finished = .{
+            .identity = app_page.RequestIdentity.review(0, 1),
             .generation = 3,
             .result = .{ .failed = try allocator.dupe(u8, "owned deferred failure") },
         },

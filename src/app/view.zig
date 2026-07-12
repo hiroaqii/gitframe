@@ -25,7 +25,7 @@ const review_page = if (builtin.is_test) @import("pages/review.zig") else struct
 /// shared with tests through small public helpers.
 const shell_frame_border = ui.Panel.Border.rounded;
 const help_dialog_max_width: u16 = 108;
-const help_dialog_max_height: u16 = 34;
+const help_dialog_max_height: u16 = 40;
 const help_two_column_min_width: u16 = 96;
 const help_column_gap: u16 = 2;
 const help_header_rows: u16 = 2;
@@ -65,7 +65,9 @@ pub const Context = struct {
     keymap: keymap.Effective,
     terminal_size: chasen.Size,
     actions: *const app_actions.ActionState,
+    /// Shell notifications temporarily win over the active page diagnostic.
     status: *const app_state.StatusMessage,
+    page_status: ?*const app_state.StatusMessage = null,
     commit_panel: *const app_commit_panel.State,
     repo_picker: *const app_prompt.RepoPickerState,
     repo_picker_discovery: ?repo_discovery.DiscoveryResult,
@@ -112,7 +114,7 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     });
     if (sections.page_bar) |rect| {
         var page_bar = surface.child(rect);
-        viewPageBar(app.active_page, app.theme, &page_bar);
+        viewPageBar(app.active_page, sections.body.height == 0 or sections.footer.height == 0, app.theme, &page_bar);
     }
     var body = surface.child(sections.body);
     try viewBody(app, &body);
@@ -123,31 +125,31 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     if (app.repo_picker.mode) {
         try viewRepoPicker(app, surface);
     }
-    if (app.overlay.isHelp()) {
+    if (app.overlay.isHelp() and app.overlay.visibleOn(app.active_page)) {
         try viewHelpPopup(app, surface);
     }
     if (app.commit_panel.is_open and !app.overlay.isAmendCommit()) {
         try viewCommitPanel(app, surface);
     }
-    if (app.overlay.isDiscardFile()) {
+    if (app.overlay.isDiscardFile() and app.overlay.visibleOn(app.active_page)) {
         try viewDiscardConfirmation(app, surface);
     }
-    if (app.overlay.isAmendCommit()) {
+    if (app.overlay.isAmendCommit() and app.overlay.visibleOn(app.active_page)) {
         try viewAmendConfirmation(app, surface);
     }
-    if (app.overlay.isPushBranch()) {
+    if (app.overlay.isPushBranch() and app.overlay.visibleOn(app.active_page)) {
         try viewPushConfirmation(app, surface);
     }
-    if (app.overlay.isPullBranch()) {
+    if (app.overlay.isPullBranch() and app.overlay.visibleOn(app.active_page)) {
         try viewPullConfirmation(app, surface);
     }
-    if (app.overlay.isSwitchBranch()) {
+    if (app.overlay.isSwitchBranch() and app.overlay.visibleOn(app.active_page)) {
         try viewBranchSwitchPopup(app, surface);
     }
-    if (app.overlay.isPushError()) {
+    if (app.overlay.isPushError() and app.overlay.visibleOn(app.active_page)) {
         try viewPushError(app, surface);
     }
-    if (app.overlay.isPushCredentials()) {
+    if (app.overlay.isPushCredentials() and app.overlay.visibleOn(app.active_page)) {
         try viewPushCredentials(app, surface);
     }
 }
@@ -165,26 +167,34 @@ fn shellFrameOptions(palette: theme.Palette) ui.Panel.ViewOptions {
 fn viewBody(app: Context, surface: *chasen.Surface) !void {
     return switch (app.active_page) {
         .review => review_view.view(app.review, surface),
-        .repository, .history, .config => viewPlaceholderPage(app.active_page, app.theme, surface),
+        .repository, .history, .config => viewPlaceholderPage(app.active_page, app.repo_state.activeRoot() != null, app.theme, surface),
     };
 }
 
-fn viewPageBar(active: page.Id, palette: theme.Palette, surface: *chasen.Surface) void {
-    var col: u16 = 1;
+fn viewPageBar(active: page.Id, compact: bool, palette: theme.Palette, surface: *chasen.Surface) void {
+    if (compact) {
+        const label = std.fmt.allocPrint(surface.frameAllocator(), " {s} ", .{active.label()}) catch active.label();
+        draw.copyClippedTextAt(surface, 1, 0, label, palette.boldStyle(.accent)) catch {};
+        return;
+    }
     for (page.all) |id| {
-        if (col >= surface.size().width) return;
+        const tab = page.tab(id);
+        if (tab.col >= surface.size().width) return;
         const label = std.fmt.allocPrint(surface.frameAllocator(), " {s} ", .{id.label()}) catch id.label();
-        draw.copyClippedTextAt(surface, col, 0, label, if (id == active) palette.boldStyle(.accent) else palette.style(.muted)) catch {};
-        col +|= @intCast(@min(chasen.text.displayWidth(label) + 1, std.math.maxInt(u16)));
+        draw.copyClippedTextAt(surface, tab.col, 0, label, if (id == active) palette.boldStyle(.accent) else palette.style(.muted)) catch {};
     }
 }
 
-fn viewPlaceholderPage(id: page.Id, palette: theme.Palette, surface: *chasen.Surface) void {
+fn viewPlaceholderPage(id: page.Id, has_repository: bool, palette: theme.Palette, surface: *chasen.Surface) void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
     const row = size.height / 2;
     draw.copyClippedTextAt(surface, 1, row, id.label(), palette.boldStyle(.accent)) catch {};
-    if (row + 1 < size.height) draw.copyClippedTextAt(surface, 1, row + 1, id.placeholderDescription(), palette.style(.muted)) catch {};
+    const description = if (!has_repository and (id == .repository or id == .history))
+        "Repository required"
+    else
+        id.placeholderDescription();
+    if (row + 1 < size.height) draw.copyClippedTextAt(surface, 1, row + 1, description, palette.style(.muted)) catch {};
 }
 
 fn viewFooter(app: Context, surface: *chasen.Surface) void {
@@ -192,7 +202,7 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
     if (width == 0) return;
     const review_footer = app.review.footer();
 
-    if (review_footer.file_search_mode) {
+    if (app.active_page == .review and review_footer.file_search_mode) {
         const label = "file: ";
         const label_col: u16 = 1;
         _ = surface.borrowTextAt(label_col, 0, label, app.theme.boldStyle(.prompt));
@@ -205,8 +215,8 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
         return;
     }
 
-    var footer_item_storage: [4]ui.key_hint.Item = undefined;
-    var footer_key_buffers: [4][16]u8 = undefined;
+    var footer_item_storage: [8]ui.key_hint.Item = undefined;
+    var footer_key_buffers: [8][16]u8 = undefined;
     const hint_items = footerItems(app, &footer_item_storage, &footer_key_buffers);
     const hint_width = ui.key_hint.width(hint_items, footerKeyHintOptions(app.theme));
     const hint_col = if (width > hint_width + 1) width - hint_width - 1 else 0;
@@ -220,23 +230,35 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
         }) catch return,
         .style = app.theme.style(.muted),
     });
-    if (review_footer.source_label) |label| footer_segments.append(.{
-        .text = label,
-        .style = app.theme.style(.prompt),
-        .drop_priority = .source,
-    });
-    if (review_footer.auto_reload_enabled) footer_segments.append(.{
-        .text = "auto",
-        .style = app.theme.style(.staged),
-        .drop_priority = .auto,
-    });
+    if (app.active_page == .review) {
+        if (review_footer.source_label) |label| footer_segments.append(.{
+            .text = label,
+            .style = app.theme.style(.prompt),
+            .drop_priority = .source,
+        });
+        if (review_footer.auto_reload_enabled) footer_segments.append(.{
+            .text = "auto",
+            .style = app.theme.style(.staged),
+            .drop_priority = .auto,
+        });
+        if (review_footer.activation) |activation| footer_segments.append(.{
+            .text = switch (activation) {
+                .validating => "validating",
+                .stale => "stale",
+            },
+            .style = switch (activation) {
+                .validating => app.theme.style(.prompt),
+                .stale => app.theme.style(.danger),
+            },
+        });
+    }
     if (gitActionSpinnerText(app, surface.frameAllocator())) |spinner_text| {
         footer_segments.append(.{
             .text = spinner_text,
             .style = app.theme.style(.prompt),
         });
-    } else if (app.status.text().len > 0) footer_segments.append(.{
-        .text = app.status.text(),
+    } else if (visibleStatus(app).len > 0) footer_segments.append(.{
+        .text = visibleStatus(app),
         .style = app.theme.style(.prompt),
     });
 
@@ -334,12 +356,18 @@ const FooterSegments = struct {
 
 fn gitActionSpinnerText(app: Context, allocator: std.mem.Allocator) ?[]const u8 {
     const pending = app.actions.pending orelse return null;
-    const label = if (app.status.text().len > 0)
-        app.status.text()
+    const label = if (visibleStatus(app).len > 0)
+        visibleStatus(app)
     else
         pendingActionFallbackLabel(pending.kind);
     const spinner = ui.Spinner.init(.{});
     return std.fmt.allocPrint(allocator, "{s} {s}", .{ spinner.frameAt(app.git_action_spinner_tick), label }) catch label;
+}
+
+fn visibleStatus(app: Context) []const u8 {
+    if (app.status.text().len > 0) return app.status.text();
+    if (app.page_status) |status| return status.text();
+    return "";
 }
 
 fn pendingActionFallbackLabel(kind: app_actions.ActionKind) []const u8 {
@@ -1166,8 +1194,20 @@ fn stagedSummaryText(allocator: std.mem.Allocator, summary: app_commit_panel.Sta
     };
 }
 
-fn footerItems(app: Context, storage: *[4]ui.key_hint.Item, key_buffers: *[4][16]u8) []const ui.key_hint.Item {
+fn footerItems(app: Context, storage: *[8]ui.key_hint.Item, key_buffers: *[8][16]u8) []const ui.key_hint.Item {
     var len: usize = 0;
+    if (app.active_page != .review) {
+        appendFooterItem(app, storage, key_buffers, &len, .page_review, "review");
+        appendFooterItem(app, storage, key_buffers, &len, .page_repository, "repo");
+        appendFooterItem(app, storage, key_buffers, &len, .page_history, "history");
+        appendFooterItem(app, storage, key_buffers, &len, .page_config, "config");
+        appendFooterItem(app, storage, key_buffers, &len, .repo_picker, "repository");
+        appendFooterItem(app, storage, key_buffers, &len, .reload, "reload");
+        appendFooterItem(app, storage, key_buffers, &len, .help, "help");
+        storage[len] = ui.key_hint.item("q", "quit");
+        len += 1;
+        return storage[0..len];
+    }
     if (app.review.footer().sidebar_hidden) {
         appendFooterItem(app, storage, key_buffers, &len, .toggle_sidebar, "sidebar");
     } else {
@@ -1183,8 +1223,8 @@ fn footerItems(app: Context, storage: *[4]ui.key_hint.Item, key_buffers: *[4][16
 
 fn appendFooterItem(
     app: Context,
-    storage: *[4]ui.key_hint.Item,
-    key_buffers: *[4][16]u8,
+    storage: *[8]ui.key_hint.Item,
+    key_buffers: *[8][16]u8,
     len: *usize,
     action: keymap.PublicAction,
     description: []const u8,
@@ -1204,6 +1244,17 @@ fn viewHelpPopup(app: Context, surface: *chasen.Surface) !void {
 
     _ = content.borrowTextAt(0, 0, "GitFrame shortcuts", .{ .bold = true });
     if (size.height <= 2) return;
+
+    if (app.active_page != .review) {
+        var list = content.child(.{
+            .col = 0,
+            .row = help_header_rows,
+            .width = size.width,
+            .height = size.height - help_header_rows,
+        });
+        try drawHelpSections(app, &list, &help_placeholder_sections, 0);
+        return;
+    }
 
     const body = helpBodyLayout(size);
     const total_rows = helpRenderedRows(size);
@@ -1515,6 +1566,7 @@ const ShellViewTestHarness = struct {
             .terminal_size = self.terminal_size,
             .actions = &self.actions,
             .status = &self.status,
+            .page_status = &self.review.status,
             .commit_panel = &self.commit_panel,
             .repo_picker = &self.repo_picker,
             .repo_picker_discovery = null,
@@ -1537,7 +1589,22 @@ const ShellViewTestHarness = struct {
     }
 };
 
-test "page bar and placeholder dispatch remain available behind the visibility gate" {
+test "shell notification temporarily wins over Review diagnostic" {
+    var harness: ShellViewTestHarness = .{};
+    harness.review.status.set("review diagnostic", .{});
+    var context = harness.context();
+    try std.testing.expectEqualStrings("review diagnostic", visibleStatus(context));
+
+    harness.status.set("shell notification", .{});
+    context = harness.context();
+    try std.testing.expectEqualStrings("shell notification", visibleStatus(context));
+
+    harness.status.clear();
+    context = harness.context();
+    try std.testing.expectEqualStrings("review diagnostic", visibleStatus(context));
+}
+
+test "page bar dispatch shows repository requirement for unavailable placeholders" {
     var harness: ShellViewTestHarness = .{};
     var context = harness.context();
     context.active_page = .repository;
@@ -1551,7 +1618,7 @@ test "page bar and placeholder dispatch remain available behind the visibility g
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository browser is not initialized") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository required") != null);
 }
 
 test "shell content size matches panel content surface" {
@@ -1599,7 +1666,7 @@ test "help popup uses two columns on wide content" {
 }
 
 test "help popup reserves indicator row only when content overflows" {
-    const roomy = chasen.Size{ .width = 140, .height = 40 };
+    const roomy = chasen.Size{ .width = 140, .height = 48 };
     const cramped = chasen.Size{ .width = 140, .height = 10 };
 
     try std.testing.expectEqual(@as(usize, 0), helpMaxScroll(roomy));
@@ -1721,6 +1788,10 @@ const HelpSection = struct {
 };
 
 const help_global_items = [_]HelpItem{
+    .{ .key = .{ .action = .page_review }, .description = "Review page" },
+    .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
+    .{ .key = .{ .action = .page_history }, .description = "History page" },
+    .{ .key = .{ .action = .page_config }, .description = "Config page" },
     .{ .key = .{ .text = "Tab" }, .description = "focus sidebar / diff" },
     .{ .key = .{ .action = .help }, .description = "open / close help" },
     .{ .key = .{ .text = "q" }, .description = "quit" },
@@ -1736,6 +1807,21 @@ const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .open_editor }, .description = "open selected file in editor" },
     .{ .key = .{ .text = "a / N" }, .description = "approve / needs changes in review mode" },
     .{ .key = .{ .pair = .{ .left = .first_file, .right = .last_file } }, .description = "first / last file" },
+};
+
+const help_placeholder_items = [_]HelpItem{
+    .{ .key = .{ .action = .page_review }, .description = "Review page" },
+    .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
+    .{ .key = .{ .action = .page_history }, .description = "History page" },
+    .{ .key = .{ .action = .page_config }, .description = "Config page" },
+    .{ .key = .{ .action = .repo_picker }, .description = "switch repository" },
+    .{ .key = .{ .action = .reload }, .description = "reload (not available on this page yet)" },
+    .{ .key = .{ .action = .help }, .description = "close help" },
+    .{ .key = .{ .text = "q" }, .description = "quit" },
+};
+
+const help_placeholder_sections = [_]HelpSection{
+    .{ .title = "Global", .items = &help_placeholder_items },
 };
 
 const help_sidebar_items = [_]HelpItem{

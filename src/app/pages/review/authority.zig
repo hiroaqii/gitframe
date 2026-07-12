@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const auto_reload = @import("../../auto_reload.zig");
+const page = @import("../../page.zig");
 
 pub const MemberFreshness = enum {
     pending,
@@ -94,28 +95,113 @@ pub const ActivationState = union(enum) {
         const vector = self.members() orelse return false;
         return vector.satisfies(requirements);
     }
+
+    pub fn satisfiesAction(self: ActivationState, action: Action) bool {
+        return self.satisfies(action.requirements());
+    }
 };
 
-pub fn fromCurrent(
-    repo_epoch: u64,
-    source: MemberFreshness,
-    status: auto_reload.AuxiliaryTracker,
-    branch: auto_reload.AuxiliaryTracker,
-) ActivationState {
-    return .{
-        .active = .{
-            // Review is the only reachable page in A3. C replaces this compatibility
-            // identity with a monotonically increasing activation id.
-            .activation_id = 0,
+pub const Member = enum {
+    source,
+    status,
+    branch,
+};
+
+/// Persistent Review activation owner.
+///
+/// Retained documents and reload fingerprints live outside this value. Leaving
+/// Review therefore revokes action authority without destroying last-good
+/// display state. A completion may mutate a member only when both its repo
+/// epoch and activation id still identify the current visible activation.
+pub const Lifecycle = struct {
+    state: ActivationState = .inactive,
+    next_activation_id: u64 = 0,
+    revalidation_requested: ?u64 = null,
+
+    pub fn activate(
+        self: *Lifecycle,
+        repo_epoch: u64,
+        source: MemberFreshness,
+        status: MemberFreshness,
+        branch: MemberFreshness,
+    ) u64 {
+        self.next_activation_id +%= 1;
+        if (self.next_activation_id == 0) self.next_activation_id = 1;
+        const activation_id = self.next_activation_id;
+        self.state = .{ .active = .{
+            .activation_id = activation_id,
             .repo_epoch = repo_epoch,
-            .members = .{
-                .source = source,
-                .status = auxiliaryMember(status),
-                .branch = auxiliaryMember(branch),
+            .members = .{ .source = source, .status = status, .branch = branch },
+        } };
+        self.revalidation_requested = null;
+        return activation_id;
+    }
+
+    pub fn deactivate(self: *Lifecycle) void {
+        self.state = .inactive;
+        self.revalidation_requested = null;
+    }
+
+    pub fn currentIdentity(self: Lifecycle) ?page.RequestIdentity {
+        return switch (self.state) {
+            .inactive => null,
+            .active => |active| page.RequestIdentity.review(active.repo_epoch, active.activation_id),
+        };
+    }
+
+    pub fn queueRevalidation(self: *Lifecycle) void {
+        self.revalidation_requested = switch (self.state) {
+            .inactive => null,
+            .active => |active| active.activation_id,
+        };
+    }
+
+    pub fn takeQueuedRevalidation(self: *Lifecycle) bool {
+        const requested = self.revalidation_requested orelse return false;
+        const matches = switch (self.state) {
+            .inactive => false,
+            .active => |active| active.activation_id == requested,
+        };
+        self.revalidation_requested = null;
+        return matches;
+    }
+
+    pub fn markPending(self: *Lifecycle, member: Member) void {
+        switch (self.state) {
+            .inactive => {},
+            .active => |*active| memberPtr(&active.members, member).* = .pending,
+        }
+    }
+
+    pub fn finishMember(
+        self: *Lifecycle,
+        identity: page.RequestIdentity,
+        member: Member,
+        freshness: MemberFreshness,
+    ) bool {
+        if (identity.origin != .review) return false;
+        switch (self.state) {
+            .inactive => return false,
+            .active => |*active| {
+                if (active.repo_epoch != identity.repo_epoch or active.activation_id != identity.activation_id) return false;
+                memberPtr(&active.members, member).* = freshness;
+                return true;
             },
-        },
-    };
-}
+        }
+    }
+
+    pub fn acceptsRepoEpoch(_: Lifecycle, identity: page.RequestIdentity, repo_epoch: u64) bool {
+        return identity.origin == .review and identity.repo_epoch == repo_epoch;
+    }
+
+    fn memberPtr(vector: *MemberVector, member: Member) *MemberFreshness {
+        return switch (member) {
+            .source => &vector.source,
+            .status => &vector.status,
+            .branch => &vector.branch,
+        };
+    }
+};
 
 pub fn auxiliaryMember(tracker: auto_reload.AuxiliaryTracker) MemberFreshness {
     if (tracker.isPending()) return .pending;
@@ -147,20 +233,6 @@ test "immutable source satisfies readable but not mutable authority" {
     try std.testing.expect(!vector.satisfies(.{ .source = .fresh }));
 }
 
-test "current A3 activation derives auxiliary member states" {
-    var status: auto_reload.AuxiliaryTracker = .{};
-    status.freshness = .stale_refresh;
-    var branch: auto_reload.AuxiliaryTracker = .{};
-    branch.begin(null);
-
-    const activation = fromCurrent(7, .fresh, status, branch);
-    const active = activation.active;
-    try std.testing.expectEqual(@as(u64, 0), active.activation_id);
-    try std.testing.expectEqual(@as(u64, 7), active.repo_epoch);
-    try std.testing.expectEqual(MemberFreshness.failed, active.members.status);
-    try std.testing.expectEqual(MemberFreshness.pending, active.members.branch);
-}
-
 test "action requirements do not globally couple auxiliary members" {
     try std.testing.expectEqual(
         Requirements{ .branch = .fresh },
@@ -174,4 +246,28 @@ test "action requirements do not globally couple auxiliary members" {
         Requirements{ .source = .readable },
         Action.read_diff.requirements(),
     );
+}
+
+test "lifecycle rejects completion from an older activation" {
+    var lifecycle: Lifecycle = .{};
+    const first = lifecycle.activate(4, .pending, .pending, .pending);
+    lifecycle.deactivate();
+    const second = lifecycle.activate(4, .pending, .pending, .pending);
+    try std.testing.expect(first != second);
+    try std.testing.expect(!lifecycle.finishMember(page.RequestIdentity.review(4, first), .source, .fresh));
+    try std.testing.expect(lifecycle.finishMember(page.RequestIdentity.review(4, second), .source, .fresh));
+    try std.testing.expect(lifecycle.state.satisfiesAction(.read_diff));
+}
+
+test "queued revalidation belongs to the current activation" {
+    var lifecycle: Lifecycle = .{};
+    _ = lifecycle.activate(2, .pending, .pending, .pending);
+    lifecycle.queueRevalidation();
+    try std.testing.expect(lifecycle.takeQueuedRevalidation());
+    try std.testing.expect(!lifecycle.takeQueuedRevalidation());
+
+    _ = lifecycle.activate(2, .pending, .pending, .pending);
+    lifecycle.queueRevalidation();
+    lifecycle.deactivate();
+    try std.testing.expect(!lifecycle.takeQueuedRevalidation());
 }

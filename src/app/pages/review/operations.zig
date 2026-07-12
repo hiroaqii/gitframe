@@ -189,15 +189,10 @@ pub const View = struct {
     navigation: navigation.View,
     source: diff_source.SourceMode,
     repo_root: ?[]const u8,
-    repo_epoch: u64,
+    activation_state: authority.ActivationState,
 
     pub fn activation(self: View) authority.ActivationState {
-        return authority.fromCurrent(
-            self.repo_epoch,
-            self.sourceMember(),
-            self.page.status_load,
-            self.page.branch_status_load,
-        );
+        return self.activation_state;
     }
 
     pub fn selectedSidebarActionTarget(self: View) ?git_ops.PathTarget {
@@ -220,101 +215,106 @@ pub const View = struct {
         };
     }
 
-    pub fn targetContext(self: View) git_ops.TargetContext {
-        const members = self.activation().active.members;
+    pub fn targetContext(self: View, action: authority.Action) git_ops.TargetContext {
+        const members = self.activationMembers();
+        const requirements = action.requirements();
         return .{
             .source = self.source,
             .repo_root = self.repo_root,
             .action_target = self.selectedSidebarActionTarget(),
             .status = .{
                 .repo_root = self.page.git_status.repo_root,
-                .loading = members.status == .pending,
-                .fresh = members.status == .fresh,
+                .loading = requirements.status != .unused and members.status == .pending,
+                .fresh = members.status.satisfies(requirements.status),
                 .entries = self.page.git_status.document.entries,
             },
-            .source_fresh = members.source == .fresh,
+            .source_fresh = members.source.satisfies(requirements.source),
         };
     }
 
     pub fn stageTarget(self: View) git_ops.StageTargetResult {
-        return git_ops.stageTarget(self.targetContext());
+        return git_ops.stageTarget(self.targetContext(.stage_file));
     }
 
     pub fn toggleStageTarget(self: View) git_ops.ToggleStageTargetResult {
-        return git_ops.toggleStageTarget(self.targetContext());
+        return git_ops.toggleStageTarget(self.targetContext(.stage_file));
     }
 
     pub fn unstageTarget(self: View) git_ops.UnstageTargetResult {
-        return git_ops.unstageTarget(self.targetContext());
+        return git_ops.unstageTarget(self.targetContext(.unstage_file));
     }
 
     pub fn discardTarget(self: View) git_ops.DiscardTargetResult {
-        return git_ops.discardTarget(self.targetContext());
+        return git_ops.discardTarget(self.targetContext(.discard_file));
     }
 
     pub fn pushTarget(self: View) git_ops.PushTargetResult {
-        const members = self.activation().active.members;
+        const members = self.activationMembers();
+        const requirements = authority.Action.push.requirements();
         return git_ops.pushTarget(.{
             .source = self.source,
             .repo_root = self.repo_root,
             .branch_status = .{
                 .repo_root = self.page.branch_status.repo_root,
-                .loading = members.branch == .pending,
-                .fresh = members.branch == .fresh,
+                .loading = requirements.branch != .unused and members.branch == .pending,
+                .fresh = members.branch.satisfies(requirements.branch),
                 .status = self.page.branch_status.status,
             },
         });
     }
 
     pub fn pullTarget(self: View) git_ops.PullTargetResult {
-        const members = self.activation().active.members;
+        const members = self.activationMembers();
+        const requirements = authority.Action.pull.requirements();
         return git_ops.pullTarget(.{
             .source = self.source,
             .repo_root = self.repo_root,
             .branch_status = .{
                 .repo_root = self.page.branch_status.repo_root,
-                .loading = members.branch == .pending,
-                .fresh = members.branch == .fresh,
+                .loading = requirements.branch != .unused and members.branch == .pending,
+                .fresh = members.branch.satisfies(requirements.branch),
                 .status = self.page.branch_status.status,
             },
             .status = .{
                 .repo_root = self.page.git_status.repo_root,
-                .loading = members.status == .pending,
-                .fresh = members.status == .fresh,
+                .loading = requirements.status != .unused and members.status == .pending,
+                .fresh = members.status.satisfies(requirements.status),
                 .entries = self.page.git_status.document.entries,
             },
         });
     }
 
     pub fn fetchTarget(self: View) git_ops.FetchTargetResult {
-        const members = self.activation().active.members;
+        const members = self.activationMembers();
+        const requirements = authority.Action.fetch.requirements();
         return git_ops.fetchTarget(.{
             .source = self.source,
             .repo_root = self.repo_root,
             .branch_status = .{
                 .repo_root = self.page.branch_status.repo_root,
-                .loading = members.branch == .pending,
-                .fresh = members.branch == .fresh,
+                .loading = requirements.branch != .unused and members.branch == .pending,
+                .fresh = members.branch.satisfies(requirements.branch),
                 .status = self.page.branch_status.status,
             },
         });
     }
 
     pub fn branchSwitchTarget(self: View) git_ops.BranchSwitchTargetResult {
-        const members = self.activation().active.members;
+        const members = self.activationMembers();
+        const requirements = authority.Action.switch_branch.requirements();
         return git_ops.branchSwitchTarget(.{
             .source = self.source,
             .repo_root = self.repo_root,
             .branch_status = .{
                 .repo_root = self.page.branch_status.repo_root,
-                .loading = members.branch == .pending,
-                .fresh = members.branch == .fresh,
+                .loading = requirements.branch != .unused and members.branch == .pending,
+                .fresh = members.branch.satisfies(requirements.branch),
                 .status = self.page.branch_status.status,
             },
             .status = .{
                 .repo_root = self.page.git_status.repo_root,
-                .loading = members.status == .pending,
-                .fresh = members.status == .fresh,
+                .loading = requirements.status != .unused and members.status == .pending,
+                .fresh = members.status.satisfies(requirements.status),
                 .entries = self.page.git_status.document.entries,
             },
         });
@@ -326,9 +326,8 @@ pub const View = struct {
 
     pub fn commitSummary(self: View) CommitSummary {
         if (!diff_source.sourceAllowsStageProjection(self.source)) return .unavailable;
-        if (!self.page.auto_reload.sourceIsActionable()) return .loading_or_stale;
+        if (!self.activation().satisfiesAction(.commit)) return .loading_or_stale;
         const active_root = self.repo_root orelse return .unavailable;
-        if (!self.page.status_load.isFresh()) return .loading_or_stale;
         const snapshot_root = self.page.git_status.repo_root orelse return .unavailable;
         if (!std.mem.eql(u8, active_root, snapshot_root)) return .loading_or_stale;
 
@@ -397,7 +396,7 @@ pub const View = struct {
         const can_stage = diff_source.sourceAllowsStageAction(self.source);
         const can_unstage = diff_source.sourceAllowsUnstageAction(self.source);
         if (!can_stage and !can_unstage) return .unavailable_source;
-        if (!self.page.auto_reload.sourceIsActionable()) return .stale_source;
+        if (!self.activation().satisfiesAction(.stage_hunk)) return self.hunkAuthorityFailure(.stage_hunk);
 
         const repo_root = self.repo_root orelse return .no_repo;
         if (self.currentCombinedProjection()) |bundle| {
@@ -429,7 +428,10 @@ pub const View = struct {
 
     pub fn selectedHunkStageTarget(self: View, allocator: std.mem.Allocator) HunkStageTargetResult {
         if (!diff_source.sourceAllowsStageAction(self.source)) return .unavailable_source;
-        if (!self.page.auto_reload.sourceIsActionable()) return .stale_source;
+        if (!self.activation().satisfiesAction(.stage_hunk)) return switch (self.hunkAuthorityFailure(.stage_hunk)) {
+            .stale_status => .stale_status,
+            else => .stale_source,
+        };
         const repo_root = self.repo_root orelse return .no_repo;
         if (self.currentCombinedProjection()) |bundle| {
             return self.selectedProjectedHunkStageTarget(allocator, repo_root, bundle);
@@ -463,7 +465,10 @@ pub const View = struct {
 
     pub fn selectedHunkUnstageTarget(self: View, allocator: std.mem.Allocator) HunkUnstageTargetResult {
         if (!diff_source.sourceAllowsUnstageAction(self.source)) return .unavailable_source;
-        if (!self.page.auto_reload.sourceIsActionable()) return .stale_source;
+        if (!self.activation().satisfiesAction(.unstage_hunk)) return switch (self.hunkAuthorityFailure(.unstage_hunk)) {
+            .stale_status => .stale_status,
+            else => .stale_source,
+        };
         const repo_root = self.repo_root orelse return .no_repo;
         if (self.currentCombinedProjection()) |bundle| {
             return self.selectedProjectedHunkUnstageTarget(allocator, repo_root, bundle);
@@ -572,28 +577,26 @@ pub const View = struct {
     }
 
     fn currentCombinedProjection(self: View) ?*const review_projection.CombinedHunkBundle {
-        if (self.activation().active.members.status != .fresh) return null;
+        if (!self.activation().satisfiesAction(.stage_hunk)) return null;
         const bundle = self.navigation.activeCombinedProjection() orelse return null;
         const request = self.page.review_projection.displayed.request() orelse return null;
         if (request.kind != .combined_hunks or request.status_snapshot_revision != self.page.status_snapshot_revision) return null;
         return bundle;
     }
 
-    fn sourceMember(self: View) authority.MemberFreshness {
-        if (diff_source.sourceIsOneShotInput(self.source)) {
-            return switch (self.page.load.state) {
-                .loaded, .empty => .immutable,
-                .loading => .pending,
-                .failed => .failed,
-                .idle => .unavailable,
-            };
-        }
-        if (self.page.auto_reload.sourceIsActionable()) return .fresh;
-        if (self.page.load.hasPending()) return .pending;
-        return switch (self.page.load.state) {
-            .failed => .failed,
-            else => .unavailable,
+    fn activationMembers(self: View) authority.MemberVector {
+        return self.activation().members() orelse .{
+            .source = .unavailable,
+            .status = .unavailable,
+            .branch = .unavailable,
         };
+    }
+
+    fn hunkAuthorityFailure(self: View, action: authority.Action) ToggleHunkTargetResult {
+        const requirements = action.requirements();
+        const members = self.activationMembers();
+        if (!members.source.satisfies(requirements.source)) return .stale_source;
+        return .stale_status;
     }
 };
 
@@ -797,7 +800,15 @@ fn testView(page: *const review_page.ReviewPageState, source: diff_source.Source
         },
         .source = source,
         .repo_root = "/repo",
-        .repo_epoch = 0,
+        .activation_state = .{ .active = .{
+            .activation_id = 1,
+            .repo_epoch = 0,
+            .members = .{
+                .source = if (page.auto_reload.sourceIsActionable()) .fresh else .unavailable,
+                .status = authority.auxiliaryMember(page.status_load),
+                .branch = authority.auxiliaryMember(page.branch_status_load),
+            },
+        } },
     };
 }
 

@@ -3,12 +3,14 @@ const chasen = @import("chasen");
 const keymap = @import("keymap");
 const key_input = @import("key_input.zig");
 const app_prompt = @import("prompt.zig");
+const page = @import("page.zig");
 const review_page = @import("pages/review.zig");
 const review_input = @import("pages/review/input.zig");
 
 /// Minimal snapshot needed to translate a terminal key into an App message.
 /// Keeping this small prevents input mapping from depending on full App state.
 pub const KeyContext = struct {
+    active_page: page.Id = .review,
     search_mode: bool = false,
     file_search_mode: bool = false,
     commit_panel_mode: bool = false,
@@ -140,8 +142,28 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.push_error_mode) return pushErrorKeyToMsg(Msg, key);
     if (context.push_credential_mode) return pushCredentialKeyToMsg(Msg, key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(Msg, key);
+    if (pageForKey(context.keymap, key)) |target| return payloadMsg(Msg, "switch_page", target);
+    if (context.keymap.spec(.help)) |spec| if (spec.matches(key)) return voidMsg(Msg, "open_help");
+    if (context.keymap.spec(.repo_picker)) |spec| if (spec.matches(key)) return voidMsg(Msg, "enter_repo_picker");
+    if (context.keymap.spec(.reload)) |spec| if (spec.matches(key)) return voidMsg(Msg, "reload");
+    if (key.codepoint == 'q' and !key_input.hasCommandModifier(key)) return voidMsg(Msg, "quit");
+    if (context.active_page != .review) return null;
     const review_msg = review_input.keyToMsg(context.review(), key) orelse return null;
     return translateReviewMsg(Msg, review_msg);
+}
+
+fn pageForKey(effective: keymap.Effective, key: chasen.Key) ?page.Id {
+    const bindings = [_]struct { action: keymap.PublicAction, id: page.Id }{
+        .{ .action = .page_review, .id = .review },
+        .{ .action = .page_repository, .id = .repository },
+        .{ .action = .page_history, .id = .history },
+        .{ .action = .page_config, .id = .config },
+    };
+    for (bindings) |binding| {
+        const spec = effective.spec(binding.action) orelse continue;
+        if (spec.matches(key)) return binding.id;
+    }
+    return null;
 }
 
 fn translateReviewMsg(comptime Msg: type, msg: review_input.Msg) Msg {
@@ -379,6 +401,7 @@ fn payloadMsg(comptime Msg: type, comptime tag: []const u8, payload: anytype) Ms
 
 const TestMsg = union(enum) {
     terminal_resized: chasen.Size,
+    switch_page: page.Id,
     cancel_search,
     submit_search,
     search_backspace,
@@ -507,6 +530,21 @@ const TestMsg = union(enum) {
     quit,
     reload,
 };
+
+test "normal page keys map after text and overlay precedence" {
+    try std.testing.expectEqual(TestMsg{ .switch_page = .review }, keyToMsg(TestMsg, .{}, .{ .codepoint = '1' }).?);
+    try std.testing.expectEqual(TestMsg{ .switch_page = .config }, keyToMsg(TestMsg, .{}, .{ .codepoint = '4' }).?);
+    try std.testing.expectEqual(TestMsg{ .search_insert = '2' }, keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = '2' }).?);
+    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = '3' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = '3' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = '2', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .active_page = .repository }, .{ .codepoint = 'j' }));
+
+    var config: keymap.Config = .{};
+    config.set(.page_repository, .{ .plain_codepoint = 'w' });
+    const remapped = keymap.Effective.fromConfig(config);
+    try std.testing.expectEqual(TestMsg{ .switch_page = .repository }, keyToMsg(TestMsg, .{ .keymap = remapped }, .{ .codepoint = 'w' }).?);
+    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .keymap = remapped }, .{ .codepoint = '2' }));
+}
 
 test "eventToMsg maps winsize event" {
     const msg = eventToMsg(TestMsg, .{}, .{ .winsize = .{

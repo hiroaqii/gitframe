@@ -31,6 +31,12 @@ pub const FooterView = struct {
     sidebar_hidden: bool,
     auto_reload_enabled: bool,
     source_label: ?[]const u8,
+    activation: ?ActivationPresentation,
+};
+
+pub const ActivationPresentation = enum {
+    validating,
+    stale,
 };
 
 pub const Context = struct {
@@ -73,6 +79,7 @@ pub const Context = struct {
             .sidebar_hidden = self.page.viewer.sidebar_hidden,
             .auto_reload_enabled = self.page.auto_reload.enabled(),
             .source_label = sourceFooterLabel(self.source),
+            .activation = activationPresentation(self.page, self.source),
         };
     }
 
@@ -113,6 +120,25 @@ pub const Context = struct {
     }
 };
 
+fn activationPresentation(review: *const review_page.ReviewPageState, source: diff_source.SourceMode) ?ActivationPresentation {
+    // Accepted one-shot input is immutable on re-entry and must never pretend
+    // that stdin/pager is being read a second time.
+    if (diff_source.sourceIsOneShotInput(source)) return null;
+    return switch (review.activation.state) {
+        .inactive => null,
+        .active => |active| blk: {
+            const members = active.members;
+            if (members.source == .pending or members.status == .pending or members.branch == .pending) {
+                break :blk .validating;
+            }
+            if (members.source == .failed or members.status == .failed or members.branch == .failed) {
+                break :blk .stale;
+            }
+            break :blk null;
+        },
+    };
+}
+
 fn sourceFooterLabel(source: diff_source.SourceMode) ?[]const u8 {
     return switch (source) {
         .unstaged => null,
@@ -123,6 +149,18 @@ fn sourceFooterLabel(source: diff_source.SourceMode) ?[]const u8 {
         .range => "range",
         .no_index => "difftool",
     };
+}
+
+test "reloadable activation reports validating and stale while one-shot input stays immutable" {
+    var review: review_page.ReviewPageState = .{};
+    _ = review.activation.activate(1, .pending, .pending, .pending);
+    try std.testing.expectEqual(ActivationPresentation.validating, activationPresentation(&review, .unstaged).?);
+
+    review.activation.state.active.members = .{ .source = .fresh, .status = .failed, .branch = .fresh };
+    try std.testing.expectEqual(ActivationPresentation.stale, activationPresentation(&review, .unstaged).?);
+
+    try std.testing.expect(activationPresentation(&review, .stdin) == null);
+    try std.testing.expect(activationPresentation(&review, .{ .pager = "" }) == null);
 }
 
 const StateTone = enum {

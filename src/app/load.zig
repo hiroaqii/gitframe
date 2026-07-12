@@ -1,6 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const auto_reload = @import("auto_reload.zig");
+const page = @import("page.zig");
 const diff_parser = @import("../diff/parser.zig");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
 const diff_source = @import("../diff/source.zig");
@@ -27,6 +28,7 @@ const untracked_stats_total_bytes = 4 * 1024 * 1024;
 
 /// Result payload sent from the asynchronous diff load task back to App.
 pub const DiffLoadFinished = struct {
+    identity: page.RequestIdentity,
     generation: u64,
     background_cycle_id: ?u64 = null,
     result: DiffLoadTaskResult,
@@ -39,6 +41,7 @@ pub const DiffLoadFinished = struct {
 
 /// Result payload sent from the asynchronous repository discovery task.
 pub const RepoDiscoveryFinished = struct {
+    identity: page.RequestIdentity,
     generation: u64,
     background_cycle_id: ?u64 = null,
     result: RepoDiscoveryTaskResult,
@@ -64,6 +67,7 @@ pub const RepoPathDiscoveryFinished = struct {
 
 /// Result payload sent from the asynchronous status load task.
 pub const StatusLoadFinished = struct {
+    identity: page.RequestIdentity,
     generation: u64,
     background_cycle_id: ?u64 = null,
     repo_root: []u8,
@@ -77,6 +81,7 @@ pub const StatusLoadFinished = struct {
 
 /// Result payload sent from the asynchronous branch status load task.
 pub const BranchStatusLoadFinished = struct {
+    identity: page.RequestIdentity,
     generation: u64,
     background_cycle_id: ?u64 = null,
     repo_root: []u8,
@@ -231,6 +236,7 @@ pub const LoadedDiffBundle = struct {
 /// construction stays centralized in App's Msg definition.
 pub fn RepoDiscoveryTask(comptime Msg: type) type {
     return struct {
+        identity: page.RequestIdentity,
         generation: u64,
         background_cycle_id: ?u64 = null,
 
@@ -239,6 +245,7 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
             defer allocator.destroy(task);
 
             return Msg.loadFinished(.{ .repos_discovered = RepoDiscoveryFinished{
+                .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .result = runDiscovery(allocator, io),
@@ -250,6 +257,7 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
             defer allocator.destroy(task);
 
             return Msg.loadFinished(.{ .repos_discovered = RepoDiscoveryFinished{
+                .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
@@ -322,6 +330,7 @@ pub fn runPathDiscovery(path: []const u8, allocator: std.mem.Allocator, io: std.
 
 pub fn DiffLoadTask(comptime Msg: type) type {
     return struct {
+        identity: page.RequestIdentity,
         request: LoadRequest,
         generation: u64,
         expected_fingerprint: ?auto_reload.SourceFingerprint = null,
@@ -335,6 +344,7 @@ pub fn DiffLoadTask(comptime Msg: type) type {
             }
 
             return Msg.loadFinished(.{ .diff_loaded = DiffLoadFinished{
+                .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .result = runLoadExpected(task.request, task.expected_fingerprint, allocator, io),
@@ -349,6 +359,7 @@ pub fn DiffLoadTask(comptime Msg: type) type {
             }
 
             return Msg.loadFinished(.{ .diff_loaded = DiffLoadFinished{
+                .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
@@ -359,6 +370,7 @@ pub fn DiffLoadTask(comptime Msg: type) type {
 
 pub fn StatusLoadTask(comptime Msg: type) type {
     return struct {
+        identity: page.RequestIdentity,
         repo_root: []u8,
         generation: u64,
         origin: git_backend.ReadOrigin = .foreground,
@@ -369,6 +381,7 @@ pub fn StatusLoadTask(comptime Msg: type) type {
             defer allocator.destroy(task);
 
             const result = StatusLoadFinished{
+                .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
@@ -384,6 +397,7 @@ pub fn StatusLoadTask(comptime Msg: type) type {
             defer allocator.destroy(task);
 
             const result = StatusLoadFinished{
+                .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
@@ -398,6 +412,7 @@ pub fn StatusLoadTask(comptime Msg: type) type {
 
 pub fn BranchStatusLoadTask(comptime Msg: type) type {
     return struct {
+        identity: page.RequestIdentity,
         repo_root: []u8,
         generation: u64,
         background_cycle_id: ?u64 = null,
@@ -407,6 +422,7 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
             defer allocator.destroy(task);
 
             const result = BranchStatusLoadFinished{
+                .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
@@ -422,6 +438,7 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
             defer allocator.destroy(task);
 
             const result = BranchStatusLoadFinished{
+                .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
@@ -1307,6 +1324,7 @@ test "StatusLoadTask failed preserves generation and moves repo root" {
 
     const task = try allocator.create(Task);
     task.* = .{
+        .identity = page.RequestIdentity.review(7, 11),
         .repo_root = try allocator.dupe(u8, "/repo"),
         .generation = 42,
     };
@@ -1320,6 +1338,7 @@ test "StatusLoadTask failed preserves generation and moves repo root" {
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 42), finished.generation);
+    try std.testing.expectEqual(page.RequestIdentity.review(7, 11), finished.identity);
     try std.testing.expectEqualStrings("/repo", finished.repo_root);
     try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
         .failed_static => |message| message,
@@ -1343,6 +1362,7 @@ test "DiffLoadTask failed frees request and preserves generation" {
 
     const task = try allocator.create(Task);
     task.* = .{
+        .identity = page.RequestIdentity.review(3, 5),
         .request = .{
             .source = .{ .range = try allocator.dupe(u8, "HEAD~1..HEAD") },
             .repo_root = try allocator.dupe(u8, "/repo"),
@@ -1359,6 +1379,7 @@ test "DiffLoadTask failed frees request and preserves generation" {
     defer finished.result.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 9), finished.generation);
+    try std.testing.expectEqual(page.RequestIdentity.review(3, 5), finished.identity);
     try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
         .failed_static => |message| message,
         else => return error.UnexpectedResult,
@@ -1381,6 +1402,7 @@ test "ReviewProjectionTask failed preserves request identity" {
 
     const task = try allocator.create(Task);
     task.* = .{ .request = .{
+        .identity = page.RequestIdentity.review(0, 1),
         .id = 11,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .path_key = try allocator.dupe(u8, "src/main.zig"),

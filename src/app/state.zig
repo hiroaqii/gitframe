@@ -3,6 +3,7 @@ const git_branch_status = @import("../git/branch_status.zig");
 const git_push = @import("../git/push.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const text_edit = @import("text_edit.zig");
+const page = @import("page.zig");
 
 pub const OverlayKind = enum {
     none,
@@ -29,6 +30,7 @@ pub const OverlayMouseMode = enum {
 /// closing, and future overlays do not add more primitive fields to `App`.
 pub const OverlayState = struct {
     kind: OverlayKind = .none,
+    owner_page: ?page.Id = null,
     help_scroll: usize = 0,
     push_error_scroll: usize = 0,
 
@@ -74,41 +76,58 @@ pub const OverlayState = struct {
     }
 
     pub fn openHelp(self: *OverlayState) void {
+        self.openHelpForPage(.review);
+    }
+
+    pub fn openHelpForPage(self: *OverlayState, owner_page: page.Id) void {
         self.kind = .help;
+        self.owner_page = owner_page;
         self.help_scroll = 0;
     }
 
     pub fn openDiscardFile(self: *OverlayState) void {
         self.kind = .discard_file;
+        self.owner_page = .review;
     }
 
     pub fn openAmendCommit(self: *OverlayState) void {
         self.kind = .amend_commit;
+        self.owner_page = .review;
     }
 
     pub fn openPushBranch(self: *OverlayState) void {
         self.kind = .push_branch;
+        self.owner_page = .review;
     }
 
     pub fn openPullBranch(self: *OverlayState) void {
         self.kind = .pull_branch;
+        self.owner_page = .review;
     }
 
     pub fn openSwitchBranch(self: *OverlayState) void {
         self.kind = .switch_branch;
+        self.owner_page = .review;
     }
 
     pub fn openPushError(self: *OverlayState) void {
         self.kind = .push_error;
+        self.owner_page = .review;
         self.push_error_scroll = 0;
     }
 
     pub fn openPushCredentials(self: *OverlayState) void {
         self.kind = .push_credentials;
+        self.owner_page = .review;
     }
 
     pub fn close(self: *OverlayState) void {
         self.kind = .none;
+        self.owner_page = null;
+    }
+
+    pub fn visibleOn(self: OverlayState, active_page: page.Id) bool {
+        return self.kind != .none and self.owner_page == active_page;
     }
 };
 
@@ -513,11 +532,17 @@ test "OverlayState opens help and resets its scroll" {
 
     overlay.close();
     try std.testing.expectEqual(OverlayKind.none, overlay.kind);
+    try std.testing.expect(overlay.owner_page == null);
     try std.testing.expectEqual(@as(usize, 5), overlay.help_scroll);
 
     overlay.openHelp();
     try std.testing.expectEqual(OverlayKind.help, overlay.kind);
+    try std.testing.expectEqual(page.Id.review, overlay.owner_page.?);
     try std.testing.expectEqual(@as(usize, 0), overlay.help_scroll);
+
+    overlay.openHelpForPage(.repository);
+    try std.testing.expect(overlay.visibleOn(.repository));
+    try std.testing.expect(!overlay.visibleOn(.review));
 }
 
 test "StatusMessage owns its formatted text buffer" {

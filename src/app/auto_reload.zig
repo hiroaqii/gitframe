@@ -204,6 +204,13 @@ pub const State = struct {
         if (cycle.id == cycle_id and !cycle.pending.any()) self.background_cycle = null;
     }
 
+    /// Ends scheduling ownership for work bound to a superseded repository
+    /// epoch. In-flight tasks still complete and free their payloads, but their
+    /// old cycle can no longer keep the new repository session permanently busy.
+    pub fn supersedeCycle(self: *State) void {
+        self.background_cycle = null;
+    }
+
     pub fn acceptSource(self: *State, fingerprint: SourceFingerprint) void {
         self.accepted_source = .{ .fingerprint = fingerprint };
         self.last_failure = null;

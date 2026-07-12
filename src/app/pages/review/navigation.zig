@@ -10,8 +10,9 @@ const builtin = @import("builtin");
 const chasen = @import("chasen");
 const app_direction = @import("../../direction.zig");
 const app_load = @import("../../load.zig");
+const app_page = @import("../../page.zig");
 const app_state = @import("../../state.zig");
-const shell_layout = @import("../../shell_layout.zig");
+const shell_layout = if (builtin.is_test) @import("../../shell_layout.zig") else struct {};
 const review_layout = @import("layout.zig");
 const review_projection = @import("../../review_projection.zig");
 const app_review_projection = review_projection;
@@ -780,7 +781,7 @@ pub const View = struct {
     }
 
     pub fn diffVisibleRows(self: View) usize {
-        return diff_render.visibleBodyRows(terminalBodyHeight(self.layout.height));
+        return diff_render.visibleBodyRows(self.layout.height);
     }
 
     pub fn diffPaneWidth(self: View) u16 {
@@ -1797,10 +1798,6 @@ fn contentWidth(width: u16) u16 {
     return review_layout.diffContentWidth(width);
 }
 
-fn terminalBodyHeight(content_height: u16) u16 {
-    return shell_layout.bodyHeight(content_height);
-}
-
 fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
     return review_layout.sidebarWidth(total_width, preferred_width);
 }
@@ -1870,23 +1867,23 @@ const TestHarness = struct {
     }
 
     fn controller(self: *TestHarness) Controller {
-        const content_size = shell_layout.contentSize(self.terminal_size);
+        const body_size = shell_layout.compute(self.terminal_size, .{ .page_bar_visible = true }).bodySize();
         return .{
             .page = &self.pages.review,
             .repo_root = self.repo_root,
             .source = self.source,
-            .layout = .{ .width = content_size.width, .height = content_size.height },
+            .layout = .{ .width = body_size.width, .height = body_size.height },
             .diagnostics = .{ .target = &self.status },
         };
     }
 
     fn view(self: *const TestHarness) View {
-        const content_size = shell_layout.contentSize(self.terminal_size);
+        const body_size = shell_layout.compute(self.terminal_size, .{ .page_bar_visible = true }).bodySize();
         return .{
             .page = &self.pages.review,
             .repo_root = self.repo_root,
             .source = self.source,
-            .layout = .{ .width = content_size.width, .height = content_size.height },
+            .layout = .{ .width = body_size.width, .height = body_size.height },
         };
     }
 
@@ -2019,7 +2016,7 @@ test "Review mouse selection stays on its originating diff side" {
             .display_mode = .side_by_side,
             .sidebar_hidden = true,
         },
-    }, .{ .width = 140, .height = 10 });
+    }, .{ .width = 140, .height = 11 });
 
     harness.controller().pressDiffMouse(.{
         .col = 4,
@@ -2267,7 +2264,7 @@ test "diff scroll keeps visible cursor screen position stable" {
                 .diff_scroll = 3,
             },
         } },
-        .terminal_size = .{ .width = 140, .height = 8 },
+        .terminal_size = .{ .width = 140, .height = 9 },
     };
     const old_scroll = app.pages.review.viewer.diff_scroll;
     const old_offset = old_scroll + 1;
@@ -2808,6 +2805,7 @@ test "cached preview uses displayed diff for cursor movement" {
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        app_page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -2847,6 +2845,7 @@ test "cached preview supports diff search" {
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        app_page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "a",
@@ -2890,6 +2889,7 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        app_page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "src/new.zig",
@@ -2930,6 +2930,7 @@ test "generated preview blocks diff search" {
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        app_page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "src/new.zig",
@@ -2973,6 +2974,7 @@ test "staged new file preview blocks diff search" {
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        app_page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "src/new.zig",
@@ -3016,6 +3018,7 @@ test "staged new file preview does not refresh existing search query" {
 
     const request = try app_review_projection.cloneRequest(
         std.testing.allocator,
+        app_page.RequestIdentity.review(0, 1),
         1,
         "/repo",
         "src/new.zig",

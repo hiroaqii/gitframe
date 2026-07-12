@@ -1,6 +1,7 @@
 const std = @import("std");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
 const app_load = @import("load.zig");
+const page = @import("page.zig");
 
 pub const max_generated_file_bytes = 1024 * 1024;
 
@@ -17,6 +18,7 @@ pub const SourceKind = enum {
 };
 
 pub const Request = struct {
+    identity: page.RequestIdentity,
     id: u64,
     repo_root: []u8,
     path_key: []u8,
@@ -207,6 +209,7 @@ pub const State = struct {
 
 pub fn cloneRequest(
     allocator: std.mem.Allocator,
+    identity: page.RequestIdentity,
     id: u64,
     repo_root: []const u8,
     path_key: []const u8,
@@ -219,6 +222,7 @@ pub fn cloneRequest(
     errdefer allocator.free(owned_root);
     const owned_path = try allocator.dupe(u8, path_key);
     return .{
+        .identity = identity,
         .id = id,
         .repo_root = owned_root,
         .path_key = owned_path,
@@ -278,7 +282,7 @@ test "generated file splits content lines in an owned arena" {
 }
 
 test "request matches semantic projection identity" {
-    var request = try cloneRequest(std.testing.allocator, 1, "/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20);
+    var request = try cloneRequest(std.testing.allocator, page.RequestIdentity.review(0, 1), 1, "/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20);
     defer request.deinit(std.testing.allocator);
 
     try std.testing.expect(request.matchesBorrowed("/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20));

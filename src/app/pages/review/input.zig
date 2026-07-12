@@ -154,8 +154,9 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     };
 }
 
-fn publicActionToMsg(action: keymap.PublicAction) Msg {
+fn publicActionToMsg(action: keymap.PublicAction) ?Msg {
     return switch (action) {
+        .page_review, .page_repository, .page_history, .page_config => null,
         .help => .open_help,
         .reload => .reload,
         .search => .enter_search,
