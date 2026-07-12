@@ -50,6 +50,7 @@ test {
     _ = @import("app/pages/review/update.zig");
     _ = @import("app/pages/review/view.zig");
     _ = @import("app/prompt.zig");
+    _ = @import("app/push_retry.zig");
     _ = @import("app/repo_picker.zig");
     _ = @import("app/review_projection.zig");
     _ = @import("app/state.zig");

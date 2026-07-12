@@ -80,8 +80,9 @@ pub const Context = struct {
     push_confirmation: ?app_state.PushConfirmation,
     pull_confirmation: ?app_state.PullConfirmation,
     push_error_message: ?[]const u8,
-    push_retry_target: ?app_state.PushRetryTarget,
+    push_retry_target: ?*const app_state.PushRetryTarget,
     push_retry_credentials_available: bool,
+    push_retry_inspecting: bool,
     push_credential_prompt: ?*const app_state.PushCredentialPrompt,
     branch_switch: *const app_state.BranchSwitchState,
     git_action_spinner_tick: u8,
@@ -937,7 +938,9 @@ fn viewPushError(app: Context, surface: *chasen.Surface) !void {
     }
 
     if (size.height > 0) {
-        const footer = if (app.push_retry_target != null and app.push_retry_credentials_available)
+        const footer = if (app.push_retry_inspecting)
+            "checking push target...    Enter/Esc/q: cancel"
+        else if (app.push_retry_target != null and app.push_retry_credentials_available)
             "i: interactive    c: credentials    Enter/Esc/q: close"
         else if (app.push_retry_target != null)
             "i: interactive    Enter/Esc/q: close"
@@ -1581,6 +1584,7 @@ const ShellViewTestHarness = struct {
             .push_error_message = null,
             .push_retry_target = null,
             .push_retry_credentials_available = false,
+            .push_retry_inspecting = false,
             .push_credential_prompt = null,
             .branch_switch = &self.branch_switch,
             .git_action_spinner_tick = self.git_action_spinner_tick,

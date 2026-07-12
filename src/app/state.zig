@@ -329,6 +329,24 @@ pub const PushRetryTarget = struct {
     oid: []u8,
     remote_url: ?[]u8 = null,
 
+    pub fn empty() PushRetryTarget {
+        return .{
+            .mode = .upstream,
+            .repo_root = &.{},
+            .branch = &.{},
+            .remote = &.{},
+            .remote_branch = &.{},
+            .oid = &.{},
+            .remote_url = null,
+        };
+    }
+
+    pub fn take(self: *PushRetryTarget) PushRetryTarget {
+        const owned = self.*;
+        self.* = empty();
+        return owned;
+    }
+
     pub fn deinit(self: *PushRetryTarget, allocator: std.mem.Allocator) void {
         if (self.repo_root.len > 0) allocator.free(self.repo_root);
         if (self.branch.len > 0) allocator.free(self.branch);
@@ -336,7 +354,7 @@ pub const PushRetryTarget = struct {
         if (self.remote_branch.len > 0) allocator.free(self.remote_branch);
         if (self.oid.len > 0) allocator.free(self.oid);
         if (self.remote_url) |remote_url| allocator.free(remote_url);
-        self.* = undefined;
+        self.* = empty();
     }
 };
 

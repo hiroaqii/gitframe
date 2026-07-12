@@ -23,6 +23,7 @@ const review_reload = @import("app/pages/review/reload.zig");
 const review_page_update = @import("app/pages/review/update.zig");
 const review_view = @import("app/pages/review/view.zig");
 const app_prompt = @import("app/prompt.zig");
+const app_push_retry = @import("app/push_retry.zig");
 const app_repo_picker = @import("app/repo_picker.zig");
 const app_review_projection = @import("app/review_projection.zig");
 const app_state = @import("app/state.zig");
@@ -157,18 +158,6 @@ const ActionFinishedMsg = union(enum) {
 
 const DiffLoadStartOptions = review_reload.SourceLoadOptions;
 
-const PushForegroundState = struct {
-    request_id: chasen.ForegroundCommandRequestId,
-    pending: app_actions.PendingAction,
-    origin: PageEffectOrigin,
-    target: app_state.PushRetryTarget,
-
-    fn deinit(self: *PushForegroundState, allocator: std.mem.Allocator) void {
-        self.target.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
 const ShellSurface = enum {
     push_error,
     commit_panel,
@@ -181,11 +170,7 @@ const EffectOrigin = union(enum) {
     shell_surface: ShellSurfaceOrigin,
 };
 
-const PageEffectOrigin = struct {
-    page_id: page.Id,
-    repo_epoch: u64,
-    activation_id: u64,
-};
+const PageEffectOrigin = app_push_retry.Origin;
 
 const ShellSurfaceOrigin = struct {
     surface: ShellSurface,
@@ -264,10 +249,7 @@ pub const App = struct {
     push_confirmation: ?app_state.PushConfirmation = null,
     pull_confirmation: ?app_state.PullConfirmation = null,
     push_error_message: ?[]u8 = null,
-    push_retry_target: ?app_state.PushRetryTarget = null,
-    push_retry_credentials_available: bool = false,
-    push_credential_prompt: ?*app_state.PushCredentialPrompt = null,
-    push_foreground: ?PushForegroundState = null,
+    push_retry: app_push_retry.Model = .{},
     editor_foreground_request: ?EditorForegroundState = null,
     /// Correlates shell-owned clipboard completions with semantic metadata
     /// captured at request time. Values own no storage; the map allocation is
@@ -306,6 +288,7 @@ pub const App = struct {
         switch_page: page.Id,
         load_finished: LoadFinishedMsg,
         action_finished: ActionFinishedMsg,
+        push_inspection_finished: app_push_retry.Finished,
         clipboard_copy_finished: ClipboardCopyFinished,
         review: review_message.Msg,
         cancel_commit_panel,
@@ -386,6 +369,10 @@ pub const App = struct {
             return .{ .action_finished = inner };
         }
 
+        pub fn pushInspectionFinished(inner: app_push_retry.Finished) @This() {
+            return .{ .push_inspection_finished = inner };
+        }
+
         /// Releases messages that the Chasen runtime cannot deliver to
         /// `App.update`, most notably task results completed during shutdown.
         /// Synchronous borrowed paste variants and timer/control variants own
@@ -394,10 +381,11 @@ pub const App = struct {
             switch (self.*) {
                 .load_finished => |*finished| finished.deinit(allocator),
                 .action_finished => |*finished| finished.deinit(allocator),
-                // Keep every owned async result grouped under load_finished or
-                // action_finished so their exhaustive inner deinit switches
-                // force classification. A new top-level owned variant must add
-                // an explicit arm here instead of relying on this plain case.
+                .push_inspection_finished => |*finished| finished.deinit(allocator),
+                // Most owned async results stay grouped under load_finished or
+                // action_finished so exhaustive inner switches force
+                // classification. Shell lifecycle completions with their own
+                // state machine, such as push inspection, remain explicit.
                 else => {},
             }
             self.* = undefined;
@@ -432,8 +420,7 @@ pub const App = struct {
         self.cancelAmendConfirmation(deinit_ctx.allocator);
         self.cancelPushConfirmation(deinit_ctx.allocator);
         self.cancelPullConfirmation(deinit_ctx.allocator);
-        self.cancelPushCredentialPrompt(deinit_ctx.allocator);
-        self.clearPushForeground(deinit_ctx.allocator);
+        self.push_retry.deinit(deinit_ctx.allocator);
         self.clipboard_copy_states.deinit(deinit_ctx.allocator);
         self.clearPushError(deinit_ctx.allocator);
         self.clearBranchSwitch(deinit_ctx.allocator);
@@ -530,6 +517,7 @@ pub const App = struct {
             },
             .load_finished => |finished| try self.finishLoadResult(ctx, finished),
             .action_finished => |finished| try self.finishActionResult(ctx, finished),
+            .push_inspection_finished => |finished| try self.finishPushInspection(ctx, finished),
             .clipboard_copy_finished => |finished| self.finishClipboardCopy(ctx, finished),
             .review => |review_msg| try self.updateReview(ctx, review_msg),
             .cancel_commit_panel => self.closeCommitPanel(),
@@ -721,6 +709,7 @@ pub const App = struct {
             .terminal_resized,
             .load_finished,
             .action_finished,
+            .push_inspection_finished,
             .clipboard_copy_finished,
             .auto_reload_tick,
             .focus_lost,
@@ -782,9 +771,10 @@ pub const App = struct {
             .push_confirmation = self.push_confirmation,
             .pull_confirmation = self.pull_confirmation,
             .push_error_message = self.push_error_message,
-            .push_retry_target = self.push_retry_target,
-            .push_retry_credentials_available = self.push_retry_credentials_available,
-            .push_credential_prompt = self.push_credential_prompt,
+            .push_retry_target = self.push_retry.state.availableTarget(),
+            .push_retry_credentials_available = self.push_retry.state.credentialsAvailable(),
+            .push_retry_inspecting = self.push_retry.state == .inspecting,
+            .push_credential_prompt = self.push_retry.state.credentialPrompt(),
             .branch_switch = &self.branch_switch,
             .git_action_spinner_tick = self.git_action_spinner_tick,
             .staged_summary = self.stagedSummaryForActiveRepo(),
@@ -1013,7 +1003,7 @@ pub const App = struct {
             .branch_switch = self.overlay.isSwitchBranch(),
             .push_error = self.overlay.isPushError(),
             .git_action = app_git_requests.hasPendingAction(self.actions),
-            .foreground_command = self.push_foreground != null or self.editor_foreground_request != null,
+            .foreground_command = self.push_retry.state.hasForeground() or self.editor_foreground_request != null,
             .live_review_waiter = if (self.review_output) |output| !output.ready else false,
             .teardown = self.teardown_requested,
         };
@@ -2456,18 +2446,24 @@ pub const App = struct {
     fn setPushErrorWithRetry(self: *App, allocator: std.mem.Allocator, message: []const u8, retry_target: ?app_state.PushRetryTarget, credentials_available: bool) !void {
         self.clearPushError(allocator);
         self.push_error_message = try allocator.dupe(u8, message);
-        self.push_retry_target = retry_target;
-        self.push_retry_credentials_available = retry_target != null and credentials_available;
+        if (retry_target) |target| {
+            self.push_retry.state = .{ .available = .{
+                .target = target,
+                .credentials_available = credentials_available,
+            } };
+        }
         self.reviewNavigation().clearDiffSelection();
         self.overlay.openPushError();
     }
 
     fn clearPushError(self: *App, allocator: std.mem.Allocator) void {
+        self.clearPushErrorPresentation(allocator);
+        self.push_retry.state.deinit(allocator);
+    }
+
+    fn clearPushErrorPresentation(self: *App, allocator: std.mem.Allocator) void {
         if (self.push_error_message) |message| allocator.free(message);
         self.push_error_message = null;
-        if (self.push_retry_target) |*target| target.deinit(allocator);
-        self.push_retry_target = null;
-        self.push_retry_credentials_available = false;
         if (self.overlay.isPushError()) self.overlay.close();
     }
 
@@ -2477,27 +2473,164 @@ pub const App = struct {
         if (self.overlay.isSwitchBranch()) self.overlay.close();
     }
 
-    fn takePushRetryTarget(self: *App) ?app_state.PushRetryTarget {
-        // Retry flows move the failed push snapshot out of the error popup.
-        // The popup must stop owning it first; otherwise close/cancel paths can
-        // double free the same branch/oid snapshot after another state owns it.
-        const target = self.push_retry_target orelse return null;
-        self.push_retry_target = null;
-        self.push_retry_credentials_available = false;
-        return target;
-    }
-
     fn restorePushRetryTarget(self: *App, allocator: std.mem.Allocator, target: app_state.PushRetryTarget, credentials_available: bool) void {
-        if (self.push_retry_target) |*existing| existing.deinit(allocator);
-        self.push_retry_target = target;
-        self.push_retry_credentials_available = credentials_available;
+        self.push_retry.restoreAvailable(allocator, target, credentials_available);
         self.reviewNavigation().clearDiffSelection();
         self.overlay.openPushError();
     }
 
     fn clearPushForeground(self: *App, allocator: std.mem.Allocator) void {
-        if (self.push_foreground) |*foreground| foreground.deinit(allocator);
-        self.push_foreground = null;
+        if (self.push_retry.state == .foreground) self.push_retry.state.deinit(allocator);
+    }
+
+    fn startPushInspection(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        kind: app_push_retry.InspectionKind,
+        unavailable_message: []const u8,
+    ) !void {
+        if (self.push_retry.state == .inspecting) {
+            self.setReviewStatus("push retry inspection already running", .{});
+            return;
+        }
+        var started = self.push_retry.beginInspection(kind, self.reviewPageEffectOrigin()) orelse {
+            self.setReviewStatus("{s}", .{unavailable_message});
+            return;
+        };
+
+        app_push_retry.startInspection(
+            Msg,
+            ctx,
+            started.metadata,
+            &started.target,
+            started.credentials_available,
+        ) catch |err| {
+            self.restorePushRetryTarget(ctx.allocator(), started.target.take(), started.credentials_available);
+            self.setReviewStatus("could not start push retry inspection", .{});
+            return err;
+        };
+        switch (kind) {
+            .verify_snapshot => self.setReviewStatus("checking push retry target...", .{}),
+            .lookup_remote => self.setReviewStatus("reading push remote URL...", .{}),
+        }
+    }
+
+    fn finishPushInspection(self: *App, ctx: *chasen.Ctx(Msg), finished: app_push_retry.Finished) !void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+
+        const inspecting = switch (self.push_retry.state) {
+            .inspecting => |inspecting| inspecting,
+            else => return,
+        };
+        if (!inspecting.accepts(result)) return;
+        self.push_retry.state = .idle;
+
+        // Repository supersession invalidates an otherwise matching task. The
+        // returned target remains result-owned and is released by the defer.
+        if (result.repo_epoch != self.repo_epoch) return;
+
+        const diagnostic_origin: EffectOrigin = .{ .page = result.origin };
+        // A matching inactive Review instance may retain its diagnostic, but a
+        // later activation is a distinct semantic owner. Direct/future routes
+        // must not open a prompt or foreground process in that newer instance.
+        if (!self.effectOriginIsLive(diagnostic_origin)) {
+            self.clearPushErrorPresentation(ctx.allocator());
+            return;
+        }
+        switch (result.outcome) {
+            .snapshot_valid => {
+                if (result.kind != .verify_snapshot) {
+                    self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
+                    self.setEffectStatus(diagnostic_origin, "push retry inspection returned an invalid result", .{});
+                } else {
+                    try self.startInteractivePushAfterInspection(ctx, result.origin, result.target.take(), result.credentials_available);
+                }
+            },
+            .snapshot_changed => {
+                self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
+                self.setEffectStatus(diagnostic_origin, "push retry unavailable: branch changed; reload and try again", .{});
+            },
+            .remote_ready => {
+                if (result.kind != .lookup_remote or result.target.remote_url == null) {
+                    self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
+                    self.setEffectStatus(diagnostic_origin, "push retry inspection returned an invalid remote", .{});
+                } else {
+                    const prompt = ctx.allocator().create(app_state.PushCredentialPrompt) catch |err| {
+                        self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
+                        self.setEffectStatus(diagnostic_origin, "could not open push credential prompt", .{});
+                        return err;
+                    };
+                    prompt.* = .{ .target = result.target.take() };
+                    self.push_retry.state = .{ .credential_prompt = prompt };
+                    self.clearPushErrorPresentation(ctx.allocator());
+                    self.reviewNavigation().clearDiffSelection();
+                    self.overlay.openPushCredentials();
+                }
+            },
+            .remote_not_https => {
+                self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
+                self.setEffectStatus(diagnostic_origin, "credential prompt is only available for HTTPS remotes", .{});
+            },
+            .inspection_failed => |message| {
+                self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
+                self.setEffectStatus(diagnostic_origin, "{s}", .{message});
+            },
+        }
+        if (self.active_page != result.origin.page_id) ctx.redraw().skip();
+    }
+
+    fn startInteractivePushAfterInspection(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        origin: PageEffectOrigin,
+        owned_target: app_state.PushRetryTarget,
+        credentials_available: bool,
+    ) !void {
+        var target = owned_target;
+        errdefer target.deinit(ctx.allocator());
+
+        if (app_git_requests.hasPendingAction(self.actions)) {
+            self.restorePushRetryTarget(ctx.allocator(), target.take(), credentials_available);
+            self.setEffectStatus(.{ .page = origin }, "another git action is running", .{});
+            return;
+        }
+
+        // Use the snapshotted commit as the refspec source. A branch-name
+        // source can be resolved by Git after a prompt and would weaken the
+        // inspection guarantee.
+        const refspec = std.fmt.allocPrint(ctx.allocator(), "{s}:refs/heads/{s}", .{ target.oid, target.remote_branch }) catch |err| {
+            self.restorePushRetryTarget(ctx.allocator(), target.take(), credentials_available);
+            return err;
+        };
+        defer ctx.allocator().free(refspec);
+
+        const argv = [_][]const u8{ "git", "push", target.remote, refspec };
+        const pending = self.actions.begin(.push);
+        const request_id = ctx.terminal().runForegroundCommand(.{
+            .argv = &argv,
+            .cwd = target.repo_root,
+            .finished = pushForegroundDone,
+        }) catch |err| {
+            _ = self.actions.finish(pending);
+            self.restorePushRetryTarget(ctx.allocator(), target.take(), credentials_available);
+            switch (err) {
+                error.ForegroundCommandLimitExceeded => self.setEffectStatus(.{ .page = origin }, "interactive push already queued", .{}),
+                error.ForegroundCommandEmptyArgv => self.setEffectStatus(.{ .page = origin }, "interactive push command is empty", .{}),
+                error.OutOfMemory => return err,
+            }
+            return;
+        };
+
+        self.push_retry.state = .{ .foreground = .{
+            .request_id = request_id,
+            .pending = pending,
+            .origin = origin,
+            .target = target.take(),
+        } };
+        const foreground = &self.push_retry.state.foreground;
+        self.clearPushErrorPresentation(ctx.allocator());
+        self.setEffectStatus(.{ .page = origin }, "running interactive push: {s} -> {s}/{s}", .{ foreground.target.branch, foreground.target.remote, foreground.target.remote_branch });
     }
 
     fn runInteractivePush(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -2505,122 +2638,31 @@ pub const App = struct {
             self.setReviewStatus("another git action is running", .{});
             return;
         }
-
-        const current_target = self.push_retry_target orelse {
-            self.setReviewStatus("interactive push retry is not available for this failure", .{});
-            return;
-        };
-
-        // Foreground push can wait on a human prompt. Recheck before handing
-        // control to Git so an old push-error popup cannot target a branch that
-        // has already moved.
-        const snapshot_ok = verifyPushRetrySnapshot(ctx.allocator(), ctx.io(), current_target) catch {
-            self.setReviewStatus("could not verify push retry target", .{});
-            return;
-        };
-        if (!snapshot_ok) {
-            self.setReviewStatus("push retry unavailable: branch changed; reload and try again", .{});
-            return;
-        }
-
-        const credentials_available = self.push_retry_credentials_available;
-        const target = self.takePushRetryTarget() orelse {
-            self.setReviewStatus("interactive push retry target is no longer available", .{});
-            return;
-        };
-
-        // Use the snapshotted commit as the refspec source. A branch-name
-        // source can be resolved by Git after SSH/credential prompts, which
-        // would let prompt-time commits change what gets pushed. Because
-        // `--set-upstream` only associates local branch sources, foreground
-        // retries intentionally omit it even for set-upstream push targets.
-        const refspec = std.fmt.allocPrint(ctx.allocator(), "{s}:refs/heads/{s}", .{ target.oid, target.remote_branch }) catch |err| {
-            self.restorePushRetryTarget(ctx.allocator(), target, credentials_available);
-            return err;
-        };
-        defer ctx.allocator().free(refspec);
-
-        const argv = [_][]const u8{ "git", "push", target.remote, refspec };
-        const pending = self.actions.begin(.push);
-        // Chasen connects foreground commands directly to /dev/tty and returns
-        // only an exit outcome. That is intentional for this escape hatch:
-        // passphrases and helper prompts stay outside GitFrame state.
-        const request_id = ctx.terminal().runForegroundCommand(.{
-            .argv = &argv,
-            .cwd = target.repo_root,
-            .finished = pushForegroundDone,
-        }) catch |err| {
-            _ = self.actions.finish(pending);
-            // Queue failure means Git never ran, so keep the original failed
-            // push snapshot available for another retry instead of dropping it.
-            self.restorePushRetryTarget(ctx.allocator(), target, credentials_available);
-            switch (err) {
-                error.ForegroundCommandLimitExceeded => self.setReviewStatus("interactive push already queued", .{}),
-                error.ForegroundCommandEmptyArgv => self.setReviewStatus("interactive push command is empty", .{}),
-                error.OutOfMemory => return err,
-            }
-            return;
-        };
-
-        self.push_foreground = .{
-            .request_id = request_id,
-            .pending = pending,
-            .origin = self.reviewPageEffectOrigin(),
-            .target = target,
-        };
-        self.clearPushError(ctx.allocator());
-        self.setReviewStatus("running interactive push: {s} -> {s}/{s}", .{ target.branch, target.remote, target.remote_branch });
+        try self.startPushInspection(ctx, .verify_snapshot, "interactive push retry is not available for this failure");
     }
 
     fn openPushCredentialPrompt(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        if (!self.push_retry_credentials_available) {
+        if (!self.push_retry.state.credentialsAvailable()) {
             self.setReviewStatus("credential retry is not available for this push failure", .{});
             return;
         }
-
-        var target = self.takePushRetryTarget() orelse {
-            self.setReviewStatus("credential retry target is no longer available", .{});
-            return;
-        };
-        errdefer target.deinit(ctx.allocator());
-
-        const remote_url = getRemoteUrl(ctx.allocator(), ctx.io(), target.repo_root, target.remote) catch {
-            self.setReviewStatus("could not read push remote URL", .{});
-            target.deinit(ctx.allocator());
-            return;
-        };
-        errdefer ctx.allocator().free(remote_url);
-
-        if (!isHttpRemoteUrl(remote_url)) {
-            self.setReviewStatus("credential prompt is only available for HTTPS remotes", .{});
-            ctx.allocator().free(remote_url);
-            target.deinit(ctx.allocator());
-            return;
-        }
-
-        // Prompt state owns the original push snapshot so retry does not depend
-        // on whatever repository or branch is active by the time the user types
-        // credentials. The backend rechecks this oid immediately before push.
-        target.remote_url = remote_url;
-        const prompt = try ctx.allocator().create(app_state.PushCredentialPrompt);
-        prompt.* = .{ .target = target };
-        self.cancelPushCredentialPrompt(ctx.allocator());
-        self.push_credential_prompt = prompt;
-        self.reviewNavigation().clearDiffSelection();
-        self.overlay.openPushCredentials();
+        try self.startPushInspection(ctx, .lookup_remote, "credential retry target is no longer available");
     }
 
     fn cancelPushCredentialPrompt(self: *App, allocator: std.mem.Allocator) void {
-        if (self.push_credential_prompt) |prompt| {
-            prompt.deinit(allocator);
-            allocator.destroy(prompt);
-        }
-        self.push_credential_prompt = null;
+        if (self.push_retry.state == .credential_prompt) self.push_retry.state.deinit(allocator);
         if (self.overlay.isPushCredentials()) self.overlay.close();
     }
 
+    fn mutablePushCredentialPrompt(self: *App) ?*app_state.PushCredentialPrompt {
+        return switch (self.push_retry.state) {
+            .credential_prompt => |prompt| prompt,
+            else => null,
+        };
+    }
+
     fn activePushCredentialInput(self: *App) ?*app_state.SecretInput {
-        const prompt = self.push_credential_prompt orelse return null;
+        const prompt = self.mutablePushCredentialPrompt() orelse return null;
         return switch (prompt.active_field) {
             .username => &prompt.username,
             .password => &prompt.password,
@@ -2628,7 +2670,7 @@ pub const App = struct {
     }
 
     fn togglePushCredentialField(self: *App) void {
-        const prompt = self.push_credential_prompt orelse return;
+        const prompt = self.mutablePushCredentialPrompt() orelse return;
         prompt.active_field = switch (prompt.active_field) {
             .username => .password,
             .password => .username,
@@ -2665,7 +2707,7 @@ pub const App = struct {
     }
 
     fn submitPushCredentials(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        const prompt = self.push_credential_prompt orelse return;
+        const prompt = self.mutablePushCredentialPrompt() orelse return;
         if (prompt.active_field == .username) {
             prompt.active_field = .password;
             return;
@@ -2699,90 +2741,14 @@ pub const App = struct {
         username = &.{};
         password = &.{};
 
-        var target = prompt.target;
-        prompt.target = .{
-            .mode = .upstream,
-            .repo_root = &.{},
-            .branch = &.{},
-            .remote = &.{},
-            .remote_branch = &.{},
-            .oid = &.{},
-            .remote_url = prompt.target.remote_url,
-        };
-        prompt.target.remote_url = null;
+        var target = prompt.target.take();
         self.setReviewStatus("retrying push with credentials: {s} -> {s}/{s}", .{ target.branch, target.remote, target.remote_branch });
         self.cancelPushCredentialPrompt(ctx.allocator());
-        self.clearPushError(ctx.allocator());
 
         app_git_requests.startCredentialedPush(Msg, ctx, &self.actions, self.env_map, &target, &credentials) catch |err| {
             target.deinit(ctx.allocator());
             return err;
         };
-    }
-
-    fn getRemoteUrl(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, remote: []const u8) ![]u8 {
-        const argv = [_][]const u8{ "git", "remote", "get-url", remote };
-        const result = try std.process.run(allocator, io, .{
-            .argv = &argv,
-            .cwd = .{ .path = repo_root },
-            .stdout_limit = .limited(64 * 1024),
-            .stderr_limit = .limited(64 * 1024),
-        });
-        defer allocator.free(result.stderr);
-
-        switch (result.term) {
-            .exited => |code| if (code == 0) {
-                const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
-                const remote_url = try allocator.dupe(u8, trimmed);
-                allocator.free(result.stdout);
-                return remote_url;
-            },
-            else => {},
-        }
-        allocator.free(result.stdout);
-        return error.RemoteUrlUnavailable;
-    }
-
-    fn isHttpRemoteUrl(remote_url: []const u8) bool {
-        return std.mem.startsWith(u8, remote_url, "https://") or std.mem.startsWith(u8, remote_url, "http://");
-    }
-
-    fn verifyPushRetrySnapshot(allocator: std.mem.Allocator, io: std.Io, target: app_state.PushRetryTarget) !bool {
-        // The foreground refspec pushes the original oid, but still require the
-        // local branch to match the failed push snapshot before opening the
-        // terminal. Otherwise the user could approve an old popup while looking
-        // at a newer branch state.
-        const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
-        const branch_result = try std.process.run(allocator, io, .{
-            .argv = &branch_argv,
-            .cwd = .{ .path = target.repo_root },
-            .stdout_limit = .limited(64 * 1024),
-            .stderr_limit = .limited(64 * 1024),
-        });
-        defer allocator.free(branch_result.stdout);
-        defer allocator.free(branch_result.stderr);
-        switch (branch_result.term) {
-            .exited => |code| if (code != 0) return false,
-            else => return false,
-        }
-        if (!std.mem.eql(u8, std.mem.trim(u8, branch_result.stdout, " \t\r\n"), target.branch)) return false;
-
-        // Full HEAD oid equality keeps the retry bound to the commit that
-        // failed previously. Detached HEAD and unreadable refs fail closed.
-        const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
-        const oid_result = try std.process.run(allocator, io, .{
-            .argv = &oid_argv,
-            .cwd = .{ .path = target.repo_root },
-            .stdout_limit = .limited(64 * 1024),
-            .stderr_limit = .limited(64 * 1024),
-        });
-        defer allocator.free(oid_result.stdout);
-        defer allocator.free(oid_result.stderr);
-        switch (oid_result.term) {
-            .exited => |code| if (code != 0) return false,
-            else => return false,
-        }
-        return std.mem.eql(u8, std.mem.trim(u8, oid_result.stdout, " \t\r\n"), target.oid);
     }
 
     pub fn stagedSummaryForActiveRepo(self: *const App) app_commit_panel.StagedSummary {
@@ -3204,9 +3170,12 @@ pub const App = struct {
     }
 
     fn finishPushForeground(self: *App, ctx: *chasen.Ctx(Msg), result: chasen.ForegroundCommandResult) !void {
-        var foreground = self.push_foreground orelse return;
+        var foreground = switch (self.push_retry.state) {
+            .foreground => |foreground| foreground,
+            else => return,
+        };
         if (foreground.request_id.id != result.request_id.id) return;
-        self.push_foreground = null;
+        self.push_retry.state = .idle;
         defer foreground.deinit(ctx.allocator());
 
         if (!self.actions.finish(foreground.pending)) return;
@@ -3956,9 +3925,14 @@ pub const App = struct {
     /// fresh authority to the old display.
     fn invalidateReviewForRepoChange(self: *App, allocator: ?std.mem.Allocator) void {
         if (allocator) |owner| {
+            switch (self.push_retry.state) {
+                .available, .inspecting, .credential_prompt => self.clearPushError(owner),
+                .idle, .foreground => {},
+            }
             self.reviewReload().clearPendingReload(owner);
             self.reviewNavigation().clearPendingSelectionRestore(owner);
         } else {
+            std.debug.assert(self.push_retry.state == .idle or self.push_retry.state == .foreground);
             std.debug.assert(self.pages.review.pending_reload == null);
             std.debug.assert(self.pages.review.pending_selection_restore == null);
         }
@@ -6257,6 +6231,20 @@ fn setupPushRetryRepoForTest(allocator: std.mem.Allocator, io: std.Io, tmp: *std
     return .{ .repo_root = repo_root, .oid = oid };
 }
 
+fn runOnlyPushInspectionTaskForTest(app: *App, ctx: *chasen.Ctx(App.Msg), io: std.Io) !void {
+    const pending = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    const msg = pending[0].run(pending[0].ctx, ctx.allocator(), io);
+    try app.update(msg, ctx);
+}
+
+fn deinitOnlyPushInspectionTaskForTest(ctx: *chasen.Ctx(App.Msg), io: std.Io) !void {
+    const pending = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    var msg = pending[0].run(pending[0].ctx, ctx.allocator(), io);
+    msg.deinitUndelivered(ctx.allocator());
+}
+
 fn runAppTestGit(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !void {
     const result = try std.process.run(allocator, io, .{
         .argv = argv,
@@ -7671,10 +7659,10 @@ test "finishPush failed preserves retry target oid for credential prompt" {
         .result = .{ .failed = try std.testing.allocator.dupe(u8, "fatal: could not read Username for 'https://host': terminal prompts disabled") },
     });
 
-    const target = app.push_retry_target orelse return error.ExpectedPushRetryTarget;
+    const target = app.push_retry.state.availableTarget() orelse return error.ExpectedPushRetryTarget;
     try std.testing.expectEqual(git_ops.PushMode.set_upstream, target.mode);
     try std.testing.expectEqualStrings("abc123", target.oid);
-    try std.testing.expect(app.push_retry_credentials_available);
+    try std.testing.expect(app.push_retry.state.credentialsAvailable());
 }
 
 test "clearPushError frees retained retry target" {
@@ -7691,8 +7679,7 @@ test "clearPushError frees retained retry target" {
     app.clearPushError(std.testing.allocator);
 
     try std.testing.expect(app.push_error_message == null);
-    try std.testing.expect(app.push_retry_target == null);
-    try std.testing.expect(!app.push_retry_credentials_available);
+    try std.testing.expect(app.push_retry.state == .idle);
 }
 
 test "runInteractivePush rejects while another action is pending" {
@@ -7715,9 +7702,237 @@ test "runInteractivePush rejects while another action is pending" {
     const pending = app.actions.pending orelse return error.ExpectedPendingAction;
     try std.testing.expectEqual(@as(u64, 7), pending.generation);
     try std.testing.expectEqual(app_actions.ActionKind.stage_file, pending.kind);
-    try std.testing.expect(app.push_retry_target != null);
+    try std.testing.expect(app.push_retry.state.availableTarget() != null);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
+}
+
+test "push retry inspection rejects duplicate requests without losing task ownership" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    defer app.clearPushError(allocator);
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, "/missing/repo"),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+    }, true);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+
+    try app.runInteractivePush(&ctx);
+    try app.runInteractivePush(&ctx);
+
+    try std.testing.expect(app.push_retry.state == .inspecting);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    try std.testing.expectEqualStrings("push retry inspection already running", app.pages.review.status.text());
+
+    app.clearPushError(allocator);
+    try deinitOnlyPushInspectionTaskForTest(&ctx, std.testing.io);
+}
+
+test "push retry inspection spawn rollback restores the sole target" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    defer app.clearPushError(allocator);
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+    }, true);
+    var ctx: chasen.Ctx(App.Msg) = .{
+        ._allocator = allocator,
+        ._io = std.testing.io,
+        ._pending_tasks_with_len = 16,
+    };
+
+    try std.testing.expectError(error.TaskLimitExceeded, app.runInteractivePush(&ctx));
+    ctx._pending_tasks_with_len = 0;
+
+    const restored = app.push_retry.state.availableTarget() orelse return error.ExpectedPushRetryTarget;
+    try std.testing.expectEqualStrings("abc123", restored.oid);
+    try std.testing.expect(app.push_retry.state.credentialsAvailable());
+    try std.testing.expectEqualStrings("could not start push retry inspection", app.pages.review.status.text());
+}
+
+test "closing push error invalidates an in-flight inspection result" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, "/missing/repo"),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+    }, false);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+
+    try app.runInteractivePush(&ctx);
+    app.clearPushError(allocator);
+    try runOnlyPushInspectionTaskForTest(&app, &ctx, std.testing.io);
+
+    try std.testing.expect(app.push_retry.state == .idle);
+    try std.testing.expect(app.push_error_message == null);
+    try std.testing.expect(!app.overlay.isPushError());
+}
+
+test "repository supersession invalidates an in-flight push inspection" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    defer app.repo_state.deinit(allocator);
+    try std.testing.expect(app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, "/repo/a"),
+        0,
+        .external_selection,
+    ));
+    _ = app.activateReview();
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, "/missing/repo"),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+    }, false);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+
+    try app.runInteractivePush(&ctx);
+    try std.testing.expect(app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, "/repo/b"),
+        0,
+        .external_selection,
+    ));
+    try runOnlyPushInspectionTaskForTest(&app, &ctx, std.testing.io);
+
+    try std.testing.expect(app.push_retry.state == .idle);
+    try std.testing.expectEqualStrings("/repo/b", app.activeRepoRoot().?);
+    try std.testing.expect(app.push_error_message == null);
+}
+
+test "undelivered push inspection completion releases its returned target" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    defer app.clearPushError(allocator);
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, "/missing/repo"),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+    }, false);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+
+    try app.runInteractivePush(&ctx);
+    try deinitOnlyPushInspectionTaskForTest(&ctx, std.testing.io);
+
+    // The App retains only non-owning correlation metadata until its own
+    // teardown; the undelivered Msg was the sole owner of the returned target.
+    try std.testing.expect(app.push_retry.state == .inspecting);
+}
+
+test "direct root quit remains allowed while push inspection is running" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    defer app.clearPushError(allocator);
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, "/missing/repo"),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+    }, false);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+
+    try app.runInteractivePush(&ctx);
+    try app.update(.quit, &ctx);
+
+    try std.testing.expect(ctx.shouldQuit());
+    try std.testing.expect(app.push_retry.state == .inspecting);
+    try deinitOnlyPushInspectionTaskForTest(&ctx, std.testing.io);
+}
+
+test "push inspection surface blocks page switching until canceled" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    defer app.clearPushError(allocator);
+    _ = app.activateReview();
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, "/missing/repo"),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+    }, false);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+
+    try app.runInteractivePush(&ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx);
+
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqualStrings("close push error before switching pages", app.status.text());
+    app.clearPushError(allocator);
+    try deinitOnlyPushInspectionTaskForTest(&ctx, std.testing.io);
+}
+
+test "inactive Review accepts push inspection diagnostic without redraw" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    defer app.clearPushError(allocator);
+    _ = app.activateReview();
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, "/missing/repo"),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+    }, false);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+
+    try app.runInteractivePush(&ctx);
+    app.active_page = .repository;
+    try runOnlyPushInspectionTaskForTest(&app, &ctx, std.testing.io);
+
+    try std.testing.expect(app.push_retry.state.availableTarget() != null);
+    try std.testing.expectEqualStrings("could not verify push retry target", app.pages.review.status.text());
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "Review reactivation discards an old push inspection completion" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    defer app.clearPushError(allocator);
+    _ = app.activateReview();
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, "/missing/repo"),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+    }, false);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+
+    try app.runInteractivePush(&ctx);
+    app.pages.review.activation.deactivate();
+    _ = app.activateReview();
+    app.setReviewStatus("new Review activation", .{});
+    try runOnlyPushInspectionTaskForTest(&app, &ctx, std.testing.io);
+
+    try std.testing.expect(app.push_retry.state == .idle);
+    try std.testing.expectEqualStrings("new Review activation", app.pages.review.status.text());
+    try std.testing.expect(app.push_error_message == null);
+    try std.testing.expect(!app.overlay.isPushError());
 }
 
 test "runInteractivePush queues foreground oid refspec and owns retry target" {
@@ -7745,12 +7960,14 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
 
     try app.runInteractivePush(&ctx);
 
+    try std.testing.expect(app.push_retry.state == .inspecting);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
+
     try std.testing.expect(app.push_error_message == null);
-    try std.testing.expect(app.push_retry_target == null);
-    try std.testing.expect(!app.push_retry_credentials_available);
-    try std.testing.expect(app.push_foreground != null);
-    try std.testing.expectEqual(page.Id.review, app.push_foreground.?.origin.page_id);
-    try std.testing.expectEqual(app.repo_epoch, app.push_foreground.?.origin.repo_epoch);
+    try std.testing.expect(app.push_retry.state == .foreground);
+    try std.testing.expectEqual(page.Id.review, app.push_retry.state.foreground.origin.page_id);
+    try std.testing.expectEqual(app.repo_epoch, app.push_retry.state.foreground.origin.repo_epoch);
     try std.testing.expect(app.actions.pending != null);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_foreground_commands_len);
 
@@ -7801,11 +8018,11 @@ test "runInteractivePush keeps retry target when foreground queue is full" {
     }, true);
 
     try app.runInteractivePush(&ctx);
+    try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
 
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(app.push_foreground == null);
-    try std.testing.expect(app.push_retry_target != null);
-    try std.testing.expect(app.push_retry_credentials_available);
+    try std.testing.expect(app.push_retry.state.availableTarget() != null);
+    try std.testing.expect(app.push_retry.state.credentialsAvailable());
     try std.testing.expect(app.overlay.isPushError());
     try std.testing.expectEqualStrings("interactive push already queued", app.pages.review.status.text());
 }
@@ -7833,10 +8050,11 @@ test "runInteractivePush stale snapshot does not queue foreground command" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
 
     try app.runInteractivePush(&ctx);
+    try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(app.push_retry_target != null);
+    try std.testing.expect(app.push_retry.state.availableTarget() != null);
     try std.testing.expectEqualStrings("push retry unavailable: branch changed; reload and try again", app.pages.review.status.text());
 }
 
@@ -7852,7 +8070,7 @@ test "finishPushForeground reloads matching active repo after failure" {
     };
     _ = app.activateReview();
     const pending = app.actions.begin(.push);
-    app.push_foreground = .{
+    app.push_retry.state = .{ .foreground = .{
         .request_id = .{ .id = 9 },
         .pending = pending,
         .origin = .{ .page_id = .review, .repo_epoch = app.repo_epoch, .activation_id = app.pages.review.activation.next_activation_id },
@@ -7864,7 +8082,7 @@ test "finishPushForeground reloads matching active repo after failure" {
             .remote_branch = try allocator.dupe(u8, "main"),
             .oid = try allocator.dupe(u8, "abc123"),
         },
-    };
+    } };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
@@ -7874,7 +8092,7 @@ test "finishPushForeground reloads matching active repo after failure" {
     });
 
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(app.push_foreground == null);
+    try std.testing.expect(app.push_retry.state == .idle);
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
     try std.testing.expectEqualStrings("interactive push exited: 1", app.pages.review.status.text());
 }
@@ -7886,7 +8104,7 @@ test "finishPushForeground ignores stale request id" {
     defer app.actions.clear();
 
     const pending = app.actions.begin(.push);
-    app.push_foreground = .{
+    app.push_retry.state = .{ .foreground = .{
         .request_id = .{ .id = 2 },
         .pending = pending,
         .origin = .{ .page_id = .review, .repo_epoch = app.repo_epoch, .activation_id = app.pages.review.activation.next_activation_id },
@@ -7898,7 +8116,7 @@ test "finishPushForeground ignores stale request id" {
             .remote_branch = try allocator.dupe(u8, "main"),
             .oid = try allocator.dupe(u8, "abc123"),
         },
-    };
+    } };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
     try app.finishPushForeground(&ctx, .{
@@ -7907,7 +8125,7 @@ test "finishPushForeground ignores stale request id" {
     });
 
     try std.testing.expect(app.actions.pending != null);
-    try std.testing.expect(app.push_foreground != null);
+    try std.testing.expect(app.push_retry.state == .foreground);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
@@ -7919,7 +8137,7 @@ test "inactive Review foreground completions retain diagnostics without effects"
         .repo_epoch = 3,
     };
     const pending = app.actions.begin(.push);
-    app.push_foreground = .{
+    app.push_retry.state = .{ .foreground = .{
         .request_id = .{ .id = 7 },
         .pending = pending,
         .origin = .{ .page_id = .review, .repo_epoch = 3, .activation_id = 0 },
@@ -7931,7 +8149,7 @@ test "inactive Review foreground completions retain diagnostics without effects"
             .remote_branch = try allocator.dupe(u8, "main"),
             .oid = try allocator.dupe(u8, "abc123"),
         },
-    };
+    } };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
     try app.finishPushForeground(&ctx, .{
@@ -7958,7 +8176,7 @@ test "inactive Review foreground completions retain diagnostics without effects"
     try std.testing.expect(ctx._redraw_suppressed);
 }
 
-test "openPushCredentialPrompt rejects non-HTTPS remote and frees retry target" {
+test "push remote inspection rejects non-HTTPS and restores retry target" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -7975,7 +8193,7 @@ test "openPushCredentialPrompt rejects non-HTTPS remote and frees retry target" 
     allocator.free(init_result.stdout);
     allocator.free(init_result.stderr);
     const remote_result = try std.process.run(allocator, io, .{
-        .argv = &[_][]const u8{ "git", "remote", "add", "origin", "git@github.com:owner/repo.git" },
+        .argv = &[_][]const u8{ "git", "remote", "add", "origin", "http://example.test/owner/repo.git" },
         .cwd = .{ .path = repo_root },
     });
     allocator.free(remote_result.stdout);
@@ -7994,10 +8212,113 @@ test "openPushCredentialPrompt rejects non-HTTPS remote and frees retry target" 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
 
     try app.openPushCredentialPrompt(&ctx);
+    try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
 
-    try std.testing.expect(app.push_retry_target == null);
-    try std.testing.expect(app.push_credential_prompt == null);
+    try std.testing.expect(app.push_retry.state.availableTarget() != null);
+    try std.testing.expect(app.push_retry.state.credentialPrompt() == null);
     try std.testing.expectEqualStrings("credential prompt is only available for HTTPS remotes", app.pages.review.status.text());
+}
+
+test "push remote inspection transfers HTTPS URL into credential prompt" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(io, "work", .default_dir);
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", allocator);
+    defer allocator.free(repo_root);
+
+    const init_result = try std.process.run(allocator, io, .{
+        .argv = &[_][]const u8{ "git", "init", "--initial-branch=main" },
+        .cwd = .{ .path = repo_root },
+    });
+    allocator.free(init_result.stdout);
+    allocator.free(init_result.stderr);
+    const remote_result = try std.process.run(allocator, io, .{
+        .argv = &[_][]const u8{ "git", "remote", "add", "origin", "https://example.test/owner/repo.git" },
+        .cwd = .{ .path = repo_root },
+    });
+    allocator.free(remote_result.stdout);
+    allocator.free(remote_result.stderr);
+
+    var app: App = .{ .allocator = allocator };
+    defer app.cancelPushCredentialPrompt(allocator);
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, repo_root),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+    }, true);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+
+    try app.openPushCredentialPrompt(&ctx);
+    try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
+
+    const prompt = app.push_retry.state.credentialPrompt() orelse return error.ExpectedPushCredentialPrompt;
+    try std.testing.expectEqualStrings("https://example.test/owner/repo.git", prompt.target.remote_url.?);
+    try std.testing.expect(app.overlay.isPushCredentials());
+    try std.testing.expect(app.push_error_message == null);
+}
+
+test "prompt allocation failure restores and later replaces owned remote URL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(io, "work", .default_dir);
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", allocator);
+    defer allocator.free(repo_root);
+
+    const init_result = try std.process.run(allocator, io, .{
+        .argv = &[_][]const u8{ "git", "init", "--initial-branch=main" },
+        .cwd = .{ .path = repo_root },
+    });
+    allocator.free(init_result.stdout);
+    allocator.free(init_result.stderr);
+    const remote_result = try std.process.run(allocator, io, .{
+        .argv = &[_][]const u8{ "git", "remote", "add", "origin", "https://example.test/owner/repo.git" },
+        .cwd = .{ .path = repo_root },
+    });
+    allocator.free(remote_result.stdout);
+    allocator.free(remote_result.stderr);
+
+    var app: App = .{ .allocator = allocator };
+    defer app.clearPushError(allocator);
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, repo_root),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+    }, true);
+
+    var first_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+    try app.openPushCredentialPrompt(&first_ctx);
+    const first_pending = first_ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), first_pending.len);
+    const first_msg = first_pending[0].run(first_pending[0].ctx, allocator, io);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var failing_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = failing.allocator(), ._io = io };
+    try std.testing.expectError(error.OutOfMemory, app.update(first_msg, &failing_ctx));
+
+    const restored = app.push_retry.state.availableTarget() orelse return error.ExpectedPushRetryTarget;
+    const old_remote_url = restored.remote_url orelse return error.ExpectedRemoteUrl;
+    try std.testing.expectEqualStrings("https://example.test/owner/repo.git", old_remote_url);
+    try std.testing.expect(app.overlay.isPushError());
+
+    var second_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+    try app.openPushCredentialPrompt(&second_ctx);
+    try runOnlyPushInspectionTaskForTest(&app, &second_ctx, io);
+
+    const prompt = app.push_retry.state.credentialPrompt() orelse return error.ExpectedPushCredentialPrompt;
+    try std.testing.expectEqualStrings("https://example.test/owner/repo.git", prompt.target.remote_url.?);
+    app.cancelPushCredentialPrompt(allocator);
 }
 
 test "manual reload clears action selection restore" {
