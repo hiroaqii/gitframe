@@ -213,6 +213,9 @@ pub const State = struct {
     body: BodyText = .{},
     commit_error: ?CommitError = null,
     draft_revision: u64 = 0,
+    /// Identifies one concrete panel surface across close/reopen cycles so
+    /// asynchronous presentation cannot attach to a later draft instance.
+    instance_id: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) State {
         return .{ .allocator = allocator };
@@ -229,6 +232,8 @@ pub const State = struct {
     }
 
     pub fn open(self: *State, mode: Mode) void {
+        self.instance_id +%= 1;
+        if (self.instance_id == 0) self.instance_id = 1;
         self.is_open = true;
         self.mode = mode;
         self.commit_error = null;

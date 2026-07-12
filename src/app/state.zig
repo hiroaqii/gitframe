@@ -33,6 +33,10 @@ pub const OverlayState = struct {
     owner_page: ?page.Id = null,
     help_scroll: usize = 0,
     push_error_scroll: usize = 0,
+    /// Identifies one concrete push-error surface across close/reopen cycles.
+    /// Async results captured by an older surface must not present in a newer
+    /// popup merely because both have the same overlay kind.
+    push_error_instance_id: u64 = 0,
 
     pub fn isHelp(self: OverlayState) bool {
         return self.kind == .help;
@@ -111,6 +115,8 @@ pub const OverlayState = struct {
     }
 
     pub fn openPushError(self: *OverlayState) void {
+        self.push_error_instance_id +%= 1;
+        if (self.push_error_instance_id == 0) self.push_error_instance_id = 1;
         self.kind = .push_error;
         self.owner_page = .review;
         self.push_error_scroll = 0;

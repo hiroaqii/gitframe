@@ -21,6 +21,7 @@ const file_tree = @import("../../../file_tree.zig");
 const git_backend = @import("../../../git/backend.zig");
 const git_status = @import("../../../git/status.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
+const repo_discovery = @import("../../../repo/discovery.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
@@ -34,6 +35,29 @@ pub const CompletionApply = struct {
     project_status: ?bool = null,
     diagnostic: ?Diagnostic = null,
     skip_redraw: bool = false,
+};
+
+/// Owned cross-boundary command produced only after Review has accepted the
+/// discovery task identity. App consumes the discovery to commit active-repo
+/// identity; Review never mutates shell repository state directly.
+pub const DiscoveryApply = struct {
+    commit_discovery: ?repo_discovery.DiscoveryResult = null,
+
+    pub fn deinit(self: *DiscoveryApply, allocator: std.mem.Allocator) void {
+        if (self.commit_discovery) |*discovery| discovery.deinit(allocator);
+        self.commit_discovery = null;
+    }
+
+    pub fn takeCommitDiscovery(self: *DiscoveryApply) ?repo_discovery.DiscoveryResult {
+        const discovery = self.commit_discovery;
+        self.commit_discovery = null;
+        return discovery;
+    }
+};
+
+pub const DiscoveryCommitOutcome = enum {
+    none,
+    start_initial_read,
 };
 
 pub const ProjectionApply = struct {
@@ -637,6 +661,50 @@ pub const Controller = struct {
     pub fn rejectProjectionSpawn(self: Controller, allocator: std.mem.Allocator, request_id: u64) void {
         const pending_id = if (self.page.review_projection.pending) |request| request.id else return;
         if (pending_id == request_id) self.page.review_projection.clearPending(allocator);
+    }
+
+    /// Accepts the Review-owned half of repository discovery and returns the
+    /// only owned value allowed to cross into the App repository coordinator.
+    pub fn applyRepoDiscoveryFinished(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        result: *app_load.RepoDiscoveryFinished,
+    ) !DiscoveryApply {
+        if (!self.acceptsIdentity(result.identity)) return .{};
+        self.page.auto_reload.finishMember(result.background_cycle_id, .source);
+        _ = self.page.load.finishPending(.{ .repo_discovery = result.generation });
+        if (!self.page.load.isCurrent(result.generation)) return .{};
+
+        switch (result.result) {
+            .empty => unreachable,
+            .discovered => |discovery| {
+                result.result = .empty;
+                return .{ .commit_discovery = discovery };
+            },
+            .failed => |message| try self.storeFailedMessage(allocator, std.mem.trim(u8, message, " \t\r\n")),
+            .failed_static => |message| try self.storeFailedMessage(allocator, message),
+        }
+        return .{};
+    }
+
+    /// Applies the narrow outcome returned by the App repository coordinator.
+    /// The page owns load-state consequences; App owns only repository commit.
+    pub fn applyRepoDiscoveryCommit(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        has_repository: bool,
+        active: bool,
+    ) DiscoveryCommitOutcome {
+        if (!has_repository) {
+            self.clearSourceDisplay(allocator);
+            self.page.load.replaceEmpty(allocator, .no_repository);
+            return .none;
+        }
+        if (!active) {
+            self.page.load.state = .idle;
+            return .none;
+        }
+        return .start_initial_read;
     }
 
     /// Accepts one status task result into the Review page. The caller retains
@@ -1343,6 +1411,83 @@ test "owned read command variants release every payload" {
         6,
     ) } };
     projection_update.deinit(allocator);
+}
+
+test "repository discovery transfers ownership only after Review acceptance" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{};
+    defer page.deinit(allocator);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    const identity = page.activation.currentIdentity().?;
+    const generation = page.load.beginRepoDiscovery();
+
+    var finished: app_load.RepoDiscoveryFinished = .{
+        .identity = identity,
+        .generation = generation,
+        .result = .{ .discovered = .{ .none = .{
+            .current_root = try allocator.dupe(u8, "/workspace"),
+        } } },
+    };
+    defer finished.deinit(allocator);
+
+    var applied = try controller.applyRepoDiscoveryFinished(allocator, &finished);
+    defer applied.deinit(allocator);
+    try std.testing.expect(finished.result == .empty);
+    try std.testing.expect(page.load.pending == null);
+
+    var discovery = applied.takeCommitDiscovery() orelse return error.ExpectedDiscoveryCommit;
+    defer discovery.deinit(allocator);
+    try std.testing.expectEqualStrings("/workspace", discovery.none.current_root);
+    try std.testing.expect(applied.commit_discovery == null);
+}
+
+test "stale repository epoch retains discovery ownership with task completion" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{};
+    defer page.deinit(allocator);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    const identity = page.activation.currentIdentity().?;
+    const generation = page.load.beginRepoDiscovery();
+
+    var finished: app_load.RepoDiscoveryFinished = .{
+        .identity = app_page.RequestIdentity.review(identity.repo_epoch + 1, identity.activation_id),
+        .generation = generation,
+        .result = .{ .discovered = .{ .none = .{
+            .current_root = try allocator.dupe(u8, "/stale"),
+        } } },
+    };
+    defer finished.deinit(allocator);
+
+    var applied = try controller.applyRepoDiscoveryFinished(allocator, &finished);
+    defer applied.deinit(allocator);
+    try std.testing.expect(applied.commit_discovery == null);
+    try std.testing.expect(finished.result == .discovered);
+    try std.testing.expect(page.load.pending != null);
+}
+
+test "repository discovery commit leaves load policy with Review" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{};
+    defer page.deinit(allocator);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    try std.testing.expectEqual(
+        DiscoveryCommitOutcome.start_initial_read,
+        controller.applyRepoDiscoveryCommit(allocator, true, true),
+    );
+    try std.testing.expectEqual(
+        DiscoveryCommitOutcome.none,
+        controller.applyRepoDiscoveryCommit(allocator, true, false),
+    );
+    try std.testing.expect(page.load.state == .idle);
+    try std.testing.expectEqual(
+        DiscoveryCommitOutcome.none,
+        controller.applyRepoDiscoveryCommit(allocator, false, true),
+    );
+    try std.testing.expectEqual(load_state.EmptyReason.no_repository, page.load.state.empty);
 }
 
 test "source command allocation failure rolls back pending identities" {

@@ -94,6 +94,9 @@ pub const BranchStatusLoadFinished = struct {
 };
 
 pub const BranchListLoadFinished = struct {
+    origin: page.Id,
+    repo_epoch: u64,
+    activation_id: u64,
     generation: u64,
     repo_root: []u8,
     result: BranchListLoadTaskResult,
@@ -105,6 +108,66 @@ pub const BranchListLoadFinished = struct {
 };
 
 pub const ReviewProjectionFinished = review_projection.Finished;
+
+/// Read results whose acceptance and retained state belong to the Review page.
+/// The shell still transports these messages and starts any follow-up effects,
+/// but it must not flatten their vocabulary back into root App messages.
+pub const ReviewReadFinished = union(enum) {
+    source: DiffLoadFinished,
+    status: StatusLoadFinished,
+    branch_status: BranchStatusLoadFinished,
+    projection: ReviewProjectionFinished,
+
+    pub fn deinit(self: *ReviewReadFinished, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            inline else => |*finished| finished.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+/// Read results accepted by a live shell-owned operation surface.
+pub const ShellReadFinished = union(enum) {
+    repo_path_discovery: RepoPathDiscoveryFinished,
+    branch_list: BranchListLoadFinished,
+
+    pub fn deinit(self: *ShellReadFinished, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            inline else => |*finished| finished.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+/// Results whose acceptance starts in one owner and commits state in another.
+/// Repository discovery is validated by Review, then transferred to the App
+/// repository-identity coordinator as one owned command.
+pub const CoordinatorReadFinished = union(enum) {
+    repo_discovery: RepoDiscoveryFinished,
+
+    pub fn deinit(self: *CoordinatorReadFinished, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            inline else => |*finished| finished.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+/// Exhaustive owner routing for every asynchronous read completion.
+/// Adding a Repository page extends this union with a page-owned branch rather
+/// than adding Repository-shaped tags beside Review tags in App.Msg.
+pub const ReadFinished = union(enum) {
+    review: ReviewReadFinished,
+    shell: ShellReadFinished,
+    coordinator: CoordinatorReadFinished,
+
+    pub fn deinit(self: *ReadFinished, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            inline else => |*finished| finished.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
 
 pub const RepoDiscoveryTaskResult = union(enum) {
     empty,
@@ -244,24 +307,24 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
 
-            return Msg.loadFinished(.{ .repos_discovered = RepoDiscoveryFinished{
+            return Msg.loadFinished(.{ .coordinator = .{ .repo_discovery = RepoDiscoveryFinished{
                 .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .result = runDiscovery(allocator, io),
-            } });
+            } } });
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
 
-            return Msg.loadFinished(.{ .repos_discovered = RepoDiscoveryFinished{
+            return Msg.loadFinished(.{ .coordinator = .{ .repo_discovery = RepoDiscoveryFinished{
                 .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
-            } });
+            } } });
         }
     };
 }
@@ -288,11 +351,11 @@ pub fn RepoPathDiscoveryTask(comptime Msg: type) type {
             const submitted_path = task.path;
             task.path = &.{};
 
-            return Msg.loadFinished(.{ .repo_path_discovered = RepoPathDiscoveryFinished{
+            return Msg.loadFinished(.{ .shell = .{ .repo_path_discovery = RepoPathDiscoveryFinished{
                 .generation = task.generation,
                 .submitted_path = submitted_path,
                 .result = runPathDiscovery(submitted_path, allocator, io),
-            } });
+            } } });
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -302,11 +365,11 @@ pub fn RepoPathDiscoveryTask(comptime Msg: type) type {
             const submitted_path = task.path;
             task.path = &.{};
 
-            return Msg.loadFinished(.{ .repo_path_discovered = RepoPathDiscoveryFinished{
+            return Msg.loadFinished(.{ .shell = .{ .repo_path_discovery = RepoPathDiscoveryFinished{
                 .generation = task.generation,
                 .submitted_path = submitted_path,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
-            } });
+            } } });
         }
     };
 }
@@ -343,12 +406,12 @@ pub fn DiffLoadTask(comptime Msg: type) type {
                 allocator.destroy(task);
             }
 
-            return Msg.loadFinished(.{ .diff_loaded = DiffLoadFinished{
+            return Msg.loadFinished(.{ .review = .{ .source = DiffLoadFinished{
                 .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .result = runLoadExpected(task.request, task.expected_fingerprint, allocator, io),
-            } });
+            } } });
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -358,12 +421,12 @@ pub fn DiffLoadTask(comptime Msg: type) type {
                 allocator.destroy(task);
             }
 
-            return Msg.loadFinished(.{ .diff_loaded = DiffLoadFinished{
+            return Msg.loadFinished(.{ .review = .{ .source = DiffLoadFinished{
                 .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
-            } });
+            } } });
         }
     };
 }
@@ -389,7 +452,7 @@ pub fn StatusLoadTask(comptime Msg: type) type {
             };
             task.repo_root = &.{};
 
-            return Msg.loadFinished(.{ .status_loaded = result });
+            return Msg.loadFinished(.{ .review = .{ .status = result } });
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -405,7 +468,7 @@ pub fn StatusLoadTask(comptime Msg: type) type {
             };
             task.repo_root = &.{};
 
-            return Msg.loadFinished(.{ .status_loaded = result });
+            return Msg.loadFinished(.{ .review = .{ .status = result } });
         }
     };
 }
@@ -430,7 +493,7 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
             };
             task.repo_root = &.{};
 
-            return Msg.loadFinished(.{ .branch_status_loaded = result });
+            return Msg.loadFinished(.{ .review = .{ .branch_status = result } });
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -446,13 +509,16 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
             };
             task.repo_root = &.{};
 
-            return Msg.loadFinished(.{ .branch_status_loaded = result });
+            return Msg.loadFinished(.{ .review = .{ .branch_status = result } });
         }
     };
 }
 
 pub fn BranchListLoadTask(comptime Msg: type) type {
     return struct {
+        origin: page.Id,
+        repo_epoch: u64,
+        activation_id: u64,
         repo_root: []u8,
         generation: u64,
 
@@ -461,13 +527,16 @@ pub fn BranchListLoadTask(comptime Msg: type) type {
             defer allocator.destroy(task);
 
             const result = BranchListLoadFinished{
+                .origin = task.origin,
+                .repo_epoch = task.repo_epoch,
+                .activation_id = task.activation_id,
                 .generation = task.generation,
                 .repo_root = task.repo_root,
                 .result = runBranchListLoad(task.repo_root, allocator, io),
             };
             task.repo_root = &.{};
 
-            return Msg.loadFinished(.{ .branch_list_loaded = result });
+            return Msg.loadFinished(.{ .shell = .{ .branch_list = result } });
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -475,13 +544,16 @@ pub fn BranchListLoadTask(comptime Msg: type) type {
             defer allocator.destroy(task);
 
             const result = BranchListLoadFinished{
+                .origin = task.origin,
+                .repo_epoch = task.repo_epoch,
+                .activation_id = task.activation_id,
                 .generation = task.generation,
                 .repo_root = task.repo_root,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
             };
             task.repo_root = &.{};
 
-            return Msg.loadFinished(.{ .branch_list_loaded = result });
+            return Msg.loadFinished(.{ .shell = .{ .branch_list = result } });
         }
     };
 }
@@ -497,10 +569,10 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
             const request = task.request;
             task.request = undefined;
 
-            return Msg.loadFinished(.{ .review_projection_loaded = ReviewProjectionFinished{
+            return Msg.loadFinished(.{ .review = .{ .projection = ReviewProjectionFinished{
                 .request = request,
                 .result = runReviewProjectionLoad(request, allocator, io),
-            } });
+            } } });
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -510,10 +582,10 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
             const request = task.request;
             task.request = undefined;
 
-            return Msg.loadFinished(.{ .review_projection_loaded = ReviewProjectionFinished{
+            return Msg.loadFinished(.{ .review = .{ .projection = ReviewProjectionFinished{
                 .request = request,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
-            } });
+            } } });
         }
     };
 }
@@ -1309,9 +1381,7 @@ fn runTestGit(io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !void {
 }
 
 test "StatusLoadTask failed preserves generation and moves repo root" {
-    const TestLoadMsg = union(enum) {
-        status_loaded: StatusLoadFinished,
-    };
+    const TestLoadMsg = ReadFinished;
     const TestMsg = union(enum) {
         load: TestLoadMsg,
 
@@ -1332,7 +1402,11 @@ test "StatusLoadTask failed preserves generation and moves repo root" {
     const msg = Task.failed(task, .{ .start_failed = "SystemResources" }, allocator);
     var finished = switch (msg) {
         .load => |load| switch (load) {
-            .status_loaded => |payload| payload,
+            .review => |review| switch (review) {
+                .status => |payload| payload,
+                else => return error.UnexpectedReadRoute,
+            },
+            else => return error.UnexpectedReadRoute,
         },
     };
     defer finished.deinit(allocator);
@@ -1347,9 +1421,7 @@ test "StatusLoadTask failed preserves generation and moves repo root" {
 }
 
 test "DiffLoadTask failed frees request and preserves generation" {
-    const TestLoadMsg = union(enum) {
-        diff_loaded: DiffLoadFinished,
-    };
+    const TestLoadMsg = ReadFinished;
     const TestMsg = union(enum) {
         load: TestLoadMsg,
 
@@ -1373,7 +1445,11 @@ test "DiffLoadTask failed frees request and preserves generation" {
     const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
     var finished = switch (msg) {
         .load => |load| switch (load) {
-            .diff_loaded => |payload| payload,
+            .review => |review| switch (review) {
+                .source => |payload| payload,
+                else => return error.UnexpectedReadRoute,
+            },
+            else => return error.UnexpectedReadRoute,
         },
     };
     defer finished.result.deinit(allocator);
@@ -1387,9 +1463,7 @@ test "DiffLoadTask failed frees request and preserves generation" {
 }
 
 test "ReviewProjectionTask failed preserves request identity" {
-    const TestLoadMsg = union(enum) {
-        review_projection_loaded: ReviewProjectionFinished,
-    };
+    const TestLoadMsg = ReadFinished;
     const TestMsg = union(enum) {
         load: TestLoadMsg,
 
@@ -1415,7 +1489,11 @@ test "ReviewProjectionTask failed preserves request identity" {
     const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
     var finished = switch (msg) {
         .load => |load| switch (load) {
-            .review_projection_loaded => |payload| payload,
+            .review => |review| switch (review) {
+                .projection => |payload| payload,
+                else => return error.UnexpectedReadRoute,
+            },
+            else => return error.UnexpectedReadRoute,
         },
     };
     defer finished.deinit(allocator);

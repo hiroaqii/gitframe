@@ -13,6 +13,7 @@ const page = @import("app/page.zig");
 const page_transition = @import("app/page_transition.zig");
 const app_shell_layout = @import("app/shell_layout.zig");
 const review_page = @import("app/pages/review.zig");
+const review_content = @import("app/pages/review/content.zig");
 const review_layout = @import("app/pages/review/layout.zig");
 const review_message = @import("app/pages/review/message.zig");
 const review_navigation = @import("app/pages/review/navigation.zig");
@@ -127,22 +128,7 @@ const MousePane = enum {
 
 const MousePoint = review_navigation.MousePoint;
 
-const LoadFinishedMsg = union(enum) {
-    repos_discovered: RepoDiscoveryFinished,
-    repo_path_discovered: RepoPathDiscoveryFinished,
-    diff_loaded: DiffLoadFinished,
-    status_loaded: StatusLoadFinished,
-    branch_status_loaded: BranchStatusLoadFinished,
-    branch_list_loaded: BranchListLoadFinished,
-    review_projection_loaded: ReviewProjectionFinished,
-
-    fn deinit(self: *LoadFinishedMsg, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            inline else => |*finished| finished.deinit(allocator),
-        }
-        self.* = undefined;
-    }
-};
+const LoadFinishedMsg = app_load.ReadFinished;
 
 const ActionFinishedMsg = union(enum) {
     stage_file: StageFileFinished,
@@ -174,12 +160,46 @@ const DiffLoadStartOptions = review_reload.SourceLoadOptions;
 const PushForegroundState = struct {
     request_id: chasen.ForegroundCommandRequestId,
     pending: app_actions.PendingAction,
+    origin: PageEffectOrigin,
     target: app_state.PushRetryTarget,
 
     fn deinit(self: *PushForegroundState, allocator: std.mem.Allocator) void {
         self.target.deinit(allocator);
         self.* = undefined;
     }
+};
+
+const ShellSurface = enum {
+    push_error,
+    commit_panel,
+};
+
+/// Semantic owner of an effect diagnostic. The shell owns the physical
+/// clipboard/process lifecycle, while the captured origin owns presentation.
+const EffectOrigin = union(enum) {
+    page: PageEffectOrigin,
+    shell_surface: ShellSurfaceOrigin,
+};
+
+const PageEffectOrigin = struct {
+    page_id: page.Id,
+    repo_epoch: u64,
+    activation_id: u64,
+};
+
+const ShellSurfaceOrigin = struct {
+    surface: ShellSurface,
+    instance_id: u64,
+};
+
+const EditorForegroundState = struct {
+    request_id: chasen.ForegroundCommandRequestId,
+    origin: PageEffectOrigin,
+};
+
+const ClipboardCopyState = struct {
+    origin: EffectOrigin,
+    label: []const u8,
 };
 
 fn expandUserPath(allocator: std.mem.Allocator, path: []const u8, home: ?[]const u8) ![]u8 {
@@ -248,7 +268,11 @@ pub const App = struct {
     push_retry_credentials_available: bool = false,
     push_credential_prompt: ?*app_state.PushCredentialPrompt = null,
     push_foreground: ?PushForegroundState = null,
-    editor_foreground_request: ?chasen.ForegroundCommandRequestId = null,
+    editor_foreground_request: ?EditorForegroundState = null,
+    /// Correlates shell-owned clipboard completions with semantic metadata
+    /// captured at request time. Values own no storage; the map allocation is
+    /// released during App teardown.
+    clipboard_copy_states: std.AutoHashMapUnmanaged(u64, ClipboardCopyState) = .empty,
     branch_switch: app_state.BranchSwitchState = .{},
     branch_switch_load_generation: u64 = 0,
     branch_switch_load_pending: ?u64 = null,
@@ -260,11 +284,12 @@ pub const App = struct {
     };
 
     const ClipboardCopyFinished = struct {
-        label: []const u8,
+        request_id: chasen.ClipboardCopyRequestId,
         outcome: ClipboardCopyOutcome,
     };
 
     const CopyRequest = struct {
+        origin: EffectOrigin,
         label: []const u8,
         text: []const u8,
     };
@@ -409,6 +434,7 @@ pub const App = struct {
         self.cancelPullConfirmation(deinit_ctx.allocator);
         self.cancelPushCredentialPrompt(deinit_ctx.allocator);
         self.clearPushForeground(deinit_ctx.allocator);
+        self.clipboard_copy_states.deinit(deinit_ctx.allocator);
         self.clearPushError(deinit_ctx.allocator);
         self.clearBranchSwitch(deinit_ctx.allocator);
     }
@@ -444,6 +470,15 @@ pub const App = struct {
             .source = self.config.source,
             .repo_root = self.activeRepoRoot(),
             .activation_state = self.pages.review.activation.state,
+        };
+    }
+
+    fn reviewContent(self: *const App) review_content.View {
+        return .{
+            .page = &self.pages.review,
+            .navigation = self.reviewNavigationView(),
+            .source = self.config.source,
+            .repo_root = self.activeRepoRoot(),
         };
     }
 
@@ -640,13 +675,19 @@ pub const App = struct {
 
     fn finishLoadResult(self: *App, ctx: *chasen.Ctx(Msg), finished: LoadFinishedMsg) !void {
         switch (finished) {
-            .repos_discovered => |result| try self.finishRepoDiscovery(ctx, result),
-            .repo_path_discovered => |result| try self.finishRepoPathDiscovery(ctx, result),
-            .diff_loaded => |result| try self.finishDiffLoad(ctx, result),
-            .status_loaded => |result| try self.finishStatusLoad(ctx, result),
-            .branch_status_loaded => |result| self.finishBranchStatusLoad(ctx, result),
-            .branch_list_loaded => |result| try self.finishBranchListLoad(ctx, result),
-            .review_projection_loaded => |result| try self.finishReviewProjectionLoad(ctx, result),
+            .review => |review_result| switch (review_result) {
+                .source => |result| try self.finishDiffLoad(ctx, result),
+                .status => |result| try self.finishStatusLoad(ctx, result),
+                .branch_status => |result| self.finishBranchStatusLoad(ctx, result),
+                .projection => |result| try self.finishReviewProjectionLoad(ctx, result),
+            },
+            .shell => |shell_result| switch (shell_result) {
+                .repo_path_discovery => |result| try self.finishRepoPathDiscovery(ctx, result),
+                .branch_list => |result| try self.finishBranchListLoad(ctx, result),
+            },
+            .coordinator => |coordinator_result| switch (coordinator_result) {
+                .repo_discovery => |result| try self.finishRepoDiscovery(ctx, result),
+            },
         }
     }
 
@@ -1105,42 +1146,25 @@ pub const App = struct {
 
     fn finishRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg), finished: RepoDiscoveryFinished) !void {
         defer if (self.active_page != .review) ctx.redraw().skip();
-        var result = finished.result;
+        var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.pages.review.activation.acceptsRepoEpoch(finished.identity, self.repo_epoch)) return;
-        self.pages.review.auto_reload.finishMember(finished.background_cycle_id, .source);
+        var applied = try self.reviewReload().applyRepoDiscoveryFinished(ctx.allocator(), &result);
+        defer applied.deinit(ctx.allocator());
+        const discovery = applied.commit_discovery orelse return;
 
-        _ = self.pages.review.load.finishPending(.{ .repo_discovery = finished.generation });
-        if (!self.pages.review.load.isCurrent(finished.generation)) return;
+        try self.recent_repos.rememberDiscovery(ctx.allocator(), discovery);
+        self.persistRecentRepositories(ctx);
+        const owned_discovery = applied.takeCommitDiscovery() orelse unreachable;
+        _ = self.commitRepoDiscovery(ctx.allocator(), owned_discovery, 0, .discovery_completion);
 
-        switch (result) {
-            .empty => unreachable,
-            .discovered => |discovery| {
-                try self.recent_repos.rememberDiscovery(ctx.allocator(), discovery);
-                self.persistRecentRepositories(ctx);
-                result = .empty;
-                _ = self.commitRepoDiscovery(ctx.allocator(), discovery, 0, .discovery_completion);
-
-                if (self.activeRepoRoot() == null) {
-                    self.reviewReload().clearSourceDisplay(self.allocator);
-                    self.pages.review.load.replaceEmpty(ctx.allocator(), .no_repository);
-                    return;
-                }
-
-                if (self.active_page == .review) {
-                    try self.startDiffLoad(ctx, .initial);
-                } else {
-                    self.pages.review.load.state = .idle;
-                    ctx.redraw().skip();
-                }
-            },
-            .failed => |message| {
-                try self.reviewReload().storeFailedMessage(ctx.allocator(), git_ops.trimGitOutput(message));
-            },
-            .failed_static => |message| {
-                try self.reviewReload().storeFailedMessage(ctx.allocator(), message);
-            },
+        switch (self.reviewReload().applyRepoDiscoveryCommit(
+            ctx.allocator(),
+            self.activeRepoRoot() != null,
+            self.active_page == .review,
+        )) {
+            .none => {},
+            .start_initial_read => try self.startDiffLoad(ctx, .initial),
         }
     }
 
@@ -2362,7 +2386,13 @@ pub const App = struct {
         errdefer self.clearBranchSwitch(ctx.allocator());
 
         const task = try ctx.allocator().create(BranchListLoadTask);
-        task.* = .{ .repo_root = &.{}, .generation = generation };
+        task.* = .{
+            .origin = .review,
+            .repo_epoch = self.repo_epoch,
+            .activation_id = self.pages.review.activation.next_activation_id,
+            .repo_root = &.{},
+            .generation = generation,
+        };
         errdefer ctx.allocator().destroy(task);
         task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
         errdefer ctx.allocator().free(task.repo_root);
@@ -2535,6 +2565,7 @@ pub const App = struct {
         self.push_foreground = .{
             .request_id = request_id,
             .pending = pending,
+            .origin = self.reviewPageEffectOrigin(),
             .target = target,
         };
         self.clearPushError(ctx.allocator());
@@ -3123,6 +3154,8 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
+        if (result.repo_epoch != self.repo_epoch) return;
+
         switch (app_load_state.acceptBranchListResult(
             &self.branch_switch_load_pending,
             self.branch_switch.hasState(),
@@ -3134,6 +3167,12 @@ pub const App = struct {
             .accepted => {},
             .no_pending, .stale_pending_generation, .missing_state, .stale_state_generation, .repo_mismatch => return,
         }
+        const diagnostic_origin: EffectOrigin = .{ .page = .{
+            .page_id = result.origin,
+            .repo_epoch = result.repo_epoch,
+            .activation_id = result.activation_id,
+        } };
+        const diagnostic_is_live = self.effectOriginIsLive(diagnostic_origin);
 
         switch (result.result) {
             .loaded => |list| {
@@ -3149,18 +3188,19 @@ pub const App = struct {
                 self.branch_switch.selected_index = branchSwitchInitialSelection(branches);
             },
             .failed => |message| {
-                self.setReviewStatus("branch list load failed: {s}", .{git_ops.trimGitOutput(message)});
+                if (diagnostic_is_live) self.setEffectStatus(diagnostic_origin, "branch list load failed: {s}", .{git_ops.trimGitOutput(message)});
                 self.clearBranchSwitch(ctx.allocator());
             },
             .failed_static => |message| {
-                self.setReviewStatus("branch list load failed: {s}", .{message});
+                if (diagnostic_is_live) self.setEffectStatus(diagnostic_origin, "branch list load failed: {s}", .{message});
                 self.clearBranchSwitch(ctx.allocator());
             },
             .empty => {
-                self.setReviewStatus("branch list load failed", .{});
+                if (diagnostic_is_live) self.setEffectStatus(diagnostic_origin, "branch list load failed", .{});
                 self.clearBranchSwitch(ctx.allocator());
             },
         }
+        if (self.active_page != result.origin) ctx.redraw().skip();
     }
 
     fn finishPushForeground(self: *App, ctx: *chasen.Ctx(Msg), result: chasen.ForegroundCommandResult) !void {
@@ -3171,45 +3211,56 @@ pub const App = struct {
 
         if (!self.actions.finish(foreground.pending)) return;
 
-        const active_matches = self.activeRepoMatches(foreground.target.repo_root);
+        const diagnostic_origin: EffectOrigin = .{ .page = foreground.origin };
+        if (!self.effectOriginIsLive(diagnostic_origin)) {
+            ctx.redraw().skip();
+            return;
+        }
+        const active_matches = foreground.origin.repo_epoch == self.repo_epoch and
+            self.activeRepoMatches(foreground.target.repo_root);
 
         switch (result.outcome) {
             .exited => |code| {
                 if (code == 0) {
                     if (active_matches) {
-                        self.setReviewStatus("pushed interactively: {s} -> {s}/{s}", .{ foreground.target.branch, foreground.target.remote, foreground.target.remote_branch });
+                        self.setEffectStatus(diagnostic_origin, "pushed interactively: {s} -> {s}/{s}", .{ foreground.target.branch, foreground.target.remote, foreground.target.remote_branch });
                     } else {
-                        self.setReviewStatus("pushed interactively: {s}", .{foreground.target.repo_root});
+                        self.setEffectStatus(diagnostic_origin, "pushed interactively: {s}", .{foreground.target.repo_root});
                     }
                 } else {
                     if (active_matches) {
-                        self.setReviewStatus("interactive push exited: {d}", .{code});
+                        self.setEffectStatus(diagnostic_origin, "interactive push exited: {d}", .{code});
                     } else {
-                        self.setReviewStatus("interactive push exited for {s}: {d}", .{ foreground.target.repo_root, code });
+                        self.setEffectStatus(diagnostic_origin, "interactive push exited for {s}: {d}", .{ foreground.target.repo_root, code });
                     }
                 }
             },
             .signaled => |signal| {
                 if (active_matches) {
-                    self.setReviewStatus("interactive push signal: {d}", .{signal});
+                    self.setEffectStatus(diagnostic_origin, "interactive push signal: {d}", .{signal});
                 } else {
-                    self.setReviewStatus("interactive push signal for {s}: {d}", .{ foreground.target.repo_root, signal });
+                    self.setEffectStatus(diagnostic_origin, "interactive push signal for {s}: {d}", .{ foreground.target.repo_root, signal });
                 }
             },
             .spawn_failed => |err| {
                 if (active_matches) {
-                    self.setReviewStatus("interactive push spawn failed: {s}", .{err});
+                    self.setEffectStatus(diagnostic_origin, "interactive push spawn failed: {s}", .{err});
                 } else {
-                    self.setReviewStatus("interactive push spawn failed for {s}: {s}", .{ foreground.target.repo_root, err });
+                    self.setEffectStatus(diagnostic_origin, "interactive push spawn failed for {s}: {s}", .{ foreground.target.repo_root, err });
                 }
             },
             .wait_failed => |err| {
                 if (active_matches) {
-                    self.setReviewStatus("interactive push wait failed: {s}", .{err});
+                    self.setEffectStatus(diagnostic_origin, "interactive push wait failed: {s}", .{err});
                 } else {
-                    self.setReviewStatus("interactive push wait failed for {s}: {s}", .{ foreground.target.repo_root, err });
+                    self.setEffectStatus(diagnostic_origin, "interactive push wait failed for {s}: {s}", .{ foreground.target.repo_root, err });
                 }
             },
+        }
+
+        if (self.active_page != foreground.origin.page_id) {
+            ctx.redraw().skip();
+            return;
         }
 
         if (active_matches) {
@@ -3287,7 +3338,7 @@ pub const App = struct {
             return;
         }
 
-        const target = switch (self.selectedEditorTarget()) {
+        const target = switch (self.reviewContent().editorTarget()) {
             .ready => |target| target,
             .unavailable_source, .no_repo => {
                 self.setReviewStatus("editor unavailable for this source", .{});
@@ -3314,7 +3365,7 @@ pub const App = struct {
         var argv = editor.build(ctx.allocator(), self.user_config.editor, self.env_map, .{
             .repo_root = target.repo_root,
             .path = target.path,
-            .line = self.editorTargetLine(),
+            .line = target.line,
             .column = 1,
         }) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -3348,104 +3399,40 @@ pub const App = struct {
             },
             error.OutOfMemory => return err,
         };
-        self.editor_foreground_request = request_id;
+        self.editor_foreground_request = .{
+            .request_id = request_id,
+            .origin = self.reviewPageEffectOrigin(),
+        };
         self.setReviewStatus("opening editor: {s}", .{target.path});
     }
 
-    const EditorTarget = struct {
-        repo_root: []const u8,
-        path: []const u8,
-    };
-
-    const EditorTargetResult = union(enum) {
-        ready: EditorTarget,
-        unavailable_source,
-        no_repo,
-        no_path,
-        directory_unsupported,
-        deleted_file,
-        stale_source,
-    };
-
-    fn selectedEditorTarget(self: *const App) EditorTargetResult {
-        // Editor actions open the current worktree path selected in the
-        // sidebar. Do not derive this from the rendered diff/projection, which
-        // can represent staged or synthetic content for the same file.
-        if (!diff_source.sourceAllowsEditorAction(self.config.source)) return .unavailable_source;
-        if (!self.pages.review.activation.state.satisfiesAction(.read_diff)) return .stale_source;
-        const repo_root = self.activeRepoRoot() orelse return .no_repo;
-        const action_target = self.reviewOperations().selectedSidebarActionTarget() orelse return .no_path;
-
-        return switch (action_target.kind) {
-            .repository, .directory => .directory_unsupported,
-            .file => blk: {
-                if (self.editorTargetIsDeleted(repo_root, action_target.path)) return .deleted_file;
-                break :blk .{ .ready = .{ .repo_root = repo_root, .path = action_target.path } };
-            },
-        };
-    }
-
-    fn editorTargetIsDeleted(self: *const App, repo_root: []const u8, path_key: []const u8) bool {
-        if (self.reviewNavigationView().freshStatusEntryForPathKey(repo_root, path_key)) |entry| {
-            return entry.worktree == .deleted or (entry.index == .deleted and !entry.isUnstaged());
-        }
-
-        const file = self.reviewNavigationView().selectedFile() orelse return false;
-        const selected_key = diff_file.canonicalPathKey(file) orelse return false;
-        if (!std.mem.eql(u8, selected_key, path_key)) return false;
-        return diff_file.status(file) == .deleted;
-    }
-
-    fn editorTargetLine(self: *const App) ?u32 {
-        const file = self.reviewNavigationView().selectedFile() orelse return null;
-        return switch (self.pages.review.viewer.diff_cursor) {
-            .hunk_line => |line| worktreeLineForHunkLine(file, line.hunk_index, line.line_index),
-            .hunk_header => |hunk_index| worktreeLineForHunkLine(file, hunk_index, 0),
-            else => null,
-        };
-    }
-
-    fn worktreeLineForHunkLine(file: diff_parser.FileDiff, hunk_index: usize, line_index: usize) ?u32 {
-        if (hunk_index >= file.hunks.len) return null;
-        const lines = file.hunks[hunk_index].lines;
-        if (lines.len == 0) return null;
-
-        if (line_index < lines.len) {
-            if (lines[line_index].new_line) |line| return line;
-        }
-
-        var index = line_index;
-        while (index < lines.len) : (index += 1) {
-            if (lines[index].new_line) |line| return line;
-        }
-
-        index = @min(line_index, lines.len - 1);
-        while (true) {
-            if (lines[index].new_line) |line| return line;
-            if (index == 0) break;
-            index -= 1;
-        }
-
-        return null;
-    }
-
     fn finishEditorCommand(self: *App, ctx: *chasen.Ctx(Msg), result: chasen.ForegroundCommandResult) !void {
-        if (self.editor_foreground_request) |request| {
-            if (request.id != result.request_id.id) return;
-            self.editor_foreground_request = null;
+        const foreground = self.editor_foreground_request orelse return;
+        if (foreground.request_id.id != result.request_id.id) return;
+        self.editor_foreground_request = null;
+        const diagnostic_origin: EffectOrigin = .{ .page = foreground.origin };
+        if (!self.effectOriginIsLive(diagnostic_origin)) {
+            ctx.redraw().skip();
+            return;
         }
         switch (result.outcome) {
             .exited => |code| {
                 if (code == 0) {
-                    self.setReviewStatus("editor closed", .{});
+                    self.setEffectStatus(diagnostic_origin, "editor closed", .{});
                 } else {
-                    self.setReviewStatus("editor exited: {d}", .{code});
+                    self.setEffectStatus(diagnostic_origin, "editor exited: {d}", .{code});
                 }
             },
-            .signaled => |signal| self.setReviewStatus("editor signal: {d}", .{signal}),
-            .spawn_failed => |err| self.setReviewStatus("editor spawn failed: {s}", .{err}),
-            .wait_failed => |err| self.setReviewStatus("editor wait failed: {s}", .{err}),
+            .signaled => |signal| self.setEffectStatus(diagnostic_origin, "editor signal: {d}", .{signal}),
+            .spawn_failed => |err| self.setEffectStatus(diagnostic_origin, "editor spawn failed: {s}", .{err}),
+            .wait_failed => |err| self.setEffectStatus(diagnostic_origin, "editor wait failed: {s}", .{err}),
         }
+
+        if (self.active_page != foreground.origin.page_id) {
+            ctx.redraw().skip();
+            return;
+        }
+        if (foreground.origin.page_id != .review or foreground.origin.repo_epoch != self.repo_epoch) return;
 
         if (diff_source.sourceIsOneShotInput(self.config.source)) {
             ctx.redraw().skip();
@@ -3469,49 +3456,14 @@ pub const App = struct {
         return Msg.actionFinished(.{ .push_foreground = result });
     }
 
-    fn copyCurrentLineDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
+    fn clipboardCopyDone(result: chasen.ClipboardCopyResult) Msg {
         return .{ .clipboard_copy_finished = .{
-            .label = "current line",
+            .request_id = result.request_id,
             .outcome = clipboardCopyOutcome(result.outcome),
         } };
     }
 
-    fn copyCurrentHunkDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
-        return .{ .clipboard_copy_finished = .{
-            .label = "current hunk",
-            .outcome = clipboardCopyOutcome(result.outcome),
-        } };
-    }
-
-    fn copyDiffSelectionDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
-        return .{ .clipboard_copy_finished = .{
-            .label = "diff selection",
-            .outcome = clipboardCopyOutcome(result.outcome),
-        } };
-    }
-
-    fn copyDiffHeaderPathDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
-        return .{ .clipboard_copy_finished = .{
-            .label = "file path",
-            .outcome = clipboardCopyOutcome(result.outcome),
-        } };
-    }
-
-    fn copyPopupDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
-        return .{ .clipboard_copy_finished = .{
-            .label = "push error",
-            .outcome = clipboardCopyOutcome(result.outcome),
-        } };
-    }
-
-    fn copyCommitMessageDone(result: chasen.Ctx(Msg).ClipboardCopyResult) Msg {
-        return .{ .clipboard_copy_finished = .{
-            .label = "commit message",
-            .outcome = clipboardCopyOutcome(result.outcome),
-        } };
-    }
-
-    fn clipboardCopyOutcome(outcome: chasen.Ctx(Msg).ClipboardCopyOutcome) ClipboardCopyOutcome {
+    fn clipboardCopyOutcome(outcome: chasen.ClipboardCopyOutcome) ClipboardCopyOutcome {
         return switch (outcome) {
             .sent => .sent,
             .unsupported_runtime => .unsupported_runtime,
@@ -3520,69 +3472,63 @@ pub const App = struct {
     }
 
     fn copyCurrentLine(self: *App, ctx: *chasen.Ctx(Msg)) void {
-        const text = self.currentDiffLineCopyText() orelse {
+        const text = self.reviewContent().currentLineCopyText() orelse {
             self.setReviewStatus("no diff line selected", .{});
             return;
         };
         self.queueClipboardCopy(ctx, .{
+            .origin = .{ .page = self.reviewPageEffectOrigin() },
             .label = "current line",
             .text = text,
-        }, copyCurrentLineDone);
+        });
     }
 
     fn copyCurrentHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        const hunk_index = self.selectedHunkIndex() orelse {
-            self.setReviewStatus("no hunk selected", .{});
-            return;
-        };
-        const file = self.reviewNavigationView().displayedDiffFile() orelse {
-            self.setReviewStatus("no hunk selected", .{});
-            return;
-        };
-        if (hunk_index >= file.hunks.len) {
-            self.setReviewStatus("no hunk selected", .{});
-            return;
+        var content = try self.reviewContent().selectedHunkCopyText(ctx.allocator());
+        defer content.deinit(ctx.allocator());
+        switch (content) {
+            .ready => |text| self.queueClipboardCopy(ctx, .{
+                .origin = .{ .page = self.reviewPageEffectOrigin() },
+                .label = "current hunk",
+                .text = text,
+            }),
+            .no_hunk => self.setReviewStatus("no hunk selected", .{}),
+            .no_new_side => self.setReviewStatus("no new-side text in selected hunk", .{}),
         }
-
-        const text = try newSideHunkCopyText(ctx.allocator(), file.hunks[hunk_index]);
-        defer ctx.allocator().free(text);
-        if (text.len == 0) {
-            self.setReviewStatus("no new-side text in selected hunk", .{});
-            return;
-        }
-        self.queueClipboardCopy(ctx, .{
-            .label = "current hunk",
-            .text = text,
-        }, copyCurrentHunkDone);
     }
 
     fn copyDiffSelection(self: *App, ctx: *chasen.Ctx(Msg), selection: diff_selection.DragSelection) !void {
-        const target = self.reviewNavigationView().normalLoadedDiffSelectionTarget(selection.identity) orelse return;
-        const text = try diff_selection.copyText(ctx.allocator(), target.file, selection);
+        const text = try self.reviewContent().diffSelectionCopyText(ctx.allocator(), selection) orelse return;
         defer ctx.allocator().free(text);
         self.queueClipboardCopy(ctx, .{
+            .origin = .{ .page = self.reviewPageEffectOrigin() },
             .label = "diff selection",
             .text = text,
-        }, copyDiffSelectionDone);
+        });
     }
 
     fn copyDiffHeaderPath(self: *App, ctx: *chasen.Ctx(Msg), selection: diff_selection.HeaderPathSelection) void {
-        const target = self.reviewNavigationView().displayedDiffHeaderTarget(selection.identity) orelse return;
+        const path = self.reviewContent().diffHeaderPath(selection) orelse return;
         self.queueClipboardCopy(ctx, .{
+            .origin = .{ .page = self.reviewPageEffectOrigin() },
             .label = "file path",
-            .text = target.display_path,
-        }, copyDiffHeaderPathDone);
+            .text = path,
+        });
     }
 
     fn copyPopup(self: *App, ctx: *chasen.Ctx(Msg)) void {
         const target = self.popupCopyTarget() orelse {
-            self.setReviewStatus("nothing to copy: popup", .{});
+            self.setStatus("nothing to copy: popup", .{});
             return;
         };
         self.queueClipboardCopy(ctx, .{
+            .origin = .{ .shell_surface = .{
+                .surface = .push_error,
+                .instance_id = self.overlay.push_error_instance_id,
+            } },
             .label = target.label,
             .text = target.text,
-        }, copyPopupDone);
+        });
     }
 
     fn popupCopyTarget(self: *const App) ?PopupCopyTarget {
@@ -3598,99 +3544,77 @@ pub const App = struct {
 
     fn copyCommitMessage(self: *App, ctx: *chasen.Ctx(Msg)) void {
         if (!self.commit_panel.is_open) {
-            self.setReviewStatus("nothing to copy: commit message", .{});
+            self.setStatus("nothing to copy: commit message", .{});
             return;
         }
         const text = self.commit_panel.formatMessage(ctx.allocator()) catch {
             self.commit_panel.commit_error = .input_allocation_failed;
-            self.setReviewStatus("could not prepare commit message copy", .{});
+            self.setStatus("could not prepare commit message copy", .{});
             return;
         };
         defer ctx.allocator().free(text);
 
         self.queueClipboardCopy(ctx, .{
+            .origin = .{ .shell_surface = .{
+                .surface = .commit_panel,
+                .instance_id = self.commit_panel.instance_id,
+            } },
             .label = "commit message",
             .text = text,
-        }, copyCommitMessageDone);
+        });
     }
 
     fn queueClipboardCopy(
         self: *App,
         ctx: *chasen.Ctx(Msg),
         request: CopyRequest,
-        finished: chasen.Ctx(Msg).ClipboardCopyFinishedFn,
     ) void {
         if (request.text.len == 0) {
-            self.setReviewStatus("nothing to copy: {s}", .{request.label});
+            self.setEffectStatus(request.origin, "nothing to copy: {s}", .{request.label});
             return;
         }
-        ctx.terminal().copyToClipboard(.{
-            .text = request.text,
-            .finished = finished,
-        }) catch |err| switch (err) {
-            error.OutOfMemory => self.setReviewStatus("could not prepare clipboard copy", .{}),
-            error.ClipboardCopyLimitExceeded => self.setReviewStatus("clipboard copy already queued", .{}),
+        self.clipboard_copy_states.ensureUnusedCapacity(ctx.allocator(), 1) catch {
+            self.setEffectStatus(request.origin, "could not track clipboard copy", .{});
+            return;
         };
+        const request_id = ctx.terminal().copyToClipboard(.{
+            .text = request.text,
+            .finished = clipboardCopyDone,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.setEffectStatus(request.origin, "could not prepare clipboard copy", .{});
+                return;
+            },
+            error.ClipboardCopyLimitExceeded => {
+                self.setEffectStatus(request.origin, "clipboard copy already queued", .{});
+                return;
+            },
+        };
+        self.clipboard_copy_states.putAssumeCapacity(request_id.id, .{
+            .origin = request.origin,
+            .label = request.label,
+        });
     }
 
     fn finishClipboardCopy(self: *App, ctx: *chasen.Ctx(Msg), finished: ClipboardCopyFinished) void {
+        const removed = self.clipboard_copy_states.fetchRemove(finished.request_id.id) orelse {
+            ctx.redraw().skip();
+            return;
+        };
+        const state = removed.value;
+        if (!self.effectOriginIsLive(state.origin)) {
+            ctx.redraw().skip();
+            return;
+        }
         switch (finished.outcome) {
-            .sent => self.setReviewStatus("clipboard copy sent: {s}", .{finished.label}),
-            .unsupported_runtime => self.setReviewStatus("clipboard copy unavailable: {s}", .{finished.label}),
-            .write_failed => |err| self.setReviewStatus("clipboard copy failed: {s}: {s}", .{ finished.label, err }),
+            .sent => self.setEffectStatus(state.origin, "clipboard copy sent: {s}", .{state.label}),
+            .unsupported_runtime => self.setEffectStatus(state.origin, "clipboard copy unavailable: {s}", .{state.label}),
+            .write_failed => |err| self.setEffectStatus(state.origin, "clipboard copy failed: {s}: {s}", .{ state.label, err }),
         }
-        if (self.active_page != .review) ctx.redraw().skip();
-    }
-
-    fn currentDiffLineCopyText(self: *const App) ?[]const u8 {
-        const coordinate = switch (self.pages.review.viewer.diff_cursor) {
-            .hunk_line => |line| line,
-            .metadata, .binary_marker, .hunk_header => return null,
-        };
-        const file = self.reviewNavigationView().displayedDiffFile() orelse return null;
-        if (coordinate.hunk_index >= file.hunks.len) return null;
-        const hunk = file.hunks[coordinate.hunk_index];
-        if (coordinate.line_index >= hunk.lines.len) return null;
-
-        return switch (self.reviewNavigationView().effectiveDisplayMode()) {
-            .unified => hunk.lines[coordinate.line_index].text,
-            .side_by_side => sideBySideLineCopyText(hunk, coordinate.line_index),
-        };
-    }
-
-    fn sideBySideLineCopyText(hunk: diff_parser.Hunk, line_index: usize) ?[]const u8 {
-        var rows = diff_view_model.SideBySideIndexedIterator.init(hunk.lines);
-        while (rows.next()) |row| {
-            switch (row) {
-                .single => |line| {
-                    if (line.line_index == line_index) return line.line.text;
-                },
-                .paired => |pair| {
-                    const matches_removed = if (pair.removed) |removed| removed.line_index == line_index else false;
-                    const matches_added = if (pair.added) |added| added.line_index == line_index else false;
-                    if (!matches_removed and !matches_added) continue;
-                    if (pair.added) |added| return added.line.text;
-                    if (pair.removed) |removed| return removed.line.text;
-                },
-            }
+        switch (state.origin) {
+            .page => |origin_page| if (self.active_page != origin_page.page_id) ctx.redraw().skip(),
+            .shell_surface => {},
         }
-        return null;
-    }
-
-    fn newSideHunkCopyText(allocator: std.mem.Allocator, hunk: diff_parser.Hunk) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(allocator);
-        errdefer out.deinit();
-
-        for (hunk.lines) |line| {
-            switch (line.kind) {
-                .context, .added => {
-                    try out.writer.writeAll(line.text);
-                    try out.writer.writeByte('\n');
-                },
-                .removed, .metadata => {},
-            }
-        }
-        return try out.toOwnedSlice();
     }
 
     fn setStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
@@ -3699,6 +3623,46 @@ pub const App = struct {
 
     fn setReviewStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
         self.pages.review.status.set(fmt, args);
+    }
+
+    fn effectOriginIsLive(self: *const App, origin: EffectOrigin) bool {
+        return switch (origin) {
+            .page => |origin_page| switch (origin_page.page_id) {
+                .review => origin_page.repo_epoch == self.repo_epoch and
+                    origin_page.activation_id == self.pages.review.activation.next_activation_id,
+                .repository, .history, .config => origin_page.repo_epoch == self.repo_epoch,
+            },
+            .shell_surface => |origin_surface| switch (origin_surface.surface) {
+                .push_error => self.overlay.isPushError() and
+                    self.overlay.push_error_instance_id == origin_surface.instance_id,
+                .commit_panel => self.commit_panel.is_open and
+                    self.commit_panel.instance_id == origin_surface.instance_id,
+            },
+        };
+    }
+
+    fn setEffectStatus(self: *App, origin: EffectOrigin, comptime fmt: []const u8, args: anytype) void {
+        switch (origin) {
+            .page => |origin_page| switch (origin_page.page_id) {
+                .review => self.setReviewStatus(fmt, args),
+                // Later page owners replace these placeholders with their own
+                // diagnostic slots without changing the effect completion tag.
+                .repository, .history, .config => self.setStatus(fmt, args),
+            },
+            .shell_surface => self.setStatus(fmt, args),
+        }
+    }
+
+    fn reviewPageEffectOrigin(self: *const App) PageEffectOrigin {
+        const identity = self.pages.review.activation.currentIdentity();
+        return .{
+            .page_id = .review,
+            .repo_epoch = if (identity) |value| value.repo_epoch else self.repo_epoch,
+            // `next_activation_id` retains the most recent Review instance
+            // while inactive. A later reactivation increments it, so old
+            // completions cannot present in the new page instance.
+            .activation_id = if (identity) |value| value.activation_id else self.pages.review.activation.next_activation_id,
+        };
     }
 
     fn persistRecentRepositories(self: *App, ctx: *chasen.Ctx(Msg)) void {
@@ -4841,78 +4805,36 @@ test "line number toggle clamps horizontal scroll without changing vertical scro
     try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll <= app.reviewNavigationView().visibleBodyTextMaxHorizontalScroll());
 }
 
-test "current line copy text uses side-by-side paired new side" {
-    var app: App = .{
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .display_mode = .side_by_side,
-                .sidebar_hidden = true,
-                .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } },
-                .diff_horizontal_scroll = 99,
-                .view_options = .{ .line_numbers = false },
-            },
-        } },
-        .terminal_size = .{ .width = 140, .height = 24 },
-    };
-
-    try std.testing.expectEqualStrings("new", app.currentDiffLineCopyText().?);
-}
-
-test "side-by-side line copy falls back to removed side when no added pair exists" {
-    const hunk: diff_parser.Hunk = .{
-        .old_start = 1,
-        .old_count = 1,
-        .new_start = 1,
-        .new_count = 0,
-        .section = "",
-        .lines = &.{.{ .kind = .removed, .text = "deleted", .old_line = 1 }},
-    };
-
-    try std.testing.expectEqualStrings("deleted", App.sideBySideLineCopyText(hunk, 0).?);
-}
-
-test "new side hunk copy text is undecorated and keeps trailing newline" {
-    const text = try App.newSideHunkCopyText(std.testing.allocator, app_test_support.hunks[0]);
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expectEqualStrings("one\ntwo\nnew\nfour\n", text);
-}
-
-test "new side hunk copy text is empty for removed-only hunk" {
-    const hunk: diff_parser.Hunk = .{
-        .old_start = 1,
-        .old_count = 1,
-        .new_start = 1,
-        .new_count = 0,
-        .section = "",
-        .lines = &.{.{ .kind = .removed, .text = "deleted", .old_line = 1 }},
-    };
-
-    const text = try App.newSideHunkCopyText(std.testing.allocator, hunk);
-    defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings("", text);
-}
-
 test "clipboard copy result status uses best-effort wording" {
     var app: App = .{};
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    const origin: EffectOrigin = .{ .page = app.reviewPageEffectOrigin() };
 
-    app.finishClipboardCopy(&ctx, .{ .label = "current line", .outcome = .sent });
+    try app.clipboard_copy_states.put(std.testing.allocator, 1, .{ .origin = origin, .label = "current line" });
+    app.finishClipboardCopy(&ctx, .{ .request_id = .{ .id = 1 }, .outcome = .sent });
     try std.testing.expectEqualStrings("clipboard copy sent: current line", app.pages.review.status.text());
 
-    app.finishClipboardCopy(&ctx, .{ .label = "current hunk", .outcome = .unsupported_runtime });
+    try app.clipboard_copy_states.put(std.testing.allocator, 2, .{ .origin = origin, .label = "current hunk" });
+    app.finishClipboardCopy(&ctx, .{ .request_id = .{ .id = 2 }, .outcome = .unsupported_runtime });
     try std.testing.expectEqualStrings("clipboard copy unavailable: current hunk", app.pages.review.status.text());
 
-    app.finishClipboardCopy(&ctx, .{ .label = "current line", .outcome = .{ .write_failed = "BrokenPipe" } });
+    try app.clipboard_copy_states.put(std.testing.allocator, 3, .{ .origin = origin, .label = "current line" });
+    app.finishClipboardCopy(&ctx, .{ .request_id = .{ .id = 3 }, .outcome = .{ .write_failed = "BrokenPipe" } });
     try std.testing.expectEqualStrings("clipboard copy failed: current line: BrokenPipe", app.pages.review.status.text());
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_copy_states.count());
 }
 
 test "inactive Review clipboard completion retains diagnostic without redraw" {
     var app: App = .{ .active_page = .repository };
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.clipboard_copy_states.put(std.testing.allocator, 4, .{
+        .origin = .{ .page = app.reviewPageEffectOrigin() },
+        .label = "current line",
+    });
 
-    app.finishClipboardCopy(&ctx, .{ .label = "current line", .outcome = .sent });
+    app.finishClipboardCopy(&ctx, .{ .request_id = .{ .id = 4 }, .outcome = .sent });
 
     try std.testing.expectEqualStrings("clipboard copy sent: current line", app.pages.review.status.text());
     try std.testing.expectEqualStrings("", app.status.text());
@@ -4921,10 +4843,11 @@ test "inactive Review clipboard completion retains diagnostic without redraw" {
 
 test "copyPopup queues push error message text" {
     var app: App = .{
-        .overlay = .{ .kind = .push_error },
         .push_error_message = try std.testing.allocator.dupe(u8, "  fatal\nline two  "),
     };
     defer std.testing.allocator.free(app.push_error_message.?);
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
+    app.overlay.openPushError();
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer ctx.runtimeClearPendingEffectCopies();
@@ -4934,7 +4857,97 @@ test "copyPopup queues push error message text" {
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
     const entry = ctx._pending_clipboard_copies[0];
     try std.testing.expectEqualStrings("  fatal\nline two  ", entry.text);
-    try std.testing.expectEqual(@as(chasen.Ctx(App.Msg).ClipboardCopyFinishedFn, App.copyPopupDone), entry.finished);
+    try std.testing.expectEqual(@as(chasen.Ctx(App.Msg).ClipboardCopyFinishedFn, App.clipboardCopyDone), entry.finished);
+    const state = app.clipboard_copy_states.get(entry.request_id.id) orelse return error.ExpectedClipboardState;
+    try std.testing.expectEqual(app.overlay.push_error_instance_id, state.origin.shell_surface.instance_id);
+}
+
+test "closed shell surface discards clipboard completion presentation" {
+    var app: App = .{};
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    app.overlay.openPushError();
+    const instance_id = app.overlay.push_error_instance_id;
+    app.overlay.close();
+    try app.clipboard_copy_states.put(std.testing.allocator, 5, .{
+        .origin = .{ .shell_surface = .{ .surface = .push_error, .instance_id = instance_id } },
+        .label = "push error",
+    });
+
+    app.finishClipboardCopy(&ctx, .{
+        .request_id = .{ .id = 5 },
+        .outcome = .sent,
+    });
+
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expectEqualStrings("", app.pages.review.status.text());
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "live shell surface owns clipboard completion presentation" {
+    var app: App = .{};
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    app.overlay.openPushError();
+    try app.clipboard_copy_states.put(std.testing.allocator, 6, .{
+        .origin = .{ .shell_surface = .{
+            .surface = .push_error,
+            .instance_id = app.overlay.push_error_instance_id,
+        } },
+        .label = "push error",
+    });
+
+    app.finishClipboardCopy(&ctx, .{
+        .request_id = .{ .id = 6 },
+        .outcome = .sent,
+    });
+
+    try std.testing.expectEqualStrings("clipboard copy sent: push error", app.status.text());
+    try std.testing.expectEqualStrings("", app.pages.review.status.text());
+}
+
+test "reopened shell surface rejects prior clipboard completion" {
+    var app: App = .{};
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    app.overlay.openPushError();
+    const old_instance = app.overlay.push_error_instance_id;
+    try app.clipboard_copy_states.put(std.testing.allocator, 7, .{
+        .origin = .{ .shell_surface = .{ .surface = .push_error, .instance_id = old_instance } },
+        .label = "old push error",
+    });
+    app.overlay.close();
+    app.overlay.openPushError();
+    try std.testing.expect(app.overlay.push_error_instance_id != old_instance);
+
+    app.finishClipboardCopy(&ctx, .{ .request_id = .{ .id = 7 }, .outcome = .sent });
+
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_copy_states.count());
+}
+
+test "clipboard completion rejects unknown id and superseded page instance" {
+    var app: App = .{};
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
+    const old_activation = app.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    try app.clipboard_copy_states.put(std.testing.allocator, 8, .{
+        .origin = .{ .page = .{ .page_id = .review, .repo_epoch = 0, .activation_id = old_activation } },
+        .label = "old page",
+    });
+    _ = app.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    app.finishClipboardCopy(&ctx, .{ .request_id = .{ .id = 999 }, .outcome = .sent });
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_copy_states.count());
+    try std.testing.expectEqualStrings("", app.pages.review.status.text());
+
+    ctx._redraw_suppressed = false;
+    app.finishClipboardCopy(&ctx, .{ .request_id = .{ .id = 8 }, .outcome = .sent });
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_copy_states.count());
+    try std.testing.expectEqualStrings("", app.pages.review.status.text());
+    try std.testing.expect(ctx._redraw_suppressed);
 }
 
 test "copyPopup reports empty target outside copyable popup" {
@@ -4945,7 +4958,7 @@ test "copyPopup reports empty target outside copyable popup" {
     app.copyPopup(&ctx);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings("nothing to copy: popup", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("nothing to copy: popup", app.status.text());
 }
 
 test "copyCommitMessage queues formatted commit message text" {
@@ -4953,6 +4966,7 @@ test "copyCommitMessage queues formatted commit message text" {
         .commit_panel = app_commit_panel.State.init(std.testing.allocator),
     };
     defer app.commit_panel.deinit();
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer ctx.runtimeClearPendingEffectCopies();
 
@@ -4964,7 +4978,9 @@ test "copyCommitMessage queues formatted commit message text" {
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
     const entry = ctx._pending_clipboard_copies[0];
     try std.testing.expectEqualStrings("subject\n\nbody\n\nline two", entry.text);
-    try std.testing.expectEqual(@as(chasen.Ctx(App.Msg).ClipboardCopyFinishedFn, App.copyCommitMessageDone), entry.finished);
+    try std.testing.expectEqual(@as(chasen.Ctx(App.Msg).ClipboardCopyFinishedFn, App.clipboardCopyDone), entry.finished);
+    const state = app.clipboard_copy_states.get(entry.request_id.id) orelse return error.ExpectedClipboardState;
+    try std.testing.expectEqual(app.commit_panel.instance_id, state.origin.shell_surface.instance_id);
 }
 
 test "copyCommitMessage uses same commit panel state for amend mode" {
@@ -4972,6 +4988,7 @@ test "copyCommitMessage uses same commit panel state for amend mode" {
         .commit_panel = app_commit_panel.State.init(std.testing.allocator),
     };
     defer app.commit_panel.deinit();
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer ctx.runtimeClearPendingEffectCopies();
 
@@ -4989,6 +5006,7 @@ test "copyCommitMessage preserves body-only formatMessage shape" {
         .commit_panel = app_commit_panel.State.init(std.testing.allocator),
     };
     defer app.commit_panel.deinit();
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer ctx.runtimeClearPendingEffectCopies();
 
@@ -5012,13 +5030,13 @@ test "copyCommitMessage reports empty draft and closed panel" {
     app.copyCommitMessage(&ctx);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings("nothing to copy: commit message", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("nothing to copy: commit message", app.status.text());
 
     app.commit_panel.open(.commit);
     app.copyCommitMessage(&ctx);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings("nothing to copy: commit message", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("nothing to copy: commit message", app.status.text());
 }
 
 test "display mode toggle keeps nearby vertical scroll position" {
@@ -5200,28 +5218,28 @@ test "undelivered action result releases owned payloads" {
 }
 
 test "undelivered diff and status loads release owned payloads" {
-    var diff_msg = App.Msg.loadFinished(.{ .diff_loaded = .{
+    var diff_msg = App.Msg.loadFinished(.{ .review = .{ .source = .{
         .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .loaded = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one) },
-    } });
+    } } });
     diff_msg.deinitUndelivered(std.testing.allocator);
 
-    var status_msg = App.Msg.loadFinished(.{ .status_loaded = .{
+    var status_msg = App.Msg.loadFinished(.{ .review = .{ .status = .{
         .identity = page.RequestIdentity.review(0, 1),
         .generation = 2,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .failed = try std.testing.allocator.dupe(u8, "status failed") },
-    } });
+    } } });
     status_msg.deinitUndelivered(std.testing.allocator);
 }
 
 test "undelivered repo and projection loads release owned payloads" {
-    var repo_msg = App.Msg.loadFinished(.{ .repos_discovered = .{
+    var repo_msg = App.Msg.loadFinished(.{ .coordinator = .{ .repo_discovery = .{
         .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .failed = try std.testing.allocator.dupe(u8, "discovery failed") },
-    } });
+    } } });
     repo_msg.deinitUndelivered(std.testing.allocator);
 
     const request = try app_review_projection.cloneRequest(
@@ -5235,7 +5253,7 @@ test "undelivered repo and projection loads release owned payloads" {
         3,
         4,
     );
-    var projection_msg = App.Msg.loadFinished(.{ .review_projection_loaded = .{
+    var projection_msg = App.Msg.loadFinished(.{ .review = .{ .projection = .{
         .request = request,
         .result = .{ .failed = try app_review_projection.statusBodyAlloc(
             std.testing.allocator,
@@ -5243,8 +5261,37 @@ test "undelivered repo and projection loads release owned payloads" {
             "{s}",
             .{"projection failed"},
         ) },
-    } });
+    } } });
     projection_msg.deinitUndelivered(std.testing.allocator);
+}
+
+test "undelivered remaining read routes release owned payloads" {
+    const allocator = std.testing.allocator;
+
+    var branch_status_msg = App.Msg.loadFinished(.{ .review = .{ .branch_status = .{
+        .identity = page.RequestIdentity.review(0, 1),
+        .generation = 1,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .failed = try allocator.dupe(u8, "branch status failed") },
+    } } });
+    branch_status_msg.deinitUndelivered(allocator);
+
+    var repo_path_msg = App.Msg.loadFinished(.{ .shell = .{ .repo_path_discovery = .{
+        .generation = 2,
+        .submitted_path = try allocator.dupe(u8, "/workspace"),
+        .result = .{ .failed = try allocator.dupe(u8, "path discovery failed") },
+    } } });
+    repo_path_msg.deinitUndelivered(allocator);
+
+    var branch_list_msg = App.Msg.loadFinished(.{ .shell = .{ .branch_list = .{
+        .origin = .review,
+        .repo_epoch = 3,
+        .activation_id = 5,
+        .generation = 4,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .failed = try allocator.dupe(u8, "branch list failed") },
+    } } });
+    branch_list_msg.deinitUndelivered(allocator);
 }
 
 test "undelivered plain root message is a no-op" {
@@ -6524,6 +6571,9 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     try std.testing.expect(app.branch_switch.loading);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
     const task: *BranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0..ctx._pending_tasks_with_len][0].ctx));
+    try std.testing.expectEqual(page.Id.review, task.origin);
+    try std.testing.expectEqual(app.repo_epoch, task.repo_epoch);
+    try std.testing.expectEqual(app.pages.review.activation.next_activation_id, task.activation_id);
     try std.testing.expectEqualStrings("/repo", task.repo_root);
     try std.testing.expectEqual(app.branch_switch.generation, task.generation);
 }
@@ -6575,6 +6625,9 @@ test "finishBranchListLoad ignores stale result and accepts matching generation"
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishBranchListLoad(&ctx, .{
+        .origin = .review,
+        .repo_epoch = 0,
+        .activation_id = 0,
         .generation = 2,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = try branchListForTest(std.testing.allocator, &.{
@@ -6585,6 +6638,9 @@ test "finishBranchListLoad ignores stale result and accepts matching generation"
     try std.testing.expectEqual(@as(usize, 0), app.branch_switch.branches.len);
 
     try app.finishBranchListLoad(&ctx, .{
+        .origin = .review,
+        .repo_epoch = 0,
+        .activation_id = 0,
         .generation = 3,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = try branchListForTest(std.testing.allocator, &.{
@@ -6597,6 +6653,77 @@ test "finishBranchListLoad ignores stale result and accepts matching generation"
     try std.testing.expectEqual(@as(usize, 2), app.branch_switch.branches.len);
     try std.testing.expectEqual(@as(usize, 1), app.branch_switch.selected_index);
     try std.testing.expectEqualStrings("feature/topic", app.branch_switch.branches[1].name);
+}
+
+test "finishBranchListLoad rejects matching operation from stale repo epoch" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .repo_epoch = 4,
+        .branch_switch = .{
+            .repo_root = try allocator.dupe(u8, "/repo"),
+            .current_branch = try allocator.dupe(u8, "main"),
+            .current_oid = try allocator.dupe(u8, "abc123"),
+            .generation = 3,
+            .loading = true,
+        },
+        .branch_switch_load_pending = 3,
+        .overlay = .{ .kind = .switch_branch },
+    };
+    defer app.clearBranchSwitch(allocator);
+    app.pages.review.status.set("retained", .{});
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.finishBranchListLoad(&ctx, .{
+        .origin = .review,
+        .repo_epoch = 3,
+        .activation_id = 1,
+        .generation = 3,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .failed = try allocator.dupe(u8, "stale failure") },
+    });
+
+    try std.testing.expectEqual(@as(?u64, 3), app.branch_switch_load_pending);
+    try std.testing.expect(app.branch_switch.loading);
+    try std.testing.expectEqual(@as(usize, 0), app.branch_switch.branches.len);
+    try std.testing.expectEqualStrings("retained", app.pages.review.status.text());
+}
+
+test "stale branch-list diagnostic does not overwrite reactivated Review" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .branch_switch = .{
+            .repo_root = try allocator.dupe(u8, "/repo"),
+            .current_branch = try allocator.dupe(u8, "main"),
+            .current_oid = try allocator.dupe(u8, "abc123"),
+            .generation = 3,
+            .loading = true,
+        },
+        .branch_switch_load_pending = 3,
+        .overlay = .{ .kind = .switch_branch },
+    };
+    defer app.clearBranchSwitch(allocator);
+    const old_activation = app.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    const new_activation = app.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    try std.testing.expect(old_activation != new_activation);
+    app.pages.review.status.set("new Review diagnostic", .{});
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.finishBranchListLoad(&ctx, .{
+        .origin = .review,
+        .repo_epoch = 0,
+        .activation_id = old_activation,
+        .generation = 3,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .failed = try allocator.dupe(u8, "old operation failure") },
+    });
+
+    try std.testing.expect(app.branch_switch_load_pending == null);
+    try std.testing.expect(!app.branch_switch.hasState());
+    try std.testing.expect(!app.overlay.isSwitchBranch());
+    try std.testing.expectEqualStrings("new Review diagnostic", app.pages.review.status.text());
+    try std.testing.expect(!ctx._redraw_suppressed);
 }
 
 test "confirmBranchSwitch treats current branch as no-op without clearing state" {
@@ -7086,6 +7213,29 @@ fn testNamedSingleRepoDiscovery(allocator: std.mem.Allocator, label: []const u8,
         .display_path = try allocator.dupe(u8, root),
         .canonical_root = try allocator.dupe(u8, root),
     } };
+}
+
+test "repo discovery remains owned when recent-store update fails" {
+    const backing = std.testing.allocator;
+    var app: App = .{ .active_page = .repository };
+    const activation_id = app.pages.review.activation.activate(0, .pending, .unavailable, .unavailable);
+    const generation = app.pages.review.load.beginRepoDiscovery();
+    const discovery = try testSingleRepoDiscovery(backing, "/repo/owned-until-commit");
+
+    var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 0 });
+    const allocator = failing.allocator();
+    defer app.repo_state.deinit(allocator);
+    defer app.recent_repos.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try std.testing.expectError(error.OutOfMemory, app.finishRepoDiscovery(&ctx, .{
+        .identity = page.RequestIdentity.review(0, activation_id),
+        .generation = generation,
+        .result = .{ .discovered = discovery },
+    }));
+
+    try std.testing.expect(app.repo_state.discovery == null);
+    try std.testing.expectEqual(@as(usize, 0), app.recent_repos.entries.items.len);
 }
 
 test "repo discovery completion cannot overwrite a newer repository commitment" {
@@ -7599,6 +7749,8 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
     try std.testing.expect(app.push_retry_target == null);
     try std.testing.expect(!app.push_retry_credentials_available);
     try std.testing.expect(app.push_foreground != null);
+    try std.testing.expectEqual(page.Id.review, app.push_foreground.?.origin.page_id);
+    try std.testing.expectEqual(app.repo_epoch, app.push_foreground.?.origin.repo_epoch);
     try std.testing.expect(app.actions.pending != null);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_foreground_commands_len);
 
@@ -7703,6 +7855,7 @@ test "finishPushForeground reloads matching active repo after failure" {
     app.push_foreground = .{
         .request_id = .{ .id = 9 },
         .pending = pending,
+        .origin = .{ .page_id = .review, .repo_epoch = app.repo_epoch, .activation_id = app.pages.review.activation.next_activation_id },
         .target = .{
             .mode = .upstream,
             .repo_root = try allocator.dupe(u8, "/repo"),
@@ -7736,6 +7889,7 @@ test "finishPushForeground ignores stale request id" {
     app.push_foreground = .{
         .request_id = .{ .id = 2 },
         .pending = pending,
+        .origin = .{ .page_id = .review, .repo_epoch = app.repo_epoch, .activation_id = app.pages.review.activation.next_activation_id },
         .target = .{
             .mode = .upstream,
             .repo_root = try allocator.dupe(u8, "/repo"),
@@ -7755,6 +7909,53 @@ test "finishPushForeground ignores stale request id" {
     try std.testing.expect(app.actions.pending != null);
     try std.testing.expect(app.push_foreground != null);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+}
+
+test "inactive Review foreground completions retain diagnostics without effects" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .repository,
+        .repo_epoch = 3,
+    };
+    const pending = app.actions.begin(.push);
+    app.push_foreground = .{
+        .request_id = .{ .id = 7 },
+        .pending = pending,
+        .origin = .{ .page_id = .review, .repo_epoch = 3, .activation_id = 0 },
+        .target = .{
+            .mode = .upstream,
+            .repo_root = try allocator.dupe(u8, "/repo"),
+            .branch = try allocator.dupe(u8, "main"),
+            .remote = try allocator.dupe(u8, "origin"),
+            .remote_branch = try allocator.dupe(u8, "main"),
+            .oid = try allocator.dupe(u8, "abc123"),
+        },
+    };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.finishPushForeground(&ctx, .{
+        .request_id = .{ .id = 7 },
+        .outcome = .{ .exited = 1 },
+    });
+
+    try std.testing.expectEqualStrings("interactive push exited for /repo: 1", app.pages.review.status.text());
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expect(ctx._redraw_suppressed);
+
+    ctx._redraw_suppressed = false;
+    app.editor_foreground_request = .{
+        .request_id = .{ .id = 8 },
+        .origin = .{ .page_id = .review, .repo_epoch = 3, .activation_id = 0 },
+    };
+    try app.finishEditorCommand(&ctx, .{
+        .request_id = .{ .id = 8 },
+        .outcome = .{ .exited = 0 },
+    });
+
+    try std.testing.expectEqualStrings("editor closed", app.pages.review.status.text());
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expect(ctx._redraw_suppressed);
 }
 
 test "openPushCredentialPrompt rejects non-HTTPS remote and frees retry target" {
@@ -7965,7 +8166,7 @@ test "selectedEditorTarget accepts status-only file rows" {
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/staged.zig\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
 
-    switch (app.selectedEditorTarget()) {
+    switch (app.reviewContent().editorTarget()) {
         .ready => |target| {
             try std.testing.expectEqualStrings("/repo", target.repo_root);
             try std.testing.expectEqualStrings("src/staged.zig", target.path);
@@ -7992,10 +8193,10 @@ test "selectedEditorTarget rejects deleted and historical sources" {
     };
     acceptTestSource(&app);
 
-    try std.testing.expectEqual(App.EditorTargetResult.deleted_file, app.selectedEditorTarget());
+    try std.testing.expectEqual(review_content.EditorTargetResult.deleted_file, app.reviewContent().editorTarget());
 
     app.config.source = .{ .range = "main...HEAD" };
-    try std.testing.expectEqual(App.EditorTargetResult.unavailable_source, app.selectedEditorTarget());
+    try std.testing.expectEqual(review_content.EditorTargetResult.unavailable_source, app.reviewContent().editorTarget());
 }
 
 test "selectedEditorTarget rejects deleted status-only file rows from fresh status" {
@@ -8038,7 +8239,7 @@ test "selectedEditorTarget rejects deleted status-only file rows from fresh stat
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " D src/deleted.zig\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
 
-    try std.testing.expectEqual(App.EditorTargetResult.deleted_file, app.selectedEditorTarget());
+    try std.testing.expectEqual(review_content.EditorTargetResult.deleted_file, app.reviewContent().editorTarget());
 }
 
 test "selectedEditorTarget rejects live sources without active repo" {
@@ -8050,7 +8251,7 @@ test "selectedEditorTarget rejects live sources without active repo" {
     };
     acceptTestSource(&app);
 
-    try std.testing.expectEqual(App.EditorTargetResult.no_repo, app.selectedEditorTarget());
+    try std.testing.expectEqual(review_content.EditorTargetResult.no_repo, app.reviewContent().editorTarget());
 }
 
 test "selectedEditorTarget rejects directory rows" {
@@ -8069,7 +8270,7 @@ test "selectedEditorTarget rejects directory rows" {
     };
     acceptTestSource(&app);
 
-    try std.testing.expectEqual(App.EditorTargetResult.directory_unsupported, app.selectedEditorTarget());
+    try std.testing.expectEqual(review_content.EditorTargetResult.directory_unsupported, app.reviewContent().editorTarget());
 }
 
 test "selectedStageToggleOperation resolves directory operation from descendants" {
