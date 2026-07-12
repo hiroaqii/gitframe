@@ -185,7 +185,8 @@ pub const GitStatusRequest = struct {
 };
 
 pub const RepositoryManifestRequest = struct {
-    repo_root: []const u8,
+    /// Borrowed descriptor cwd. The caller keeps it alive through command wait.
+    cwd: std.Io.Dir,
 };
 
 /// Request for branch/upstream/ahead-behind status in a concrete repository.
@@ -339,7 +340,7 @@ pub const LocalCommandBackend = struct {
     }
 
     pub fn loadRepositoryManifest(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult {
-        return loadGitRepositoryManifest(allocator, io, request.repo_root);
+        return loadGitRepositoryManifest(allocator, io, request.cwd);
     }
 
     pub fn loadBranchStatus(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
@@ -468,9 +469,8 @@ fn repositoryManifestResultFromGitCommand(allocator: std.mem.Allocator, result: 
         else => {},
     }
     allocator.free(result.stdout);
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
     allocator.free(result.stderr);
-    return .{ .failed = allocator.dupe(u8, "git ls-files failed") catch return error.OutOfMemory };
+    return .{ .failed_static = "Repository manifest could not be loaded" };
 }
 
 fn operationResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) LoadError!OperationResult {
@@ -545,15 +545,13 @@ pub fn repositoryManifestArgv() []const []const u8 {
     return &repository_manifest_argv;
 }
 
-fn loadGitRepositoryManifest(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!RepositoryManifestLoadResult {
-    const result = try runCapturedCommand(
-        allocator,
-        io,
-        repo_root,
-        repositoryManifestArgv(),
-        .limited(max_repository_manifest_bytes),
-        .limited(256 * 1024),
-    );
+fn loadGitRepositoryManifest(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir) LoadError!RepositoryManifestLoadResult {
+    const result = process_runner.runCaptured(allocator, io, .{
+        .argv = repositoryManifestArgv(),
+        .cwd = .{ .dir = cwd },
+        .stdout_limit = .limited(max_repository_manifest_bytes),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch |err| return runnerErrorToLoadError(err);
     return repositoryManifestResultFromGitCommand(allocator, result);
 }
 
@@ -586,10 +584,8 @@ test "repository manifest backend deduplicates a real three-stage conflict" {
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-am", "main" }, work);
     try runTestGitFailure(io, &.{ "git", "merge", "side" }, work);
 
-    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
-    defer std.testing.allocator.free(repo_root);
     var backend: LocalCommandBackend = .{};
-    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .repo_root = repo_root });
+    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = work });
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |value| value,
@@ -616,10 +612,8 @@ test "repository manifest backend accepts gitlink as one path" {
     defer std.testing.allocator.free(cache_info);
     try runTestGit(io, &.{ "git", "update-index", "--add", "--cacheinfo", cache_info }, work);
 
-    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
-    defer std.testing.allocator.free(repo_root);
     var backend: LocalCommandBackend = .{};
-    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .repo_root = repo_root });
+    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = work });
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |value| value,
@@ -644,10 +638,8 @@ test "repository manifest backend includes tracked and non-ignored untracked pat
     try work.writeFile(io, .{ .sub_path = "ignored.log", .data = "ignored\n" });
     try work.writeFile(io, .{ .sub_path = "visible.txt", .data = "visible\n" });
 
-    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
-    defer std.testing.allocator.free(repo_root);
     var backend: LocalCommandBackend = .{};
-    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .repo_root = repo_root });
+    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = work });
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |value| value,
@@ -659,16 +651,49 @@ test "repository manifest backend includes tracked and non-ignored untracked pat
     try std.testing.expect(!containsNulPath(bytes, "ignored.log"));
 }
 
+test "repository manifest descriptor cwd stays on committed directory after path replacement" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var committed = try tmp.dir.openDir(io, "work", .{});
+    defer committed.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, committed);
+    try committed.writeFile(io, .{ .sub_path = "committed.txt", .data = "old\n" });
+
+    try tmp.dir.rename("work", tmp.dir, "old-work", io);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var replacement = try tmp.dir.openDir(io, "work", .{});
+    defer replacement.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, replacement);
+    try replacement.writeFile(io, .{ .sub_path = "replacement.txt", .data = "new\n" });
+
+    var backend: LocalCommandBackend = .{};
+    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = committed });
+    defer result.deinit(std.testing.allocator);
+    const bytes = switch (result) {
+        .ok => |value| value,
+        else => return error.UnexpectedRepositoryManifestFailure,
+    };
+    try std.testing.expect(containsNulPath(bytes, "committed.txt"));
+    try std.testing.expect(!containsNulPath(bytes, "replacement.txt"));
+}
+
 test "repository manifest unsupported option is a typed failure" {
+    const secret = "/private/worktree/token-123";
     const result = process_runner.Result{
         .term = .{ .exited = 129 },
         .stdout = try std.testing.allocator.alloc(u8, 0),
-        .stderr = try std.testing.allocator.dupe(u8, "error: unknown option `deduplicate`\n"),
+        .stderr = try std.fmt.allocPrint(std.testing.allocator, "error at {s}: unknown option `deduplicate`\n", .{secret}),
     };
     const mapped = try repositoryManifestResultFromGitCommand(std.testing.allocator, result);
     defer mapped.deinit(std.testing.allocator);
     switch (mapped) {
-        .failed => |message| try std.testing.expect(std.mem.indexOf(u8, message, "deduplicate") != null),
+        .failed_static => |message| {
+            try std.testing.expectEqualStrings("Repository manifest could not be loaded", message);
+            try std.testing.expect(std.mem.indexOf(u8, message, secret) == null);
+            try std.testing.expect(std.mem.indexOf(u8, message, "deduplicate") == null);
+        },
         else => return error.ExpectedRepositoryManifestFailure,
     }
 }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("../config.zig");
+const content_fingerprint = @import("../content_fingerprint.zig");
 const diff_source = @import("../diff/source.zig");
 
 pub const Activation = enum {
@@ -13,26 +14,8 @@ pub const SourceFreshness = enum {
     stale_background_failure,
 };
 
-pub const SourceFingerprint = struct {
-    byte_len: u64,
-    digest: [32]u8,
-
-    pub fn init(bytes: []const u8) SourceFingerprint {
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.Blake3.hash(bytes, &digest, .{});
-        return .{
-            .byte_len = @intCast(bytes.len),
-            .digest = digest,
-        };
-    }
-
-    pub fn eql(lhs: SourceFingerprint, rhs: SourceFingerprint) bool {
-        return lhs.byte_len == rhs.byte_len and std.mem.eql(u8, &lhs.digest, &rhs.digest);
-    }
-};
-
 pub const AcceptedSource = struct {
-    fingerprint: SourceFingerprint,
+    fingerprint: content_fingerprint.Fingerprint,
     freshness: SourceFreshness = .fresh,
 };
 
@@ -211,7 +194,7 @@ pub const State = struct {
         self.background_cycle = null;
     }
 
-    pub fn acceptSource(self: *State, fingerprint: SourceFingerprint) void {
+    pub fn acceptSource(self: *State, fingerprint: content_fingerprint.Fingerprint) void {
         self.accepted_source = .{ .fingerprint = fingerprint };
         self.last_failure = null;
     }
@@ -260,14 +243,6 @@ test "policy resolution honors cli config and source eligibility" {
     try std.testing.expectEqual(@as(u64, std.time.ns_per_s), State.init(.inherit, .{ .interval_seconds = 1 }, .unstaged).interval_ns);
 }
 
-test "source fingerprint includes content and length" {
-    const first = SourceFingerprint.init("abc");
-    try std.testing.expect(first.eql(SourceFingerprint.init("abc")));
-    try std.testing.expect(!first.eql(SourceFingerprint.init("abd")));
-    try std.testing.expect(!first.eql(SourceFingerprint.init("abc\n")));
-    try std.testing.expect(SourceFingerprint.init("").eql(SourceFingerprint.init("")));
-}
-
 test "background cycle remains busy until every member finishes" {
     var state = State.init(.inherit, .{}, .unstaged);
     const id = state.beginCycle().?;
@@ -297,7 +272,7 @@ test "deferred source apply keeps its background cycle busy" {
 
 test "accepted source failure is deduplicated and unchanged success restores freshness" {
     var state = State.init(.inherit, .{}, .unstaged);
-    const fingerprint = SourceFingerprint.init("diff");
+    const fingerprint = content_fingerprint.Fingerprint.init("diff");
     state.acceptSource(fingerprint);
     try std.testing.expect(state.sourceIsFresh());
     try std.testing.expect(state.markSourceFailure("failed"));
@@ -310,7 +285,7 @@ test "accepted source failure is deduplicated and unchanged success restores fre
 test "missing accepted source fails closed for diff-derived actions" {
     var state = State.init(.inherit, .{}, .unstaged);
     try std.testing.expect(!state.sourceIsActionable());
-    state.acceptSource(SourceFingerprint.init(""));
+    state.acceptSource(content_fingerprint.Fingerprint.init(""));
     try std.testing.expect(state.sourceIsActionable());
     state.clearAcceptedSource();
     try std.testing.expect(!state.sourceIsActionable());
@@ -318,7 +293,7 @@ test "missing accepted source fails closed for diff-derived actions" {
 
 test "replacement invalidation preserves failure identity but fails closed" {
     var state = State.init(.inherit, .{}, .unstaged);
-    state.acceptSource(SourceFingerprint.init("old"));
+    state.acceptSource(content_fingerprint.Fingerprint.init("old"));
     try std.testing.expect(state.markSourceFailure("transient"));
     const failure = state.last_failure.?;
 

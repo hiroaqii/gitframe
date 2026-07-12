@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const repo_discovery = @import("discovery.zig");
+const root_capability = @import("root_capability.zig");
 
 pub const max_recent_entries = 32;
 
@@ -12,16 +13,54 @@ pub const max_recent_entries = 32;
 pub const State = struct {
     discovery: ?repo_discovery.DiscoveryResult = null,
     active_index: usize = 0,
+    root: ?root_capability.RootCapability = null,
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         if (self.discovery) |*discovery| discovery.deinit(allocator);
+        if (self.root) |*root| root.deinit();
         self.* = .{};
     }
 
-    pub fn replace(self: *State, allocator: std.mem.Allocator, discovery: repo_discovery.DiscoveryResult) void {
+    /// Atomically replace path metadata and the matching committed root owner.
+    pub fn replaceCommitted(
+        self: *State,
+        allocator: std.mem.Allocator,
+        discovery: repo_discovery.DiscoveryResult,
+        active_index: usize,
+        root: ?root_capability.RootCapability,
+    ) void {
         self.deinit(allocator);
         self.discovery = discovery;
-        self.active_index = 0;
+        self.active_index = active_index;
+        self.root = root;
+    }
+
+    /// Replace refreshed discovery metadata while retaining the exact same
+    /// root capability committed for the unchanged path/object identity.
+    pub fn replaceDiscoveryKeepingRoot(
+        self: *State,
+        allocator: std.mem.Allocator,
+        discovery: repo_discovery.DiscoveryResult,
+        active_index: usize,
+    ) void {
+        if (self.discovery) |*old| old.deinit(allocator);
+        self.discovery = discovery;
+        self.active_index = active_index;
+    }
+
+    /// Commit a workspace selection and its already-open matching capability.
+    pub fn selectWorkspaceRoot(
+        self: *State,
+        active_index: usize,
+        root: root_capability.RootCapability,
+    ) void {
+        if (self.root) |*old| old.deinit();
+        self.active_index = active_index;
+        self.root = root;
+    }
+
+    pub fn selectWorkspaceIndexKeepingRoot(self: *State, active_index: usize) void {
+        self.active_index = active_index;
     }
 
     pub fn activeRoot(self: *const State) ?[]const u8 {
@@ -34,6 +73,14 @@ pub const State = struct {
                 null,
             .none => null,
         };
+    }
+
+    pub fn activeCapability(self: *const State) ?*const root_capability.RootCapability {
+        return if (self.root) |*root| root else null;
+    }
+
+    pub fn activeIdentity(self: *const State) ?root_capability.Identity {
+        return if (self.root) |root| root.identity else null;
     }
 
     pub fn workspaceRepos(self: *const State) ?[]const repo_discovery.RepoEntry {

@@ -6,6 +6,7 @@
 //! process ownership, and transferring the proposal into an async task payload.
 
 const std = @import("std");
+const content_fingerprint = @import("../../../content_fingerprint.zig");
 const builtin = @import("builtin");
 const authority = @import("authority.zig");
 const navigation = @import("navigation.zig");
@@ -813,7 +814,7 @@ fn testView(page: *const review_page.ReviewPageState, source: diff_source.Source
 }
 
 fn acceptTestSource(page: *review_page.ReviewPageState) void {
-    page.auto_reload.acceptSource(auto_reload.SourceFingerprint.init("test"));
+    page.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test"));
 }
 
 test "stage target skips only fresh staged-only files" {

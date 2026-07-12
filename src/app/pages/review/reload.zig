@@ -5,6 +5,7 @@
 //! effects; it deliberately has no `App`, `Ctx`, overlay, or process access.
 
 const std = @import("std");
+const content_fingerprint = @import("../../../content_fingerprint.zig");
 const builtin = @import("builtin");
 const auto_reload = @import("../../auto_reload.zig");
 const app_load = @import("../../load.zig");
@@ -117,7 +118,7 @@ pub const OwnedSourceRead = struct {
     identity: app_page.RequestIdentity,
     request: diff_source.LoadRequest,
     generation: u64,
-    expected_fingerprint: ?auto_reload.SourceFingerprint,
+    expected_fingerprint: ?content_fingerprint.Fingerprint,
     background_cycle_id: ?u64,
 
     fn deinit(self: *OwnedSourceRead, allocator: std.mem.Allocator) void {
@@ -1081,7 +1082,7 @@ pub const Controller = struct {
                     self.installDisplayRestore(allocator, restore);
                     acceptance_restore = null;
                 }
-                outcome.recovered_failure = self.acceptSourceFingerprint(auto_reload.SourceFingerprint.init(""));
+                outcome.recovered_failure = self.acceptSourceFingerprint(content_fingerprint.Fingerprint.init(""));
                 _ = self.page.activation.finishMember(finished.identity, .source, self.acceptedSourceMember());
                 can_project_status = true;
             },
@@ -1200,7 +1201,7 @@ pub const Controller = struct {
         return .{};
     }
 
-    fn acceptSourceFingerprint(self: Controller, fingerprint: auto_reload.SourceFingerprint) ?auto_reload.FailureIdentity {
+    fn acceptSourceFingerprint(self: Controller, fingerprint: content_fingerprint.Fingerprint) ?auto_reload.FailureIdentity {
         const recovered_failure = self.page.auto_reload.last_failure;
         self.page.auto_reload.acceptSource(fingerprint);
         return recovered_failure;
@@ -2112,7 +2113,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
         .finished = .{
             .identity = app_page.RequestIdentity.review(0, 1),
             .generation = 2,
-            .result = .{ .unchanged = auto_reload.SourceFingerprint.init("same") },
+            .result = .{ .unchanged = content_fingerprint.Fingerprint.init("same") },
         },
     };
     const accepted_controller = testController(&accepted_page, &status_message, .unstaged);

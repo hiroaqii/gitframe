@@ -1,10 +1,11 @@
 const std = @import("std");
 const chasen = @import("chasen");
-const auto_reload = @import("../app/auto_reload.zig");
+const content_fingerprint = @import("../content_fingerprint.zig");
+const repository_path = @import("path.zig");
 
 pub const max_bytes: usize = 16 * 1024 * 1024;
 pub const max_paths: usize = 200_000;
-pub const max_path_bytes: usize = 64 * 1024;
+pub const max_path_bytes: usize = repository_path.max_bytes;
 
 pub const ParseError = error{
     OutOfMemory,
@@ -24,7 +25,7 @@ pub const ParseError = error{
 pub const Document = struct {
     bytes: []u8,
     paths: []const []const u8,
-    fingerprint: auto_reload.SourceFingerprint,
+    fingerprint: content_fingerprint.Fingerprint,
 
     pub fn deinit(self: *Document, allocator: std.mem.Allocator) void {
         allocator.free(self.paths);
@@ -44,7 +45,7 @@ pub fn parseOwned(allocator: std.mem.Allocator, bytes: []u8) ParseError!Document
     var start: usize = 0;
     while (start < bytes.len) {
         const end = std.mem.indexOfScalarPos(u8, bytes, start, 0) orelse return error.MissingTerminator;
-        try validatePath(bytes[start..end]);
+        try repository_path.validate(bytes[start..end]);
         path_count += 1;
         if (path_count > max_paths) return error.TooManyPaths;
         start = end + 1;
@@ -69,25 +70,8 @@ pub fn parseOwned(allocator: std.mem.Allocator, bytes: []u8) ParseError!Document
     return .{
         .bytes = bytes,
         .paths = paths,
-        .fingerprint = auto_reload.SourceFingerprint.init(bytes),
+        .fingerprint = content_fingerprint.Fingerprint.init(bytes),
     };
-}
-
-fn validatePath(path: []const u8) ParseError!void {
-    if (path.len == 0) return error.EmptyPath;
-    if (path.len > max_path_bytes) return error.PathTooLong;
-    if (path[0] == '/' or std.fs.path.isAbsolute(path)) return error.AbsolutePath;
-
-    var components = std.mem.splitScalar(u8, path, '/');
-    while (components.next()) |component| {
-        if (component.len == 0 or
-            std.mem.eql(u8, component, ".") or
-            std.mem.eql(u8, component, "..") or
-            std.mem.eql(u8, component, ".git"))
-        {
-            return error.InvalidComponent;
-        }
-    }
 }
 
 /// Orders each directory level as directories first, then files, with bytewise

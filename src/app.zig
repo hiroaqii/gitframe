@@ -34,6 +34,7 @@ const app_git_requests = @import("app/git_requests.zig");
 const context = @import("context.zig");
 const context_export = @import("context_export.zig");
 const config_mod = @import("config.zig");
+const content_fingerprint = @import("content_fingerprint.zig");
 const diff_parser = @import("diff/parser.zig");
 const diff_file = @import("diff/file.zig");
 const diff_hunk_projection = @import("diff/hunk_projection.zig");
@@ -52,6 +53,7 @@ const git_status = @import("git/status.zig");
 const keymap = @import("keymap");
 const loaded_diff = @import("loaded_diff.zig");
 const repo_discovery = @import("repo/discovery.zig");
+const repo_root_capability = @import("repo/root_capability.zig");
 const review_session = @import("review/session.zig");
 const theme = @import("theme");
 const repo_state = @import("repo/state.zig");
@@ -66,6 +68,8 @@ const PendingRecentPathDiscovery = struct {
     kind: repo_state.RecentKind,
     index: usize,
 };
+
+const RepoCommitOutcome = enum { unchanged, changed, rejected };
 
 pub const SourceMode = diff_source.SourceMode;
 pub const CliConfig = diff_source.CliConfig;
@@ -100,6 +104,7 @@ const PathTarget = git_ops.PathTarget;
 const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
 const RepositoryManifestTask = repository_page.ManifestTask(App.Msg);
+const RepositoryDocumentTask = repository_page.DocumentTask(App.Msg);
 const AmendFinished = app_actions.AmendFinished;
 const CommitFinished = app_actions.CommitFinished;
 const CommitMessageAssistFinished = app_actions.CommitMessageAssistFinished;
@@ -626,6 +631,7 @@ pub const App = struct {
         }
         try self.maybeStartQueuedReviewRevalidation(ctx);
         try self.maybeStartRepositoryManifest(ctx);
+        try self.maybeStartRepositoryDocument(ctx);
         if (self.active_page == .review) try self.ensureReviewProjection(ctx);
         self.reconcileGitActionSpinnerTimer(ctx);
     }
@@ -677,12 +683,18 @@ pub const App = struct {
                 const outcome = self.pages.repository.applyFinished(ctx.allocator(), &owned);
                 if (self.active_page != .repository or outcome == .discarded or outcome == .unchanged) ctx.redraw().skip();
             },
+            .document_finished => |finished| {
+                var owned = finished;
+                defer owned.deinit(ctx.allocator());
+                const outcome = self.pages.repository.applyDocumentFinished(ctx.allocator(), &owned);
+                if (self.active_page != .repository or outcome == .discarded or outcome == .unchanged) ctx.redraw().skip();
+            },
             else => {
                 if (self.active_page != .repository) {
                     ctx.redraw().skip();
                     return;
                 }
-                self.pages.repository.applyNavigation(msg, self.shellLayout().bodySize());
+                _ = self.pages.repository.applyNavigation(ctx.allocator(), msg, self.shellLayout().bodySize());
             },
         }
     }
@@ -693,8 +705,12 @@ pub const App = struct {
             self.pages.repository.requestReload(false);
             return;
         };
+        const capability = self.repo_state.activeCapability() orelse {
+            self.pages.repository.requestReload(false);
+            return;
+        };
 
-        var request = self.pages.repository.prepareRequest(ctx.allocator(), repo_root) catch |err| {
+        var request = self.pages.repository.prepareRequest(ctx.allocator(), repo_root, capability) catch |err| {
             self.pages.repository.markRequestPreparationFailed(err);
             return err;
         };
@@ -708,14 +724,47 @@ pub const App = struct {
         task.* = .{
             .identity = request.identity,
             .generation = request.generation,
-            .repo_root = request.repo_root,
+            .root_path = request.root_path,
+            .root = request.root,
             .expected_fingerprint = request.expected_fingerprint,
         };
         request_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = RepositoryManifestTask.run, .failed = RepositoryManifestTask.failed }) catch |err| {
-            ctx.allocator().free(task.repo_root);
+            ctx.allocator().free(task.root_path);
+            task.root.deinit();
             ctx.allocator().destroy(task);
             self.pages.repository.rejectSpawn(generation);
+            return err;
+        };
+    }
+
+    fn maybeStartRepositoryDocument(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.active_page != .repository or !self.pages.repository.wantsDocumentRequest()) return;
+        const capability = self.repo_state.activeCapability() orelse return;
+        var request = self.pages.repository.prepareDocumentRequest(ctx.allocator(), capability) catch |err| {
+            self.pages.repository.markDocumentRequestPreparationFailed(err);
+            return err;
+        };
+        var request_consumed = false;
+        defer if (!request_consumed) request.deinit(ctx.allocator());
+        const generation = request.generation;
+        const task = ctx.allocator().create(RepositoryDocumentTask) catch |err| {
+            self.pages.repository.rejectDocumentSpawn(generation);
+            return err;
+        };
+        task.* = .{
+            .identity = request.identity,
+            .generation = request.generation,
+            .manifest_revision = request.manifest_revision,
+            .path = request.path,
+            .root = request.root,
+        };
+        request_consumed = true;
+        ctx.task().spawnWith(.{ .ctx = task, .run = RepositoryDocumentTask.run, .failed = RepositoryDocumentTask.failed }) catch |err| {
+            ctx.allocator().free(task.path);
+            task.root.deinit();
+            ctx.allocator().destroy(task);
+            self.pages.repository.rejectDocumentSpawn(generation);
             return err;
         };
     }
@@ -1106,7 +1155,7 @@ pub const App = struct {
                 _ = self.activateReview();
                 try self.requestReviewRevalidation(ctx);
             },
-            .repository => self.pages.repository.activate(self.repo_epoch, self.activeRepoRoot() != null),
+            .repository => self.pages.repository.activate(self.repo_epoch, self.repo_state.activeIdentity()),
             .history => self.pages.history.ensureInitialized(),
             .config => self.pages.config.ensureInitialized(),
         }
@@ -3925,9 +3974,16 @@ pub const App = struct {
         return self.repo_state.activeRoot();
     }
 
-    fn sameRepoIdentity(left: ?[]const u8, right: ?[]const u8) bool {
-        if (left == null or right == null) return left == null and right == null;
-        return std.mem.eql(u8, left.?, right.?);
+    fn sameRepoIdentity(
+        left_path: ?[]const u8,
+        left_object: ?repo_root_capability.Identity,
+        right_path: ?[]const u8,
+        right_object: ?repo_root_capability.Identity,
+    ) bool {
+        if (left_path == null or right_path == null) return left_path == null and right_path == null;
+        if (!std.mem.eql(u8, left_path.?, right_path.?)) return false;
+        if (left_object == null or right_object == null) return left_object == null and right_object == null;
+        return left_object.?.eql(right_object.?);
     }
 
     fn discoveryRootAt(discovery: repo_discovery.DiscoveryResult, active_index: usize) ?[]const u8 {
@@ -3946,8 +4002,23 @@ pub const App = struct {
         discovery: repo_discovery.DiscoveryResult,
         active_index: usize,
         origin: RepoCommitOrigin,
-    ) bool {
-        const changed = !sameRepoIdentity(self.activeRepoRoot(), discoveryRootAt(discovery, active_index));
+    ) RepoCommitOutcome {
+        const proposed_root = discoveryRootAt(discovery, active_index);
+        var candidate: ?repo_root_capability.RootCapability = if (proposed_root) |root|
+            repo_root_capability.RootCapability.openCanonical(root) catch {
+                var rejected = discovery;
+                rejected.deinit(allocator);
+                self.pages.repository.repositoryCommitFailed();
+                return .rejected;
+            }
+        else
+            null;
+        const changed = !sameRepoIdentity(
+            self.activeRepoRoot(),
+            self.repo_state.activeIdentity(),
+            proposed_root,
+            if (candidate) |root| root.identity else null,
+        );
         // An explicit picker/path selection is a repository-state commitment
         // even when its canonical root is unchanged. Supersede older discovery
         // generations so an earlier same-epoch result cannot restore stale
@@ -3955,26 +4026,66 @@ pub const App = struct {
         if (changed or origin == .external_selection) self.supersedeRepoBoundReads(allocator);
         if (changed) self.invalidateReviewForRepoChange(allocator);
         if (changed) self.advanceRepoEpoch();
-        self.repo_state.replace(allocator, discovery);
-        self.repo_state.active_index = active_index;
-        if (changed) self.pages.repository.repositoryChanged(allocator, self.repo_epoch, self.activeRepoRoot() != null);
+        if (changed) {
+            const committed_root = candidate;
+            candidate = null;
+            self.repo_state.replaceCommitted(allocator, discovery, active_index, committed_root);
+        } else {
+            if (candidate) |*root| root.deinit();
+            self.repo_state.replaceDiscoveryKeepingRoot(allocator, discovery, active_index);
+        }
+        if (changed) self.pages.repository.repositoryChanged(allocator, self.repo_epoch, self.repo_state.activeIdentity());
         if (changed) self.finishRepoIdentityCommit();
-        return changed;
+        return if (changed) .changed else .unchanged;
     }
 
-    fn commitWorkspaceRepoIndex(self: *App, active_index: usize) bool {
-        const repos = self.repo_state.workspaceRepos() orelse return false;
-        const new_root = if (active_index < repos.len) repos[active_index].canonical_root else null;
-        const changed = !sameRepoIdentity(self.activeRepoRoot(), new_root);
+    fn commitWorkspaceRepoIndex(self: *App, active_index: usize) RepoCommitOutcome {
+        const repos = self.repo_state.workspaceRepos() orelse return .unchanged;
+        if (active_index >= repos.len) {
+            self.pages.repository.repositoryCommitFailed();
+            return .rejected;
+        }
+        const new_root = repos[active_index].canonical_root;
+        var candidate: ?repo_root_capability.RootCapability = repo_root_capability.RootCapability.openCanonical(new_root) catch {
+            self.pages.repository.repositoryCommitFailed();
+            return .rejected;
+        };
+        const changed = !sameRepoIdentity(
+            self.activeRepoRoot(),
+            self.repo_state.activeIdentity(),
+            new_root,
+            if (candidate) |root| root.identity else null,
+        );
         if (changed) {
             self.supersedeRepoBoundReads(self.allocator);
             self.invalidateReviewForRepoChange(self.allocator);
         }
         if (changed) self.advanceRepoEpoch();
-        self.repo_state.active_index = active_index;
-        if (changed) self.pages.repository.repositoryChanged(self.allocator, self.repo_epoch, self.activeRepoRoot() != null);
+        if (changed) {
+            const committed = candidate.?;
+            candidate = null;
+            self.repo_state.selectWorkspaceRoot(active_index, committed);
+        } else {
+            if (candidate) |*root| root.deinit();
+            self.repo_state.selectWorkspaceIndexKeepingRoot(active_index);
+        }
+        if (changed) self.pages.repository.repositoryChanged(self.allocator, self.repo_epoch, self.repo_state.activeIdentity());
         if (changed) self.finishRepoIdentityCommit();
-        return changed;
+        return if (changed) .changed else .unchanged;
+    }
+
+    /// Applies only the shell effects authorized by a completed repository
+    /// commitment. A rejected capability open must not reload or reset the
+    /// still-authoritative Review page.
+    fn finishRepoPickerCommit(self: *App, ctx: *chasen.Ctx(Msg), outcome: RepoCommitOutcome) !void {
+        switch (outcome) {
+            .changed => {
+                if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
+                self.reviewNavigation().resetAfterRepositorySwitch();
+            },
+            .unchanged => {},
+            .rejected => self.setStatus("Repository root could not be opened safely", .{}),
+        }
     }
 
     fn advanceRepoEpoch(self: *App) void {
@@ -4193,9 +4304,7 @@ pub const App = struct {
                 self.persistRecentRepositories(ctx);
                 if (repo_index == self.repo_state.active_index) return;
 
-                _ = self.commitWorkspaceRepoIndex(repo_index);
-                if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
-                self.reviewNavigation().resetAfterRepositorySwitch();
+                try self.finishRepoPickerCommit(ctx, self.commitWorkspaceRepoIndex(repo_index));
             },
             .pending_workspace_repo => |repo_index| {
                 try self.acceptPendingRepoPickerWorkspace(ctx, repo_index);
@@ -4450,10 +4559,9 @@ pub const App = struct {
                 self.persistRecentRepositories(ctx);
                 self.closeRepoPickerForSwitch(ctx.allocator());
                 self.clearRepoPickerDiscovery(ctx.allocator());
-                _ = self.commitRepoDiscovery(ctx.allocator(), owned_discovery, 0, .external_selection);
+                const outcome = self.commitRepoDiscovery(ctx.allocator(), owned_discovery, 0, .external_selection);
                 owned_discovery = .{ .none = .{ .current_root = "" } };
-                if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
-                self.reviewNavigation().resetAfterRepositorySwitch();
+                try self.finishRepoPickerCommit(ctx, outcome);
             },
             .workspace => |workspace| {
                 try self.recent_repos.rememberWorkspace(ctx.allocator(), workspace.current_root);
@@ -4492,10 +4600,9 @@ pub const App = struct {
         try self.recent_repos.rememberRepo(ctx.allocator(), workspace.repos[repo_index].canonical_root);
         self.persistRecentRepositories(ctx);
         self.closeRepoPickerForSwitch(ctx.allocator());
-        _ = self.commitRepoDiscovery(ctx.allocator(), discovery, repo_index, .external_selection);
+        const outcome = self.commitRepoDiscovery(ctx.allocator(), discovery, repo_index, .external_selection);
         discovery = .{ .none = .{ .current_root = "" } };
-        if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
-        self.reviewNavigation().resetAfterRepositorySwitch();
+        try self.finishRepoPickerCommit(ctx, outcome);
     }
 
     fn clearRepoPickerItems(self: *App, allocator: std.mem.Allocator) void {
@@ -7108,15 +7215,19 @@ test "keyboard and page bar mouse share the page switch transition" {
 }
 
 test "repository activation and manual reload route to page-owned manifest tasks" {
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
     var app: App = .{
         .allocator = std.testing.allocator,
         .config = .{ .source = .stdin },
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
-            .display_path = "/repo",
-            .canonical_root = "/repo",
+            .display_path = roots.a,
+            .canonical_root = roots.a,
         } } },
     };
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer if (app.repo_state.root) |*root| root.deinit();
     defer app.pages.repository.deinit(std.testing.allocator);
     _ = app.activateReview();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -7229,7 +7340,7 @@ test "Review re-entry starts immediate fingerprint revalidation even when pollin
         } } },
         .pages = .{ .review = .{ .load = .{ .state = .{ .empty = .no_changes } } } },
     };
-    app.pages.review.auto_reload.acceptSource(app_auto_reload.SourceFingerprint.init("retained"));
+    app.pages.review.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("retained"));
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
 
@@ -7248,25 +7359,130 @@ test "Review re-entry starts immediate fingerprint revalidation even when pollin
 }
 
 test "workspace repository commitments advance one authoritative epoch" {
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
     var repos = [_]repo_discovery.RepoEntry{
-        .{ .label = "a", .display_path = "/a", .canonical_root = "/a" },
-        .{ .label = "b", .display_path = "/b", .canonical_root = "/b" },
+        .{ .label = "a", .display_path = roots.a, .canonical_root = roots.a },
+        .{ .label = "b", .display_path = roots.b, .canonical_root = roots.b },
     };
     var app: App = .{ .repo_state = .{ .discovery = .{ .workspace = .{
         .current_root = "/workspace",
         .repos = &repos,
     } } } };
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer if (app.repo_state.root) |*root| root.deinit();
     _ = app.activateReview();
 
-    try std.testing.expect(!app.commitWorkspaceRepoIndex(0));
+    try std.testing.expectEqual(RepoCommitOutcome.unchanged, app.commitWorkspaceRepoIndex(0));
     try std.testing.expectEqual(@as(u64, 0), app.repo_epoch);
-    try std.testing.expect(app.commitWorkspaceRepoIndex(1));
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitWorkspaceRepoIndex(1));
     try std.testing.expectEqual(@as(u64, 1), app.repo_epoch);
-    try std.testing.expectEqualStrings("/b", app.activeRepoRoot().?);
-    try std.testing.expect(app.commitWorkspaceRepoIndex(0));
+    try std.testing.expectEqualStrings(roots.b, app.activeRepoRoot().?);
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitWorkspaceRepoIndex(0));
     try std.testing.expectEqual(@as(u64, 2), app.repo_epoch);
-    try std.testing.expectEqualStrings("/a", app.activeRepoRoot().?);
+    try std.testing.expectEqualStrings(roots.a, app.activeRepoRoot().?);
     try std.testing.expectEqual(@as(u64, 2), app.pages.review.activation.state.active.repo_epoch);
+}
+
+test "same repository path with a new filesystem object advances epoch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "repo", .default_dir);
+    const root_path = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(root_path);
+    var app: App = .{ .allocator = allocator };
+    defer app.repo_state.deinit(allocator);
+
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, root_path),
+        0,
+        .external_selection,
+    ));
+    const first_identity = app.repo_state.activeIdentity().?;
+    try std.testing.expectEqual(@as(u64, 1), app.repo_epoch);
+
+    try tmp.dir.rename("repo", tmp.dir, "old-repo", io);
+    try tmp.dir.createDir(io, "repo", .default_dir);
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, root_path),
+        0,
+        .external_selection,
+    ));
+    try std.testing.expect(!first_identity.eql(app.repo_state.activeIdentity().?));
+    try std.testing.expectEqual(@as(u64, 2), app.repo_epoch);
+}
+
+test "repository capability commit failure leaves prior identity unchanged" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    try roots.tmp.dir.symLink(io, "b", "linked", .{ .is_directory = true });
+    const linked = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(roots.a).?, "linked" });
+    defer allocator.free(linked);
+    var app: App = .{ .allocator = allocator };
+    defer app.repo_state.deinit(allocator);
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, roots.a),
+        0,
+        .external_selection,
+    ));
+    const identity = app.repo_state.activeIdentity().?;
+
+    try std.testing.expectEqual(RepoCommitOutcome.rejected, app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, linked),
+        0,
+        .external_selection,
+    ));
+    try std.testing.expectEqual(@as(u64, 1), app.repo_epoch);
+    try std.testing.expectEqualStrings(roots.a, app.activeRepoRoot().?);
+    try std.testing.expect(identity.eql(app.repo_state.activeIdentity().?));
+}
+
+test "repo picker capability rejection preserves Review navigation and does not reload" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    try roots.tmp.dir.symLink(io, "b", "linked", .{ .is_directory = true });
+    const linked = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(roots.a).?, "linked" });
+    defer allocator.free(linked);
+
+    var app: App = .{ .allocator = allocator, .repo_picker = .{ .mode = true } };
+    defer app.repo_state.deinit(allocator);
+    defer app.repo_picker.deinit(allocator);
+    defer app.deinitRepoPickerItems(allocator);
+    defer app.recent_repos.deinit(allocator);
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, roots.a),
+        0,
+        .external_selection,
+    ));
+    const prior_epoch = app.repo_epoch;
+    const prior_identity = app.repo_state.activeIdentity().?;
+    app.pages.review.viewer.selected_target = .{ .diff_file = 3 };
+    app.pages.review.viewer.selected_file = 3;
+    app.pages.review.viewer.selected_node = 7;
+    app.pages.review.search.mode = true;
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.acceptRepoPathDiscovery(&ctx, try testSingleRepoDiscovery(allocator, linked));
+
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(prior_epoch, app.repo_epoch);
+    try std.testing.expectEqualStrings(roots.a, app.activeRepoRoot().?);
+    try std.testing.expect(prior_identity.eql(app.repo_state.activeIdentity().?));
+    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 7), app.pages.review.viewer.selected_node);
+    try std.testing.expect(app.pages.review.search.mode);
+    try std.testing.expectEqualStrings("Repository root could not be opened safely", app.status.text());
 }
 
 fn testSingleRepoDiscovery(allocator: std.mem.Allocator, root: []const u8) !repo_discovery.DiscoveryResult {
@@ -7280,6 +7496,30 @@ fn testNamedSingleRepoDiscovery(allocator: std.mem.Allocator, label: []const u8,
         .canonical_root = try allocator.dupe(u8, root),
     } };
 }
+
+const TestRepoPair = struct {
+    tmp: std.testing.TmpDir,
+    a: [:0]u8,
+    b: [:0]u8,
+
+    fn init() !TestRepoPair {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.createDir(std.testing.io, "a", .default_dir);
+        try tmp.dir.createDir(std.testing.io, "b", .default_dir);
+        const a = try tmp.dir.realPathFileAlloc(std.testing.io, "a", std.testing.allocator);
+        errdefer std.testing.allocator.free(a);
+        const b = try tmp.dir.realPathFileAlloc(std.testing.io, "b", std.testing.allocator);
+        return .{ .tmp = tmp, .a = a, .b = b };
+    }
+
+    fn deinit(self: *TestRepoPair) void {
+        std.testing.allocator.free(self.a);
+        std.testing.allocator.free(self.b);
+        self.tmp.cleanup();
+        self.* = undefined;
+    }
+};
 
 test "repo discovery remains owned when recent-store update fails" {
     const backing = std.testing.allocator;
@@ -7306,6 +7546,8 @@ test "repo discovery remains owned when recent-store update fails" {
 
 test "repo discovery completion cannot overwrite a newer repository commitment" {
     const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
     var app: App = .{ .active_page = .repository };
     defer app.repo_state.deinit(allocator);
     defer app.recent_repos.deinit(allocator);
@@ -7316,9 +7558,9 @@ test "repo discovery completion cannot overwrite a newer repository commitment" 
     try app.finishRepoDiscovery(&ctx, .{
         .identity = page.RequestIdentity.review(0, first_activation),
         .generation = first_generation,
-        .result = .{ .discovered = try testSingleRepoDiscovery(allocator, "/repo/a") },
+        .result = .{ .discovered = try testSingleRepoDiscovery(allocator, roots.a) },
     });
-    try std.testing.expectEqualStrings("/repo/a", app.activeRepoRoot().?);
+    try std.testing.expectEqualStrings(roots.a, app.activeRepoRoot().?);
     try std.testing.expectEqual(@as(u64, 1), app.repo_epoch);
 
     const same_activation = app.pages.review.activation.activate(app.repo_epoch, .pending, .pending, .pending);
@@ -7326,15 +7568,15 @@ test "repo discovery completion cannot overwrite a newer repository commitment" 
     try app.finishRepoDiscovery(&ctx, .{
         .identity = page.RequestIdentity.review(1, same_activation),
         .generation = same_generation,
-        .result = .{ .discovered = try testSingleRepoDiscovery(allocator, "/repo/a") },
+        .result = .{ .discovered = try testSingleRepoDiscovery(allocator, roots.a) },
     });
     try std.testing.expectEqual(@as(u64, 1), app.repo_epoch);
 
     const same_epoch_stale_activation = app.pages.review.activation.activate(app.repo_epoch, .pending, .pending, .pending);
     const same_epoch_stale_generation = app.pages.review.load.beginRepoDiscovery();
-    try std.testing.expect(!app.commitRepoDiscovery(
+    try std.testing.expectEqual(RepoCommitOutcome.unchanged, app.commitRepoDiscovery(
         allocator,
-        try testNamedSingleRepoDiscovery(allocator, "fresh selection", "/repo/a"),
+        try testNamedSingleRepoDiscovery(allocator, "fresh selection", roots.a),
         0,
         .external_selection,
     ));
@@ -7342,7 +7584,7 @@ test "repo discovery completion cannot overwrite a newer repository commitment" 
     try app.finishRepoDiscovery(&ctx, .{
         .identity = page.RequestIdentity.review(1, same_epoch_stale_activation),
         .generation = same_epoch_stale_generation,
-        .result = .{ .discovered = try testNamedSingleRepoDiscovery(allocator, "stale completion", "/repo/a") },
+        .result = .{ .discovered = try testNamedSingleRepoDiscovery(allocator, "stale completion", roots.a) },
     });
     const committed = app.repo_state.discovery orelse return error.ExpectedSingleRepository;
     switch (committed) {
@@ -7353,31 +7595,33 @@ test "repo discovery completion cannot overwrite a newer repository commitment" 
 
     const stale_activation = app.pages.review.activation.activate(app.repo_epoch, .pending, .pending, .pending);
     const stale_generation = app.pages.review.load.beginRepoDiscovery();
-    try std.testing.expect(app.commitRepoDiscovery(allocator, try testSingleRepoDiscovery(allocator, "/repo/b"), 0, .external_selection));
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(allocator, try testSingleRepoDiscovery(allocator, roots.b), 0, .external_selection));
     try std.testing.expectEqual(@as(u64, 2), app.repo_epoch);
     try std.testing.expect(!app.pages.review.load.hasPending());
 
     try app.finishRepoDiscovery(&ctx, .{
         .identity = page.RequestIdentity.review(1, stale_activation),
         .generation = stale_generation,
-        .result = .{ .discovered = try testSingleRepoDiscovery(allocator, "/repo/a") },
+        .result = .{ .discovered = try testSingleRepoDiscovery(allocator, roots.a) },
     });
-    try std.testing.expectEqualStrings("/repo/b", app.activeRepoRoot().?);
+    try std.testing.expectEqualStrings(roots.b, app.activeRepoRoot().?);
     try std.testing.expectEqual(@as(u64, 2), app.repo_epoch);
 
-    try std.testing.expect(app.commitRepoDiscovery(allocator, try testSingleRepoDiscovery(allocator, "/repo/a"), 0, .external_selection));
-    try std.testing.expectEqualStrings("/repo/a", app.activeRepoRoot().?);
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(allocator, try testSingleRepoDiscovery(allocator, roots.a), 0, .external_selection));
+    try std.testing.expectEqualStrings(roots.a, app.activeRepoRoot().?);
     try std.testing.expectEqual(@as(u64, 3), app.repo_epoch);
 }
 
 test "inactive repository change invalidates retained source before equal-fingerprint re-entry" {
     const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
     var app: App = .{ .active_page = .repository, .allocator = allocator };
     defer app.repo_state.deinit(allocator);
 
-    try std.testing.expect(app.commitRepoDiscovery(
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(
         allocator,
-        try testSingleRepoDiscovery(allocator, "/repo/a"),
+        try testSingleRepoDiscovery(allocator, roots.a),
         0,
         .external_selection,
     ));
@@ -7385,7 +7629,7 @@ test "inactive repository change invalidates retained source before equal-finger
     var retained = app_test_support.loadedDiffOne();
     retained.text = app_test_support.diff_one;
     app.pages.review.load = app_test_support.loadState(retained);
-    const shared_fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    const shared_fingerprint = content_fingerprint.Fingerprint.init(app_test_support.diff_one);
     app.pages.review.auto_reload.acceptSource(shared_fingerprint);
 
     const source_revision = app.pages.review.source_session_revision;
@@ -7395,7 +7639,7 @@ test "inactive repository change invalidates retained source before equal-finger
             allocator,
             page.RequestIdentity.review(app.repo_epoch, 1),
             1,
-            "/repo/a",
+            roots.a,
             "cached-a",
             .generated_added_file,
             .unstaged,
@@ -7406,7 +7650,7 @@ test "inactive repository change invalidates retained source before equal-finger
     });
     app.pages.review.review_projection.cacheOrClearDisplayed(
         allocator,
-        "/repo/a",
+        roots.a,
         .unstaged,
         source_revision,
         status_revision,
@@ -7416,7 +7660,7 @@ test "inactive repository change invalidates retained source before equal-finger
             allocator,
             page.RequestIdentity.review(app.repo_epoch, 1),
             2,
-            "/repo/a",
+            roots.a,
             "displayed-a",
             .generated_added_file,
             .unstaged,
@@ -7429,7 +7673,7 @@ test "inactive repository change invalidates retained source before equal-finger
         allocator,
         page.RequestIdentity.review(app.repo_epoch, 1),
         3,
-        "/repo/a",
+        roots.a,
         "pending-a",
         .generated_added_file,
         .unstaged,
@@ -7438,13 +7682,13 @@ test "inactive repository change invalidates retained source before equal-finger
     );
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.review_projection.cacheLen());
 
-    try std.testing.expect(app.commitRepoDiscovery(
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(
         allocator,
-        try testSingleRepoDiscovery(allocator, "/repo/b"),
+        try testSingleRepoDiscovery(allocator, roots.b),
         0,
         .external_selection,
     ));
-    try std.testing.expectEqualStrings("/repo/b", app.activeRepoRoot().?);
+    try std.testing.expectEqualStrings(roots.b, app.activeRepoRoot().?);
     try std.testing.expect(app.pages.review.auto_reload.accepted_source == null);
     try std.testing.expect(app.pages.review.load.state == .idle);
     try std.testing.expect(app.reviewNavigation().loadedDiff() == null);
@@ -7452,7 +7696,7 @@ test "inactive repository change invalidates retained source before equal-finger
     try std.testing.expect(!app.pages.review.review_projection.hasDisplayed());
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.review_projection.cacheLen());
     try std.testing.expect(!app.pages.review.review_projection.cacheHas(
-        "/repo/a",
+        roots.a,
         "cached-a",
         .generated_added_file,
         .unstaged,
@@ -7923,11 +8167,13 @@ test "closing push error invalidates an in-flight inspection result" {
 
 test "repository supersession invalidates an in-flight push inspection" {
     const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
     var app: App = .{ .allocator = allocator };
     defer app.repo_state.deinit(allocator);
-    try std.testing.expect(app.commitRepoDiscovery(
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(
         allocator,
-        try testSingleRepoDiscovery(allocator, "/repo/a"),
+        try testSingleRepoDiscovery(allocator, roots.a),
         0,
         .external_selection,
     ));
@@ -7943,16 +8189,16 @@ test "repository supersession invalidates an in-flight push inspection" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
     try app.runInteractivePush(&ctx);
-    try std.testing.expect(app.commitRepoDiscovery(
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(
         allocator,
-        try testSingleRepoDiscovery(allocator, "/repo/b"),
+        try testSingleRepoDiscovery(allocator, roots.b),
         0,
         .external_selection,
     ));
     try runOnlyPushInspectionTaskForTest(&app, &ctx, std.testing.io);
 
     try std.testing.expect(app.push_retry.state == .idle);
-    try std.testing.expectEqualStrings("/repo/b", app.activeRepoRoot().?);
+    try std.testing.expectEqualStrings(roots.b, app.activeRepoRoot().?);
     try std.testing.expect(app.push_error_message == null);
 }
 
@@ -11406,7 +11652,7 @@ test "changed watch reload restores acceptance-time navigation instead of launch
 test "unchanged recovery clears its source failure and redraws" {
     var current = app_test_support.loadedDiffOne();
     current.text = app_test_support.diff_one;
-    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    const fingerprint = content_fingerprint.Fingerprint.init(app_test_support.diff_one);
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(current),
@@ -11454,7 +11700,7 @@ test "unchanged recovery clears its source failure and redraws" {
 test "unchanged source recovery preserves a newer auxiliary failure" {
     var current = app_test_support.loadedDiffOne();
     current.text = app_test_support.diff_one;
-    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    const fingerprint = content_fingerprint.Fingerprint.init(app_test_support.diff_one);
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(current),
@@ -11485,7 +11731,7 @@ test "unchanged source recovery preserves a newer auxiliary failure" {
 test "auxiliary failure followed by source failure clears only the recovered source message" {
     var current = app_test_support.loadedDiffOne();
     current.text = app_test_support.diff_one;
-    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    const fingerprint = content_fingerprint.Fingerprint.init(app_test_support.diff_one);
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(current),
@@ -11532,7 +11778,7 @@ test "auxiliary failure followed by source failure clears only the recovered sou
 test "ordinary unchanged source completion suppresses redraw" {
     var current = app_test_support.loadedDiffOne();
     current.text = app_test_support.diff_one;
-    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    const fingerprint = content_fingerprint.Fingerprint.init(app_test_support.diff_one);
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(current),
@@ -11559,7 +11805,7 @@ test "ordinary unchanged source completion suppresses redraw" {
 test "changed loaded recovery clears its matching source failure and redraws" {
     var current = app_test_support.loadedDiffOne();
     current.text = "old";
-    const old_fingerprint = app_auto_reload.SourceFingerprint.init("old");
+    const old_fingerprint = content_fingerprint.Fingerprint.init("old");
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(current),
@@ -11591,7 +11837,7 @@ test "changed loaded recovery clears its matching source failure and redraws" {
 test "empty recovery clears its matching source failure and redraws" {
     var current = app_test_support.loadedDiffOne();
     current.text = "old";
-    const old_fingerprint = app_auto_reload.SourceFingerprint.init("old");
+    const old_fingerprint = content_fingerprint.Fingerprint.init("old");
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(current),
@@ -11623,7 +11869,7 @@ test "empty recovery clears its matching source failure and redraws" {
 test "destructive action-result failure invalidates accepted source before identical success" {
     var current = app_test_support.loadedDiffOne();
     current.text = app_test_support.diff_one;
-    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    const fingerprint = content_fingerprint.Fingerprint.init(app_test_support.diff_one);
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(current),
@@ -11662,7 +11908,7 @@ test "destructive action-result failure invalidates accepted source before ident
 test "destructive manual failure invalidates accepted source before identical success" {
     var current = app_test_support.loadedDiffOne();
     current.text = app_test_support.diff_one;
-    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    const fingerprint = content_fingerprint.Fingerprint.init(app_test_support.diff_one);
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(current),
@@ -11701,7 +11947,7 @@ test "destructive manual failure invalidates accepted source before identical su
 test "diff task start failure invalidates accepted source and next watch cannot return unchanged" {
     var current = app_test_support.loadedDiffOne();
     current.text = app_test_support.diff_one;
-    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    const fingerprint = content_fingerprint.Fingerprint.init(app_test_support.diff_one);
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(current),
@@ -11748,7 +11994,7 @@ test "diff task start failure invalidates accepted source and next watch cannot 
 test "watch failure retains display and blocks source-derived actions until success" {
     var current = app_test_support.loadedDiffOne();
     current.text = app_test_support.diff_one;
-    const fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
+    const fingerprint = content_fingerprint.Fingerprint.init(app_test_support.diff_one);
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(current),
@@ -11826,7 +12072,7 @@ test "changed watch result arriving during mouse selection defers apply until re
 test "background source completion during repository action is discarded and releases cycle" {
     var current = app_test_support.loadedDiffOne();
     current.text = "old";
-    const accepted = app_auto_reload.SourceFingerprint.init("old");
+    const accepted = content_fingerprint.Fingerprint.init("old");
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(current),
@@ -12301,7 +12547,7 @@ test "clean loaded status tears down status-only session after empty diff" {
         .generation = 2,
         .result = .empty,
     });
-    const empty_fingerprint = app_auto_reload.SourceFingerprint.init("");
+    const empty_fingerprint = content_fingerprint.Fingerprint.init("");
 
     try std.testing.expect(app.reviewNavigation().loadedDiff() != null);
     try std.testing.expectEqual(@as(usize, 0), app.reviewNavigation().loadedDiff().?.document.files.len);
@@ -12647,7 +12893,7 @@ fn setFileSearchInput(app: *App, query: []const u8) void {
 }
 
 fn acceptTestSource(app: *App) void {
-    app.pages.review.auto_reload.acceptSource(app_auto_reload.SourceFingerprint.init("test source"));
+    app.pages.review.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
     syncTestActivation(app);
 }
 
@@ -12681,7 +12927,8 @@ fn clearPendingStatusTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocat
 fn clearPendingRepositoryTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
     for (ctx.takePendingTasksWith()) |entry| {
         const task: *RepositoryManifestTask = @ptrCast(@alignCast(entry.ctx));
-        allocator.free(task.repo_root);
+        allocator.free(task.root_path);
+        task.root.deinit();
         allocator.destroy(task);
     }
 }

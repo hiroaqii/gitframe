@@ -1,4 +1,5 @@
 const std = @import("std");
+const content_fingerprint = @import("../content_fingerprint.zig");
 const chasen = @import("chasen");
 const auto_reload = @import("auto_reload.zig");
 const page = @import("page.zig");
@@ -204,7 +205,7 @@ pub const RepoPathDiscoveryTaskResult = union(enum) {
 
 pub const DiffLoadTaskResult = union(enum) {
     empty,
-    unchanged: auto_reload.SourceFingerprint,
+    unchanged: content_fingerprint.Fingerprint,
     loaded: LoadedDiffBundle,
     failed: []u8,
     failed_static: []const u8,
@@ -274,7 +275,7 @@ pub const BranchListLoadTaskResult = union(enum) {
 pub const LoadedDiffBundle = struct {
     arena: ?std.heap.ArenaAllocator,
     loaded: LoadedDiff,
-    fingerprint: auto_reload.SourceFingerprint = .{
+    fingerprint: content_fingerprint.Fingerprint = .{
         .byte_len = 0,
         .digest = [_]u8{0} ** 32,
     },
@@ -396,7 +397,7 @@ pub fn DiffLoadTask(comptime Msg: type) type {
         identity: page.RequestIdentity,
         request: LoadRequest,
         generation: u64,
-        expected_fingerprint: ?auto_reload.SourceFingerprint = null,
+        expected_fingerprint: ?content_fingerprint.Fingerprint = null,
         background_cycle_id: ?u64 = null,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
@@ -880,7 +881,7 @@ pub fn runLoad(request: LoadRequest, allocator: std.mem.Allocator, io: std.Io) D
 
 pub fn runLoadExpected(
     request: LoadRequest,
-    expected_fingerprint: ?auto_reload.SourceFingerprint,
+    expected_fingerprint: ?content_fingerprint.Fingerprint,
     allocator: std.mem.Allocator,
     io: std.Io,
 ) DiffLoadTaskResult {
@@ -894,7 +895,7 @@ pub fn runLoadExpected(
     switch (raw_result) {
         .ok => |bytes| {
             defer allocator.free(bytes);
-            const fingerprint = auto_reload.SourceFingerprint.init(bytes);
+            const fingerprint = content_fingerprint.Fingerprint.init(bytes);
             if (expected_fingerprint) |expected| {
                 if (expected.eql(fingerprint)) return .{ .unchanged = fingerprint };
             }
@@ -1063,7 +1064,7 @@ pub fn buildLoadedBundle(allocator: std.mem.Allocator, bytes: []const u8) !Loade
 }
 
 pub fn buildLoadedBundleWithIo(allocator: std.mem.Allocator, io: std.Io, bytes: []const u8) !LoadedDiffBundle {
-    return buildLoadedBundleWithOptions(allocator, io, bytes, .{}, auto_reload.SourceFingerprint.init(bytes));
+    return buildLoadedBundleWithOptions(allocator, io, bytes, .{}, content_fingerprint.Fingerprint.init(bytes));
 }
 
 fn buildLoadedBundleForRequest(
@@ -1071,7 +1072,7 @@ fn buildLoadedBundleForRequest(
     io: std.Io,
     bytes: []const u8,
     request: LoadRequest,
-    fingerprint: auto_reload.SourceFingerprint,
+    fingerprint: content_fingerprint.Fingerprint,
 ) !LoadedDiffBundle {
     const root = request.repo_root orelse return buildLoadedBundleWithOptions(allocator, io, bytes, .{}, fingerprint);
     const name = repoRootName(root);
@@ -1083,7 +1084,7 @@ fn buildLoadedBundleWithOptions(
     io: std.Io,
     bytes: []const u8,
     tree_options: file_tree.BuildOptions,
-    fingerprint: auto_reload.SourceFingerprint,
+    fingerprint: content_fingerprint.Fingerprint,
 ) !LoadedDiffBundle {
     var arena: std.heap.ArenaAllocator = .init(allocator);
     errdefer arena.deinit();
@@ -1146,7 +1147,7 @@ test "expected raw fingerprint returns unchanged before diff parsing" {
     const path = try tmp.dir.realPathFileAlloc(std.testing.io, "same.patch", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    const expected = auto_reload.SourceFingerprint.init(bytes);
+    const expected = content_fingerprint.Fingerprint.init(bytes);
     var result = runLoadExpected(
         .{ .source = .{ .patch_file = path } },
         expected,

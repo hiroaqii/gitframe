@@ -60,6 +60,7 @@ test {
     _ = @import("app/view.zig");
     _ = @import("app/view_primitives.zig");
     _ = @import("config.zig");
+    _ = @import("content_fingerprint.zig");
     _ = @import("context.zig");
     _ = @import("context_export.zig");
     _ = @import("draw");
@@ -79,7 +80,10 @@ test {
     _ = @import("path_key.zig");
     _ = @import("process/runner.zig");
     _ = @import("repo/state.zig");
+    _ = @import("repo/root_capability.zig");
     _ = @import("repository/manifest.zig");
+    _ = @import("repository/document.zig");
+    _ = @import("repository/path.zig");
     _ = @import("repository/tree.zig");
     _ = @import("review/session.zig");
     _ = @import("review/state.zig");
