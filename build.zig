@@ -275,6 +275,41 @@ pub fn build(b: *std.Build) void {
     const perf_baseline_step = b.step("perf-baseline", "Run GitFrame performance baseline");
     perf_baseline_step.dependOn(&run_perf_baseline.step);
 
+    const projection_perf_step = b.step(
+        "projection-perf",
+        "Profile staged projection construction from a recorded patch",
+    );
+    if (syntax_provider == .flow_syntax) {
+        const flow_syntax_dep = b.lazyDependency("flow_syntax", .{
+            .target = target,
+            .optimize = optimize,
+            .@"use-llvm" = true,
+        }) orelse return;
+        const projection_perf_exe = b.addExecutable(.{
+            .name = "gitframe-projection-perf",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/projection_perf.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "flow_syntax", .module = flow_syntax_dep.module("syntax") },
+                    .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+                    .{ .name = "draw", .module = draw_mod },
+                    .{ .name = "theme", .module = theme_mod },
+                    .{ .name = "keymap", .module = keymap_mod },
+                },
+            }),
+        });
+        configureFlowSyntaxArtifact(projection_perf_exe, target, true);
+        const run_projection_perf = b.addRunArtifact(projection_perf_exe);
+        if (b.args) |args| run_projection_perf.addArgs(args);
+        projection_perf_step.dependOn(&run_projection_perf.step);
+    } else {
+        projection_perf_step.dependOn(&b.addFail(
+            "run `zig build projection-perf -Dsyntax-provider=flow_syntax -- <patch-file> [iterations]` on macOS or Linux",
+        ).step);
+    }
+
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,

@@ -3,6 +3,8 @@ const diff_parser = @import("../diff/parser.zig");
 const flow_syntax = @import("flow_syntax");
 const provider = @import("provider.zig");
 
+// `tools/projection_perf.zig` mirrors this hunk-side pipeline for stage-level
+// measurements. Keep that developer-only mirror in sync when this work order changes.
 pub fn buildDocumentSpans(allocator: std.mem.Allocator, io: std.Io, document: diff_parser.DiffDocument) !provider.DocumentSpans {
     var spans = try provider.allocateEmptyForDocument(allocator, document);
     errdefer spans.deinit(allocator);
