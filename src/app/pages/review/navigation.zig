@@ -14,6 +14,7 @@ const app_page = @import("../../page.zig");
 const app_state = @import("../../state.zig");
 const shell_layout = if (builtin.is_test) @import("../../shell_layout.zig") else struct {};
 const review_layout = @import("layout.zig");
+const review_message = @import("message.zig");
 const review_projection = @import("../../review_projection.zig");
 const app_review_projection = review_projection;
 const review_page = @import("../review.zig");
@@ -51,7 +52,7 @@ pub const DiagnosticSink = struct {
     }
 };
 
-pub const MousePoint = struct { col: u16, row: u16 };
+pub const MousePoint = review_message.MousePoint;
 
 pub const DiffMouseHit = struct {
     identity: diff_selection.Identity,

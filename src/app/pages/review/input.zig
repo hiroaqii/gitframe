@@ -9,6 +9,9 @@ const chasen = @import("chasen");
 const keymap = @import("keymap");
 const key_input = @import("../../key_input.zig");
 const review_page = @import("../review.zig");
+const review_message = @import("message.zig");
+
+pub const Msg = review_message.Msg;
 
 pub const Context = struct {
     search_mode: bool = false,
@@ -18,72 +21,6 @@ pub const Context = struct {
     sidebar_hidden: bool = false,
     review_mode: bool = false,
     keymap: keymap.Effective = .{},
-};
-
-pub const Msg = union(enum) {
-    cancel_search,
-    submit_search,
-    search_backspace,
-    search_move_left,
-    search_move_right,
-    search_insert: u21,
-    search_paste: []const u8,
-    cancel_file_search,
-    submit_file_search,
-    file_search_backspace,
-    file_search_insert: u21,
-    file_search_paste: []const u8,
-    toggle_focus,
-    page_diff_up,
-    page_diff_down,
-    select_first_file,
-    select_last_file,
-    clear_search,
-    toggle_directory,
-    toggle_hunk_fold,
-    expand_directory,
-    collapse_or_parent_directory,
-    scroll_diff_right,
-    scroll_diff_left,
-    scroll_sidebar_right,
-    scroll_sidebar_left,
-    scroll_diff_up,
-    select_previous_file,
-    scroll_diff_down,
-    select_next_file,
-    enter_search,
-    select_next_search_match,
-    select_next_hunk,
-    select_previous_search_match,
-    select_previous_hunk,
-    enter_file_search,
-    enter_repo_picker,
-    open_help,
-    cycle_changed_file_filter,
-    toggle_reviewed_file,
-    toggle_hide_reviewed_files,
-    toggle_sidebar_visibility,
-    decrease_sidebar_width,
-    increase_sidebar_width,
-    enter_commit_panel,
-    enter_amend_panel,
-    toggle_selected_file,
-    toggle_selected_hunk,
-    request_discard_selected_file,
-    request_push,
-    request_pull,
-    request_fetch,
-    request_branch_switch,
-    open_selected_file_in_editor,
-    toggle_display_mode,
-    toggle_line_numbers,
-    copy_current_line,
-    copy_current_hunk,
-    finish_review_approved,
-    finish_review_needs_changes,
-    finish_review_canceled,
-    quit,
-    reload,
 };
 
 pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
@@ -149,7 +86,7 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
         'n' => if (context.search_query_len > 0) .select_next_search_match else .select_next_hunk,
         'p' => if (context.search_query_len > 0) .select_previous_search_match else .select_previous_hunk,
         's' => if (context.focus == .diff) .toggle_selected_hunk else .toggle_selected_file,
-        'q' => if (context.review_mode) .finish_review_canceled else .quit,
+        'q' => if (context.review_mode) .finish_review_canceled else null,
         else => null,
     };
 }
@@ -157,11 +94,10 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
 fn publicActionToMsg(action: keymap.PublicAction) ?Msg {
     return switch (action) {
         .page_review, .page_repository, .page_history, .page_config => null,
-        .help => .open_help,
-        .reload => .reload,
+        .help, .reload => null,
         .search => .enter_search,
         .file_search => .enter_file_search,
-        .repo_picker => .enter_repo_picker,
+        .repo_picker => null,
         .open_editor => .open_selected_file_in_editor,
         .commit => .enter_commit_panel,
         .amend => .enter_amend_panel,
@@ -203,15 +139,15 @@ test "file search input rejects non text modes" {
 test "normal mapping is focus and review-mode aware" {
     try std.testing.expectEqual(Msg.select_next_file, keyToMsg(.{}, chasen.Key{ .codepoint = 'j' }).?);
     try std.testing.expectEqual(Msg.scroll_diff_down, keyToMsg(.{ .focus = .diff }, chasen.Key{ .codepoint = 'j' }).?);
-    try std.testing.expectEqual(Msg.quit, keyToMsg(.{}, chasen.Key{ .codepoint = 'q' }).?);
+    try std.testing.expect(keyToMsg(.{}, chasen.Key{ .codepoint = 'q' }) == null);
     try std.testing.expectEqual(Msg.finish_review_canceled, keyToMsg(.{ .review_mode = true }, chasen.Key{ .codepoint = 'q' }).?);
 }
 
-test "normal mapping uses configured Review commands" {
+test "shell-owned configured commands are not duplicated by Review" {
     var config: keymap.Config = .{};
     config.set(.reload, .{ .ctrl = .s });
     const effective = keymap.Effective.fromConfig(config);
-    try std.testing.expectEqual(Msg.reload, keyToMsg(.{ .keymap = effective }, chasen.Key{ .codepoint = 's', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expect(keyToMsg(.{ .keymap = effective }, chasen.Key{ .codepoint = 's', .mods = .{ .ctrl = true } }) == null);
 }
 
 test "focus controls enter arrows sidebar scroll and stage target" {
@@ -270,7 +206,6 @@ test "static Review command matrix preserves configurable defaults" {
         .{ .codepoint = 'y', .expected = .copy_current_line },
         .{ .codepoint = 'Y', .expected = .copy_current_hunk },
         .{ .codepoint = 'G', .expected = .select_last_file },
-        .{ .codepoint = 'R', .expected = .enter_repo_picker },
         .{ .codepoint = 'F', .expected = .cycle_changed_file_filter },
         .{ .codepoint = 'H', .expected = .toggle_hide_reviewed_files },
         .{ .codepoint = chasen.Key.home, .expected = .select_first_file },
@@ -283,7 +218,6 @@ test "shifted terminal encodings preserve Review commands" {
     const Case = struct { lower: u21, upper: u21, expected: Msg };
     const cases = [_]Case{
         .{ .lower = 'g', .upper = 'G', .expected = .select_last_file },
-        .{ .lower = 'r', .upper = 'R', .expected = .enter_repo_picker },
         .{ .lower = 'f', .upper = 'F', .expected = .cycle_changed_file_filter },
         .{ .lower = 'h', .upper = 'H', .expected = .toggle_hide_reviewed_files },
         .{ .lower = 'p', .upper = 'P', .expected = .request_push },

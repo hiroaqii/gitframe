@@ -41,10 +41,12 @@ test {
     _ = @import("app/pages/review.zig");
     _ = @import("app/pages/review/input.zig");
     _ = @import("app/pages/review/layout.zig");
+    _ = @import("app/pages/review/message.zig");
     _ = @import("app/pages/review/navigation.zig");
     _ = @import("app/pages/review/authority.zig");
     _ = @import("app/pages/review/operations.zig");
     _ = @import("app/pages/review/reload.zig");
+    _ = @import("app/pages/review/update.zig");
     _ = @import("app/pages/review/view.zig");
     _ = @import("app/prompt.zig");
     _ = @import("app/repo_picker.zig");

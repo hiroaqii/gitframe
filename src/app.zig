@@ -14,10 +14,12 @@ const page_transition = @import("app/page_transition.zig");
 const app_shell_layout = @import("app/shell_layout.zig");
 const review_page = @import("app/pages/review.zig");
 const review_layout = @import("app/pages/review/layout.zig");
+const review_message = @import("app/pages/review/message.zig");
 const review_navigation = @import("app/pages/review/navigation.zig");
 const review_authority = @import("app/pages/review/authority.zig");
 const review_operations = @import("app/pages/review/operations.zig");
 const review_reload = @import("app/pages/review/reload.zig");
+const review_page_update = @import("app/pages/review/update.zig");
 const review_view = @import("app/pages/review/view.zig");
 const app_prompt = @import("app/prompt.zig");
 const app_repo_picker = @import("app/repo_picker.zig");
@@ -280,63 +282,7 @@ pub const App = struct {
         load_finished: LoadFinishedMsg,
         action_finished: ActionFinishedMsg,
         clipboard_copy_finished: ClipboardCopyFinished,
-        select_previous_file,
-        select_next_file,
-        toggle_directory,
-        expand_directory,
-        collapse_or_parent_directory,
-        scroll_diff_up,
-        scroll_diff_down,
-        scroll_diff_left,
-        scroll_diff_right,
-        scroll_sidebar_left,
-        scroll_sidebar_right,
-        page_diff_up,
-        page_diff_down,
-        select_previous_hunk,
-        select_next_hunk,
-        toggle_hunk_fold,
-        select_first_file,
-        select_last_file,
-        toggle_focus,
-        toggle_sidebar_visibility,
-        decrease_sidebar_width,
-        increase_sidebar_width,
-        focus_sidebar,
-        focus_diff,
-        sidebar_click_node: usize,
-        mouse_sidebar_wheel_up,
-        mouse_sidebar_wheel_down,
-        mouse_diff_wheel_up,
-        mouse_diff_wheel_down,
-        mouse_diff_wheel_left,
-        mouse_diff_wheel_right,
-        mouse_diff_press: MousePoint,
-        mouse_diff_drag: ?MousePoint,
-        mouse_diff_release: ?MousePoint,
-        toggle_display_mode,
-        toggle_line_numbers,
-        enter_search,
-        cancel_search,
-        clear_search,
-        submit_search,
-        search_insert: u21,
-        /// Borrowed from `chasen.Event.paste`; valid only in the synchronous handleEvent/update dispatch.
-        search_paste: []const u8,
-        search_backspace,
-        search_move_left,
-        search_move_right,
-        select_next_search_match,
-        select_previous_search_match,
-        enter_file_search,
-        cancel_file_search,
-        submit_file_search,
-        file_search_insert: u21,
-        /// Borrowed from `chasen.Event.paste`; valid only in the synchronous handleEvent/update dispatch.
-        file_search_paste: []const u8,
-        file_search_backspace,
-        enter_commit_panel,
-        enter_amend_panel,
+        review: review_message.Msg,
         cancel_commit_panel,
         submit_commit_panel,
         assist_commit_message,
@@ -386,28 +332,14 @@ pub const App = struct {
         push_credential_backspace,
         push_credential_move_left,
         push_credential_move_right,
-        toggle_reviewed_file,
-        toggle_hide_reviewed_files,
-        cycle_changed_file_filter,
-        toggle_selected_file,
-        toggle_selected_hunk,
-        stage_selected_file,
-        stage_selected_hunk,
-        unstage_selected_file,
-        unstage_selected_hunk,
-        request_discard_selected_file,
         confirm_discard_file,
         cancel_discard_file,
         confirm_amend,
         cancel_amend,
-        request_push,
         confirm_push,
         cancel_push,
-        request_pull,
         confirm_pull,
         cancel_pull,
-        request_fetch,
-        request_branch_switch,
         branch_switch_move_previous,
         branch_switch_move_next,
         confirm_branch_switch,
@@ -415,12 +347,6 @@ pub const App = struct {
         close_push_error,
         open_push_credentials,
         run_interactive_push,
-        open_selected_file_in_editor,
-        copy_current_line,
-        copy_current_hunk,
-        finish_review_approved,
-        finish_review_needs_changes,
-        finish_review_canceled,
         reload,
         auto_reload_tick,
         focus_lost,
@@ -550,8 +476,6 @@ pub const App = struct {
 
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         self.clearEphemeralStatusForUserAction(msg);
-        const tracks_display_navigation = msgTracksDisplayNavigation(msg);
-        const navigation_before = if (tracks_display_navigation) self.displayNavigationSnapshot() else undefined;
 
         switch (msg) {
             .switch_page => |target| try self.requestPageSwitch(ctx, target),
@@ -572,115 +496,7 @@ pub const App = struct {
             .load_finished => |finished| try self.finishLoadResult(ctx, finished),
             .action_finished => |finished| try self.finishActionResult(ctx, finished),
             .clipboard_copy_finished => |finished| self.finishClipboardCopy(ctx, finished),
-            .select_previous_file => self.reviewNavigation().selectFileDelta(-1),
-            .select_next_file => self.reviewNavigation().selectFileDelta(1),
-            .toggle_directory => try self.reviewNavigation().toggleSelectedDirectory(),
-            .expand_directory => try self.reviewNavigation().expandSelectedDirectory(),
-            .collapse_or_parent_directory => try self.reviewNavigation().collapseOrSelectParentDirectory(),
-            .scroll_diff_up => self.reviewNavigation().moveDiffCursorRows(.up),
-            .scroll_diff_down => self.reviewNavigation().moveDiffCursorRows(.down),
-            .scroll_diff_left => self.reviewNavigation().scrollDiffHorizontal(.left),
-            .scroll_diff_right => self.reviewNavigation().scrollDiffHorizontal(.right),
-            .scroll_sidebar_left => self.reviewNavigation().scrollSidebarHorizontal(.left),
-            .scroll_sidebar_right => self.reviewNavigation().scrollSidebarHorizontal(.right),
-            .page_diff_up => self.reviewNavigation().moveDiffCursorPage(.up),
-            .page_diff_down => self.reviewNavigation().moveDiffCursorPage(.down),
-            .select_previous_hunk => self.reviewNavigation().selectHunkDelta(-1),
-            .select_next_hunk => self.reviewNavigation().selectHunkDelta(1),
-            .toggle_hunk_fold => self.reviewNavigation().toggleSelectedHunkFold(),
-            .select_first_file => self.reviewNavigation().selectFileAbsolute(0),
-            .select_last_file => self.reviewNavigation().selectLastFile(),
-            .toggle_focus => {
-                if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = self.pages.review.viewer.focus.toggled();
-            },
-            .toggle_sidebar_visibility => self.reviewNavigation().toggleSidebarVisibility(),
-            .decrease_sidebar_width => self.reviewNavigation().adjustSidebarWidth(.shrink),
-            .increase_sidebar_width => self.reviewNavigation().adjustSidebarWidth(.grow),
-            .focus_sidebar => {
-                if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .sidebar;
-            },
-            .focus_diff => self.pages.review.viewer.focus = .diff,
-            .sidebar_click_node => |node_index| try self.reviewNavigation().clickSidebarNode(node_index),
-            .mouse_sidebar_wheel_up => {
-                if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .sidebar;
-                self.reviewNavigation().selectFileDelta(-1);
-            },
-            .mouse_sidebar_wheel_down => {
-                if (!self.pages.review.viewer.sidebar_hidden) self.pages.review.viewer.focus = .sidebar;
-                self.reviewNavigation().selectFileDelta(1);
-            },
-            .mouse_diff_wheel_up => {
-                self.pages.review.viewer.focus = .diff;
-                self.reviewNavigation().scrollDiff(.up);
-            },
-            .mouse_diff_wheel_down => {
-                self.pages.review.viewer.focus = .diff;
-                self.reviewNavigation().scrollDiff(.down);
-            },
-            .mouse_diff_wheel_left => {
-                self.pages.review.viewer.focus = .diff;
-                self.reviewNavigation().scrollDiffHorizontal(.left);
-            },
-            .mouse_diff_wheel_right => {
-                self.pages.review.viewer.focus = .diff;
-                self.reviewNavigation().scrollDiffHorizontal(.right);
-            },
-            .mouse_diff_press => |point| self.reviewNavigation().pressDiffMouse(point),
-            .mouse_diff_drag => |point| self.reviewNavigation().dragDiffMouse(point),
-            .mouse_diff_release => |point| try self.releaseDiffMouse(ctx, point),
-            .toggle_display_mode => {
-                self.reviewNavigation().clearDiffSelection();
-                const old_mode = self.reviewNavigationView().effectiveDisplayMode();
-                const old_scroll = self.pages.review.viewer.diff_scroll;
-                self.pages.review.viewer.display_mode = self.pages.review.viewer.display_mode.toggled();
-                const new_mode = self.reviewNavigationView().effectiveDisplayMode();
-                self.pages.review.viewer.diff_scroll = self.reviewNavigationView().remapDiffScrollForModeChange(old_mode, new_mode, old_scroll);
-                self.reviewNavigation().resetDiffHorizontalScroll();
-                self.reviewNavigation().updateSearchMatchOffset();
-                self.reviewNavigation().scrollSearchMatchIntoView();
-                self.reviewNavigation().applyDiffCursorScrolloff();
-                self.reviewNavigation().clampDiffNavigation();
-            },
-            .toggle_line_numbers => {
-                self.pages.review.viewer.view_options.toggleLineNumbers();
-                self.reviewNavigation().clampDiffHorizontalScrollToVisibleRows();
-            },
-            .enter_search => self.reviewNavigation().enterSearchMode(),
-            .cancel_search => self.reviewNavigation().cancelSearchMode(),
-            .clear_search => self.reviewNavigation().clearSearch(),
-            .submit_search => self.reviewNavigation().submitSearch(),
-            .search_insert => |codepoint| self.pages.review.search.input.insert(codepoint) catch {
-                self.setReviewStatus("search query is too long", .{});
-            },
-            .search_paste => |text| self.pages.review.search.input.insertSlice(text) catch {
-                self.setReviewStatus("search query is too long", .{});
-            },
-            .search_backspace => self.pages.review.search.input.backspace(),
-            .search_move_left => self.pages.review.search.input.moveLeft(),
-            .search_move_right => self.pages.review.search.input.moveRight(),
-            .select_next_search_match => self.reviewNavigation().selectSearchMatch(.forward),
-            .select_previous_search_match => self.reviewNavigation().selectSearchMatch(.backward),
-            .enter_file_search => self.reviewNavigation().enterFileSearchMode(),
-            .cancel_file_search => self.reviewNavigation().cancelFileSearchMode(ctx.allocator()),
-            .submit_file_search => try self.reviewNavigation().submitFileSearch(ctx.allocator()),
-            .file_search_insert => |codepoint| {
-                self.pages.review.file_search.resetNoMatch();
-                self.pages.review.file_search.input.insert(codepoint) catch {
-                    self.setReviewStatus("file search query is too long", .{});
-                };
-            },
-            .file_search_paste => |text| {
-                self.pages.review.file_search.resetNoMatch();
-                self.pages.review.file_search.input.insertSlice(text) catch {
-                    self.setReviewStatus("file search query is too long", .{});
-                };
-            },
-            .file_search_backspace => {
-                self.pages.review.file_search.resetNoMatch();
-                self.pages.review.file_search.input.backspace();
-            },
-            .enter_commit_panel => self.enterCommitPanelMode(.commit),
-            .enter_amend_panel => self.enterCommitPanelMode(.amend),
+            .review => |review_msg| try self.updateReview(ctx, review_msg),
             .cancel_commit_panel => self.closeCommitPanel(),
             .submit_commit_panel => try self.submitCommitPanel(ctx),
             .assist_commit_message => try self.assistCommitMessage(ctx),
@@ -737,28 +553,14 @@ pub const App = struct {
             .push_credential_backspace => self.backspacePushCredential(),
             .push_credential_move_left => self.movePushCredentialLeft(),
             .push_credential_move_right => self.movePushCredentialRight(),
-            .toggle_reviewed_file => try self.reviewNavigation().toggleReviewedFile(ctx.allocator()),
-            .toggle_hide_reviewed_files => try self.reviewNavigation().toggleHideReviewedFiles(),
-            .cycle_changed_file_filter => try self.reviewNavigation().cycleChangedFileFilter(),
-            .toggle_selected_file => try self.toggleSelectedFileStage(ctx),
-            .toggle_selected_hunk => try self.toggleSelectedHunkStage(ctx),
-            .stage_selected_file => try self.stageSelectedFile(ctx),
-            .stage_selected_hunk => try self.stageSelectedHunk(ctx),
-            .unstage_selected_file => try self.unstageSelectedFile(ctx),
-            .unstage_selected_hunk => try self.unstageSelectedHunk(ctx),
-            .request_discard_selected_file => try self.requestDiscardSelectedFile(ctx.allocator()),
             .confirm_discard_file => try self.confirmDiscardFile(ctx),
             .cancel_discard_file => self.cancelDiscardConfirmation(ctx.allocator()),
             .confirm_amend => try self.confirmAmend(ctx),
             .cancel_amend => self.cancelAmendConfirmation(ctx.allocator()),
-            .request_push => try self.requestPush(ctx.allocator()),
             .confirm_push => try self.confirmPush(ctx),
             .cancel_push => self.cancelPushConfirmation(ctx.allocator()),
-            .request_pull => try self.requestPull(ctx.allocator()),
             .confirm_pull => try self.confirmPull(ctx),
             .cancel_pull => self.cancelPullConfirmation(ctx.allocator()),
-            .request_fetch => try self.requestFetch(ctx),
-            .request_branch_switch => try self.requestBranchSwitch(ctx),
             .branch_switch_move_previous => self.moveBranchSwitchSelection(-1),
             .branch_switch_move_next => self.moveBranchSwitchSelection(1),
             .confirm_branch_switch => try self.confirmBranchSwitch(ctx),
@@ -766,12 +568,6 @@ pub const App = struct {
             .close_push_error => self.clearPushError(ctx.allocator()),
             .open_push_credentials => try self.openPushCredentialPrompt(ctx),
             .run_interactive_push => try self.runInteractivePush(ctx),
-            .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
-            .copy_current_line => self.copyCurrentLine(ctx),
-            .copy_current_hunk => try self.copyCurrentHunk(ctx),
-            .finish_review_approved => try self.finishReview(ctx, .approved),
-            .finish_review_needs_changes => try self.finishReview(ctx, .needs_changes),
-            .finish_review_canceled => try self.finishReview(ctx, .canceled),
             .reload => reload: {
                 if (self.active_page != .review) {
                     self.status.set("reload is not available on this page yet", .{});
@@ -788,18 +584,12 @@ pub const App = struct {
                 }
             },
             .auto_reload_tick => try self.autoReloadTick(ctx),
-            .focus_lost => self.reviewNavigation().terminateDiffSelection(),
+            .focus_lost => switch (self.active_page) {
+                .review => self.reviewNavigation().terminateDiffSelection(),
+                .repository, .history, .config => {},
+            },
             .git_action_spinner_tick => self.gitActionSpinnerTick(ctx),
             .quit => self.requestQuit(ctx),
-        }
-        if (tracks_display_navigation) {
-            const navigation_after = self.displayNavigationSnapshot();
-            if (!std.meta.eql(navigation_before, navigation_after)) {
-                self.pages.review.display_navigation_input_revision +%= 1;
-                if (self.pages.review.pending_display_navigation_restore != null) {
-                    try self.reviewReload().captureDisplayOverride(ctx.allocator());
-                }
-            }
         }
         if (!self.pages.review.selection_owner.activeMouseSelection() and self.pages.review.deferred_source_apply != null) {
             try self.applyDeferredSource(ctx);
@@ -809,48 +599,6 @@ pub const App = struct {
         self.reconcileGitActionSpinnerTimer(ctx);
     }
 
-    fn msgTracksDisplayNavigation(msg: Msg) bool {
-        return switch (msg) {
-            .select_previous_file,
-            .select_next_file,
-            .toggle_directory,
-            .expand_directory,
-            .collapse_or_parent_directory,
-            .scroll_diff_up,
-            .scroll_diff_down,
-            .scroll_diff_left,
-            .scroll_diff_right,
-            .scroll_sidebar_left,
-            .scroll_sidebar_right,
-            .page_diff_up,
-            .page_diff_down,
-            .select_previous_hunk,
-            .select_next_hunk,
-            .toggle_hunk_fold,
-            .select_first_file,
-            .select_last_file,
-            .sidebar_click_node,
-            .mouse_sidebar_wheel_up,
-            .mouse_sidebar_wheel_down,
-            .mouse_diff_wheel_up,
-            .mouse_diff_wheel_down,
-            .mouse_diff_wheel_left,
-            .mouse_diff_wheel_right,
-            .toggle_display_mode,
-            .clear_search,
-            .submit_search,
-            .select_next_search_match,
-            .select_previous_search_match,
-            .submit_file_search,
-            => true,
-            else => false,
-        };
-    }
-
-    fn displayNavigationSnapshot(self: *const App) review_navigation.DisplayNavigationSnapshot {
-        return self.reviewNavigationView().displayNavigationSnapshot();
-    }
-
     fn requestQuit(self: *App, ctx: *chasen.Ctx(Msg)) void {
         if (app_git_requests.hasPendingAction(self.actions)) {
             self.setStatus("finish current git action before quitting", .{});
@@ -858,6 +606,36 @@ pub const App = struct {
         }
         self.teardown_requested = true;
         ctx.quit();
+    }
+
+    fn updateReview(self: *App, ctx: *chasen.Ctx(Msg), msg: review_message.Msg) !void {
+        var page_update = try (review_page_update.Controller{ .navigation = self.reviewNavigation() }).apply(self.allocator, msg);
+        defer page_update.deinit(self.allocator);
+
+        if (page_update.capture_display_override) {
+            try self.reviewReload().captureDisplayOverride(ctx.allocator());
+        }
+
+        var command = page_update.takeCommand() orelse return;
+        const allocator = self.allocator orelse ctx.allocator();
+        defer command.deinit(allocator);
+        switch (command) {
+            .enter_commit_panel => self.enterCommitPanelMode(.commit),
+            .enter_amend_panel => self.enterCommitPanelMode(.amend),
+            .toggle_selected_file => try self.toggleSelectedFileStage(ctx),
+            .toggle_selected_hunk => try self.toggleSelectedHunkStage(ctx),
+            .request_discard_selected_file => try self.requestDiscardSelectedFile(ctx.allocator()),
+            .request_push => try self.requestPush(ctx.allocator()),
+            .request_pull => try self.requestPull(ctx.allocator()),
+            .request_fetch => try self.requestFetch(ctx),
+            .request_branch_switch => try self.requestBranchSwitch(ctx),
+            .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
+            .copy_current_line => self.copyCurrentLine(ctx),
+            .copy_current_hunk => try self.copyCurrentHunk(ctx),
+            .copy_diff_selection => |selection| try self.copyDiffSelection(ctx, selection),
+            .copy_diff_header_path => |selection| self.copyDiffHeaderPath(ctx, selection),
+            .finish_review => |decision| try self.finishReview(ctx, decision),
+        }
     }
 
     fn finishLoadResult(self: *App, ctx: *chasen.Ctx(Msg), finished: LoadFinishedMsg) !void {
@@ -1019,8 +797,8 @@ pub const App = struct {
     fn mouseToMsg(self: *const App, mouse: anytype) ?Msg {
         if (self.pages.review.selection_owner.activeMouseSelection()) {
             switch (mouse.type) {
-                .drag => return .{ .mouse_diff_drag = self.bodyMousePoint(mouse) },
-                .release => return .{ .mouse_diff_release = self.bodyMousePoint(mouse) },
+                .drag => return .{ .review = .{ .mouse_diff_drag = self.bodyMousePoint(mouse) } },
+                .release => return .{ .review = .{ .mouse_diff_release = self.bodyMousePoint(mouse) } },
                 else => {},
             }
         }
@@ -1065,24 +843,24 @@ pub const App = struct {
         const pane = self.mousePane(mouse) orelse return null;
         return switch (mouse.button) {
             .left => switch (pane) {
-                .sidebar => self.sidebarClickToMsg(mouse),
-                .diff => .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null },
+                .sidebar => .{ .review = self.sidebarClickToMsg(mouse) },
+                .diff => .{ .review = .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null } },
             },
             .wheel_up => switch (pane) {
-                .sidebar => .mouse_sidebar_wheel_up,
-                .diff => .mouse_diff_wheel_up,
+                .sidebar => .{ .review = .mouse_sidebar_wheel_up },
+                .diff => .{ .review = .mouse_diff_wheel_up },
             },
             .wheel_down => switch (pane) {
-                .sidebar => .mouse_sidebar_wheel_down,
-                .diff => .mouse_diff_wheel_down,
+                .sidebar => .{ .review = .mouse_sidebar_wheel_down },
+                .diff => .{ .review = .mouse_diff_wheel_down },
             },
             .wheel_left => switch (pane) {
                 .sidebar => null,
-                .diff => .mouse_diff_wheel_left,
+                .diff => .{ .review = .mouse_diff_wheel_left },
             },
             .wheel_right => switch (pane) {
                 .sidebar => null,
-                .diff => .mouse_diff_wheel_right,
+                .diff => .{ .review = .mouse_diff_wheel_right },
             },
             else => null,
         };
@@ -1101,7 +879,7 @@ pub const App = struct {
         return .diff;
     }
 
-    fn sidebarClickToMsg(self: *const App, mouse: anytype) Msg {
+    fn sidebarClickToMsg(self: *const App, mouse: anytype) review_message.Msg {
         const point = self.bodyMousePoint(mouse) orelse return .focus_sidebar;
         const body_height = self.shellLayout().body.height;
         if (point.row < sidebar_header_rows or body_height <= sidebar_header_rows) return .focus_sidebar;
@@ -1111,20 +889,6 @@ pub const App = struct {
         const body_row: usize = point.row - sidebar_header_rows;
         const node_index = loaded.sidebarNodeAtBodyRow(self.pages.review.viewer.selected_node, visible_rows, body_row) orelse return .focus_sidebar;
         return .{ .sidebar_click_node = node_index };
-    }
-
-    fn releaseDiffMouse(self: *App, ctx: *chasen.Ctx(Msg), point_opt: ?MousePoint) !void {
-        _ = point_opt;
-        const owner = self.pages.review.selection_owner;
-        self.reviewNavigation().clearDiffSelection();
-        switch (owner) {
-            .none => return,
-            .diff => |selection| {
-                if (!selection.moved) return;
-                try self.copyDiffSelection(ctx, selection);
-            },
-            .diff_header => |selection| self.copyDiffHeaderPath(ctx, selection),
-        }
     }
 
     /// Single termination boundary for every mouse-selection lifetime. Update
@@ -5046,7 +4810,7 @@ test "display mode and search navigation reset horizontal scroll" {
         .terminal_size = .{ .width = 120, .height = 8 },
     };
 
-    try app.update(.toggle_display_mode, undefined);
+    try app.update(.{ .review = .toggle_display_mode }, undefined);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_horizontal_scroll);
 
     app.pages.review.viewer.diff_horizontal_scroll = 16;
@@ -5070,7 +4834,7 @@ test "line number toggle clamps horizontal scroll without changing vertical scro
     };
 
     const old_scroll = app.pages.review.viewer.diff_scroll;
-    try app.update(.toggle_line_numbers, undefined);
+    try app.update(.{ .review = .toggle_line_numbers }, undefined);
 
     try std.testing.expect(!app.pages.review.viewer.view_options.line_numbers);
     try std.testing.expectEqual(old_scroll, app.pages.review.viewer.diff_scroll);
@@ -5271,7 +5035,7 @@ test "display mode toggle keeps nearby vertical scroll position" {
     };
     app.pages.review.viewer.diff_cursor = app.reviewNavigationView().selectedCoordinateAtOffset(app.pages.review.viewer.diff_scroll) orelse app.pages.review.viewer.diff_cursor;
 
-    try app.update(.toggle_display_mode, undefined);
+    try app.update(.{ .review = .toggle_display_mode }, undefined);
 
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.reviewNavigationView().effectiveDisplayMode());
     try std.testing.expect(app.pages.review.viewer.diff_scroll > 0);
@@ -5294,7 +5058,7 @@ test "display mode toggle brings cursor back into view after wheel scroll" {
 
     try std.testing.expect(app.visibleDiffCursorOffset() == null);
 
-    try app.update(.toggle_display_mode, undefined);
+    try app.update(.{ .review = .toggle_display_mode }, undefined);
 
     try std.testing.expect(app.visibleDiffCursorOffset() != null);
 }
@@ -5314,7 +5078,7 @@ test "mouse wheel routes through diff scroll cursor sync" {
         .terminal_size = .{ .width = 140, .height = 8 },
     };
 
-    try app.update(.mouse_diff_wheel_down, undefined);
+    try app.update(.{ .review = .mouse_diff_wheel_down }, undefined);
 
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
     try std.testing.expect(app.visibleDiffCursorOffset() != null);
@@ -5339,7 +5103,7 @@ test "diff mouse drag rejects unified fallback and clears on invalidation" {
     app.reviewNavigation().pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
     try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
 
-    try app.update(.toggle_display_mode, undefined);
+    try app.update(.{ .review = .toggle_display_mode }, undefined);
     try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
 
     app.pages.review.viewer.display_mode = .side_by_side;
@@ -5359,7 +5123,7 @@ test "hidden sidebar keeps tab from changing focus" {
         } },
     };
 
-    try app.update(.toggle_focus, undefined);
+    try app.update(.{ .review = .toggle_focus }, undefined);
 
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
@@ -5368,7 +5132,7 @@ test "user actions clear previous ephemeral status" {
     var app: App = .{};
     app.setStatus("staged: {s}", .{"src/app.zig"});
 
-    try app.update(.toggle_focus, undefined);
+    try app.update(.{ .review = .toggle_focus }, undefined);
 
     try std.testing.expectEqualStrings("", app.status.text());
 }
@@ -5878,11 +5642,11 @@ test "search overflow reports query status for insert and paste" {
     app.pages.review.search.input.len = app.pages.review.search.input.buffer.len;
     app.pages.review.search.input.cursor = app.pages.review.search.input.buffer.len;
 
-    try app.update(.{ .search_insert = 'y' }, undefined);
+    try app.update(.{ .review = .{ .search_insert = 'y' } }, undefined);
     try std.testing.expectEqualStrings("search query is too long", app.pages.review.status.text());
 
     app.status.clear();
-    try app.update(.{ .search_paste = "y" }, undefined);
+    try app.update(.{ .review = .{ .search_paste = "y" } }, undefined);
     try std.testing.expectEqualStrings("search query is too long", app.pages.review.status.text());
 }
 
@@ -5894,11 +5658,11 @@ test "file search overflow reports query status for insert and paste" {
     app.pages.review.file_search.input.len = app.pages.review.file_search.input.buffer.len;
     app.pages.review.file_search.input.cursor = app.pages.review.file_search.input.buffer.len;
 
-    try app.update(.{ .file_search_insert = 'y' }, undefined);
+    try app.update(.{ .review = .{ .file_search_insert = 'y' } }, undefined);
     try std.testing.expectEqualStrings("file search query is too long", app.pages.review.status.text());
 
     app.status.clear();
-    try app.update(.{ .file_search_paste = "y" }, undefined);
+    try app.update(.{ .review = .{ .file_search_paste = "y" } }, undefined);
     try std.testing.expectEqualStrings("file search query is too long", app.pages.review.status.text());
 }
 
@@ -7511,6 +7275,72 @@ test "finishReview writes output and quits when no git action is pending" {
     try std.testing.expect(std.mem.indexOf(u8, output.json.items, "\"decision\":\"approved\"") != null);
 }
 
+test "direct nested Review message uses the same update owner as keyboard input" {
+    var direct: App = .{ .allocator = std.testing.allocator };
+    var keyboard: App = .{ .allocator = std.testing.allocator };
+    var direct_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var keyboard_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try direct.update(.{ .review = .toggle_focus }, &direct_ctx);
+    const keyboard_msg = keyboard.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.tab } }) orelse return error.ExpectedReviewMessage;
+    try std.testing.expectEqual(App.Msg{ .review = .toggle_focus }, keyboard_msg);
+    try keyboard.update(keyboard_msg, &keyboard_ctx);
+
+    try std.testing.expectEqual(review_page.Focus.diff, direct.pages.review.viewer.focus);
+    try std.testing.expectEqual(direct.pages.review.viewer.focus, keyboard.pages.review.viewer.focus);
+}
+
+test "normal and help commit keys use the same nested Review adapter" {
+    const repo: repo_discovery.RepoEntry = .{
+        .label = "repo",
+        .display_path = "/repo",
+        .canonical_root = "/repo",
+    };
+    var normal: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = repo } },
+    };
+    var help: App = .{
+        .allocator = std.testing.allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = repo } },
+    };
+    help.overlay.openHelpForPage(.review);
+    var normal_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var help_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    const normal_msg = normal.handleEvent(.{ .key_press = .{ .codepoint = 'c' } }) orelse return error.ExpectedReviewMessage;
+    const help_msg = help.handleEvent(.{ .key_press = .{ .codepoint = 'c' } }) orelse return error.ExpectedReviewMessage;
+    try std.testing.expectEqual(App.Msg{ .review = .enter_commit_panel }, normal_msg);
+    try std.testing.expectEqual(normal_msg, help_msg);
+
+    try normal.update(normal_msg, &normal_ctx);
+    try help.update(help_msg, &help_ctx);
+    try std.testing.expect(normal.commit_panel.is_open);
+    try std.testing.expect(help.commit_panel.is_open);
+    try std.testing.expect(!help.overlay.isHelp());
+}
+
+test "review session q writes structured canceled output before quitting" {
+    var output: review_session.Output = .{};
+    defer output.deinit(std.testing.allocator);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .config = .{ .review_mode = true },
+        .review_output = &output,
+    };
+    _ = app.pages.review.activation.activate(0, .fresh, .unavailable, .unavailable);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    const msg = app.handleEvent(.{ .key_press = .{ .codepoint = 'q' } }) orelse return error.ExpectedReviewCancel;
+    try std.testing.expectEqual(App.Msg{ .review = .finish_review_canceled }, msg);
+    try app.update(msg, &ctx);
+
+    try std.testing.expect(ctx.shouldQuit());
+    try std.testing.expect(output.ready);
+    try std.testing.expectEqual(@as(u8, 130), output.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, output.json.items, "\"decision\":\"canceled\"") != null);
+}
+
 test "finishPush does not reload a stale active repository" {
     var app: App = .{
         .allocator = std.testing.allocator,
@@ -8936,11 +8766,11 @@ test "explicit interim navigation creates override but automatic state does not"
     };
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    try app.update(.scroll_diff_up, &ctx);
+    try app.update(.{ .review = .scroll_diff_up }, &ctx);
     try std.testing.expectEqual(@as(u64, 0), app.pages.review.display_navigation_input_revision);
     try std.testing.expect(app.pages.review.pending_display_navigation_restore.?.override == null);
 
-    try app.update(.scroll_diff_down, &ctx);
+    try app.update(.{ .review = .scroll_diff_down }, &ctx);
 
     try std.testing.expectEqual(@as(u64, 1), app.pages.review.display_navigation_input_revision);
     var restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
@@ -8948,7 +8778,7 @@ test "explicit interim navigation creates override but automatic state does not"
     try std.testing.expectEqual(app.pages.review.viewer.diff_cursor, override.diff_cursor);
     try std.testing.expectEqual(app.reviewNavigationView().selectedDiffCursorOffset(), override.diff_cursor_offset);
 
-    try app.update(.scroll_diff_down, &ctx);
+    try app.update(.{ .review = .scroll_diff_down }, &ctx);
     try std.testing.expectEqual(@as(u64, 2), app.pages.review.display_navigation_input_revision);
     restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
     override = restore.override orelse return error.ExpectedNavigationOverride;
