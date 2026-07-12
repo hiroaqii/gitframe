@@ -204,7 +204,8 @@ fn classifyOwned(bytes: []u8, allocator: std.mem.Allocator) Value {
 fn containsUnsafeControl(bytes: []const u8) bool {
     var iter = std.unicode.Utf8Iterator{ .bytes = bytes, .i = 0 };
     while (iter.nextCodepoint()) |codepoint| {
-        if (codepoint == '\t' or codepoint == '\n' or codepoint == '\r') continue;
+        if (codepoint == '\t' or codepoint == '\n') continue;
+        if (codepoint == '\r' and iter.i < bytes.len and bytes[iter.i] == '\n') continue;
         if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint <= 0x9f)) return true;
     }
     return false;
@@ -553,6 +554,11 @@ test "repository document rejects unsafe content without retaining bytes" {
     var c1_value = classifyOwned(c1, allocator);
     defer c1_value.deinit(allocator);
     try std.testing.expect(c1_value == .unsafe_control_text);
+
+    const lone_cr = try allocator.dupe(u8, "before\rafter");
+    var lone_cr_value = classifyOwned(lone_cr, allocator);
+    defer lone_cr_value.deinit(allocator);
+    try std.testing.expect(lone_cr_value == .unsafe_control_text);
 
     const invalid = try allocator.dupe(u8, "invalid-\xff");
     var invalid_value = classifyOwned(invalid, allocator);

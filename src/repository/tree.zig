@@ -184,6 +184,20 @@ pub const Tree = struct {
         }
         return null;
     }
+
+    pub fn revealNode(self: *Tree, node_index: usize) ?usize {
+        if (node_index >= self.nodes.len) return null;
+        var parent = self.nodes[node_index].parent;
+        while (parent) |index| {
+            self.nodes[index].expanded = true;
+            parent = self.nodes[index].parent;
+        }
+        self.rebuildVisible();
+        for (self.visibleNodes(), 0..) |visible_node, visible_index| {
+            if (visible_node == node_index) return visible_index;
+        }
+        return null;
+    }
 };
 
 const Shape = struct { node_count: usize, max_directory_depth: usize };
@@ -284,6 +298,20 @@ test "repository tree builds compact hierarchy and visible mapping" {
     try std.testing.expectEqual(@as(usize, 4), tree.visible_len);
     try std.testing.expect(tree.toggleVisible(0));
     try std.testing.expectEqual(@as(usize, 2), tree.visible_len);
+}
+
+test "repository tree reveals a file below collapsed ancestors" {
+    var document = try documentForTest("a/b/file.zig\x00root.zig\x00");
+    defer document.deinit(std.testing.allocator);
+    var tree = try Tree.build(std.testing.allocator, &document);
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expect(tree.toggleVisible(0));
+    try std.testing.expect(tree.visibleIndexForPath("a/b/file.zig") == null);
+    const file_index = for (tree.nodes, 0..) |node, index| {
+        if (std.mem.eql(u8, node.path, "a/b/file.zig")) break index;
+    } else return error.ExpectedFile;
+    const visible = tree.revealNode(file_index) orelse return error.ExpectedVisibleFile;
+    try std.testing.expectEqualStrings("a/b/file.zig", tree.nodes[tree.visible[visible]].path);
 }
 
 test "repository tree restores collapse and selected fallback by identity" {

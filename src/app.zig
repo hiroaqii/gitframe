@@ -940,7 +940,9 @@ pub const App = struct {
             }
         }
 
-        if (self.pages.review.search.mode or self.pages.review.file_search.mode or self.commit_panel.is_open or self.repo_picker.mode) return null;
+        if ((self.active_page == .review and (self.pages.review.search.mode or self.pages.review.file_search.mode)) or
+            (self.active_page == .repository and (self.pages.repository.source_search.mode or self.pages.repository.file_search.mode)) or
+            self.commit_panel.is_open or self.repo_picker.mode) return null;
         if (mouse.type != .press) return null;
 
         switch (self.overlay.mouseMode()) {
@@ -1059,8 +1061,16 @@ pub const App = struct {
     fn keyContext(self: *const App) app_input.KeyContext {
         return .{
             .active_page = self.active_page,
-            .search_mode = self.pages.review.search.mode,
-            .file_search_mode = self.pages.review.file_search.mode,
+            .review = .{
+                .search_mode = self.pages.review.search.mode,
+                .file_search_mode = self.pages.review.file_search.mode,
+                .search_query_len = self.pages.review.search.query.len,
+                .focus = self.pages.review.viewer.focus,
+                .sidebar_hidden = self.pages.review.viewer.sidebar_hidden,
+                .review_mode = self.config.review_mode,
+                .keymap = self.keymap,
+            },
+            .repository = self.pages.repository.inputContext(self.keymap),
             .commit_panel_mode = self.commit_panel.is_open,
             .repo_picker_mode = self.repo_picker.mode,
             .repo_picker_input_mode = self.repo_picker.input_mode,
@@ -1072,10 +1082,6 @@ pub const App = struct {
             .branch_switch_mode = self.overlay.isSwitchBranch(),
             .push_error_mode = self.overlay.isPushError(),
             .push_credential_mode = self.overlay.isPushCredentials(),
-            .search_query_len = self.pages.review.search.query.len,
-            .focus = self.pages.review.viewer.focus,
-            .sidebar_hidden = self.pages.review.viewer.sidebar_hidden,
-            .review_mode = self.config.review_mode,
             .keymap = self.keymap,
         };
     }
@@ -1116,6 +1122,8 @@ pub const App = struct {
             .review_deferred_apply = self.pages.review.deferred_source_apply != null,
             .review_search = self.pages.review.search.mode,
             .review_file_search = self.pages.review.file_search.mode,
+            .repository_source_search = self.pages.repository.source_search.mode,
+            .repository_file_search = self.pages.repository.file_search.mode,
             .repo_picker = self.repo_picker.mode,
             .help = self.overlay.isHelp(),
             .commit_input = self.commit_panel.is_open,

@@ -8,8 +8,15 @@ const page = @import("../page.zig");
 const git_backend = @import("../../git/backend.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 const selected_document = @import("../../repository/document.zig");
+const source_document = @import("../../repository/source.zig");
 const manifest = @import("../../repository/manifest.zig");
 const repository_tree = @import("../../repository/tree.zig");
+const repository_input = @import("repository/input.zig");
+const repository_model = @import("repository/model.zig");
+const repository_navigation = @import("repository/navigation.zig");
+const repository_view = @import("repository/view.zig");
+
+pub const InputContext = repository_input.Context;
 
 pub const LoadState = enum { idle, no_repository, loading, loaded, empty, failed };
 
@@ -53,11 +60,43 @@ pub const ManifestFinished = struct {
 pub const DisplayedDocument = struct {
     path: []u8,
     manifest_revision: u64,
-    value: selected_document.Value,
+    value: DocumentValue,
 
     pub fn deinit(self: *DisplayedDocument, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         self.value.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentValue = union(enum) {
+    source: source_document.Document,
+    inert: selected_document.Value,
+
+    pub fn fromLoaded(allocator: std.mem.Allocator, loaded: *selected_document.Value) DocumentValue {
+        return switch (loaded.*) {
+            .text => |text| blk: {
+                const source = source_document.Document.initOwned(allocator, text.bytes, text.fingerprint) catch {
+                    allocator.free(text.bytes);
+                    loaded.* = .unreadable;
+                    break :blk .{ .inert = .unreadable };
+                };
+                loaded.* = .unreadable;
+                break :blk .{ .source = source };
+            },
+            else => blk: {
+                const inert = loaded.*;
+                loaded.* = .unreadable;
+                break :blk .{ .inert = inert };
+            },
+        };
+    }
+
+    pub fn deinit(self: *DocumentValue, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .source => |*source| source.deinit(allocator),
+            .inert => |*inert| inert.deinit(allocator),
+        }
         self.* = undefined;
     }
 };
@@ -68,7 +107,7 @@ pub const DocumentFinished = struct {
     generation: u64,
     manifest_revision: u64,
     path: []u8,
-    value: selected_document.Value,
+    value: DocumentValue,
 
     pub fn deinit(self: *DocumentFinished, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -89,6 +128,36 @@ pub const Msg = union(enum) {
     scroll_right,
     mouse_row: usize,
     mouse_toggle_row: usize,
+    mouse_source_row: usize,
+    mouse_source_wheel_up,
+    mouse_source_wheel_down,
+    focus_tree,
+    focus_source,
+    toggle_focus,
+    tree_first,
+    tree_last,
+    source_first,
+    source_last,
+    toggle_line_numbers,
+    enter_source_search,
+    cancel_source_search,
+    submit_source_search,
+    clear_source_search,
+    next_source_match,
+    previous_source_match,
+    source_search_backspace,
+    source_search_move_left,
+    source_search_move_right,
+    source_search_insert: u21,
+    source_search_paste: []const u8,
+    enter_file_search,
+    cancel_file_search,
+    submit_file_search,
+    file_search_previous,
+    file_search_next,
+    file_search_backspace,
+    file_search_insert: u21,
+    file_search_paste: []const u8,
     wheel_up,
     wheel_down,
 
@@ -178,13 +247,15 @@ pub fn DocumentTask(comptime AppMsg: type) type {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
             defer task.root.deinit();
+            var loaded = selected_document.load(task.root, task.path, allocator, io);
+            defer loaded.deinit(allocator);
             const finished = DocumentFinished{
                 .identity = task.identity,
                 .root_identity = task.root.identity,
                 .generation = task.generation,
                 .manifest_revision = task.manifest_revision,
                 .path = task.path,
-                .value = selected_document.load(task.root, task.path, allocator, io),
+                .value = DocumentValue.fromLoaded(allocator, &loaded),
             };
             task.path = &.{};
             return .{ .repository = .{ .document_finished = finished } };
@@ -200,7 +271,7 @@ pub fn DocumentTask(comptime AppMsg: type) type {
                 .generation = task.generation,
                 .manifest_revision = task.manifest_revision,
                 .path = task.path,
-                .value = .unreadable,
+                .value = .{ .inert = .unreadable },
             };
             task.path = &.{};
             return .{ .repository = .{ .document_finished = finished } };
@@ -315,9 +386,9 @@ pub const RepositoryPageState = struct {
     bundle: ?Bundle = null,
     displayed_document: ?DisplayedDocument = null,
     selected_path: ?[]const u8 = null,
-    cursor_visible: usize = 0,
-    vertical_scroll: usize = 0,
-    horizontal_scroll: usize = 0,
+    viewer: repository_model.ViewerState = .{},
+    source_search: repository_model.SourceSearchState = .{},
+    file_search: repository_model.FileSearchState = .{},
     status: app_state.StatusMessage = .{},
 
     pub fn deinit(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
@@ -368,9 +439,9 @@ pub const RepositoryPageState = struct {
         }
         self.displayed_document = null;
         self.selected_path = null;
-        self.cursor_visible = 0;
-        self.vertical_scroll = 0;
-        self.horizontal_scroll = 0;
+        self.viewer = .{};
+        self.source_search.clear();
+        self.file_search.close();
         self.pending_generation = null;
         self.pending_document_generation = null;
         self.repo_epoch = repo_epoch;
@@ -559,7 +630,10 @@ pub const RepositoryPageState = struct {
             .value = finished.value,
         };
         finished.path = &.{};
-        finished.value = .unreadable;
+        finished.value = .{ .inert = .unreadable };
+        self.viewer.resetSource();
+        if (self.currentSource() == null) self.viewer.focus = .tree;
+        self.source_search.clear();
         self.status.clear();
         return .changed;
     }
@@ -576,7 +650,8 @@ pub const RepositoryPageState = struct {
         incoming.* = undefined;
         self.selected_path = selected;
         self.load_state = if (self.bundle.?.document.paths.len == 0) .empty else .loaded;
-        self.cursor_visible = if (selected) |path| self.bundle.?.tree.visibleIndexForPath(path) orelse 0 else 0;
+        self.viewer.tree_cursor = if (selected) |path| self.bundle.?.tree.visibleIndexForPath(path) orelse 0 else 0;
+        if (self.file_search.mode) repository_navigation.refreshFileSearch(&self.file_search, &self.bundle.?.tree);
         self.clampScroll(0);
     }
 
@@ -594,16 +669,137 @@ pub const RepositoryPageState = struct {
     ) bool {
         const previous = self.selected_path;
         const body_height = bodyLayout(body_size).treeRows(body_size.height);
+        const source = self.currentSource();
+        const right_width = body_size.width -| bodyLayout(body_size).tree_width -| 1;
+        const source_text_width = if (source) |document| repository_view.sourceTextWidth(right_width, document, self.viewer.line_numbers) else 0;
         switch (msg) {
-            .move_up, .wheel_up => self.moveCursor(-1, body_height),
-            .move_down, .wheel_down => self.moveCursor(1, body_height),
-            .page_up => self.moveCursor(-@as(isize, @intCast(@max(body_height -| 1, 1))), body_height),
-            .page_down => self.moveCursor(@intCast(@max(body_height -| 1, 1)), body_height),
+            .move_up => if (self.viewer.focus == .source and source != null)
+                repository_navigation.moveSource(&self.viewer, source.?, -1, body_size.height)
+            else
+                self.moveCursor(-1, body_height),
+            .move_down => if (self.viewer.focus == .source and source != null)
+                repository_navigation.moveSource(&self.viewer, source.?, 1, body_size.height)
+            else
+                self.moveCursor(1, body_height),
+            .wheel_up => {
+                self.viewer.focus = .tree;
+                self.moveCursor(-1, body_height);
+            },
+            .wheel_down => {
+                self.viewer.focus = .tree;
+                self.moveCursor(1, body_height);
+            },
+            .page_up => if (self.viewer.focus == .source and source != null)
+                repository_navigation.pageSource(&self.viewer, source.?, -1, body_size.height)
+            else
+                self.moveCursor(-@as(isize, @intCast(@max(body_height -| 1, 1))), body_height),
+            .page_down => if (self.viewer.focus == .source and source != null)
+                repository_navigation.pageSource(&self.viewer, source.?, 1, body_size.height)
+            else
+                self.moveCursor(@intCast(@max(body_height -| 1, 1)), body_height),
             .toggle_directory => self.toggleCursor(body_height),
-            .scroll_left => self.horizontal_scroll -|= 4,
-            .scroll_right => self.horizontal_scroll = @min(self.horizontal_scroll +| 4, manifest.max_path_bytes * 4),
-            .mouse_row => |row| self.setCursor(row, body_height, false),
-            .mouse_toggle_row => |row| self.setCursor(row, body_height, true),
+            .scroll_left => if (self.viewer.focus == .source and source != null) {
+                repository_navigation.scrollSourceHorizontal(&self.viewer, source.?, -8, source_text_width);
+            } else {
+                self.viewer.tree_horizontal_scroll -|= 4;
+            },
+            .scroll_right => if (self.viewer.focus == .source and source != null) {
+                repository_navigation.scrollSourceHorizontal(&self.viewer, source.?, 8, source_text_width);
+            } else {
+                self.viewer.tree_horizontal_scroll = @min(self.viewer.tree_horizontal_scroll +| 4, manifest.max_path_bytes * 4);
+            },
+            .mouse_row => |row| {
+                self.viewer.focus = .tree;
+                self.setCursor(row, body_height, false);
+            },
+            .mouse_toggle_row => |row| {
+                self.viewer.focus = .tree;
+                self.setCursor(row, body_height, true);
+            },
+            .mouse_source_row => |row| if (source) |document| {
+                self.viewer.focus = .source;
+                self.viewer.source_cursor = @min(self.viewer.source_vertical_scroll + row, document.rowCount() - 1);
+                repository_navigation.clampSource(&self.viewer, document, body_size.height, source_text_width);
+            },
+            .mouse_source_wheel_up => if (source) |document| {
+                self.viewer.focus = .source;
+                repository_navigation.moveSource(&self.viewer, document, -1, body_size.height);
+            },
+            .mouse_source_wheel_down => if (source) |document| {
+                self.viewer.focus = .source;
+                repository_navigation.moveSource(&self.viewer, document, 1, body_size.height);
+            },
+            .focus_tree => self.viewer.focus = .tree,
+            .focus_source => if (source != null) {
+                self.viewer.focus = .source;
+            },
+            .toggle_focus => if (source != null) {
+                self.viewer.focus = if (self.viewer.focus == .tree) .source else .tree;
+            },
+            .tree_first => self.selectTreeEdge(false, body_height),
+            .tree_last => self.selectTreeEdge(true, body_height),
+            .source_first => if (source) |document| repository_navigation.firstSource(&self.viewer, document, body_size.height),
+            .source_last => if (source) |document| repository_navigation.lastSource(&self.viewer, document, body_size.height),
+            .toggle_line_numbers => {
+                self.viewer.line_numbers = !self.viewer.line_numbers;
+                if (source) |document| repository_navigation.clampSource(&self.viewer, document, body_size.height, repository_view.sourceTextWidth(right_width, document, self.viewer.line_numbers));
+            },
+            .enter_source_search => if (source != null) {
+                self.source_search.mode = true;
+                self.source_search.input = self.source_search.query;
+                self.viewer.focus = .source;
+            },
+            .cancel_source_search => {
+                self.source_search.mode = false;
+                self.source_search.input = .{};
+            },
+            .submit_source_search => if (source) |document| {
+                self.source_search.mode = false;
+                self.source_search.query = self.source_search.input;
+                self.source_search.match = document.findNext(self.source_search.query.slice(), null);
+                if (self.source_search.match) |match| repository_navigation.revealMatch(&self.viewer, document, match, body_size.height, source_text_width) else self.status.set("No source match", .{});
+            },
+            .clear_source_search => self.source_search.clear(),
+            .next_source_match => if (source) |document| {
+                self.source_search.match = document.findNext(self.source_search.query.slice(), self.source_search.match);
+                if (self.source_search.match) |match| repository_navigation.revealMatch(&self.viewer, document, match, body_size.height, source_text_width);
+            },
+            .previous_source_match => if (source) |document| {
+                self.source_search.match = document.findPrevious(self.source_search.query.slice(), self.source_search.match);
+                if (self.source_search.match) |match| repository_navigation.revealMatch(&self.viewer, document, match, body_size.height, source_text_width);
+            },
+            .source_search_backspace => self.source_search.input.backspace(),
+            .source_search_move_left => self.source_search.input.moveLeft(),
+            .source_search_move_right => self.source_search.input.moveRight(),
+            .source_search_insert => |codepoint| self.source_search.input.insert(codepoint) catch self.status.set("Source search is too long", .{}),
+            .source_search_paste => |text| self.source_search.input.insertSlice(text) catch self.status.set("Source search is too long", .{}),
+            .enter_file_search => {
+                self.file_search.mode = true;
+                self.file_search.input = .{};
+                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree);
+            },
+            .cancel_file_search => self.file_search.close(),
+            .submit_file_search => self.submitFileSearch(body_height),
+            .file_search_previous => self.file_search.move(-1),
+            .file_search_next => self.file_search.move(1),
+            .file_search_backspace => {
+                self.file_search.input.backspace();
+                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree);
+            },
+            .file_search_insert => |codepoint| {
+                self.file_search.input.insert(codepoint) catch {
+                    self.status.set("File search is too long", .{});
+                    return false;
+                };
+                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree);
+            },
+            .file_search_paste => |text| {
+                self.file_search.input.insertSlice(text) catch {
+                    self.status.set("File search is too long", .{});
+                    return false;
+                };
+                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree);
+            },
             .manifest_finished, .document_finished => unreachable,
         }
         if (optionalPathEql(previous, self.selected_path)) return false;
@@ -611,75 +807,147 @@ pub const RepositoryPageState = struct {
         self.needs_document_revalidation = self.selected_path != null;
         if (self.displayed_document) |*document| document.deinit(allocator);
         self.displayed_document = null;
+        self.viewer.resetSource();
+        self.source_search.clear();
         return true;
+    }
+
+    fn currentSource(self: *const RepositoryPageState) ?*const source_document.Document {
+        const displayed = if (self.displayed_document) |*document| document else return null;
+        const selected = self.selected_path orelse return null;
+        if (displayed.manifest_revision != self.manifest_revision or !std.mem.eql(u8, displayed.path, selected)) return null;
+        return switch (displayed.value) {
+            .source => |*source| source,
+            .inert => null,
+        };
+    }
+
+    pub fn inputContext(self: *const RepositoryPageState, keymap: @import("keymap").Effective) repository_input.Context {
+        const source_available = self.currentSource() != null;
+        return .{
+            .focus = if (source_available) self.viewer.focus else .tree,
+            .source_available = source_available,
+            .source_search_mode = self.source_search.mode,
+            .file_search_mode = self.file_search.mode,
+            .source_query_len = self.source_search.query.len,
+            .keymap = keymap,
+        };
+    }
+
+    fn selectTreeEdge(self: *RepositoryPageState, last: bool, body_height: u16) void {
+        const tree = if (self.bundle) |*bundle| &bundle.tree else return;
+        if (tree.visible_len == 0) return;
+        if (last) {
+            var index = tree.visible_len;
+            while (index > 0) {
+                index -= 1;
+                if (tree.nodes[tree.visible[index]].kind == .file) {
+                    self.viewer.tree_cursor = index;
+                    break;
+                }
+            }
+        } else {
+            for (tree.visibleNodes(), 0..) |node_index, visible_index| if (tree.nodes[node_index].kind == .file) {
+                self.viewer.tree_cursor = visible_index;
+                break;
+            };
+        }
+        self.viewer.focus = .tree;
+        self.selectCursor();
+        self.clampScroll(body_height);
+    }
+
+    fn submitFileSearch(self: *RepositoryPageState, body_height: u16) void {
+        const node_index = self.file_search.selectedNode() orelse {
+            self.file_search.no_match = true;
+            return;
+        };
+        const tree = if (self.bundle) |*bundle| &bundle.tree else return;
+        const visible = tree.revealNode(node_index) orelse return;
+        self.viewer.tree_cursor = visible;
+        self.viewer.focus = .tree;
+        self.selected_path = tree.nodes[node_index].path;
+        self.file_search.close();
+        self.clampScroll(body_height);
     }
 
     fn moveCursor(self: *RepositoryPageState, delta: isize, body_height: u16) void {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
         if (tree.visible_len == 0) return;
-        if (delta < 0) self.cursor_visible -|= @intCast(-delta) else self.cursor_visible = @min(self.cursor_visible +| @as(usize, @intCast(delta)), tree.visible_len - 1);
+        if (delta < 0) self.viewer.tree_cursor -|= @intCast(-delta) else self.viewer.tree_cursor = @min(self.viewer.tree_cursor +| @as(usize, @intCast(delta)), tree.visible_len - 1);
         self.selectCursor();
         self.clampScroll(body_height);
     }
 
     fn setCursor(self: *RepositoryPageState, body_row: usize, body_height: u16, toggle: bool) void {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
-        const index = self.vertical_scroll + body_row;
+        const index = self.viewer.tree_vertical_scroll + body_row;
         if (index >= tree.visible_len) return;
-        self.cursor_visible = index;
+        self.viewer.tree_cursor = index;
         if (toggle and tree.nodes[tree.visible[index]].kind == .directory) self.toggleCursor(body_height) else self.selectCursor();
     }
 
     fn toggleCursor(self: *RepositoryPageState, body_height: u16) void {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
-        if (tree.toggleVisible(self.cursor_visible)) {
-            if (tree.visible_len > 0) self.cursor_visible = @min(self.cursor_visible, tree.visible_len - 1);
+        if (tree.toggleVisible(self.viewer.tree_cursor)) {
+            if (tree.visible_len > 0) self.viewer.tree_cursor = @min(self.viewer.tree_cursor, tree.visible_len - 1);
             self.clampScroll(body_height);
         } else self.selectCursor();
     }
 
     fn selectCursor(self: *RepositoryPageState) void {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
-        if (self.cursor_visible >= tree.visible_len) return;
-        const node = tree.nodes[tree.visible[self.cursor_visible]];
+        if (self.viewer.tree_cursor >= tree.visible_len) return;
+        const node = tree.nodes[tree.visible[self.viewer.tree_cursor]];
         if (node.kind == .file) self.selected_path = node.path;
     }
 
     pub fn clampScroll(self: *RepositoryPageState, body_height: u16) void {
         const visible_len = if (self.bundle) |*bundle| bundle.tree.visible_len else 0;
         if (visible_len == 0) {
-            self.cursor_visible = 0;
-            self.vertical_scroll = 0;
+            self.viewer.tree_cursor = 0;
+            self.viewer.tree_vertical_scroll = 0;
             return;
         }
-        self.cursor_visible = @min(self.cursor_visible, visible_len - 1);
+        self.viewer.tree_cursor = @min(self.viewer.tree_cursor, visible_len - 1);
         const rows: usize = @max(@as(usize, body_height), 1);
-        if (self.cursor_visible < self.vertical_scroll) self.vertical_scroll = self.cursor_visible;
-        if (self.cursor_visible >= self.vertical_scroll + rows) self.vertical_scroll = self.cursor_visible - rows + 1;
-        self.vertical_scroll = @min(self.vertical_scroll, visible_len -| rows);
+        if (self.viewer.tree_cursor < self.viewer.tree_vertical_scroll) self.viewer.tree_vertical_scroll = self.viewer.tree_cursor;
+        if (self.viewer.tree_cursor >= self.viewer.tree_vertical_scroll + rows) self.viewer.tree_vertical_scroll = self.viewer.tree_cursor - rows + 1;
+        self.viewer.tree_vertical_scroll = @min(self.viewer.tree_vertical_scroll, visible_len -| rows);
     }
 
     pub fn clampForBodySize(self: *RepositoryPageState, body_size: chasen.Size) void {
-        self.clampScroll(bodyLayout(body_size).treeRows(body_size.height));
+        const layout = bodyLayout(body_size);
+        self.clampScroll(layout.treeRows(body_size.height));
+        if (self.currentSource()) |document| {
+            const right_width = body_size.width -| layout.tree_width -| 1;
+            const text_width = repository_view.sourceTextWidth(right_width, document, self.viewer.line_numbers);
+            repository_navigation.clampSource(&self.viewer, document, body_size.height, text_width);
+        }
     }
 
     pub fn mouseToMsg(self: *const RepositoryPageState, point: BodyPoint, button: MouseButton, size: chasen.Size) ?Msg {
         const layout = bodyLayout(size);
-        if (point.col >= layout.tree_width) return null;
-        return switch (button) {
+        if (point.col < layout.tree_width) return switch (button) {
             .wheel_up => .wheel_up,
             .wheel_down => .wheel_down,
-            .left => {
-                const body_row = layout.treeBodyRow(point) orelse return null;
+            .left => blk: {
+                const body_row = layout.treeBodyRow(point) orelse return .focus_tree;
                 const tree = if (self.bundle) |*bundle| &bundle.tree else return null;
-                const visible_index = self.vertical_scroll + body_row;
+                const visible_index = self.viewer.tree_vertical_scroll + body_row;
                 if (visible_index >= tree.visible_len) return null;
                 const node = tree.nodes[tree.visible[visible_index]];
-                return if (node.kind == .directory)
+                break :blk if (node.kind == .directory)
                     .{ .mouse_toggle_row = body_row }
                 else
                     .{ .mouse_row = body_row };
             },
+        };
+        if (point.col == layout.tree_width or self.currentSource() == null) return null;
+        return switch (button) {
+            .wheel_up => .mouse_source_wheel_up,
+            .wheel_down => .mouse_source_wheel_down,
+            .left => if (point.row >= 2) .{ .mouse_source_row = point.row - 2 } else .focus_source,
         };
     }
 };
@@ -689,15 +957,12 @@ fn optionalPathEql(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
-pub fn keyToMsg(key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return .move_up;
-    if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return .move_down;
-    if (key.matches(chasen.Key.page_up, .{})) return .page_up;
-    if (key.matches(chasen.Key.page_down, .{})) return .page_down;
-    if (key.matches(chasen.Key.enter, .{}) or key.codepoint == ' ') return .toggle_directory;
-    if (key.matches(chasen.Key.left, .{}) or key.codepoint == 'h') return .scroll_left;
-    if (key.matches(chasen.Key.right, .{}) or key.codepoint == 'l') return .scroll_right;
-    return null;
+pub fn keyToMsg(context: repository_input.Context, key: chasen.Key) ?Msg {
+    return repository_input.keyToMsg(Msg, context, key);
+}
+
+pub fn pasteToMsg(context: repository_input.Context, text: []const u8) ?Msg {
+    return repository_input.pasteToMsg(Msg, context, text);
 }
 
 pub const ViewContext = struct {
@@ -740,21 +1005,25 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     const tree = &state.bundle.?.tree;
     const rows = layout.treeRows(size.height);
     var body_row: usize = 0;
-    while (body_row < rows and state.vertical_scroll + body_row < tree.visible_len) : (body_row += 1) {
-        const visible_index = state.vertical_scroll + body_row;
+    while (body_row < rows and state.viewer.tree_vertical_scroll + body_row < tree.visible_len) : (body_row += 1) {
+        const visible_index = state.viewer.tree_vertical_scroll + body_row;
         const node = tree.nodes[tree.visible[visible_index]];
         const visible_text = try treeRowTextAlloc(
             surface.frameAllocator(),
             node,
-            state.horizontal_scroll,
+            state.viewer.tree_horizontal_scroll,
             left_width -| 1,
         );
-        const style = if (visible_index == state.cursor_visible) context.palette.boldStyle(.prompt) else if (node.kind == .directory) context.palette.boldStyle(.accent) else context.palette.style(.muted);
+        const style = if (visible_index == state.viewer.tree_cursor) context.palette.boldStyle(.prompt) else if (node.kind == .directory) context.palette.boldStyle(.accent) else context.palette.style(.muted);
         draw.copyClippedTextAt(&left, 1, @intCast(body_row + 1), visible_text, style) catch {};
     }
 
     if (left_width + 1 >= size.width) return;
     var right = surface.child(.{ .col = left_width + 1, .row = 0, .width = size.width - left_width - 1, .height = size.height });
+    if (state.file_search.mode) {
+        try repository_view.drawFileSearch(&right, tree, &state.file_search, context.palette);
+        return;
+    }
     if (state.selected_path) |path| {
         const path_window = try manifest.displayWindowAlloc(surface.frameAllocator(), path, 0, right.size().width -| 1);
         draw.copyClippedTextAt(&right, 1, 0, path_window.text(), context.palette.boldStyle(.accent)) catch {};
@@ -778,15 +1047,22 @@ fn drawDocumentCheckpoint(
         draw.copyClippedTextAt(surface, 1, 2, "Loading selected file...", palette.style(.muted)) catch {};
         return;
     }
-    const label: []const u8 = switch (displayed.value) {
-        .text => |text| if (text.bytes.len == 0)
-            "Empty file"
-        else
-            try std.fmt.allocPrint(surface.frameAllocator(), "Text file loaded ({d} bytes)", .{text.bytes.len}),
+    switch (displayed.value) {
+        .source => |*source| {
+            try repository_view.drawSource(surface, source, state.viewer, state.source_search, palette);
+            return;
+        },
+        .inert => |inert| drawInertCheckpoint(inert, surface, palette),
+    }
+}
+
+fn drawInertCheckpoint(value: selected_document.Value, surface: *chasen.Surface, palette: theme.Palette) void {
+    const label: []const u8 = switch (value) {
+        .text => unreachable,
         .symlink => |link| blk: {
             const width = surface.size().width -| "Symbolic link -> ".len -| 1;
-            const target = try manifest.displayWindowAlloc(surface.frameAllocator(), link.target, 0, width);
-            break :blk try std.fmt.allocPrint(surface.frameAllocator(), "Symbolic link -> {s}", .{target.text()});
+            const target = manifest.displayWindowAlloc(surface.frameAllocator(), link.target, 0, width) catch break :blk "Symbolic link";
+            break :blk std.fmt.allocPrint(surface.frameAllocator(), "Symbolic link -> {s}", .{target.text()}) catch "Symbolic link";
         },
         .binary => "Binary file is not shown",
         .invalid_utf8 => "Non-UTF-8 file is not shown",
@@ -856,12 +1132,31 @@ test "repository page navigation keeps sticky file selection on directory" {
     var state: RepositoryPageState = .{ .bundle = .{ .document = document, .tree = tree }, .load_state = .loaded };
     defer state.deinit(std.testing.allocator);
     state.selected_path = state.bundle.?.tree.firstFilePath();
-    state.cursor_visible = 1;
+    state.viewer.tree_cursor = 1;
     _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 11 });
     try std.testing.expectEqualStrings("a/one.zig", state.selected_path.?);
-    state.cursor_visible = 0;
+    state.viewer.tree_cursor = 0;
     _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 11 });
     try std.testing.expectEqualStrings("a/one.zig", state.selected_path.?);
+}
+
+test "repository manifest replacement refreshes active file search indices" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("old.zig\x00other.zig\x00"),
+        .load_state = .loaded,
+        .file_search = .{ .mode = true },
+    };
+    defer state.deinit(allocator);
+    try state.file_search.input.insertSlice("old");
+    repository_navigation.refreshFileSearch(&state.file_search, &state.bundle.?.tree);
+    try std.testing.expectEqual(@as(usize, 1), state.file_search.len);
+
+    var incoming = try bundleForTest("new.zig\x00");
+    errdefer incoming.deinit(allocator);
+    try state.replaceBundle(allocator, &incoming);
+    try std.testing.expectEqual(@as(usize, 0), state.file_search.len);
+    try std.testing.expect(state.file_search.no_match);
 }
 
 fn bundleForTest(bytes: []const u8) !Bundle {
@@ -938,6 +1233,35 @@ test "repository tasks derive completion root identity from their descriptor" {
     defer document_message.repository.deinitUndelivered(allocator);
     switch (document_message.repository) {
         .document_finished => |finished| try std.testing.expect(expected_identity.eql(finished.root_identity)),
+        else => return error.ExpectedDocumentCompletion,
+    }
+}
+
+test "repository document task builds the bounded source model before delivery" {
+    var root = try TestRoot.init();
+    defer root.deinit();
+    try root.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source.zig", .data = "first\r\nsecond\n" });
+    const allocator = std.testing.allocator;
+    const Document = DocumentTask(TaskIdentityTestMsg);
+    const task = try allocator.create(Document);
+    task.* = .{
+        .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
+        .generation = 5,
+        .manifest_revision = 6,
+        .path = try allocator.dupe(u8, "source.zig"),
+        .root = try root.capability.duplicate(),
+    };
+    var message = Document.run(task, allocator, std.testing.io);
+    defer message.repository.deinitUndelivered(allocator);
+    switch (message.repository) {
+        .document_finished => |finished| switch (finished.value) {
+            .source => |source| {
+                try std.testing.expectEqual(@as(usize, 2), source.rowCount());
+                try std.testing.expectEqualStrings("first", source.lineBody(0).?);
+                try std.testing.expectEqualStrings("second", source.lineBody(1).?);
+            },
+            .inert => return error.ExpectedSource,
+        },
         else => return error.ExpectedDocumentCompletion,
     }
 }
@@ -1042,7 +1366,7 @@ test "repository page rejects matching generation with wrong root identity" {
     try std.testing.expect(!state.needs_document_revalidation);
 }
 
-test "repository page accepts selected document and renders inert checkpoint" {
+test "repository page accepts selected document and renders plain source" {
     var root = try TestRoot.init();
     defer root.deinit();
     var state: RepositoryPageState = .{};
@@ -1069,13 +1393,26 @@ test "repository page accepts selected document and renders inert checkpoint" {
         .generation = request.generation,
         .manifest_revision = request.manifest_revision,
         .path = try std.testing.allocator.dupe(u8, request.path),
-        .value = .{ .text = .{
-            .bytes = bytes,
-            .fingerprint = content_fingerprint.Fingerprint.init(bytes),
-        } },
+        .value = .{ .source = try source_document.Document.initOwned(
+            std.testing.allocator,
+            bytes,
+            content_fingerprint.Fingerprint.init(bytes),
+        ) },
     };
     defer finished.deinit(std.testing.allocator);
+    state.viewer.source_cursor = 20;
+    state.viewer.source_vertical_scroll = 10;
+    state.viewer.source_horizontal_scroll = 30;
+    try state.source_search.query.insertSlice("old-query");
+    state.source_search.mode = true;
+    state.source_search.match = .{ .line = 1, .start = 0, .end = 1 };
     try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(std.testing.allocator, &finished));
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.source_search.query.len);
+    try std.testing.expect(!state.source_search.mode);
+    try std.testing.expect(state.source_search.match == null);
 
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(60, 10);
@@ -1083,8 +1420,118 @@ test "repository page accepts selected document and renders inert checkpoint" {
     try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
     const snapshot = try test_surface.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Text file loaded") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "const value") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "const value = 1;") != null);
+}
+
+test "repository page owns source focus navigation search and mouse geometry" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("src/main.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 3,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    const bytes = try allocator.dupe(u8, "first\nneedle here\nthird\nfourth\n");
+    state.displayed_document = .{
+        .path = try allocator.dupe(u8, state.selected_path.?),
+        .manifest_revision = state.manifest_revision,
+        .value = .{ .source = try source_document.Document.initOwned(allocator, bytes, .init(bytes)) },
+    };
+
+    const size = chasen.Size{ .width = 60, .height = 6 };
+    _ = state.applyNavigation(allocator, .toggle_focus, size);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    _ = state.applyNavigation(allocator, .move_down, size);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
+    _ = state.applyNavigation(allocator, .source_last, size);
+    try std.testing.expectEqual(@as(usize, 3), state.viewer.source_cursor);
+    _ = state.applyNavigation(allocator, .source_first, size);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
+
+    _ = state.applyNavigation(allocator, .enter_source_search, size);
+    for ("needle") |byte| _ = state.applyNavigation(allocator, .{ .source_search_insert = byte }, size);
+    _ = state.applyNavigation(allocator, .submit_source_search, size);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
+    try std.testing.expect(state.source_search.match != null);
+
+    const layout = bodyLayout(size);
+    try std.testing.expectEqual(Msg.focus_source, state.mouseToMsg(.{ .col = layout.tree_width + 1, .row = 1 }, .left, size).?);
+    try std.testing.expectEqual(Msg{ .mouse_source_row = 0 }, state.mouseToMsg(.{ .col = layout.tree_width + 1, .row = 2 }, .left, size).?);
+    try std.testing.expectEqual(Msg.mouse_source_wheel_down, state.mouseToMsg(.{ .col = layout.tree_width + 1, .row = 2 }, .wheel_down, size).?);
+
+    state.viewer.focus = .source;
+    state.viewer.source_cursor = 2;
+    _ = state.applyNavigation(allocator, .wheel_down, size);
+    try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 2), state.viewer.source_cursor);
+
+    state.viewer.source_cursor = 99;
+    state.viewer.source_vertical_scroll = 99;
+    state.viewer.source_horizontal_scroll = 99;
+    state.clampForBodySize(size);
+    try std.testing.expectEqual(@as(usize, 3), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_horizontal_scroll);
+}
+
+test "repository source completion rejects stale identity and frees undelivered payload" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .repo_epoch = 4,
+        .activation_id = 5,
+        .root_identity = .{ .device = 6, .inode = 7 },
+        .manifest_revision = 8,
+        .document_generation = 9,
+        .pending_document_generation = 9,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    try state.source_search.query.insertSlice("retained-on-stale");
+
+    const stale_bytes = try allocator.dupe(u8, "stale\n");
+    var stale = DocumentFinished{
+        .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 5 },
+        .root_identity = state.root_identity.?,
+        .generation = 9,
+        .manifest_revision = 8,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .value = .{ .source = try source_document.Document.initOwned(allocator, stale_bytes, .init(stale_bytes)) },
+    };
+    defer stale.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyDocumentFinished(allocator, &stale));
+    try std.testing.expect(state.displayed_document == null);
+    try std.testing.expectEqualStrings("retained-on-stale", state.source_search.query.slice());
+
+    const owned_bytes = try allocator.dupe(u8, "owned\n");
+    var undelivered = Msg{ .document_finished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = 4, .activation_id = 5 },
+        .root_identity = state.root_identity.?,
+        .generation = 9,
+        .manifest_revision = 8,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .value = .{ .source = try source_document.Document.initOwned(allocator, owned_bytes, .init(owned_bytes)) },
+    } };
+    undelivered.deinitUndelivered(allocator);
+
+    const matching_bytes = try allocator.dupe(u8, "retained-on-stale\n");
+    var matching = DocumentFinished{
+        .identity = .{ .origin = .repository, .repo_epoch = 4, .activation_id = 5 },
+        .root_identity = state.root_identity.?,
+        .generation = 9,
+        .manifest_revision = 8,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .value = .{ .source = try source_document.Document.initOwned(allocator, matching_bytes, .init(matching_bytes)) },
+    };
+    defer matching.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &matching));
+    try std.testing.expectEqual(@as(usize, 0), state.source_search.query.len);
+
+    state.pending_document_generation = 10;
+    state.rejectDocumentSpawn(10);
+    try std.testing.expect(state.pending_document_generation == null);
+    try std.testing.expectEqualStrings("Could not start selected file task", state.status.text());
 }
 
 test "repository manifest root liveness check rejects stable path replacement" {
@@ -1138,7 +1585,7 @@ test "repository page layout and mouse mapping share tree geometry" {
     const wide = chasen.Size{ .width = 60, .height = 10 };
     const wide_layout = bodyLayout(wide);
     try std.testing.expectEqual(@as(u16, 20), wide_layout.tree_width);
-    try std.testing.expect(state.mouseToMsg(.{ .col = 1, .row = 0 }, .left, wide) == null);
+    try std.testing.expectEqual(Msg.focus_tree, state.mouseToMsg(.{ .col = 1, .row = 0 }, .left, wide).?);
     try std.testing.expect(state.mouseToMsg(.{ .col = 20, .row = 1 }, .left, wide) == null);
     try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, state.mouseToMsg(.{ .col = 1, .row = 1 }, .left, wide).?);
     try std.testing.expectEqual(Msg{ .mouse_row = 1 }, state.mouseToMsg(.{ .col = 1, .row = 2 }, .left, wide).?);

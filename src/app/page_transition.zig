@@ -13,6 +13,8 @@ pub const Blocker = enum {
     review_deferred_apply,
     review_search,
     review_file_search,
+    repository_source_search,
+    repository_file_search,
     repo_picker,
     help,
     commit_input,
@@ -31,6 +33,8 @@ pub const Blocker = enum {
             .review_deferred_apply => "finish deferred Review update before switching pages",
             .review_search => "finish search before switching pages",
             .review_file_search => "finish file search before switching pages",
+            .repository_source_search => "finish source search before switching pages",
+            .repository_file_search => "finish file search before switching pages",
             .repo_picker => "close repository picker before switching pages",
             .help => "close help before switching pages",
             .commit_input => "close commit input before switching pages",
@@ -51,6 +55,8 @@ pub const Snapshot = struct {
     review_deferred_apply: bool = false,
     review_search: bool = false,
     review_file_search: bool = false,
+    repository_source_search: bool = false,
+    repository_file_search: bool = false,
     repo_picker: bool = false,
     help: bool = false,
     commit_input: bool = false,
@@ -85,6 +91,8 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
     if (snapshot.push_error) return .{ .blocked = .push_error };
     if (snapshot.review_search) return .{ .blocked = .review_search };
     if (snapshot.review_file_search) return .{ .blocked = .review_file_search };
+    if (snapshot.repository_source_search) return .{ .blocked = .repository_source_search };
+    if (snapshot.repository_file_search) return .{ .blocked = .repository_file_search };
     if (snapshot.review_mouse_selection) return .{ .blocked = .review_mouse_selection };
     if (snapshot.review_deferred_apply) return .{ .blocked = .review_deferred_apply };
     return .allowed;
@@ -114,5 +122,16 @@ test "transition policy is conservative and leaves same-page requests unchanged"
     try std.testing.expectEqual(
         Disposition{ .blocked = .review_mouse_selection },
         disposition(.review, .config, .{ .review_mouse_selection = true }),
+    );
+}
+
+test "repository prompt modes block mouse initiated page transitions" {
+    try std.testing.expectEqual(
+        Disposition{ .blocked = .repository_source_search },
+        disposition(.repository, .review, .{ .repository_source_search = true }),
+    );
+    try std.testing.expectEqual(
+        Disposition{ .blocked = .repository_file_search },
+        disposition(.repository, .history, .{ .repository_file_search = true }),
     );
 }

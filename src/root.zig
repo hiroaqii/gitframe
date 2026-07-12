@@ -50,6 +50,10 @@ test {
     _ = @import("app/pages/review/update.zig");
     _ = @import("app/pages/review/view.zig");
     _ = @import("app/pages/repository.zig");
+    _ = @import("app/pages/repository/input.zig");
+    _ = @import("app/pages/repository/model.zig");
+    _ = @import("app/pages/repository/navigation.zig");
+    _ = @import("app/pages/repository/view.zig");
     _ = @import("app/prompt.zig");
     _ = @import("app/push_retry.zig");
     _ = @import("app/repo_picker.zig");
@@ -84,6 +88,7 @@ test {
     _ = @import("repository/manifest.zig");
     _ = @import("repository/document.zig");
     _ = @import("repository/path.zig");
+    _ = @import("repository/source.zig");
     _ = @import("repository/tree.zig");
     _ = @import("review/session.zig");
     _ = @import("review/state.zig");
