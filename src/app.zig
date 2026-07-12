@@ -22,6 +22,7 @@ const review_operations = @import("app/pages/review/operations.zig");
 const review_reload = @import("app/pages/review/reload.zig");
 const review_page_update = @import("app/pages/review/update.zig");
 const review_view = @import("app/pages/review/view.zig");
+const repository_page = @import("app/pages/repository.zig");
 const app_prompt = @import("app/prompt.zig");
 const app_push_retry = @import("app/push_retry.zig");
 const app_repo_picker = @import("app/repo_picker.zig");
@@ -98,6 +99,7 @@ const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
 const PathTarget = git_ops.PathTarget;
 const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
+const RepositoryManifestTask = repository_page.ManifestTask(App.Msg);
 const AmendFinished = app_actions.AmendFinished;
 const CommitFinished = app_actions.CommitFinished;
 const CommitMessageAssistFinished = app_actions.CommitMessageAssistFinished;
@@ -206,7 +208,7 @@ const RepoCommitOrigin = enum {
 
 const PageStates = struct {
     review: review_page.ReviewPageState = .{},
-    repository: page.LazyPlaceholder = .{},
+    repository: repository_page.RepositoryPageState = .{},
     history: page.LazyPlaceholder = .{},
     config: page.LazyPlaceholder = .{},
 };
@@ -291,6 +293,7 @@ pub const App = struct {
         push_inspection_finished: app_push_retry.Finished,
         clipboard_copy_finished: ClipboardCopyFinished,
         review: review_message.Msg,
+        repository: repository_page.Msg,
         cancel_commit_panel,
         submit_commit_panel,
         assist_commit_message,
@@ -382,6 +385,7 @@ pub const App = struct {
                 .load_finished => |*finished| finished.deinit(allocator),
                 .action_finished => |*finished| finished.deinit(allocator),
                 .push_inspection_finished => |*finished| finished.deinit(allocator),
+                .repository => |*repository_msg| repository_msg.deinitUndelivered(allocator),
                 // Most owned async results stay grouped under load_finished or
                 // action_finished so exhaustive inner switches force
                 // classification. Shell lifecycle completions with their own
@@ -410,6 +414,7 @@ pub const App = struct {
     pub fn deinit(self: *App, deinit_ctx: chasen.AppDeinitContext) void {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.pages.review.deinit(deinit_ctx.allocator);
+        self.pages.repository.deinit(deinit_ctx.allocator);
         self.repo_state.deinit(deinit_ctx.allocator);
         self.commit_panel.deinit();
         self.repo_picker.deinit(deinit_ctx.allocator);
@@ -512,6 +517,7 @@ pub const App = struct {
                 self.reviewNavigation().updateSearchMatchOffset();
                 self.reviewNavigation().scrollSearchMatchIntoView();
                 self.reviewNavigation().clampDiffNavigation();
+                self.pages.repository.clampForBodySize(self.shellLayout().bodySize());
                 self.clampHelpScroll();
                 self.clampPushErrorScroll();
             },
@@ -520,6 +526,7 @@ pub const App = struct {
             .push_inspection_finished => |finished| try self.finishPushInspection(ctx, finished),
             .clipboard_copy_finished => |finished| self.finishClipboardCopy(ctx, finished),
             .review => |review_msg| try self.updateReview(ctx, review_msg),
+            .repository => |repository_msg| try self.updateRepository(ctx, repository_msg),
             .cancel_commit_panel => self.closeCommitPanel(),
             .submit_commit_panel => try self.submitCommitPanel(ctx),
             .assist_commit_message => try self.assistCommitMessage(ctx),
@@ -591,20 +598,20 @@ pub const App = struct {
             .close_push_error => self.clearPushError(ctx.allocator()),
             .open_push_credentials => try self.openPushCredentialPrompt(ctx),
             .run_interactive_push => try self.runInteractivePush(ctx),
-            .reload => reload: {
-                if (self.active_page != .review) {
-                    self.status.set("reload is not available on this page yet", .{});
-                    break :reload;
-                }
-                self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
-                self.clearBranchSwitch(ctx.allocator());
-                if (diff_source.sourceIsOneShotInput(self.config.source)) {
-                    ctx.redraw().skip();
-                } else if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
-                    try self.startRepoDiscovery(ctx, null);
-                } else {
-                    try self.startDiffLoad(ctx, .manual);
-                }
+            .reload => switch (self.active_page) {
+                .review => {
+                    self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
+                    self.clearBranchSwitch(ctx.allocator());
+                    if (diff_source.sourceIsOneShotInput(self.config.source)) {
+                        ctx.redraw().skip();
+                    } else if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
+                        try self.startRepoDiscovery(ctx, null);
+                    } else {
+                        try self.startDiffLoad(ctx, .manual);
+                    }
+                },
+                .repository => self.pages.repository.requestReload(self.activeRepoRoot() != null),
+                .history, .config => self.status.set("reload is not available on this page yet", .{}),
             },
             .auto_reload_tick => try self.autoReloadTick(ctx),
             .focus_lost => switch (self.active_page) {
@@ -618,6 +625,7 @@ pub const App = struct {
             try self.applyDeferredSource(ctx);
         }
         try self.maybeStartQueuedReviewRevalidation(ctx);
+        try self.maybeStartRepositoryManifest(ctx);
         if (self.active_page == .review) try self.ensureReviewProjection(ctx);
         self.reconcileGitActionSpinnerTimer(ctx);
     }
@@ -661,6 +669,57 @@ pub const App = struct {
         }
     }
 
+    fn updateRepository(self: *App, ctx: *chasen.Ctx(Msg), msg: repository_page.Msg) !void {
+        switch (msg) {
+            .manifest_finished => |finished| {
+                var owned = finished;
+                defer owned.deinit(ctx.allocator());
+                const outcome = self.pages.repository.applyFinished(ctx.allocator(), &owned);
+                if (self.active_page != .repository or outcome == .discarded or outcome == .unchanged) ctx.redraw().skip();
+            },
+            else => {
+                if (self.active_page != .repository) {
+                    ctx.redraw().skip();
+                    return;
+                }
+                self.pages.repository.applyNavigation(msg, self.shellLayout().bodySize());
+            },
+        }
+    }
+
+    fn maybeStartRepositoryManifest(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (self.active_page != .repository or !self.pages.repository.wantsManifestRequest()) return;
+        const repo_root = self.activeRepoRoot() orelse {
+            self.pages.repository.requestReload(false);
+            return;
+        };
+
+        var request = self.pages.repository.prepareRequest(ctx.allocator(), repo_root) catch |err| {
+            self.pages.repository.markRequestPreparationFailed(err);
+            return err;
+        };
+        var request_consumed = false;
+        defer if (!request_consumed) request.deinit(ctx.allocator());
+        const generation = request.generation;
+        const task = ctx.allocator().create(RepositoryManifestTask) catch |err| {
+            self.pages.repository.rejectSpawn(generation);
+            return err;
+        };
+        task.* = .{
+            .identity = request.identity,
+            .generation = request.generation,
+            .repo_root = request.repo_root,
+            .expected_fingerprint = request.expected_fingerprint,
+        };
+        request_consumed = true;
+        ctx.task().spawnWith(.{ .ctx = task, .run = RepositoryManifestTask.run, .failed = RepositoryManifestTask.failed }) catch |err| {
+            ctx.allocator().free(task.repo_root);
+            ctx.allocator().destroy(task);
+            self.pages.repository.rejectSpawn(generation);
+            return err;
+        };
+    }
+
     fn finishLoadResult(self: *App, ctx: *chasen.Ctx(Msg), finished: LoadFinishedMsg) !void {
         switch (finished) {
             .review => |review_result| switch (review_result) {
@@ -702,6 +761,7 @@ pub const App = struct {
         if (msgKeepsEphemeralStatus(msg)) return;
         self.status.clearIfEphemeral();
         if (self.active_page == .review) self.pages.review.status.clearIfEphemeral();
+        if (self.active_page == .repository) self.pages.repository.status.clearIfEphemeral();
     }
 
     fn msgKeepsEphemeralStatus(msg: Msg) bool {
@@ -715,6 +775,10 @@ pub const App = struct {
             .focus_lost,
             .git_action_spinner_tick,
             => true,
+            .repository => |repository_msg| switch (repository_msg) {
+                .manifest_finished => true,
+                else => false,
+            },
             else => false,
         };
     }
@@ -751,6 +815,7 @@ pub const App = struct {
     fn shellViewContext(self: *const App) app_view.Context {
         return .{
             .review = self.reviewViewContext(),
+            .repository = .{ .page_state = &self.pages.repository, .palette = self.theme },
             .active_page = self.active_page,
             .page_bar_visible = true,
             .theme = self.theme,
@@ -861,6 +926,21 @@ pub const App = struct {
             }
         }
 
+        if (self.active_page == .repository) {
+            const point = self.shellLayout().terminalToBody(mouse.col, mouse.row) orelse return null;
+            const button: repository_page.MouseButton = switch (mouse.button) {
+                .left => .left,
+                .wheel_up => .wheel_up,
+                .wheel_down => .wheel_down,
+                else => return null,
+            };
+            const repository_msg = self.pages.repository.mouseToMsg(
+                .{ .col = point.col, .row = point.row },
+                button,
+                self.shellLayout().bodySize(),
+            ) orelse return null;
+            return .{ .repository = repository_msg };
+        }
         if (self.active_page != .review) return null;
 
         const pane = self.mousePane(mouse) orelse return null;
@@ -958,7 +1038,8 @@ pub const App = struct {
     fn activePageStatus(self: *const App) ?*const app_state.StatusMessage {
         return switch (self.active_page) {
             .review => &self.pages.review.status,
-            .repository, .history, .config => null,
+            .repository => &self.pages.repository.status,
+            .history, .config => null,
         };
     }
 
@@ -1018,13 +1099,14 @@ pub const App = struct {
 
         self.status.clearIfEphemeral();
         if (self.active_page == .review) self.pages.review.activation.deactivate();
+        if (self.active_page == .repository) self.pages.repository.deactivate();
         self.active_page = target;
         switch (target) {
             .review => {
                 _ = self.activateReview();
                 try self.requestReviewRevalidation(ctx);
             },
-            .repository => self.pages.repository.ensureInitialized(),
+            .repository => self.pages.repository.activate(self.repo_epoch, self.activeRepoRoot() != null),
             .history => self.pages.history.ensureInitialized(),
             .config => self.pages.config.ensureInitialized(),
         }
@@ -3875,6 +3957,7 @@ pub const App = struct {
         if (changed) self.advanceRepoEpoch();
         self.repo_state.replace(allocator, discovery);
         self.repo_state.active_index = active_index;
+        if (changed) self.pages.repository.repositoryChanged(allocator, self.repo_epoch, self.activeRepoRoot() != null);
         if (changed) self.finishRepoIdentityCommit();
         return changed;
     }
@@ -3889,6 +3972,7 @@ pub const App = struct {
         }
         if (changed) self.advanceRepoEpoch();
         self.repo_state.active_index = active_index;
+        if (changed) self.pages.repository.repositoryChanged(self.allocator, self.repo_epoch, self.activeRepoRoot() != null);
         if (changed) self.finishRepoIdentityCommit();
         return changed;
     }
@@ -7004,7 +7088,8 @@ test "keyboard and page bar mouse share the page switch transition" {
     try std.testing.expect(app.pages.review.activation.state == .inactive);
 
     try app.update(.reload, &ctx);
-    try std.testing.expectEqualStrings("reload is not available on this page yet", app.status.text());
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expectEqualStrings("Repository required", app.pages.repository.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 
     const layout = app.shellLayout();
@@ -7020,6 +7105,35 @@ test "keyboard and page bar mouse share the page switch transition" {
     try std.testing.expectEqual(page.Id.review, app.active_page);
     try std.testing.expect(app.pages.review.activation.state.satisfiesAction(.read_diff));
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+}
+
+test "repository activation and manual reload route to page-owned manifest tasks" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .config = .{ .source = .stdin },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    defer app.pages.repository.deinit(std.testing.allocator);
+    _ = app.activateReview();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer clearPendingRepositoryTasks(&ctx, std.testing.allocator);
+
+    try app.update(.{ .switch_page = .repository }, &ctx);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    const first: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    try std.testing.expectEqual(page.Id.repository, first.identity.origin);
+    try std.testing.expectEqual(app.repo_epoch, first.identity.repo_epoch);
+    const first_generation = first.generation;
+
+    try app.update(.reload, &ctx);
+    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
+    const second: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[1].ctx));
+    try std.testing.expect(second.generation > first_generation);
+    try std.testing.expectEqual(second.generation, app.pages.repository.pending_generation.?);
 }
 
 test "page transition blocker leaves page and Review state unchanged" {
@@ -12559,6 +12673,14 @@ fn clearPendingStatusTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocat
     // state transition only, so clean up the queued task context explicitly.
     for (ctx.takePendingTasksWith()) |entry| {
         const task: *StatusLoadTask = @ptrCast(@alignCast(entry.ctx));
+        allocator.free(task.repo_root);
+        allocator.destroy(task);
+    }
+}
+
+fn clearPendingRepositoryTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
+    for (ctx.takePendingTasksWith()) |entry| {
+        const task: *RepositoryManifestTask = @ptrCast(@alignCast(entry.ctx));
         allocator.free(task.repo_root);
         allocator.destroy(task);
     }

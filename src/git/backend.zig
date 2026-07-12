@@ -5,6 +5,7 @@ const process_runner = @import("../process/runner.zig");
 
 pub const max_diff_bytes = 16 * 1024 * 1024;
 pub const max_status_bytes = 8 * 1024 * 1024;
+pub const max_repository_manifest_bytes = 16 * 1024 * 1024;
 
 pub const LoadError = error{
     StreamTooLong,
@@ -38,6 +39,21 @@ pub const StatusLoadResult = union(enum) {
     failed_static: []const u8,
 
     pub fn deinit(self: StatusLoadResult, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .ok => |bytes| allocator.free(bytes),
+            .failed => |message| allocator.free(message),
+            .failed_static => {},
+        }
+    }
+};
+
+pub const RepositoryManifestLoadResult = union(enum) {
+    /// Owned raw NUL-delimited `git ls-files` output.
+    ok: []u8,
+    failed: []u8,
+    failed_static: []const u8,
+
+    pub fn deinit(self: RepositoryManifestLoadResult, allocator: std.mem.Allocator) void {
         switch (self) {
             .ok => |bytes| allocator.free(bytes),
             .failed => |message| allocator.free(message),
@@ -168,6 +184,10 @@ pub const GitStatusRequest = struct {
     origin: ReadOrigin = .foreground,
 };
 
+pub const RepositoryManifestRequest = struct {
+    repo_root: []const u8,
+};
+
 /// Request for branch/upstream/ahead-behind status in a concrete repository.
 pub const BranchStatusRequest = struct {
     repo_root: []const u8,
@@ -257,6 +277,7 @@ pub const OperationRequest = struct {
 pub const Backend = struct {
     ptr: *anyopaque,
     load_diff_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, GitDiffRequest) LoadError!LoadResult,
+    load_repository_manifest_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult,
     load_status_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, GitStatusRequest) LoadError!StatusLoadResult,
     load_branch_status_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, BranchStatusRequest) LoadError!BranchStatusLoadResult,
     load_branch_list_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, BranchListRequest) LoadError!BranchListLoadResult,
@@ -264,6 +285,10 @@ pub const Backend = struct {
 
     pub fn loadDiff(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) LoadError!LoadResult {
         return self.load_diff_fn(self.ptr, allocator, io, request);
+    }
+
+    pub fn loadRepositoryManifest(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult {
+        return self.load_repository_manifest_fn(self.ptr, allocator, io, request);
     }
 
     pub fn loadStatus(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
@@ -291,6 +316,7 @@ pub const LocalCommandBackend = struct {
         return .{
             .ptr = self,
             .load_diff_fn = loadDiffErased,
+            .load_repository_manifest_fn = loadRepositoryManifestErased,
             .load_status_fn = loadStatusErased,
             .load_branch_status_fn = loadBranchStatusErased,
             .load_branch_list_fn = loadBranchListErased,
@@ -310,6 +336,10 @@ pub const LocalCommandBackend = struct {
 
     pub fn loadStatus(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
         return loadGitStatus(allocator, io, request);
+    }
+
+    pub fn loadRepositoryManifest(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult {
+        return loadGitRepositoryManifest(allocator, io, request.repo_root);
     }
 
     pub fn loadBranchStatus(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
@@ -346,6 +376,11 @@ pub const LocalCommandBackend = struct {
     fn loadStatusErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
         const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
         return self.loadStatus(allocator, io, request);
+    }
+
+    fn loadRepositoryManifestErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult {
+        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
+        return self.loadRepositoryManifest(allocator, io, request);
     }
 
     fn loadBranchStatusErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
@@ -424,6 +459,20 @@ fn statusResultFromGitCommand(allocator: std.mem.Allocator, result: process_runn
     return .{ .failed = std.fmt.allocPrint(allocator, "{s} failed: {any}", .{ fallback_label, result.term }) catch return error.OutOfMemory };
 }
 
+fn repositoryManifestResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result) LoadError!RepositoryManifestLoadResult {
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .{ .ok = result.stdout };
+        },
+        else => {},
+    }
+    allocator.free(result.stdout);
+    if (result.stderr.len > 0) return .{ .failed = result.stderr };
+    allocator.free(result.stderr);
+    return .{ .failed = allocator.dupe(u8, "git ls-files failed") catch return error.OutOfMemory };
+}
+
 fn operationResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) LoadError!OperationResult {
     allocator.free(result.stdout);
     switch (result.term) {
@@ -479,6 +528,149 @@ fn loadGitStatus(allocator: std.mem.Allocator, io: std.Io, request: GitStatusReq
     const argv = statusArgvForOrigin(request.origin);
     const result = try runCapturedCommand(allocator, io, request.repo_root, argv, .limited(max_status_bytes), .limited(256 * 1024));
     return statusResultFromGitCommand(allocator, result, "git status");
+}
+
+const repository_manifest_argv = [_][]const u8{
+    "git",
+    "--no-optional-locks",
+    "ls-files",
+    "-z",
+    "--cached",
+    "--others",
+    "--exclude-standard",
+    "--deduplicate",
+};
+
+pub fn repositoryManifestArgv() []const []const u8 {
+    return &repository_manifest_argv;
+}
+
+fn loadGitRepositoryManifest(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!RepositoryManifestLoadResult {
+    const result = try runCapturedCommand(
+        allocator,
+        io,
+        repo_root,
+        repositoryManifestArgv(),
+        .limited(max_repository_manifest_bytes),
+        .limited(256 * 1024),
+    );
+    return repositoryManifestResultFromGitCommand(allocator, result);
+}
+
+test "repository manifest argv is read-only NUL-delimited and deduplicated" {
+    const argv = repositoryManifestArgv();
+    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
+    try std.testing.expectEqualStrings("ls-files", argv[2]);
+    try std.testing.expectEqualStrings("-z", argv[3]);
+    try std.testing.expectEqualStrings("--deduplicate", argv[7]);
+}
+
+test "repository manifest backend deduplicates a real three-stage conflict" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try work.writeFile(io, .{ .sub_path = "conflict.txt", .data = "base\n" });
+    try runTestGit(io, &.{ "git", "add", "conflict.txt" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, work);
+    try runTestGit(io, &.{ "git", "checkout", "-b", "side" }, work);
+    try work.writeFile(io, .{ .sub_path = "conflict.txt", .data = "side\n" });
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-am", "side" }, work);
+    try runTestGit(io, &.{ "git", "checkout", "main" }, work);
+    try work.writeFile(io, .{ .sub_path = "conflict.txt", .data = "main\n" });
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-am", "main" }, work);
+    try runTestGitFailure(io, &.{ "git", "merge", "side" }, work);
+
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+    var backend: LocalCommandBackend = .{};
+    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .repo_root = repo_root });
+    defer result.deinit(std.testing.allocator);
+    const bytes = switch (result) {
+        .ok => |value| value,
+        else => return error.UnexpectedRepositoryManifestFailure,
+    };
+    try std.testing.expectEqualStrings("conflict.txt\x00", bytes);
+}
+
+test "repository manifest backend accepts gitlink as one path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "base\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, work);
+    const oid_output = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "HEAD" });
+    defer std.testing.allocator.free(oid_output);
+    const cache_info = try std.fmt.allocPrint(std.testing.allocator, "160000,{s},vendor/sub", .{trimLineEnd(oid_output)});
+    defer std.testing.allocator.free(cache_info);
+    try runTestGit(io, &.{ "git", "update-index", "--add", "--cacheinfo", cache_info }, work);
+
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+    var backend: LocalCommandBackend = .{};
+    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .repo_root = repo_root });
+    defer result.deinit(std.testing.allocator);
+    const bytes = switch (result) {
+        .ok => |value| value,
+        else => return error.UnexpectedRepositoryManifestFailure,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "vendor/sub\x00") != null);
+}
+
+test "repository manifest backend includes tracked and non-ignored untracked paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try work.writeFile(io, .{ .sub_path = "tracked.log", .data = "tracked\n" });
+    try runTestGit(io, &.{ "git", "add", "tracked.log" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, work);
+    try work.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\n" });
+    try work.writeFile(io, .{ .sub_path = "ignored.log", .data = "ignored\n" });
+    try work.writeFile(io, .{ .sub_path = "visible.txt", .data = "visible\n" });
+
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+    var backend: LocalCommandBackend = .{};
+    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .repo_root = repo_root });
+    defer result.deinit(std.testing.allocator);
+    const bytes = switch (result) {
+        .ok => |value| value,
+        else => return error.UnexpectedRepositoryManifestFailure,
+    };
+    try std.testing.expect(containsNulPath(bytes, "tracked.log"));
+    try std.testing.expect(containsNulPath(bytes, ".gitignore"));
+    try std.testing.expect(containsNulPath(bytes, "visible.txt"));
+    try std.testing.expect(!containsNulPath(bytes, "ignored.log"));
+}
+
+test "repository manifest unsupported option is a typed failure" {
+    const result = process_runner.Result{
+        .term = .{ .exited = 129 },
+        .stdout = try std.testing.allocator.alloc(u8, 0),
+        .stderr = try std.testing.allocator.dupe(u8, "error: unknown option `deduplicate`\n"),
+    };
+    const mapped = try repositoryManifestResultFromGitCommand(std.testing.allocator, result);
+    defer mapped.deinit(std.testing.allocator);
+    switch (mapped) {
+        .failed => |message| try std.testing.expect(std.mem.indexOf(u8, message, "deduplicate") != null),
+        else => return error.ExpectedRepositoryManifestFailure,
+    }
 }
 
 test "background status suppresses optional locks without changing foreground argv" {
@@ -2505,6 +2697,31 @@ fn runTestGit(io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !void {
         else => {},
     }
     return error.GitCommandFailed;
+}
+
+fn runTestGitFailure(io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !void {
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = argv,
+        .cwd = .{ .dir = cwd },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer freeRunResult(std.testing.allocator, result);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return,
+        else => {},
+    }
+    return error.ExpectedGitCommandFailure;
+}
+
+fn containsNulPath(bytes: []const u8, expected: []const u8) bool {
+    var start: usize = 0;
+    while (start < bytes.len) {
+        const end = std.mem.indexOfScalarPos(u8, bytes, start, 0) orelse return false;
+        if (std.mem.eql(u8, bytes[start..end], expected)) return true;
+        start = end + 1;
+    }
+    return false;
 }
 
 fn setupPullWorkRepoForTest(io: std.Io, tmp: *std.testing.TmpDir) !struct { repo_root: []u8, oid: []u8 } {

@@ -9,6 +9,7 @@ const app_state = @import("state.zig");
 const shell_layout = @import("shell_layout.zig");
 const view_primitives = @import("view_primitives.zig");
 const review_view = @import("pages/review/view.zig");
+const repository_page = @import("pages/repository.zig");
 const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
 const draw = @import("draw");
@@ -59,6 +60,7 @@ const StateMessage = struct {
 
 pub const Context = struct {
     review: review_view.Context,
+    repository: repository_page.ViewContext,
     active_page: page.Id,
     page_bar_visible: bool,
     theme: theme.Palette,
@@ -168,7 +170,8 @@ fn shellFrameOptions(palette: theme.Palette) ui.Panel.ViewOptions {
 fn viewBody(app: Context, surface: *chasen.Surface) !void {
     return switch (app.active_page) {
         .review => review_view.view(app.review, surface),
-        .repository, .history, .config => viewPlaceholderPage(app.active_page, app.repo_state.activeRoot() != null, app.theme, surface),
+        .repository => repository_page.view(app.repository, surface),
+        .history, .config => viewPlaceholderPage(app.active_page, app.repo_state.activeRoot() != null, app.theme, surface),
     };
 }
 
@@ -1537,6 +1540,7 @@ test "footer labels enabled automatic reload as auto" {
 
 const ShellViewTestHarness = struct {
     review: review_page.ReviewPageState = .{},
+    repository: repository_page.RepositoryPageState = .{},
     keymap: keymap.Effective = .{},
     theme: theme.Palette = .default(),
     terminal_size: chasen.Size = .{ .width = 80, .height = 24 },
@@ -1562,6 +1566,7 @@ const ShellViewTestHarness = struct {
         const review = review_view.Context.init(&self.review, navigation, self.theme, self.keymap, "working tree", .unstaged, null, .{});
         return .{
             .review = review,
+            .repository = .{ .page_state = &self.repository, .palette = self.theme },
             .active_page = .review,
             .page_bar_visible = false,
             .theme = self.theme,
@@ -1610,6 +1615,7 @@ test "shell notification temporarily wins over Review diagnostic" {
 
 test "page bar dispatch shows repository requirement for unavailable placeholders" {
     var harness: ShellViewTestHarness = .{};
+    harness.repository.load_state = .no_repository;
     var context = harness.context();
     context.active_page = .repository;
     context.page_bar_visible = true;

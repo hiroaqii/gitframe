@@ -49,6 +49,7 @@ test {
     _ = @import("app/pages/review/reload.zig");
     _ = @import("app/pages/review/update.zig");
     _ = @import("app/pages/review/view.zig");
+    _ = @import("app/pages/repository.zig");
     _ = @import("app/prompt.zig");
     _ = @import("app/push_retry.zig");
     _ = @import("app/repo_picker.zig");
@@ -78,6 +79,8 @@ test {
     _ = @import("path_key.zig");
     _ = @import("process/runner.zig");
     _ = @import("repo/state.zig");
+    _ = @import("repository/manifest.zig");
+    _ = @import("repository/tree.zig");
     _ = @import("review/session.zig");
     _ = @import("review/state.zig");
     _ = @import("syntax/provider.zig");

@@ -6,6 +6,7 @@ const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
 const review_page = @import("pages/review.zig");
 const review_input = @import("pages/review/input.zig");
+const repository_page = @import("pages/repository.zig");
 
 /// Minimal snapshot needed to translate a terminal key into an App message.
 /// Keeping this small prevents input mapping from depending on full App state.
@@ -148,6 +149,11 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.active_page == .review) {
         if (review_input.keyToMsg(context.review(), key)) |review_msg| {
             return translateReviewMsg(Msg, review_msg);
+        }
+    }
+    if (context.active_page == .repository) {
+        if (repository_page.keyToMsg(key)) |repository_msg| {
+            return payloadMsg(Msg, "repository", repository_msg);
         }
     }
     if (key.codepoint == 'q' and !key_input.hasCommandModifier(key)) return voidMsg(Msg, "quit");
@@ -402,6 +408,7 @@ const TestMsg = union(enum) {
     terminal_resized: chasen.Size,
     switch_page: page.Id,
     review: review_input.Msg,
+    repository: repository_page.Msg,
     cancel_commit_panel,
     submit_commit_panel,
     assist_commit_message,
@@ -478,7 +485,7 @@ test "normal page keys map after text and overlay precedence" {
     try std.testing.expectEqual(reviewMsg(.{ .search_insert = '2' }), keyToMsg(TestMsg, .{ .search_mode = true }, .{ .codepoint = '2' }).?);
     try std.testing.expectEqual(TestMsg{ .commit_panel_insert = '3' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = '3' }).?);
     try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = '2', .mods = .{ .ctrl = true } }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .active_page = .repository }, .{ .codepoint = 'j' }));
+    try std.testing.expectEqual(TestMsg{ .repository = .move_down }, keyToMsg(TestMsg, .{ .active_page = .repository }, .{ .codepoint = 'j' }).?);
 
     var config: keymap.Config = .{};
     config.set(.page_repository, .{ .plain_codepoint = 'w' });
