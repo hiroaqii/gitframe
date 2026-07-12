@@ -1195,6 +1195,14 @@ pub const Controller = struct {
         self.clearSearchMatch();
     }
 
+    /// Resets only Review-local navigation after the shell commits a different
+    /// repository identity. Repository selection and reload remain shell-owned.
+    pub fn resetAfterRepositorySwitch(self: Controller) void {
+        self.setSelectedDiffFile(0);
+        self.page.viewer.selected_node = 0;
+        self.clearSearch();
+    }
+
     pub fn enterFileSearchMode(self: Controller) void {
         self.clearDiffSelection();
         self.page.file_search_return_focus = if (self.page.viewer.sidebar_hidden) .diff else self.page.viewer.focus;

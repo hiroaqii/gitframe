@@ -103,6 +103,16 @@ pub const SourceLoadOptions = struct {
     background_cycle_id: ?u64 = null,
 };
 
+pub const OwnedRepoDiscoveryRead = struct {
+    identity: app_page.RequestIdentity,
+    generation: u64,
+    background_cycle_id: ?u64,
+
+    fn deinit(self: *OwnedRepoDiscoveryRead, _: std.mem.Allocator) void {
+        self.* = undefined;
+    }
+};
+
 pub const OwnedSourceRead = struct {
     identity: app_page.RequestIdentity,
     request: diff_source.LoadRequest,
@@ -145,6 +155,7 @@ pub const OwnedBranchStatusRead = struct {
 /// separately cloned pending identity; the command alone owns the request that
 /// crosses into the async task.
 pub const OwnedReadCommand = union(enum) {
+    repo_discovery: OwnedRepoDiscoveryRead,
     source_load: OwnedSourceRead,
     status_load: OwnedStatusRead,
     branch_status_load: OwnedBranchStatusRead,
@@ -152,6 +163,7 @@ pub const OwnedReadCommand = union(enum) {
 
     pub fn deinit(self: *OwnedReadCommand, allocator: std.mem.Allocator) void {
         switch (self.*) {
+            .repo_discovery => |*request| request.deinit(allocator),
             .source_load => |*request| request.deinit(allocator),
             .status_load => |*request| request.deinit(allocator),
             .branch_status_load => |*request| request.deinit(allocator),
@@ -484,6 +496,33 @@ pub const Controller = struct {
             .expected_fingerprint = expected_fingerprint,
             .background_cycle_id = options.background_cycle_id,
         } } };
+    }
+
+    pub fn prepareRepoDiscovery(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        background_cycle_id: ?u64,
+    ) !ReviewUpdate {
+        const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
+        const generation = self.page.load.beginRepoDiscovery();
+        self.clearPendingReload(allocator);
+        self.clearSourceDisplay(allocator);
+        self.page.load.state = .loading;
+        self.page.activation.markPending(.source);
+        return .{ .command = .{ .repo_discovery = .{
+            .identity = identity,
+            .generation = generation,
+            .background_cycle_id = background_cycle_id,
+        } } };
+    }
+
+    pub fn acceptRepoDiscoverySpawn(self: Controller, background_cycle_id: ?u64) void {
+        if (background_cycle_id) |cycle_id| _ = self.page.auto_reload.markMemberStarted(cycle_id, .source);
+    }
+
+    pub fn rejectRepoDiscoverySpawn(self: Controller, generation: u64) void {
+        _ = self.page.load.clearPendingIfCurrent(.{ .repo_discovery = generation });
+        self.failActiveMember(.source);
     }
 
     pub fn acceptSourceSpawn(self: Controller, background_cycle_id: ?u64) void {
@@ -1160,6 +1199,11 @@ pub const Controller = struct {
         self.clearLoadedDiff(allocator);
     }
 
+    pub fn replaceMissingRepository(self: Controller, allocator: std.mem.Allocator) void {
+        self.clearSourceDisplay(allocator);
+        self.page.load.replaceEmpty(allocator, .no_repository);
+    }
+
     /// Accepted replacement transition: keep failure provenance until the new
     /// fingerprint is accepted, but prevent use of the old snapshot.
     pub fn clearSourceDisplayForReplacement(self: Controller, allocator: ?std.mem.Allocator) void {
@@ -1373,6 +1417,13 @@ test "owned Review update consumes command exactly once" {
 test "owned read command variants release every payload" {
     const allocator = std.testing.allocator;
 
+    var discovery_update: ReviewUpdate = .{ .command = .{ .repo_discovery = .{
+        .identity = app_page.RequestIdentity.review(0, 1),
+        .generation = 1,
+        .background_cycle_id = null,
+    } } };
+    discovery_update.deinit(allocator);
+
     var source_update: ReviewUpdate = .{ .command = .{ .source_load = .{
         .identity = app_page.RequestIdentity.review(0, 1),
         .request = try diff_source.cloneLoadRequest(allocator, .{ .source = .{ .range = "main...HEAD" }, .repo_root = "/repo" }),
@@ -1569,6 +1620,11 @@ test "read command reject terminals clear only matching page state" {
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
+    page.load.generation = 1;
+    page.load.pending = .{ .repo_discovery = 1 };
+    controller.rejectRepoDiscoverySpawn(1);
+    try std.testing.expect(page.load.pending == null);
+
     _ = page.status_load.prepare(false);
     page.status_load.begin(null);
     controller.rejectStatusSpawn(allocator, null);
@@ -1601,6 +1657,27 @@ test "read command reject terminals clear only matching page state" {
     controller.rejectSourceSpawn(allocator, 11);
     try std.testing.expect(page.load.pending == null);
     try std.testing.expect(page.pending_reload == null);
+}
+
+test "repository discovery preparation owns Review load state" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{};
+    defer page.deinit(allocator);
+    _ = page.activation.activate(4, .pending, .pending, .pending);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    var update = try controller.prepareRepoDiscovery(allocator, 9);
+    defer update.deinit(allocator);
+    const command = update.command orelse return error.ExpectedCommand;
+
+    try std.testing.expect(command == .repo_discovery);
+    try std.testing.expectEqual(@as(?u64, 9), command.repo_discovery.background_cycle_id);
+    try std.testing.expect(page.load.state == .loading);
+    try std.testing.expectEqual(
+        load_state.PendingLoad{ .repo_discovery = command.repo_discovery.generation },
+        page.load.pending.?,
+    );
 }
 
 test "deferred source terminals consume blocked and accepted ownership" {

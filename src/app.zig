@@ -796,7 +796,7 @@ pub const App = struct {
         return hints;
     }
 
-    pub fn reviewViewContext(self: *const App) review_view.Context {
+    fn reviewViewContext(self: *const App) review_view.Context {
         return review_view.Context.init(
             &self.pages.review,
             self.reviewNavigationView(),
@@ -807,14 +807,6 @@ pub const App = struct {
             self.activeRepoRoot(),
             self.reviewEmptyRemoteActionHints(),
         );
-    }
-
-    pub fn diffSelectionView(self: *const App) ?diff_selection.View {
-        return self.reviewNavigationView().diffSelectionView();
-    }
-
-    pub fn diffHeaderSelectionActive(self: *const App) bool {
-        return self.reviewNavigationView().diffHeaderSelectionActive();
     }
 
     pub fn handleEvent(self: *const App, event: chasen.Event) ?Msg {
@@ -1117,21 +1109,30 @@ pub const App = struct {
     }
 
     fn startRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg), background_cycle_id: ?u64) !void {
-        const identity = self.pages.review.activation.currentIdentity() orelse return;
-        const task = try ctx.allocator().create(RepoDiscoveryTask);
-        errdefer ctx.allocator().destroy(task);
-
-        const generation = self.pages.review.load.beginRepoDiscovery();
-        task.* = .{ .identity = identity, .generation = generation, .background_cycle_id = background_cycle_id };
-        self.reviewReload().clearPendingReload(ctx.allocator());
-        self.reviewReload().clearSourceDisplay(self.allocator);
-        self.pages.review.load.state = .loading;
+        var review_update = try self.reviewReload().prepareRepoDiscovery(ctx.allocator(), background_cycle_id);
+        defer review_update.deinit(ctx.allocator());
+        var command = review_update.takeCommand() orelse unreachable;
+        var command_consumed = false;
+        defer if (!command_consumed) command.deinit(ctx.allocator());
+        const discovery = &command.repo_discovery;
+        const generation = discovery.generation;
+        const task = ctx.allocator().create(RepoDiscoveryTask) catch |err| {
+            self.reviewReload().rejectRepoDiscoverySpawn(generation);
+            return err;
+        };
+        task.* = .{
+            .identity = discovery.identity,
+            .generation = discovery.generation,
+            .background_cycle_id = discovery.background_cycle_id,
+        };
+        command_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = RepoDiscoveryTask.run, .failed = RepoDiscoveryTask.failed }) catch |err| {
-            _ = self.pages.review.load.clearPendingIfCurrent(.{ .repo_discovery = generation });
+            ctx.allocator().destroy(task);
+            self.reviewReload().rejectRepoDiscoverySpawn(generation);
             try self.reviewReload().storeFailedMessage(ctx.allocator(), "Could not start repo discovery task");
             return err;
         };
-        if (background_cycle_id) |cycle_id| _ = self.pages.review.auto_reload.markMemberStarted(cycle_id, .source);
+        self.reviewReload().acceptRepoDiscoverySpawn(background_cycle_id);
     }
 
     fn finishRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg), finished: RepoDiscoveryFinished) !void {
@@ -1159,11 +1160,8 @@ pub const App = struct {
     }
 
     fn startDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), kind: review_page.ReloadKind) !void {
-        const repo_root = self.repoRootForCurrentSource() catch |err| {
-            self.reviewReload().clearSourceDisplay(self.allocator);
-            self.pages.review.load.replaceEmpty(ctx.allocator(), switch (err) {
-                error.MissingRepoRoot => .no_repository,
-            });
+        const repo_root = self.repoRootForCurrentSource() catch {
+            self.reviewReload().replaceMissingRepository(ctx.allocator());
             return;
         };
 
@@ -1317,7 +1315,7 @@ pub const App = struct {
         defer if (!command_consumed) owned_command.deinit(allocator);
 
         switch (owned_command) {
-            .source_load, .status_load, .branch_status_load => unreachable,
+            .repo_discovery, .source_load, .status_load, .branch_status_load => unreachable,
             .review_projection => |*request| {
                 const request_id = request.id;
                 const task = allocator.create(ReviewProjectionTask) catch |err| {
@@ -2751,7 +2749,7 @@ pub const App = struct {
         };
     }
 
-    pub fn stagedSummaryForActiveRepo(self: *const App) app_commit_panel.StagedSummary {
+    fn stagedSummaryForActiveRepo(self: *const App) app_commit_panel.StagedSummary {
         return switch (self.reviewOperations().commitSummary()) {
             .unavailable => .unavailable,
             .loading_or_stale => .loading_or_stale,
@@ -4113,7 +4111,7 @@ pub const App = struct {
 
                 _ = self.commitWorkspaceRepoIndex(repo_index);
                 if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
-                self.resetViewAfterRepoSwitch();
+                self.reviewNavigation().resetAfterRepositorySwitch();
             },
             .pending_workspace_repo => |repo_index| {
                 try self.acceptPendingRepoPickerWorkspace(ctx, repo_index);
@@ -4249,12 +4247,6 @@ pub const App = struct {
         self.clearBranchSwitch(allocator);
     }
 
-    fn resetViewAfterRepoSwitch(self: *App) void {
-        self.reviewNavigation().setSelectedDiffFile(0);
-        self.pages.review.viewer.selected_node = 0;
-        self.reviewNavigation().clearSearch();
-    }
-
     fn submitRepoPickerPath(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         const path = std.mem.trim(u8, self.repo_picker.path_input.slice(), " \t\r\n");
         if (path.len == 0) {
@@ -4377,7 +4369,7 @@ pub const App = struct {
                 _ = self.commitRepoDiscovery(ctx.allocator(), owned_discovery, 0, .external_selection);
                 owned_discovery = .{ .none = .{ .current_root = "" } };
                 if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
-                self.resetViewAfterRepoSwitch();
+                self.reviewNavigation().resetAfterRepositorySwitch();
             },
             .workspace => |workspace| {
                 try self.recent_repos.rememberWorkspace(ctx.allocator(), workspace.current_root);
@@ -4419,7 +4411,7 @@ pub const App = struct {
         _ = self.commitRepoDiscovery(ctx.allocator(), discovery, repo_index, .external_selection);
         discovery = .{ .none = .{ .current_root = "" } };
         if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
-        self.resetViewAfterRepoSwitch();
+        self.reviewNavigation().resetAfterRepositorySwitch();
     }
 
     fn clearRepoPickerItems(self: *App, allocator: std.mem.Allocator) void {
@@ -4496,34 +4488,6 @@ pub const App = struct {
                 .right_path = paths.right,
             },
         };
-    }
-
-    pub fn selectedStatusEntry(self: *const App) ?git_status.StatusEntry {
-        return self.reviewNavigationView().selectedStatusEntry();
-    }
-
-    pub fn selectedStatusLineStats(self: *const App) ?file_tree.Stats {
-        return self.reviewNavigationView().selectedStatusLineStats();
-    }
-
-    pub fn activeDiffDisplay(self: *const App, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?review_navigation.ActiveDiffDisplay {
-        return self.reviewNavigationView().activeDiffDisplay(allocator, mode);
-    }
-
-    pub fn activeGeneratedFileProjection(self: *const App) ?*const app_review_projection.GeneratedFileBundle {
-        return self.reviewNavigationView().activeGeneratedFileProjection();
-    }
-
-    pub fn activeCachedDiffProjection(self: *const App) ?*const app_load.LoadedDiffBundle {
-        return self.reviewNavigationView().activeCachedDiffProjection();
-    }
-
-    pub fn selectedHunkIndex(self: *const App) ?usize {
-        return self.reviewNavigationView().selectedHunkIndex();
-    }
-
-    pub fn visibleDiffCursorOffset(self: *const App) ?usize {
-        return self.reviewNavigationView().visibleDiffCursorOffset();
     }
 
     fn layoutSize(self: *const App) chasen.Size {
@@ -5048,11 +5012,11 @@ test "display mode toggle brings cursor back into view after wheel scroll" {
         .terminal_size = .{ .width = 140, .height = 8 },
     };
 
-    try std.testing.expect(app.visibleDiffCursorOffset() == null);
+    try std.testing.expect(app.reviewNavigationView().visibleDiffCursorOffset() == null);
 
     try app.update(.{ .review = .toggle_display_mode }, undefined);
 
-    try std.testing.expect(app.visibleDiffCursorOffset() != null);
+    try std.testing.expect(app.reviewNavigationView().visibleDiffCursorOffset() != null);
 }
 
 test "mouse wheel routes through diff scroll cursor sync" {
@@ -5073,7 +5037,7 @@ test "mouse wheel routes through diff scroll cursor sync" {
     try app.update(.{ .review = .mouse_diff_wheel_down }, undefined);
 
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expect(app.visibleDiffCursorOffset() != null);
+    try std.testing.expect(app.reviewNavigationView().visibleDiffCursorOffset() != null);
 }
 
 test "diff mouse drag rejects unified fallback and clears on invalidation" {
@@ -5743,7 +5707,7 @@ test "sidebar navigation keeps status-only target through clamp" {
 
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expect(app.reviewNavigationView().selectedFileIndex(loaded) == null);
-    try std.testing.expect(app.selectedStatusEntry() != null);
+    try std.testing.expect(app.reviewNavigationView().selectedStatusEntry() != null);
 }
 
 test "sidebar navigation moves between status-only nodes" {
@@ -8772,7 +8736,7 @@ test "active diff display uses ready combined projection by identity" {
 
     var frame_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer frame_arena.deinit();
-    const display = (try app.activeDiffDisplay(frame_arena.allocator(), .unified)) orelse return error.ExpectedActiveDisplay;
+    const display = (try app.reviewNavigationView().activeDiffDisplay(frame_arena.allocator(), .unified)) orelse return error.ExpectedActiveDisplay;
     try std.testing.expect(display == .combined_projection);
     try std.testing.expectEqual(@as(usize, 2), display.combined_projection.file.hunks.len);
     try std.testing.expectEqual(@as(usize, 2), display.combined_projection.staged_flags.len);
@@ -9083,7 +9047,7 @@ test "empty watch source carries combined navigation into cached projection" {
     });
 
     try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
-    try std.testing.expect(app.activeCachedDiffProjection() != null);
+    try std.testing.expect(app.reviewNavigationView().activeCachedDiffProjection() != null);
     const final_offset = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
     try std.testing.expect(final_offset > 0);
     try std.testing.expect(final_offset <= original_offset);
@@ -9184,7 +9148,7 @@ test "empty watch source carries generated navigation into generated projection"
     });
 
     try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
-    try std.testing.expect(app.activeGeneratedFileProjection() != null);
+    try std.testing.expect(app.reviewNavigationView().activeGeneratedFileProjection() != null);
     try std.testing.expectEqual(@as(?usize, 2), app.reviewNavigationView().selectedDiffCursorOffset());
 }
 
