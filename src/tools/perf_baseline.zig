@@ -1,3 +1,19 @@
+//! Synthetic performance baseline for GitFrame's shared diff model and renderer.
+//!
+//! This developer-only benchmark generates deterministic large-diff fixtures and
+//! reports observational timings and retained arena capacity for three scenarios: a
+//! huge single file rendered near its end, a tree containing many files, and a
+//! side-by-side search with no match. It is intended for before/after development
+//! comparisons, not correctness tests or wall-clock acceptance gates.
+//!
+//! Usage:
+//!   zig build perf-baseline
+//!   zig build perf-baseline -Doptimize=ReleaseFast
+//!
+//! `zig build test` compiles this executable but does not run the benchmark. This tool
+//! does not profile staged Review projection or flow-syntax stages; use
+//! `projection-perf` with a recorded patch for that purpose.
+
 const std = @import("std");
 
 const chasen = @import("chasen");

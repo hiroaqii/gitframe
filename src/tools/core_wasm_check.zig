@@ -1,3 +1,15 @@
+//! Compile-time portability check for GitFrame's terminal-independent shared core.
+//!
+//! This developer tool makes Zig analyze representative parser, file-tree,
+//! view-model, search, and sidebar paths for the `wasm32-freestanding` target. It is
+//! stricter than an import-only check because Zig otherwise analyzes unused function
+//! bodies lazily. The exported function also exercises those paths with a small fixed
+//! diff and a fixed-buffer allocator.
+//!
+//! Run it explicitly with `zig build check-core-wasm`; `zig build test` also compiles
+//! the check artifact. This is not a browser runtime entry point and does not provide
+//! a WebAssembly UI, Git backend, allocator, or host integration.
+
 const std = @import("std");
 
 const diff_file = @import("../diff/file.zig");
