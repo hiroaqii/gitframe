@@ -6,6 +6,8 @@ const diff_parser = @import("parser.zig");
 const diff_selection = @import("selection.zig");
 const diff_view_model = @import("view_model.zig");
 const syntax_provider = @import("../syntax/provider.zig");
+const syntax_style = @import("../syntax/style.zig");
+const syntax_token = @import("../syntax/token.zig");
 const theme = @import("theme");
 
 pub const DisplayMode = diff_view_model.DisplayMode;
@@ -501,7 +503,7 @@ fn drawHunkGuide(surface: *chasen.Surface, row: u16, glyph: []const u8, styles: 
 }
 
 const UnifiedSyntaxContext = struct {
-    line_spans: syntax_provider.LineSpans = .empty(),
+    line_spans: syntax_token.LineSpans = .empty(),
     hunk_side_has_visible_syntax: bool = false,
 };
 
@@ -607,7 +609,7 @@ const BodyCursor = struct {
     }
 };
 
-fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_provider.LineSpans, hunk_side_has_visible_syntax: bool) !void {
+fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool) !void {
     const text_style = bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax);
     const marker_style = markerStyleForLine(line.kind, staged, styles);
     const prefix = prefixForLine(line.kind, hunk_side_has_visible_syntax);
@@ -623,8 +625,8 @@ fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLin
 }
 
 const SideBySideSyntaxSpans = struct {
-    old: syntax_provider.LineSpans = .empty(),
-    new: syntax_provider.LineSpans = .empty(),
+    old: syntax_token.LineSpans = .empty(),
+    new: syntax_token.LineSpans = .empty(),
     old_hunk_side_has_visible_syntax: bool = false,
     new_hunk_side_has_visible_syntax: bool = false,
 };
@@ -745,7 +747,7 @@ fn sideBySideSelectionForPair(options: RenderOptions, file: diff_parser.FileDiff
     return selected;
 }
 
-fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_provider.LineSpans, hunk_side_has_visible_syntax: bool, selected: bool) !void {
+fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selected: bool) !void {
     const layout = lineLayout(line_numbers, .side_by_side);
     drawGutterLeadInBackground(surface, row, layout, selectedStyle(gutterLeadInStyle(line.kind, staged, styles), selected, styles));
     if (line_numbers) {
@@ -756,7 +758,7 @@ fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffL
     try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), selected, styles), syntax_spans, styles);
 }
 
-fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_provider.LineSpans, hunk_side_has_visible_syntax: bool, selected: bool) !void {
+fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selected: bool) !void {
     const layout = lineLayout(line_numbers, .side_by_side);
     drawGutterLeadInBackground(surface, row, layout, selectedStyle(gutterLeadInStyle(line.kind, staged, styles), selected, styles));
     if (line_numbers) {
@@ -813,7 +815,7 @@ fn copyScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []cons
     try copyPlainClippedTextAt(surface, col, row, scrolled, style);
 }
 
-fn copyStyledScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, horizontal_scroll: usize, base_style: chasen.TextStyle, spans: syntax_provider.LineSpans, styles: RenderStyles) !void {
+fn copyStyledScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, horizontal_scroll: usize, base_style: chasen.TextStyle, spans: syntax_token.LineSpans, styles: RenderStyles) !void {
     try copyScrolledTextAt(surface, col, row, text, horizontal_scroll, base_style);
     if (spans.spans.len == 0) return;
     if (col >= surface.size().width) return;
@@ -835,46 +837,12 @@ fn copyStyledScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, text: 
     }
 }
 
-fn syntaxStyle(base: chasen.TextStyle, role: syntax_provider.TokenRole, styles: RenderStyles) chasen.TextStyle {
-    var style = base;
-    if (syntaxForegroundForRole(role, styles)) |fg| style.fg = fg;
-    return style;
+fn syntaxStyle(base: chasen.TextStyle, role: syntax_token.TokenRole, styles: RenderStyles) chasen.TextStyle {
+    return syntax_style.apply(base, role, styles.palette);
 }
 
-fn roleChangesForeground(role: syntax_provider.TokenRole) bool {
-    return syntaxForegroundRole(role) != null;
-}
-
-fn syntaxForegroundForRole(role: syntax_provider.TokenRole, styles: RenderStyles) ?chasen.Color {
-    return switch (syntaxForegroundRole(role) orelse return null) {
-        .accent => styles.palette.color(.accent),
-        .info => styles.palette.color(.info),
-        .prompt => styles.palette.color(.prompt),
-        .success => styles.palette.color(.success),
-        .warning => styles.palette.color(.warning),
-        .muted => styles.palette.color(.muted),
-    };
-}
-
-const SyntaxForegroundRole = enum {
-    accent,
-    info,
-    prompt,
-    success,
-    warning,
-    muted,
-};
-
-fn syntaxForegroundRole(role: syntax_provider.TokenRole) ?SyntaxForegroundRole {
-    return switch (role) {
-        .keyword, .operator => .accent,
-        .function, .property => .info,
-        .type, .constant => .prompt,
-        .string => .success,
-        .number => .warning,
-        .comment => .muted,
-        .variable, .punctuation, .plain => null,
-    };
+fn roleChangesForeground(role: syntax_token.TokenRole) bool {
+    return syntax_style.changesForeground(role);
 }
 
 // Scrollable diff body text should not draw an artificial ellipsis; users can
@@ -1272,8 +1240,8 @@ test "renderFile applies unified syntax spans without removing diff background" 
     const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
     var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
     defer spans.deinit(std.testing.allocator);
-    const old_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
-    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .string }});
+    const old_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
+    const new_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 3, .role = .string }});
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }, .{ .spans = old_spans });
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .new }, .{ .spans = new_spans });
 
@@ -1319,7 +1287,7 @@ test "renderFile hides unified diff prefix for highlighted hunk side and keeps f
     const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
     var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
     defer spans.deinit(std.testing.allocator);
-    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .string }});
+    const new_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 3, .role = .string }});
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 2, .side = .new }, .{ .spans = new_spans });
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .syntax_spans = spans });
@@ -1359,8 +1327,8 @@ test "renderFile normalizes highlighted unified body base foreground" {
     const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
     var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
     defer spans.deinit(std.testing.allocator);
-    const old_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
-    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
+    const old_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
+    const new_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .old }, .{ .spans = old_spans });
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 2, .side = .new }, .{ .spans = new_spans });
 
@@ -1423,8 +1391,8 @@ test "renderFile keeps unified diff prefix when spans do not change foreground" 
     const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
     var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
     defer spans.deinit(std.testing.allocator);
-    const plain_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 5, .role = .plain }});
-    const fallback_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{
+    const plain_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 5, .role = .plain }});
+    const fallback_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{
         .{ .start = 0, .end = 5, .role = .variable },
         .{ .start = 5, .end = 7, .role = .punctuation },
     });
@@ -1463,8 +1431,8 @@ test "renderFile applies side-by-side context syntax spans per side" {
     const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
     var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
     defer spans.deinit(std.testing.allocator);
-    const old_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 4, .role = .keyword }});
-    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 4, .role = .string }});
+    const old_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 4, .role = .keyword }});
+    const new_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 4, .role = .string }});
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }, .{ .spans = old_spans });
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .new }, .{ .spans = new_spans });
 
@@ -1499,8 +1467,8 @@ test "renderFile hides side-by-side diff prefixes by highlighted hunk side" {
     const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
     var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
     defer spans.deinit(std.testing.allocator);
-    const old_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
-    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .string }});
+    const old_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
+    const new_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 3, .role = .string }});
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }, .{ .spans = old_spans });
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .new }, .{ .spans = new_spans });
 
@@ -1580,8 +1548,8 @@ test "renderFile normalizes highlighted side-by-side body base foreground" {
     const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
     var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
     defer spans.deinit(std.testing.allocator);
-    const old_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
-    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
+    const old_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
+    const new_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 3, .role = .keyword }});
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }, .{ .spans = old_spans });
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .new }, .{ .spans = new_spans });
 
@@ -1618,7 +1586,7 @@ test "renderFile clips syntax spans through horizontal scroll without splitting 
     const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
     var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
     defer spans.deinit(std.testing.allocator);
-    const new_spans = try std.testing.allocator.dupe(syntax_provider.TokenSpan, &[_]syntax_provider.TokenSpan{.{ .start = 1, .end = 4, .role = .string }});
+    const new_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 1, .end = 4, .role = .string }});
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .new }, .{ .spans = new_spans });
 
     try renderFile(&ts.surface, file, .{

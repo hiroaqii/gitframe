@@ -1,42 +1,6 @@
 const std = @import("std");
 const diff_parser = @import("../diff/parser.zig");
-
-pub const TokenRole = enum {
-    keyword,
-    function,
-    type,
-    string,
-    number,
-    comment,
-    constant,
-    variable,
-    operator,
-    punctuation,
-    property,
-    plain,
-};
-
-/// Byte offsets are relative to the rendered diff line body (`DiffLine.text`),
-/// not to the full source file, line-number gutter, or diff prefix.
-pub const TokenSpan = struct {
-    start: usize,
-    end: usize,
-    role: TokenRole,
-
-    pub fn validForLine(self: TokenSpan, line: []const u8) bool {
-        return self.start <= self.end and
-            self.end <= line.len and
-            std.unicode.utf8ValidateSlice(line[self.start..self.end]);
-    }
-};
-
-pub const LineSpans = struct {
-    spans: []const TokenSpan = &.{},
-
-    pub fn empty() LineSpans {
-        return .{};
-    }
-};
+const token = @import("token.zig");
 
 pub const Side = enum {
     old,
@@ -51,10 +15,10 @@ pub const LineKey = struct {
 };
 
 pub const LineEntry = struct {
-    old: LineSpans = .empty(),
-    new: LineSpans = .empty(),
+    old: token.LineSpans = .empty(),
+    new: token.LineSpans = .empty(),
 
-    pub fn forSide(self: LineEntry, side: Side) LineSpans {
+    pub fn forSide(self: LineEntry, side: Side) token.LineSpans {
         return switch (side) {
             .old => self.old,
             .new => self.new,
@@ -92,7 +56,7 @@ pub const DocumentSpans = struct {
         self.* = .empty();
     }
 
-    pub fn lineSpans(self: DocumentSpans, key: LineKey) LineSpans {
+    pub fn lineSpans(self: DocumentSpans, key: LineKey) token.LineSpans {
         if (key.file_index >= self.files.len) return .empty();
         const file = self.files[key.file_index];
         if (key.hunk_index >= file.hunks.len) return .empty();
@@ -138,7 +102,7 @@ pub fn allocateEmptyForDocument(allocator: std.mem.Allocator, document: diff_par
     return allocateEmpty(allocator, .{ .files = files });
 }
 
-pub fn putLineSpans(document: *DocumentSpans, key: LineKey, spans: LineSpans) void {
+pub fn putLineSpans(document: *DocumentSpans, key: LineKey, spans: token.LineSpans) void {
     if (key.file_index >= document.files.len) return;
     const file = document.files[key.file_index];
     if (key.hunk_index >= file.hunks.len) return;
@@ -208,9 +172,9 @@ pub const ByteRange = struct {
 pub fn appendRangeSpans(
     allocator: std.mem.Allocator,
     line_maps: []const FragmentLine,
-    line_lists: []std.ArrayList(TokenSpan),
+    line_lists: []std.ArrayList(token.TokenSpan),
     range: ByteRange,
-    role: TokenRole,
+    role: token.TokenRole,
 ) !void {
     if (range.end <= range.start) return;
     for (line_maps, 0..) |line_map, index| {
@@ -227,52 +191,6 @@ pub fn appendRangeSpans(
     }
 }
 
-pub fn sanitizeLineSpans(allocator: std.mem.Allocator, line: []const u8, spans: []const TokenSpan) !LineSpans {
-    var valid: std.ArrayList(TokenSpan) = .empty;
-    for (spans) |span| {
-        if (span.validForLine(line)) try valid.append(allocator, span);
-    }
-    const owned = try valid.toOwnedSlice(allocator);
-    std.mem.sort(TokenSpan, owned, {}, compareSpan);
-    return .{ .spans = try removeOverlaps(allocator, owned) };
-}
-
-fn compareSpan(_: void, a: TokenSpan, b: TokenSpan) bool {
-    if (a.start != b.start) return a.start < b.start;
-    return a.end < b.end;
-}
-
-fn removeOverlaps(allocator: std.mem.Allocator, spans: []TokenSpan) ![]const TokenSpan {
-    defer allocator.free(spans);
-    var compact: std.ArrayList(TokenSpan) = .empty;
-    var last_end: usize = 0;
-    for (spans) |span| {
-        if (span.start < last_end) continue;
-        try compact.append(allocator, span);
-        last_end = span.end;
-    }
-    return compact.toOwnedSlice(allocator);
-}
-
-pub fn roleFromScope(scope: []const u8) TokenRole {
-    if (contains(scope, "comment")) return .comment;
-    if (contains(scope, "string")) return .string;
-    if (contains(scope, "number") or contains(scope, "float") or contains(scope, "integer")) return .number;
-    if (contains(scope, "keyword")) return .keyword;
-    if (contains(scope, "function") or contains(scope, "method")) return .function;
-    if (contains(scope, "type") or contains(scope, "class") or contains(scope, "struct") or contains(scope, "enum")) return .type;
-    if (contains(scope, "constant") or contains(scope, "boolean")) return .constant;
-    if (contains(scope, "variable") or contains(scope, "parameter")) return .variable;
-    if (contains(scope, "operator")) return .operator;
-    if (contains(scope, "punctuation") or contains(scope, "delimiter")) return .punctuation;
-    if (contains(scope, "property") or contains(scope, "field")) return .property;
-    return .plain;
-}
-
-fn contains(haystack: []const u8, needle: []const u8) bool {
-    return std.mem.indexOf(u8, haystack, needle) != null;
-}
-
 test "DocumentSpans uses parsed diff identity and side as lookup key" {
     const hunk_line_counts = [_]usize{1};
     const files = [_]FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
@@ -280,20 +198,13 @@ test "DocumentSpans uses parsed diff identity and side as lookup key" {
     var spans = try allocateEmpty(std.testing.allocator, .{ .files = &files });
     defer spans.deinit(std.testing.allocator);
 
-    const old_spans = try std.testing.allocator.dupe(TokenSpan, &[_]TokenSpan{.{ .start = 0, .end = 5, .role = .keyword }});
-    const new_spans = try std.testing.allocator.dupe(TokenSpan, &[_]TokenSpan{.{ .start = 6, .end = 11, .role = .variable }});
+    const old_spans = try std.testing.allocator.dupe(token.TokenSpan, &[_]token.TokenSpan{.{ .start = 0, .end = 5, .role = .keyword }});
+    const new_spans = try std.testing.allocator.dupe(token.TokenSpan, &[_]token.TokenSpan{.{ .start = 6, .end = 11, .role = .variable }});
     putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }, .{ .spans = old_spans });
     putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .new }, .{ .spans = new_spans });
 
-    try std.testing.expectEqual(TokenRole.keyword, spans.lineSpans(.{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }).spans[0].role);
-    try std.testing.expectEqual(TokenRole.variable, spans.lineSpans(.{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .new }).spans[0].role);
-}
-
-test "roleFromScope maps common tree-sitter capture names" {
-    try std.testing.expectEqual(TokenRole.keyword, roleFromScope("keyword.control"));
-    try std.testing.expectEqual(TokenRole.function, roleFromScope("function.method"));
-    try std.testing.expectEqual(TokenRole.comment, roleFromScope("comment.documentation"));
-    try std.testing.expectEqual(TokenRole.plain, roleFromScope("unknown.capture"));
+    try std.testing.expectEqual(token.TokenRole.keyword, spans.lineSpans(.{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }).spans[0].role);
+    try std.testing.expectEqual(token.TokenRole.variable, spans.lineSpans(.{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .new }).spans[0].role);
 }
 
 test "allocateEmptyForDocument allocates parsed diff shape" {
@@ -355,29 +266,13 @@ test "appendRangeSpans maps fragment byte ranges to line-local spans" {
         .{ .line_index = 0, .text = "abc", .start = 0, .end = 3 },
         .{ .line_index = 1, .text = "def", .start = 4, .end = 7 },
     };
-    var line_lists = [_]std.ArrayList(TokenSpan){ .empty, .empty };
+    var line_lists = [_]std.ArrayList(token.TokenSpan){ .empty, .empty };
     defer for (&line_lists) |*list| list.deinit(std.testing.allocator);
 
     try appendRangeSpans(std.testing.allocator, &line_maps, &line_lists, .{ .start = 2, .end = 6 }, .keyword);
 
     try std.testing.expectEqual(@as(usize, 1), line_lists[0].items.len);
-    try std.testing.expectEqual(TokenSpan{ .start = 2, .end = 3, .role = .keyword }, line_lists[0].items[0]);
+    try std.testing.expectEqual(token.TokenSpan{ .start = 2, .end = 3, .role = .keyword }, line_lists[0].items[0]);
     try std.testing.expectEqual(@as(usize, 1), line_lists[1].items.len);
-    try std.testing.expectEqual(TokenSpan{ .start = 0, .end = 2, .role = .keyword }, line_lists[1].items[0]);
-}
-
-test "sanitizeLineSpans drops invalid spans, sorts, and keeps first non-overlapping spans" {
-    const raw = [_]TokenSpan{
-        .{ .start = 1, .end = 4, .role = .string },
-        .{ .start = 0, .end = 1, .role = .keyword },
-        .{ .start = 2, .end = 3, .role = .number },
-        .{ .start = 0, .end = 100, .role = .comment },
-    };
-
-    const spans = try sanitizeLineSpans(std.testing.allocator, "aあb", &raw);
-    defer std.testing.allocator.free(spans.spans);
-
-    try std.testing.expectEqual(@as(usize, 2), spans.spans.len);
-    try std.testing.expectEqual(TokenSpan{ .start = 0, .end = 1, .role = .keyword }, spans.spans[0]);
-    try std.testing.expectEqual(TokenSpan{ .start = 1, .end = 4, .role = .string }, spans.spans[1]);
+    try std.testing.expectEqual(token.TokenSpan{ .start = 0, .end = 2, .role = .keyword }, line_lists[1].items[0]);
 }

@@ -11,6 +11,8 @@ const selected_document = @import("../../repository/document.zig");
 const source_document = @import("../../repository/source.zig");
 const manifest = @import("../../repository/manifest.zig");
 const repository_tree = @import("../../repository/tree.zig");
+const source_syntax = @import("../../syntax/source.zig");
+const source_syntax_runtime = @import("../../syntax/source_runtime.zig");
 const repository_input = @import("repository/input.zig");
 const repository_model = @import("repository/model.zig");
 const repository_navigation = @import("repository/navigation.zig");
@@ -60,11 +62,44 @@ pub const ManifestFinished = struct {
 pub const DisplayedDocument = struct {
     path: []u8,
     manifest_revision: u64,
+    source_revision: u64 = 0,
     value: DocumentValue,
+    syntax_spans: source_syntax.SourceSpans = .empty(),
 
     pub fn deinit(self: *DisplayedDocument, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         self.value.deinit(allocator);
+        self.syntax_spans.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const SyntaxResult = union(enum) {
+    loaded: source_syntax.SourceSpans,
+    unavailable,
+
+    pub fn deinit(self: *SyntaxResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .loaded => |*spans| spans.deinit(allocator),
+            .unavailable => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const SyntaxFinished = struct {
+    identity: page.RequestIdentity,
+    root_identity: root_capability.Identity,
+    generation: u64,
+    manifest_revision: u64,
+    source_revision: u64,
+    path: []u8,
+    fingerprint: content_fingerprint.Fingerprint,
+    result: SyntaxResult,
+
+    pub fn deinit(self: *SyntaxFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.result.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -119,6 +154,7 @@ pub const DocumentFinished = struct {
 pub const Msg = union(enum) {
     manifest_finished: ManifestFinished,
     document_finished: DocumentFinished,
+    syntax_finished: SyntaxFinished,
     move_up,
     move_down,
     toggle_directory,
@@ -165,6 +201,7 @@ pub const Msg = union(enum) {
         switch (self.*) {
             .manifest_finished => |*finished| finished.deinit(allocator),
             .document_finished => |*finished| finished.deinit(allocator),
+            .syntax_finished => |*finished| finished.deinit(allocator),
             else => {},
         }
         self.* = undefined;
@@ -279,6 +316,75 @@ pub fn DocumentTask(comptime AppMsg: type) type {
     };
 }
 
+pub fn SyntaxTask(comptime AppMsg: type) type {
+    return struct {
+        identity: page.RequestIdentity,
+        generation: u64,
+        manifest_revision: u64,
+        source_revision: u64,
+        expected_fingerprint: content_fingerprint.Fingerprint,
+        path: []u8,
+        root: root_capability.RootCapability,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+            defer task.root.deinit();
+            // Re-read through an independently owned root/path instead of
+            // borrowing DisplayedDocument across threads. The extra bounded
+            // read keeps plain-source acceptance immediate and avoids shared or
+            // refcounted mutable lifetime between page state and the worker.
+            var loaded = selected_document.load(task.root, task.path, allocator, io);
+            defer loaded.deinit(allocator);
+            var fingerprint = task.expected_fingerprint;
+            var result: SyntaxResult = .unavailable;
+            switch (loaded) {
+                .text => |text| {
+                    var document: ?source_document.Document = source_document.Document.initOwned(allocator, text.bytes, text.fingerprint) catch null;
+                    if (document) |*source| {
+                        loaded = .unreadable;
+                        defer source.deinit(allocator);
+                        fingerprint = source.fingerprint;
+                        const spans: ?source_syntax.SourceSpans = source_syntax_runtime.buildSourceSpans(allocator, io, source, task.path) catch null;
+                        if (spans) |owned| result = .{ .loaded = owned };
+                    }
+                },
+                else => {},
+            }
+            const finished = SyntaxFinished{
+                .identity = task.identity,
+                .root_identity = task.root.identity,
+                .generation = task.generation,
+                .manifest_revision = task.manifest_revision,
+                .source_revision = task.source_revision,
+                .path = task.path,
+                .fingerprint = fingerprint,
+                .result = result,
+            };
+            task.path = &.{};
+            return .{ .repository = .{ .syntax_finished = finished } };
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+            defer task.root.deinit();
+            const finished = SyntaxFinished{
+                .identity = task.identity,
+                .root_identity = task.root.identity,
+                .generation = task.generation,
+                .manifest_revision = task.manifest_revision,
+                .source_revision = task.source_revision,
+                .path = task.path,
+                .fingerprint = task.expected_fingerprint,
+                .result = .unavailable,
+            };
+            task.path = &.{};
+            return .{ .repository = .{ .syntax_finished = finished } };
+        }
+    };
+}
+
 pub fn runManifestLoad(
     cwd: std.Io.Dir,
     expected_fingerprint: ?content_fingerprint.Fingerprint,
@@ -342,6 +448,22 @@ pub const DocumentRequest = struct {
     }
 };
 
+pub const SyntaxRequest = struct {
+    identity: page.RequestIdentity,
+    generation: u64,
+    manifest_revision: u64,
+    source_revision: u64,
+    expected_fingerprint: content_fingerprint.Fingerprint,
+    path: []u8,
+    root: root_capability.RootCapability,
+
+    pub fn deinit(self: *SyntaxRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.root.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const ApplyOutcome = enum { discarded, unchanged, changed, failed };
 
 pub const MouseButton = enum { left, wheel_up, wheel_down };
@@ -379,6 +501,10 @@ pub const RepositoryPageState = struct {
     manifest_revision: u64 = 0,
     document_generation: u64 = 0,
     pending_document_generation: ?u64 = null,
+    source_revision: u64 = 0,
+    syntax_generation: u64 = 0,
+    pending_syntax_generation: ?u64 = null,
+    needs_syntax_request: bool = false,
     needs_revalidation: bool = false,
     needs_document_revalidation: bool = false,
     freshness: enum { unavailable, validating, fresh, failed } = .unavailable,
@@ -405,6 +531,8 @@ pub const RepositoryPageState = struct {
         if (self.repo_epoch != repo_epoch) self.repo_epoch = repo_epoch;
         self.root_identity = identity;
         self.pending_document_generation = null;
+        self.pending_syntax_generation = null;
+        self.needs_syntax_request = false;
         self.needs_document_revalidation = false;
         if (identity == null) {
             self.needs_revalidation = false;
@@ -444,6 +572,7 @@ pub const RepositoryPageState = struct {
         self.file_search.close();
         self.pending_generation = null;
         self.pending_document_generation = null;
+        self.pending_syntax_generation = null;
         self.repo_epoch = repo_epoch;
         self.root_identity = identity;
         self.status.clear();
@@ -451,6 +580,7 @@ pub const RepositoryPageState = struct {
         self.freshness = if (identity != null) .validating else .unavailable;
         self.needs_revalidation = self.active and identity != null;
         self.needs_document_revalidation = false;
+        self.needs_syntax_request = false;
     }
 
     pub fn prepareRequest(
@@ -467,7 +597,9 @@ pub const RepositoryPageState = struct {
         if (self.generation == 0) self.generation = 1;
         self.pending_generation = self.generation;
         self.pending_document_generation = null;
+        self.pending_syntax_generation = null;
         self.needs_document_revalidation = false;
+        self.needs_syntax_request = false;
         self.needs_revalidation = false;
         self.freshness = .validating;
         if (self.bundle != null) self.status.set("Validating repository...", .{});
@@ -505,6 +637,36 @@ pub const RepositoryPageState = struct {
         };
     }
 
+    pub fn prepareSyntaxRequest(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        capability: *const root_capability.RootCapability,
+    ) !SyntaxRequest {
+        if (!source_syntax_runtime.enabled) return error.SyntaxProviderDisabled;
+        const displayed = self.displayed_document orelse return error.NoDisplayedSource;
+        const source = switch (displayed.value) {
+            .source => |source| source,
+            .inert => return error.NoDisplayedSource,
+        };
+        const path = try allocator.dupe(u8, displayed.path);
+        errdefer allocator.free(path);
+        var root = try capability.duplicate();
+        errdefer root.deinit();
+        self.syntax_generation +%= 1;
+        if (self.syntax_generation == 0) self.syntax_generation = 1;
+        self.pending_syntax_generation = self.syntax_generation;
+        self.needs_syntax_request = false;
+        return .{
+            .identity = .{ .origin = .repository, .repo_epoch = self.repo_epoch, .activation_id = self.activation_id },
+            .generation = self.syntax_generation,
+            .manifest_revision = displayed.manifest_revision,
+            .source_revision = displayed.source_revision,
+            .expected_fingerprint = source.fingerprint,
+            .path = path,
+            .root = root,
+        };
+    }
+
     pub fn rejectSpawn(self: *RepositoryPageState, generation: u64) void {
         if (self.pending_generation == generation) self.pending_generation = null;
         self.freshness = .failed;
@@ -517,9 +679,20 @@ pub const RepositoryPageState = struct {
         self.status.set("Could not start selected file task", .{});
     }
 
+    pub fn rejectSyntaxSpawn(self: *RepositoryPageState, generation: u64) void {
+        if (self.pending_syntax_generation != generation) return;
+        self.pending_syntax_generation = null;
+        // Task-start failure is transient and occurs before a provider verdict.
+        // Preserve intent for a later event; maybeStart... is called only once
+        // per update, so this does not create an immediate retry loop.
+        self.needs_syntax_request = source_syntax_runtime.enabled and self.currentSource() != null;
+    }
+
     pub fn requestReload(self: *RepositoryPageState, has_repository: bool) void {
         self.pending_document_generation = null;
+        self.pending_syntax_generation = null;
         self.needs_document_revalidation = false;
+        self.needs_syntax_request = false;
         if (!has_repository) {
             self.needs_revalidation = false;
             self.freshness = .unavailable;
@@ -540,6 +713,13 @@ pub const RepositoryPageState = struct {
             self.selected_path != null and self.root_identity != null;
     }
 
+    pub fn wantsSyntaxRequest(self: *const RepositoryPageState) bool {
+        return source_syntax_runtime.enabled and self.active and self.needs_syntax_request and
+            self.pending_generation == null and self.pending_document_generation == null and
+            self.pending_syntax_generation == null and self.displayed_document != null and
+            self.root_identity != null;
+    }
+
     pub fn markRequestPreparationFailed(self: *RepositoryPageState, err: anyerror) void {
         self.freshness = .failed;
         if (self.bundle == null) self.load_state = .failed;
@@ -548,6 +728,14 @@ pub const RepositoryPageState = struct {
 
     pub fn markDocumentRequestPreparationFailed(self: *RepositoryPageState, err: anyerror) void {
         self.status.set("Could not prepare selected file: {s}", .{@errorName(err)});
+    }
+
+    pub fn markSyntaxRequestPreparationFailed(self: *RepositoryPageState) void {
+        self.pending_syntax_generation = null;
+        // Preparation failure has the same retry semantics as spawn failure.
+        // Parser/query/metadata failure is different: its delivered completion
+        // consumes intent and deliberately leaves the plain source terminal.
+        self.needs_syntax_request = source_syntax_runtime.enabled and self.currentSource() != null;
     }
 
     pub fn repositoryCommitFailed(self: *RepositoryPageState) void {
@@ -590,6 +778,8 @@ pub const RepositoryPageState = struct {
                 self.manifest_revision +%= 1;
                 if (self.manifest_revision == 0) self.manifest_revision = 1;
                 self.pending_document_generation = null;
+                self.pending_syntax_generation = null;
+                self.needs_syntax_request = false;
                 self.needs_document_revalidation = self.selected_path != null;
                 if (self.displayed_document) |*document| document.deinit(allocator);
                 self.displayed_document = null;
@@ -623,10 +813,14 @@ pub const RepositoryPageState = struct {
         const selected = self.selected_path orelse return .discarded;
         if (!std.mem.eql(u8, selected, finished.path)) return .discarded;
 
+        self.pending_syntax_generation = null;
+        self.source_revision +%= 1;
+        if (self.source_revision == 0) self.source_revision = 1;
         if (self.displayed_document) |*previous| previous.deinit(allocator);
         self.displayed_document = .{
             .path = finished.path,
             .manifest_revision = finished.manifest_revision,
+            .source_revision = self.source_revision,
             .value = finished.value,
         };
         finished.path = &.{};
@@ -634,8 +828,42 @@ pub const RepositoryPageState = struct {
         self.viewer.resetSource();
         if (self.currentSource() == null) self.viewer.focus = .tree;
         self.source_search.clear();
+        self.needs_syntax_request = source_syntax_runtime.enabled and self.currentSource() != null;
         self.status.clear();
         return .changed;
+    }
+
+    pub fn applySyntaxFinished(self: *RepositoryPageState, allocator: std.mem.Allocator, finished: *SyntaxFinished) ApplyOutcome {
+        if (finished.identity.origin != .repository or
+            finished.identity.repo_epoch != self.repo_epoch or
+            finished.identity.activation_id != self.activation_id or
+            finished.generation != self.syntax_generation or
+            self.pending_syntax_generation != finished.generation or
+            finished.manifest_revision != self.manifest_revision)
+        {
+            return .discarded;
+        }
+        self.pending_syntax_generation = null;
+        const expected_root = self.root_identity orelse return .discarded;
+        if (!expected_root.eql(finished.root_identity)) return .discarded;
+        const displayed = if (self.displayed_document) |*document| document else return .discarded;
+        if (displayed.source_revision != finished.source_revision or
+            displayed.manifest_revision != finished.manifest_revision or
+            !std.mem.eql(u8, displayed.path, finished.path)) return .discarded;
+        const source = switch (displayed.value) {
+            .source => |*source| source,
+            .inert => return .discarded,
+        };
+        if (!source.fingerprint.eql(finished.fingerprint)) return .discarded;
+        switch (finished.result) {
+            .loaded => |spans| {
+                displayed.syntax_spans.deinit(allocator);
+                displayed.syntax_spans = spans;
+                finished.result = .unavailable;
+                return .changed;
+            },
+            .unavailable => return .unchanged,
+        }
     }
 
     fn replaceBundle(self: *RepositoryPageState, allocator: std.mem.Allocator, incoming: *Bundle) !void {
@@ -800,10 +1028,12 @@ pub const RepositoryPageState = struct {
                 };
                 if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree);
             },
-            .manifest_finished, .document_finished => unreachable,
+            .manifest_finished, .document_finished, .syntax_finished => unreachable,
         }
         if (optionalPathEql(previous, self.selected_path)) return false;
         self.pending_document_generation = null;
+        self.pending_syntax_generation = null;
+        self.needs_syntax_request = false;
         self.needs_document_revalidation = self.selected_path != null;
         if (self.displayed_document) |*document| document.deinit(allocator);
         self.displayed_document = null;
@@ -1014,7 +1244,7 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             state.viewer.tree_horizontal_scroll,
             left_width -| 1,
         );
-        const style = if (visible_index == state.viewer.tree_cursor) context.palette.boldStyle(.prompt) else if (node.kind == .directory) context.palette.boldStyle(.accent) else context.palette.style(.muted);
+        const style = if (visible_index == state.viewer.tree_cursor) context.palette.boldStyle(.prompt) else if (node.kind == .directory) context.palette.boldStyle(.accent) else context.palette.style(.foreground);
         draw.copyClippedTextAt(&left, 1, @intCast(body_row + 1), visible_text, style) catch {};
     }
 
@@ -1049,7 +1279,7 @@ fn drawDocumentCheckpoint(
     }
     switch (displayed.value) {
         .source => |*source| {
-            try repository_view.drawSource(surface, source, state.viewer, state.source_search, palette);
+            try repository_view.drawSource(surface, source, &displayed.syntax_spans, state.viewer, state.source_search, palette);
             return;
         },
         .inert => |inert| drawInertCheckpoint(inert, surface, palette),
@@ -1266,6 +1496,125 @@ test "repository document task builds the bounded source model before delivery" 
     }
 }
 
+test "repository syntax task is plain-first and accepts only matching source identity" {
+    if (!source_syntax_runtime.enabled) return error.SkipZigTest;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    const source_bytes = "const value: usize = 42;\n";
+    try root.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = source_bytes });
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .active = true,
+        .repo_epoch = 3,
+        .activation_id = 4,
+        .root_identity = root.capability.identity,
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .needs_syntax_request = true,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    const owned = try allocator.dupe(u8, source_bytes);
+    state.displayed_document = .{
+        .path = try allocator.dupe(u8, "main.zig"),
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .value = .{ .source = try source_document.Document.initOwned(allocator, owned, .init(owned)) },
+    };
+    try std.testing.expectEqual(@as(usize, 0), state.displayed_document.?.syntax_spans.spans.len);
+
+    var request = try state.prepareSyntaxRequest(allocator, &root.capability);
+    defer request.deinit(allocator);
+    const Syntax = SyntaxTask(TaskIdentityTestMsg);
+    const task = try allocator.create(Syntax);
+    task.* = .{
+        .identity = request.identity,
+        .generation = request.generation,
+        .manifest_revision = request.manifest_revision,
+        .source_revision = request.source_revision,
+        .expected_fingerprint = request.expected_fingerprint,
+        .path = try allocator.dupe(u8, request.path),
+        .root = try request.root.duplicate(),
+    };
+    var message = Syntax.run(task, allocator, std.testing.io);
+    defer message.repository.deinitUndelivered(allocator);
+    switch (message.repository) {
+        .syntax_finished => |*finished| {
+            try std.testing.expectEqual(ApplyOutcome.changed, state.applySyntaxFinished(allocator, finished));
+            try std.testing.expect(state.pending_syntax_generation == null);
+        },
+        else => return error.ExpectedSyntaxCompletion,
+    }
+
+    var stale = SyntaxFinished{
+        .identity = request.identity,
+        .root_identity = request.root.identity,
+        .generation = request.generation,
+        .manifest_revision = request.manifest_revision,
+        .source_revision = request.source_revision,
+        .path = try allocator.dupe(u8, request.path),
+        .fingerprint = .init("different"),
+        .result = .{ .loaded = .empty() },
+    };
+    defer stale.deinit(allocator);
+
+    stale.identity.repo_epoch += 1;
+    state.pending_syntax_generation = request.generation;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applySyntaxFinished(allocator, &stale));
+    stale.identity = request.identity;
+
+    stale.identity.activation_id += 1;
+    state.pending_syntax_generation = request.generation;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applySyntaxFinished(allocator, &stale));
+    stale.identity = request.identity;
+
+    stale.manifest_revision += 1;
+    state.pending_syntax_generation = request.generation;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applySyntaxFinished(allocator, &stale));
+    stale.manifest_revision = request.manifest_revision;
+
+    stale.source_revision += 1;
+    state.pending_syntax_generation = request.generation;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applySyntaxFinished(allocator, &stale));
+    stale.source_revision = request.source_revision;
+
+    allocator.free(stale.path);
+    stale.path = try allocator.dupe(u8, "other.zig");
+    state.pending_syntax_generation = request.generation;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applySyntaxFinished(allocator, &stale));
+    allocator.free(stale.path);
+    stale.path = try allocator.dupe(u8, request.path);
+
+    var other_root = try TestRoot.init();
+    defer other_root.deinit();
+    stale.root_identity = other_root.capability.identity;
+    state.pending_syntax_generation = request.generation;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applySyntaxFinished(allocator, &stale));
+    stale.root_identity = request.root.identity;
+
+    state.pending_syntax_generation = request.generation;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applySyntaxFinished(allocator, &stale));
+
+    var candidates = [_]source_syntax.Candidate{.{
+        .line_index = 0,
+        .span = .{ .start = 0, .end = 5, .role = .keyword },
+    }};
+    const undelivered_spans = try source_syntax.build(allocator, state.currentSource().?, &candidates);
+    var undelivered = Msg{ .syntax_finished = .{
+        .identity = request.identity,
+        .root_identity = request.root.identity,
+        .generation = request.generation,
+        .manifest_revision = request.manifest_revision,
+        .source_revision = request.source_revision,
+        .path = try allocator.dupe(u8, request.path),
+        .fingerprint = request.expected_fingerprint,
+        .result = .{ .loaded = undelivered_spans },
+    } };
+    undelivered.deinitUndelivered(allocator);
+}
+
 test "repository page accepts active and inactive matching manifest completions" {
     var root = try TestRoot.init();
     defer root.deinit();
@@ -1413,6 +1762,14 @@ test "repository page accepts selected document and renders plain source" {
     try std.testing.expectEqual(@as(usize, 0), state.source_search.query.len);
     try std.testing.expect(!state.source_search.mode);
     try std.testing.expect(state.source_search.match == null);
+    try std.testing.expectEqual(source_syntax_runtime.enabled, state.needs_syntax_request);
+    try std.testing.expectEqual(source_syntax_runtime.enabled, state.wantsSyntaxRequest());
+    if (!source_syntax_runtime.enabled) {
+        try std.testing.expectError(
+            error.SyntaxProviderDisabled,
+            state.prepareSyntaxRequest(std.testing.allocator, &root.capability),
+        );
+    }
 
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(60, 10);
@@ -1421,6 +1778,69 @@ test "repository page accepts selected document and renders plain source" {
     const snapshot = try test_surface.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "const value = 1;") != null);
+}
+
+test "repository syntax start failures preserve retryable source intent" {
+    if (!source_syntax_runtime.enabled) return error.SkipZigTest;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "const value = 1;\n");
+    var state: RepositoryPageState = .{
+        .active = true,
+        .repo_epoch = 3,
+        .activation_id = 4,
+        .root_identity = root.capability.identity,
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .needs_syntax_request = true,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    state.displayed_document = .{
+        .path = try allocator.dupe(u8, "main.zig"),
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .value = .{ .source = try source_document.Document.initOwned(allocator, bytes, .init(bytes)) },
+    };
+
+    var path_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, state.prepareSyntaxRequest(path_failing.allocator(), &root.capability));
+    state.markSyntaxRequestPreparationFailed();
+    try std.testing.expect(state.wantsSyntaxRequest());
+
+    var invalid_root = root_capability.RootCapability{
+        .handle = -1,
+        .identity = root.capability.identity,
+    };
+    try std.testing.expectError(error.InvalidRootCapability, state.prepareSyntaxRequest(allocator, &invalid_root));
+    state.markSyntaxRequestPreparationFailed();
+    try std.testing.expect(state.wantsSyntaxRequest());
+
+    // Both task allocation failure and runtime spawn rejection terminate through
+    // rejectSyntaxSpawn; the still-owned request is released by its caller.
+    var allocation_request = try state.prepareSyntaxRequest(allocator, &root.capability);
+    defer allocation_request.deinit(allocator);
+    state.rejectSyntaxSpawn(allocation_request.generation);
+    try std.testing.expect(state.wantsSyntaxRequest());
+
+    var retry = try state.prepareSyntaxRequest(allocator, &root.capability);
+    defer retry.deinit(allocator);
+    var finished = SyntaxFinished{
+        .identity = retry.identity,
+        .root_identity = retry.root.identity,
+        .generation = retry.generation,
+        .manifest_revision = retry.manifest_revision,
+        .source_revision = retry.source_revision,
+        .path = try allocator.dupe(u8, retry.path),
+        .fingerprint = retry.expected_fingerprint,
+        .result = .{ .loaded = .empty() },
+    };
+    defer finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applySyntaxFinished(allocator, &finished));
+    try std.testing.expect(!state.wantsSyntaxRequest());
 }
 
 test "repository page owns source focus navigation search and mouse geometry" {
@@ -1573,6 +1993,8 @@ test "repository page renders tree and selected-document loading checkpoint" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository files") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "README.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading selected file") != null);
+    const non_selected_file = test_surface.surface.readCell(7, 3) orelse return error.ExpectedFileCell;
+    try std.testing.expectEqual(theme.Palette.default().color(.foreground), non_selected_file.style.fg);
 }
 
 test "repository page layout and mouse mapping share tree geometry" {

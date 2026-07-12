@@ -2,6 +2,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 
 pub const Role = enum {
+    foreground,
     accent,
     muted,
     prompt,
@@ -93,6 +94,7 @@ pub const Palette = struct {
         var palette = Palette{
             .colors = undefined,
         };
+        palette.set(.foreground, .default);
         palette.set(.accent, .{ .index = 14 });
         palette.set(.muted, .gray);
         palette.set(.prompt, .{ .index = 11 });
@@ -245,6 +247,7 @@ test "parseColorValue rejects invalid values" {
 }
 
 test "roleFromKey maps known theme keys" {
+    try std.testing.expectEqual(Role.foreground, roleFromKey("foreground").?);
     try std.testing.expectEqual(Role.accent, roleFromKey("accent").?);
     try std.testing.expectEqual(Role.diff_added, roleFromKey("diff_added").?);
     try std.testing.expectEqual(Role.diff_added_bg, roleFromKey("diff_added_bg").?);

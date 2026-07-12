@@ -245,6 +245,7 @@ pub fn renderRangeWindowAlloc(
     var output_width: usize = 0;
     var iter = chasen.text.graphemeIterator(line);
     while (iter.next()) |grapheme| {
+        if (grapheme.start >= clamped_end or logical_col >= viewport_end) break;
         const bytes = grapheme.bytes(line);
         const cells = if (bytes.len == 1 and bytes[0] == '\t')
             tab_width - (logical_col % tab_width)
@@ -253,8 +254,8 @@ pub fn renderRangeWindowAlloc(
         const segment_end = logical_col + cells;
         defer logical_col = segment_end;
         const grapheme_end = grapheme.start + grapheme.len;
-        if (grapheme_end <= byte_start or grapheme.start >= clamped_end) continue;
-        if (segment_end <= horizontal_scroll or logical_col >= viewport_end) continue;
+        if (grapheme_end <= byte_start) continue;
+        if (segment_end <= horizontal_scroll) continue;
 
         const visible_start = @max(logical_col, horizontal_scroll);
         const visible_end = @min(segment_end, viewport_end);

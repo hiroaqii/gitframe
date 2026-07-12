@@ -2,6 +2,7 @@ const std = @import("std");
 const diff_parser = @import("../diff/parser.zig");
 const flow_syntax = @import("flow_syntax");
 const provider = @import("provider.zig");
+const token = @import("token.zig");
 
 // `tools/projection_perf.zig` mirrors this hunk-side pipeline for stage-level
 // measurements. Keep that developer-only mirror in sync when this work order changes.
@@ -62,7 +63,7 @@ fn highlightHunkSide(
     defer syntax.destroy();
     try syntax.refresh_full(fragment.text);
 
-    const line_lists = try allocator.alloc(std.ArrayList(provider.TokenSpan), fragment.lines.len);
+    const line_lists = try allocator.alloc(std.ArrayList(token.TokenSpan), fragment.lines.len);
     defer allocator.free(line_lists);
     for (line_lists) |*list| list.* = .empty;
     defer for (line_lists) |*list| list.deinit(allocator);
@@ -78,7 +79,7 @@ fn highlightHunkSide(
     };
 
     for (fragment.lines, 0..) |line_map, index| {
-        const line_spans = try provider.sanitizeLineSpans(allocator, line_map.text, line_lists[index].items);
+        const line_spans = try token.sanitizeLineSpans(allocator, line_map.text, line_lists[index].items);
         provider.putLineSpans(document_spans, .{
             .file_index = key.file_index,
             .hunk_index = key.hunk_index,
@@ -98,7 +99,7 @@ fn filePathForSide(file: diff_parser.FileDiff, side: provider.Side) ?[]const u8 
 const RenderContext = struct {
     allocator: std.mem.Allocator,
     line_maps: []const provider.FragmentLine,
-    line_lists: []std.ArrayList(provider.TokenSpan),
+    line_lists: []std.ArrayList(token.TokenSpan),
     allocation_failed: bool = false,
 
     fn capture(
@@ -112,7 +113,7 @@ const RenderContext = struct {
         // Capture groups often include nested scopes. Keep the outermost range
         // for now so overlapping captures do not churn colors within one token.
         if (capture_index != 0) return;
-        const role = provider.roleFromScope(scope);
+        const role = token.roleFromScope(scope);
         provider.appendRangeSpans(self.allocator, self.line_maps, self.line_lists, .{
             .start = @intCast(range.start_byte),
             .end = @intCast(range.end_byte),
