@@ -323,11 +323,11 @@ pub const Controller = struct {
         self.page.pending_initial_first_visible_selection = false;
     }
 
-    pub fn dropStatusSnapshot(self: Controller) void {
+    pub fn dropStatusSnapshot(self: Controller, allocator: ?std.mem.Allocator) void {
         _ = self.page.status_load.prepare(false);
         self.page.pending_initial_first_visible_selection = false;
         if (self.page.git_status.repo_root != null or self.page.git_status.document.entries.len != 0) {
-            self.advanceStatusSnapshotRevision();
+            self.advanceStatusSnapshotRevision(allocator);
         }
         self.page.git_status.clear();
     }
@@ -541,10 +541,10 @@ pub const Controller = struct {
             if (std.mem.eql(u8, current_root, repo_root)) {
                 self.invalidateStatusSnapshot();
             } else {
-                self.dropStatusSnapshot();
+                self.dropStatusSnapshot(allocator);
             }
         } else {
-            self.dropStatusSnapshot();
+            self.dropStatusSnapshot(allocator);
         }
         errdefer self.navigation.clearPendingSelectionRestore(allocator);
         const owned_root = try allocator.dupe(u8, repo_root);
@@ -623,12 +623,23 @@ pub const Controller = struct {
             const allocator = allocator_opt orelse {
                 if (!self.page.review_projection.hasPending() and
                     !self.page.review_projection.hasDisplayed() and
+                    self.page.review_projection.cacheLen() == 0 and
                     self.page.pending_display_navigation_restore == null) return .{};
                 return error.MissingAllocator;
             };
             if (self.page.pending_display_navigation_restore != null) self.clearDisplayRestore(allocator);
-            if (self.page.review_projection.hasPending() or self.page.review_projection.hasDisplayed()) {
-                self.page.review_projection.deinit(allocator);
+            self.page.review_projection.clearPending(allocator);
+            if (self.repo_root) |repo_root| {
+                self.page.review_projection.cacheOrClearDisplayed(
+                    allocator,
+                    repo_root,
+                    sourceKind(self.source),
+                    self.page.source_session_revision,
+                    self.page.status_snapshot_revision,
+                );
+            } else {
+                self.page.review_projection.clearDisplayed(allocator);
+                self.page.review_projection.clearCache(allocator);
             }
             return .{};
         };
@@ -646,6 +657,45 @@ pub const Controller = struct {
             self.page.source_session_revision,
             self.page.status_snapshot_revision,
         )) return .{};
+
+        if (self.page.review_projection.cacheHas(
+            target.repo_root,
+            target.path_key,
+            target.kind,
+            target.source_kind,
+            self.page.source_session_revision,
+            self.page.status_snapshot_revision,
+        )) {
+            var local_navigation = if (self.page.pending_display_navigation_restore == null)
+                try self.view().captureAnchor(allocator)
+            else
+                null;
+            defer if (local_navigation) |*anchor| anchor.deinit(allocator);
+
+            var hit = self.page.review_projection.takeCached(
+                target.repo_root,
+                target.path_key,
+                target.kind,
+                target.source_kind,
+                self.page.source_session_revision,
+                self.page.status_snapshot_revision,
+            ) orelse unreachable;
+            var hit_owned = true;
+            defer if (hit_owned) hit.deinit(allocator);
+
+            self.page.review_projection.clearPending(allocator);
+            self.page.review_projection.cacheOrClearDisplayed(
+                allocator,
+                target.repo_root,
+                target.source_kind,
+                self.page.source_session_revision,
+                self.page.status_snapshot_revision,
+            );
+            self.page.review_projection.installReady(hit);
+            hit_owned = false;
+            self.reconcileInstalledProjectionNavigation(allocator, if (local_navigation) |*anchor| anchor else null);
+            return .{};
+        }
         if (self.page.review_projection.pendingMatches(
             target.repo_root,
             target.path_key,
@@ -657,7 +707,13 @@ pub const Controller = struct {
 
         self.page.review_projection.clearPending(allocator);
         if (!self.view().displayedMatchesStableIdentity(target)) {
-            self.page.review_projection.clearDisplayed(allocator);
+            self.page.review_projection.cacheOrClearDisplayed(
+                allocator,
+                target.repo_root,
+                target.source_kind,
+                self.page.source_session_revision,
+                self.page.status_snapshot_revision,
+            );
         }
         self.page.review_projection_next_id +%= 1;
         const request_id = self.page.review_projection_next_id;
@@ -700,6 +756,21 @@ pub const Controller = struct {
     pub fn rejectProjectionSpawn(self: Controller, allocator: std.mem.Allocator, request_id: u64) void {
         const pending_id = if (self.page.review_projection.pending) |request| request.id else return;
         if (pending_id == request_id) self.page.review_projection.clearPending(allocator);
+    }
+
+    fn reconcileInstalledProjectionNavigation(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        local_navigation: ?*const review_page.ReloadAnchor,
+    ) void {
+        if (self.page.pending_display_navigation_restore) |*restore| {
+            self.restoreDisplayedNavigation(restore.authoritative());
+            self.clearDisplayRestore(allocator);
+        } else if (local_navigation) |anchor| {
+            self.restoreDisplayedNavigation(anchor);
+        } else {
+            self.navigation.refreshSearchForSelectedFile();
+        }
     }
 
     /// Accepts the Review-owned half of repository discovery and returns the
@@ -772,7 +843,7 @@ pub const Controller = struct {
                     std.mem.eql(u8, root, result.repo_root)
                 else
                     false;
-                if (!same_root or self.page.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision();
+                if (!same_root or self.page.git_status.document.entries.len != 0) self.advanceStatusSnapshotRevision(allocator);
                 self.page.status_load.markSuccess();
                 _ = self.page.activation.finishMember(result.identity, .status, .fresh);
                 self.page.git_status.clear();
@@ -800,7 +871,7 @@ pub const Controller = struct {
                     .replace_changed,
                     => {},
                 }
-                self.advanceStatusSnapshotRevision();
+                self.advanceStatusSnapshotRevision(allocator);
                 try self.page.git_status.replace(result.repo_root, bundle);
                 self.page.status_load.markSuccess();
                 _ = self.page.activation.finishMember(result.identity, .status, .fresh);
@@ -820,7 +891,7 @@ pub const Controller = struct {
         _ = self.page.activation.finishMember(identity, .status, .failed);
         if (!retain) {
             if (self.page.git_status.repo_root != null or self.page.git_status.document.entries.len != 0) {
-                self.advanceStatusSnapshotRevision();
+                self.advanceStatusSnapshotRevision(allocator);
             }
             self.page.git_status.clear();
         }
@@ -914,21 +985,20 @@ pub const Controller = struct {
         defer if (local_navigation) |*anchor| anchor.deinit(allocator);
 
         self.page.review_projection.clearPending(allocator);
-        self.page.review_projection.clearDisplayed(allocator);
+        self.page.review_projection.cacheOrClearDisplayed(
+            allocator,
+            current.repo_root,
+            current.source_kind,
+            self.page.source_session_revision,
+            self.page.status_snapshot_revision,
+        );
         switch (result.result) {
             .ready => |ready| {
-                self.page.review_projection.displayed = .{ .ready = .{
+                self.page.review_projection.installReady(.{
                     .request = result.request,
                     .value = ready,
-                } };
-                if (self.page.pending_display_navigation_restore) |*restore| {
-                    self.restoreDisplayedNavigation(restore.authoritative());
-                    self.clearDisplayRestore(allocator);
-                } else if (local_navigation) |*anchor| {
-                    self.restoreDisplayedNavigation(anchor);
-                } else {
-                    self.navigation.refreshSearchForSelectedFile();
-                }
+                });
+                self.reconcileInstalledProjectionNavigation(allocator, if (local_navigation) |*anchor| anchor else null);
                 return .{ .result_transferred = true };
             },
             .failed => |body| {
@@ -1161,11 +1231,24 @@ pub const Controller = struct {
         self.navigation.clampDiffHorizontalScrollToVisibleRows();
     }
 
-    pub fn advanceSourceSessionRevision(self: Controller) void {
+    pub fn advanceSourceSessionRevision(self: Controller, allocator: ?std.mem.Allocator) void {
+        if (allocator) |owner| {
+            self.page.review_projection.clearCache(owner);
+        } else {
+            std.debug.assert(self.page.review_projection.cacheLen() == 0);
+        }
         self.page.source_session_revision +%= 1;
     }
 
-    pub fn advanceStatusSnapshotRevision(self: Controller) void {
+    /// Projection cache validity relies on StatusDocument.eql comparing both
+    /// staged and unstaged line statistics. A line-stat-only change must advance
+    /// this revision and invalidate every retained projection.
+    pub fn advanceStatusSnapshotRevision(self: Controller, allocator: ?std.mem.Allocator) void {
+        if (allocator) |owner| {
+            self.page.review_projection.clearCache(owner);
+        } else {
+            std.debug.assert(self.page.review_projection.cacheLen() == 0);
+        }
         self.page.status_snapshot_revision +%= 1;
     }
 
@@ -1177,7 +1260,8 @@ pub const Controller = struct {
     /// not revoke accepted source authority; callers choose the destructive or
     /// replacement transition below explicitly.
     pub fn clearLoadedDiff(self: Controller, allocator: ?std.mem.Allocator) void {
-        self.advanceSourceSessionRevision();
+        if (allocator == null) std.debug.assert(self.page.review_projection.isEmpty());
+        self.advanceSourceSessionRevision(allocator);
         self.navigation.clearDiffSelection();
         self.page.load.clearCurrent(allocator);
         if (allocator) |owned_allocator| {
@@ -1299,7 +1383,7 @@ pub const Controller = struct {
         };
         try loaded.rebuildVisibleNodes(arena_allocator, false, self.page.review_display.changed_file_filter);
 
-        self.advanceSourceSessionRevision();
+        self.advanceSourceSessionRevision(allocator);
         if (self.page.pending_display_navigation_restore) |*restore| {
             restore.source_session_revision = self.page.source_session_revision;
         }
@@ -1678,6 +1762,315 @@ test "repository discovery preparation owns Review load state" {
         load_state.PendingLoad{ .repo_discovery = command.repo_discovery.generation },
         page.load.pending.?,
     );
+}
+
+test "projection cache revisits A after B without a third read command" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00?? b\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    var first = try controller.prepareProjection(allocator);
+    defer first.deinit(allocator);
+    const a_lines = try finishGeneratedProjection(controller, allocator, &first, "a");
+
+    page.viewer.selected_target = .{ .status_only = 1 };
+    var second = try controller.prepareProjection(allocator);
+    defer second.deinit(allocator);
+    try std.testing.expect(page.review_projection.cacheHas("/repo", "a", .generated_added_file, .unstaged, 0, 0));
+    _ = try finishGeneratedProjection(controller, allocator, &second, "b");
+
+    page.viewer.selected_target = .{ .status_only = 0 };
+    page.review_projection.pending = try review_projection.cloneRequest(
+        allocator,
+        page.activation.currentIdentity().?,
+        99,
+        "/repo",
+        "b",
+        .generated_added_file,
+        .unstaged,
+        0,
+        0,
+    );
+    var late: app_load.ReviewProjectionFinished = .{
+        .request = try review_projection.cloneRequest(
+            allocator,
+            page.activation.currentIdentity().?,
+            99,
+            "/repo",
+            "b",
+            .generated_added_file,
+            .unstaged,
+            0,
+            0,
+        ),
+        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "b", "late\n", false) } },
+    };
+    defer late.deinit(allocator);
+    var revisit = try controller.prepareProjection(allocator);
+    defer revisit.deinit(allocator);
+    try std.testing.expect(revisit.command == null);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.file.lines.ptr);
+    try std.testing.expect(page.review_projection.cacheHas("/repo", "b", .generated_added_file, .unstaged, 0, 0));
+
+    const late_apply = try controller.applyProjectionFinished(allocator, &late);
+    try std.testing.expect(!late_apply.result_transferred);
+    try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.file.lines.ptr);
+}
+
+test "projection cache survives selecting a file that needs no projection" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffTwo()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? c\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    var first = try controller.prepareProjection(allocator);
+    defer first.deinit(allocator);
+    const c_lines = try finishGeneratedProjection(controller, allocator, &first, "c");
+
+    page.viewer.selected_target = .{ .diff_file = 0 };
+    var ordinary = try controller.prepareProjection(allocator);
+    defer ordinary.deinit(allocator);
+    try std.testing.expect(ordinary.command == null);
+    try std.testing.expect(!page.review_projection.hasDisplayed());
+    try std.testing.expect(page.review_projection.cacheHas("/repo", "c", .generated_added_file, .unstaged, 0, 0));
+
+    page.viewer.selected_target = .{ .status_only = 0 };
+    var revisit = try controller.prepareProjection(allocator);
+    defer revisit.deinit(allocator);
+    try std.testing.expect(revisit.command == null);
+    try std.testing.expectEqual(c_lines, page.review_projection.displayed.ready.value.generated_added_file.file.lines.ptr);
+}
+
+test "full projection cache promotes LRU before old display admission" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00?? b\x00?? c\x00?? d\x00?? e\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    const paths = [_][]const u8{ "a", "b", "c", "d" };
+    var a_lines: [*]const []const u8 = undefined;
+    for (paths, 0..) |path, index| {
+        const ready = try testGeneratedReady(allocator, index + 1, path, 0, 0);
+        if (index == 0) a_lines = ready.value.generated_added_file.file.lines.ptr;
+        page.review_projection.installReady(ready);
+        page.review_projection.cacheOrClearDisplayed(allocator, "/repo", .unstaged, 0, 0);
+    }
+    try std.testing.expectEqual(review_projection.max_cached_entries, page.review_projection.cacheLen());
+
+    page.review_projection.installReady(try testGeneratedReady(allocator, 5, "e", 0, 0));
+    page.review_projection.pending = try review_projection.cloneRequest(
+        allocator,
+        page.activation.currentIdentity().?,
+        99,
+        "/repo",
+        "late",
+        .generated_added_file,
+        .unstaged,
+        0,
+        0,
+    );
+
+    // captureAnchor performs the one permitted allocation. If old-display
+    // admission unexpectedly needs cache metadata after removing the hit, the
+    // next allocation fails; the hit must still remain installable either way.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    var update = try controller.prepareProjection(failing.allocator());
+    defer update.deinit(allocator);
+
+    try std.testing.expect(update.command == null);
+    try std.testing.expectEqual(@as(usize, 1), failing.alloc_index);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.file.lines.ptr);
+    try std.testing.expectEqual(review_projection.max_cached_entries, page.review_projection.cacheLen());
+    try std.testing.expect(page.review_projection.cacheHas("/repo", "e", .generated_added_file, .unstaged, 0, 0));
+    try std.testing.expect(page.review_projection.cacheRetainedBytes() <= review_projection.max_cached_retained_bytes);
+}
+
+test "status line stats change invalidates retained projection cache" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{};
+    defer page.deinit(allocator);
+    var initial = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try initial.attachLineStats(&.{.{ .path_key = "a", .stats = .{ .added = 1, .removed = 1 } }});
+    try page.git_status.replace("/repo", &initial);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    page.review_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
+    page.review_projection.cacheOrClearDisplayed(allocator, "/repo", .unstaged, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
+
+    _ = page.status_load.prepare(false);
+    page.status_load.begin(null);
+    var identical = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try identical.attachLineStats(&.{.{ .path_key = "a", .stats = .{ .added = 1, .removed = 1 } }});
+    var identical_finished: app_load.StatusLoadFinished = .{
+        .identity = page.activation.currentIdentity().?,
+        .generation = page.status_load.generation,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = identical },
+    };
+    identical = undefined;
+    defer identical_finished.deinit(allocator);
+    _ = try controller.applyStatusFinished(allocator, &identical_finished, false);
+    try std.testing.expectEqual(@as(u64, 0), page.status_snapshot_revision);
+    try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
+
+    _ = page.status_load.prepare(false);
+    page.status_load.begin(null);
+    var changed = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try changed.attachLineStats(&.{.{ .path_key = "a", .stats = .{ .added = 2, .removed = 1 } }});
+    var finished: app_load.StatusLoadFinished = .{
+        .identity = page.activation.currentIdentity().?,
+        .generation = page.status_load.generation,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = changed },
+    };
+    changed = undefined;
+    defer finished.deinit(allocator);
+
+    _ = try controller.applyStatusFinished(allocator, &finished, false);
+    try std.testing.expectEqual(@as(u64, 1), page.status_snapshot_revision);
+    try std.testing.expectEqual(@as(usize, 0), page.review_projection.cacheLen());
+}
+
+test "source session replacement clears populated projection cache" {
+    const allocator = std.testing.allocator;
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    defer status_bundle.deinit();
+    var page: review_page.ReviewPageState = .{};
+    defer page.deinit(allocator);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    page.review_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
+    page.review_projection.cacheOrClearDisplayed(allocator, "/repo", .unstaged, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
+
+    try controller.createStatusOnlyLoadedSession(allocator, status_bundle.document);
+    try std.testing.expectEqual(@as(u64, 1), page.source_session_revision);
+    try std.testing.expectEqual(@as(usize, 0), page.review_projection.cacheLen());
+    try std.testing.expect(!page.review_projection.cacheHas("/repo", "a", .generated_added_file, .unstaged, 0, 0));
+}
+
+test "old revision display is not admitted when fresh completion replaces it" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    page.review_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
+    controller.advanceStatusSnapshotRevision(allocator);
+    page.review_projection.pending = try review_projection.cloneRequest(
+        allocator,
+        page.activation.currentIdentity().?,
+        2,
+        "/repo",
+        "a",
+        .generated_added_file,
+        .unstaged,
+        0,
+        1,
+    );
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = try review_projection.cloneRequest(
+            allocator,
+            page.activation.currentIdentity().?,
+            2,
+            "/repo",
+            "a",
+            .generated_added_file,
+            .unstaged,
+            0,
+            1,
+        ),
+        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "fresh\n", false) } },
+    };
+    var finished_owned = true;
+    defer if (finished_owned) finished.deinit(allocator);
+
+    const applied = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(applied.result_transferred);
+    finished_owned = false;
+    try std.testing.expectEqual(@as(usize, 0), page.review_projection.cacheLen());
+    try std.testing.expectEqual(@as(u64, 1), page.review_projection.displayed.ready.request.status_snapshot_revision);
+}
+
+fn finishGeneratedProjection(
+    controller: Controller,
+    allocator: std.mem.Allocator,
+    update: *ReviewUpdate,
+    path: []const u8,
+) ![*]const []const u8 {
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const request = switch (command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    command = undefined;
+
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = request,
+        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, path, "one\ntwo\n", false) } },
+    };
+    var finished_owned = true;
+    defer if (finished_owned) finished.deinit(allocator);
+    const lines = finished.result.ready.generated_added_file.file.lines.ptr;
+    const applied = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(applied.result_transferred);
+    finished_owned = false;
+    return lines;
+}
+
+fn testGeneratedReady(
+    allocator: std.mem.Allocator,
+    id: usize,
+    path: []const u8,
+    source_session_revision: u64,
+    status_snapshot_revision: u64,
+) !review_projection.ReadyDisplay {
+    var request = try review_projection.cloneRequest(
+        allocator,
+        app_page.RequestIdentity.review(0, 1),
+        id,
+        "/repo",
+        path,
+        .generated_added_file,
+        .unstaged,
+        source_session_revision,
+        status_snapshot_revision,
+    );
+    errdefer request.deinit(allocator);
+    return .{
+        .request = request,
+        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, path, "one\ntwo\n", false) },
+    };
 }
 
 test "deferred source terminals consume blocked and accepted ownership" {

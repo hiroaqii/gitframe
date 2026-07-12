@@ -1173,7 +1173,7 @@ pub const App = struct {
             self.startStatusLoad(ctx, root, if (options.kind == .watch) .background else .foreground, options.background_cycle_id);
             self.startBranchStatusLoad(ctx, root, options.background_cycle_id);
         } else {
-            self.reviewReload().dropStatusSnapshot();
+            self.reviewReload().dropStatusSnapshot(ctx.allocator());
             self.reviewReload().invalidateBranchStatusSnapshot();
         }
 
@@ -3935,7 +3935,7 @@ pub const App = struct {
             std.debug.assert(self.pages.review.pending_selection_restore == null);
         }
         self.reviewReload().clearSourceDisplay(allocator);
-        self.reviewReload().dropStatusSnapshot();
+        self.reviewReload().dropStatusSnapshot(allocator);
         self.reviewReload().invalidateBranchStatusSnapshot();
     }
 
@@ -7274,6 +7274,56 @@ test "inactive repository change invalidates retained source before equal-finger
     const shared_fingerprint = app_auto_reload.SourceFingerprint.init(app_test_support.diff_one);
     app.pages.review.auto_reload.acceptSource(shared_fingerprint);
 
+    const source_revision = app.pages.review.source_session_revision;
+    const status_revision = app.pages.review.status_snapshot_revision;
+    app.pages.review.review_projection.installReady(.{
+        .request = try app_review_projection.cloneRequest(
+            allocator,
+            page.RequestIdentity.review(app.repo_epoch, 1),
+            1,
+            "/repo/a",
+            "cached-a",
+            .generated_added_file,
+            .unstaged,
+            source_revision,
+            status_revision,
+        ),
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(allocator, "cached-a", "cached\n", false) },
+    });
+    app.pages.review.review_projection.cacheOrClearDisplayed(
+        allocator,
+        "/repo/a",
+        .unstaged,
+        source_revision,
+        status_revision,
+    );
+    app.pages.review.review_projection.installReady(.{
+        .request = try app_review_projection.cloneRequest(
+            allocator,
+            page.RequestIdentity.review(app.repo_epoch, 1),
+            2,
+            "/repo/a",
+            "displayed-a",
+            .generated_added_file,
+            .unstaged,
+            source_revision,
+            status_revision,
+        ),
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(allocator, "displayed-a", "displayed\n", false) },
+    });
+    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
+        allocator,
+        page.RequestIdentity.review(app.repo_epoch, 1),
+        3,
+        "/repo/a",
+        "pending-a",
+        .generated_added_file,
+        .unstaged,
+        source_revision,
+        status_revision,
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.review_projection.cacheLen());
+
     try std.testing.expect(app.commitRepoDiscovery(
         allocator,
         try testSingleRepoDiscovery(allocator, "/repo/b"),
@@ -7284,12 +7334,24 @@ test "inactive repository change invalidates retained source before equal-finger
     try std.testing.expect(app.pages.review.auto_reload.accepted_source == null);
     try std.testing.expect(app.pages.review.load.state == .idle);
     try std.testing.expect(app.reviewNavigation().loadedDiff() == null);
+    try std.testing.expect(app.pages.review.review_projection.pending == null);
+    try std.testing.expect(!app.pages.review.review_projection.hasDisplayed());
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.review_projection.cacheLen());
+    try std.testing.expect(!app.pages.review.review_projection.cacheHas(
+        "/repo/a",
+        "cached-a",
+        .generated_added_file,
+        .unstaged,
+        source_revision,
+        status_revision,
+    ));
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
     try app.requestPageSwitch(&ctx, .review);
 
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.review_projection.cacheLen());
     const diff_task: *DiffLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[2].ctx));
     try std.testing.expect(diff_task.expected_fingerprint == null);
     try std.testing.expectEqual(app.repo_epoch, diff_task.identity.repo_epoch);
