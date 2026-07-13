@@ -1,5 +1,11 @@
 const std = @import("std");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
+const content_fingerprint = @import("../content_fingerprint.zig");
+const repository_source = @import("../repository/source.zig");
+const root_capability = @import("../repo/root_capability.zig");
+const source_syntax = @import("../syntax/source.zig");
+const source_syntax_runtime = @import("../syntax/source_runtime.zig");
+const syntax_style = @import("../syntax/style.zig");
 const app_load = @import("load.zig");
 const page = @import("page.zig");
 
@@ -28,6 +34,7 @@ pub const Request = struct {
     source_kind: SourceKind,
     source_session_revision: u64,
     status_snapshot_revision: u64,
+    root_identity: ?root_capability.Identity = null,
 
     pub fn deinit(self: *Request, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_root);
@@ -52,7 +59,7 @@ pub const Request = struct {
     }
 
     pub fn sameSemanticKey(self: Request, other: Request) bool {
-        return self.matchesBorrowed(
+        return optionalRootIdentityEql(self.root_identity, other.root_identity) and self.matchesBorrowed(
             other.repo_root,
             other.path_key,
             other.kind,
@@ -68,22 +75,74 @@ pub const Request = struct {
             self.status_snapshot_revision == status_snapshot_revision and
             std.mem.eql(u8, self.repo_root, repo_root);
     }
+
+    pub fn matchesRootIdentity(self: Request, expected: ?root_capability.Identity) bool {
+        return optionalRootIdentityEql(self.root_identity, expected);
+    }
 };
 
-pub const GeneratedFile = struct {
-    path: []const u8,
-    lines: []const []const u8,
-    truncated: bool = false,
+pub const TerminalPlainReason = enum {
+    provider_disabled,
+    provider_unavailable,
+    snapshot_changed,
+};
+
+pub const GeneratedDecoration = union(enum) {
+    eligible,
+    terminal_plain: TerminalPlainReason,
+    decorated: struct {
+        spans: source_syntax.SourceSpans,
+        has_visible_syntax: bool,
+    },
+
+    pub fn deinit(self: *GeneratedDecoration, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .decorated => |*decorated| decorated.spans.deinit(allocator),
+            .eligible, .terminal_plain => {},
+        }
+        self.* = undefined;
+    }
+
+    pub fn retainedBytes(self: GeneratedDecoration) usize {
+        return switch (self) {
+            .decorated => |decorated| decorated.spans.retainedBytes(),
+            .eligible, .terminal_plain => 0,
+        };
+    }
+
+    pub fn lineSpans(self: GeneratedDecoration, line_index: usize) @import("../syntax/token.zig").LineSpans {
+        return switch (self) {
+            .decorated => |decorated| decorated.spans.lineSpans(line_index),
+            .eligible, .terminal_plain => .empty(),
+        };
+    }
+
+    pub fn hasVisibleSyntax(self: GeneratedDecoration) bool {
+        return switch (self) {
+            .decorated => |decorated| decorated.has_visible_syntax,
+            .eligible, .terminal_plain => false,
+        };
+    }
 };
 
 pub const GeneratedFileBundle = struct {
-    arena: ?std.heap.ArenaAllocator,
-    file: GeneratedFile,
+    path: []u8,
+    source: repository_source.Document,
+    decoration: GeneratedDecoration,
 
-    pub fn deinit(self: *GeneratedFileBundle) void {
-        if (self.arena) |*arena| arena.deinit();
-        self.arena = null;
-        self.file = undefined;
+    pub fn deinit(self: *GeneratedFileBundle, allocator: std.mem.Allocator) void {
+        self.decoration.deinit(allocator);
+        self.source.deinit(allocator);
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+
+    pub fn retainedBytes(self: *const GeneratedFileBundle) usize {
+        return self.path.len +| self.source.retainedBytes() +| self.decoration.retainedBytes();
+    }
+
+    pub fn fingerprint(self: *const GeneratedFileBundle) content_fingerprint.Fingerprint {
+        return self.source.fingerprint;
     }
 };
 
@@ -122,7 +181,7 @@ pub const Ready = union(enum) {
     pub fn deinit(self: *Ready, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .cached_diff => |*bundle| bundle.deinit(),
-            .generated_added_file => |*bundle| bundle.deinit(),
+            .generated_added_file => |*bundle| bundle.deinit(allocator),
             .combined_hunks => |*bundle| bundle.deinit(),
             .status_body => |*body| body.deinit(allocator),
         }
@@ -139,7 +198,7 @@ pub const Ready = union(enum) {
     fn retainedBytes(self: Ready) usize {
         return switch (self) {
             .cached_diff => |bundle| arenaCapacity(bundle.arena),
-            .generated_added_file => |bundle| arenaCapacity(bundle.arena),
+            .generated_added_file => |bundle| bundle.retainedBytes(),
             .combined_hunks => |bundle| saturatedSum(&.{
                 arenaCapacity(bundle.arena),
                 arenaCapacity(bundle.cached_bundle.arena),
@@ -172,6 +231,66 @@ pub const Finished = struct {
     pub fn deinit(self: *Finished, allocator: std.mem.Allocator) void {
         self.request.deinit(allocator);
         self.result.deinit(allocator);
+    }
+};
+
+pub const GeneratedSyntaxRequest = struct {
+    identity: page.RequestIdentity,
+    id: u64,
+    projection_id: u64,
+    root_identity: root_capability.Identity,
+    repo_root: []u8,
+    path_key: []u8,
+    source_kind: SourceKind,
+    source_session_revision: u64,
+    status_snapshot_revision: u64,
+    expected_fingerprint: content_fingerprint.Fingerprint,
+
+    pub fn deinit(self: *GeneratedSyntaxRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.path_key);
+        self.* = undefined;
+    }
+
+    pub fn matches(self: GeneratedSyntaxRequest, other: GeneratedSyntaxRequest) bool {
+        return self.id == other.id and
+            self.projection_id == other.projection_id and
+            self.identity.origin == other.identity.origin and
+            self.identity.repo_epoch == other.identity.repo_epoch and
+            self.identity.activation_id == other.identity.activation_id and
+            self.root_identity.eql(other.root_identity) and
+            self.source_kind == other.source_kind and
+            self.source_session_revision == other.source_session_revision and
+            self.status_snapshot_revision == other.status_snapshot_revision and
+            self.expected_fingerprint.eql(other.expected_fingerprint) and
+            std.mem.eql(u8, self.repo_root, other.repo_root) and
+            std.mem.eql(u8, self.path_key, other.path_key);
+    }
+};
+
+pub const GeneratedSyntaxResult = union(enum) {
+    loaded: source_syntax.SourceSpans,
+    terminal_plain: TerminalPlainReason,
+    stale,
+
+    pub fn deinit(self: *GeneratedSyntaxResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .loaded => |*spans| spans.deinit(allocator),
+            .terminal_plain, .stale => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const GeneratedSyntaxFinished = struct {
+    request: GeneratedSyntaxRequest,
+    snapshot_fingerprint: ?content_fingerprint.Fingerprint,
+    result: GeneratedSyntaxResult,
+
+    pub fn deinit(self: *GeneratedSyntaxFinished, allocator: std.mem.Allocator) void {
+        self.request.deinit(allocator);
+        self.result.deinit(allocator);
+        self.* = undefined;
     }
 };
 
@@ -349,10 +468,13 @@ const Cache = struct {
 pub const State = struct {
     displayed: Displayed = .idle,
     pending: ?Request = null,
+    syntax_pending: ?GeneratedSyntaxRequest = null,
+    syntax_next_id: u64 = 0,
     cache: Cache = .{},
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         self.clearPending(allocator);
+        self.clearSyntaxPending(allocator);
         self.displayed.deinit(allocator);
         self.cache.deinit(allocator);
     }
@@ -363,7 +485,13 @@ pub const State = struct {
     }
 
     pub fn clearDisplayed(self: *State, allocator: std.mem.Allocator) void {
+        self.clearSyntaxPending(allocator);
         self.displayed.deinit(allocator);
+    }
+
+    pub fn clearSyntaxPending(self: *State, allocator: std.mem.Allocator) void {
+        if (self.syntax_pending) |*request| request.deinit(allocator);
+        self.syntax_pending = null;
     }
 
     pub fn clearCache(self: *State, allocator: std.mem.Allocator) void {
@@ -371,7 +499,7 @@ pub const State = struct {
     }
 
     pub fn isEmpty(self: *const State) bool {
-        return self.pending == null and self.displayed.request() == null and self.cache.entries.items.len == 0;
+        return self.pending == null and self.syntax_pending == null and self.displayed.request() == null and self.cache.entries.items.len == 0;
     }
 
     pub fn cacheLen(self: *const State) usize {
@@ -417,6 +545,7 @@ pub const State = struct {
         source_session_revision: u64,
         status_snapshot_revision: u64,
     ) void {
+        self.clearSyntaxPending(allocator);
         var previous = self.displayed;
         self.displayed = .idle;
         switch (previous) {
@@ -449,6 +578,10 @@ pub const State = struct {
         return self.pending != null;
     }
 
+    pub fn hasSyntaxPending(self: State) bool {
+        return self.syntax_pending != null;
+    }
+
     pub fn hasDisplayed(self: *const State) bool {
         return self.displayed.request() != null;
     }
@@ -474,6 +607,11 @@ fn saturatedSum(values: []const usize) usize {
     return total;
 }
 
+fn optionalRootIdentityEql(left: ?root_capability.Identity, right: ?root_capability.Identity) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return left.?.eql(right.?);
+}
+
 pub fn cloneRequest(
     allocator: std.mem.Allocator,
     identity: page.RequestIdentity,
@@ -484,6 +622,32 @@ pub fn cloneRequest(
     source_kind: SourceKind,
     source_session_revision: u64,
     status_snapshot_revision: u64,
+) !Request {
+    return cloneRequestWithRootIdentity(
+        allocator,
+        identity,
+        id,
+        repo_root,
+        path_key,
+        kind,
+        source_kind,
+        source_session_revision,
+        status_snapshot_revision,
+        null,
+    );
+}
+
+pub fn cloneRequestWithRootIdentity(
+    allocator: std.mem.Allocator,
+    identity: page.RequestIdentity,
+    id: u64,
+    repo_root: []const u8,
+    path_key: []const u8,
+    kind: Kind,
+    source_kind: SourceKind,
+    source_session_revision: u64,
+    status_snapshot_revision: u64,
+    root_identity: ?root_capability.Identity,
 ) !Request {
     const owned_root = try allocator.dupe(u8, repo_root);
     errdefer allocator.free(owned_root);
@@ -497,6 +661,53 @@ pub fn cloneRequest(
         .source_kind = source_kind,
         .source_session_revision = source_session_revision,
         .status_snapshot_revision = status_snapshot_revision,
+        .root_identity = root_identity,
+    };
+}
+
+pub fn cloneGeneratedSyntaxRequest(
+    allocator: std.mem.Allocator,
+    request: GeneratedSyntaxRequest,
+) !GeneratedSyntaxRequest {
+    const owned_root = try allocator.dupe(u8, request.repo_root);
+    errdefer allocator.free(owned_root);
+    const owned_path = try allocator.dupe(u8, request.path_key);
+    return .{
+        .identity = request.identity,
+        .id = request.id,
+        .projection_id = request.projection_id,
+        .root_identity = request.root_identity,
+        .repo_root = owned_root,
+        .path_key = owned_path,
+        .source_kind = request.source_kind,
+        .source_session_revision = request.source_session_revision,
+        .status_snapshot_revision = request.status_snapshot_revision,
+        .expected_fingerprint = request.expected_fingerprint,
+    };
+}
+
+pub fn generatedSyntaxRequestForProjection(
+    allocator: std.mem.Allocator,
+    id: u64,
+    identity: page.RequestIdentity,
+    projection: Request,
+    fingerprint: content_fingerprint.Fingerprint,
+) !GeneratedSyntaxRequest {
+    const root_identity = projection.root_identity orelse return error.MissingRootIdentity;
+    const owned_root = try allocator.dupe(u8, projection.repo_root);
+    errdefer allocator.free(owned_root);
+    const owned_path = try allocator.dupe(u8, projection.path_key);
+    return .{
+        .identity = identity,
+        .id = id,
+        .projection_id = projection.id,
+        .root_identity = root_identity,
+        .repo_root = owned_root,
+        .path_key = owned_path,
+        .source_kind = projection.source_kind,
+        .source_session_revision = projection.source_session_revision,
+        .status_snapshot_revision = projection.status_snapshot_revision,
+        .expected_fingerprint = fingerprint,
     };
 }
 
@@ -507,45 +718,89 @@ pub fn statusBodyAlloc(allocator: std.mem.Allocator, path: []const u8, comptime 
     };
 }
 
-pub fn generatedFileFromContent(allocator: std.mem.Allocator, path: []const u8, content: []const u8, truncated: bool) !GeneratedFileBundle {
-    var arena: std.heap.ArenaAllocator = .init(allocator);
-    errdefer arena.deinit();
-    const arena_allocator = arena.allocator();
-
-    const copied_path = try arena_allocator.dupe(u8, path);
-    const copied_content = try arena_allocator.dupe(u8, content);
-
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(arena_allocator);
-
-    var start: usize = 0;
-    while (start < copied_content.len) {
-        const end = std.mem.indexOfScalarPos(u8, copied_content, start, '\n') orelse copied_content.len;
-        const raw_line = copied_content[start..end];
-        const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r') raw_line[0 .. raw_line.len - 1] else raw_line;
-        try lines.append(arena_allocator, line);
-        start = if (end < copied_content.len) end + 1 else copied_content.len;
-    }
-    if (copied_content.len == 0) try lines.append(arena_allocator, "");
-
+pub fn generatedFileFromOwnedContent(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    content: []u8,
+    fingerprint: content_fingerprint.Fingerprint,
+) !GeneratedFileBundle {
+    var content_owned = true;
+    errdefer if (content_owned) allocator.free(content);
+    const copied_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(copied_path);
+    var source = try repository_source.Document.initOwned(allocator, content, fingerprint);
+    content_owned = false;
+    errdefer source.deinit(allocator);
     return .{
-        .arena = arena,
-        .file = .{
-            .path = copied_path,
-            .lines = try lines.toOwnedSlice(arena_allocator),
-            .truncated = truncated,
-        },
+        .path = copied_path,
+        .source = source,
+        .decoration = if (source_syntax_runtime.enabled)
+            .eligible
+        else
+            .{ .terminal_plain = .provider_disabled },
     };
 }
 
-test "generated file splits content lines in an owned arena" {
-    var bundle = try generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\n", false);
-    defer bundle.deinit();
+pub fn generatedFileFromContent(allocator: std.mem.Allocator, path: []const u8, content: []const u8) !GeneratedFileBundle {
+    const copied_content = try allocator.dupe(u8, content);
+    return generatedFileFromOwnedContent(allocator, path, copied_content, .init(copied_content));
+}
 
-    try std.testing.expectEqualStrings("src/new.zig", bundle.file.path);
-    try std.testing.expectEqual(@as(usize, 2), bundle.file.lines.len);
-    try std.testing.expectEqualStrings("one", bundle.file.lines[0]);
-    try std.testing.expectEqualStrings("two", bundle.file.lines[1]);
+pub fn sourceSpansHaveVisibleSyntax(spans: source_syntax.SourceSpans) bool {
+    for (spans.spans) |span| {
+        if (syntax_style.changesForeground(span.role)) return true;
+    }
+    return false;
+}
+
+test "generated file owns the shared source line model" {
+    var bundle = try generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\n");
+    defer bundle.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("src/new.zig", bundle.path);
+    try std.testing.expectEqual(@as(usize, 2), bundle.source.rowCount());
+    try std.testing.expectEqualStrings("one", bundle.source.lineBody(0).?);
+    try std.testing.expectEqualStrings("two", bundle.source.lineBody(1).?);
+    if (source_syntax_runtime.enabled) {
+        try std.testing.expect(bundle.decoration == .eligible);
+    } else {
+        try std.testing.expectEqual(TerminalPlainReason.provider_disabled, bundle.decoration.terminal_plain);
+    }
+}
+
+test "generated decoration distinguishes terminal empty and visible outcomes" {
+    const allocator = std.testing.allocator;
+    var bundle = try generatedFileFromContent(allocator, "src/new.zig", "const value = 1;\n");
+    defer bundle.deinit(allocator);
+
+    bundle.decoration = .{ .terminal_plain = .provider_unavailable };
+    try std.testing.expect(!bundle.decoration.hasVisibleSyntax());
+
+    bundle.decoration = .{ .decorated = .{
+        .spans = .empty(),
+        .has_visible_syntax = false,
+    } };
+    try std.testing.expectEqual(@as(usize, 0), bundle.decoration.lineSpans(0).spans.len);
+
+    const entries = try allocator.dupe(source_syntax.LineEntry, &.{.{
+        .line_index = 0,
+        .span_start = 0,
+        .span_count = 1,
+    }});
+    const spans = try allocator.dupe(@import("../syntax/token.zig").TokenSpan, &.{.{
+        .start = 0,
+        .end = 5,
+        .role = .keyword,
+    }});
+    bundle.decoration.deinit(allocator);
+    bundle.decoration = .{ .decorated = .{
+        .spans = .{ .line_entries = entries, .spans = spans },
+        .has_visible_syntax = true,
+    } };
+    try std.testing.expect(bundle.decoration.hasVisibleSyntax());
+    try std.testing.expectEqual(@as(usize, 1), bundle.decoration.lineSpans(0).spans.len);
+    try std.testing.expect(sourceSpansHaveVisibleSyntax(bundle.decoration.decorated.spans));
+    try std.testing.expect(bundle.retainedBytes() >= bundle.source.retainedBytes() + entries.len * @sizeOf(source_syntax.LineEntry) + spans.len * @sizeOf(@import("../syntax/token.zig").TokenSpan));
 }
 
 test "request matches semantic projection identity" {
@@ -559,13 +814,39 @@ test "request matches semantic projection identity" {
     try std.testing.expect(!request.matchesBorrowed("/other", "src/main.zig", .cached_diff, .unstaged, 10, 20));
 }
 
+test "generated request and syntax clone retain pinned root identity" {
+    const allocator = std.testing.allocator;
+    const root = root_capability.Identity{ .device = 7, .inode = 11 };
+    var projection = try cloneRequestWithRootIdentity(
+        allocator,
+        page.RequestIdentity.review(3, 5),
+        9,
+        "/repo",
+        "src/new.zig",
+        .generated_added_file,
+        .unstaged,
+        13,
+        17,
+        root,
+    );
+    defer projection.deinit(allocator);
+    try std.testing.expect(projection.matchesRootIdentity(root));
+    try std.testing.expect(!projection.matchesRootIdentity(.{ .device = 7, .inode = 12 }));
+
+    var syntax_request = try generatedSyntaxRequestForProjection(allocator, 21, projection.identity, projection, .init("const x = 1;\n"));
+    defer syntax_request.deinit(allocator);
+    var cloned = try cloneGeneratedSyntaxRequest(allocator, syntax_request);
+    defer cloned.deinit(allocator);
+    try std.testing.expect(syntax_request.matches(cloned));
+}
+
 test "projection cache promotion re-admission and equal key replacement preserve LRU ownership" {
     const allocator = std.testing.allocator;
     var cache: Cache = .{};
     defer cache.deinit(allocator);
 
     var a = try testGeneratedProjection(allocator, 1, "a", 10, 20);
-    const a_lines = a.value.generated_added_file.file.lines.ptr;
+    const a_lines = a.value.generated_added_file.source.bytes.ptr;
     cache.admitWithLimits(allocator, a, 2, max_cached_retained_bytes);
     a = undefined;
     var b = try testGeneratedProjection(allocator, 2, "b", 10, 20);
@@ -574,7 +855,7 @@ test "projection cache promotion re-admission and equal key replacement preserve
 
     var promoted_a = cache.takeMatching("/repo", "a", .generated_added_file, .unstaged, 10, 20) orelse
         return error.ExpectedCacheHit;
-    try std.testing.expectEqual(a_lines, promoted_a.value.generated_added_file.file.lines.ptr);
+    try std.testing.expectEqual(a_lines, promoted_a.value.generated_added_file.source.bytes.ptr);
     cache.admitWithLimits(allocator, promoted_a, 2, max_cached_retained_bytes);
     promoted_a = undefined;
 
@@ -586,14 +867,14 @@ test "projection cache promotion re-admission and equal key replacement preserve
     try std.testing.expect(cache.hasMatching("/repo", "c", .generated_added_file, .unstaged, 10, 20));
 
     var replacement_a = try testGeneratedProjection(allocator, 4, "a", 10, 20);
-    const replacement_lines = replacement_a.value.generated_added_file.file.lines.ptr;
+    const replacement_lines = replacement_a.value.generated_added_file.source.bytes.ptr;
     cache.admitWithLimits(allocator, replacement_a, 2, max_cached_retained_bytes);
     replacement_a = undefined;
     try std.testing.expectEqual(@as(usize, 2), cache.entries.items.len);
     var final_a = cache.takeMatching("/repo", "a", .generated_added_file, .unstaged, 10, 20) orelse
         return error.ExpectedReplacement;
     defer final_a.deinit(allocator);
-    try std.testing.expectEqual(replacement_lines, final_a.value.generated_added_file.file.lines.ptr);
+    try std.testing.expectEqual(replacement_lines, final_a.value.generated_added_file.source.bytes.ptr);
 }
 
 test "projection cache enforces four entry and retained byte bounds" {
@@ -738,6 +1019,6 @@ fn testGeneratedProjection(
     errdefer request.deinit(allocator);
     return .{
         .request = request,
-        .value = .{ .generated_added_file = try generatedFileFromContent(allocator, path, "one\ntwo\n", false) },
+        .value = .{ .generated_added_file = try generatedFileFromContent(allocator, path, "one\ntwo\n") },
     };
 }

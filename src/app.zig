@@ -103,6 +103,7 @@ const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
 const PathTarget = git_ops.PathTarget;
 const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
+const GeneratedSyntaxTask = app_load.GeneratedSyntaxTask(App.Msg);
 const RepositoryManifestTask = repository_page.ManifestTask(App.Msg);
 const RepositoryDocumentTask = repository_page.DocumentTask(App.Msg);
 const RepositorySyntaxTask = repository_page.SyntaxTask(App.Msg);
@@ -496,6 +497,7 @@ pub const App = struct {
             .source = self.config.source,
             .repo_root = self.activeRepoRoot(),
             .repo_epoch = self.repo_epoch,
+            .root_identity = self.repo_state.activeIdentity(),
         };
     }
 
@@ -820,6 +822,7 @@ pub const App = struct {
                 .status => |result| try self.finishStatusLoad(ctx, result),
                 .branch_status => |result| self.finishBranchStatusLoad(ctx, result),
                 .projection => |result| try self.finishReviewProjectionLoad(ctx, result),
+                .projection_syntax => |result| self.finishGeneratedProjectionSyntax(ctx, result),
             },
             .shell => |shell_result| switch (shell_result) {
                 .repo_path_discovery => |result| try self.finishRepoPathDiscovery(ctx, result),
@@ -1490,33 +1493,95 @@ pub const App = struct {
 
     fn ensureReviewProjection(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         var review_update = try self.reviewReload().prepareProjection(self.allocator);
-        const command = review_update.takeCommand() orelse return;
-        const allocator = ctx.allocator();
-        defer review_update.deinit(allocator);
-        var owned_command = command;
-        var command_consumed = false;
-        defer if (!command_consumed) owned_command.deinit(allocator);
+        if (review_update.takeCommand()) |command| {
+            const allocator = ctx.allocator();
+            var owned_command = command;
+            var command_consumed = false;
+            defer if (!command_consumed) owned_command.deinit(allocator);
 
-        switch (owned_command) {
-            .repo_discovery, .source_load, .status_load, .branch_status_load => unreachable,
-            .review_projection => |*request| {
-                const request_id = request.id;
-                const task = allocator.create(ReviewProjectionTask) catch |err| {
-                    self.reviewReload().rejectProjectionSpawn(allocator, request_id);
-                    return err;
-                };
-                task.* = .{ .request = request.* };
-                request.* = undefined;
-                command_consumed = true;
+            switch (owned_command) {
+                .repo_discovery, .source_load, .status_load, .branch_status_load => unreachable,
+                .review_projection => |*request| {
+                    const request_id = request.id;
+                    var root: ?repo_root_capability.RootCapability = null;
+                    if (request.kind == .generated_added_file) {
+                        const capability = self.repo_state.activeCapability() orelse {
+                            self.reviewReload().rejectProjectionSpawn(allocator, request_id);
+                            return;
+                        };
+                        if (!request.matchesRootIdentity(capability.identity)) {
+                            self.reviewReload().rejectProjectionSpawn(allocator, request_id);
+                            return;
+                        }
+                        root = capability.duplicate() catch |err| {
+                            self.reviewReload().rejectProjectionSpawn(allocator, request_id);
+                            return err;
+                        };
+                    }
+                    errdefer if (root) |*owned| owned.deinit();
+                    const task = allocator.create(ReviewProjectionTask) catch |err| {
+                        self.reviewReload().rejectProjectionSpawn(allocator, request_id);
+                        return err;
+                    };
+                    task.* = .{ .request = request.*, .root = root };
+                    root = null;
+                    request.* = undefined;
+                    command_consumed = true;
 
-                ctx.task().spawnWith(.{ .ctx = task, .run = ReviewProjectionTask.run, .failed = ReviewProjectionTask.failed }) catch |err| {
-                    task.request.deinit(allocator);
-                    allocator.destroy(task);
-                    self.reviewReload().rejectProjectionSpawn(allocator, request_id);
-                    return err;
-                };
-            },
+                    ctx.task().spawnWith(.{ .ctx = task, .run = ReviewProjectionTask.run, .failed = ReviewProjectionTask.failed }) catch |err| {
+                        task.request.deinit(allocator);
+                        if (task.root) |*owned| owned.deinit();
+                        allocator.destroy(task);
+                        self.reviewReload().rejectProjectionSpawn(allocator, request_id);
+                        return err;
+                    };
+                    return;
+                },
+            }
         }
+        if (source_syntax_runtime.enabled) self.ensureGeneratedProjectionSyntax(ctx);
+    }
+
+    /// Best-effort decoration for an already usable generated-file preview.
+    ///
+    /// The primary projection has established the plain display before this
+    /// path runs. Allocation, root duplication, and task-queue failures must
+    /// therefore leave that display usable and retryable instead of turning an
+    /// optional syntax enhancement into an application-level failure.
+    fn ensureGeneratedProjectionSyntax(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        const allocator = self.allocator orelse return;
+        var request = self.reviewReload().prepareGeneratedSyntax(allocator) catch return orelse return;
+        var request_consumed = false;
+        defer if (!request_consumed) request.deinit(allocator);
+        const request_id = request.id;
+        const capability = self.repo_state.activeCapability() orelse {
+            self.reviewReload().rejectGeneratedSyntaxSpawn(allocator, request_id);
+            return;
+        };
+        if (!capability.identity.eql(request.root_identity)) {
+            self.reviewReload().rejectGeneratedSyntaxSpawn(allocator, request_id);
+            return;
+        }
+        var root = capability.duplicate() catch {
+            self.reviewReload().rejectGeneratedSyntaxSpawn(allocator, request_id);
+            return;
+        };
+        var root_consumed = false;
+        defer if (!root_consumed) root.deinit();
+        const task = allocator.create(GeneratedSyntaxTask) catch {
+            self.reviewReload().rejectGeneratedSyntaxSpawn(allocator, request_id);
+            return;
+        };
+        task.* = .{ .request = request, .root = root };
+        request_consumed = true;
+        root_consumed = true;
+        ctx.task().spawnWith(.{ .ctx = task, .run = GeneratedSyntaxTask.run, .failed = GeneratedSyntaxTask.failed }) catch {
+            task.request.deinit(allocator);
+            task.root.deinit();
+            allocator.destroy(task);
+            self.reviewReload().rejectGeneratedSyntaxSpawn(allocator, request_id);
+            return;
+        };
     }
 
     fn stageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -4161,7 +4226,11 @@ pub const App = struct {
         self.pages.review.auto_reload.supersedeCycle();
         if (allocator) |owner| {
             self.pages.review.review_projection.clearPending(owner);
-        } else std.debug.assert(!self.pages.review.review_projection.hasPending());
+            self.pages.review.review_projection.clearSyntaxPending(owner);
+        } else {
+            std.debug.assert(!self.pages.review.review_projection.hasPending());
+            std.debug.assert(!self.pages.review.review_projection.hasSyntaxPending());
+        }
     }
 
     /// A repository identity change is destructive source supersession, not a
@@ -4270,6 +4339,17 @@ pub const App = struct {
         var result_transferred = false;
         defer if (!result_transferred) result.deinit(ctx.allocator());
         result_transferred = (try self.reviewReload().applyProjectionFinished(ctx.allocator(), &result)).result_transferred;
+        if (self.active_page != .review) ctx.redraw().skip();
+    }
+
+    fn finishGeneratedProjectionSyntax(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        finished: app_review_projection.GeneratedSyntaxFinished,
+    ) void {
+        var result = finished;
+        defer result.deinit(ctx.allocator());
+        self.reviewReload().applyGeneratedSyntaxFinished(ctx.allocator(), &result);
         if (self.active_page != .review) ctx.redraw().skip();
     }
 
@@ -7698,7 +7778,7 @@ test "inactive repository change invalidates retained source before equal-finger
             source_revision,
             status_revision,
         ),
-        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(allocator, "cached-a", "cached\n", false) },
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(allocator, "cached-a", "cached\n") },
     });
     app.pages.review.review_projection.cacheOrClearDisplayed(
         allocator,
@@ -7719,7 +7799,7 @@ test "inactive repository change invalidates retained source before equal-finger
             source_revision,
             status_revision,
         ),
-        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(allocator, "displayed-a", "displayed\n", false) },
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(allocator, "displayed-a", "displayed\n") },
     });
     app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
         allocator,
@@ -8853,6 +8933,109 @@ test "repository syntax task allocation and spawn failures release owners and re
     abandoned.deinitUndelivered(allocator);
 }
 
+test "generated projection syntax start failures preserve plain display and remain retryable" {
+    if (!source_syntax_runtime.enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .review,
+        .config = .{ .source = .unstaged },
+    };
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.discovery = try testSingleRepoDiscovery(allocator, root_path);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(root_path);
+    app.pages.review.load = app_test_support.loadState(app_test_support.loadedDiffOne());
+    app.pages.review.viewer.selected_target = .{ .status_only = 0 };
+    _ = app.pages.review.activation.activate(0, .pending, .pending, .pending);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? new.zig\x00");
+    try app.pages.review.git_status.replace(root_path, &status_bundle);
+    app.pages.review.review_projection.installReady(.{
+        .request = try app_review_projection.cloneRequestWithRootIdentity(
+            allocator,
+            app.pages.review.activation.currentIdentity().?,
+            11,
+            root_path,
+            "new.zig",
+            .generated_added_file,
+            .unstaged,
+            0,
+            0,
+            app.repo_state.root.?.identity,
+        ),
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(
+            allocator,
+            "new.zig",
+            "const value = 1;\n",
+        ) },
+    });
+
+    // Failure while preparing the two owned request clones must not escape
+    // App.update's best-effort decoration tail or leave a pending owner behind.
+    var prepare_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    app.allocator = prepare_failing.allocator();
+    var prepare_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = prepare_failing.allocator(), ._io = io };
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 24 } }, &prepare_ctx);
+    app.allocator = allocator;
+    try std.testing.expect(!app.pages.review.review_projection.hasSyntaxPending());
+    try std.testing.expectEqual(@as(usize, 0), prepare_ctx.takePendingTasksWith().len);
+    try expectGeneratedProjectionEligible(&app);
+
+    // Four string allocations build the page/task request clones. Fail the
+    // following task-object allocation and verify both clones are reclaimed.
+    var task_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 4 });
+    app.allocator = task_failing.allocator();
+    var allocation_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = task_failing.allocator(), ._io = io };
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 24 } }, &allocation_ctx);
+    app.allocator = allocator;
+    try std.testing.expect(!app.pages.review.review_projection.hasSyntaxPending());
+    try std.testing.expectEqual(@as(usize, 0), allocation_ctx.takePendingTasksWith().len);
+    try expectGeneratedProjectionEligible(&app);
+
+    const DummyTask = struct {
+        fn run(_: std.mem.Allocator, _: std.Io) App.Msg {
+            return .quit;
+        }
+        fn failed(_: chasen.TaskFailure) App.Msg {
+            return .quit;
+        }
+    };
+    var spawn_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+    for (0..16) |_| try spawn_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 24 } }, &spawn_ctx);
+    try std.testing.expect(!app.pages.review.review_projection.hasSyntaxPending());
+    try std.testing.expectEqual(@as(usize, 0), spawn_ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 16), spawn_ctx.takePendingTasks().len);
+    try expectGeneratedProjectionEligible(&app);
+
+    var retry_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 24 } }, &retry_ctx);
+    const queued = retry_ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    try std.testing.expect(app.pages.review.review_projection.hasSyntaxPending());
+    try expectGeneratedProjectionEligible(&app);
+    var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+}
+
+fn expectGeneratedProjectionEligible(app: *const App) !void {
+    const ready = switch (app.pages.review.review_projection.displayed) {
+        .ready => |ready| ready,
+        .idle, .failed => return error.ExpectedGeneratedProjection,
+    };
+    const bundle = switch (ready.value) {
+        .generated_added_file => |bundle| bundle,
+        else => return error.ExpectedGeneratedProjection,
+    };
+    try std.testing.expect(bundle.decoration == .eligible);
+}
+
 fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette {
     const FakeConfig = struct {
         role: theme.Role,
@@ -9649,7 +9832,7 @@ test "empty watch source carries generated navigation into generated projection"
     );
     app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = displayed_request,
-        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "a", "one\ntwo\nthree\nfour\n", false) },
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "a", "one\ntwo\nthree\nfour\n") },
     } };
     const original_offset = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
     try std.testing.expectEqual(@as(usize, 2), original_offset);
@@ -9697,7 +9880,7 @@ test "empty watch source carries generated navigation into generated projection"
     );
     try app.finishReviewProjectionLoad(&ctx, .{
         .request = result_request,
-        .result = .{ .ready = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "a", "one\ntwo\nthree\nfour\nfive\n", false) } },
+        .result = .{ .ready = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "a", "one\ntwo\nthree\nfour\nfive\n") } },
     });
 
     try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);

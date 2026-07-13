@@ -1,4 +1,5 @@
-//! Bounded current-file source coordinates for the Repository page.
+//! Bounded current-file source coordinates shared by Repository source view
+//! and Review's generated preview for an untracked file.
 //!
 //! `Document` owns the safe UTF-8 bytes accepted by `repository/document.zig`.
 //! Lines borrow those bytes through 32-bit offsets; no per-line text is copied.
@@ -171,6 +172,13 @@ pub const Document = struct {
 
     pub fn maxDisplayWidth(self: *const Document) usize {
         return self.max_display_width;
+    }
+
+    /// Bytes retained by this move-only source model. The value excludes the
+    /// struct itself so aggregate owners can account for their own overhead
+    /// exactly once.
+    pub fn retainedBytes(self: *const Document) usize {
+        return self.bytes.len +| self.line_starts.len *| @sizeOf(u32);
     }
 };
 

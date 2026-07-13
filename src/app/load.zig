@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const chasen = @import("chasen");
 const auto_reload = @import("auto_reload.zig");
@@ -16,6 +17,11 @@ const path_key_mod = @import("../path_key.zig");
 const process_runner = @import("../process/runner.zig");
 const review_projection = @import("review_projection.zig");
 const repo_discovery = @import("../repo/discovery.zig");
+const root_capability = @import("../repo/root_capability.zig");
+const selected_document = @import("../repository/document.zig");
+const repository_source = @import("../repository/source.zig");
+const source_syntax = @import("../syntax/source.zig");
+const source_syntax_runtime = @import("../syntax/source_runtime.zig");
 const syntax_provider = @import("../syntax/provider_runtime.zig");
 
 const LoadRequest = diff_source.LoadRequest;
@@ -118,6 +124,7 @@ pub const ReviewReadFinished = union(enum) {
     status: StatusLoadFinished,
     branch_status: BranchStatusLoadFinished,
     projection: ReviewProjectionFinished,
+    projection_syntax: review_projection.GeneratedSyntaxFinished,
 
     pub fn deinit(self: *ReviewReadFinished, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -562,23 +569,26 @@ pub fn BranchListLoadTask(comptime Msg: type) type {
 pub fn ReviewProjectionTask(comptime Msg: type) type {
     return struct {
         request: review_projection.Request,
+        root: ?root_capability.RootCapability = null,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
+            defer if (task.root) |*root| root.deinit();
 
             const request = task.request;
             task.request = undefined;
 
             return Msg.loadFinished(.{ .review = .{ .projection = ReviewProjectionFinished{
                 .request = request,
-                .result = runReviewProjectionLoad(request, allocator, io),
+                .result = runReviewProjectionLoad(request, task.root, allocator, io),
             } } });
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
+            defer if (task.root) |*root| root.deinit();
 
             const request = task.request;
             task.request = undefined;
@@ -586,6 +596,68 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
             return Msg.loadFinished(.{ .review = .{ .projection = ReviewProjectionFinished{
                 .request = request,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
+            } } });
+        }
+    };
+}
+
+pub fn GeneratedSyntaxTask(comptime Msg: type) type {
+    return struct {
+        request: review_projection.GeneratedSyntaxRequest,
+        root: root_capability.RootCapability,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+            defer task.root.deinit();
+
+            const request = task.request;
+            task.request = undefined;
+            var snapshot_fingerprint: ?content_fingerprint.Fingerprint = null;
+            var result: review_projection.GeneratedSyntaxResult = .{ .terminal_plain = .provider_unavailable };
+
+            if (!task.root.identity.eql(request.root_identity)) {
+                result = .stale;
+            } else {
+                var snapshot = selected_document.load(task.root, request.path_key, allocator, io);
+                defer snapshot.deinit(allocator);
+                switch (snapshot) {
+                    .text => |text| {
+                        snapshot_fingerprint = text.fingerprint;
+                        if (!text.fingerprint.eql(request.expected_fingerprint)) {
+                            result = .stale;
+                        } else {
+                            var source = repository_source.Document.initOwned(allocator, text.bytes, text.fingerprint) catch null;
+                            if (source) |*document| {
+                                snapshot = .unreadable;
+                                defer document.deinit(allocator);
+                                const spans: ?source_syntax.SourceSpans = source_syntax_runtime.buildSourceSpans(allocator, io, document, request.path_key) catch null;
+                                if (spans) |owned| result = .{ .loaded = owned };
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            return Msg.loadFinished(.{ .review = .{ .projection_syntax = .{
+                .request = request,
+                .snapshot_fingerprint = snapshot_fingerprint,
+                .result = result,
+            } } });
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+            defer task.root.deinit();
+
+            const request = task.request;
+            task.request = undefined;
+            return Msg.loadFinished(.{ .review = .{ .projection_syntax = .{
+                .request = request,
+                .snapshot_fingerprint = null,
+                .result = .{ .terminal_plain = .provider_unavailable },
             } } });
         }
     };
@@ -911,10 +983,15 @@ pub fn runLoadExpected(
     }
 }
 
-pub fn runReviewProjectionLoad(request: review_projection.Request, allocator: std.mem.Allocator, io: std.Io) review_projection.TaskResult {
+pub fn runReviewProjectionLoad(
+    request: review_projection.Request,
+    root: ?root_capability.RootCapability,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) review_projection.TaskResult {
     return switch (request.kind) {
         .cached_diff => loadCachedFileDiff(request, allocator, io),
-        .generated_added_file => loadGeneratedAddedFile(request, allocator, io),
+        .generated_added_file => loadGeneratedAddedFile(request, root, allocator, io),
         .combined_hunks => loadCombinedHunks(request, allocator, io),
     };
 }
@@ -1002,29 +1079,51 @@ fn loadCombinedHunks(request: review_projection.Request, allocator: std.mem.Allo
     return .{ .ready = .{ .combined_hunks = bundle } };
 }
 
-fn loadGeneratedAddedFile(request: review_projection.Request, allocator: std.mem.Allocator, io: std.Io) review_projection.TaskResult {
-    const content = readRepoFile(allocator, io, request.repo_root, request.path_key) catch |err| {
-        return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Cannot show file content: {s}", .{@errorName(err)}) catch
-            return .{ .failed_static = "Projection allocation failed" } };
-    };
-    defer allocator.free(content);
+fn loadGeneratedAddedFile(
+    request: review_projection.Request,
+    root: ?root_capability.RootCapability,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) review_projection.TaskResult {
+    const capability = root orelse return .{ .failed_static = "Repository root is unavailable" };
+    if (!request.matchesRootIdentity(capability.identity)) return .{ .failed_static = "Repository root changed" };
 
-    if (std.mem.indexOfScalar(u8, content, 0) != null) {
-        return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "Binary file content is not shown.", .{}) catch
-            return .{ .failed_static = "Projection allocation failed" } } };
+    var snapshot = selected_document.load(capability, request.path_key, allocator, io);
+    defer snapshot.deinit(allocator);
+    switch (snapshot) {
+        .text => |text| {
+            const bytes = text.bytes;
+            const fingerprint = text.fingerprint;
+            snapshot = .unreadable;
+            const bundle = review_projection.generatedFileFromOwnedContent(
+                allocator,
+                request.path_key,
+                bytes,
+                fingerprint,
+            ) catch return .{ .failed_static = "Generated preview allocation failed" };
+            return .{ .ready = .{ .generated_added_file = bundle } };
+        },
+        .binary => return generatedStatusBody(allocator, request.path_key, "Binary file content is not shown."),
+        .invalid_utf8 => return generatedStatusBody(allocator, request.path_key, "Invalid UTF-8 file content is not shown."),
+        .unsafe_control_text => return generatedStatusBody(allocator, request.path_key, "Unsafe control characters are not shown."),
+        .oversized => return generatedStatusBody(allocator, request.path_key, "File exceeds the 1 MiB preview limit."),
+        .symlink => return generatedStatusBody(allocator, request.path_key, "Symbolic link content is not shown."),
+        .directory_or_gitlink => return generatedStatusBody(allocator, request.path_key, "Directory content is not shown."),
+        .named_pipe, .unix_socket, .block_device, .character_device, .unknown_special => return generatedStatusBody(allocator, request.path_key, "Special file content is not shown."),
+        .missing_or_changed => return generatedStatusBody(allocator, request.path_key, "File changed while loading."),
+        .unreadable => return generatedStatusBody(allocator, request.path_key, "File content could not be read."),
+        .unsupported_platform => return generatedStatusBody(allocator, request.path_key, "Safe file preview is unavailable on this platform."),
     }
-
-    const bundle = review_projection.generatedFileFromContent(allocator, request.path_key, content, false) catch |err| {
-        return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Generated diff failed: {s}", .{@errorName(err)}) catch
-            return .{ .failed_static = "Generated diff failed: OutOfMemory" } };
-    };
-    return .{ .ready = .{ .generated_added_file = bundle } };
 }
 
-fn readRepoFile(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path_key: []const u8) ![]u8 {
-    return readRepoFileLimited(allocator, io, repo_root, path_key, review_projection.max_generated_file_bytes);
+fn generatedStatusBody(allocator: std.mem.Allocator, path: []const u8, message: []const u8) review_projection.TaskResult {
+    return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, path, "{s}", .{message}) catch
+        return .{ .failed_static = "Projection allocation failed" } } };
 }
 
+/// Residual stats-only helper for best-effort untracked line counts. Review
+/// preview bytes must use `repository/document.zig` instead: this legacy walk
+/// validates components but cannot make its stat/open pairs race-free.
 fn readRepoFileLimited(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path_key: []const u8, limit: usize) ![]u8 {
     try validateRepoRelativePath(path_key);
 
@@ -1162,7 +1261,7 @@ test "expected raw fingerprint returns unchanged before diff parsing" {
     }
 }
 
-test "readRepoFile rejects symlink components" {
+test "stats-only repository read rejects stable symlink components" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1176,12 +1275,97 @@ test "readRepoFile rejects symlink components" {
     const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo_root);
 
-    const content = try readRepoFile(std.testing.allocator, io, repo_root, "inside.txt");
+    const content = try readRepoFileLimited(std.testing.allocator, io, repo_root, "inside.txt", review_projection.max_generated_file_bytes);
     defer std.testing.allocator.free(content);
     try std.testing.expectEqualStrings("inside", content);
 
-    try std.testing.expectError(error.InvalidPath, readRepoFile(std.testing.allocator, io, repo_root, "linked.txt"));
-    try std.testing.expectError(error.InvalidPath, readRepoFile(std.testing.allocator, io, repo_root, "linked-dir/inside.txt"));
+    try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, repo_root, "linked.txt", review_projection.max_generated_file_bytes));
+    try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, repo_root, "linked-dir/inside.txt", review_projection.max_generated_file_bytes));
+}
+
+test "generated projection uses pinned safe source snapshot" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "new.zig", .data = "const value = 1;\r\n" });
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    var root = try root_capability.RootCapability.openCanonical(root_path);
+    defer root.deinit();
+    var request = try review_projection.cloneRequestWithRootIdentity(
+        allocator,
+        page.RequestIdentity.review(1, 2),
+        3,
+        root_path,
+        "new.zig",
+        .generated_added_file,
+        .unstaged,
+        4,
+        5,
+        root.identity,
+    );
+    defer request.deinit(allocator);
+
+    var result = runReviewProjectionLoad(request, root, allocator, io);
+    defer result.deinit(allocator);
+    switch (result) {
+        .ready => |ready| switch (ready) {
+            .generated_added_file => |bundle| {
+                try std.testing.expectEqualStrings("const value = 1;", bundle.source.lineBody(0).?);
+                try std.testing.expect(bundle.fingerprint().eql(content_fingerprint.Fingerprint.init("const value = 1;\r\n")));
+            },
+            else => return error.ExpectedGeneratedPreview,
+        },
+        else => return error.ExpectedGeneratedPreview,
+    }
+}
+
+test "generated projection keeps unsafe text inert and rejects another root identity" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    try first.dir.writeFile(io, .{ .sub_path = "unsafe.zig", .data = "before\rafter" });
+    const first_path = try first.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(first_path);
+    const second_path = try second.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(second_path);
+    var first_root = try root_capability.RootCapability.openCanonical(first_path);
+    defer first_root.deinit();
+    var second_root = try root_capability.RootCapability.openCanonical(second_path);
+    defer second_root.deinit();
+    var request = try review_projection.cloneRequestWithRootIdentity(
+        allocator,
+        page.RequestIdentity.review(1, 2),
+        3,
+        first_path,
+        "unsafe.zig",
+        .generated_added_file,
+        .unstaged,
+        4,
+        5,
+        first_root.identity,
+    );
+    defer request.deinit(allocator);
+
+    var unsafe = runReviewProjectionLoad(request, first_root, allocator, io);
+    defer unsafe.deinit(allocator);
+    try std.testing.expect(switch (unsafe) {
+        .ready => |ready| ready == .status_body,
+        else => false,
+    });
+
+    var wrong_root = runReviewProjectionLoad(request, second_root, allocator, io);
+    defer wrong_root.deinit(allocator);
+    try std.testing.expect(switch (wrong_root) {
+        .failed_static => |message| std.mem.eql(u8, message, "Repository root changed"),
+        else => false,
+    });
 }
 
 test "addedFileLineCount uses diff stats semantics" {
@@ -1508,4 +1692,58 @@ test "ReviewProjectionTask failed preserves request identity" {
         .failed_static => |message| message,
         else => return error.UnexpectedResult,
     });
+}
+
+test "GeneratedSyntaxTask rereads pinned matching source and owns completion" {
+    if (!source_syntax_runtime.enabled) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const TestLoadMsg = ReadFinished;
+    const TestMsg = union(enum) {
+        load: TestLoadMsg,
+
+        pub fn loadFinished(msg: TestLoadMsg) @This() {
+            return .{ .load = msg };
+        }
+    };
+    const Task = GeneratedSyntaxTask(TestMsg);
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const content = "const value = 1;\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "new.zig", .data = content });
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    var root = try root_capability.RootCapability.openCanonical(root_path);
+    defer root.deinit();
+
+    const task = try allocator.create(Task);
+    task.* = .{
+        .request = .{
+            .identity = page.RequestIdentity.review(2, 3),
+            .id = 4,
+            .projection_id = 5,
+            .root_identity = root.identity,
+            .repo_root = try allocator.dupe(u8, root_path),
+            .path_key = try allocator.dupe(u8, "new.zig"),
+            .source_kind = .unstaged,
+            .source_session_revision = 6,
+            .status_snapshot_revision = 7,
+            .expected_fingerprint = .init(content),
+        },
+        .root = try root.duplicate(),
+    };
+    const msg = Task.run(task, allocator, io);
+    var finished = switch (msg) {
+        .load => |load| switch (load) {
+            .review => |review| switch (review) {
+                .projection_syntax => |payload| payload,
+                else => return error.UnexpectedReadRoute,
+            },
+            else => return error.UnexpectedReadRoute,
+        },
+    };
+    defer finished.deinit(allocator);
+    try std.testing.expect(finished.snapshot_fingerprint.?.eql(.init(content)));
+    try std.testing.expect(finished.result == .loaded);
 }

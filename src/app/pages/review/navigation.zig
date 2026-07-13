@@ -210,8 +210,8 @@ pub const View = struct {
         const target: DiffHeaderTarget = blk: {
             if (self.activeGeneratedFileProjection()) |bundle| {
                 break :blk .{
-                    .identity = .{ .kind = .generated_file, .path_key = bundle.file.path },
-                    .display_path = bundle.file.path,
+                    .identity = .{ .kind = .generated_file, .path_key = bundle.path },
+                    .display_path = bundle.path,
                 };
             }
             if (self.activeCombinedProjection()) |bundle| {
@@ -270,7 +270,7 @@ pub const View = struct {
     pub fn displayedDiffHeaderLayout(self: View, content_width: u16, display_path: []const u8) ?diff_render.HeaderLayout {
         const mode_width = diff_render.bodyWidth(content_width);
         if (self.activeGeneratedFileProjection()) |bundle| {
-            return diff_render.generatedHeaderLayout(content_width, display_path, bundle.file.lines.len, bundle.file.truncated, self.page.viewer.display_mode, mode_width);
+            return diff_render.generatedHeaderLayout(content_width, display_path, bundle.source.contentLineCount(), self.page.viewer.display_mode, mode_width);
         }
         const file = self.displayedDiffFile() orelse return null;
         return diff_render.fileHeaderLayout(content_width, display_path, file, self.page.viewer.display_mode, mode_width);
@@ -385,7 +385,7 @@ pub const View = struct {
                     if (bundle.loaded.cachedRenderedLineIndex(0, self.effectiveDisplayMode())) |index| index.lineCount() else 0
                 else
                     0,
-                .generated_added_file => |bundle| bundle.file.lines.len + @as(usize, if (bundle.file.truncated) 1 else 0),
+                .generated_added_file => |bundle| bundle.source.rowCount(),
                 .combined_hunks => |bundle| bundle.projection.lineIndex(self.effectiveDisplayMode()).lineCount(),
                 .status_body => 1,
             },
@@ -585,7 +585,7 @@ pub const View = struct {
 
     pub fn displayedGeneratedLineCount(self: View) ?usize {
         const bundle = self.activeGeneratedFileProjection() orelse return null;
-        return bundle.file.lines.len + @as(usize, if (bundle.file.truncated) 1 else 0);
+        return bundle.source.rowCount();
     }
 
     pub fn displayedDiffLineIndex(self: View, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
@@ -2909,7 +2909,7 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
     );
     app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
-        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n", false) },
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n") },
     } };
 
     try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
@@ -2950,7 +2950,7 @@ test "generated preview blocks diff search" {
     );
     app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
-        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n", false) },
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n") },
     } };
 
     app.reviewNavigation().enterSearchMode();

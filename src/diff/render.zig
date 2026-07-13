@@ -1,11 +1,14 @@
 const std = @import("std");
 const chasen = @import("chasen");
+const content_fingerprint = @import("../content_fingerprint.zig");
 const draw = @import("draw");
 const diff_file = @import("file.zig");
 const diff_parser = @import("parser.zig");
 const diff_selection = @import("selection.zig");
 const diff_view_model = @import("view_model.zig");
 const syntax_provider = @import("../syntax/provider.zig");
+const source_syntax = @import("../syntax/source.zig");
+const repository_source = @import("../repository/source.zig");
 const syntax_style = @import("../syntax/style.zig");
 const syntax_token = @import("../syntax/token.zig");
 const theme = @import("theme");
@@ -26,6 +29,8 @@ pub const RenderOptions = struct {
     palette: theme.Palette = .default(),
     file_index: usize = 0,
     syntax_spans: syntax_provider.DocumentSpans = .empty(),
+    source_syntax_spans: source_syntax.SourceSpans = .empty(),
+    source_has_visible_syntax: bool = false,
     selection: ?diff_selection.View = null,
     header_selection: bool = false,
 };
@@ -102,8 +107,8 @@ pub fn fileHeaderLayout(width: u16, path: []const u8, file: diff_parser.FileDiff
     }, modeLabel(mode_width, requested_mode));
 }
 
-pub fn generatedHeaderLayout(width: u16, path: []const u8, added_lines: usize, truncated: bool, requested_mode: DisplayMode, mode_width: u16) HeaderLayout {
-    const detail = if (truncated) "generated truncated" else "generated";
+pub fn generatedHeaderLayout(width: u16, path: []const u8, added_lines: usize, requested_mode: DisplayMode, mode_width: u16) HeaderLayout {
+    const detail = "generated";
     return headerLayout(width, path, .{
         .added = added_lines,
         .removed = 0,
@@ -278,14 +283,14 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     }
 }
 
-pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, lines: []const []const u8, truncated: bool, options: RenderOptions) !void {
+pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, source: *const repository_source.Document, options: RenderOptions) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
     const styles = stylesForOptions(options);
     const content_width = bodyWidth(size.width);
     const mode = effectiveMode(content_width, options.requested_mode);
-    try renderGeneratedFileHeader(surface, path, lines.len, truncated, options.requested_mode, content_width, options.pane_active, options.header_selection, styles);
+    try renderGeneratedFileHeader(surface, path, source.contentLineCount(), options.requested_mode, content_width, options.pane_active, options.header_selection, styles);
     var body_surface = surface.child(.{
         .col = cursor_gutter_width,
         .row = 0,
@@ -298,30 +303,25 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, line
         .height = size.height,
     };
 
-    if (truncated) {
-        const body_offset = cursor.bodyOffset();
-        const row = cursor.nextRow();
-        if (row) |visible_row| {
-            drawCursorMarker(surface, visible_row, body_offset, options.cursor_offset, styles);
-            try draw.copyClippedTextAt(&body_surface, 0, visible_row, "File preview truncated", styles.warning);
-        }
-    }
-
-    for (lines, 0..) |line_text, index| {
+    for (0..source.rowCount()) |index| {
         if (cursor.done()) return;
         const body_offset = cursor.bodyOffset();
         const row = cursor.nextRow() orelse continue;
         drawCursorMarker(surface, row, body_offset, options.cursor_offset, styles);
         const line: diff_parser.DiffLine = .{
             .kind = .added,
-            .text = line_text,
+            .text = source.lineBody(index).?,
             .new_line = @intCast(index + 1),
         };
+        const line_spans = options.source_syntax_spans.lineSpans(index);
         if (mode == .side_by_side) {
             const geometry = sideBySideGeometry(body_surface.size().width);
-            try drawSideBySidePair(&body_surface, row, null, line, geometry, options.horizontal_scroll, options.line_numbers, false, styles, .{}, null);
+            try drawSideBySidePair(&body_surface, row, null, line, geometry, options.horizontal_scroll, options.line_numbers, false, styles, .{
+                .new = line_spans,
+                .new_hunk_side_has_visible_syntax = options.source_has_visible_syntax,
+            }, null);
         } else {
-            try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, false, styles, .empty(), false);
+            try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, false, styles, line_spans, options.source_has_visible_syntax);
         }
     }
 }
@@ -352,18 +352,16 @@ fn renderGeneratedFileHeader(
     surface: *chasen.Surface,
     path: []const u8,
     added_lines: usize,
-    truncated: bool,
     requested_mode: DisplayMode,
     mode_width: u16,
     pane_active: bool,
     header_selected: bool,
     styles: RenderStyles,
 ) !void {
-    const detail = if (truncated) "generated truncated" else "generated";
     try drawHeaderLine(surface, path, .{
         .added = added_lines,
         .removed = 0,
-        .detail = detail,
+        .detail = "generated",
     }, modeLabel(mode_width, requested_mode), pane_active, header_selected, styles);
 }
 
@@ -1798,7 +1796,10 @@ test "renderGeneratedAddedFile draws content on new side in side-by-side mode" {
     try ts.init(90, 6);
     defer ts.deinit();
 
-    try renderGeneratedAddedFile(&ts.surface, "src/new.zig", &.{ "const value = 1;", "pub fn main() void {}" }, false, .{ .requested_mode = .side_by_side });
+    const bytes = try std.testing.allocator.dupe(u8, "const value = 1;\npub fn main() void {}");
+    var source = try repository_source.Document.initOwned(std.testing.allocator, bytes, .init(bytes));
+    defer source.deinit(std.testing.allocator);
+    try renderGeneratedAddedFile(&ts.surface, "src/new.zig", &source, .{ .requested_mode = .side_by_side });
 
     const geometry = sideBySideGeometry(bodyWidth(90));
     const new_start = cursor_gutter_width + geometry.new.col;
@@ -1814,7 +1815,10 @@ test "renderGeneratedAddedFile draws cursor marker" {
     try ts.init(80, 6);
     defer ts.deinit();
 
-    try renderGeneratedAddedFile(&ts.surface, "src/new.zig", &.{ "one", "two" }, false, .{
+    const bytes = try std.testing.allocator.dupe(u8, "one\ntwo");
+    var source = try repository_source.Document.initOwned(std.testing.allocator, bytes, content_fingerprint.Fingerprint.init(bytes));
+    defer source.deinit(std.testing.allocator);
+    try renderGeneratedAddedFile(&ts.surface, "src/new.zig", &source, .{
         .requested_mode = .unified,
         .cursor_offset = 1,
     });
@@ -1822,6 +1826,43 @@ test "renderGeneratedAddedFile draws cursor marker" {
     try ts.expectCellText(0, 3, " ");
     try ts.expectCellText(0, 4, "▌");
     try ts.expectCellText(14, 4, "t");
+}
+
+test "renderGeneratedAddedFile applies source syntax and hides plain added prefix" {
+    const allocator = std.testing.allocator;
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 6);
+    defer ts.deinit();
+    const bytes = try allocator.dupe(u8, "const value = 1;\n// note");
+    var source = try repository_source.Document.initOwned(allocator, bytes, .init(bytes));
+    defer source.deinit(allocator);
+    var spans = source_syntax.SourceSpans{
+        .line_entries = try allocator.dupe(source_syntax.LineEntry, &.{
+            .{ .line_index = 0, .span_start = 0, .span_count = 1 },
+            .{ .line_index = 1, .span_start = 1, .span_count = 1 },
+        }),
+        .spans = try allocator.dupe(syntax_token.TokenSpan, &.{
+            .{ .start = 0, .end = 5, .role = .keyword },
+            .{ .start = 0, .end = 7, .role = .comment },
+        }),
+    };
+    defer spans.deinit(allocator);
+
+    try renderGeneratedAddedFile(&ts.surface, "src/new.zig", &source, .{
+        .requested_mode = .unified,
+        .source_syntax_spans = spans,
+        .source_has_visible_syntax = true,
+    });
+
+    try ts.expectCellText(12, 3, " ");
+    try ts.expectCellText(12, 4, " ");
+    const keyword = ts.surface.readCell(14, 3).?;
+    try std.testing.expect(keyword.style.fg.eql(theme.Palette.default().color(.accent)));
+    try std.testing.expect(keyword.style.bg.eql(theme.Palette.default().color(.diff_added_bg)));
+    const identifier = ts.surface.readCell(20, 3).?;
+    try std.testing.expect(identifier.style.fg.eql(.default));
+    const comment = ts.surface.readCell(14, 4).?;
+    try std.testing.expect(comment.style.fg.eql(theme.Palette.default().color(.muted)));
 }
 
 test "narrow side-by-side request labels file header as automatic unified fallback" {

@@ -12,6 +12,8 @@ const app_load = @import("../../load.zig");
 const app_page = @import("../../page.zig");
 const load_state = @import("../../load_state.zig");
 const review_projection = @import("../../review_projection.zig");
+const root_capability = @import("../../../repo/root_capability.zig");
+const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
 const review_page = @import("../review.zig");
 const authority = @import("authority.zig");
 const navigation = @import("navigation.zig");
@@ -300,6 +302,7 @@ pub const Controller = struct {
     source: diff_source.SourceMode,
     repo_root: ?[]const u8,
     repo_epoch: u64 = 0,
+    root_identity: ?root_capability.Identity = null,
 
     fn acceptsIdentity(self: Controller, identity: app_page.RequestIdentity) bool {
         return self.page.activation.acceptsRepoEpoch(identity, self.repo_epoch);
@@ -650,14 +653,17 @@ pub const Controller = struct {
         if (self.page.pending_display_navigation_restore != null and !self.view().pendingDisplayRestoreMatchesTarget(target)) {
             self.clearDisplayRestore(allocator);
         }
-        if (self.page.review_projection.displayedMatches(
+        const displayed_matches = self.page.review_projection.displayedMatches(
             target.repo_root,
             target.path_key,
             target.kind,
             target.source_kind,
             self.page.source_session_revision,
             self.page.status_snapshot_revision,
-        )) return .{};
+        );
+        if (displayed_matches and
+            (target.kind != .generated_added_file or
+                self.page.review_projection.displayed.request().?.matchesRootIdentity(self.root_identity))) return .{};
 
         if (self.page.review_projection.cacheHas(
             target.repo_root,
@@ -684,18 +690,20 @@ pub const Controller = struct {
             var hit_owned = true;
             defer if (hit_owned) hit.deinit(allocator);
 
-            self.page.review_projection.clearPending(allocator);
-            self.page.review_projection.cacheOrClearDisplayed(
-                allocator,
-                target.repo_root,
-                target.source_kind,
-                self.page.source_session_revision,
-                self.page.status_snapshot_revision,
-            );
-            self.page.review_projection.installReady(hit);
-            hit_owned = false;
-            self.reconcileInstalledProjectionNavigation(allocator, if (local_navigation) |*anchor| anchor else null);
-            return .{};
+            if (target.kind != .generated_added_file or hit.request.matchesRootIdentity(self.root_identity)) {
+                self.page.review_projection.clearPending(allocator);
+                self.page.review_projection.cacheOrClearDisplayed(
+                    allocator,
+                    target.repo_root,
+                    target.source_kind,
+                    self.page.source_session_revision,
+                    self.page.status_snapshot_revision,
+                );
+                self.page.review_projection.installReady(hit);
+                hit_owned = false;
+                self.reconcileInstalledProjectionNavigation(allocator, if (local_navigation) |*anchor| anchor else null);
+                return .{};
+            }
         }
         if (self.page.review_projection.pendingMatches(
             target.repo_root,
@@ -720,7 +728,8 @@ pub const Controller = struct {
         const request_id = self.page.review_projection_next_id;
         const identity = self.page.activation.currentIdentity() orelse return .{};
 
-        var state_request = try review_projection.cloneRequest(
+        const request_root_identity = if (target.kind == .generated_added_file) self.root_identity else null;
+        var state_request = try review_projection.cloneRequestWithRootIdentity(
             allocator,
             identity,
             request_id,
@@ -730,10 +739,11 @@ pub const Controller = struct {
             target.source_kind,
             self.page.source_session_revision,
             self.page.status_snapshot_revision,
+            request_root_identity,
         );
         errdefer state_request.deinit(allocator);
 
-        var task_request = try review_projection.cloneRequest(
+        var task_request = try review_projection.cloneRequestWithRootIdentity(
             allocator,
             identity,
             request_id,
@@ -743,6 +753,7 @@ pub const Controller = struct {
             target.source_kind,
             self.page.source_session_revision,
             self.page.status_snapshot_revision,
+            request_root_identity,
         );
         errdefer task_request.deinit(allocator);
 
@@ -757,6 +768,138 @@ pub const Controller = struct {
     pub fn rejectProjectionSpawn(self: Controller, allocator: std.mem.Allocator, request_id: u64) void {
         const pending_id = if (self.page.review_projection.pending) |request| request.id else return;
         if (pending_id == request_id) self.page.review_projection.clearPending(allocator);
+    }
+
+    /// Prepares optional syntax only for the current plain generated preview.
+    /// The bundle remains `eligible` while the page-owned pending request is
+    /// in flight, so immutable cache admission never needs to mutate an entry.
+    pub fn prepareGeneratedSyntax(self: Controller, allocator: std.mem.Allocator) !?review_projection.GeneratedSyntaxRequest {
+        if (!source_syntax_runtime.enabled) return null;
+        const target = self.view().projectionTarget() orelse return null;
+        if (target.kind != .generated_added_file) return null;
+
+        const ready = switch (self.page.review_projection.displayed) {
+            .ready => |*ready| ready,
+            .idle, .failed => return null,
+        };
+        if (!ready.request.matchesBorrowed(
+            target.repo_root,
+            target.path_key,
+            target.kind,
+            target.source_kind,
+            self.page.source_session_revision,
+            self.page.status_snapshot_revision,
+        )) return null;
+        if (!ready.request.matchesRootIdentity(self.root_identity)) return null;
+        const bundle = switch (ready.value) {
+            .generated_added_file => |*bundle| bundle,
+            else => return null,
+        };
+        switch (bundle.decoration) {
+            .eligible => {},
+            .terminal_plain, .decorated => return null,
+        }
+        const current_identity = self.page.activation.currentIdentity() orelse return null;
+
+        if (self.page.review_projection.syntax_pending) |pending| {
+            if (pending.projection_id == ready.request.id and
+                pending.identity.origin == current_identity.origin and
+                pending.identity.repo_epoch == current_identity.repo_epoch and
+                pending.identity.activation_id == current_identity.activation_id and
+                pending.root_identity.eql(ready.request.root_identity.?) and
+                pending.expected_fingerprint.eql(bundle.fingerprint())) return null;
+            self.page.review_projection.clearSyntaxPending(allocator);
+        }
+
+        self.page.review_projection.syntax_next_id +%= 1;
+        if (self.page.review_projection.syntax_next_id == 0) self.page.review_projection.syntax_next_id = 1;
+        var state_request = try review_projection.generatedSyntaxRequestForProjection(
+            allocator,
+            self.page.review_projection.syntax_next_id,
+            current_identity,
+            ready.request,
+            bundle.fingerprint(),
+        );
+        errdefer state_request.deinit(allocator);
+        const task_request = try review_projection.cloneGeneratedSyntaxRequest(allocator, state_request);
+        self.page.review_projection.syntax_pending = state_request;
+        return task_request;
+    }
+
+    pub fn rejectGeneratedSyntaxSpawn(self: Controller, allocator: std.mem.Allocator, request_id: u64) void {
+        const pending_id = if (self.page.review_projection.syntax_pending) |request| request.id else return;
+        if (pending_id == request_id) self.page.review_projection.clearSyntaxPending(allocator);
+    }
+
+    pub fn applyGeneratedSyntaxFinished(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        finished: *review_projection.GeneratedSyntaxFinished,
+    ) void {
+        const current_identity = self.page.activation.currentIdentity() orelse {
+            if (self.page.review_projection.syntax_pending) |pending| {
+                if (pending.matches(finished.request)) self.page.review_projection.clearSyntaxPending(allocator);
+            }
+            return;
+        };
+        if (current_identity.origin != finished.request.identity.origin or
+            current_identity.repo_epoch != finished.request.identity.repo_epoch or
+            current_identity.activation_id != finished.request.identity.activation_id)
+        {
+            if (self.page.review_projection.syntax_pending) |pending| {
+                if (pending.matches(finished.request)) self.page.review_projection.clearSyntaxPending(allocator);
+            }
+            return;
+        }
+        const pending = self.page.review_projection.syntax_pending orelse return;
+        if (!pending.matches(finished.request)) return;
+        self.page.review_projection.clearSyntaxPending(allocator);
+        const active_root = self.root_identity orelse return;
+        if (!active_root.eql(finished.request.root_identity)) return;
+
+        const target = self.view().projectionTarget() orelse return;
+        if (target.kind != .generated_added_file) return;
+        const ready = switch (self.page.review_projection.displayed) {
+            .ready => |*ready| ready,
+            .idle, .failed => return,
+        };
+        if (ready.request.id != finished.request.projection_id or
+            !ready.request.matchesRootIdentity(active_root) or
+            !ready.request.matchesBorrowed(
+                target.repo_root,
+                target.path_key,
+                target.kind,
+                target.source_kind,
+                self.page.source_session_revision,
+                self.page.status_snapshot_revision,
+            )) return;
+        const bundle = switch (ready.value) {
+            .generated_added_file => |*bundle| bundle,
+            else => return,
+        };
+        if (!bundle.fingerprint().eql(finished.request.expected_fingerprint)) return;
+
+        switch (finished.result) {
+            .loaded => |spans| {
+                const snapshot = finished.snapshot_fingerprint orelse {
+                    bundle.decoration = .{ .terminal_plain = .snapshot_changed };
+                    return;
+                };
+                if (!snapshot.eql(finished.request.expected_fingerprint) or
+                    !snapshot.eql(bundle.fingerprint()))
+                {
+                    bundle.decoration = .{ .terminal_plain = .snapshot_changed };
+                    return;
+                }
+                bundle.decoration = .{ .decorated = .{
+                    .spans = spans,
+                    .has_visible_syntax = review_projection.sourceSpansHaveVisibleSyntax(spans),
+                } };
+                finished.result = .stale;
+            },
+            .terminal_plain => |reason| bundle.decoration = .{ .terminal_plain = reason },
+            .stale => bundle.decoration = .{ .terminal_plain = .snapshot_changed },
+        }
     }
 
     fn reconcileInstalledProjectionNavigation(
@@ -970,6 +1113,8 @@ pub const Controller = struct {
         if (pending_id != result.request.id) return .{};
 
         const current = self.view().projectionTarget() orelse return .{};
+        if (result.request.kind == .generated_added_file and
+            !result.request.matchesRootIdentity(self.root_identity)) return .{};
         if (!result.request.matchesBorrowed(
             current.repo_root,
             current.path_key,
@@ -1011,7 +1156,7 @@ pub const Controller = struct {
                 return .{ .result_transferred = true };
             },
             .failed_static => |message| {
-                var request = try review_projection.cloneRequest(
+                var request = try review_projection.cloneRequestWithRootIdentity(
                     allocator,
                     result.request.identity,
                     result.request.id,
@@ -1021,6 +1166,7 @@ pub const Controller = struct {
                     result.request.source_kind,
                     result.request.source_session_revision,
                     result.request.status_snapshot_revision,
+                    result.request.root_identity,
                 );
                 errdefer request.deinit(allocator);
                 var body = try review_projection.statusBodyAlloc(allocator, result.request.path_key, "{s}", .{message});
@@ -1811,19 +1957,19 @@ test "projection cache revisits A after B without a third read command" {
             0,
             0,
         ),
-        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "b", "late\n", false) } },
+        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "b", "late\n") } },
     };
     defer late.deinit(allocator);
     var revisit = try controller.prepareProjection(allocator);
     defer revisit.deinit(allocator);
     try std.testing.expect(revisit.command == null);
     try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.file.lines.ptr);
+    try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
     try std.testing.expect(page.review_projection.cacheHas("/repo", "b", .generated_added_file, .unstaged, 0, 0));
 
     const late_apply = try controller.applyProjectionFinished(allocator, &late);
     try std.testing.expect(!late_apply.result_transferred);
-    try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.file.lines.ptr);
+    try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
 }
 
 test "projection cache survives selecting a file that needs no projection" {
@@ -1853,7 +1999,7 @@ test "projection cache survives selecting a file that needs no projection" {
     var revisit = try controller.prepareProjection(allocator);
     defer revisit.deinit(allocator);
     try std.testing.expect(revisit.command == null);
-    try std.testing.expectEqual(c_lines, page.review_projection.displayed.ready.value.generated_added_file.file.lines.ptr);
+    try std.testing.expectEqual(c_lines, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
 }
 
 test "full projection cache promotes LRU before old display admission" {
@@ -1869,10 +2015,10 @@ test "full projection cache promotes LRU before old display admission" {
     const controller = testController(&page, &status_message, .unstaged);
 
     const paths = [_][]const u8{ "a", "b", "c", "d" };
-    var a_lines: [*]const []const u8 = undefined;
+    var a_lines: [*]const u8 = undefined;
     for (paths, 0..) |path, index| {
         const ready = try testGeneratedReady(allocator, index + 1, path, 0, 0);
-        if (index == 0) a_lines = ready.value.generated_added_file.file.lines.ptr;
+        if (index == 0) a_lines = ready.value.generated_added_file.source.bytes.ptr;
         page.review_projection.installReady(ready);
         page.review_projection.cacheOrClearDisplayed(allocator, "/repo", .unstaged, 0, 0);
     }
@@ -1901,10 +2047,132 @@ test "full projection cache promotes LRU before old display admission" {
     try std.testing.expect(update.command == null);
     try std.testing.expectEqual(@as(usize, 1), failing.alloc_index);
     try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.file.lines.ptr);
+    try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
     try std.testing.expectEqual(review_projection.max_cached_entries, page.review_projection.cacheLen());
     try std.testing.expect(page.review_projection.cacheHas("/repo", "e", .generated_added_file, .unstaged, 0, 0));
     try std.testing.expect(page.review_projection.cacheRetainedBytes() <= review_projection.max_cached_retained_bytes);
+}
+
+test "generated syntax lifecycle separates pending decorated terminal and cache states" {
+    if (!source_syntax_runtime.enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const root = root_capability.Identity{ .device = 9, .inode = 17 };
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    var controller = testController(&page, &status_message, .unstaged);
+    controller.root_identity = root;
+
+    page.review_projection.installReady(.{
+        .request = try review_projection.cloneRequestWithRootIdentity(
+            allocator,
+            page.activation.currentIdentity().?,
+            11,
+            "/repo",
+            "a",
+            .generated_added_file,
+            .unstaged,
+            0,
+            0,
+            root,
+        ),
+        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "const value = 1;\n") },
+    });
+
+    var task_request = (try controller.prepareGeneratedSyntax(allocator)) orelse return error.ExpectedSyntaxRequest;
+    defer task_request.deinit(allocator);
+    try std.testing.expect(page.review_projection.hasSyntaxPending());
+    try std.testing.expect((try controller.prepareGeneratedSyntax(allocator)) == null);
+
+    const entries = try allocator.dupe(@import("../../../syntax/source.zig").LineEntry, &.{.{
+        .line_index = 0,
+        .span_start = 0,
+        .span_count = 1,
+    }});
+    const spans = try allocator.dupe(@import("../../../syntax/token.zig").TokenSpan, &.{.{
+        .start = 0,
+        .end = 5,
+        .role = .keyword,
+    }});
+    var finished = review_projection.GeneratedSyntaxFinished{
+        .request = try review_projection.cloneGeneratedSyntaxRequest(allocator, task_request),
+        .snapshot_fingerprint = task_request.expected_fingerprint,
+        .result = .{ .loaded = .{ .line_entries = entries, .spans = spans } },
+    };
+    defer finished.deinit(allocator);
+    controller.applyGeneratedSyntaxFinished(allocator, &finished);
+    try std.testing.expect(!page.review_projection.hasSyntaxPending());
+    const decorated_bundle = &page.review_projection.displayed.ready.value.generated_added_file;
+    try std.testing.expect(decorated_bundle.decoration == .decorated);
+    try std.testing.expect(decorated_bundle.decoration.hasVisibleSyntax());
+    try std.testing.expect((try controller.prepareGeneratedSyntax(allocator)) == null);
+
+    page.review_projection.cacheOrClearDisplayed(allocator, "/repo", .unstaged, 0, 0);
+    var promoted = try controller.prepareProjection(allocator);
+    defer promoted.deinit(allocator);
+    try std.testing.expect(promoted.command == null);
+    try std.testing.expect((try controller.prepareGeneratedSyntax(allocator)) == null);
+
+    page.review_projection.displayed.ready.value.generated_added_file.decoration.deinit(allocator);
+    page.review_projection.displayed.ready.value.generated_added_file.decoration = .{ .terminal_plain = .provider_unavailable };
+    try std.testing.expect((try controller.prepareGeneratedSyntax(allocator)) == null);
+}
+
+test "generated syntax completion after cache admission cannot mutate immutable entry" {
+    if (!source_syntax_runtime.enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const root = root_capability.Identity{ .device = 4, .inode = 8 };
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    var controller = testController(&page, &status_message, .unstaged);
+    controller.root_identity = root;
+    page.review_projection.installReady(.{
+        .request = try review_projection.cloneRequestWithRootIdentity(
+            allocator,
+            page.activation.currentIdentity().?,
+            31,
+            "/repo",
+            "a",
+            .generated_added_file,
+            .unstaged,
+            0,
+            0,
+            root,
+        ),
+        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "const x = 1;\n") },
+    });
+    var task_request = (try controller.prepareGeneratedSyntax(allocator)) orelse return error.ExpectedSyntaxRequest;
+    defer task_request.deinit(allocator);
+    page.review_projection.cacheOrClearDisplayed(allocator, "/repo", .unstaged, 0, 0);
+    try std.testing.expect(!page.review_projection.hasSyntaxPending());
+    try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
+
+    var late = review_projection.GeneratedSyntaxFinished{
+        .request = try review_projection.cloneGeneratedSyntaxRequest(allocator, task_request),
+        .snapshot_fingerprint = task_request.expected_fingerprint,
+        .result = .{ .loaded = .empty() },
+    };
+    defer late.deinit(allocator);
+    controller.applyGeneratedSyntaxFinished(allocator, &late);
+    try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
+
+    var promoted = try controller.prepareProjection(allocator);
+    defer promoted.deinit(allocator);
+    try std.testing.expect(promoted.command == null);
+    try std.testing.expect(page.review_projection.displayed.ready.value.generated_added_file.decoration == .eligible);
+    var retried = (try controller.prepareGeneratedSyntax(allocator)) orelse return error.ExpectedSyntaxRetry;
+    defer retried.deinit(allocator);
 }
 
 test "status line stats change invalidates retained projection cache" {
@@ -2011,7 +2279,7 @@ test "old revision display is not admitted when fresh completion replaces it" {
             0,
             1,
         ),
-        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "fresh\n", false) } },
+        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "fresh\n") } },
     };
     var finished_owned = true;
     defer if (finished_owned) finished.deinit(allocator);
@@ -2028,7 +2296,7 @@ fn finishGeneratedProjection(
     allocator: std.mem.Allocator,
     update: *ReviewUpdate,
     path: []const u8,
-) ![*]const []const u8 {
+) ![*]const u8 {
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
         .review_projection => |request| request,
@@ -2038,11 +2306,11 @@ fn finishGeneratedProjection(
 
     var finished: app_load.ReviewProjectionFinished = .{
         .request = request,
-        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, path, "one\ntwo\n", false) } },
+        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, path, "one\ntwo\n") } },
     };
     var finished_owned = true;
     defer if (finished_owned) finished.deinit(allocator);
-    const lines = finished.result.ready.generated_added_file.file.lines.ptr;
+    const lines = finished.result.ready.generated_added_file.source.bytes.ptr;
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(applied.result_transferred);
     finished_owned = false;
@@ -2070,7 +2338,7 @@ fn testGeneratedReady(
     errdefer request.deinit(allocator);
     return .{
         .request = request,
-        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, path, "one\ntwo\n", false) },
+        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, path, "one\ntwo\n") },
     };
 }
 

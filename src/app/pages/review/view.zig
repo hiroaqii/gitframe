@@ -572,7 +572,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
     }
 
     if (app.activeGeneratedFileProjection()) |bundle| {
-        try diff_render.renderGeneratedAddedFile(&content, bundle.file.path, bundle.file.lines, bundle.file.truncated, .{
+        try diff_render.renderGeneratedAddedFile(&content, bundle.path, &bundle.source, .{
             .requested_mode = app.page.viewer.display_mode,
             .scroll = app.page.viewer.diff_scroll,
             .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
@@ -581,6 +581,11 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
             .cursor_offset = app.visibleDiffCursorOffset(),
             .palette = app.theme,
             .header_selection = app.diffHeaderSelectionActive(),
+            .source_syntax_spans = switch (bundle.decoration) {
+                .decorated => |decorated| decorated.spans,
+                .eligible, .terminal_plain => .empty(),
+            },
+            .source_has_visible_syntax = bundle.decoration.hasVisibleSyntax(),
         });
         drawPaneHeaderRule(surface, active, app.theme);
         return;

@@ -59,6 +59,13 @@ pub const SourceSpans = struct {
         }
         return .empty();
     }
+
+    /// Direct allocations that survive provider completion. Parser trees,
+    /// queries, and raw candidates are task-local and are not counted here.
+    pub fn retainedBytes(self: SourceSpans) usize {
+        return self.line_entries.len *| @sizeOf(LineEntry) +|
+            self.spans.len *| @sizeOf(token.TokenSpan);
+    }
 };
 
 pub fn build(
