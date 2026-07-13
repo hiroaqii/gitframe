@@ -6,10 +6,12 @@ const app_state = @import("../state.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const page = @import("../page.zig");
 const git_backend = @import("../../git/backend.zig");
+const process_runner = @import("../../process/runner.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 const selected_document = @import("../../repository/document.zig");
 const source_document = @import("../../repository/source.zig");
 const repository_change_map = @import("../../repository/change_map.zig");
+const repository_change_index = @import("../../repository/change_index.zig");
 const manifest = @import("../../repository/manifest.zig");
 const repository_tree = @import("../../repository/tree.zig");
 const source_syntax = @import("../../syntax/source.zig");
@@ -26,6 +28,11 @@ pub const LoadState = enum { idle, no_repository, loading, loaded, empty, failed
 pub const Bundle = struct {
     document: manifest.Document,
     tree: repository_tree.Tree,
+    /// Present only when the optional status snapshot parsed successfully.
+    /// The raw fingerprint is independent from the manifest fingerprint so a
+    /// status-only refresh never invalidates the selected source document.
+    status_fingerprint: ?content_fingerprint.Fingerprint = null,
+    status_available: bool = false,
 
     pub fn deinit(self: *Bundle, allocator: std.mem.Allocator) void {
         self.tree.deinit(allocator);
@@ -34,14 +41,29 @@ pub const Bundle = struct {
     }
 };
 
+pub const StatusUpdate = union(enum) {
+    loaded: repository_change_index.Index,
+    unavailable,
+
+    pub fn deinit(self: *StatusUpdate, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .loaded => |*index| index.deinit(allocator),
+            .unavailable => {},
+        }
+        self.* = undefined;
+    }
+};
+
 pub const TaskResult = union(enum) {
     unchanged: content_fingerprint.Fingerprint,
+    status_changed: StatusUpdate,
     loaded: Bundle,
     failed_static: []const u8,
 
     pub fn deinit(self: *TaskResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .unchanged, .failed_static => {},
+            .status_changed => |*update| update.deinit(allocator),
             .loaded => |*bundle| bundle.deinit(allocator),
         }
         self.* = undefined;
@@ -282,6 +304,7 @@ pub fn ManifestTask(comptime AppMsg: type) type {
         root_path: []u8,
         root: root_capability.RootCapability,
         expected_fingerprint: ?content_fingerprint.Fingerprint,
+        expected_status_fingerprint: ?content_fingerprint.Fingerprint = null,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
@@ -292,6 +315,7 @@ pub fn ManifestTask(comptime AppMsg: type) type {
                 task.root_path,
                 task.root,
                 task.expected_fingerprint,
+                task.expected_status_fingerprint,
                 allocator,
                 io,
             );
@@ -327,11 +351,12 @@ fn runManifestLoadChecked(
     root_path: []const u8,
     root: root_capability.RootCapability,
     expected_fingerprint: ?content_fingerprint.Fingerprint,
+    expected_status_fingerprint: ?content_fingerprint.Fingerprint,
     allocator: std.mem.Allocator,
     io: std.Io,
 ) TaskResult {
     if (!root_capability.pathMatches(root_path, root.identity)) return .{ .failed_static = "Repository root changed" };
-    var result = runManifestLoad(root.dir(), expected_fingerprint, allocator, io);
+    var result = runManifestLoad(root.dir(), expected_fingerprint, expected_status_fingerprint, allocator, io);
     if (!root_capability.pathMatches(root_path, root.identity)) {
         result.deinit(allocator);
         return .{ .failed_static = "Repository root changed" };
@@ -562,24 +587,77 @@ fn loadChangeMap(
 pub fn runManifestLoad(
     cwd: std.Io.Dir,
     expected_fingerprint: ?content_fingerprint.Fingerprint,
+    expected_status_fingerprint: ?content_fingerprint.Fingerprint,
     allocator: std.mem.Allocator,
     io: std.Io,
 ) TaskResult {
     var backend: git_backend.LocalCommandBackend = .{};
-    const raw = backend.backend().loadRepositoryManifest(allocator, io, .{ .cwd = cwd }) catch
+    const raw_manifest = backend.backend().loadRepositoryManifest(allocator, io, .{ .cwd = cwd }) catch
         return .{ .failed_static = "Repository manifest could not be loaded" };
-    switch (raw) {
-        .ok => |bytes| {
-            const fingerprint = content_fingerprint.Fingerprint.init(bytes);
-            if (expected_fingerprint) |expected| {
-                if (expected.eql(fingerprint)) {
+    const raw_status = backend.backend().loadRepositoryFileStatus(allocator, io, .{ .cwd = cwd }) catch null;
+    return buildManifestTaskResult(allocator, raw_manifest, raw_status, expected_fingerprint, expected_status_fingerprint);
+}
+
+/// Resolves the manifest/status result-owner matrix after both descriptor-safe
+/// reads complete. Status is optional: any command or parser failure removes
+/// decoration but cannot invalidate a usable manifest. A changed manifest
+/// always reparses status, even when its raw fingerprint is unchanged, because
+/// the path projection belongs to the new tree generation.
+fn buildManifestTaskResult(
+    allocator: std.mem.Allocator,
+    raw_manifest: git_backend.RepositoryManifestLoadResult,
+    raw_status: ?git_backend.RepositoryFileStatusLoadResult,
+    expected_fingerprint: ?content_fingerprint.Fingerprint,
+    expected_status_fingerprint: ?content_fingerprint.Fingerprint,
+) TaskResult {
+    const status_bytes: ?[]u8 = if (raw_status) |status| switch (status) {
+        .ok => |bytes| bytes,
+        .failed_static => null,
+    } else null;
+
+    switch (raw_manifest) {
+        .ok => |manifest_bytes| {
+            const fingerprint = content_fingerprint.Fingerprint.init(manifest_bytes);
+            const manifest_same = if (expected_fingerprint) |expected| expected.eql(fingerprint) else false;
+            if (status_bytes) |bytes| {
+                const status_fingerprint = content_fingerprint.Fingerprint.init(bytes);
+                const status_same = if (expected_status_fingerprint) |expected| expected.eql(status_fingerprint) else false;
+                if (manifest_same and status_same) {
                     allocator.free(bytes);
+                    allocator.free(manifest_bytes);
                     return .{ .unchanged = fingerprint };
                 }
+                if (manifest_same) {
+                    allocator.free(manifest_bytes);
+                    const index = repository_change_index.parseOwned(allocator, bytes) catch
+                        return .{ .status_changed = .unavailable };
+                    return .{ .status_changed = .{ .loaded = index } };
+                }
+
+                var document = manifest.parseOwned(allocator, manifest_bytes) catch {
+                    allocator.free(bytes);
+                    return .{ .failed_static = "Repository manifest could not be parsed" };
+                };
+                const tree = repository_tree.Tree.build(allocator, &document) catch {
+                    allocator.free(bytes);
+                    document.deinit(allocator);
+                    return .{ .failed_static = "Repository tree could not be built" };
+                };
+                var bundle = Bundle{ .document = document, .tree = tree };
+                var index = repository_change_index.parseOwned(allocator, bytes) catch return .{ .loaded = bundle };
+                defer index.deinit(allocator);
+                _ = bundle.tree.applyChangeIndex(&index);
+                bundle.status_fingerprint = index.fingerprint;
+                bundle.status_available = true;
+                return .{ .loaded = bundle };
             }
-            var document = manifest.parseOwned(allocator, bytes) catch {
+
+            if (manifest_same) {
+                allocator.free(manifest_bytes);
+                return .{ .status_changed = .unavailable };
+            }
+            var document = manifest.parseOwned(allocator, manifest_bytes) catch
                 return .{ .failed_static = "Repository manifest could not be parsed" };
-            };
             const tree = repository_tree.Tree.build(allocator, &document) catch {
                 document.deinit(allocator);
                 return .{ .failed_static = "Repository tree could not be built" };
@@ -587,10 +665,14 @@ pub fn runManifestLoad(
             return .{ .loaded = .{ .document = document, .tree = tree } };
         },
         .failed => |message| {
+            if (status_bytes) |bytes| allocator.free(bytes);
             allocator.free(message);
             return .{ .failed_static = "Repository manifest could not be loaded" };
         },
-        .failed_static => |message| return .{ .failed_static = message },
+        .failed_static => |message| {
+            if (status_bytes) |bytes| allocator.free(bytes);
+            return .{ .failed_static = message };
+        },
     }
 }
 
@@ -600,6 +682,7 @@ pub const Request = struct {
     root_path: []u8,
     root: root_capability.RootCapability,
     expected_fingerprint: ?content_fingerprint.Fingerprint,
+    expected_status_fingerprint: ?content_fingerprint.Fingerprint = null,
 
     pub fn deinit(self: *Request, allocator: std.mem.Allocator) void {
         allocator.free(self.root_path);
@@ -812,6 +895,7 @@ pub const RepositoryPageState = struct {
             .root_path = owned_root,
             .root = root,
             .expected_fingerprint = if (self.bundle) |*bundle| bundle.document.fingerprint else null,
+            .expected_status_fingerprint = if (self.bundle) |*bundle| bundle.status_fingerprint else null,
         };
     }
 
@@ -1025,6 +1109,39 @@ pub const RepositoryPageState = struct {
                 self.needs_document_revalidation = self.selected_path != null;
                 self.status.clear();
                 return .unchanged;
+            },
+            .status_changed => |*update| {
+                const bundle = if (self.bundle) |*owned| owned else {
+                    // A status-only completion is only valid against a retained
+                    // manifest. Treat an impossible orphan as optional loss;
+                    // its owned payload remains with `finished.deinit`.
+                    self.freshness = if (self.active) .fresh else .validating;
+                    self.status.clear();
+                    return .unchanged;
+                };
+                const visible_changed = switch (update.*) {
+                    .loaded => |*index| blk: {
+                        const changed = bundle.tree.applyChangeIndex(index);
+                        bundle.status_fingerprint = index.fingerprint;
+                        bundle.status_available = true;
+                        index.deinit(allocator);
+                        update.* = .unavailable;
+                        break :blk changed;
+                    },
+                    .unavailable => blk: {
+                        bundle.status_fingerprint = null;
+                        bundle.status_available = false;
+                        break :blk bundle.tree.clearChangeIndex();
+                    },
+                };
+                // Status-only refresh does not change manifest/source identity,
+                // or replace the displayed source. The manifest request consumed
+                // the existing source-validation intent, so restore it for both
+                // successful and unavailable optional status outcomes.
+                self.needs_document_revalidation = self.selected_path != null;
+                self.freshness = if (self.active) .fresh else .validating;
+                self.status.clear();
+                return if (visible_changed) .changed else .unchanged;
             },
             .loaded => |*incoming| {
                 self.replaceBundle(allocator, incoming) catch |err| {
@@ -1557,7 +1674,17 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             state.viewer.tree_horizontal_scroll,
             left_width -| 1,
         );
-        const style = if (visible_index == state.viewer.tree_cursor) context.palette.boldStyle(.prompt) else if (node.kind == .directory) context.palette.boldStyle(.accent) else context.palette.style(.foreground);
+        const style = if (visible_index == state.viewer.tree_cursor)
+            context.palette.boldStyle(.prompt)
+        else if (node.kind == .directory)
+            context.palette.boldStyle(.accent)
+        else if (node.file_change) |change|
+            context.palette.style(switch (change) {
+                .added => .diff_added,
+                .modified => .diff_modified,
+            })
+        else
+            context.palette.style(.foreground);
         draw.copyClippedTextAt(&left, 1, @intCast(body_row + 1), visible_text, style) catch {};
     }
 
@@ -1714,6 +1841,332 @@ fn bundleForTest(bytes: []const u8) !Bundle {
     var document = try manifest.parseOwned(std.testing.allocator, try std.testing.allocator.dupe(u8, bytes));
     errdefer document.deinit(std.testing.allocator);
     return .{ .tree = try repository_tree.Tree.build(std.testing.allocator, &document), .document = document };
+}
+
+fn manifestResultForTest(bytes: []const u8) !git_backend.RepositoryManifestLoadResult {
+    return .{ .ok = try std.testing.allocator.dupe(u8, bytes) };
+}
+
+fn statusResultForTest(bytes: []const u8) !git_backend.RepositoryFileStatusLoadResult {
+    return .{ .ok = try std.testing.allocator.dupe(u8, bytes) };
+}
+
+test "repository manifest task result matrix keeps manifest and status identities separate" {
+    const allocator = std.testing.allocator;
+    const old_manifest = "a.zig\x00";
+    const new_manifest = "a.zig\x00new.zig\x00";
+    const old_status = " M a.zig\x00";
+    const new_status = "?? new.zig\x00";
+    const old_manifest_fingerprint = content_fingerprint.Fingerprint.init(old_manifest);
+    const old_status_fingerprint = content_fingerprint.Fingerprint.init(old_status);
+
+    var unchanged = buildManifestTaskResult(
+        allocator,
+        try manifestResultForTest(old_manifest),
+        try statusResultForTest(old_status),
+        old_manifest_fingerprint,
+        old_status_fingerprint,
+    );
+    defer unchanged.deinit(allocator);
+    try std.testing.expect(unchanged == .unchanged);
+
+    var status_only = buildManifestTaskResult(
+        allocator,
+        try manifestResultForTest(old_manifest),
+        try statusResultForTest(new_status),
+        old_manifest_fingerprint,
+        old_status_fingerprint,
+    );
+    defer status_only.deinit(allocator);
+    try std.testing.expectEqual(repository_change_index.Kind.added, status_only.status_changed.loaded.kindForPath("new.zig").?);
+
+    var status_unavailable = buildManifestTaskResult(
+        allocator,
+        try manifestResultForTest(old_manifest),
+        git_backend.RepositoryFileStatusLoadResult{ .failed_static = "optional failure" },
+        old_manifest_fingerprint,
+        old_status_fingerprint,
+    );
+    defer status_unavailable.deinit(allocator);
+    try std.testing.expect(status_unavailable.status_changed == .unavailable);
+
+    // A new tree generation must reproject the unchanged raw status instead of
+    // reusing an Index whose path membership belonged to the previous tree.
+    var manifest_only = buildManifestTaskResult(
+        allocator,
+        try manifestResultForTest(new_manifest),
+        try statusResultForTest(old_status),
+        old_manifest_fingerprint,
+        old_status_fingerprint,
+    );
+    defer manifest_only.deinit(allocator);
+    try std.testing.expect(manifest_only == .loaded);
+    try std.testing.expect(manifest_only.loaded.status_available);
+    try std.testing.expectEqual(repository_change_index.Kind.modified, manifest_only.loaded.tree.nodes[0].file_change.?);
+    try std.testing.expect(manifest_only.loaded.tree.nodes[1].file_change == null);
+
+    var both_changed = buildManifestTaskResult(
+        allocator,
+        try manifestResultForTest(new_manifest),
+        try statusResultForTest(new_status),
+        old_manifest_fingerprint,
+        old_status_fingerprint,
+    );
+    defer both_changed.deinit(allocator);
+    try std.testing.expectEqual(repository_change_index.Kind.added, both_changed.loaded.tree.nodes[1].file_change.?);
+
+    var malformed_optional = buildManifestTaskResult(
+        allocator,
+        try manifestResultForTest(new_manifest),
+        try statusResultForTest(" M unterminated"),
+        old_manifest_fingerprint,
+        old_status_fingerprint,
+    );
+    defer malformed_optional.deinit(allocator);
+    try std.testing.expect(malformed_optional == .loaded);
+    try std.testing.expect(!malformed_optional.loaded.status_available);
+    for (malformed_optional.loaded.tree.nodes) |node| try std.testing.expect(node.file_change == null);
+
+    var manifest_failed = buildManifestTaskResult(
+        allocator,
+        git_backend.RepositoryManifestLoadResult{ .failed = try allocator.dupe(u8, "private diagnostic") },
+        try statusResultForTest(new_status),
+        old_manifest_fingerprint,
+        old_status_fingerprint,
+    );
+    defer manifest_failed.deinit(allocator);
+    try std.testing.expect(manifest_failed == .failed_static);
+}
+
+const ManifestStatusAllocationFixture = struct {
+    fn exercise(allocator: std.mem.Allocator) !void {
+        const manifest_bytes = try allocator.dupe(u8, "a.zig\x00clean.zig\x00");
+        var manifest_owned = true;
+        errdefer if (manifest_owned) allocator.free(manifest_bytes);
+        const status_bytes = try allocator.dupe(u8, " M a.zig\x00");
+        manifest_owned = false;
+        var result = buildManifestTaskResult(
+            allocator,
+            .{ .ok = manifest_bytes },
+            .{ .ok = status_bytes },
+            content_fingerprint.Fingerprint.init("old.zig\x00"),
+            content_fingerprint.Fingerprint.init("?? old.zig\x00"),
+        );
+        defer result.deinit(allocator);
+        switch (result) {
+            .loaded => |bundle| if (!bundle.status_available) return error.OutOfMemory,
+            else => return error.OutOfMemory,
+        }
+    }
+};
+
+test "repository manifest status matrix releases every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, ManifestStatusAllocationFixture.exercise, .{});
+}
+
+test "repository status-only completion preserves source and revisions" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("a.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 7,
+        .source_revision = 11,
+        .displayed_document = .{
+            .path = try allocator.dupe(u8, "a.zig"),
+            .manifest_revision = 7,
+            .source_revision = 11,
+            .value = .{ .inert = .unreadable },
+        },
+    };
+    defer state.deinit(allocator);
+    state.activate(3, root.capability.identity);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    var request = try state.prepareRequest(allocator, root.path, &root.capability);
+    defer request.deinit(allocator);
+    const displayed_path_address = @intFromPtr(state.displayed_document.?.path.ptr);
+    var finished = ManifestFinished{
+        .identity = request.identity,
+        .root_identity = request.root.identity,
+        .generation = request.generation,
+        .result = .{ .status_changed = .{ .loaded = try repository_change_index.parseOwned(
+            allocator,
+            try allocator.dupe(u8, " M a.zig\x00"),
+        ) } },
+    };
+    defer finished.deinit(allocator);
+
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &finished));
+    try std.testing.expectEqual(@as(u64, 7), state.manifest_revision);
+    try std.testing.expectEqual(@as(u64, 11), state.source_revision);
+    try std.testing.expectEqual(displayed_path_address, @intFromPtr(state.displayed_document.?.path.ptr));
+    try std.testing.expect(state.needs_document_revalidation);
+    try std.testing.expect(state.wantsDocumentRequest());
+    try std.testing.expectEqual(repository_change_index.Kind.modified, state.bundle.?.tree.nodes[0].file_change.?);
+
+    state.needs_revalidation = true;
+    var unavailable_request = try state.prepareRequest(allocator, root.path, &root.capability);
+    defer unavailable_request.deinit(allocator);
+    var unavailable = ManifestFinished{
+        .identity = unavailable_request.identity,
+        .root_identity = unavailable_request.root.identity,
+        .generation = unavailable_request.generation,
+        .result = .{ .status_changed = .unavailable },
+    };
+    defer unavailable.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &unavailable));
+    try std.testing.expect(state.bundle.?.tree.nodes[0].file_change == null);
+    try std.testing.expect(!state.bundle.?.status_available);
+    try std.testing.expectEqual(@as(u64, 7), state.manifest_revision);
+    try std.testing.expectEqual(displayed_path_address, @intFromPtr(state.displayed_document.?.path.ptr));
+    try std.testing.expect(state.needs_document_revalidation);
+    try std.testing.expect(state.wantsDocumentRequest());
+}
+
+fn runRepositoryTestGit(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) !void {
+    const result = try process_runner.runCaptured(std.testing.allocator, io, .{
+        .argv = argv,
+        .cwd = .{ .dir = cwd },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    defer result.deinit(std.testing.allocator);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    return error.RepositoryTestGitFailed;
+}
+
+test "repository real reload updates status color and selected source" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "repo", .default_dir);
+    var work = try tmp.dir.openDir(io, "repo", .{});
+    defer work.close(io);
+    try runRepositoryTestGit(io, work, &.{ "git", "init", "--initial-branch=main" });
+    try work.writeFile(io, .{ .sub_path = "a.zig", .data = "const value = 1;\n" });
+    try runRepositoryTestGit(io, work, &.{ "git", "add", "a.zig" });
+    try runRepositoryTestGit(io, work, &.{
+        "git",
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "base",
+    });
+    const root_path = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(root_path);
+    var capability = try root_capability.RootCapability.openCanonical(root_path);
+    defer capability.deinit();
+
+    var state: RepositoryPageState = .{};
+    defer state.deinit(allocator);
+    state.activate(1, capability.identity);
+    var initial_request = try state.prepareRequest(allocator, root_path, &capability);
+    defer initial_request.deinit(allocator);
+    var initial_finished = ManifestFinished{
+        .identity = initial_request.identity,
+        .root_identity = initial_request.root.identity,
+        .generation = initial_request.generation,
+        .result = runManifestLoad(
+            initial_request.root.dir(),
+            initial_request.expected_fingerprint,
+            initial_request.expected_status_fingerprint,
+            allocator,
+            io,
+        ),
+    };
+    defer initial_finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &initial_finished));
+    try std.testing.expect(state.wantsDocumentRequest());
+
+    var initial_document_request = try state.prepareDocumentRequest(allocator, &capability);
+    defer initial_document_request.deinit(allocator);
+    var initial_loaded = selected_document.load(initial_document_request.root, initial_document_request.path, allocator, io);
+    defer initial_loaded.deinit(allocator);
+    var initial_document_finished = DocumentFinished{
+        .identity = initial_document_request.identity,
+        .root_identity = initial_document_request.root.identity,
+        .generation = initial_document_request.generation,
+        .manifest_revision = initial_document_request.manifest_revision,
+        .path = try allocator.dupe(u8, initial_document_request.path),
+        .value = DocumentValue.fromLoaded(allocator, &initial_loaded),
+    };
+    defer initial_document_finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &initial_document_finished));
+    try std.testing.expectEqualStrings("const value = 1;\n", state.currentSource().?.bytes);
+    const manifest_revision = state.manifest_revision;
+
+    try work.writeFile(io, .{ .sub_path = "a.zig", .data = "const value = 2;\n" });
+    state.requestReload(true);
+    var reload_request = try state.prepareRequest(allocator, root_path, &capability);
+    defer reload_request.deinit(allocator);
+    var reload_finished = ManifestFinished{
+        .identity = reload_request.identity,
+        .root_identity = reload_request.root.identity,
+        .generation = reload_request.generation,
+        .result = runManifestLoad(
+            reload_request.root.dir(),
+            reload_request.expected_fingerprint,
+            reload_request.expected_status_fingerprint,
+            allocator,
+            io,
+        ),
+    };
+    defer reload_finished.deinit(allocator);
+    try std.testing.expect(reload_finished.result == .status_changed);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &reload_finished));
+    try std.testing.expectEqual(manifest_revision, state.manifest_revision);
+    try std.testing.expectEqual(repository_change_index.Kind.modified, state.bundle.?.tree.nodes[0].file_change.?);
+    try std.testing.expect(state.wantsDocumentRequest());
+
+    var reload_document_request = try state.prepareDocumentRequest(allocator, &capability);
+    defer reload_document_request.deinit(allocator);
+    var reload_loaded = selected_document.load(reload_document_request.root, reload_document_request.path, allocator, io);
+    defer reload_loaded.deinit(allocator);
+    var reload_document_finished = DocumentFinished{
+        .identity = reload_document_request.identity,
+        .root_identity = reload_document_request.root.identity,
+        .generation = reload_document_request.generation,
+        .manifest_revision = reload_document_request.manifest_revision,
+        .path = try allocator.dupe(u8, reload_document_request.path),
+        .value = DocumentValue.fromLoaded(allocator, &reload_loaded),
+    };
+    defer reload_document_finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &reload_document_finished));
+    try std.testing.expectEqualStrings("const value = 2;\n", state.currentSource().?.bytes);
+}
+
+test "repository tree file colors preserve directory and selection priority" {
+    const allocator = std.testing.allocator;
+    var bundle = try bundleForTest("added.zig\x00modified.zig\x00selected.zig\x00");
+    var index = try repository_change_index.parseOwned(allocator, try allocator.dupe(u8, "?? added.zig\x00" ++
+        " M modified.zig\x00" ++
+        " M selected.zig\x00"));
+    defer index.deinit(allocator);
+    _ = bundle.tree.applyChangeIndex(&index);
+    var state: RepositoryPageState = .{
+        .bundle = bundle,
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.nodes[2].path;
+    state.viewer.tree_cursor = 2;
+    const palette: theme.Palette = .default();
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(60, 6);
+    defer test_surface.deinit();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+
+    try std.testing.expectEqual(palette.color(.diff_added), test_surface.surface.readCell(1, 1).?.style.fg);
+    try std.testing.expectEqual(palette.color(.diff_modified), test_surface.surface.readCell(1, 2).?.style.fg);
+    try std.testing.expectEqual(palette.color(.prompt), test_surface.surface.readCell(1, 3).?.style.fg);
 }
 
 const TestRoot = struct {
@@ -2486,7 +2939,7 @@ test "repository manifest root liveness check rejects stable path replacement" {
     try tmp.dir.rename("repo", tmp.dir, "old-repo", io);
     try tmp.dir.symLink(io, "outside", "repo", .{ .is_directory = true });
 
-    var result = runManifestLoadChecked(root_path, root, null, allocator, io);
+    var result = runManifestLoadChecked(root_path, root, null, null, allocator, io);
     defer result.deinit(allocator);
     switch (result) {
         .failed_static => |message| try std.testing.expectEqualStrings("Repository root changed", message),

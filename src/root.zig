@@ -85,6 +85,7 @@ test {
     _ = @import("repo/state.zig");
     _ = @import("repo/root_capability.zig");
     _ = @import("repository/manifest.zig");
+    _ = @import("repository/change_index.zig");
     _ = @import("repository/document.zig");
     _ = @import("repository/path.zig");
     _ = @import("repository/source.zig");

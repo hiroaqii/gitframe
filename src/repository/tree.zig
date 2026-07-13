@@ -1,4 +1,5 @@
 const std = @import("std");
+const change_index = @import("change_index.zig");
 const manifest = @import("manifest.zig");
 
 pub const max_nodes: usize = 400_000;
@@ -16,6 +17,10 @@ pub const Node = struct {
     name: []const u8,
     depth: usize,
     expanded: bool = true,
+    file_change: ?change_index.Kind = null,
+    /// Cached now for the immediately following Changed-only filter slice.
+    /// Slice A does not recolor directories; this only records descendants.
+    subtree_has_change: bool = false,
 };
 
 pub const BuildError = error{
@@ -198,6 +203,40 @@ pub const Tree = struct {
         }
         return null;
     }
+
+    /// Projects byte-exact status paths onto current manifest files and caches
+    /// the descendant predicate needed by the next, separately committed
+    /// Changed-only filter. Deleted paths cannot create synthetic tree nodes.
+    pub fn applyChangeIndex(self: *Tree, index: *const change_index.Index) bool {
+        var changed = false;
+        for (self.nodes) |*node| {
+            const next: ?change_index.Kind = if (node.kind == .file) index.kindForPath(node.path) else null;
+            // Directory predicates are derived solely from file classifications
+            // below. Comparing their transient reset state would make an
+            // identical final projection report a false-positive redraw.
+            changed = changed or node.file_change != next;
+            node.file_change = next;
+            node.subtree_has_change = next != null;
+        }
+        var cursor = self.nodes.len;
+        while (cursor > 0) {
+            cursor -= 1;
+            const node = &self.nodes[cursor];
+            if (!node.subtree_has_change) continue;
+            if (node.parent) |parent| self.nodes[parent].subtree_has_change = true;
+        }
+        return changed;
+    }
+
+    pub fn clearChangeIndex(self: *Tree) bool {
+        var changed = false;
+        for (self.nodes) |*node| {
+            changed = changed or node.file_change != null;
+            node.file_change = null;
+            node.subtree_has_change = false;
+        }
+        return changed;
+    }
 };
 
 const Shape = struct { node_count: usize, max_directory_depth: usize };
@@ -360,6 +399,40 @@ test "repository tree restores dash sibling collapse by raw identity" {
 
     const a_index = new.visibleIndexForPath("a") orelse return error.ExpectedDirectory;
     try std.testing.expect(!new.nodes[new.visible[a_index]].expanded);
+}
+
+test "repository tree projects exact file changes and changed ancestors" {
+    var document = try documentForTest("a/file.zig\x00a/nested/other.zig\x00plain.zig\x00");
+    defer document.deinit(std.testing.allocator);
+    var tree = try Tree.build(std.testing.allocator, &document);
+    defer tree.deinit(std.testing.allocator);
+    var index = try change_index.parseOwned(std.testing.allocator, try std.testing.allocator.dupe(u8, "?? a/file.zig\x00" ++
+        " M a/nested/other.zig\x00" ++
+        " M deleted.zig\x00"));
+    defer index.deinit(std.testing.allocator);
+
+    try std.testing.expect(tree.applyChangeIndex(&index));
+    for (tree.nodes) |node| {
+        if (std.mem.eql(u8, node.path, "a/file.zig"))
+            try std.testing.expectEqual(change_index.Kind.added, node.file_change.?)
+        else if (std.mem.eql(u8, node.path, "a/nested/other.zig"))
+            try std.testing.expectEqual(change_index.Kind.modified, node.file_change.?)
+        else if (node.kind == .directory and (std.mem.eql(u8, node.path, "a") or std.mem.eql(u8, node.path, "a/nested")))
+            try std.testing.expect(node.subtree_has_change)
+        else if (std.mem.eql(u8, node.path, "plain.zig"))
+            try std.testing.expect(node.file_change == null);
+    }
+    try std.testing.expect(!tree.applyChangeIndex(&index));
+    var same_projection = try change_index.parseOwned(std.testing.allocator, try std.testing.allocator.dupe(u8, " A a/file.zig\x00" ++
+        "M  a/nested/other.zig\x00"));
+    defer same_projection.deinit(std.testing.allocator);
+    try std.testing.expect(!tree.applyChangeIndex(&same_projection));
+    try std.testing.expect(tree.clearChangeIndex());
+    try std.testing.expect(!tree.clearChangeIndex());
+    for (tree.nodes) |node| {
+        try std.testing.expect(node.file_change == null);
+        try std.testing.expect(!node.subtree_has_change);
+    }
 }
 
 test "repository tree deleted selection follows surviving old order" {

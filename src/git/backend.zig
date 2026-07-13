@@ -63,6 +63,22 @@ pub const RepositoryManifestLoadResult = union(enum) {
     }
 };
 
+/// Optional Repository-tree status snapshot. This is deliberately separate
+/// from Review's string-root status API: Repository tasks remain committed to
+/// the already-open root descriptor for both manifest and status reads.
+pub const RepositoryFileStatusLoadResult = union(enum) {
+    /// Owned porcelain-v1 `-z` bytes.
+    ok: []u8,
+    failed_static: []const u8,
+
+    pub fn deinit(self: RepositoryFileStatusLoadResult, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .ok => |bytes| allocator.free(bytes),
+            .failed_static => {},
+        }
+    }
+};
+
 /// Bounded raw-object comparison for one Repository source gutter.
 pub const RepositoryFileChangeLoadResult = union(enum) {
     /// The pinned HEAD tree has no blob for this path, or HEAD is unborn.
@@ -209,6 +225,11 @@ pub const RepositoryManifestRequest = struct {
     cwd: std.Io.Dir,
 };
 
+pub const RepositoryFileStatusRequest = struct {
+    /// Borrowed descriptor cwd. The caller keeps it alive through command wait.
+    cwd: std.Io.Dir,
+};
+
 pub const RepositoryFileChangeRequest = struct {
     /// Borrowed descriptor cwd kept alive by the synchronous task call.
     cwd: std.Io.Dir,
@@ -310,6 +331,7 @@ pub const Backend = struct {
     ptr: *anyopaque,
     load_diff_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, GitDiffRequest) LoadError!LoadResult,
     load_repository_manifest_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult,
+    load_repository_file_status_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, RepositoryFileStatusRequest) LoadError!RepositoryFileStatusLoadResult,
     load_repository_file_change_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, RepositoryFileChangeRequest) LoadError!RepositoryFileChangeLoadResult,
     load_status_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, GitStatusRequest) LoadError!StatusLoadResult,
     load_branch_status_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, BranchStatusRequest) LoadError!BranchStatusLoadResult,
@@ -322,6 +344,10 @@ pub const Backend = struct {
 
     pub fn loadRepositoryManifest(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult {
         return self.load_repository_manifest_fn(self.ptr, allocator, io, request);
+    }
+
+    pub fn loadRepositoryFileStatus(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileStatusRequest) LoadError!RepositoryFileStatusLoadResult {
+        return self.load_repository_file_status_fn(self.ptr, allocator, io, request);
     }
 
     pub fn loadRepositoryFileChange(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileChangeRequest) LoadError!RepositoryFileChangeLoadResult {
@@ -354,6 +380,7 @@ pub const LocalCommandBackend = struct {
             .ptr = self,
             .load_diff_fn = loadDiffErased,
             .load_repository_manifest_fn = loadRepositoryManifestErased,
+            .load_repository_file_status_fn = loadRepositoryFileStatusErased,
             .load_repository_file_change_fn = loadRepositoryFileChangeErased,
             .load_status_fn = loadStatusErased,
             .load_branch_status_fn = loadBranchStatusErased,
@@ -378,6 +405,10 @@ pub const LocalCommandBackend = struct {
 
     pub fn loadRepositoryManifest(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult {
         return loadGitRepositoryManifest(allocator, io, request.cwd);
+    }
+
+    pub fn loadRepositoryFileStatus(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileStatusRequest) LoadError!RepositoryFileStatusLoadResult {
+        return loadGitRepositoryFileStatus(allocator, io, request.cwd);
     }
 
     pub fn loadRepositoryFileChange(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileChangeRequest) LoadError!RepositoryFileChangeLoadResult {
@@ -423,6 +454,11 @@ pub const LocalCommandBackend = struct {
     fn loadRepositoryManifestErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult {
         const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
         return self.loadRepositoryManifest(allocator, io, request);
+    }
+
+    fn loadRepositoryFileStatusErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileStatusRequest) LoadError!RepositoryFileStatusLoadResult {
+        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
+        return self.loadRepositoryFileStatus(allocator, io, request);
     }
 
     fn loadRepositoryFileChangeErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileChangeRequest) LoadError!RepositoryFileChangeLoadResult {
@@ -519,6 +555,21 @@ fn repositoryManifestResultFromGitCommand(allocator: std.mem.Allocator, result: 
     return .{ .failed_static = "Repository manifest could not be loaded" };
 }
 
+fn repositoryFileStatusResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result) RepositoryFileStatusLoadResult {
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            allocator.free(result.stderr);
+            return .{ .ok = result.stdout };
+        },
+        else => {},
+    }
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
+    // Status is an optional tree decoration. Raw Git diagnostics (including
+    // repository paths) never cross this backend boundary into page status.
+    return .{ .failed_static = "Repository file status could not be loaded" };
+}
+
 fn operationResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) LoadError!OperationResult {
     allocator.free(result.stdout);
     switch (result.term) {
@@ -599,6 +650,29 @@ fn loadGitRepositoryManifest(allocator: std.mem.Allocator, io: std.Io, cwd: std.
         .stderr_limit = .limited(256 * 1024),
     }) catch |err| return runnerErrorToLoadError(err);
     return repositoryManifestResultFromGitCommand(allocator, result);
+}
+
+const repository_file_status_argv = [_][]const u8{
+    "git",
+    "--no-optional-locks",
+    "status",
+    "--porcelain=v1",
+    "-z",
+    "-uall",
+};
+
+pub fn repositoryFileStatusArgv() []const []const u8 {
+    return &repository_file_status_argv;
+}
+
+fn loadGitRepositoryFileStatus(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir) LoadError!RepositoryFileStatusLoadResult {
+    const result = process_runner.runCaptured(allocator, io, .{
+        .argv = repositoryFileStatusArgv(),
+        .cwd = .{ .dir = cwd },
+        .stdout_limit = .limited(max_status_bytes),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch |err| return runnerErrorToLoadError(err);
+    return repositoryFileStatusResultFromGitCommand(allocator, result);
 }
 
 const repository_change_small_output_limit = 256 * 1024;
@@ -1492,6 +1566,159 @@ test "repository manifest argv is read-only NUL-delimited and deduplicated" {
     try std.testing.expectEqualStrings("ls-files", argv[2]);
     try std.testing.expectEqualStrings("-z", argv[3]);
     try std.testing.expectEqualStrings("--deduplicate", argv[7]);
+}
+
+test "repository file status argv is descriptor-safe porcelain v1" {
+    const argv = repositoryFileStatusArgv();
+    try std.testing.expectEqualSlices([]const u8, &repository_file_status_argv, argv);
+    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
+    try std.testing.expectEqualStrings("status", argv[2]);
+    try std.testing.expectEqualStrings("--porcelain=v1", argv[3]);
+    try std.testing.expectEqualStrings("-z", argv[4]);
+    try std.testing.expectEqualStrings("-uall", argv[5]);
+}
+
+test "repository file status reports real intent-to-add as current added path" {
+    const repository_change_index = @import("../repository/change_index.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try work.writeFile(io, .{ .sub_path = "intent.zig", .data = "const value = 1;\n" });
+    try runTestGit(io, &.{ "git", "add", "-N", "intent.zig" }, work);
+
+    var backend: LocalCommandBackend = .{};
+    var result = try backend.loadRepositoryFileStatus(std.testing.allocator, io, .{ .cwd = work });
+    const bytes = switch (result) {
+        .ok => |owned| blk: {
+            result = .{ .failed_static = "consumed" };
+            break :blk owned;
+        },
+        .failed_static => return error.UnexpectedRepositoryFileStatusFailure,
+    };
+    var index = try repository_change_index.parseOwned(std.testing.allocator, bytes);
+    defer index.deinit(std.testing.allocator);
+    try std.testing.expectEqual(repository_change_index.Kind.added, index.kindForPath("intent.zig").?);
+}
+
+test "repository file status descriptor cwd survives path replacement" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var committed = try tmp.dir.openDir(io, "work", .{});
+    defer committed.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, committed);
+    try committed.writeFile(io, .{ .sub_path = "committed.txt", .data = "old\n" });
+
+    try tmp.dir.rename("work", tmp.dir, "old-work", io);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var replacement = try tmp.dir.openDir(io, "work", .{});
+    defer replacement.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, replacement);
+    try replacement.writeFile(io, .{ .sub_path = "replacement.txt", .data = "new\n" });
+
+    var backend: LocalCommandBackend = .{};
+    const result = try backend.loadRepositoryFileStatus(std.testing.allocator, io, .{ .cwd = committed });
+    defer result.deinit(std.testing.allocator);
+    const bytes = switch (result) {
+        .ok => |owned| owned,
+        .failed_static => return error.UnexpectedRepositoryFileStatusFailure,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "committed.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "replacement.txt") == null);
+}
+
+test "repository file status with rename detection disabled keeps only current path" {
+    const repository_change_index = @import("../repository/change_index.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try work.writeFile(io, .{ .sub_path = "old.zig", .data = "const value = 1;\n" });
+    try runTestGit(io, &.{ "git", "add", "old.zig" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, work);
+    try runTestGit(io, &.{ "git", "config", "status.renames", "false" }, work);
+    try work.rename("old.zig", work, "new.zig", io);
+
+    var backend: LocalCommandBackend = .{};
+    var result = try backend.loadRepositoryFileStatus(std.testing.allocator, io, .{ .cwd = work });
+    const bytes = switch (result) {
+        .ok => |owned| blk: {
+            result = .{ .failed_static = "consumed" };
+            break :blk owned;
+        },
+        .failed_static => return error.UnexpectedRepositoryFileStatusFailure,
+    };
+    var index = try repository_change_index.parseOwned(std.testing.allocator, bytes);
+    defer index.deinit(std.testing.allocator);
+    try std.testing.expect(index.kindForPath("old.zig") == null);
+    try std.testing.expectEqual(repository_change_index.Kind.added, index.kindForPath("new.zig").?);
+}
+
+test "repository file status classifies a dirty submodule gitlink" {
+    const repository_change_index = @import("../repository/change_index.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "child", .default_dir);
+    var child = try tmp.dir.openDir(io, "child", .{});
+    defer child.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, child);
+    try child.writeFile(io, .{ .sub_path = "source.zig", .data = "const value = 1;\n" });
+    try runTestGit(io, &.{ "git", "add", "source.zig" }, child);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, child);
+    const child_path = try tmp.dir.realPathFileAlloc(io, "child", allocator);
+    defer allocator.free(child_path);
+
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try runTestGit(io, &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", child_path, "vendor/sub" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "submodule" }, work);
+    var checked_out_child = try work.openDir(io, "vendor/sub", .{});
+    defer checked_out_child.close(io);
+    try checked_out_child.writeFile(io, .{ .sub_path = "source.zig", .data = "const value = 2;\n" });
+
+    var backend: LocalCommandBackend = .{};
+    var result = try backend.loadRepositoryFileStatus(allocator, io, .{ .cwd = work });
+    const bytes = switch (result) {
+        .ok => |owned| blk: {
+            result = .{ .failed_static = "consumed" };
+            break :blk owned;
+        },
+        .failed_static => return error.UnexpectedRepositoryFileStatusFailure,
+    };
+    var index = try repository_change_index.parseOwned(allocator, bytes);
+    defer index.deinit(allocator);
+    try std.testing.expectEqual(repository_change_index.Kind.modified, index.kindForPath("vendor/sub").?);
+}
+
+test "repository file status failure does not expose diagnostics" {
+    const secret = "/private/worktree/token-123";
+    const raw = process_runner.Result{
+        .term = .{ .exited = 128 },
+        .stdout = try std.testing.allocator.alloc(u8, 0),
+        .stderr = try std.fmt.allocPrint(std.testing.allocator, "fatal at {s}\n", .{secret}),
+    };
+    const result = repositoryFileStatusResultFromGitCommand(std.testing.allocator, raw);
+    defer result.deinit(std.testing.allocator);
+    switch (result) {
+        .failed_static => |message| {
+            try std.testing.expectEqualStrings("Repository file status could not be loaded", message);
+            try std.testing.expect(std.mem.indexOf(u8, message, secret) == null);
+        },
+        .ok => return error.ExpectedRepositoryFileStatusFailure,
+    }
 }
 
 test "repository manifest backend deduplicates a real three-stage conflict" {

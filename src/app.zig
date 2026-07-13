@@ -746,6 +746,7 @@ pub const App = struct {
             .root_path = request.root_path,
             .root = request.root,
             .expected_fingerprint = request.expected_fingerprint,
+            .expected_status_fingerprint = request.expected_status_fingerprint,
         };
         request_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = RepositoryManifestTask.run, .failed = RepositoryManifestTask.failed }) catch |err| {
