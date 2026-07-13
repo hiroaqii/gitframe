@@ -934,6 +934,7 @@ test "loadConfig accepts theme color overrides" {
         \\accent = "bright-cyan"
         \\success = "#010203"
         \\diff_added = "index:10"
+        \\diff_modified = "index:12"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
@@ -944,6 +945,7 @@ test "loadConfig accepts theme color overrides" {
     try std.testing.expect(result.config.value.theme.get(.accent).?.toChasen().eql(.{ .index = 14 }));
     try std.testing.expect(result.config.value.theme.get(.success).?.toChasen().eql(.{ .rgb = .{ 1, 2, 3 } }));
     try std.testing.expect(result.config.value.theme.get(.diff_added).?.toChasen().eql(.{ .index = 10 }));
+    try std.testing.expect(result.config.value.theme.get(.diff_modified).?.toChasen().eql(.{ .index = 12 }));
 }
 
 test "loadConfig accepts keymap overrides" {
@@ -1363,6 +1365,7 @@ test "loaded theme config feeds palette derivation" {
         \\schema_version = 1
         \\[theme]
         \\success = "#010203"
+        \\info = "#070809"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
@@ -1374,6 +1377,7 @@ test "loaded theme config feeds palette derivation" {
     const palette = theme.Palette.fromConfig(result.config.value.theme);
     try std.testing.expect(palette.color(.success).eql(.{ .rgb = .{ 1, 2, 3 } }));
     try std.testing.expect(palette.color(.diff_added).eql(.{ .rgb = .{ 1, 2, 3 } }));
+    try std.testing.expect(palette.color(.diff_modified).eql(.{ .rgb = .{ 7, 8, 9 } }));
 }
 
 test "loadConfig rejects unknown theme keys" {

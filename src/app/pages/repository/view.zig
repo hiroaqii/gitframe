@@ -7,6 +7,7 @@ const theme = @import("theme");
 const model = @import("model.zig");
 const navigation = @import("navigation.zig");
 const source = @import("../../../repository/source.zig");
+const repository_change_map = @import("../../../repository/change_map.zig");
 const source_syntax = @import("../../../syntax/source.zig");
 const syntax_style = @import("../../../syntax/style.zig");
 const syntax_token = @import("../../../syntax/token.zig");
@@ -22,6 +23,7 @@ pub fn drawSource(
     surface: *chasen.Surface,
     document: *const source.Document,
     syntax: ?*const source_syntax.SourceSpans,
+    changes: ?*const repository_change_map.Map,
     viewer: model.ViewerState,
     search: model.SourceSearchState,
     palette: theme.Palette,
@@ -45,7 +47,14 @@ pub fn drawSource(
         else
             palette.style(.foreground);
 
-        _ = surface.borrowTextAt(0, row, " ", palette.style(.diff_added));
+        const change = if (changes) |map| map.row(line_index) else .none;
+        const gutter: []const u8 = if (change == .none) " " else "│";
+        const gutter_role: theme.Role = switch (change) {
+            .none => .foreground,
+            .added => .diff_added,
+            .modified => .diff_modified,
+        };
+        _ = surface.borrowTextAt(0, row, gutter, palette.style(gutter_role));
         if (viewer.line_numbers) {
             const number = try std.fmt.allocPrint(surface.frameAllocator(), "{d}", .{line_index + 1});
             const number_col: u16 = @intCast(1 + number_width - chasen.text.displayWidth(number));
@@ -221,11 +230,33 @@ test "repository source view reserves gutter and renders plain text" {
     try test_surface.init(40, 6);
     defer test_surface.deinit();
 
-    try drawSource(&test_surface.surface, &document, null, .{ .focus = .source }, .{}, .default());
+    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, .default());
     const snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 const value = 1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 second") != null);
+}
+
+test "repository source gutter renders added and modified rows without moving text" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "added\nmodified\nplain\n");
+    var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    var map = repository_change_map.Map{ .rows = try allocator.dupe(repository_change_map.Kind, &.{ .added, .modified, .none }) };
+    defer map.deinit(allocator);
+    const palette: theme.Palette = .default();
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(40, 6);
+    defer test_surface.deinit();
+
+    try drawSource(&test_surface.surface, &document, null, &map, .{ .focus = .source, .source_cursor = 1 }, .{}, palette);
+    try test_surface.expectCellText(0, 2, "│");
+    try test_surface.expectCellText(0, 3, "│");
+    try test_surface.expectCellText(0, 4, " ");
+    try test_surface.expectCellText(3, 2, "a");
+    try test_surface.expectCellText(3, 3, "m");
+    try std.testing.expectEqual(palette.color(.diff_added), test_surface.surface.readCell(0, 2).?.style.fg);
+    try std.testing.expectEqual(palette.color(.diff_modified), test_surface.surface.readCell(0, 3).?.style.fg);
 }
 
 test "repository empty source keeps one synthetic viewer row" {
@@ -236,7 +267,7 @@ test "repository empty source keeps one synthetic viewer row" {
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(12, 4);
     defer test_surface.deinit();
-    try drawSource(&test_surface.surface, &document, null, .{ .focus = .source }, .{}, .default());
+    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, .default());
     try test_surface.expectCellText(0, 2, " ");
     try test_surface.expectCellText(1, 2, "1");
 }
@@ -264,7 +295,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try test_surface.init(32, 6);
     defer test_surface.deinit();
 
-    try drawSource(&test_surface.surface, &document, null, .{ .focus = .source }, .{}, .default());
+    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, .default());
     var snapshot = try test_surface.snapshot(allocator);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "/needle") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 first") != null);
@@ -274,7 +305,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try test_surface.init(32, 6);
     var search: model.SourceSearchState = .{ .mode = true };
     try search.input.insertSlice("needle");
-    try drawSource(&test_surface.surface, &document, null, .{ .focus = .source }, search, .default());
+    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, search, .default());
     snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "/needle") != null);
@@ -293,7 +324,7 @@ test "repository source match overlay remains distinct on the cursor line" {
     const search: model.SourceSearchState = .{
         .match = .{ .line = 0, .start = 2, .end = 8 },
     };
-    try drawSource(&test_surface.surface, &document, null, .{ .focus = .source, .source_cursor = 0 }, search, palette);
+    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source, .source_cursor = 0 }, search, palette);
     const match_cell = test_surface.surface.readCell(7, 2) orelse return error.ExpectedMatchCell;
     const plain_cell = test_surface.surface.readCell(3, 2) orelse return error.ExpectedPlainCell;
     try std.testing.expectEqual(palette.boldStyle(.warning), match_cell.style);
@@ -322,7 +353,7 @@ test "repository source syntax uses neutral styles below the search overlay" {
     var syntax_surface: chasen.testing.TestSurface = undefined;
     try syntax_surface.init(24, 6);
     defer syntax_surface.deinit();
-    try drawSource(&syntax_surface.surface, &document, &spans, .{ .focus = .source }, .{}, palette);
+    try drawSource(&syntax_surface.surface, &document, &spans, null, .{ .focus = .source }, .{}, palette);
     const keyword_cell = syntax_surface.surface.readCell(3, 2) orelse return error.ExpectedKeywordCell;
     const plain_cell = syntax_surface.surface.readCell(9, 2) orelse return error.ExpectedPlainCell;
     const comment_cell = syntax_surface.surface.readCell(3, 3) orelse return error.ExpectedCommentCell;
@@ -335,7 +366,7 @@ test "repository source syntax uses neutral styles below the search overlay" {
     var search_surface: chasen.testing.TestSurface = undefined;
     try search_surface.init(24, 4);
     defer search_surface.deinit();
-    try drawSource(&search_surface.surface, &document, &spans, .{ .focus = .source }, .{
+    try drawSource(&search_surface.surface, &document, &spans, null, .{ .focus = .source }, .{
         .match = .{ .line = 0, .start = 0, .end = 5 },
     }, palette);
     const match_cell = search_surface.surface.readCell(3, 2) orelse return error.ExpectedMatchCell;

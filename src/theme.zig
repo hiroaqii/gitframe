@@ -15,6 +15,7 @@ pub const Role = enum {
     amend,
 
     diff_added,
+    diff_modified,
     diff_removed,
     diff_added_bg,
     diff_removed_bg,
@@ -107,6 +108,7 @@ pub const Palette = struct {
         palette.set(.amend, .{ .rgb = .{ 203, 166, 247 } });
 
         palette.set(.diff_added, palette.color(.success));
+        palette.set(.diff_modified, palette.color(.info));
         palette.set(.diff_removed, palette.color(.danger));
         palette.set(.diff_added_bg, .{ .rgb = .{ 18, 54, 35 } });
         palette.set(.diff_removed_bg, .{ .rgb = .{ 66, 28, 32 } });
@@ -158,6 +160,7 @@ pub const Palette = struct {
 
     fn deriveDiffRoles(self: *Palette) void {
         self.set(.diff_added, self.color(.success));
+        self.set(.diff_modified, self.color(.info));
         self.set(.diff_removed, self.color(.danger));
         self.set(.diff_metadata, self.color(.muted));
         self.set(.diff_line_number, self.color(.muted));
@@ -169,6 +172,7 @@ pub const Palette = struct {
 fn isDerivedRole(role: Role) bool {
     return switch (role) {
         .diff_added,
+        .diff_modified,
         .diff_removed,
         .diff_added_bg,
         .diff_removed_bg,
@@ -250,6 +254,7 @@ test "roleFromKey maps known theme keys" {
     try std.testing.expectEqual(Role.foreground, roleFromKey("foreground").?);
     try std.testing.expectEqual(Role.accent, roleFromKey("accent").?);
     try std.testing.expectEqual(Role.diff_added, roleFromKey("diff_added").?);
+    try std.testing.expectEqual(Role.diff_modified, roleFromKey("diff_modified").?);
     try std.testing.expectEqual(Role.diff_added_bg, roleFromKey("diff_added_bg").?);
     try std.testing.expect(roleFromKey("diff-added") == null);
 }
@@ -259,6 +264,7 @@ test "Palette.fromConfig derives diff roles from base role overrides" {
         pub fn get(_: @This(), role: Role) ?ColorValue {
             return switch (role) {
                 .success => .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } },
+                .info => .{ .rgb = .{ .r = 7, .g = 8, .b = 9 } },
                 else => null,
             };
         }
@@ -267,6 +273,7 @@ test "Palette.fromConfig derives diff roles from base role overrides" {
     const palette = Palette.fromConfig(FakeConfig{});
     try std.testing.expect(palette.color(.success).eql(.{ .rgb = .{ 1, 2, 3 } }));
     try std.testing.expect(palette.color(.diff_added).eql(.{ .rgb = .{ 1, 2, 3 } }));
+    try std.testing.expect(palette.color(.diff_modified).eql(.{ .rgb = .{ 7, 8, 9 } }));
 }
 
 test "Palette.fromConfig lets explicit diff role overrides win" {
@@ -275,6 +282,7 @@ test "Palette.fromConfig lets explicit diff role overrides win" {
             return switch (role) {
                 .success => .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } },
                 .diff_added => .{ .index = 10 },
+                .diff_modified => .{ .index = 12 },
                 .diff_added_bg => .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } },
                 else => null,
             };
@@ -284,5 +292,6 @@ test "Palette.fromConfig lets explicit diff role overrides win" {
     const palette = Palette.fromConfig(FakeConfig{});
     try std.testing.expect(palette.color(.success).eql(.{ .rgb = .{ 1, 2, 3 } }));
     try std.testing.expect(palette.color(.diff_added).eql(.{ .index = 10 }));
+    try std.testing.expect(palette.color(.diff_modified).eql(.{ .index = 12 }));
     try std.testing.expect(palette.color(.diff_added_bg).eql(.{ .rgb = .{ 4, 5, 6 } }));
 }

@@ -9,6 +9,7 @@ const git_backend = @import("../../git/backend.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 const selected_document = @import("../../repository/document.zig");
 const source_document = @import("../../repository/source.zig");
+const repository_change_map = @import("../../repository/change_map.zig");
 const manifest = @import("../../repository/manifest.zig");
 const repository_tree = @import("../../repository/tree.zig");
 const source_syntax = @import("../../syntax/source.zig");
@@ -65,12 +66,45 @@ pub const DisplayedDocument = struct {
     source_revision: u64 = 0,
     value: DocumentValue,
     syntax_spans: source_syntax.SourceSpans = .empty(),
+    change_decoration: ChangeDecoration = .terminal_plain,
 
     pub fn deinit(self: *DisplayedDocument, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         self.value.deinit(allocator);
         self.syntax_spans.deinit(allocator);
+        self.change_decoration.deinit(allocator);
         self.* = undefined;
+    }
+};
+
+/// Explicit async decoration state. `eligible` means the accepted source still
+/// needs exactly one comparison; `terminal_plain` is a deliberate fail-closed
+/// result, not an invitation to retry on every unrelated event.
+pub const ChangeDecoration = union(enum) {
+    eligible,
+    resolved: repository_change_map.Map,
+    terminal_plain,
+
+    pub fn deinit(self: *ChangeDecoration, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .resolved => |*resolved| resolved.deinit(allocator),
+            .eligible, .terminal_plain => {},
+        }
+        self.* = .terminal_plain;
+    }
+
+    pub fn map(self: *const ChangeDecoration) ?*const repository_change_map.Map {
+        return switch (self.*) {
+            .resolved => |*resolved| resolved,
+            .eligible, .terminal_plain => null,
+        };
+    }
+
+    pub fn isEligible(self: *const ChangeDecoration) bool {
+        return switch (self.*) {
+            .eligible => true,
+            .resolved, .terminal_plain => false,
+        };
     }
 };
 
@@ -98,6 +132,37 @@ pub const SyntaxFinished = struct {
     result: SyntaxResult,
 
     pub fn deinit(self: *SyntaxFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const ChangeMapResult = union(enum) {
+    loaded: repository_change_map.Map,
+    unavailable,
+
+    pub fn deinit(self: *ChangeMapResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .loaded => |*map| map.deinit(allocator),
+            .unavailable => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const ChangeMapFinished = struct {
+    identity: page.RequestIdentity,
+    root_identity: root_capability.Identity,
+    generation: u64,
+    manifest_revision: u64,
+    source_revision: u64,
+    path: []u8,
+    fingerprint: content_fingerprint.Fingerprint,
+    content_line_count: usize,
+    result: ChangeMapResult,
+
+    pub fn deinit(self: *ChangeMapFinished, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         self.result.deinit(allocator);
         self.* = undefined;
@@ -155,6 +220,7 @@ pub const Msg = union(enum) {
     manifest_finished: ManifestFinished,
     document_finished: DocumentFinished,
     syntax_finished: SyntaxFinished,
+    change_map_finished: ChangeMapFinished,
     move_up,
     move_down,
     toggle_directory,
@@ -202,6 +268,7 @@ pub const Msg = union(enum) {
             .manifest_finished => |*finished| finished.deinit(allocator),
             .document_finished => |*finished| finished.deinit(allocator),
             .syntax_finished => |*finished| finished.deinit(allocator),
+            .change_map_finished => |*finished| finished.deinit(allocator),
             else => {},
         }
         self.* = undefined;
@@ -385,6 +452,113 @@ pub fn SyntaxTask(comptime AppMsg: type) type {
     };
 }
 
+pub fn ChangeMapTask(comptime AppMsg: type) type {
+    return struct {
+        identity: page.RequestIdentity,
+        generation: u64,
+        manifest_revision: u64,
+        source_revision: u64,
+        expected_fingerprint: content_fingerprint.Fingerprint,
+        expected_content_line_count: usize,
+        path: []u8,
+        root: root_capability.RootCapability,
+        temp_base_path: []u8,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+            defer task.root.deinit();
+            defer allocator.free(task.temp_base_path);
+
+            var fingerprint = task.expected_fingerprint;
+            var content_line_count = task.expected_content_line_count;
+            var result: ChangeMapResult = .unavailable;
+            var loaded = selected_document.load(task.root, task.path, allocator, io);
+            defer loaded.deinit(allocator);
+            var value = DocumentValue.fromLoaded(allocator, &loaded);
+            defer value.deinit(allocator);
+            switch (value) {
+                .source => |*source| {
+                    fingerprint = source.fingerprint;
+                    content_line_count = source.contentLineCount();
+                    if (task.expected_fingerprint.eql(fingerprint) and
+                        task.expected_content_line_count == content_line_count)
+                    {
+                        result = loadChangeMap(
+                            allocator,
+                            io,
+                            task.root.dir(),
+                            task.path,
+                            source,
+                            task.temp_base_path,
+                        );
+                    }
+                },
+                .inert => {},
+            }
+
+            const finished = ChangeMapFinished{
+                .identity = task.identity,
+                .root_identity = task.root.identity,
+                .generation = task.generation,
+                .manifest_revision = task.manifest_revision,
+                .source_revision = task.source_revision,
+                .path = task.path,
+                .fingerprint = fingerprint,
+                .content_line_count = content_line_count,
+                .result = result,
+            };
+            task.path = &.{};
+            return .{ .repository = .{ .change_map_finished = finished } };
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+            defer task.root.deinit();
+            defer allocator.free(task.temp_base_path);
+            const finished = ChangeMapFinished{
+                .identity = task.identity,
+                .root_identity = task.root.identity,
+                .generation = task.generation,
+                .manifest_revision = task.manifest_revision,
+                .source_revision = task.source_revision,
+                .path = task.path,
+                .fingerprint = task.expected_fingerprint,
+                .content_line_count = task.expected_content_line_count,
+                .result = .unavailable,
+            };
+            task.path = &.{};
+            return .{ .repository = .{ .change_map_finished = finished } };
+        }
+    };
+}
+
+fn loadChangeMap(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    path: []const u8,
+    source: *const source_document.Document,
+    temp_base_path: []const u8,
+) ChangeMapResult {
+    var backend: git_backend.LocalCommandBackend = .{};
+    const loaded = backend.backend().loadRepositoryFileChange(allocator, io, .{
+        .cwd = cwd,
+        .path = path,
+        .source_bytes = source.bytes,
+        .temp_base_path = temp_base_path,
+    }) catch return .unavailable;
+    defer loaded.deinit(allocator);
+    const map = switch (loaded) {
+        .all_added => repository_change_map.allAdded(allocator, source.contentLineCount()),
+        .patch => |patch| repository_change_map.fromPatch(allocator, patch, source.contentLineCount()),
+        .unchanged => repository_change_map.fromPatch(allocator, "", source.contentLineCount()),
+        .failed_static => return .unavailable,
+    } catch return .unavailable;
+    return .{ .loaded = map };
+}
+
 pub fn runManifestLoad(
     cwd: std.Io.Dir,
     expected_fingerprint: ?content_fingerprint.Fingerprint,
@@ -464,6 +638,25 @@ pub const SyntaxRequest = struct {
     }
 };
 
+pub const ChangeMapRequest = struct {
+    identity: page.RequestIdentity,
+    generation: u64,
+    manifest_revision: u64,
+    source_revision: u64,
+    expected_fingerprint: content_fingerprint.Fingerprint,
+    expected_content_line_count: usize,
+    path: []u8,
+    root: root_capability.RootCapability,
+    temp_base_path: []u8,
+
+    pub fn deinit(self: *ChangeMapRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.root.deinit();
+        allocator.free(self.temp_base_path);
+        self.* = undefined;
+    }
+};
+
 pub const ApplyOutcome = enum { discarded, unchanged, changed, failed };
 
 pub const MouseButton = enum { left, wheel_up, wheel_down };
@@ -505,6 +698,9 @@ pub const RepositoryPageState = struct {
     syntax_generation: u64 = 0,
     pending_syntax_generation: ?u64 = null,
     needs_syntax_request: bool = false,
+    change_map_generation: u64 = 0,
+    pending_change_map_generation: ?u64 = null,
+    needs_change_map_request: bool = false,
     needs_revalidation: bool = false,
     needs_document_revalidation: bool = false,
     freshness: enum { unavailable, validating, fresh, failed } = .unavailable,
@@ -532,7 +728,9 @@ pub const RepositoryPageState = struct {
         self.root_identity = identity;
         self.pending_document_generation = null;
         self.pending_syntax_generation = null;
+        self.pending_change_map_generation = null;
         self.needs_syntax_request = false;
+        self.needs_change_map_request = false;
         self.needs_document_revalidation = false;
         if (identity == null) {
             self.needs_revalidation = false;
@@ -573,6 +771,7 @@ pub const RepositoryPageState = struct {
         self.pending_generation = null;
         self.pending_document_generation = null;
         self.pending_syntax_generation = null;
+        self.pending_change_map_generation = null;
         self.repo_epoch = repo_epoch;
         self.root_identity = identity;
         self.status.clear();
@@ -581,6 +780,7 @@ pub const RepositoryPageState = struct {
         self.needs_revalidation = self.active and identity != null;
         self.needs_document_revalidation = false;
         self.needs_syntax_request = false;
+        self.needs_change_map_request = false;
     }
 
     pub fn prepareRequest(
@@ -598,8 +798,10 @@ pub const RepositoryPageState = struct {
         self.pending_generation = self.generation;
         self.pending_document_generation = null;
         self.pending_syntax_generation = null;
+        self.pending_change_map_generation = null;
         self.needs_document_revalidation = false;
         self.needs_syntax_request = false;
+        self.needs_change_map_request = false;
         self.needs_revalidation = false;
         self.freshness = .validating;
         if (self.bundle != null) self.status.set("Validating repository...", .{});
@@ -667,6 +869,41 @@ pub const RepositoryPageState = struct {
         };
     }
 
+    pub fn prepareChangeMapRequest(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        capability: *const root_capability.RootCapability,
+        temp_base_path: []const u8,
+    ) !ChangeMapRequest {
+        const displayed = self.displayed_document orelse return error.NoDisplayedSource;
+        const source = switch (displayed.value) {
+            .source => |source| source,
+            .inert => return error.NoDisplayedSource,
+        };
+        if (!displayed.change_decoration.isEligible()) return error.ChangeMapNotEligible;
+        const path = try allocator.dupe(u8, displayed.path);
+        errdefer allocator.free(path);
+        var root = try capability.duplicate();
+        errdefer root.deinit();
+        const owned_temp_base = try allocator.dupe(u8, temp_base_path);
+        errdefer allocator.free(owned_temp_base);
+        self.change_map_generation +%= 1;
+        if (self.change_map_generation == 0) self.change_map_generation = 1;
+        self.pending_change_map_generation = self.change_map_generation;
+        self.needs_change_map_request = false;
+        return .{
+            .identity = .{ .origin = .repository, .repo_epoch = self.repo_epoch, .activation_id = self.activation_id },
+            .generation = self.change_map_generation,
+            .manifest_revision = displayed.manifest_revision,
+            .source_revision = displayed.source_revision,
+            .expected_fingerprint = source.fingerprint,
+            .expected_content_line_count = source.contentLineCount(),
+            .path = path,
+            .root = root,
+            .temp_base_path = owned_temp_base,
+        };
+    }
+
     pub fn rejectSpawn(self: *RepositoryPageState, generation: u64) void {
         if (self.pending_generation == generation) self.pending_generation = null;
         self.freshness = .failed;
@@ -688,11 +925,19 @@ pub const RepositoryPageState = struct {
         self.needs_syntax_request = source_syntax_runtime.enabled and self.currentSource() != null;
     }
 
+    pub fn rejectChangeMapSpawn(self: *RepositoryPageState, generation: u64) void {
+        if (self.pending_change_map_generation != generation) return;
+        self.pending_change_map_generation = null;
+        self.needs_change_map_request = self.currentSource() != null;
+    }
+
     pub fn requestReload(self: *RepositoryPageState, has_repository: bool) void {
         self.pending_document_generation = null;
         self.pending_syntax_generation = null;
+        self.pending_change_map_generation = null;
         self.needs_document_revalidation = false;
         self.needs_syntax_request = false;
+        self.needs_change_map_request = false;
         if (!has_repository) {
             self.needs_revalidation = false;
             self.freshness = .unavailable;
@@ -720,6 +965,13 @@ pub const RepositoryPageState = struct {
             self.root_identity != null;
     }
 
+    pub fn wantsChangeMapRequest(self: *const RepositoryPageState) bool {
+        return self.active and self.needs_change_map_request and
+            self.pending_generation == null and self.pending_document_generation == null and
+            self.pending_change_map_generation == null and self.displayed_document != null and
+            self.root_identity != null;
+    }
+
     pub fn markRequestPreparationFailed(self: *RepositoryPageState, err: anyerror) void {
         self.freshness = .failed;
         if (self.bundle == null) self.load_state = .failed;
@@ -736,6 +988,11 @@ pub const RepositoryPageState = struct {
         // Parser/query/metadata failure is different: its delivered completion
         // consumes intent and deliberately leaves the plain source terminal.
         self.needs_syntax_request = source_syntax_runtime.enabled and self.currentSource() != null;
+    }
+
+    pub fn markChangeMapRequestPreparationFailed(self: *RepositoryPageState) void {
+        self.pending_change_map_generation = null;
+        self.needs_change_map_request = self.currentSource() != null;
     }
 
     pub fn repositoryCommitFailed(self: *RepositoryPageState) void {
@@ -779,7 +1036,9 @@ pub const RepositoryPageState = struct {
                 if (self.manifest_revision == 0) self.manifest_revision = 1;
                 self.pending_document_generation = null;
                 self.pending_syntax_generation = null;
+                self.pending_change_map_generation = null;
                 self.needs_syntax_request = false;
+                self.needs_change_map_request = false;
                 self.needs_document_revalidation = self.selected_path != null;
                 if (self.displayed_document) |*document| document.deinit(allocator);
                 self.displayed_document = null;
@@ -814,6 +1073,7 @@ pub const RepositoryPageState = struct {
         if (!std.mem.eql(u8, selected, finished.path)) return .discarded;
 
         self.pending_syntax_generation = null;
+        self.pending_change_map_generation = null;
         self.source_revision +%= 1;
         if (self.source_revision == 0) self.source_revision = 1;
         if (self.displayed_document) |*previous| previous.deinit(allocator);
@@ -822,6 +1082,10 @@ pub const RepositoryPageState = struct {
             .manifest_revision = finished.manifest_revision,
             .source_revision = self.source_revision,
             .value = finished.value,
+            .change_decoration = switch (finished.value) {
+                .source => .eligible,
+                .inert => .terminal_plain,
+            },
         };
         finished.path = &.{};
         finished.value = .{ .inert = .unreadable };
@@ -829,6 +1093,7 @@ pub const RepositoryPageState = struct {
         if (self.currentSource() == null) self.viewer.focus = .tree;
         self.source_search.clear();
         self.needs_syntax_request = source_syntax_runtime.enabled and self.currentSource() != null;
+        self.needs_change_map_request = self.currentSource() != null;
         self.status.clear();
         return .changed;
     }
@@ -863,6 +1128,52 @@ pub const RepositoryPageState = struct {
                 return .changed;
             },
             .unavailable => return .unchanged,
+        }
+    }
+
+    pub fn applyChangeMapFinished(self: *RepositoryPageState, allocator: std.mem.Allocator, finished: *ChangeMapFinished) ApplyOutcome {
+        if (finished.identity.origin != .repository or
+            finished.identity.repo_epoch != self.repo_epoch or
+            finished.identity.activation_id != self.activation_id or
+            finished.generation != self.change_map_generation or
+            self.pending_change_map_generation != finished.generation or
+            finished.manifest_revision != self.manifest_revision)
+        {
+            return .discarded;
+        }
+        self.pending_change_map_generation = null;
+        const expected_root = self.root_identity orelse return .discarded;
+        if (!expected_root.eql(finished.root_identity)) return .discarded;
+        const displayed = if (self.displayed_document) |*document| document else return .discarded;
+        if (displayed.source_revision != finished.source_revision or
+            displayed.manifest_revision != finished.manifest_revision or
+            !std.mem.eql(u8, displayed.path, finished.path)) return .discarded;
+        const source = switch (displayed.value) {
+            .source => |*source| source,
+            .inert => return .discarded,
+        };
+        if (!source.fingerprint.eql(finished.fingerprint) or
+            source.contentLineCount() != finished.content_line_count)
+        {
+            // The independent task snapshot observed a newer file than the
+            // accepted source. Do not attach its rows to old coordinates;
+            // request a fresh primary document before trying decoration again.
+            self.needs_document_revalidation = true;
+            return .discarded;
+        }
+        if (!displayed.change_decoration.isEligible()) return .discarded;
+
+        displayed.change_decoration.deinit(allocator);
+        switch (finished.result) {
+            .loaded => |map| {
+                displayed.change_decoration = .{ .resolved = map };
+                finished.result = .unavailable;
+                return .changed;
+            },
+            .unavailable => {
+                displayed.change_decoration = .terminal_plain;
+                return .unchanged;
+            },
         }
     }
 
@@ -1028,12 +1339,14 @@ pub const RepositoryPageState = struct {
                 };
                 if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree);
             },
-            .manifest_finished, .document_finished, .syntax_finished => unreachable,
+            .manifest_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
         }
         if (optionalPathEql(previous, self.selected_path)) return false;
         self.pending_document_generation = null;
         self.pending_syntax_generation = null;
+        self.pending_change_map_generation = null;
         self.needs_syntax_request = false;
+        self.needs_change_map_request = false;
         self.needs_document_revalidation = self.selected_path != null;
         if (self.displayed_document) |*document| document.deinit(allocator);
         self.displayed_document = null;
@@ -1279,7 +1592,15 @@ fn drawDocumentCheckpoint(
     }
     switch (displayed.value) {
         .source => |*source| {
-            try repository_view.drawSource(surface, source, &displayed.syntax_spans, state.viewer, state.source_search, palette);
+            try repository_view.drawSource(
+                surface,
+                source,
+                &displayed.syntax_spans,
+                displayed.change_decoration.map(),
+                state.viewer,
+                state.source_search,
+                palette,
+            );
             return;
         },
         .inert => |inert| drawInertCheckpoint(inert, surface, palette),
@@ -1613,6 +1934,203 @@ test "repository syntax task is plain-first and accepts only matching source ide
         .result = .{ .loaded = undelivered_spans },
     } };
     undelivered.deinitUndelivered(allocator);
+}
+
+test "repository change decoration accepts only the exact displayed source identity" {
+    var root = try TestRoot.init();
+    defer root.deinit();
+    const allocator = std.testing.allocator;
+    const source_bytes = "one\ntwo\n";
+    var state: RepositoryPageState = .{
+        .active = true,
+        .repo_epoch = 3,
+        .activation_id = 4,
+        .root_identity = root.capability.identity,
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .needs_change_map_request = true,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    const owned = try allocator.dupe(u8, source_bytes);
+    state.displayed_document = .{
+        .path = try allocator.dupe(u8, "main.zig"),
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .value = .{ .source = try source_document.Document.initOwned(allocator, owned, .init(owned)) },
+        .change_decoration = .eligible,
+    };
+
+    var request = try state.prepareChangeMapRequest(allocator, &root.capability, "/tmp");
+    defer request.deinit(allocator);
+    var finished = ChangeMapFinished{
+        .identity = request.identity,
+        .root_identity = request.root.identity,
+        .generation = request.generation,
+        .manifest_revision = request.manifest_revision,
+        .source_revision = request.source_revision,
+        .path = try allocator.dupe(u8, request.path),
+        .fingerprint = request.expected_fingerprint,
+        .content_line_count = request.expected_content_line_count,
+        .result = .{ .loaded = try repository_change_map.allAdded(allocator, 2) },
+    };
+    defer finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyChangeMapFinished(allocator, &finished));
+    try std.testing.expectEqual(repository_change_map.Kind.added, state.displayed_document.?.change_decoration.map().?.row(1));
+
+    state.displayed_document.?.change_decoration.deinit(allocator);
+    state.displayed_document.?.change_decoration = .eligible;
+    state.needs_change_map_request = true;
+    var stale_request = try state.prepareChangeMapRequest(allocator, &root.capability, "/tmp");
+    defer stale_request.deinit(allocator);
+    var stale = ChangeMapFinished{
+        .identity = stale_request.identity,
+        .root_identity = stale_request.root.identity,
+        .generation = stale_request.generation,
+        .manifest_revision = stale_request.manifest_revision,
+        .source_revision = stale_request.source_revision,
+        .path = try allocator.dupe(u8, stale_request.path),
+        .fingerprint = stale_request.expected_fingerprint,
+        .content_line_count = stale_request.expected_content_line_count,
+        .result = .{ .loaded = try repository_change_map.allAdded(allocator, 2) },
+    };
+    defer stale.deinit(allocator);
+
+    stale.identity.repo_epoch += 1;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyChangeMapFinished(allocator, &stale));
+    stale.identity = stale_request.identity;
+
+    stale.identity.activation_id += 1;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyChangeMapFinished(allocator, &stale));
+    stale.identity = stale_request.identity;
+
+    stale.generation += 1;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyChangeMapFinished(allocator, &stale));
+    stale.generation = stale_request.generation;
+
+    stale.manifest_revision += 1;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyChangeMapFinished(allocator, &stale));
+    stale.manifest_revision = stale_request.manifest_revision;
+
+    var other_root = try TestRoot.init();
+    defer other_root.deinit();
+    stale.root_identity = other_root.capability.identity;
+    state.pending_change_map_generation = stale_request.generation;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyChangeMapFinished(allocator, &stale));
+    stale.root_identity = stale_request.root.identity;
+
+    stale.source_revision += 1;
+    state.pending_change_map_generation = stale_request.generation;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyChangeMapFinished(allocator, &stale));
+    stale.source_revision = stale_request.source_revision;
+
+    allocator.free(stale.path);
+    stale.path = try allocator.dupe(u8, "other.zig");
+    state.pending_change_map_generation = stale_request.generation;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyChangeMapFinished(allocator, &stale));
+    allocator.free(stale.path);
+    stale.path = try allocator.dupe(u8, stale_request.path);
+
+    stale.content_line_count += 1;
+    state.pending_change_map_generation = stale_request.generation;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyChangeMapFinished(allocator, &stale));
+    try std.testing.expect(state.needs_document_revalidation);
+    stale.content_line_count = stale_request.expected_content_line_count;
+    state.needs_document_revalidation = false;
+
+    stale.fingerprint = .init("newer source");
+    state.pending_change_map_generation = stale_request.generation;
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyChangeMapFinished(allocator, &stale));
+    try std.testing.expect(state.displayed_document.?.change_decoration.isEligible());
+    try std.testing.expect(state.needs_document_revalidation);
+
+    var undelivered = Msg{ .change_map_finished = .{
+        .identity = stale_request.identity,
+        .root_identity = stale_request.root.identity,
+        .generation = stale_request.generation,
+        .manifest_revision = stale_request.manifest_revision,
+        .source_revision = stale_request.source_revision,
+        .path = try allocator.dupe(u8, stale_request.path),
+        .fingerprint = stale_request.expected_fingerprint,
+        .content_line_count = stale_request.expected_content_line_count,
+        .result = .{ .loaded = try repository_change_map.allAdded(allocator, 2) },
+    } };
+    undelivered.deinitUndelivered(allocator);
+}
+
+fn expectRepositoryDecorationCompletionOrder(map_first: bool) !void {
+    var root = try TestRoot.init();
+    defer root.deinit();
+    const allocator = std.testing.allocator;
+    const source_bytes = "const value = 1;\n";
+    var state: RepositoryPageState = .{
+        .active = true,
+        .repo_epoch = 3,
+        .activation_id = 4,
+        .root_identity = root.capability.identity,
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .syntax_generation = 7,
+        .pending_syntax_generation = 7,
+        .change_map_generation = 8,
+        .pending_change_map_generation = 8,
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    const owned = try allocator.dupe(u8, source_bytes);
+    state.displayed_document = .{
+        .path = try allocator.dupe(u8, "main.zig"),
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .value = .{ .source = try source_document.Document.initOwned(allocator, owned, .init(owned)) },
+        .change_decoration = .eligible,
+    };
+    var candidates = [_]source_syntax.Candidate{.{
+        .line_index = 0,
+        .span = .{ .start = 0, .end = 5, .role = .keyword },
+    }};
+    var syntax_finished = SyntaxFinished{
+        .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
+        .root_identity = root.capability.identity,
+        .generation = 7,
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .fingerprint = state.currentSource().?.fingerprint,
+        .result = .{ .loaded = try source_syntax.build(allocator, state.currentSource().?, &candidates) },
+    };
+    defer syntax_finished.deinit(allocator);
+    var map_finished = ChangeMapFinished{
+        .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
+        .root_identity = root.capability.identity,
+        .generation = 8,
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .fingerprint = state.currentSource().?.fingerprint,
+        .content_line_count = 1,
+        .result = .{ .loaded = try repository_change_map.allAdded(allocator, 1) },
+    };
+    defer map_finished.deinit(allocator);
+
+    if (map_first) {
+        try std.testing.expectEqual(ApplyOutcome.changed, state.applyChangeMapFinished(allocator, &map_finished));
+        try std.testing.expectEqual(ApplyOutcome.changed, state.applySyntaxFinished(allocator, &syntax_finished));
+    } else {
+        try std.testing.expectEqual(ApplyOutcome.changed, state.applySyntaxFinished(allocator, &syntax_finished));
+        try std.testing.expectEqual(ApplyOutcome.changed, state.applyChangeMapFinished(allocator, &map_finished));
+    }
+    try std.testing.expectEqual(repository_change_map.Kind.added, state.displayed_document.?.change_decoration.map().?.row(0));
+    try std.testing.expectEqual(@as(usize, 1), state.displayed_document.?.syntax_spans.spans.len);
+}
+
+test "repository syntax and change map completions are order independent" {
+    try expectRepositoryDecorationCompletionOrder(true);
+    try expectRepositoryDecorationCompletionOrder(false);
 }
 
 test "repository page accepts active and inactive matching manifest completions" {

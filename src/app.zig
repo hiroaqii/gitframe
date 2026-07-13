@@ -107,6 +107,7 @@ const GeneratedSyntaxTask = app_load.GeneratedSyntaxTask(App.Msg);
 const RepositoryManifestTask = repository_page.ManifestTask(App.Msg);
 const RepositoryDocumentTask = repository_page.DocumentTask(App.Msg);
 const RepositorySyntaxTask = repository_page.SyntaxTask(App.Msg);
+const RepositoryChangeMapTask = repository_page.ChangeMapTask(App.Msg);
 const source_syntax_runtime = @import("syntax/source_runtime.zig");
 const AmendFinished = app_actions.AmendFinished;
 const CommitFinished = app_actions.CommitFinished;
@@ -637,6 +638,7 @@ pub const App = struct {
         try self.maybeStartRepositoryManifest(ctx);
         try self.maybeStartRepositoryDocument(ctx);
         try self.maybeStartRepositorySyntax(ctx);
+        self.maybeStartRepositoryChangeMap(ctx);
         if (self.active_page == .review) try self.ensureReviewProjection(ctx);
         self.reconcileGitActionSpinnerTimer(ctx);
     }
@@ -698,6 +700,12 @@ pub const App = struct {
                 var owned = finished;
                 defer owned.deinit(ctx.allocator());
                 const outcome = self.pages.repository.applySyntaxFinished(ctx.allocator(), &owned);
+                if (self.active_page != .repository or outcome != .changed) ctx.redraw().skip();
+            },
+            .change_map_finished => |finished| {
+                var owned = finished;
+                defer owned.deinit(ctx.allocator());
+                const outcome = self.pages.repository.applyChangeMapFinished(ctx.allocator(), &owned);
                 if (self.active_page != .repository or outcome != .changed) ctx.redraw().skip();
             },
             else => {
@@ -813,6 +821,51 @@ pub const App = struct {
             ctx.allocator().destroy(task);
             self.pages.repository.rejectSyntaxSpawn(generation);
         };
+    }
+
+    fn maybeStartRepositoryChangeMap(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        if (self.active_page != .repository or !self.pages.repository.wantsChangeMapRequest()) return;
+        const capability = self.repo_state.activeCapability() orelse return;
+        var request = self.pages.repository.prepareChangeMapRequest(
+            ctx.allocator(),
+            capability,
+            self.repositoryChangeTempBase(),
+        ) catch {
+            self.pages.repository.markChangeMapRequestPreparationFailed();
+            return;
+        };
+        var request_consumed = false;
+        defer if (!request_consumed) request.deinit(ctx.allocator());
+        const generation = request.generation;
+        const task = ctx.allocator().create(RepositoryChangeMapTask) catch {
+            self.pages.repository.rejectChangeMapSpawn(generation);
+            return;
+        };
+        task.* = .{
+            .identity = request.identity,
+            .generation = request.generation,
+            .manifest_revision = request.manifest_revision,
+            .source_revision = request.source_revision,
+            .expected_fingerprint = request.expected_fingerprint,
+            .expected_content_line_count = request.expected_content_line_count,
+            .path = request.path,
+            .root = request.root,
+            .temp_base_path = request.temp_base_path,
+        };
+        request_consumed = true;
+        ctx.task().spawnWith(.{ .ctx = task, .run = RepositoryChangeMapTask.run, .failed = RepositoryChangeMapTask.failed }) catch {
+            ctx.allocator().free(task.path);
+            task.root.deinit();
+            ctx.allocator().free(task.temp_base_path);
+            ctx.allocator().destroy(task);
+            self.pages.repository.rejectChangeMapSpawn(generation);
+        };
+    }
+
+    fn repositoryChangeTempBase(self: *const App) []const u8 {
+        const map = self.env_map orelse return "/tmp";
+        const configured = map.get("XDG_RUNTIME_DIR") orelse return "/tmp";
+        return if (std.fs.path.isAbsolute(configured)) configured else "/tmp";
     }
 
     fn finishLoadResult(self: *App, ctx: *chasen.Ctx(Msg), finished: LoadFinishedMsg) !void {
@@ -8927,6 +8980,85 @@ test "repository syntax task allocation and spawn failures release owners and re
 
     var retry_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
     try app.maybeStartRepositorySyntax(&retry_ctx);
+    const queued = retry_ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+}
+
+test "repository change map task allocation and spawn failures release owners and remain retryable" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .repository,
+    };
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(root_path);
+    const source_bytes = try allocator.dupe(u8, "const value = 1;\n");
+    var source_transferred = false;
+    var source_value = @import("repository/source.zig").Document.initOwned(
+        allocator,
+        source_bytes,
+        .init(source_bytes),
+    ) catch |err| {
+        allocator.free(source_bytes);
+        return err;
+    };
+    errdefer if (!source_transferred) source_value.deinit(allocator);
+    const displayed_path = try allocator.dupe(u8, "main.zig");
+    errdefer if (!source_transferred) allocator.free(displayed_path);
+    app.pages.repository = .{
+        .active = true,
+        .repo_epoch = 3,
+        .activation_id = 4,
+        .root_identity = app.repo_state.root.?.identity,
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .load_state = .loaded,
+        .selected_path = "main.zig",
+        .needs_change_map_request = true,
+        .displayed_document = .{
+            .path = displayed_path,
+            .manifest_revision = 5,
+            .source_revision = 6,
+            .value = .{ .source = source_value },
+            .change_decoration = .eligible,
+        },
+    };
+    source_transferred = true;
+
+    // Request preparation owns path/temp-base/root. Fail the following task
+    // allocation and prove the request defer returns all three owners.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
+    var allocation_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = failing.allocator(), ._io = io };
+    app.maybeStartRepositoryChangeMap(&allocation_ctx);
+    try std.testing.expect(app.pages.repository.wantsChangeMapRequest());
+    try std.testing.expectEqual(@as(usize, 0), allocation_ctx.takePendingTasksWith().len);
+
+    const DummyTask = struct {
+        fn run(_: std.mem.Allocator, _: std.Io) App.Msg {
+            return .quit;
+        }
+        fn failed(_: chasen.TaskFailure) App.Msg {
+            return .quit;
+        }
+    };
+    var spawn_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+    for (0..16) |_| try spawn_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+    app.maybeStartRepositoryChangeMap(&spawn_ctx);
+    try std.testing.expect(app.pages.repository.wantsChangeMapRequest());
+    try std.testing.expectEqual(@as(usize, 0), spawn_ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 16), spawn_ctx.takePendingTasks().len);
+
+    var retry_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+    app.maybeStartRepositoryChangeMap(&retry_ctx);
     const queued = retry_ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
     var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
