@@ -74,11 +74,19 @@ pub fn revealMatch(
     clampSource(viewer, document, body_height, text_width);
 }
 
-pub fn refreshFileSearch(state: *model.FileSearchState, tree: *const repository_tree.Tree) void {
+/// File search follows the active tree projection even though it scans raw
+/// nodes so collapsed descendants remain discoverable. Source search is
+/// intentionally different: it is scoped to the already selected document.
+pub fn refreshFileSearch(
+    state: *model.FileSearchState,
+    tree: *const repository_tree.Tree,
+    visibility: repository_tree.Visibility,
+) void {
     state.resetResults();
     const query = state.input.slice();
     for (tree.nodes, 0..) |node, node_index| {
         if (node.kind != .file) continue;
+        if (visibility == .changed and node.file_change == null) continue;
         if (query.len > 0 and std.mem.indexOf(u8, node.path, query) == null) continue;
         if (state.len == model.max_file_search_matches) {
             state.truncated = true;
@@ -142,18 +150,18 @@ test "repository file search retains 512 matches and reports the 513th" {
     defer tree.deinit(allocator);
     var state: model.FileSearchState = .{ .mode = true };
     try state.input.insertSlice("match-");
-    refreshFileSearch(&state, &tree);
+    refreshFileSearch(&state, &tree, .all);
     try std.testing.expectEqual(model.max_file_search_matches, state.len);
     try std.testing.expect(!state.truncated);
 
     state.input = .{};
-    refreshFileSearch(&state, &tree);
+    refreshFileSearch(&state, &tree, .all);
     try std.testing.expectEqual(model.max_file_search_matches, state.len);
     try std.testing.expect(state.truncated);
 
     state.input = .{};
     try state.input.insertSlice("other-512.zig");
-    refreshFileSearch(&state, &tree);
+    refreshFileSearch(&state, &tree, .all);
     try std.testing.expectEqual(@as(usize, 1), state.len);
     try std.testing.expect(!state.truncated);
     try std.testing.expectEqualStrings("other-512.zig", tree.nodes[state.selectedNode().?].path);
@@ -170,7 +178,31 @@ test "repository file search compares invalid raw path bytes safely" {
     defer tree.deinit(allocator);
     var state: model.FileSearchState = .{ .mode = true };
     try state.input.insertSlice("target");
-    refreshFileSearch(&state, &tree);
+    refreshFileSearch(&state, &tree, .all);
     try std.testing.expectEqual(@as(usize, 1), state.len);
     try std.testing.expectEqualStrings("target.zig", tree.nodes[state.selectedNode().?].path);
+}
+
+test "repository changed file search ignores clean files and collapsed visibility" {
+    const allocator = std.testing.allocator;
+    var manifest = try @import("../../../repository/manifest.zig").parseOwned(
+        allocator,
+        try allocator.dupe(u8, "dir/changed.zig\x00dir/clean.zig\x00"),
+    );
+    defer manifest.deinit(allocator);
+    var tree = try repository_tree.Tree.build(allocator, &manifest);
+    defer tree.deinit(allocator);
+    var changes = try @import("../../../repository/change_index.zig").parseOwned(
+        allocator,
+        try allocator.dupe(u8, " M dir/changed.zig\x00"),
+    );
+    defer changes.deinit(allocator);
+    _ = tree.applyChangeIndex(&changes);
+    tree.rebuildVisibleFor(.changed);
+    try std.testing.expect(tree.toggleVisibleFor(0, .changed));
+
+    var state: model.FileSearchState = .{ .mode = true };
+    refreshFileSearch(&state, &tree, .changed);
+    try std.testing.expectEqual(@as(usize, 1), state.len);
+    try std.testing.expectEqualStrings("dir/changed.zig", tree.nodes[state.selectedNode().?].path);
 }

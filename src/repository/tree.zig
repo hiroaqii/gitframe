@@ -8,6 +8,11 @@ const restoration_index_reserve: usize = max_nodes * 3 * @sizeOf(usize);
 
 pub const Kind = enum { directory, file };
 
+/// Selects which raw manifest nodes participate in the current visible tree.
+/// Filtering is a projection only: collapse state remains owned by every
+/// directory node and survives switching between All and Changed views.
+pub const Visibility = enum { all, changed };
+
 /// Compact preorder node. Every string is a slice into the owning manifest;
 /// directory paths are borrowed prefixes, never separately copied full paths.
 pub const Node = struct {
@@ -18,8 +23,8 @@ pub const Node = struct {
     depth: usize,
     expanded: bool = true,
     file_change: ?change_index.Kind = null,
-    /// Cached now for the immediately following Changed-only filter slice.
-    /// Slice A does not recolor directories; this only records descendants.
+    /// Cached descendant predicate for the Changed-only visible projection.
+    /// Directories keep their normal color; this only controls reachability.
     subtree_has_change: bool = false,
 };
 
@@ -151,9 +156,14 @@ pub const Tree = struct {
     }
 
     pub fn rebuildVisible(self: *Tree) void {
+        self.rebuildVisibleFor(.all);
+    }
+
+    pub fn rebuildVisibleFor(self: *Tree, visibility: Visibility) void {
         var length: usize = 0;
         var hidden_below_depth: ?usize = null;
         for (self.nodes, 0..) |node, index| {
+            if (visibility == .changed and !node.subtree_has_change) continue;
             if (hidden_below_depth) |depth| {
                 if (node.depth > depth) continue;
                 hidden_below_depth = null;
@@ -170,16 +180,47 @@ pub const Tree = struct {
     }
 
     pub fn toggleVisible(self: *Tree, visible_index: usize) bool {
+        return self.toggleVisibleFor(visible_index, .all);
+    }
+
+    pub fn toggleVisibleFor(self: *Tree, visible_index: usize, visibility: Visibility) bool {
         if (visible_index >= self.visible_len) return false;
         const node = &self.nodes[self.visible[visible_index]];
         if (node.kind != .directory) return false;
         node.expanded = !node.expanded;
-        self.rebuildVisible();
+        self.rebuildVisibleFor(visibility);
         return true;
     }
 
     pub fn firstFilePath(self: *const Tree) ?[]const u8 {
         for (self.nodes) |node| if (node.kind == .file) return node.path;
+        return null;
+    }
+
+    pub fn firstFilePathFor(self: *const Tree, visibility: Visibility) ?[]const u8 {
+        for (self.nodes) |node| {
+            if (node.kind != .file) continue;
+            if (visibility == .changed and node.file_change == null) continue;
+            return node.path;
+        }
+        return null;
+    }
+
+    pub fn filePath(self: *const Tree, path: []const u8, visibility: Visibility) ?[]const u8 {
+        for (self.nodes) |node| {
+            if (node.kind != .file or !std.mem.eql(u8, node.path, path)) continue;
+            if (visibility == .changed and node.file_change == null) return null;
+            return node.path;
+        }
+        return null;
+    }
+
+    pub fn nodeIndexForPath(self: *const Tree, path: []const u8, visibility: Visibility) ?usize {
+        for (self.nodes, 0..) |node, index| {
+            if (!std.mem.eql(u8, node.path, path)) continue;
+            if (visibility == .changed and !node.subtree_has_change) return null;
+            return index;
+        }
         return null;
     }
 
@@ -191,13 +232,18 @@ pub const Tree = struct {
     }
 
     pub fn revealNode(self: *Tree, node_index: usize) ?usize {
+        return self.revealNodeFor(node_index, .all);
+    }
+
+    pub fn revealNodeFor(self: *Tree, node_index: usize, visibility: Visibility) ?usize {
         if (node_index >= self.nodes.len) return null;
+        if (visibility == .changed and !self.nodes[node_index].subtree_has_change) return null;
         var parent = self.nodes[node_index].parent;
         while (parent) |index| {
             self.nodes[index].expanded = true;
             parent = self.nodes[index].parent;
         }
-        self.rebuildVisible();
+        self.rebuildVisibleFor(visibility);
         for (self.visibleNodes(), 0..) |visible_node, visible_index| {
             if (visible_node == node_index) return visible_index;
         }
@@ -205,8 +251,8 @@ pub const Tree = struct {
     }
 
     /// Projects byte-exact status paths onto current manifest files and caches
-    /// the descendant predicate needed by the next, separately committed
-    /// Changed-only filter. Deleted paths cannot create synthetic tree nodes.
+    /// the descendant predicate consumed by Changed visibility. Deleted paths
+    /// cannot create synthetic tree nodes.
     pub fn applyChangeIndex(self: *Tree, index: *const change_index.Index) bool {
         var changed = false;
         for (self.nodes) |*node| {
@@ -433,6 +479,37 @@ test "repository tree projects exact file changes and changed ancestors" {
         try std.testing.expect(node.file_change == null);
         try std.testing.expect(!node.subtree_has_change);
     }
+}
+
+test "repository tree changed visibility keeps only matching ancestry and collapse state" {
+    var document = try documentForTest("a/changed.zig\x00a/clean.zig\x00b/clean.zig\x00root.zig\x00");
+    defer document.deinit(std.testing.allocator);
+    var tree = try Tree.build(std.testing.allocator, &document);
+    defer tree.deinit(std.testing.allocator);
+    var index = try change_index.parseOwned(
+        std.testing.allocator,
+        try std.testing.allocator.dupe(u8, " M a/changed.zig\x00"),
+    );
+    defer index.deinit(std.testing.allocator);
+    _ = tree.applyChangeIndex(&index);
+
+    tree.rebuildVisibleFor(.changed);
+    try std.testing.expectEqual(@as(usize, 2), tree.visible_len);
+    try std.testing.expectEqualStrings("a", tree.nodes[tree.visible[0]].path);
+    try std.testing.expectEqualStrings("a/changed.zig", tree.nodes[tree.visible[1]].path);
+    try std.testing.expect(tree.toggleVisibleFor(0, .changed));
+    try std.testing.expectEqual(@as(usize, 1), tree.visible_len);
+
+    tree.rebuildVisibleFor(.all);
+    try std.testing.expect(!tree.nodes[0].expanded);
+    try std.testing.expectEqual(@as(usize, 4), tree.visible_len);
+    tree.rebuildVisibleFor(.changed);
+    try std.testing.expectEqual(@as(usize, 1), tree.visible_len);
+    const changed_index = tree.nodeIndexForPath("a/changed.zig", .changed) orelse return error.ExpectedChangedFile;
+    _ = tree.revealNodeFor(changed_index, .changed) orelse return error.ExpectedVisibleFile;
+    try std.testing.expect(tree.nodes[0].expanded);
+    try std.testing.expectEqualStrings("a/changed.zig", tree.firstFilePathFor(.changed).?);
+    try std.testing.expect(tree.filePath("a/clean.zig", .changed) == null);
 }
 
 test "repository tree deleted selection follows surviving old order" {

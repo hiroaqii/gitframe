@@ -262,6 +262,7 @@ pub const Msg = union(enum) {
     tree_last,
     source_first,
     source_last,
+    toggle_changed_filter,
     toggle_line_numbers,
     enter_source_search,
     cancel_source_search,
@@ -791,6 +792,11 @@ pub const RepositoryPageState = struct {
     bundle: ?Bundle = null,
     displayed_document: ?DisplayedDocument = null,
     selected_path: ?[]const u8 = null,
+    file_visibility: repository_tree.Visibility = .all,
+    /// Owned raw path captured before entering Changed mode. It is deliberately
+    /// independent from manifest generations so background replacement cannot
+    /// leave a borrowed selection dangling before the user returns to All.
+    all_selection_anchor: ?[]u8 = null,
     viewer: repository_model.ViewerState = .{},
     source_search: repository_model.SourceSearchState = .{},
     file_search: repository_model.FileSearchState = .{},
@@ -799,6 +805,7 @@ pub const RepositoryPageState = struct {
     pub fn deinit(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
         if (self.bundle) |*bundle| bundle.deinit(allocator);
         if (self.displayed_document) |*document| document.deinit(allocator);
+        if (self.all_selection_anchor) |anchor| allocator.free(anchor);
         self.* = .{};
     }
 
@@ -848,6 +855,12 @@ pub const RepositoryPageState = struct {
         }
         self.displayed_document = null;
         self.selected_path = null;
+        if (self.all_selection_anchor) |anchor| {
+            const owner = allocator orelse @panic("Repository selection-anchor replacement requires an allocator");
+            owner.free(anchor);
+        }
+        self.all_selection_anchor = null;
+        self.file_visibility = .all;
         self.viewer = .{};
         self.source_search.clear();
         self.file_search.close();
@@ -1105,10 +1118,12 @@ pub const RepositoryPageState = struct {
         }
         switch (finished.result) {
             .unchanged => {
+                const changed_status_message = self.file_visibility == .changed and
+                    self.bundle != null and !self.bundle.?.status_available;
                 self.freshness = if (self.active) .fresh else .validating;
                 self.needs_document_revalidation = self.selected_path != null;
                 self.status.clear();
-                return .unchanged;
+                return if (changed_status_message) .changed else .unchanged;
             },
             .status_changed => |*update| {
                 const bundle = if (self.bundle) |*owned| owned else {
@@ -1119,6 +1134,8 @@ pub const RepositoryPageState = struct {
                     self.status.clear();
                     return .unchanged;
                 };
+                const previous_selected = self.selected_path;
+                const previous_status_available = bundle.status_available;
                 const visible_changed = switch (update.*) {
                     .loaded => |*index| blk: {
                         const changed = bundle.tree.applyChangeIndex(index);
@@ -1134,14 +1151,24 @@ pub const RepositoryPageState = struct {
                         break :blk bundle.tree.clearChangeIndex();
                     },
                 };
+                const selection_changed = if (self.file_visibility == .changed)
+                    self.rebuildTreeProjection(previous_selected, false, 0)
+                else
+                    false;
                 // Status-only refresh does not change manifest/source identity,
-                // or replace the displayed source. The manifest request consumed
-                // the existing source-validation intent, so restore it for both
-                // successful and unavailable optional status outcomes.
-                self.needs_document_revalidation = self.selected_path != null;
+                // but Changed projection may move or clear selection when a file
+                // leaves the status set. Preserve the source only when its raw
+                // path identity survived that projection.
+                if (selection_changed)
+                    self.invalidateSelectedDocument(allocator)
+                else
+                    self.needs_document_revalidation = self.selected_path != null;
                 self.freshness = if (self.active) .fresh else .validating;
                 self.status.clear();
-                return if (visible_changed) .changed else .unchanged;
+                const status_availability_changed = self.file_visibility == .changed and
+                    previous_status_available != bundle.status_available;
+                const changed_status_message = self.file_visibility == .changed and !bundle.status_available;
+                return if (visible_changed or selection_changed or status_availability_changed or changed_status_message) .changed else .unchanged;
             },
             .loaded => |*incoming| {
                 self.replaceBundle(allocator, incoming) catch |err| {
@@ -1306,9 +1333,96 @@ pub const RepositoryPageState = struct {
         incoming.* = undefined;
         self.selected_path = selected;
         self.load_state = if (self.bundle.?.document.paths.len == 0) .empty else .loaded;
-        self.viewer.tree_cursor = if (selected) |path| self.bundle.?.tree.visibleIndexForPath(path) orelse 0 else 0;
-        if (self.file_search.mode) repository_navigation.refreshFileSearch(&self.file_search, &self.bundle.?.tree);
-        self.clampScroll(0);
+        if (self.file_visibility == .all) {
+            self.bundle.?.tree.rebuildVisible();
+            self.viewer.tree_cursor = if (selected) |path| self.bundle.?.tree.visibleIndexForPath(path) orelse 0 else 0;
+            if (self.file_search.mode) {
+                repository_navigation.refreshFileSearch(&self.file_search, &self.bundle.?.tree, .all);
+            }
+            self.clampScroll(0);
+        } else {
+            _ = self.rebuildTreeProjection(selected, false, 0);
+        }
+    }
+
+    /// Rebuilds only the page-visible tree and resolves selection against that
+    /// projection. The raw manifest and collapse flags remain authoritative;
+    /// switching filters therefore cannot destroy the user's All-mode shape.
+    fn rebuildTreeProjection(
+        self: *RepositoryPageState,
+        preferred: ?[]const u8,
+        reveal_preferred: bool,
+        body_height: u16,
+    ) bool {
+        const previous = self.selected_path;
+        const bundle = if (self.bundle) |*owned| owned else {
+            self.selected_path = null;
+            self.viewer.tree_cursor = 0;
+            self.viewer.tree_vertical_scroll = 0;
+            self.file_search.resetResults();
+            return !optionalPathEql(previous, null);
+        };
+        const tree = &bundle.tree;
+        tree.rebuildVisibleFor(self.file_visibility);
+
+        const status_usable = self.file_visibility == .all or bundle.status_available;
+        const retained = if (status_usable and preferred != null)
+            tree.filePath(preferred.?, self.file_visibility)
+        else
+            null;
+        const selected = retained orelse if (status_usable)
+            tree.firstFilePathFor(self.file_visibility)
+        else
+            null;
+        self.selected_path = selected;
+
+        if (selected) |path| {
+            var visible = tree.visibleIndexForPath(path);
+            if (visible == null and (reveal_preferred or retained == null)) {
+                if (tree.nodeIndexForPath(path, self.file_visibility)) |node_index| {
+                    visible = tree.revealNodeFor(node_index, self.file_visibility);
+                }
+            }
+            if (visible) |index| self.viewer.tree_cursor = index;
+        } else {
+            self.viewer.tree_cursor = 0;
+            self.viewer.tree_vertical_scroll = 0;
+            if (self.currentSource() == null) self.viewer.focus = .tree;
+        }
+        if (self.file_search.mode) {
+            repository_navigation.refreshFileSearch(&self.file_search, tree, self.file_visibility);
+        }
+        self.clampScroll(body_height);
+        return !optionalPathEql(previous, self.selected_path);
+    }
+
+    fn toggleChangedFilter(self: *RepositoryPageState, allocator: std.mem.Allocator, body_height: u16) void {
+        switch (self.file_visibility) {
+            .all => {
+                const anchor = if (self.selected_path) |path|
+                    allocator.dupe(u8, path) catch {
+                        self.status.set("Could not preserve All selection", .{});
+                        return;
+                    }
+                else
+                    null;
+                if (self.all_selection_anchor) |previous| allocator.free(previous);
+                self.all_selection_anchor = anchor;
+                self.file_visibility = .changed;
+                _ = self.rebuildTreeProjection(self.selected_path, true, body_height);
+            },
+            .changed => {
+                const anchor = self.all_selection_anchor;
+                const preferred = if (anchor) |path| blk: {
+                    const tree = if (self.bundle) |*bundle| &bundle.tree else break :blk self.selected_path;
+                    break :blk tree.filePath(path, .all) orelse self.selected_path;
+                } else self.selected_path;
+                self.file_visibility = .all;
+                _ = self.rebuildTreeProjection(preferred, true, body_height);
+                if (anchor) |owned| allocator.free(owned);
+                self.all_selection_anchor = null;
+            },
+        }
     }
 
     fn acceptFailure(self: *RepositoryPageState, message: []const u8) void {
@@ -1396,6 +1510,7 @@ pub const RepositoryPageState = struct {
             .tree_last => self.selectTreeEdge(true, body_height),
             .source_first => if (source) |document| repository_navigation.firstSource(&self.viewer, document, body_size.height),
             .source_last => if (source) |document| repository_navigation.lastSource(&self.viewer, document, body_size.height),
+            .toggle_changed_filter => self.toggleChangedFilter(allocator, body_height),
             .toggle_line_numbers => {
                 self.viewer.line_numbers = !self.viewer.line_numbers;
                 if (source) |document| repository_navigation.clampSource(&self.viewer, document, body_size.height, repository_view.sourceTextWidth(right_width, document, self.viewer.line_numbers));
@@ -1432,7 +1547,7 @@ pub const RepositoryPageState = struct {
             .enter_file_search => {
                 self.file_search.mode = true;
                 self.file_search.input = .{};
-                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree);
+                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree, self.file_visibility);
             },
             .cancel_file_search => self.file_search.close(),
             .submit_file_search => self.submitFileSearch(body_height),
@@ -1440,25 +1555,30 @@ pub const RepositoryPageState = struct {
             .file_search_next => self.file_search.move(1),
             .file_search_backspace => {
                 self.file_search.input.backspace();
-                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree);
+                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree, self.file_visibility);
             },
             .file_search_insert => |codepoint| {
                 self.file_search.input.insert(codepoint) catch {
                     self.status.set("File search is too long", .{});
                     return false;
                 };
-                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree);
+                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree, self.file_visibility);
             },
             .file_search_paste => |text| {
                 self.file_search.input.insertSlice(text) catch {
                     self.status.set("File search is too long", .{});
                     return false;
                 };
-                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree);
+                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree, self.file_visibility);
             },
             .manifest_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
         }
         if (optionalPathEql(previous, self.selected_path)) return false;
+        self.invalidateSelectedDocument(allocator);
+        return true;
+    }
+
+    fn invalidateSelectedDocument(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
         self.pending_document_generation = null;
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
@@ -1469,7 +1589,6 @@ pub const RepositoryPageState = struct {
         self.displayed_document = null;
         self.viewer.resetSource();
         self.source_search.clear();
-        return true;
     }
 
     fn currentSource(self: *const RepositoryPageState) ?*const source_document.Document {
@@ -1523,7 +1642,7 @@ pub const RepositoryPageState = struct {
             return;
         };
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
-        const visible = tree.revealNode(node_index) orelse return;
+        const visible = tree.revealNodeFor(node_index, self.file_visibility) orelse return;
         self.viewer.tree_cursor = visible;
         self.viewer.focus = .tree;
         self.selected_path = tree.nodes[node_index].path;
@@ -1549,7 +1668,7 @@ pub const RepositoryPageState = struct {
 
     fn toggleCursor(self: *RepositoryPageState, body_height: u16) void {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
-        if (tree.toggleVisible(self.viewer.tree_cursor)) {
+        if (tree.toggleVisibleFor(self.viewer.tree_cursor, self.file_visibility)) {
             if (tree.visible_len > 0) self.viewer.tree_cursor = @min(self.viewer.tree_cursor, tree.visible_len - 1);
             self.clampScroll(body_height);
         } else self.selectCursor();
@@ -1635,18 +1754,21 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     if (size.width == 0 or size.height == 0) return;
     const state = context.page_state;
     switch (state.load_state) {
-        .idle, .no_repository, .loading, .failed => {
+        .idle, .no_repository, .failed => {
             const label: []const u8 = switch (state.load_state) {
                 .idle => "Repository not loaded",
                 .no_repository => "Repository required",
-                .loading => "Loading repository files...",
                 .failed => if (state.status.text().len > 0) state.status.text() else "Repository manifest failed",
                 else => unreachable,
             };
             draw.copyClippedTextAt(surface, 1, size.height / 2, label, context.palette.style(if (state.load_state == .failed) .danger else .muted)) catch {};
             return;
         },
-        .empty => {
+        .loading => if (state.file_visibility == .all) {
+            draw.copyClippedTextAt(surface, 1, size.height / 2, "Loading repository files...", context.palette.style(.muted)) catch {};
+            return;
+        },
+        .empty => if (state.file_visibility == .all) {
             draw.copyClippedTextAt(surface, 1, size.height / 2, "Repository has no tracked or non-ignored files", context.palette.style(.muted)) catch {};
             return;
         },
@@ -1656,36 +1778,53 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     const layout = bodyLayout(size);
     const left_width = layout.tree_width;
     var left = surface.child(.{ .col = 0, .row = 0, .width = left_width, .height = size.height });
-    draw.copyClippedTextAt(&left, 1, 0, "Repository files", context.palette.boldStyle(.accent)) catch {};
+    const tree_header: []const u8 = if (state.file_visibility == .changed) "Repository files [changed]" else "Repository files";
+    draw.copyClippedTextAt(&left, 1, 0, tree_header, context.palette.boldStyle(.accent)) catch {};
     if (left_width < size.width) {
         var separator_row: u16 = 0;
         while (separator_row < size.height) : (separator_row += 1) _ = surface.borrowTextAt(left_width, separator_row, "│", context.palette.style(.muted));
     }
+    if (state.load_state == .loading) {
+        if (size.height > 1) draw.copyClippedTextAt(&left, 1, 1, "Loading changed files...", context.palette.style(.muted)) catch {};
+        return;
+    }
 
     const tree = &state.bundle.?.tree;
     const rows = layout.treeRows(size.height);
-    var body_row: usize = 0;
-    while (body_row < rows and state.viewer.tree_vertical_scroll + body_row < tree.visible_len) : (body_row += 1) {
-        const visible_index = state.viewer.tree_vertical_scroll + body_row;
-        const node = tree.nodes[tree.visible[visible_index]];
-        const visible_text = try treeRowTextAlloc(
-            surface.frameAllocator(),
-            node,
-            state.viewer.tree_horizontal_scroll,
-            left_width -| 1,
-        );
-        const style = if (visible_index == state.viewer.tree_cursor)
-            context.palette.boldStyle(.prompt)
-        else if (node.kind == .directory)
-            context.palette.boldStyle(.accent)
-        else if (node.file_change) |change|
-            context.palette.style(switch (change) {
-                .added => .diff_added,
-                .modified => .diff_modified,
-            })
-        else
-            context.palette.style(.foreground);
-        draw.copyClippedTextAt(&left, 1, @intCast(body_row + 1), visible_text, style) catch {};
+    const changed_message: ?[]const u8 = if (state.file_visibility == .all)
+        null
+    else if (!treeStatusAvailable(state))
+        if (state.freshness == .validating) "Loading changed files..." else "Changed-file status unavailable; press r to retry"
+    else if (tree.visible_len == 0)
+        "No changed files"
+    else
+        null;
+    if (changed_message) |message| {
+        if (size.height > 1) draw.copyClippedTextAt(&left, 1, 1, message, context.palette.style(.muted)) catch {};
+    } else {
+        var body_row: usize = 0;
+        while (body_row < rows and state.viewer.tree_vertical_scroll + body_row < tree.visible_len) : (body_row += 1) {
+            const visible_index = state.viewer.tree_vertical_scroll + body_row;
+            const node = tree.nodes[tree.visible[visible_index]];
+            const visible_text = try treeRowTextAlloc(
+                surface.frameAllocator(),
+                node,
+                state.viewer.tree_horizontal_scroll,
+                left_width -| 1,
+            );
+            const style = if (visible_index == state.viewer.tree_cursor)
+                context.palette.boldStyle(.prompt)
+            else if (node.kind == .directory)
+                context.palette.boldStyle(.accent)
+            else if (node.file_change) |change|
+                context.palette.style(switch (change) {
+                    .added => .diff_added,
+                    .modified => .diff_modified,
+                })
+            else
+                context.palette.style(.foreground);
+            draw.copyClippedTextAt(&left, 1, @intCast(body_row + 1), visible_text, style) catch {};
+        }
     }
 
     if (left_width + 1 >= size.width) return;
@@ -1701,6 +1840,10 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     } else {
         draw.copyClippedTextAt(&right, 1, 0, "No file selected", context.palette.style(.muted)) catch {};
     }
+}
+
+fn treeStatusAvailable(state: *const RepositoryPageState) bool {
+    return if (state.bundle) |bundle| bundle.status_available else false;
 }
 
 fn drawDocumentCheckpoint(
@@ -1827,7 +1970,7 @@ test "repository manifest replacement refreshes active file search indices" {
     };
     defer state.deinit(allocator);
     try state.file_search.input.insertSlice("old");
-    repository_navigation.refreshFileSearch(&state.file_search, &state.bundle.?.tree);
+    repository_navigation.refreshFileSearch(&state.file_search, &state.bundle.?.tree, .all);
     try std.testing.expectEqual(@as(usize, 1), state.file_search.len);
 
     var incoming = try bundleForTest("new.zig\x00");
@@ -1837,10 +1980,205 @@ test "repository manifest replacement refreshes active file search indices" {
     try std.testing.expect(state.file_search.no_match);
 }
 
+test "repository All replacement keeps pre-filter hidden-selection cursor fallback" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("dir/selected.zig\x00root.zig\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.filePath("dir/selected.zig", .all);
+    try std.testing.expect(state.bundle.?.tree.toggleVisible(0));
+    state.viewer.tree_cursor = 1;
+
+    var incoming = try bundleForTest("dir/selected.zig\x00root.zig\x00");
+    errdefer incoming.deinit(allocator);
+    try state.replaceBundle(allocator, &incoming);
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
+    try std.testing.expectEqualStrings("dir/selected.zig", state.selected_path.?);
+}
+
 fn bundleForTest(bytes: []const u8) !Bundle {
     var document = try manifest.parseOwned(std.testing.allocator, try std.testing.allocator.dupe(u8, bytes));
     errdefer document.deinit(std.testing.allocator);
     return .{ .tree = try repository_tree.Tree.build(std.testing.allocator, &document), .document = document };
+}
+
+fn applyBundleStatusForTest(bundle: *Bundle, bytes: []const u8) !void {
+    var index = try repository_change_index.parseOwned(
+        std.testing.allocator,
+        try std.testing.allocator.dupe(u8, bytes),
+    );
+    defer index.deinit(std.testing.allocator);
+    _ = bundle.tree.applyChangeIndex(&index);
+    bundle.status_fingerprint = index.fingerprint;
+    bundle.status_available = true;
+}
+
+test "repository changed filter retains changed selection without document reload" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("changed.zig\x00clean.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 3,
+    };
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, " M changed.zig\x00");
+    state.selected_path = state.bundle.?.tree.filePath("changed.zig", .all);
+    state.displayed_document = .{
+        .path = try allocator.dupe(u8, "changed.zig"),
+        .manifest_revision = 3,
+        .value = .{ .inert = .binary },
+    };
+
+    try std.testing.expect(!state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 }));
+    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
+    try std.testing.expectEqualStrings("changed.zig", state.selected_path.?);
+    try std.testing.expectEqualStrings("changed.zig", state.all_selection_anchor.?);
+    try std.testing.expect(state.displayed_document != null);
+    try std.testing.expect(!state.needs_document_revalidation);
+
+    try std.testing.expect(!state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 }));
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    try std.testing.expectEqualStrings("changed.zig", state.selected_path.?);
+    try std.testing.expect(state.all_selection_anchor == null);
+    try std.testing.expect(state.displayed_document != null);
+}
+
+test "repository changed filter falls back and restores owned All selection" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("changed.zig\x00clean.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 3,
+    };
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, " M changed.zig\x00");
+    state.selected_path = state.bundle.?.tree.filePath("clean.zig", .all);
+    state.displayed_document = .{
+        .path = try allocator.dupe(u8, "clean.zig"),
+        .manifest_revision = 3,
+        .value = .{ .inert = .binary },
+    };
+
+    try std.testing.expect(state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 }));
+    try std.testing.expectEqualStrings("changed.zig", state.selected_path.?);
+    try std.testing.expectEqualStrings("clean.zig", state.all_selection_anchor.?);
+    try std.testing.expect(state.displayed_document == null);
+    try std.testing.expect(state.needs_document_revalidation);
+
+    try std.testing.expect(state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 }));
+    try std.testing.expectEqualStrings("clean.zig", state.selected_path.?);
+    try std.testing.expect(state.all_selection_anchor == null);
+}
+
+test "repository changed navigation and mouse use only filtered visible rows" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("a-change.zig\x00b-clean.zig\x00c-change.zig\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, " M a-change.zig\x00 M c-change.zig\x00");
+    state.selected_path = state.bundle.?.tree.filePath("a-change.zig", .all);
+    const size = chasen.Size{ .width = 80, .height = 10 };
+    _ = state.applyNavigation(allocator, .toggle_changed_filter, size);
+    try std.testing.expectEqual(@as(usize, 2), state.bundle.?.tree.visible_len);
+
+    _ = state.applyNavigation(allocator, .move_down, size);
+    try std.testing.expectEqualStrings("c-change.zig", state.selected_path.?);
+    const mouse_msg = state.mouseToMsg(.{ .col = 1, .row = 1 }, .left, size) orelse return error.ExpectedFilteredMouseRow;
+    _ = state.applyNavigation(allocator, mouse_msg, size);
+    try std.testing.expectEqualStrings("a-change.zig", state.selected_path.?);
+    _ = state.applyNavigation(allocator, .tree_last, size);
+    try std.testing.expectEqualStrings("c-change.zig", state.selected_path.?);
+    state.viewer.tree_cursor = 99;
+    state.viewer.tree_vertical_scroll = 99;
+    state.clampForBodySize(.{ .width = 24, .height = 2 });
+    try std.testing.expect(state.viewer.tree_cursor < state.bundle.?.tree.visible_len);
+    try std.testing.expect(state.viewer.tree_vertical_scroll < state.bundle.?.tree.visible_len);
+}
+
+test "repository changed no-match clears document and All restores anchor once" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("clean.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 3,
+    };
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, "");
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    state.displayed_document = .{
+        .path = try allocator.dupe(u8, "clean.zig"),
+        .manifest_revision = 3,
+        .value = .{ .inert = .binary },
+    };
+
+    try std.testing.expect(state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 }));
+    try std.testing.expect(state.selected_path == null);
+    try std.testing.expect(state.displayed_document == null);
+    try std.testing.expect(!state.needs_document_revalidation);
+    try std.testing.expectEqualStrings("clean.zig", state.all_selection_anchor.?);
+
+    try std.testing.expect(state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 }));
+    try std.testing.expectEqualStrings("clean.zig", state.selected_path.?);
+    try std.testing.expect(state.needs_document_revalidation);
+    const generation = state.document_generation;
+    try std.testing.expect(!state.applyNavigation(allocator, .tree_first, .{ .width = 80, .height = 10 }));
+    try std.testing.expectEqual(generation, state.document_generation);
+}
+
+test "repository changed filter allocation failure leaves mode and selection unchanged" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .pending_document_generation = 7,
+        .pending_syntax_generation = 8,
+        .pending_change_map_generation = 9,
+        .needs_syntax_request = true,
+        .needs_change_map_request = true,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expect(!state.applyNavigation(failing.allocator(), .toggle_changed_filter, .{ .width = 80, .height = 10 }));
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    try std.testing.expectEqualStrings("main.zig", state.selected_path.?);
+    try std.testing.expect(state.all_selection_anchor == null);
+    try std.testing.expectEqual(@as(?u64, 7), state.pending_document_generation);
+    try std.testing.expectEqual(@as(?u64, 8), state.pending_syntax_generation);
+    try std.testing.expectEqual(@as(?u64, 9), state.pending_change_map_generation);
+    try std.testing.expect(state.needs_syntax_request);
+    try std.testing.expect(state.needs_change_map_request);
+    try std.testing.expectEqualStrings("Could not preserve All selection", state.status.text());
+}
+
+test "repository changed filter survives page activation and resets for repository identity" {
+    const allocator = std.testing.allocator;
+    const identity = root_capability.Identity{ .device = 1, .inode = 2 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .bundle = try bundleForTest("changed.zig\x00clean.zig\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, " M changed.zig\x00");
+    state.selected_path = state.bundle.?.tree.filePath("clean.zig", .all);
+    _ = state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 });
+
+    state.deactivate();
+    state.activate(4, identity);
+    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
+    try std.testing.expectEqualStrings("clean.zig", state.all_selection_anchor.?);
+
+    state.repositoryChanged(allocator, 5, .{ .device = 3, .inode = 4 });
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    try std.testing.expect(state.all_selection_anchor == null);
 }
 
 fn manifestResultForTest(bytes: []const u8) !git_backend.RepositoryManifestLoadResult {
@@ -2022,6 +2360,115 @@ test "repository status-only completion preserves source and revisions" {
     try std.testing.expectEqual(displayed_path_address, @intFromPtr(state.displayed_document.?.path.ptr));
     try std.testing.expect(state.needs_document_revalidation);
     try std.testing.expect(state.wantsDocumentRequest());
+}
+
+test "repository changed status loss clears projection and All restores anchor" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("a.zig\x00clean.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 7,
+        .displayed_document = .{
+            .path = try allocator.dupe(u8, "a.zig"),
+            .manifest_revision = 7,
+            .value = .{ .inert = .binary },
+        },
+    };
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, " M a.zig\x00");
+    state.activate(3, root.capability.identity);
+    state.selected_path = state.bundle.?.tree.filePath("a.zig", .all);
+    _ = state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 });
+    try std.testing.expectEqualStrings("a.zig", state.all_selection_anchor.?);
+
+    var request = try state.prepareRequest(allocator, root.path, &root.capability);
+    defer request.deinit(allocator);
+    var unavailable = ManifestFinished{
+        .identity = request.identity,
+        .root_identity = request.root.identity,
+        .generation = request.generation,
+        .result = .{ .status_changed = .unavailable },
+    };
+    defer unavailable.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &unavailable));
+    try std.testing.expect(state.selected_path == null);
+    try std.testing.expect(state.displayed_document == null);
+    try std.testing.expect(!state.needs_document_revalidation);
+    try std.testing.expectEqualStrings("a.zig", state.all_selection_anchor.?);
+
+    try std.testing.expect(state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 }));
+    try std.testing.expectEqualStrings("a.zig", state.selected_path.?);
+    try std.testing.expect(state.all_selection_anchor == null);
+    try std.testing.expect(state.needs_document_revalidation);
+}
+
+test "repository changed status refresh moves clears and repopulates selection" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("a.zig\x00b-clean.zig\x00c.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 7,
+    };
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, " M a.zig\x00");
+    state.activate(3, root.capability.identity);
+    state.selected_path = state.bundle.?.tree.filePath("a.zig", .all);
+    _ = state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 });
+
+    const snapshots = [_][]const u8{
+        " M c.zig\x00",
+        "",
+        " M a.zig\x00",
+    };
+    const expected = [_]?[]const u8{ "c.zig", null, "a.zig" };
+    for (snapshots, expected) |status_bytes, expected_path| {
+        state.needs_revalidation = true;
+        var request = try state.prepareRequest(allocator, root.path, &root.capability);
+        defer request.deinit(allocator);
+        var finished = ManifestFinished{
+            .identity = request.identity,
+            .root_identity = request.root.identity,
+            .generation = request.generation,
+            .result = .{ .status_changed = .{ .loaded = try repository_change_index.parseOwned(
+                allocator,
+                try allocator.dupe(u8, status_bytes),
+            ) } },
+        };
+        defer finished.deinit(allocator);
+        try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &finished));
+        if (expected_path) |path|
+            try std.testing.expectEqualStrings(path, state.selected_path.?)
+        else
+            try std.testing.expect(state.selected_path == null);
+    }
+    try std.testing.expectEqualStrings("a.zig", state.all_selection_anchor.?);
+}
+
+test "repository replacement keeps changed mode anchor independent of manifest storage" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("changed.zig\x00clean.zig\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, " M changed.zig\x00");
+    state.selected_path = state.bundle.?.tree.filePath("clean.zig", .all);
+    _ = state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 });
+
+    var incoming = try bundleForTest("a-first.zig\x00changed.zig\x00new.zig\x00");
+    errdefer incoming.deinit(allocator);
+    try applyBundleStatusForTest(&incoming, " M changed.zig\x00?? new.zig\x00");
+    try state.replaceBundle(allocator, &incoming);
+    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
+    try std.testing.expectEqualStrings("changed.zig", state.selected_path.?);
+    try std.testing.expectEqualStrings("clean.zig", state.all_selection_anchor.?);
+
+    _ = state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 });
+    try std.testing.expectEqualStrings("changed.zig", state.selected_path.?);
 }
 
 fn runRepositoryTestGit(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) !void {
@@ -2966,6 +3413,73 @@ test "repository page renders tree and selected-document loading checkpoint" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading selected file") != null);
     const non_selected_file = test_surface.surface.readCell(7, 3) orelse return error.ExpectedFileCell;
     try std.testing.expectEqual(theme.Palette.default().color(.foreground), non_selected_file.style.fg);
+}
+
+test "repository changed view distinguishes loading unavailable and no-match states" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .file_visibility = .changed,
+        .freshness = .validating,
+    };
+    defer state.deinit(allocator);
+    _ = state.rebuildTreeProjection(null, false, 0);
+
+    {
+        var test_surface: chasen.testing.TestSurface = undefined;
+        try test_surface.init(120, 8);
+        defer test_surface.deinit();
+        try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+        const snapshot = try test_surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository files [changed]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading changed files...") != null);
+    }
+
+    state.freshness = .fresh;
+    {
+        var test_surface: chasen.testing.TestSurface = undefined;
+        try test_surface.init(180, 8);
+        defer test_surface.deinit();
+        try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+        const snapshot = try test_surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Changed-file status unavailable; press r to retry") != null);
+    }
+
+    try applyBundleStatusForTest(&state.bundle.?, "");
+    _ = state.rebuildTreeProjection(null, false, 0);
+    {
+        var test_surface: chasen.testing.TestSurface = undefined;
+        try test_surface.init(120, 8);
+        defer test_surface.deinit();
+        try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+        const snapshot = try test_surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "No changed files") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "No file selected") != null);
+    }
+
+    // At the minimum split width and two rows the full prose is clipped, but
+    // each state still exposes a distinct leading label instead of falling
+    // through to an empty All projection.
+    const narrow_states = [_]struct { available: bool, freshness: @TypeOf(state.freshness), label: []const u8 }{
+        .{ .available = false, .freshness = .validating, .label = "Loading" },
+        .{ .available = false, .freshness = .fresh, .label = "Changed-" },
+        .{ .available = true, .freshness = .fresh, .label = "No changed" },
+    };
+    for (narrow_states) |expected| {
+        state.bundle.?.status_available = expected.available;
+        state.freshness = expected.freshness;
+        var test_surface: chasen.testing.TestSurface = undefined;
+        try test_surface.init(24, 2);
+        defer test_surface.deinit();
+        try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+        const snapshot = try test_surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, expected.label) != null);
+    }
 }
 
 test "repository page layout and mouse mapping share tree geometry" {

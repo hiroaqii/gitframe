@@ -26,6 +26,15 @@ pub fn keyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
     if (context.source_search_mode) return sourceSearchKey(Msg, key);
     if (context.file_search_mode) return fileSearchKey(Msg, key);
 
+    // A configured action claims its normal-mode key even when Repository does
+    // not own that action or its current precondition is unavailable. Falling
+    // through after a null mapping would reinterpret the same key as a local
+    // command; resolving local controls first would also make valid bindings
+    // such as `changed_file_filter = space` impossible to use here.
+    if (context.keymap.actionForKey(key)) |action| {
+        return publicActionToMsg(Msg, context, action);
+    }
+
     if (key.matches(chasen.Key.tab, .{}) and context.source_available) return voidMsg(Msg, "toggle_focus");
     if (key.matches(chasen.Key.escape, .{}) and context.source_query_len > 0) return voidMsg(Msg, "clear_source_search");
     if (context.focus == .tree and (key.matches(chasen.Key.enter, .{}) or key.matches(' ', .{}))) return voidMsg(Msg, "toggle_directory");
@@ -35,17 +44,7 @@ pub fn keyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.end, .{})) {
         return if (context.focus == .source) voidMsg(Msg, "source_last") else voidMsg(Msg, "tree_last");
     }
-    if (key.matches(chasen.Key.page_up, .{})) return voidMsg(Msg, "page_up");
-    if (key.matches(chasen.Key.page_down, .{})) return voidMsg(Msg, "page_down");
 
-    if (context.keymap.actionForKey(key)) |action| switch (action) {
-        .search => if (context.source_available) return voidMsg(Msg, "enter_source_search"),
-        .file_search => return voidMsg(Msg, "enter_file_search"),
-        .toggle_line_numbers => return voidMsg(Msg, "toggle_line_numbers"),
-        .first_file => return voidMsg(Msg, "tree_first"),
-        .last_file => return voidMsg(Msg, "tree_last"),
-        else => {},
-    };
     if (key_input.hasCommandModifier(key)) return null;
 
     return switch (key.codepoint) {
@@ -55,6 +54,20 @@ pub fn keyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
         'l', chasen.Key.right => voidMsg(Msg, "scroll_right"),
         'n' => if (context.source_query_len > 0) voidMsg(Msg, "next_source_match") else null,
         'p' => if (context.source_query_len > 0) voidMsg(Msg, "previous_source_match") else null,
+        else => null,
+    };
+}
+
+fn publicActionToMsg(comptime Msg: type, context: Context, action: keymap.PublicAction) ?Msg {
+    return switch (action) {
+        .search => if (context.source_available) voidMsg(Msg, "enter_source_search") else null,
+        .file_search => voidMsg(Msg, "enter_file_search"),
+        .changed_file_filter => voidMsg(Msg, "toggle_changed_filter"),
+        .toggle_line_numbers => voidMsg(Msg, "toggle_line_numbers"),
+        .first_file => voidMsg(Msg, "tree_first"),
+        .last_file => voidMsg(Msg, "tree_last"),
+        .page_up => voidMsg(Msg, "page_up"),
+        .page_down => voidMsg(Msg, "page_down"),
         else => null,
     };
 }
@@ -102,6 +115,7 @@ const TestMsg = union(enum) {
     tree_last,
     enter_source_search,
     enter_file_search,
+    toggle_changed_filter,
     toggle_line_numbers,
     clear_source_search,
     next_source_match,
@@ -127,6 +141,43 @@ test "repository input routes focus search and file search independently" {
     try std.testing.expectEqual(TestMsg.source_first, keyToMsg(TestMsg, .{ .focus = .source }, .{ .codepoint = chasen.Key.home }).?);
     try std.testing.expectEqual(TestMsg.tree_first, keyToMsg(TestMsg, .{}, .{ .codepoint = chasen.Key.home }).?);
     try std.testing.expectEqual(TestMsg.enter_source_search, keyToMsg(TestMsg, .{ .source_available = true }, .{ .codepoint = '/' }).?);
+    try std.testing.expectEqual(TestMsg.toggle_changed_filter, keyToMsg(TestMsg, .{}, .{ .codepoint = 'F' }).?);
+    try std.testing.expectEqual(TestMsg{ .source_search_insert = 'F' }, keyToMsg(TestMsg, .{ .source_search_mode = true }, .{ .codepoint = 'F' }).?);
+    try std.testing.expectEqual(TestMsg{ .file_search_insert = 'F' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = 'F' }).?);
     try std.testing.expectEqual(TestMsg.file_search_next, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = chasen.Key.down }).?);
     try std.testing.expectEqualStrings("needle", pasteToMsg(TestMsg, .{ .source_search_mode = true }, "needle").?.source_search_paste);
+}
+
+test "repository input uses configured changed-file filter binding" {
+    var config: keymap.Config = .{};
+    config.set(.changed_file_filter, .{ .plain_codepoint = 'z' });
+    const effective = keymap.Effective.fromConfig(config);
+    try std.testing.expectEqual(TestMsg.toggle_changed_filter, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'z' }).?);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'F' }) == null);
+}
+
+test "repository configured Space action claims normal input but not prompts" {
+    var config: keymap.Config = .{};
+    config.set(.changed_file_filter, .{ .named = .space });
+    try std.testing.expect(keymap.validateConfig(config));
+    const effective = keymap.Effective.fromConfig(config);
+    const space = chasen.Key{ .codepoint = ' ' };
+
+    try std.testing.expectEqual(TestMsg.toggle_changed_filter, keyToMsg(TestMsg, .{ .focus = .tree, .keymap = effective }, space).?);
+    try std.testing.expectEqual(TestMsg.toggle_directory, keyToMsg(TestMsg, .{ .focus = .tree }, space).?);
+    try std.testing.expectEqual(TestMsg{ .source_search_insert = ' ' }, keyToMsg(TestMsg, .{ .source_search_mode = true, .keymap = effective }, space).?);
+    try std.testing.expectEqual(TestMsg{ .file_search_insert = ' ' }, keyToMsg(TestMsg, .{ .file_search_mode = true, .keymap = effective }, space).?);
+
+    var search_config: keymap.Config = .{};
+    search_config.set(.search, .{ .named = .space });
+    try std.testing.expect(keymap.validateConfig(search_config));
+    const search_keymap = keymap.Effective.fromConfig(search_config);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .tree, .keymap = search_keymap }, space) == null);
+    try std.testing.expectEqual(TestMsg.enter_source_search, keyToMsg(TestMsg, .{ .focus = .tree, .source_available = true, .keymap = search_keymap }, space).?);
+
+    var non_repository_config: keymap.Config = .{};
+    non_repository_config.set(.push, .{ .named = .space });
+    try std.testing.expect(keymap.validateConfig(non_repository_config));
+    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .tree, .keymap = keymap.Effective.fromConfig(non_repository_config) }, space) == null);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .source_query_len = 1 }, .{ .codepoint = 'p', .mods = .{ .shift = true } }) == null);
 }
