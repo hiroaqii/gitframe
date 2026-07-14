@@ -1285,6 +1285,47 @@ pub const App = struct {
         };
     }
 
+    /// Fallible half of Review -> Repository contextual navigation.
+    ///
+    /// The borrowed Review target is classified only after the common shell
+    /// blocker policy allows the transition. A transferable path also
+    /// requires the committed root capability identity; duplicating it here
+    /// leaves both pages untouched if identity preflight or allocation fails.
+    fn prepareReviewRepositoryHandoff(
+        self: *const App,
+        allocator: std.mem.Allocator,
+    ) !page_link.RepositoryIncoming {
+        const target = self.reviewContent().repositoryTarget();
+        if (target == .no_context) return .no_context;
+        const root_identity = self.repo_state.activeIdentity() orelse
+            return error.MissingRepositoryIdentity;
+        return page_link.RepositoryIncoming.initOwned(
+            allocator,
+            self.repo_epoch,
+            root_identity,
+            target,
+        );
+    }
+
+    /// Infallible half of Review -> Repository contextual navigation.
+    ///
+    /// All rejection and allocation edges must be closed by prepare. This
+    /// phase moves the owner before changing activation, then lets Repository
+    /// resolve it only after the destination identity is installed. Later
+    /// manifest/document failures remain destination-page terminals.
+    fn commitReviewRepositoryHandoff(
+        self: *App,
+        allocator: std.mem.Allocator,
+        incoming: *page_link.RepositoryIncoming,
+    ) void {
+        std.debug.assert(self.active_page == .review);
+        self.pages.repository.acceptIncoming(allocator, incoming);
+        self.pages.review.activation.deactivate();
+        self.active_page = .repository;
+        self.pages.repository.activate(self.repo_epoch, self.repo_state.activeIdentity());
+        _ = self.pages.repository.resolveIncomingAfterActivation(allocator);
+    }
+
     /// Single page-transition entry point for keyboard, mouse, and future
     /// Session API requests. It applies the policy before mutating either page.
     fn requestPageSwitch(self: *App, ctx: *chasen.Ctx(Msg), target: page.Id) !void {
@@ -7847,6 +7888,234 @@ test "page transition blocker leaves page and Review state unchanged" {
     try std.testing.expectEqual(activation_id, app.pages.review.activation.state.active.activation_id);
     try std.testing.expectEqualStrings("finish search before switching pages", app.status.text());
     try std.testing.expect(!app.pages.history.initialized);
+}
+
+test "review repository transition C1 prepare failures leave both pages unchanged" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .repo_epoch = 7,
+        .config = .{ .source = .unstaged },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+        } },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    defer app.pages.review.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    acceptTestSource(&app);
+
+    const review_activation = app.pages.review.activation.state.active.activation_id;
+    const repository_activation = app.pages.repository.activation_id;
+    try std.testing.expect(app.reviewContent().repositoryTarget() == .location);
+
+    // Discovery path without its committed root capability cannot authorize
+    // an owned cross-page path, even when Review can derive one.
+    try std.testing.expectError(
+        error.MissingRepositoryIdentity,
+        app.prepareReviewRepositoryHandoff(allocator),
+    );
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqual(review_activation, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqual(repository_activation, app.pages.repository.activation_id);
+    try std.testing.expect(app.pages.repository.incoming == .none);
+
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        app.prepareReviewRepositoryHandoff(failing.allocator()),
+    );
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqual(review_activation, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqual(repository_activation, app.pages.repository.activation_id);
+    try std.testing.expect(app.pages.repository.incoming == .none);
+    try std.testing.expect(std.meta.eql(
+        diff_view_model.BodyCoordinate{ .hunk_header = 0 },
+        app.pages.review.viewer.diff_cursor,
+    ));
+}
+
+test "review repository transition C1 commit moves location and replaces old owner" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .repo_epoch = 7,
+        .config = .{ .source = .unstaged },
+        .pages = .{
+            .review = .{
+                .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+                .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+            },
+            .repository = .{ .activation_id = 4 },
+        },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    defer app.pages.review.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    acceptTestSource(&app);
+    const review_activation = app.pages.review.activation.state.active.activation_id;
+    const identity = app.repo_state.activeIdentity().?;
+
+    var old = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        app.repo_epoch,
+        identity,
+        .{ .location = .{ .path = "old.zig", .line = 9 } },
+    );
+    app.pages.repository.acceptIncoming(allocator, &old);
+
+    var incoming = try app.prepareReviewRepositoryHandoff(allocator);
+    var incoming_owned = true;
+    defer if (incoming_owned) incoming.deinit(allocator);
+    try std.testing.expect(incoming == .location);
+    const moved_address = @intFromPtr(incoming.location.path.ptr);
+    try std.testing.expectEqualStrings("a", incoming.location.path);
+
+    app.commitReviewRepositoryHandoff(allocator, &incoming);
+    incoming_owned = false;
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+    try std.testing.expect(app.pages.review.activation.state == .inactive);
+    try std.testing.expectEqual(review_activation, app.pages.review.activation.next_activation_id);
+    try std.testing.expect(app.pages.repository.active);
+    try std.testing.expectEqual(@as(u64, 5), app.pages.repository.activation_id);
+    try std.testing.expect(app.pages.repository.incoming == .awaiting_manifest);
+    const accepted = app.pages.repository.incoming.manifestIntent().?;
+    try std.testing.expectEqual(moved_address, @intFromPtr(accepted.path.ptr));
+    try std.testing.expectEqualStrings("a", accepted.path);
+    try std.testing.expect(std.meta.eql(
+        diff_view_model.BodyCoordinate{ .hunk_header = 0 },
+        app.pages.review.viewer.diff_cursor,
+    ));
+}
+
+test "review repository transition C1 direct unavailable uses the same commit boundary" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .repo_epoch = 3,
+        .config = .{ .source = .unstaged },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+            .viewer = .{
+                .selected_node = 1,
+                .selected_target = .{ .diff_file = 1 },
+            },
+        } },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    defer app.pages.review.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    acceptTestSource(&app);
+
+    const review_activation = app.pages.review.activation.state.active.activation_id;
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        app.prepareReviewRepositoryHandoff(failing.allocator()),
+    );
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqual(review_activation, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqual(@as(u64, 0), app.pages.repository.activation_id);
+    try std.testing.expect(app.pages.repository.incoming == .none);
+
+    var incoming = try app.prepareReviewRepositoryHandoff(allocator);
+    var incoming_owned = true;
+    defer if (incoming_owned) incoming.deinit(allocator);
+    try std.testing.expect(incoming == .unavailable);
+    const moved_address = @intFromPtr(incoming.unavailable.path.ptr);
+    try std.testing.expectEqual(page_link.RepositoryUnavailableReason.no_current_path, incoming.unavailable.reason);
+    try std.testing.expectEqualStrings("src/deleted.zig", incoming.unavailable.path);
+
+    app.commitReviewRepositoryHandoff(allocator, &incoming);
+    incoming_owned = false;
+    const unavailable = app.pages.repository.incomingUnavailable().?;
+    try std.testing.expectEqual(moved_address, @intFromPtr(unavailable.path.ptr));
+    try std.testing.expectEqual(page_link.RepositoryUnavailableReason.no_current_path, unavailable.reason);
+    try std.testing.expectEqualStrings("src/deleted.zig", unavailable.path);
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+}
+
+test "review repository transition C1 no context bypasses identity and retains browser location" {
+    const allocator = std.testing.allocator;
+    const repository_manifest = @import("repository/manifest.zig");
+    const repository_tree = @import("repository/tree.zig");
+    var document = try repository_manifest.parseOwned(
+        allocator,
+        try allocator.dupe(u8, "retained.zig\x00other.zig\x00"),
+    );
+    var document_owned = true;
+    errdefer if (document_owned) document.deinit(allocator);
+    const tree = try repository_tree.Tree.build(allocator, &document);
+
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .stdin },
+        .pages = .{
+            .review = .{ .load = app_test_support.loadState(app_test_support.loadedDiffOne()) },
+            .repository = .{
+                .activation_id = 4,
+                .bundle = .{ .document = document, .tree = tree },
+                .load_state = .loaded,
+                .viewer = .{ .tree_cursor = 1 },
+            },
+        },
+    };
+    // The Repository bundle owns the parsed document from this point. Keep
+    // the pre-transfer errdefer only for Tree.build failure; otherwise a later
+    // assertion failure would make both cleanup paths release the same bytes.
+    document_owned = false;
+    defer app.pages.review.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    acceptTestSource(&app);
+    app.pages.repository.selected_path = app.pages.repository.bundle.?.tree.filePath("retained.zig", .all).?;
+    const retained_address = @intFromPtr(app.pages.repository.selected_path.?.ptr);
+    const review_activation = app.pages.review.activation.state.active.activation_id;
+
+    var old = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        9,
+        .{ .device = 11, .inode = 13 },
+        .{ .unavailable = .{ .path = "old.zig", .reason = .path_not_found } },
+    );
+    app.pages.repository.acceptIncoming(allocator, &old);
+
+    // No-context claims no repository path authority, so even a fail-first
+    // allocator and absent root capability cannot reject its prepare phase.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var incoming = try app.prepareReviewRepositoryHandoff(failing.allocator());
+    var incoming_owned = true;
+    defer if (incoming_owned) incoming.deinit(failing.allocator());
+    try std.testing.expect(incoming == .no_context);
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqual(review_activation, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqual(@as(u64, 4), app.pages.repository.activation_id);
+    try std.testing.expect(app.pages.repository.incoming == .unavailable);
+    try std.testing.expectEqual(retained_address, @intFromPtr(app.pages.repository.selected_path.?.ptr));
+    try std.testing.expectEqual(@as(usize, 1), app.pages.repository.viewer.tree_cursor);
+
+    app.commitReviewRepositoryHandoff(allocator, &incoming);
+    incoming_owned = false;
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+    try std.testing.expect(app.pages.review.activation.state == .inactive);
+    try std.testing.expect(app.pages.repository.active);
+    try std.testing.expectEqual(@as(u64, 5), app.pages.repository.activation_id);
+    try std.testing.expect(app.pages.repository.incoming == .none);
+    try std.testing.expectEqual(retained_address, @intFromPtr(app.pages.repository.selected_path.?.ptr));
+    try std.testing.expectEqualStrings("retained.zig", app.pages.repository.selected_path.?);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.repository.viewer.tree_cursor);
 }
 
 test "live review waiter blocks direct keyboard and mouse page switches with one reason" {
