@@ -10,6 +10,7 @@ const app_input = @import("app/input.zig");
 const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
 const page = @import("app/page.zig");
+const page_link = @import("app/page_link.zig");
 const page_transition = @import("app/page_transition.zig");
 const app_shell_layout = @import("app/shell_layout.zig");
 const review_page = @import("app/pages/review.zig");
@@ -784,7 +785,10 @@ pub const App = struct {
 
     fn maybeStartRepositoryDocument(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (self.active_page != .repository or !self.pages.repository.wantsDocumentRequest()) return;
-        const capability = self.repo_state.activeCapability() orelse return;
+        const capability = self.repo_state.activeCapability() orelse {
+            self.pages.repository.markDocumentCapabilityUnavailable();
+            return;
+        };
         var request = self.pages.repository.prepareDocumentRequest(ctx.allocator(), capability) catch |err| {
             self.pages.repository.markDocumentRequestPreparationFailed(err);
             return err;
@@ -7764,6 +7768,70 @@ test "repository activation and manual reload route to page-owned manifest tasks
     const second: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[1].ctx));
     try std.testing.expect(second.generation > first_generation);
     try std.testing.expectEqual(second.generation, app.pages.repository.pending_generation.?);
+}
+
+test "repository transition B2b2a missing document capability closes incoming owner" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .repository,
+        .pages = .{ .repository = .{
+            .active = true,
+            .activation_id = 2,
+            .repo_epoch = 3,
+            .root_identity = .{ .device = 5, .inode = 8 },
+            .manifest_revision = 13,
+            .selected_path = "main.zig",
+            .needs_document_revalidation = true,
+        } },
+    };
+    defer app.pages.repository.deinit(allocator);
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        app.pages.repository.repo_epoch,
+        app.pages.repository.root_identity.?,
+        .{ .location = .{ .path = "main.zig", .line = 2 } },
+    );
+    const owned_address = @intFromPtr(incoming.location.path.ptr);
+    app.pages.repository.acceptIncoming(allocator, &incoming);
+    try std.testing.expect(app.pages.repository.incoming.advanceToDocument(
+        app.pages.repository.manifest_revision,
+    ));
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.maybeStartRepositoryDocument(&ctx);
+
+    const unavailable = app.pages.repository.incomingUnavailable().?;
+    try std.testing.expectEqual(page_link.RepositoryUnavailableReason.request_failed, unavailable.reason);
+    try std.testing.expectEqual(owned_address, @intFromPtr(unavailable.path.ptr));
+    try std.testing.expect(!app.pages.repository.needs_document_revalidation);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+}
+
+test "repository transition B2b2a ordinary document capability loss preserves retry" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .repository,
+        .pages = .{ .repository = .{
+            .active = true,
+            .activation_id = 2,
+            .repo_epoch = 3,
+            .root_identity = .{ .device = 5, .inode = 8 },
+            .manifest_revision = 13,
+            .selected_path = "main.zig",
+            .needs_document_revalidation = true,
+        } },
+    };
+    app.pages.repository.status.set("retained diagnostic", .{});
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.maybeStartRepositoryDocument(&ctx);
+
+    try std.testing.expect(app.pages.repository.needs_document_revalidation);
+    try std.testing.expectEqualStrings("retained diagnostic", app.pages.repository.status.text());
+    try std.testing.expect(app.pages.repository.incoming == .none);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
 test "page transition blocker leaves page and Review state unchanged" {

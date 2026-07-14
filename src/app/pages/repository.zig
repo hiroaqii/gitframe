@@ -1247,16 +1247,26 @@ pub const RepositoryPageState = struct {
         };
     }
 
+    /// Task allocation/spawn rejects synchronously after one generation was
+    /// prepared. Only that exact generation may close its incoming owner; a
+    /// stale rejection must not consume a newer successor.
     pub fn rejectSpawn(self: *RepositoryPageState, generation: u64) void {
-        if (self.pending_generation == generation) self.pending_generation = null;
+        if (self.pending_generation != generation) return;
+        self.pending_generation = null;
         self.freshness = .failed;
         if (self.bundle == null) self.load_state = .failed;
         self.status.set("Could not start repository manifest task", .{});
+        _ = self.terminalizeIncoming(.request_failed);
     }
 
     pub fn rejectDocumentSpawn(self: *RepositoryPageState, generation: u64) void {
-        if (self.pending_document_generation == generation) self.pending_document_generation = null;
+        if (self.pending_document_generation != generation) return;
+        self.pending_document_generation = null;
         self.status.set("Could not start selected file task", .{});
+        const pending = self.incoming.documentIntent() orelse return;
+        if (pending.document_generation == generation) {
+            _ = self.terminalizeIncoming(.request_failed);
+        }
     }
 
     pub fn rejectSyntaxSpawn(self: *RepositoryPageState, generation: u64) void {
@@ -1286,6 +1296,7 @@ pub const RepositoryPageState = struct {
             self.freshness = .unavailable;
             self.load_state = .no_repository;
             self.status.set("Repository required", .{});
+            _ = self.terminalizeIncoming(.request_failed);
             return;
         }
         self.needs_revalidation = true;
@@ -1319,10 +1330,31 @@ pub const RepositoryPageState = struct {
         self.freshness = .failed;
         if (self.bundle == null) self.load_state = .failed;
         self.status.set("Could not prepare repository manifest: {s}", .{@errorName(err)});
+        // This attempt has no descriptor, but manual reload may have left the
+        // current predecessor task acceptable. Retain the destination while
+        // that exact generation can still advance it.
+        const predecessor_can_advance = if (self.pending_generation) |pending|
+            pending == self.generation
+        else
+            false;
+        if (!predecessor_can_advance) _ = self.terminalizeIncoming(.request_failed);
     }
 
     pub fn markDocumentRequestPreparationFailed(self: *RepositoryPageState, err: anyerror) void {
         self.status.set("Could not prepare selected file: {s}", .{@errorName(err)});
+        _ = self.terminalizeIncoming(.request_failed);
+    }
+
+    pub fn markDocumentCapabilityUnavailable(self: *RepositoryPageState) void {
+        // Capability lookup used to be an inert retry edge for ordinary
+        // browsing. Only a committed contextual destination converts it into
+        // a bounded destination-page terminal.
+        if (self.incoming.documentIntent() == null) return;
+        self.needs_document_revalidation = false;
+        self.status.set("Repository root changed", .{});
+        // App orchestration reaches this only after the page committed a
+        // destination but the root capability vanished before task creation.
+        _ = self.terminalizeIncoming(.request_failed);
     }
 
     pub fn markSyntaxRequestPreparationFailed(self: *RepositoryPageState) void {
@@ -5125,6 +5157,116 @@ test "repository transition B2b1 wrong root terminalizes the bound owner" {
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.request_failed, unavailable.reason);
     try std.testing.expectEqual(owned_address, @intFromPtr(unavailable.path.ptr));
     try std.testing.expect(state.displayed_document == null);
+}
+
+fn acceptIncomingFailureOwnerForTest(
+    state: *RepositoryPageState,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !usize {
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        state.repo_epoch,
+        state.root_identity.?,
+        .{ .location = .{ .path = path, .line = 2 } },
+    );
+    const owned_address = @intFromPtr(incoming.location.path.ptr);
+    state.acceptIncoming(allocator, &incoming);
+    return owned_address;
+}
+
+fn expectIncomingRequestFailureForTest(state: *const RepositoryPageState, owned_address: usize) !void {
+    const unavailable = state.incomingUnavailable().?;
+    try std.testing.expectEqual(page_link.RepositoryUnavailableReason.request_failed, unavailable.reason);
+    try std.testing.expectEqual(owned_address, @intFromPtr(unavailable.path.ptr));
+}
+
+test "repository transition B2b2a manifest start failures close the owner" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 3,
+        .repo_epoch = 4,
+        .root_identity = .{ .device = 5, .inode = 6 },
+        .needs_revalidation = true,
+    };
+    defer state.deinit(allocator);
+
+    const preparation_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "manifest-preparation.zig");
+    state.markRequestPreparationFailed(error.OutOfMemory);
+    try expectIncomingRequestFailureForTest(&state, preparation_address);
+
+    const spawn_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "manifest-spawn.zig");
+    state.pending_generation = 8;
+    state.rejectSpawn(7);
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+    try std.testing.expectEqual(@as(?u64, 8), state.pending_generation);
+    state.rejectSpawn(8);
+    try expectIncomingRequestFailureForTest(&state, spawn_address);
+    try std.testing.expect(state.pending_generation == null);
+
+    const predecessor_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "predecessor.zig");
+    state.generation = 13;
+    state.pending_generation = 13;
+    state.requestReload(true);
+    state.markRequestPreparationFailed(error.OutOfMemory);
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+    try std.testing.expectEqual(@as(?u64, 13), state.pending_generation);
+    try std.testing.expectEqual(predecessor_address, @intFromPtr(state.incoming.manifestIntent().?.path.ptr));
+    var predecessor_finished: ManifestFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = state.root_identity.?,
+        .generation = 13,
+        .result = .{ .loaded = try bundleForTest("predecessor.zig\x00") },
+    };
+    defer predecessor_finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &predecessor_finished));
+    try std.testing.expect(state.incoming == .awaiting_document);
+    try std.testing.expectEqual(predecessor_address, @intFromPtr(state.incoming.documentIntent().?.location.path.ptr));
+
+    const missing_repository_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "missing-repository.zig");
+    state.requestReload(false);
+    try expectIncomingRequestFailureForTest(&state, missing_repository_address);
+    try std.testing.expectEqual(LoadState.no_repository, state.load_state);
+}
+
+test "repository transition B2b2a document start failures close the bound owner" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 3,
+        .repo_epoch = 4,
+        .root_identity = .{ .device = 5, .inode = 6 },
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 9,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+
+    const preparation_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "main.zig");
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    state.markDocumentRequestPreparationFailed(error.OutOfMemory);
+    try expectIncomingRequestFailureForTest(&state, preparation_address);
+
+    const spawn_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "main.zig");
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    state.document_generation = 12;
+    state.pending_document_generation = 12;
+    try std.testing.expect(state.incoming.bindDocumentGeneration(state.manifest_revision, "main.zig", 12));
+    state.rejectDocumentSpawn(11);
+    try std.testing.expect(state.incoming == .awaiting_document);
+    try std.testing.expectEqual(@as(?u64, 12), state.pending_document_generation);
+    state.rejectDocumentSpawn(12);
+    try expectIncomingRequestFailureForTest(&state, spawn_address);
+    try std.testing.expect(state.pending_document_generation == null);
+
+    const capability_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "main.zig");
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    state.needs_document_revalidation = true;
+    state.markDocumentCapabilityUnavailable();
+    try expectIncomingRequestFailureForTest(&state, capability_address);
+    try std.testing.expect(!state.needs_document_revalidation);
 }
 
 test "repository page owns reload state transitions" {
