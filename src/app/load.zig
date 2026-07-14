@@ -1049,9 +1049,31 @@ fn loadCombinedHunks(request: review_projection.Request, allocator: std.mem.Allo
         return .{ .failed_static = "Projection allocation failed" } } };
     defer unstaged_bundle.deinit();
 
+    return buildCombinedHunkResult(request.path_key, allocator, &cached_bundle, &unstaged_bundle);
+}
+
+/// Combines two already-loaded per-file bundles and transfers them only for a
+/// ready combined terminal. Keeping this ownership boundary independent from
+/// Git process I/O makes both invalid-component directions directly testable.
+fn buildCombinedHunkResult(
+    path_key: []const u8,
+    allocator: std.mem.Allocator,
+    cached_bundle: *LoadedDiffBundle,
+    unstaged_bundle: *LoadedDiffBundle,
+) review_projection.TaskResult {
     if (cached_bundle.loaded.document.files.len != 1 or unstaged_bundle.loaded.document.files.len != 1) {
-        return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "Cannot combine staged and unstaged hunks for this file.", .{}) catch
+        return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, path_key, "Cannot combine staged and unstaged hunks for this file.", .{}) catch
             return .{ .failed_static = "Projection allocation failed" } } };
+    }
+
+    if (!cached_bundle.loaded.fileTextSelectable(0) or !unstaged_bundle.loaded.fileTextSelectable(0)) {
+        const bundle = review_projection.InertCombinedBundle{
+            .cached_bundle = cached_bundle.*,
+            .unstaged_bundle = unstaged_bundle.*,
+        };
+        cached_bundle.arena = null;
+        unstaged_bundle.arena = null;
+        return .{ .ready = .{ .inert_combined = bundle } };
     }
 
     // The local cached/unstaged bundles are cleaned up on every early return.
@@ -1064,15 +1086,15 @@ fn loadCombinedHunks(request: review_projection.Request, allocator: std.mem.Allo
         unstaged_bundle.loaded.document.files[0],
     ) catch |err| {
         arena.deinit();
-        return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "Cannot combine staged and unstaged hunks: {s}", .{@errorName(err)}) catch
+        return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, path_key, "Cannot combine staged and unstaged hunks: {s}", .{@errorName(err)}) catch
             return .{ .failed_static = "Projection allocation failed" } } };
     };
 
     const bundle = review_projection.CombinedHunkBundle{
         .arena = arena,
         .projection = projection,
-        .cached_bundle = cached_bundle,
-        .unstaged_bundle = unstaged_bundle,
+        .cached_bundle = cached_bundle.*,
+        .unstaged_bundle = unstaged_bundle.*,
     };
     cached_bundle.arena = null;
     unstaged_bundle.arena = null;
@@ -1237,6 +1259,42 @@ pub fn countLines(bytes: []const u8) usize {
         if (byte == '\n') count += 1;
     }
     return count;
+}
+
+test "combined projection transfers both bundles when either component is inert" {
+    const allocator = std.testing.allocator;
+    const valid_patch =
+        "diff --git a/a b/a\n" ++
+        "index 1111111..2222222 100644\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+valid\n";
+    const invalid_patch =
+        "diff --git a/a b/a\n" ++
+        "index 1111111..2222222 100644\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+bad\xff\n";
+
+    for ([_]bool{ true, false }) |cached_is_invalid| {
+        var cached = try buildLoadedBundle(allocator, if (cached_is_invalid) invalid_patch else valid_patch);
+        defer cached.deinit();
+        var unstaged = try buildLoadedBundle(allocator, if (cached_is_invalid) valid_patch else invalid_patch);
+        defer unstaged.deinit();
+
+        var result = buildCombinedHunkResult("a", allocator, &cached, &unstaged);
+        defer result.deinit(allocator);
+        try std.testing.expect(result == .ready);
+        try std.testing.expect(result.ready == .inert_combined);
+        try std.testing.expect(cached.arena == null);
+        try std.testing.expect(unstaged.arena == null);
+        try std.testing.expectEqual(cached_is_invalid, !result.ready.inert_combined.cached_bundle.loaded.fileTextSelectable(0));
+        try std.testing.expectEqual(!cached_is_invalid, !result.ready.inert_combined.unstaged_bundle.loaded.fileTextSelectable(0));
+    }
 }
 
 test "every invalid file remains admitted as an inert tree entry" {

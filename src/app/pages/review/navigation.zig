@@ -128,6 +128,39 @@ pub const ActiveDiffDisplay = union(enum) {
     }
 };
 
+pub const invalid_utf8_body_message = "Text preview unavailable: diff content is not valid UTF-8";
+
+pub const HunkInteractionAvailability = enum {
+    available,
+    unavailable,
+    inert_invalid_utf8,
+};
+
+/// Single authority facade for the body currently promised by Review.
+///
+/// In particular, an accepted inert projection is still a displayed body; it
+/// must never collapse to `none` and accidentally reveal the primary diff
+/// underneath it.
+pub const DisplayedReviewBody = union(enum) {
+    none,
+    primary: struct {
+        loaded: *const LoadedDiff,
+        file_index: usize,
+    },
+    cached: *const app_load.LoadedDiffBundle,
+    combined: *const review_projection.CombinedHunkBundle,
+    generated: *const review_projection.GeneratedFileBundle,
+    inert_invalid_utf8: struct {
+        path_key: []const u8,
+        display_path: []const u8,
+    },
+    status: struct {
+        path: []const u8,
+        message: []const u8,
+    },
+    pending,
+};
+
 pub const NormalLoadedDiffSelectionTarget = struct {
     file_index: usize,
     file: diff_parser.FileDiff,
@@ -149,6 +182,51 @@ pub const View = struct {
     repo_root: ?[]const u8,
     source: diff_source.SourceMode,
     layout: Layout,
+
+    pub fn displayedReviewBody(self: View) DisplayedReviewBody {
+        switch (self.page.review_projection.displayed) {
+            .ready => |*ready| {
+                if (self.displayedProjectionRequestIsActive(ready.request)) {
+                    return switch (ready.value) {
+                        .cached_diff => |*bundle| blk: {
+                            if (bundle.loaded.document.files.len == 0) break :blk .none;
+                            const file = bundle.loaded.document.files[0];
+                            if (!bundle.loaded.fileTextSelectable(0)) break :blk .{ .inert_invalid_utf8 = .{
+                                .path_key = ready.request.path_key,
+                                .display_path = diff_file.displayPath(file),
+                            } };
+                            break :blk .{ .cached = bundle };
+                        },
+                        .generated_added_file => |*bundle| .{ .generated = bundle },
+                        .combined_hunks => |*bundle| .{ .combined = bundle },
+                        .inert_combined => .{ .inert_invalid_utf8 = .{
+                            .path_key = ready.request.path_key,
+                            .display_path = ready.request.path_key,
+                        } },
+                        .status_body => |*body| .{ .status = .{ .path = body.path, .message = body.message } },
+                    };
+                }
+            },
+            .failed => |*failed| {
+                if (self.displayedProjectionRequestIsActive(failed.request)) {
+                    return .{ .status = .{ .path = failed.body.path, .message = failed.body.message } };
+                }
+            },
+            .idle => {},
+        }
+
+        if (self.selectedStatusEntry() != null) return if (self.page.review_projection.hasPending()) .pending else .none;
+
+        const loaded = self.activeLoadedDiffConst() orelse return .none;
+        const file_index = self.selectedFileIndex(loaded) orelse return .none;
+        if (file_index >= loaded.document.files.len) return .none;
+        if (!loaded.fileTextSelectable(file_index)) {
+            const file = loaded.document.files[file_index];
+            const path_key = diff_file.canonicalPathKey(file) orelse diff_file.displayPath(file);
+            return .{ .inert_invalid_utf8 = .{ .path_key = path_key, .display_path = diff_file.displayPath(file) } };
+        }
+        return .{ .primary = .{ .loaded = loaded, .file_index = file_index } };
+    }
 
     pub fn diffSelectionView(self: View) ?diff_selection.View {
         const selection = self.page.selection_owner.activeDiff() orelse return null;
@@ -177,14 +255,12 @@ pub const View = struct {
     }
 
     pub fn normalLoadedDiffSelectionTarget(self: View, identity: ?diff_selection.Identity) ?NormalLoadedDiffSelectionTarget {
-        if (self.selectedStatusEntry() != null) return null;
-        if (self.activeGeneratedFileProjection() != null) return null;
-        if (self.activeCombinedProjection() != null) return null;
-        if (self.activeCachedDiffProjection() != null) return null;
-
-        const loaded = self.activeLoadedDiffConst() orelse return null;
-        const file_index = self.selectedFileIndex(loaded) orelse return null;
-        if (file_index >= loaded.document.files.len) return null;
+        const primary = switch (self.displayedReviewBody()) {
+            .primary => |primary| primary,
+            else => return null,
+        };
+        const loaded = primary.loaded;
+        const file_index = primary.file_index;
         const file = loaded.document.files[file_index];
         const path_key = diff_file.canonicalPathKey(file) orelse return null;
         const current_identity: diff_selection.Identity = .{ .loaded_file = .{
@@ -351,6 +427,7 @@ pub const View = struct {
     }
 
     pub fn visibleBodyTextMaxHorizontalScroll(self: View) usize {
+        if (self.displayedReviewBody() == .inert_invalid_utf8) return 0;
         const file = self.selectedFile() orelse return 0;
         const mode = self.effectiveDisplayMode();
         const visible_rows = self.diffVisibleRows();
@@ -382,11 +459,17 @@ pub const View = struct {
         return switch (self.page.review_projection.displayed) {
             .ready => |ready| switch (ready.value) {
                 .cached_diff => |bundle| if (bundle.loaded.document.files.len > 0)
-                    if (bundle.loaded.cachedRenderedLineIndex(0, self.effectiveDisplayMode())) |index| index.lineCount() else 0
+                    if (!bundle.loaded.fileTextSelectable(0))
+                        1
+                    else if (bundle.loaded.cachedRenderedLineIndex(0, self.effectiveDisplayMode())) |index|
+                        index.lineCount()
+                    else
+                        0
                 else
                     0,
                 .generated_added_file => |bundle| bundle.source.rowCount(),
                 .combined_hunks => |bundle| bundle.projection.lineIndex(self.effectiveDisplayMode()).lineCount(),
+                .inert_combined => 1,
                 .status_body => 1,
             },
             .failed => 1,
@@ -425,6 +508,9 @@ pub const View = struct {
     }
 
     pub fn unsupportedSearchMessage(self: View) ?[]const u8 {
+        if (self.displayedReviewBody() == .inert_invalid_utf8) {
+            return "search is unavailable because diff content is not valid UTF-8";
+        }
         if (self.activeCombinedProjection() != null) {
             return "search is unavailable for mixed staged/unstaged view";
         }
@@ -495,7 +581,7 @@ pub const View = struct {
             .file_index = file_index,
             .display_path = diff_file.displayPath(file),
             .path_key = diff_file.canonicalPathKey(file),
-            .hunk_index = if (self.selectedHunkIndex()) |hunk_index|
+            .hunk_index = if (self.rawSelectedHunkIndex()) |hunk_index|
                 if (hunk_index < file.hunks.len) hunk_index else null
             else
                 null,
@@ -554,32 +640,27 @@ pub const View = struct {
     }
 
     pub fn displayedDiffFile(self: View) ?diff_parser.FileDiff {
-        if (self.activeCombinedProjection()) |bundle| return bundle.projection.file;
-        if (self.activeCachedDiffProjection()) |bundle| {
-            if (bundle.loaded.document.files.len == 0) return null;
-            return bundle.loaded.document.files[0];
-        }
-        return self.selectedFile();
+        return switch (self.displayedReviewBody()) {
+            .primary => |primary| primary.loaded.document.files[primary.file_index],
+            .cached => |bundle| bundle.loaded.document.files[0],
+            .combined => |bundle| bundle.projection.file,
+            .none, .generated, .inert_invalid_utf8, .status, .pending => null,
+        };
     }
 
     pub fn displayedSearchTarget(self: View, mode: diff_render.DisplayMode) ?SearchTarget {
-        if (self.activeGeneratedFileProjection() != null) return null;
-        if (self.activeCombinedProjection() != null) return null;
-
-        if (self.activeCachedDiffProjection()) |bundle| {
-            if (bundle.loaded.document.files.len == 0) return null;
-            return .{
+        return switch (self.displayedReviewBody()) {
+            .cached => |bundle| .{
                 .file = bundle.loaded.document.files[0],
                 .line_index = bundle.loaded.cachedRenderedLineIndex(0, mode) orelse bundle.loaded.renderedLineIndex(0, mode),
                 .folded_hunks = &.{},
-            };
-        }
-
-        const file = self.displayedDiffFile() orelse return null;
-        return .{
-            .file = file,
-            .line_index = self.selectedFileLineIndex(mode),
-            .folded_hunks = self.selectedFoldedHunks(),
+            },
+            .primary => |primary| .{
+                .file = primary.loaded.document.files[primary.file_index],
+                .line_index = primary.loaded.renderedLineIndex(primary.file_index, mode),
+                .folded_hunks = primary.loaded.foldedHunksForFile(primary.file_index),
+            },
+            .none, .combined, .generated, .inert_invalid_utf8, .status, .pending => null,
         };
     }
 
@@ -598,20 +679,24 @@ pub const View = struct {
     }
 
     pub fn activeDiffDisplay(self: View, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?ActiveDiffDisplay {
-        if (self.activeCombinedProjection()) |bundle| {
-            const states = bundle.projection.hunk_states;
-            const flags = try allocator.alloc(bool, states.len);
-            for (states, flags) |state, *flag| flag.* = state.state == .staged;
-            return .{ .combined_projection = .{
-                .file = bundle.projection.file,
-                .line_index = bundle.projection.lineIndex(mode),
-                .staged_flags = flags,
-                .hunk_states = states,
-            } };
-        }
-
-        const loaded = self.activeLoadedDiffConst() orelse return null;
-        const file_index = self.selectedFileIndex(loaded) orelse return null;
+        const selected: struct { loaded: *const LoadedDiff, file_index: usize } = switch (self.displayedReviewBody()) {
+            .combined => |bundle| {
+                const states = bundle.projection.hunk_states;
+                const flags = try allocator.alloc(bool, states.len);
+                for (states, flags) |state, *flag| flag.* = state.state == .staged;
+                return .{ .combined_projection = .{
+                    .file = bundle.projection.file,
+                    .line_index = bundle.projection.lineIndex(mode),
+                    .staged_flags = flags,
+                    .hunk_states = states,
+                } };
+            },
+            .cached => |bundle| .{ .loaded = &bundle.loaded, .file_index = 0 },
+            .primary => |primary| .{ .loaded = primary.loaded, .file_index = primary.file_index },
+            .none, .generated, .inert_invalid_utf8, .status, .pending => return null,
+        };
+        const loaded = selected.loaded;
+        const file_index = selected.file_index;
         const file = loaded.document.files[file_index];
         return .{ .loaded = .{
             .file_index = file_index,
@@ -623,41 +708,35 @@ pub const View = struct {
     }
 
     pub fn activeGeneratedFileProjection(self: View) ?*const review_projection.GeneratedFileBundle {
-        return switch (self.page.review_projection.displayed) {
-            .ready => |*ready| blk: {
-                if (ready.request.kind != .generated_added_file or !self.displayedProjectionRequestIsActive(ready.request)) break :blk null;
-                break :blk switch (ready.value) {
-                    .generated_added_file => |*bundle| bundle,
-                    else => null,
-                };
-            },
+        return switch (self.displayedReviewBody()) {
+            .generated => |bundle| bundle,
             else => null,
         };
     }
 
     pub fn activeCachedDiffProjection(self: View) ?*const app_load.LoadedDiffBundle {
-        return switch (self.page.review_projection.displayed) {
-            .ready => |*ready| blk: {
-                if (ready.request.kind != .cached_diff or !self.displayedProjectionRequestIsActive(ready.request)) break :blk null;
-                break :blk switch (ready.value) {
-                    .cached_diff => |*bundle| bundle,
-                    else => null,
-                };
-            },
+        return switch (self.displayedReviewBody()) {
+            .cached => |bundle| bundle,
             else => null,
         };
     }
 
     pub fn activeCombinedProjection(self: View) ?*const review_projection.CombinedHunkBundle {
-        return switch (self.page.review_projection.displayed) {
-            .ready => |*ready| blk: {
-                if (ready.request.kind != .combined_hunks or !self.displayedProjectionRequestIsActive(ready.request)) break :blk null;
-                break :blk switch (ready.value) {
-                    .combined_hunks => |*bundle| bundle,
-                    else => null,
-                };
-            },
+        return switch (self.displayedReviewBody()) {
+            .combined => |bundle| bundle,
             else => null,
+        };
+    }
+
+    pub fn bodyAllowsHunkInteraction(self: View) bool {
+        return self.hunkInteractionAvailability() == .available;
+    }
+
+    pub fn hunkInteractionAvailability(self: View) HunkInteractionAvailability {
+        return switch (self.displayedReviewBody()) {
+            .primary, .cached, .combined => .available,
+            .inert_invalid_utf8 => .inert_invalid_utf8,
+            .none, .generated, .status, .pending => .unavailable,
         };
     }
 
@@ -673,6 +752,7 @@ pub const View = struct {
     }
 
     pub fn selectedFileLineIndex(self: View, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {
+        if (self.displayedReviewBody() == .inert_invalid_utf8) return .{ .mode = mode };
         if (self.displayedDiffLineIndex(mode)) |index| return index;
         const loaded = self.activeLoadedDiffConst() orelse return .{ .mode = mode };
         const file_index = self.selectedFileIndex(loaded) orelse return .{ .mode = mode };
@@ -698,6 +778,7 @@ pub const View = struct {
     }
 
     pub fn selectedHunkOffset(self: View, mode: diff_render.DisplayMode, hunk_index: usize) usize {
+        if (!self.bodyAllowsHunkInteraction()) return 0;
         if (self.activeCombinedProjection()) |bundle| return bundle.projection.lineIndex(mode).hunkOffset(hunk_index);
         const loaded = self.activeLoadedDiffConst() orelse return 0;
         const file_index = self.selectedFileIndex(loaded) orelse return 0;
@@ -706,6 +787,11 @@ pub const View = struct {
     }
 
     pub fn selectedHunkIndex(self: View) ?usize {
+        if (!self.bodyAllowsHunkInteraction()) return null;
+        return self.rawSelectedHunkIndex();
+    }
+
+    fn rawSelectedHunkIndex(self: View) ?usize {
         return switch (self.page.viewer.diff_cursor) {
             .hunk_header => |hunk_index| hunk_index,
             .hunk_line => |line| line.hunk_index,
@@ -1081,6 +1167,7 @@ pub const Controller = struct {
     }
 
     pub fn selectHunkDelta(self: Controller, delta: i2) void {
+        if (!self.view().bodyAllowsHunkInteraction()) return;
         const file = self.view().displayedDiffFile() orelse return;
         if (file.hunks.len == 0) return;
 
@@ -1100,6 +1187,7 @@ pub const Controller = struct {
     }
 
     pub fn toggleSelectedHunkFold(self: Controller) void {
+        if (!self.view().bodyAllowsHunkInteraction()) return;
         if (self.view().activeCombinedProjection() != null) {
             self.setStatus("hunk fold is unavailable for mixed staged/unstaged view", .{});
             return;
@@ -1145,6 +1233,12 @@ pub const Controller = struct {
     }
 
     pub fn clampDiffNavigation(self: Controller) void {
+        if (self.view().displayedReviewBody() == .inert_invalid_utf8) {
+            self.page.viewer.diff_cursor = .{ .metadata = 0 };
+            self.page.viewer.diff_scroll = 0;
+            self.page.viewer.diff_horizontal_scroll = 0;
+            return;
+        }
         if (self.view().selectedFile() == null) {
             const line_count = self.view().selectedProjectionLineCount();
             const visible_rows = self.view().diffVisibleRows();

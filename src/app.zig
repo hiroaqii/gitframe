@@ -1747,6 +1747,10 @@ pub const App = struct {
                 self.setReviewStatus("no hunk selected", .{});
                 return;
             },
+            .inert_invalid_utf8 => {
+                self.setReviewStatus(git_ops.inert_hunk_action_message, .{});
+                return;
+            },
             .offscreen_cursor => {
                 self.setReviewStatus("cursor is offscreen; move cursor first", .{});
                 return;
@@ -1815,6 +1819,7 @@ pub const App = struct {
             .no_file => self.setReviewStatus("no file selected", .{}),
             .no_path => self.setReviewStatus("hunk stage toggle unavailable for status-only file", .{}),
             .no_hunk => self.setReviewStatus("no hunk selected", .{}),
+            .inert_invalid_utf8 => self.setReviewStatus(git_ops.inert_hunk_action_message, .{}),
             .offscreen_cursor => self.setReviewStatus("cursor is offscreen; move cursor first", .{}),
             .stale_status => self.setReviewStatus("status is still loading", .{}),
             .stale_source => self.setReviewStatus("source is stale; press r to reload", .{}),
@@ -1842,6 +1847,10 @@ pub const App = struct {
             },
             .no_hunk => {
                 self.setReviewStatus("no hunk selected", .{});
+                return;
+            },
+            .inert_invalid_utf8 => {
+                self.setReviewStatus(git_ops.inert_hunk_action_message, .{});
                 return;
             },
             .offscreen_cursor => {

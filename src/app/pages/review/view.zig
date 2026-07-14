@@ -95,6 +95,10 @@ pub const Context = struct {
         return self.navigation.activeDiffDisplay(allocator, mode);
     }
 
+    pub fn displayedReviewBody(self: Context) review_navigation.DisplayedReviewBody {
+        return self.navigation.displayedReviewBody();
+    }
+
     pub fn activeGeneratedFileProjection(self: Context) ?*const @import("../../review_projection.zig").GeneratedFileBundle {
         return self.navigation.activeGeneratedFileProjection();
     }
@@ -483,6 +487,12 @@ pub fn viewDiffPane(app: Context, surface: *chasen.Surface, loaded: loaded_diff.
     var diff_content = diffContentSurface(surface);
     const mode = diff_render.effectiveMode(diff_render.bodyWidth(diff_content.size().width), app.page.viewer.display_mode);
     const active = app.page.viewer.sidebar_hidden or app.page.viewer.focus == .diff;
+    if (app.displayedReviewBody() == .inert_invalid_utf8) {
+        const inert = app.displayedReviewBody().inert_invalid_utf8;
+        try drawStatusBody(&diff_content, inert.display_path, review_navigation.invalid_utf8_body_message, null, active, app.theme);
+        drawPaneHeaderRule(surface, active, app.theme);
+        return;
+    }
     const display = (try app.activeDiffDisplay(surface.frameAllocator(), mode)) orelse return;
     const display_file = display.file();
     try diff_render.renderFile(&diff_content, display_file, .{
@@ -550,8 +560,8 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
     var content = diffContentSurface(surface);
     const path = entry.canonicalPathKey() orelse entry.path;
 
-    if (app.activeCachedDiffProjection()) |bundle| {
-        if (bundle.loaded.document.files.len > 0) {
+    switch (app.displayedReviewBody()) {
+        .cached => |bundle| {
             try diff_render.renderFile(&content, bundle.loaded.document.files[0], .{
                 .requested_mode = app.page.viewer.display_mode,
                 .scroll = app.page.viewer.diff_scroll,
@@ -564,57 +574,68 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .palette = app.theme,
                 .file_index = 0,
                 .syntax_spans = bundle.loaded.syntax_spans,
+                .selection = app.diffSelectionView(),
                 .header_selection = app.diffHeaderSelectionActive(),
             });
             drawPaneHeaderRule(surface, active, app.theme);
             return;
-        }
-    }
-
-    if (app.activeGeneratedFileProjection()) |bundle| {
-        try diff_render.renderGeneratedAddedFile(&content, bundle.path, &bundle.source, .{
-            .requested_mode = app.page.viewer.display_mode,
-            .scroll = app.page.viewer.diff_scroll,
-            .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
-            .pane_active = active,
-            .line_numbers = app.page.viewer.view_options.line_numbers,
-            .cursor_offset = app.visibleDiffCursorOffset(),
-            .palette = app.theme,
-            .header_selection = app.diffHeaderSelectionActive(),
-            .source_syntax_spans = switch (bundle.decoration) {
-                .decorated => |decorated| decorated.spans,
-                .eligible, .terminal_plain => .empty(),
-            },
-            .source_has_visible_syntax = bundle.decoration.hasVisibleSyntax(),
-        });
-        drawPaneHeaderRule(surface, active, app.theme);
-        return;
-    }
-
-    switch (app.page.review_projection.displayed) {
-        .ready => |ready| {
-            switch (ready.value) {
-                .cached_diff, .generated_added_file => {},
-                .combined_hunks => {},
-                .status_body => |body| {
-                    try drawStatusBody(&content, body.path, body.message, app.selectedStatusLineStats(), active, app.theme);
-                    drawPaneHeaderRule(surface, active, app.theme);
-                    return;
-                },
-            }
         },
-        .failed => |failed| {
-            try drawStatusBody(&content, failed.body.path, failed.body.message, app.selectedStatusLineStats(), active, app.theme);
+        .combined => |bundle| {
+            const flags = try surface.frameAllocator().alloc(bool, bundle.projection.hunk_states.len);
+            for (bundle.projection.hunk_states, flags) |state, *flag| flag.* = state.state == .staged;
+            try diff_render.renderFile(&content, bundle.projection.file, .{
+                .requested_mode = app.page.viewer.display_mode,
+                .scroll = app.page.viewer.diff_scroll,
+                .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
+                .pane_active = active,
+                .line_numbers = app.page.viewer.view_options.line_numbers,
+                .highlighted_hunk = app.selectedHunkIndex(),
+                .cursor_offset = app.visibleDiffCursorOffset(),
+                .line_index = bundle.projection.lineIndex(diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
+                .staged_hunks = flags,
+                .palette = app.theme,
+                .selection = app.diffSelectionView(),
+                .header_selection = app.diffHeaderSelectionActive(),
+            });
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
-        .idle => {},
-    }
-
-    if (app.page.review_projection.hasPending()) {
-        try drawStatusBody(&content, path, "Loading review projection...", app.selectedStatusLineStats(), active, app.theme);
-        drawPaneHeaderRule(surface, active, app.theme);
-        return;
+        .generated => |bundle| {
+            try diff_render.renderGeneratedAddedFile(&content, bundle.path, &bundle.source, .{
+                .requested_mode = app.page.viewer.display_mode,
+                .scroll = app.page.viewer.diff_scroll,
+                .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
+                .pane_active = active,
+                .line_numbers = app.page.viewer.view_options.line_numbers,
+                .cursor_offset = app.visibleDiffCursorOffset(),
+                .palette = app.theme,
+                .header_selection = app.diffHeaderSelectionActive(),
+                .source_syntax_spans = switch (bundle.decoration) {
+                    .decorated => |decorated| decorated.spans,
+                    .eligible, .terminal_plain => .empty(),
+                },
+                .source_has_visible_syntax = bundle.decoration.hasVisibleSyntax(),
+                .selection = app.diffSelectionView(),
+            });
+            drawPaneHeaderRule(surface, active, app.theme);
+            return;
+        },
+        .inert_invalid_utf8 => |inert| {
+            try drawStatusBody(&content, inert.display_path, review_navigation.invalid_utf8_body_message, app.selectedStatusLineStats(), active, app.theme);
+            drawPaneHeaderRule(surface, active, app.theme);
+            return;
+        },
+        .status => |status| {
+            try drawStatusBody(&content, status.path, status.message, app.selectedStatusLineStats(), active, app.theme);
+            drawPaneHeaderRule(surface, active, app.theme);
+            return;
+        },
+        .pending => {
+            try drawStatusBody(&content, path, "Loading review projection...", app.selectedStatusLineStats(), active, app.theme);
+            drawPaneHeaderRule(surface, active, app.theme);
+            return;
+        },
+        .none, .primary => {},
     }
 
     try drawTitlePath(&content, path, app.selectedStatusLineStats(), paneTitleStyle(active, app.theme), active, app.theme);

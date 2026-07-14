@@ -161,6 +161,21 @@ pub const CombinedHunkBundle = struct {
     }
 };
 
+/// Owns both component snapshots when a mixed projection is intentionally
+/// admitted as an inert body. Keeping this as a typed projection terminal
+/// prevents navigation from falling through to an unrelated primary diff and
+/// preserves the normal cache/defer/deinit ownership lifecycle.
+pub const InertCombinedBundle = struct {
+    cached_bundle: app_load.LoadedDiffBundle,
+    unstaged_bundle: app_load.LoadedDiffBundle,
+
+    pub fn deinit(self: *InertCombinedBundle) void {
+        self.cached_bundle.deinit();
+        self.unstaged_bundle.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const StatusBody = struct {
     path: []u8,
     message: []u8,
@@ -176,6 +191,7 @@ pub const Ready = union(enum) {
     cached_diff: app_load.LoadedDiffBundle,
     generated_added_file: GeneratedFileBundle,
     combined_hunks: CombinedHunkBundle,
+    inert_combined: InertCombinedBundle,
     status_body: StatusBody,
 
     pub fn deinit(self: *Ready, allocator: std.mem.Allocator) void {
@@ -183,6 +199,7 @@ pub const Ready = union(enum) {
             .cached_diff => |*bundle| bundle.deinit(),
             .generated_added_file => |*bundle| bundle.deinit(allocator),
             .combined_hunks => |*bundle| bundle.deinit(),
+            .inert_combined => |*bundle| bundle.deinit(),
             .status_body => |*body| body.deinit(allocator),
         }
         self.* = undefined;
@@ -190,7 +207,7 @@ pub const Ready = union(enum) {
 
     pub fn cacheable(self: Ready) bool {
         return switch (self) {
-            .cached_diff, .generated_added_file, .combined_hunks => true,
+            .cached_diff, .generated_added_file, .combined_hunks, .inert_combined => true,
             .status_body => false,
         };
     }
@@ -201,6 +218,10 @@ pub const Ready = union(enum) {
             .generated_added_file => |bundle| bundle.retainedBytes(),
             .combined_hunks => |bundle| saturatedSum(&.{
                 arenaCapacity(bundle.arena),
+                arenaCapacity(bundle.cached_bundle.arena),
+                arenaCapacity(bundle.unstaged_bundle.arena),
+            }),
+            .inert_combined => |bundle| saturatedSum(&.{
                 arenaCapacity(bundle.cached_bundle.arena),
                 arenaCapacity(bundle.unstaged_bundle.arena),
             }),

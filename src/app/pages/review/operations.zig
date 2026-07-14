@@ -17,6 +17,8 @@ const diff_file = @import("../../../diff/file.zig");
 const diff_patch = @import("../../../diff/patch.zig");
 const diff_source = @import("../../../diff/source.zig");
 const auto_reload = @import("../../auto_reload.zig");
+const app_load = @import("../../load.zig");
+const app_page = @import("../../page.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
 const ToggleHunkTargetResult = git_ops.ToggleHunkTargetResult;
@@ -394,6 +396,11 @@ pub const View = struct {
     }
 
     pub fn selectedHunkToggleOperation(self: View) ToggleHunkTargetResult {
+        switch (self.navigation.hunkInteractionAvailability()) {
+            .available => {},
+            .inert_invalid_utf8 => return .inert_invalid_utf8,
+            .unavailable => return .no_hunk,
+        }
         const can_stage = diff_source.sourceAllowsStageAction(self.source);
         const can_unstage = diff_source.sourceAllowsUnstageAction(self.source);
         if (!can_stage and !can_unstage) return .unavailable_source;
@@ -428,6 +435,11 @@ pub const View = struct {
     }
 
     pub fn selectedHunkStageTarget(self: View, allocator: std.mem.Allocator) HunkStageTargetResult {
+        switch (self.navigation.hunkInteractionAvailability()) {
+            .available => {},
+            .inert_invalid_utf8 => return .inert_invalid_utf8,
+            .unavailable => return .no_hunk,
+        }
         if (!diff_source.sourceAllowsStageAction(self.source)) return .unavailable_source;
         if (!self.activation().satisfiesAction(.stage_hunk)) return switch (self.hunkAuthorityFailure(.stage_hunk)) {
             .stale_status => .stale_status,
@@ -465,6 +477,11 @@ pub const View = struct {
     }
 
     pub fn selectedHunkUnstageTarget(self: View, allocator: std.mem.Allocator) HunkUnstageTargetResult {
+        switch (self.navigation.hunkInteractionAvailability()) {
+            .available => {},
+            .inert_invalid_utf8 => return .inert_invalid_utf8,
+            .unavailable => return .no_hunk,
+        }
         if (!diff_source.sourceAllowsUnstageAction(self.source)) return .unavailable_source;
         if (!self.activation().satisfiesAction(.unstage_hunk)) return switch (self.hunkAuthorityFailure(.unstage_hunk)) {
             .stale_status => .stale_status,
@@ -929,4 +946,123 @@ test "hunk toggle resolves source and session staged state" {
     try std.testing.expectEqual(git_ops.ToggleHunkTargetResult{ .operation = .unstage }, testView(&page, .unstaged).selectedHunkToggleOperation());
     try std.testing.expectEqual(git_ops.ToggleHunkTargetResult{ .operation = .unstage }, testView(&page, .cached).selectedHunkToggleOperation());
     try std.testing.expect(testView(&page, .{ .range = "main...HEAD" }).selectedHunkToggleOperation() == .unavailable_source);
+}
+
+test "inert cached projection blocks hunk authority without changing file authority" {
+    const allocator = std.testing.allocator;
+    const invalid_patch =
+        "diff --git a/a b/a\n" ++
+        "index 1111111..2222222 100644\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+bad\xff\n";
+    var cached = try app_load.buildLoadedBundle(allocator, invalid_patch);
+    var cached_owned = true;
+    defer if (cached_owned) cached.deinit();
+
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .selected_target = .{ .status_only = 0 },
+            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } },
+        },
+    };
+    defer page.deinit(allocator);
+    acceptTestSource(&page);
+    var staged = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged);
+    page.review_projection.installReady(.{
+        .request = try review_projection.cloneRequest(
+            allocator,
+            app_page.RequestIdentity.review(0, 1),
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            0,
+            0,
+        ),
+        .value = .{ .cached_diff = cached },
+    });
+    cached_owned = false;
+
+    const view = testView(&page, .unstaged);
+    try std.testing.expect(view.selectedHunkToggleOperation() == .inert_invalid_utf8);
+    try std.testing.expect(view.selectedHunkStageTarget(allocator) == .inert_invalid_utf8);
+    try std.testing.expect(view.selectedHunkUnstageTarget(allocator) == .inert_invalid_utf8);
+    try std.testing.expectEqualStrings(
+        "hunk actions unavailable for non-UTF-8 diff text",
+        git_ops.inert_hunk_action_message,
+    );
+    try std.testing.expect(std.mem.indexOfScalar(u8, git_ops.inert_hunk_action_message, 0xff) == null);
+    try std.testing.expect(view.unstageTarget() == .ready);
+}
+
+test "either inert combined component blocks all hunk targets without primary fallback" {
+    const allocator = std.testing.allocator;
+    const valid_patch =
+        "diff --git a/a b/a\n" ++
+        "index 1111111..2222222 100644\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+valid\n";
+    const invalid_patch =
+        "diff --git a/a b/a\n" ++
+        "index 1111111..2222222 100644\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+bad\xff\n";
+
+    for ([_]bool{ true, false }) |cached_is_invalid| {
+        var cached = try app_load.buildLoadedBundle(allocator, if (cached_is_invalid) invalid_patch else valid_patch);
+        var cached_owned = true;
+        defer if (cached_owned) cached.deinit();
+        var unstaged = try app_load.buildLoadedBundle(allocator, if (cached_is_invalid) valid_patch else invalid_patch);
+        var unstaged_owned = true;
+        defer if (unstaged_owned) unstaged.deinit();
+
+        var page: review_page.ReviewPageState = .{
+            .load = test_support.loadState(test_support.loadedDiffOne()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } },
+            },
+        };
+        defer page.deinit(allocator);
+        acceptTestSource(&page);
+        var status = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, "MM a\x00");
+        try page.git_status.replace("/repo", &status);
+        page.review_projection.installReady(.{
+            .request = try review_projection.cloneRequest(
+                allocator,
+                app_page.RequestIdentity.review(0, 1),
+                1,
+                "/repo",
+                "a",
+                .combined_hunks,
+                .unstaged,
+                0,
+                0,
+            ),
+            .value = .{ .inert_combined = .{
+                .cached_bundle = cached,
+                .unstaged_bundle = unstaged,
+            } },
+        });
+        cached_owned = false;
+        unstaged_owned = false;
+
+        const view = testView(&page, .unstaged);
+        try std.testing.expect(view.selectedHunkToggleOperation() == .inert_invalid_utf8);
+        try std.testing.expect(view.selectedHunkStageTarget(allocator) == .inert_invalid_utf8);
+        try std.testing.expect(view.selectedHunkUnstageTarget(allocator) == .inert_invalid_utf8);
+        try std.testing.expect(view.unstageTarget() == .ready);
+    }
 }

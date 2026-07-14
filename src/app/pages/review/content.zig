@@ -68,6 +68,7 @@ pub const View = struct {
     }
 
     pub fn currentLineCopyText(self: View) ?[]const u8 {
+        if (!self.navigation.bodyAllowsHunkInteraction()) return null;
         const coordinate = switch (self.page.viewer.diff_cursor) {
             .hunk_line => |line| line,
             .metadata, .binary_marker, .hunk_header => return null,
@@ -84,6 +85,7 @@ pub const View = struct {
     }
 
     pub fn selectedHunkCopyText(self: View, allocator: std.mem.Allocator) !HunkCopyResult {
+        if (!self.navigation.bodyAllowsHunkInteraction()) return .no_hunk;
         const hunk_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
         const file = self.navigation.displayedDiffFile() orelse return .no_hunk;
         if (hunk_index >= file.hunks.len) return .no_hunk;

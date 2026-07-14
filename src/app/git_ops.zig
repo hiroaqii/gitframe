@@ -70,6 +70,8 @@ pub const ToggleStageTargetResult = union(enum) {
     no_content: PathTarget,
 };
 
+pub const inert_hunk_action_message = "hunk actions unavailable for non-UTF-8 diff text";
+
 pub const HunkMarkSource = enum {
     session,
     projection,
@@ -93,6 +95,7 @@ pub const HunkStageTargetResult = union(enum) {
     no_file,
     no_path,
     no_hunk,
+    inert_invalid_utf8,
     offscreen_cursor,
     stale_status,
     stale_source,
@@ -112,6 +115,7 @@ pub const HunkUnstageTargetResult = union(enum) {
     no_file,
     no_path,
     no_hunk,
+    inert_invalid_utf8,
     offscreen_cursor,
     not_staged_hunk,
     binary_unsupported,
@@ -128,6 +132,7 @@ pub const ToggleHunkTargetResult = union(enum) {
     no_file,
     no_path,
     no_hunk,
+    inert_invalid_utf8,
     offscreen_cursor,
     stale_status,
     stale_source,
