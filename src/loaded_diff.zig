@@ -5,6 +5,9 @@ const diff_render = @import("diff/render.zig");
 const diff_view_model = @import("diff/view_model.zig");
 const file_tree = @import("file_tree.zig");
 const syntax_provider = @import("syntax/provider.zig");
+const text_eligibility = @import("diff/text_eligibility.zig");
+
+pub const FileTextEligibility = text_eligibility.FileTextEligibility;
 
 pub const ChangedFileFilter = enum {
     all,
@@ -55,6 +58,11 @@ pub const ChangedFileFilter = enum {
 pub const LoadedDiff = struct {
     text: []const u8,
     document: diff_parser.DiffDocument,
+    /// Required total sidecar aligned exactly with `document.files`.
+    ///
+    /// Invalid UTF-8 paths remain byte-exact; only body text classification
+    /// controls entry into Unicode-aware rendering and interaction paths.
+    file_text_eligibility: []const FileTextEligibility,
     syntax_spans: syntax_provider.DocumentSpans = .empty(),
     tree: file_tree.FileTree,
     /// Rendered row prefix cache for O(1) counts and viewport start lookup.
@@ -72,6 +80,16 @@ pub const LoadedDiff = struct {
     visible_node_count: usize = 0,
     bytes: usize,
     lines: usize,
+
+    pub fn fileTextEligibility(self: *const LoadedDiff, file_index: usize) FileTextEligibility {
+        std.debug.assert(self.file_text_eligibility.len == self.document.files.len);
+        std.debug.assert(file_index < self.file_text_eligibility.len);
+        return self.file_text_eligibility[file_index];
+    }
+
+    pub fn fileTextSelectable(self: *const LoadedDiff, file_index: usize) bool {
+        return self.fileTextEligibility(file_index).selectable();
+    }
 
     pub fn rebuildVisibleNodes(
         self: *LoadedDiff,
@@ -279,6 +297,7 @@ test "repository root visibility follows filtered file descendants" {
     var loaded: LoadedDiff = .{
         .text = "",
         .document = .{ .files = &.{} },
+        .file_text_eligibility = &.{},
         .tree = .{ .nodes = &nodes },
         .bytes = 0,
         .lines = 0,

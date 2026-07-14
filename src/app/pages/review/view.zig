@@ -1124,6 +1124,7 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
     page.load = test_support.loadState(.{
         .text = "",
         .document = .{ .files = &test_support.files_one },
+        .file_text_eligibility = &.{.selectable_utf8},
         .tree = .{ .nodes = &nodes },
         .collapsed_dirs = .{},
         .bytes = 0,
@@ -1189,6 +1190,7 @@ test "reviewed sidebar marker and visible search marker are Review view concerns
         .load = test_support.loadState(.{
             .text = "",
             .document = .{ .files = &test_support.files_two_statuses },
+            .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
             .tree = .{ .nodes = &test_support.tree_two_status_nodes },
             .reviewed_files = &reviewed,
             .collapsed_dirs = .{},

@@ -2704,6 +2704,7 @@ test "file search skips hidden reviewed matches" {
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
                 .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
                 .reviewed_files = &reviewed,
                 .collapsed_dirs = .{},
@@ -3144,6 +3145,7 @@ test "pending selection restore can restore repository root node" {
     var loaded: LoadedDiff = .{
         .text = "",
         .document = .{ .files = &app_test_support.files_one },
+        .file_text_eligibility = &.{.selectable_utf8},
         .tree = .{ .nodes = &nodes },
         .visible_nodes = &visible_nodes,
         .visible_node_count = 2,
@@ -3235,6 +3237,7 @@ test "toggleReviewedFile toggles selected diff target" {
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
                 .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
                 .reviewed_files = &reviewed,
                 .collapsed_dirs = .{},
@@ -3267,6 +3270,7 @@ test "toggleReviewedFile uses selected target while cursor is on directory" {
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
                 .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
                 .reviewed_files = &reviewed,
                 .collapsed_dirs = .{},
@@ -3303,6 +3307,7 @@ test "toggleReviewedFile ignores unkeyable files in repository input" {
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &unkeyable_files },
+                .file_text_eligibility = &.{.selectable_utf8},
                 .tree = .{ .nodes = &nodes },
                 .reviewed_files = &reviewed,
                 .collapsed_dirs = .{},
@@ -3354,6 +3359,7 @@ test "hide reviewed files removes reviewed file rows from visible list" {
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
                 .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
                 .reviewed_files = &reviewed,
                 .collapsed_dirs = .{},
@@ -3386,6 +3392,7 @@ test "hide reviewed files removes directories with no visible file descendants" 
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
                 .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
                 .reviewed_files = &reviewed,
                 .collapsed_dirs = .{},
@@ -3413,6 +3420,7 @@ test "hide reviewed files keeps directories for non-contiguous unreviewed descen
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
                 .tree = .{ .nodes = &app_test_support.tree_non_contiguous_nodes },
                 .reviewed_files = &reviewed,
                 .collapsed_dirs = .{},
@@ -3442,6 +3450,7 @@ test "marking a visible file as reviewed while hidden moves selection" {
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
                 .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
                 .reviewed_files = &reviewed,
                 .collapsed_dirs = .{},

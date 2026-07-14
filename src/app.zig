@@ -9297,6 +9297,7 @@ test "selectedEditorTarget accepts status-only file rows" {
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &.{} },
+                .file_text_eligibility = &.{},
                 .tree = .{ .nodes = &status_nodes },
                 .collapsed_dirs = .{},
                 .bytes = 0,
@@ -9369,6 +9370,7 @@ test "selectedEditorTarget rejects deleted status-only file rows from fresh stat
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &.{} },
+                .file_text_eligibility = &.{},
                 .tree = .{ .nodes = &status_nodes },
                 .collapsed_dirs = .{},
                 .bytes = 0,
@@ -10727,6 +10729,7 @@ test "initialSelectionContext falls back to first selectable status entry" {
     const empty_loaded: LoadedDiff = .{
         .text = "",
         .document = .{ .files = &.{} },
+        .file_text_eligibility = &.{},
         .tree = .{ .nodes = &.{} },
         .collapsed_dirs = .{},
         .bytes = 0,
@@ -10746,6 +10749,7 @@ test "initialSelectionContext returns null when diff and status have no selectab
     const empty_loaded: LoadedDiff = .{
         .text = "",
         .document = .{ .files = &.{} },
+        .file_text_eligibility = &.{},
         .tree = .{ .nodes = &.{} },
         .collapsed_dirs = .{},
         .bytes = 0,

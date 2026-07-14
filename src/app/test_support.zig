@@ -10,6 +10,9 @@ const LoadedDiff = loaded_diff.LoadedDiff;
 const LoadedSession = app_load_state.LoadedSession;
 const LoadRuntimeState = app_load_state.LoadRuntimeState;
 
+const selectable_one = [_]loaded_diff.FileTextEligibility{.selectable_utf8};
+const selectable_two = [_]loaded_diff.FileTextEligibility{ .selectable_utf8, .selectable_utf8 };
+
 pub fn expectSnapshotContains(ts: *const chasen.testing.TestSurface, needle: []const u8) !void {
     const actual = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(actual);
@@ -60,6 +63,7 @@ pub fn loadedDiffOne() LoadedDiff {
     return .{
         .text = "",
         .document = .{ .files = &files_one },
+        .file_text_eligibility = &selectable_one,
         .tree = .{ .nodes = &tree_one_nodes },
         .collapsed_dirs = .{},
         .bytes = 0,
@@ -71,6 +75,7 @@ pub fn loadedDiffTwo() LoadedDiff {
     return .{
         .text = "",
         .document = .{ .files = &files_two },
+        .file_text_eligibility = &selectable_two,
         .tree = .{ .nodes = &tree_two_nodes },
         .collapsed_dirs = .{},
         .bytes = 0,
@@ -82,6 +87,7 @@ pub fn loadedDiffNested() LoadedDiff {
     return .{
         .text = "",
         .document = .{ .files = &files_two },
+        .file_text_eligibility = &selectable_two,
         .tree = .{ .nodes = &tree_nested_nodes },
         .collapsed_dirs = .{},
         .bytes = 0,
@@ -93,6 +99,7 @@ pub fn loadedDiffTwoWithStatuses() LoadedDiff {
     return .{
         .text = "",
         .document = .{ .files = &files_two_statuses },
+        .file_text_eligibility = &selectable_two,
         .tree = .{ .nodes = &tree_two_status_nodes },
         .collapsed_dirs = .{},
         .bytes = 0,
@@ -104,6 +111,7 @@ pub fn loadedDiffFileOneFirst() LoadedDiff {
     return .{
         .text = "",
         .document = .{ .files = &files_two },
+        .file_text_eligibility = &selectable_two,
         .tree = .{ .nodes = &tree_file_one_first_nodes },
         .collapsed_dirs = .{},
         .bytes = 0,
@@ -115,6 +123,7 @@ pub fn loadedDiffWide() LoadedDiff {
     return .{
         .text = "",
         .document = .{ .files = &files_wide },
+        .file_text_eligibility = &selectable_one,
         .tree = .{ .nodes = &tree_one_nodes },
         .collapsed_dirs = .{},
         .bytes = 0,
@@ -126,6 +135,7 @@ pub fn loadedDiffMetadataOnly() LoadedDiff {
     return .{
         .text = "",
         .document = .{ .files = &files_metadata_only },
+        .file_text_eligibility = &selectable_one,
         .tree = .{ .nodes = &tree_one_nodes },
         .collapsed_dirs = .{},
         .bytes = 0,
@@ -137,6 +147,7 @@ pub fn loadedDiffBinaryOnly() LoadedDiff {
     return .{
         .text = "",
         .document = .{ .files = &files_binary_only },
+        .file_text_eligibility = &selectable_one,
         .tree = .{ .nodes = &tree_one_nodes },
         .collapsed_dirs = .{},
         .bytes = 0,

@@ -1518,6 +1518,7 @@ pub const Controller = struct {
         var loaded: loaded_diff.LoadedDiff = .{
             .text = "",
             .document = document,
+            .file_text_eligibility = &.{},
             .tree = try file_tree.buildWithOptions(arena_allocator, document, status_document, .{
                 .root = self.navigation.view().fileTreeRootOptions(),
                 .stable_order = self.navigation.stableOrderOptions(allocator),

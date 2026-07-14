@@ -1204,6 +1204,7 @@ fn buildLoadedBundleWithOptions(
         .lines = countLines(copied),
         .text = copied,
         .document = document,
+        .file_text_eligibility = file_text_eligibility,
         .syntax_spans = syntax_spans,
         .tree = tree,
         .rendered_line_cache = rendered_line_cache,
@@ -1238,7 +1239,7 @@ pub fn countLines(bytes: []const u8) usize {
     return count;
 }
 
-test "every invalid file remains admitted as a tree entry" {
+test "every invalid file remains admitted as an inert tree entry" {
     const patch =
         "diff --git a/a.zig b/a.zig\n" ++
         "--- a/a.zig\n" ++
@@ -1256,6 +1257,9 @@ test "every invalid file remains admitted as a tree entry" {
     defer bundle.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), bundle.loaded.document.files.len);
+    try std.testing.expectEqual(@as(usize, 2), bundle.loaded.file_text_eligibility.len);
+    try std.testing.expect(!bundle.loaded.fileTextSelectable(0));
+    try std.testing.expect(!bundle.loaded.fileTextSelectable(1));
     try std.testing.expectEqual(@as(usize, 2), bundle.loaded.visibleNodeCount());
 }
 
