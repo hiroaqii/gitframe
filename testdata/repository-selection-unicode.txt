@@ -1,0 +1,24 @@
+Repository source selection Unicode manual QA
+
+Wide grapheme
+ASCII-A 界 ASCII-B
+ASCII-A 日本語 ASCII-B
+
+Drag between the two occupied terminal cells of 界.
+Expected clipboard text: 界
+
+Combining grapheme
+ASCII-A é ASCII-B
+
+The accented character above is U+0065 LATIN SMALL LETTER E followed by
+U+0301 COMBINING ACUTE ACCENT. Select across é and adjacent ASCII text.
+The clipboard must keep é together and must not contain only the accent.
+
+Emoji grapheme
+ASCII-A 👨‍👩‍👧‍👦 ASCII-B
+ASCII-A 👍🏽 ASCII-B
+
+The family is joined with U+200D ZERO WIDTH JOINER characters. The thumbs-up
+uses a skin-tone modifier. Drag across either emoji from different occupied
+terminal cells. The clipboard must contain the complete visible emoji, not an
+individual person, joiner-separated fragment, or unmodified thumbs-up.

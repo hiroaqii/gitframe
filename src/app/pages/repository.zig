@@ -1275,11 +1275,13 @@ pub const RepositoryPageState = struct {
         const selected = self.selected_path orelse return .discarded;
         if (!std.mem.eql(u8, selected, finished.path)) return .discarded;
 
-        // Even byte-identical accepted replacements own different storage.
-        // Slice C stays fail-closed until exact semantic reconciliation lands
-        // in Slice D: end both owners before accepting replacement storage.
+        // The live drag borrows the displayed document and must always end
+        // before its storage is replaced. A completed candidate is independent
+        // owned state: retain it only when the incoming document proves the
+        // same complete semantic content token. Delivery generations and the
+        // replacement allocation itself are intentionally irrelevant.
         self.cancelSourceSelection();
-        self.clearCompletedSelection(allocator);
+        self.reconcileCompletedSelectionForDocument(allocator, finished);
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
         self.source_revision +%= 1;
@@ -1805,6 +1807,33 @@ pub const RepositoryPageState = struct {
         self.completed_selection = null;
     }
 
+    /// Reconcile only an already accepted selected-document result. At this
+    /// point repo/root/path authority has been checked by `applyDocumentFinished`
+    /// and a source result supplies the final fingerprint needed to compare the
+    /// complete semantic token. Inert results cannot prove compatible source
+    /// bytes and therefore remain fail-closed.
+    fn reconcileCompletedSelectionForDocument(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        finished: *const DocumentFinished,
+    ) void {
+        const completed = if (self.completed_selection) |*selection| selection else return;
+        const fingerprint = switch (finished.value) {
+            .source => |source| source.fingerprint,
+            .inert => {
+                self.clearCompletedSelection(allocator);
+                return;
+            },
+        };
+        const incoming = repository_selection.RepositoryContentToken{
+            .repo_epoch = self.repo_epoch,
+            .root_identity = finished.root_identity,
+            .path = finished.path,
+            .source_fingerprint = fingerprint,
+        };
+        if (!completed.token.view().eql(incoming)) self.clearCompletedSelection(allocator);
+    }
+
     fn sourceGeometry(self: *const RepositoryPageState, body_size: chasen.Size, document: *const source_document.Document) repository_source_geometry.SourceGeometry {
         const layout = bodyLayout(body_size);
         return .init(
@@ -2317,7 +2346,7 @@ fn installFirstLineCandidateForTest(
     completed = undefined;
 }
 
-fn expectDocumentReplacementClearsCandidateForTest(content: ?[]const u8) !void {
+fn expectDocumentReplacementCandidateForTest(content: ?[]const u8, retained: bool) !void {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "old source\n");
     defer state.deinit(allocator);
@@ -2339,7 +2368,11 @@ fn expectDocumentReplacementClearsCandidateForTest(content: ?[]const u8) !void {
     };
     defer finished.deinit(allocator);
     try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &finished));
-    try std.testing.expect(state.completed_selection == null);
+    try std.testing.expectEqual(retained, state.completed_selection != null);
+    if (retained) {
+        try std.testing.expectEqualStrings("old source", state.completed_selection.?.text);
+        try std.testing.expect(state.completed_selection.?.token.view().eql(state.currentContentToken().?));
+    }
 }
 
 fn applyBundleStatusForTest(bundle: *Bundle, bytes: []const u8) !void {
@@ -3983,7 +4016,7 @@ test "repository selection slice C real empty line keeps candidate without copy 
     try std.testing.expectEqualStrings("Selected source line is empty", state.status.text());
 }
 
-test "repository selection slice C basis replacements clear candidate conservatively" {
+test "repository selection slice D reconciles accepted document and keeps other replacements fail closed" {
     const allocator = std.testing.allocator;
     const size: chasen.Size = .{ .width = 60, .height = 6 };
 
@@ -4015,9 +4048,87 @@ test "repository selection slice C basis replacements clear candidate conservati
         try std.testing.expect(state.completed_selection == null);
     }
 
-    try expectDocumentReplacementClearsCandidateForTest("old source\n");
-    try expectDocumentReplacementClearsCandidateForTest("changed source\n");
-    try expectDocumentReplacementClearsCandidateForTest(null);
+    // A different delivery generation and new allocation do not change the
+    // semantic basis. Changed or inert source cannot retain the candidate.
+    try expectDocumentReplacementCandidateForTest("old source\n", true);
+    try expectDocumentReplacementCandidateForTest("changed source\n", false);
+    try expectDocumentReplacementCandidateForTest(null, false);
+}
+
+test "repository selection slice D retains candidate across inactive page and presentation changes" {
+    const allocator = std.testing.allocator;
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    var state = try selectionStateForTest("main.zig\x00", "first\nneedle here\nthird\n");
+    defer state.deinit(allocator);
+    try installFirstLineCandidateForTest(&state, allocator);
+    const retained_token = state.completed_selection.?.token.view();
+
+    state.deactivate();
+    try std.testing.expect(state.completed_selection != null);
+    state.activate(state.repo_epoch, state.root_identity);
+    try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
+
+    _ = state.applyNavigation(allocator, .focus_source, size);
+    _ = state.applyNavigation(allocator, .source_last, size);
+    _ = state.applyNavigation(allocator, .enter_source_search, size);
+    for ("needle") |byte| _ = state.applyNavigation(allocator, .{ .source_search_insert = byte }, size);
+    _ = state.applyNavigation(allocator, .submit_source_search, size);
+    try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
+
+    state.syntax_generation = 8;
+    state.pending_syntax_generation = 8;
+    var syntax_finished = SyntaxFinished{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = state.root_identity.?,
+        .generation = 8,
+        .manifest_revision = state.manifest_revision,
+        .source_revision = state.displayed_document.?.source_revision,
+        .path = try allocator.dupe(u8, state.selected_path.?),
+        .fingerprint = state.currentSource().?.fingerprint,
+        .result = .unavailable,
+    };
+    defer syntax_finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applySyntaxFinished(allocator, &syntax_finished));
+    try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
+
+    state.displayed_document.?.change_decoration = .eligible;
+    state.change_map_generation = 9;
+    state.pending_change_map_generation = 9;
+    var change_finished = ChangeMapFinished{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = state.root_identity.?,
+        .generation = 9,
+        .manifest_revision = state.manifest_revision,
+        .source_revision = state.displayed_document.?.source_revision,
+        .path = try allocator.dupe(u8, state.selected_path.?),
+        .fingerprint = state.currentSource().?.fingerprint,
+        .content_line_count = state.currentSource().?.contentLineCount(),
+        .result = .unavailable,
+    };
+    defer change_finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyChangeMapFinished(allocator, &change_finished));
+    try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
+
+    // Focus loss and resize cancel only a live borrow. The release-frozen
+    // candidate is owned independently and survives both presentation events.
+    const geometry = state.sourceGeometry(size, state.currentSource().?);
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
+        .col = geometry.text_col,
+        .row = geometry.body_first_row,
+    } }, size);
+    try std.testing.expect(state.activeSourceSelection());
+    _ = state.applyNavigation(allocator, .cancel_source_selection, size);
+    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
+        .col = geometry.text_col,
+        .row = geometry.body_first_row,
+    } }, size);
+    state.cancelSourceSelection();
+    state.clampForBodySize(.{ .width = 50, .height = 5 });
+    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
 }
 
 test "repository source completion rejects stale identity and frees undelivered payload" {
