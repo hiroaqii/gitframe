@@ -84,6 +84,19 @@ pub const State = union(enum) {
         return true;
     }
 
+    /// Move a document-stage destination back to manifest authority before a
+    /// reload/reactivation successor cycle. The byte-exact path owner and line
+    /// hint are preserved; accepted revision/generation are deliberately
+    /// discarded because neither can authorize the new cycle.
+    pub fn restartManifestCycle(self: *State) bool {
+        const location = switch (self.*) {
+            .awaiting_document => |pending| pending.location,
+            .none, .awaiting_manifest, .unavailable => return false,
+        };
+        self.* = .{ .awaiting_manifest = location };
+        return true;
+    }
+
     /// Consume a successfully resolved document owner and release its request
     /// path exactly once. The selected path/source remain Repository-owned.
     pub fn completeDocument(self: *State, allocator: std.mem.Allocator) bool {
@@ -249,4 +262,26 @@ test "Repository incoming binds one document generation and completes owner" {
     try std.testing.expect(state.completeDocument(allocator));
     try std.testing.expect(state == .none);
     try std.testing.expect(!state.completeDocument(allocator));
+}
+
+test "Repository incoming restarts document owner at manifest authority" {
+    const allocator = std.testing.allocator;
+    var state: State = .none;
+    defer state.deinit(allocator);
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        7,
+        .{ .device = 11, .inode = 13 },
+        .{ .location = .{ .path = "src/main.zig", .line = 42 } },
+    );
+    state.accept(allocator, &incoming);
+    const owned_address = @intFromPtr(state.manifestIntent().?.path.ptr);
+    try std.testing.expect(state.advanceToDocument(9));
+    try std.testing.expect(state.bindDocumentGeneration(9, "src/main.zig", 3));
+
+    try std.testing.expect(state.restartManifestCycle());
+    try std.testing.expect(state == .awaiting_manifest);
+    try std.testing.expectEqual(owned_address, @intFromPtr(state.manifestIntent().?.path.ptr));
+    try std.testing.expectEqual(@as(?u32, 42), state.manifestIntent().?.line);
+    try std.testing.expect(!state.restartManifestCycle());
 }

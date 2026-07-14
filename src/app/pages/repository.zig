@@ -877,16 +877,23 @@ pub const RepositoryPageState = struct {
         if (self.activation_id == 0) self.activation_id = 1;
         if (self.repo_epoch != repo_epoch) self.repo_epoch = repo_epoch;
         self.root_identity = identity;
+        self.pending_generation = null;
         self.pending_document_generation = null;
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
         self.needs_syntax_request = false;
         self.needs_change_map_request = false;
         self.needs_document_revalidation = false;
+        // The activation identity changes even when the repository does not,
+        // so old manifest/document generations can no longer complete. Rewind
+        // the same destination owner to the manifest authority that can name
+        // its next valid successor cycle.
+        _ = self.incoming.restartManifestCycle();
         if (identity == null) {
             self.needs_revalidation = false;
             self.freshness = .unavailable;
             self.load_state = .no_repository;
+            _ = self.terminalizeIncoming(.request_failed);
             return;
         }
         self.status.clear();
@@ -1299,6 +1306,10 @@ pub const RepositoryPageState = struct {
             _ = self.terminalizeIncoming(.request_failed);
             return;
         }
+        // Manual reload invalidates any selected-file generation. Re-resolve
+        // the retained exact path against the accepted successor manifest
+        // before a new document generation may bind to it.
+        _ = self.incoming.restartManifestCycle();
         self.needs_revalidation = true;
     }
 
@@ -5267,6 +5278,189 @@ test "repository transition B2b2a document start failures close the bound owner"
     state.markDocumentCapabilityUnavailable();
     try expectIncomingRequestFailureForTest(&state, capability_address);
     try std.testing.expect(!state.needs_document_revalidation);
+}
+
+test "repository transition B2b2b1 manual reload rebinds one destination through manifest" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state = try selectionStateForTest("main.zig\x00", "old one\nold two\nold three\n");
+    defer state.deinit(allocator);
+    state.root_identity = root.capability.identity;
+    state.freshness = .fresh;
+
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        state.repo_epoch,
+        state.root_identity.?,
+        .{ .location = .{ .path = "main.zig", .line = 2 } },
+    );
+    const owned_address = @intFromPtr(incoming.location.path.ptr);
+    state.acceptIncoming(allocator, &incoming);
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    state.document_generation = 7;
+    state.pending_document_generation = 7;
+    try std.testing.expect(state.incoming.bindDocumentGeneration(state.manifest_revision, "main.zig", 7));
+
+    state.requestReload(true);
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+    try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.manifestIntent().?.path.ptr));
+    try std.testing.expect(state.pending_document_generation == null);
+    try std.testing.expect(state.needs_revalidation);
+
+    const stale_bytes = try allocator.dupe(u8, "stale source\n");
+    var stale_document: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = state.root_identity.?,
+        .generation = 7,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .value = .{ .source = try source_document.Document.initOwned(allocator, stale_bytes, .init(stale_bytes)) },
+    };
+    defer stale_document.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyDocumentFinished(allocator, &stale_document));
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+
+    var manifest_request = try state.prepareRequest(allocator, root.path, &root.capability);
+    defer manifest_request.deinit(allocator);
+    var manifest_finished: ManifestFinished = .{
+        .identity = manifest_request.identity,
+        .root_identity = manifest_request.root.identity,
+        .generation = manifest_request.generation,
+        .result = .{ .unchanged = state.bundle.?.document.fingerprint },
+    };
+    defer manifest_finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &manifest_finished));
+    try std.testing.expect(state.incoming == .awaiting_document);
+    try std.testing.expect(state.needs_document_revalidation);
+
+    var document_request = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer document_request.deinit(allocator);
+    try std.testing.expect(document_request.generation > 7);
+    try std.testing.expectEqual(
+        @as(?u64, document_request.generation),
+        state.incoming.documentIntent().?.document_generation,
+    );
+    const new_bytes = try allocator.dupe(u8, "new one\nnew two\nnew three\n");
+    var document_finished: DocumentFinished = .{
+        .identity = document_request.identity,
+        .root_identity = document_request.root.identity,
+        .generation = document_request.generation,
+        .manifest_revision = document_request.manifest_revision,
+        .path = try allocator.dupe(u8, document_request.path),
+        .value = .{ .source = try source_document.Document.initOwned(allocator, new_bytes, .init(new_bytes)) },
+    };
+    defer document_finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &document_finished));
+    try std.testing.expect(state.incoming == .none);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
+    try std.testing.expectEqualStrings("new one\nnew two\nnew three\n", state.currentSource().?.bytes);
+}
+
+test "repository transition B2b2b1 reactivation rewinds or terminalizes document owner" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 2,
+        .repo_epoch = 3,
+        .root_identity = root.capability.identity,
+        .manifest_revision = 11,
+        .document_generation = 12,
+        .pending_document_generation = 12,
+    };
+    defer state.deinit(allocator);
+    const retained_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "retained.zig");
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    try std.testing.expect(state.incoming.bindDocumentGeneration(state.manifest_revision, "retained.zig", 12));
+
+    state.deactivate();
+    state.activate(state.repo_epoch, root.capability.identity);
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+    try std.testing.expectEqual(retained_address, @intFromPtr(state.incoming.manifestIntent().?.path.ptr));
+    try std.testing.expect(state.pending_document_generation == null);
+    try std.testing.expect(state.needs_revalidation);
+
+    var stale_document: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = 2 },
+        .root_identity = root.capability.identity,
+        .generation = 12,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, "retained.zig"),
+        .value = .{ .inert = .binary },
+    };
+    defer stale_document.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyDocumentFinished(allocator, &stale_document));
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+
+    var manifest_request = try state.prepareRequest(allocator, root.path, &root.capability);
+    defer manifest_request.deinit(allocator);
+    var manifest_finished: ManifestFinished = .{
+        .identity = manifest_request.identity,
+        .root_identity = manifest_request.root.identity,
+        .generation = manifest_request.generation,
+        .result = .{ .loaded = try bundleForTest("retained.zig\x00") },
+    };
+    defer manifest_finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &manifest_finished));
+    try std.testing.expect(state.incoming == .awaiting_document);
+
+    var document_request = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer document_request.deinit(allocator);
+    const bytes = try allocator.dupe(u8, "first\nsecond\nthird\n");
+    var document_finished: DocumentFinished = .{
+        .identity = document_request.identity,
+        .root_identity = document_request.root.identity,
+        .generation = document_request.generation,
+        .manifest_revision = document_request.manifest_revision,
+        .path = try allocator.dupe(u8, document_request.path),
+        .value = .{ .source = try source_document.Document.initOwned(allocator, bytes, .init(bytes)) },
+    };
+    defer document_finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &document_finished));
+    try std.testing.expect(state.incoming == .none);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
+
+    const unavailable_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "no-root.zig");
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    state.activate(state.repo_epoch, null);
+    try expectIncomingRequestFailureForTest(&state, unavailable_address);
+    try std.testing.expect(!state.needs_revalidation);
+    try std.testing.expectEqual(LoadState.no_repository, state.load_state);
+}
+
+test "repository transition B2b2b1 reactivation invalidates manifest predecessor" {
+    const allocator = std.testing.allocator;
+    const identity = root_capability.Identity{ .device = 5, .inode = 8 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 2,
+        .repo_epoch = 3,
+        .root_identity = identity,
+        .generation = 7,
+        .pending_generation = 7,
+    };
+    defer state.deinit(allocator);
+    const owned_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "pending.zig");
+
+    state.deactivate();
+    state.activate(state.repo_epoch, identity);
+    try std.testing.expect(state.pending_generation == null);
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+    state.markRequestPreparationFailed(error.OutOfMemory);
+    try expectIncomingRequestFailureForTest(&state, owned_address);
+
+    var stale_manifest: ManifestFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = 2 },
+        .root_identity = identity,
+        .generation = 7,
+        .result = .{ .loaded = try bundleForTest("pending.zig\x00") },
+    };
+    defer stale_manifest.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &stale_manifest));
+    try expectIncomingRequestFailureForTest(&state, owned_address);
+    try std.testing.expect(state.bundle == null);
 }
 
 test "repository page owns reload state transitions" {
