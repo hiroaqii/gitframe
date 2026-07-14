@@ -140,12 +140,25 @@ pub const DeferredSourceApply = struct {
     }
 };
 
+/// Owns a projection completion which arrived while its displayed diff was
+/// borrowed by a live mouse drag. Source completions are drained first because
+/// they can advance the source session and make this result stale.
+pub const DeferredProjectionApply = struct {
+    finished: load.ReviewProjectionFinished,
+
+    pub fn deinit(self: *DeferredProjectionApply, allocator: std.mem.Allocator) void {
+        self.finished.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const ReviewPageState = struct {
     activation: authority.Lifecycle = .{},
     status: app_state.StatusMessage = .{},
     load: load_state.LoadRuntimeState = .{},
     auto_reload: auto_reload.State = .{},
     deferred_source_apply: ?DeferredSourceApply = null,
+    deferred_projection_apply: ?DeferredProjectionApply = null,
     viewer: ViewerState = .{},
     search: DiffSearchState = .{},
     file_search: prompt.FilterPromptState = .{},
@@ -184,6 +197,7 @@ pub const ReviewPageState = struct {
         self.selection_owner = .none;
         if (self.completed_selection) |*selection| selection.deinit(allocator);
         if (self.deferred_source_apply) |*deferred| deferred.deinit(allocator);
+        if (self.deferred_projection_apply) |*deferred| deferred.deinit(allocator);
         self.load.clearCurrent(allocator);
         self.git_status.deinit();
         self.branch_status.deinit();

@@ -15,9 +15,11 @@ const review_projection = @import("../../review_projection.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
 const review_page = @import("../review.zig");
+const review_selection = @import("selection.zig");
 const authority = @import("authority.zig");
 const navigation = @import("navigation.zig");
 const diff_file = @import("../../../diff/file.zig");
+const diff_hunk_projection = @import("../../../diff/hunk_projection.zig");
 const diff_parser = @import("../../../diff/parser.zig");
 const diff_source = @import("../../../diff/source.zig");
 const file_tree = @import("../../../file_tree.zig");
@@ -306,6 +308,95 @@ pub const Controller = struct {
 
     fn acceptsIdentity(self: Controller, identity: app_page.RequestIdentity) bool {
         return self.page.activation.acceptsRepoEpoch(identity, self.repo_epoch);
+    }
+
+    /// The live drag is the only state which borrows displayed source or
+    /// projection storage. Completed selections are fully owned and therefore
+    /// never participate in this reload gate.
+    fn displayMutationBlockedByDrag(self: Controller) bool {
+        return self.page.selection_owner.activeMouseSelection();
+    }
+
+    fn clearCompletedSelection(self: Controller, allocator: std.mem.Allocator) void {
+        if (self.page.completed_selection) |*selection| selection.deinit(allocator);
+        self.page.completed_selection = null;
+    }
+
+    fn clearProjectionCompletedSelection(self: Controller, allocator: std.mem.Allocator) void {
+        const completed = self.page.completed_selection orelse return;
+        switch (completed.token.display) {
+            .loaded => {},
+            .cached_projection, .combined_projection, .generated_untracked => self.clearCompletedSelection(allocator),
+        }
+    }
+
+    fn contentTokenForReady(self: Controller, ready: *const review_projection.Ready) ?review_selection.ReviewContentToken {
+        const display: review_selection.DisplayBasis = switch (ready.*) {
+            .cached_diff => |bundle| .{ .cached_projection = .{
+                .status_snapshot_revision = self.page.status_snapshot_revision,
+                .cached = bundle.fingerprint,
+            } },
+            .combined_hunks => |bundle| .{ .combined_projection = .{
+                .status_snapshot_revision = self.page.status_snapshot_revision,
+                .cached = bundle.cached_bundle.fingerprint,
+                .unstaged = bundle.unstaged_bundle.fingerprint,
+            } },
+            .generated_added_file => |bundle| .{ .generated_untracked = .{
+                .status_snapshot_revision = self.page.status_snapshot_revision,
+                .source = bundle.fingerprint(),
+            } },
+            .inert_combined, .status_body => return null,
+        };
+        return .{
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.root_identity,
+            .source = review_selection.SourceBasis.init(self.source),
+            .source_session_revision = self.page.source_session_revision,
+            .display = display,
+        };
+    }
+
+    /// A candidate is meaningful only for the exact semantic display basis it
+    /// captured. Delivery IDs and cache slots are intentionally absent, so an
+    /// exact rebuild survives while changed content is cleared before the old
+    /// displayed owner can be moved or freed.
+    fn reconcileCompletedSelectionForReady(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        ready: *const review_projection.Ready,
+    ) void {
+        const completed = self.page.completed_selection orelse return;
+        const incoming = self.contentTokenForReady(ready) orelse {
+            self.clearCompletedSelection(allocator);
+            return;
+        };
+        if (!completed.token.eql(incoming)) self.clearCompletedSelection(allocator);
+    }
+
+    /// A normal loaded diff intentionally has no projection target. Reaching
+    /// that steady state must not erase an owned candidate captured from the
+    /// same loaded bytes; projection-derived candidates still become stale
+    /// when their displayed projection disappears.
+    fn reconcileCompletedSelectionForNoProjectionTarget(
+        self: Controller,
+        allocator: std.mem.Allocator,
+    ) void {
+        const completed = self.page.completed_selection orelse return;
+        const primary = switch (self.navigation.view().displayedReviewBody()) {
+            .primary => |primary| primary,
+            else => {
+                self.clearCompletedSelection(allocator);
+                return;
+            },
+        };
+        const current = review_selection.ReviewContentToken{
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.root_identity,
+            .source = review_selection.SourceBasis.init(self.source),
+            .source_session_revision = self.page.source_session_revision,
+            .display = .{ .loaded = .init(primary.loaded.text) },
+        };
+        if (!completed.token.eql(current)) self.clearCompletedSelection(allocator);
     }
 
     pub fn failActiveMember(self: Controller, member: authority.Member) void {
@@ -621,6 +712,11 @@ pub const Controller = struct {
     /// transfers one owned task request to the shell. The pending page identity
     /// is a distinct clone so task and page never share allocator ownership.
     pub fn prepareProjection(self: Controller, allocator_opt: ?std.mem.Allocator) !ReviewUpdate {
+        // Projection reconciliation can move or free the currently displayed
+        // owner. A live drag borrows that owner, so even cache promotion and
+        // no-target cleanup wait until release/cancel has ended the borrow.
+        if (self.displayMutationBlockedByDrag()) return .{};
+
         const target = self.view().projectionTarget() orelse {
             if (self.view().canRetainDisplayedProjection()) return .{};
             if (self.page.pending_display_navigation_restore != null and !self.page.status_load.isFresh()) return .{};
@@ -631,6 +727,7 @@ pub const Controller = struct {
                     self.page.pending_display_navigation_restore == null) return .{};
                 return error.MissingAllocator;
             };
+            self.reconcileCompletedSelectionForNoProjectionTarget(allocator);
             if (self.page.pending_display_navigation_restore != null) self.clearDisplayRestore(allocator);
             self.page.review_projection.clearPending(allocator);
             if (self.repo_root) |repo_root| {
@@ -691,6 +788,7 @@ pub const Controller = struct {
             defer if (hit_owned) hit.deinit(allocator);
 
             if (target.kind != .generated_added_file or hit.request.matchesRootIdentity(self.root_identity)) {
+                self.reconcileCompletedSelectionForReady(allocator, &hit.value);
                 self.page.review_projection.clearPending(allocator);
                 self.page.review_projection.cacheOrClearDisplayed(
                     allocator,
@@ -716,6 +814,7 @@ pub const Controller = struct {
 
         self.page.review_projection.clearPending(allocator);
         if (!self.view().displayedMatchesStableIdentity(target)) {
+            self.clearCompletedSelection(allocator);
             self.page.review_projection.cacheOrClearDisplayed(
                 allocator,
                 target.repo_root,
@@ -1124,11 +1223,26 @@ pub const Controller = struct {
             self.page.status_snapshot_revision,
         )) return .{};
 
+        // Keep the pending request and displayed owner intact until the drag
+        // transaction has copied its selection into owned memory. Only one
+        // completion can match the single pending request; a duplicate is
+        // rejected and remains the caller's cleanup responsibility.
+        if (self.displayMutationBlockedByDrag()) {
+            if (self.page.deferred_projection_apply != null) return .{};
+            self.page.deferred_projection_apply = .{ .finished = result.* };
+            return .{ .result_transferred = true };
+        }
+
         var local_navigation = if (self.page.pending_display_navigation_restore == null)
             try self.view().captureAnchor(allocator)
         else
             null;
         defer if (local_navigation) |*anchor| anchor.deinit(allocator);
+
+        switch (result.result) {
+            .ready => |*ready| self.reconcileCompletedSelectionForReady(allocator, ready),
+            .failed, .failed_static => self.clearCompletedSelection(allocator),
+        }
 
         self.page.review_projection.clearPending(allocator);
         self.page.review_projection.cacheOrClearDisplayed(
@@ -1178,6 +1292,21 @@ pub const Controller = struct {
         }
     }
 
+    /// Applies an owned projection completion after the live drag borrow has
+    /// ended. The normal acceptance checks run again because a deferred source
+    /// completion may already have advanced the session revision.
+    pub fn applyDeferredProjection(
+        self: Controller,
+        allocator: std.mem.Allocator,
+    ) !void {
+        var deferred = self.page.deferred_projection_apply orelse return;
+        self.page.deferred_projection_apply = null;
+
+        var result_transferred = false;
+        defer if (!result_transferred) deferred.deinit(allocator);
+        result_transferred = (try self.applyProjectionFinished(allocator, &deferred.finished)).result_transferred;
+    }
+
     pub fn applySourceFinished(
         self: Controller,
         allocator: std.mem.Allocator,
@@ -1190,7 +1319,7 @@ pub const Controller = struct {
             self.clearPendingReloadIfGeneration(allocator, finished.generation);
             return .{};
         }
-        if ((finished.result == .loaded or finished.result == .empty) and self.page.selection_owner.activeMouseSelection() and
+        if ((finished.result == .loaded or finished.result == .empty) and self.displayMutationBlockedByDrag() and
             self.page.load.isCurrent(finished.generation) and self.page.deferred_source_apply == null)
         {
             if (finished.background_cycle_id) |cycle_id| {
@@ -1380,9 +1509,11 @@ pub const Controller = struct {
 
     pub fn advanceSourceSessionRevision(self: Controller, allocator: ?std.mem.Allocator) void {
         if (allocator) |owner| {
+            self.clearCompletedSelection(owner);
             self.page.review_projection.clearCache(owner);
         } else {
             std.debug.assert(self.page.review_projection.cacheLen() == 0);
+            std.debug.assert(self.page.completed_selection == null);
         }
         self.page.source_session_revision +%= 1;
     }
@@ -1392,9 +1523,14 @@ pub const Controller = struct {
     /// this revision and invalidate every retained projection.
     pub fn advanceStatusSnapshotRevision(self: Controller, allocator: ?std.mem.Allocator) void {
         if (allocator) |owner| {
+            self.clearProjectionCompletedSelection(owner);
             self.page.review_projection.clearCache(owner);
         } else {
             std.debug.assert(self.page.review_projection.cacheLen() == 0);
+            if (self.page.completed_selection) |completed| switch (completed.token.display) {
+                .loaded => {},
+                .cached_projection, .combined_projection, .generated_untracked => unreachable,
+            };
         }
         self.page.status_snapshot_revision +%= 1;
     }
@@ -2341,6 +2477,506 @@ fn testGeneratedReady(
         .request = request,
         .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, path, "one\ntwo\n") },
     };
+}
+
+fn testGeneratedCandidate(
+    controller: Controller,
+    allocator: std.mem.Allocator,
+    bundle: *const review_projection.GeneratedFileBundle,
+) !review_selection.CompletedSelection {
+    const ready: review_projection.Ready = .{ .generated_added_file = bundle.* };
+    const token = controller.contentTokenForReady(&ready) orelse return error.ExpectedContentToken;
+    var drag = @import("../../../diff/selection.zig").DragSelection.init(
+        .{ .generated_file = .{ .path_key = bundle.path } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0, .leading = 0, .trailing = 3 },
+    );
+    drag.mode = .character;
+    drag.moved = true;
+    return review_selection.buildGenerated(allocator, token, bundle.path, &bundle.source, drag);
+}
+
+test "projection completion defers without moving displayed ownership during live drag" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const request = switch (command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    command = undefined;
+
+    page.selection_owner = .{ .diff = .init(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = request,
+        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "one\ntwo\n") } },
+    };
+    var finished_owned = true;
+    defer if (finished_owned) finished.deinit(allocator);
+
+    const applied = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(applied.result_transferred);
+    finished_owned = false;
+    try std.testing.expect(page.deferred_projection_apply != null);
+    try std.testing.expect(page.review_projection.pending != null);
+    try std.testing.expect(!page.review_projection.hasDisplayed());
+
+    var duplicate: app_load.ReviewProjectionFinished = .{
+        .request = try review_projection.cloneRequest(
+            allocator,
+            page.activation.currentIdentity().?,
+            page.review_projection.pending.?.id,
+            "/repo",
+            "a",
+            .generated_added_file,
+            .unstaged,
+            0,
+            0,
+        ),
+        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "duplicate\n") } },
+    };
+    defer duplicate.deinit(allocator);
+    const duplicate_apply = try controller.applyProjectionFinished(allocator, &duplicate);
+    try std.testing.expect(!duplicate_apply.result_transferred);
+    try std.testing.expect(page.deferred_projection_apply != null);
+
+    // Reconciliation, including a cache lookup, is inert for the duration of
+    // the borrow. The deferred completion remains the only result owner.
+    var while_dragging = try controller.prepareProjection(allocator);
+    defer while_dragging.deinit(allocator);
+    try std.testing.expect(while_dragging.command == null);
+    try std.testing.expect(page.deferred_projection_apply != null);
+
+    page.selection_owner = .none;
+    try controller.applyDeferredProjection(allocator);
+    try std.testing.expect(page.deferred_projection_apply == null);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.review_projection.hasDisplayed());
+}
+
+test "projection failed terminals defer through the same owned result slot" {
+    const allocator = std.testing.allocator;
+    var status_message = @import("../../state.zig").StatusMessage{};
+
+    var owned_page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer owned_page.deinit(allocator);
+    var owned_status = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try owned_page.git_status.replace("/repo", &owned_status);
+    const owned_controller = testController(&owned_page, &status_message, .unstaged);
+    var owned_update = try owned_controller.prepareProjection(allocator);
+    defer owned_update.deinit(allocator);
+    var owned_command = owned_update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const owned_request = switch (owned_command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    owned_command = undefined;
+    owned_page.selection_owner = .{ .diff = .init(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    var failed: app_load.ReviewProjectionFinished = .{
+        .request = owned_request,
+        .result = .{ .failed = try review_projection.statusBodyAlloc(allocator, "a", "{s}", .{"failed"}) },
+    };
+    const failed_apply = try owned_controller.applyProjectionFinished(allocator, &failed);
+    try std.testing.expect(failed_apply.result_transferred);
+    owned_page.selection_owner = .none;
+    try owned_controller.applyDeferredProjection(allocator);
+    try std.testing.expect(owned_page.review_projection.displayed == .failed);
+
+    var static_page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer static_page.deinit(allocator);
+    var static_status = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try static_page.git_status.replace("/repo", &static_status);
+    const static_controller = testController(&static_page, &status_message, .unstaged);
+    var static_update = try static_controller.prepareProjection(allocator);
+    defer static_update.deinit(allocator);
+    var static_command = static_update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const static_request = switch (static_command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    static_command = undefined;
+    static_page.selection_owner = .{ .diff = .init(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    var failed_static: app_load.ReviewProjectionFinished = .{
+        .request = static_request,
+        .result = .{ .failed_static = "failed static" },
+    };
+    const static_apply = try static_controller.applyProjectionFinished(allocator, &failed_static);
+    try std.testing.expect(static_apply.result_transferred);
+    static_page.selection_owner = .none;
+    try static_controller.applyDeferredProjection(allocator);
+    try std.testing.expect(static_page.review_projection.displayed == .failed);
+}
+
+test "cached and combined ready completions use the live drag deferral slot" {
+    const allocator = std.testing.allocator;
+    var status_message = @import("../../state.zig").StatusMessage{};
+
+    var cached_page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer cached_page.deinit(allocator);
+    var cached_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try cached_page.git_status.replace("/repo", &cached_status);
+    const cached_controller = testController(&cached_page, &status_message, .unstaged);
+    var cached_update = try cached_controller.prepareProjection(allocator);
+    defer cached_update.deinit(allocator);
+    var cached_command = cached_update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const cached_request = switch (cached_command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    cached_command = undefined;
+    cached_page.selection_owner = .{ .diff = .init(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    var cached_finished: app_load.ReviewProjectionFinished = .{
+        .request = cached_request,
+        .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, test_support.diff_cached_projection) } },
+    };
+    const cached_apply = try cached_controller.applyProjectionFinished(allocator, &cached_finished);
+    try std.testing.expect(cached_apply.result_transferred);
+    try std.testing.expect(cached_page.deferred_projection_apply != null);
+    cached_page.selection_owner = .none;
+    try cached_controller.applyDeferredProjection(allocator);
+    try std.testing.expect(cached_page.review_projection.displayed.ready.value == .cached_diff);
+
+    var combined_page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer combined_page.deinit(allocator);
+    var combined_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try combined_page.git_status.replace("/repo", &combined_status);
+    combined_page.status_load.markSuccess();
+    const combined_controller = testController(&combined_page, &status_message, .unstaged);
+    var combined_update = try combined_controller.prepareProjection(allocator);
+    defer combined_update.deinit(allocator);
+    var combined_command = combined_update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const combined_request = switch (combined_command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    combined_command = undefined;
+    var cached_bundle = try app_load.buildLoadedBundle(allocator, test_support.diff_cached_projection);
+    var cached_owned = true;
+    defer if (cached_owned) cached_bundle.deinit();
+    var unstaged_bundle = try app_load.buildLoadedBundle(allocator, test_support.diff_unstaged_projection);
+    var unstaged_owned = true;
+    defer if (unstaged_owned) unstaged_bundle.deinit();
+    var projection_arena = std.heap.ArenaAllocator.init(allocator);
+    var projection_owned = true;
+    defer if (projection_owned) projection_arena.deinit();
+    const projection = try diff_hunk_projection.build(
+        projection_arena.allocator(),
+        cached_bundle.loaded.document.files[0],
+        unstaged_bundle.loaded.document.files[0],
+    );
+    combined_page.selection_owner = .{ .diff = .init(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    var combined_finished: app_load.ReviewProjectionFinished = .{
+        .request = combined_request,
+        .result = .{ .ready = .{ .combined_hunks = .{
+            .arena = projection_arena,
+            .projection = projection,
+            .cached_bundle = cached_bundle,
+            .unstaged_bundle = unstaged_bundle,
+        } } },
+    };
+    const combined_apply = try combined_controller.applyProjectionFinished(allocator, &combined_finished);
+    try std.testing.expect(combined_apply.result_transferred);
+    projection_owned = false;
+    cached_owned = false;
+    unstaged_owned = false;
+    try std.testing.expect(combined_page.deferred_projection_apply != null);
+    combined_page.selection_owner = .none;
+    try combined_controller.applyDeferredProjection(allocator);
+    try std.testing.expect(combined_page.review_projection.displayed.ready.value == .combined_hunks);
+}
+
+test "either inert combined component defers caches promotes and deinits exactly once" {
+    const allocator = std.testing.allocator;
+    const valid_patch =
+        "diff --git a/a b/a\n" ++
+        "index 1111111..2222222 100644\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+valid\n";
+    const invalid_patch =
+        "diff --git a/a b/a\n" ++
+        "index 1111111..2222222 100644\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+bad\xff\n";
+
+    for ([_]bool{ true, false }) |cached_is_invalid| {
+        var status_message = @import("../../state.zig").StatusMessage{};
+        var page: review_page.ReviewPageState = .{
+            .load = test_support.loadState(test_support.loadedDiffOne()),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        };
+        defer page.deinit(allocator);
+        var status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+        try page.git_status.replace("/repo", &status);
+        page.status_load.markSuccess();
+        const controller = testController(&page, &status_message, .unstaged);
+        var update = try controller.prepareProjection(allocator);
+        defer update.deinit(allocator);
+        var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+        const request = switch (command) {
+            .review_projection => |owned| owned,
+            else => return error.ExpectedProjectionCommand,
+        };
+        command = undefined;
+
+        var cached = try app_load.buildLoadedBundle(allocator, if (cached_is_invalid) invalid_patch else valid_patch);
+        var cached_owned = true;
+        defer if (cached_owned) cached.deinit();
+        var unstaged = try app_load.buildLoadedBundle(allocator, if (cached_is_invalid) valid_patch else invalid_patch);
+        var unstaged_owned = true;
+        defer if (unstaged_owned) unstaged.deinit();
+        page.selection_owner = .{ .diff = .init(
+            .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+            .new,
+            .{ .hunk_index = 0, .line_index = 0 },
+        ) };
+        var finished: app_load.ReviewProjectionFinished = .{
+            .request = request,
+            .result = .{ .ready = .{ .inert_combined = .{
+                .cached_bundle = cached,
+                .unstaged_bundle = unstaged,
+            } } },
+        };
+        const applied = try controller.applyProjectionFinished(allocator, &finished);
+        try std.testing.expect(applied.result_transferred);
+        cached_owned = false;
+        unstaged_owned = false;
+        try std.testing.expect(page.deferred_projection_apply != null);
+        try std.testing.expect(!page.review_projection.hasDisplayed());
+
+        page.selection_owner = .none;
+        try controller.applyDeferredProjection(allocator);
+        try std.testing.expect(page.deferred_projection_apply == null);
+        try std.testing.expect(page.review_projection.displayed.ready.value == .inert_combined);
+
+        page.review_projection.cacheOrClearDisplayed(allocator, "/repo", .unstaged, 0, 0);
+        try std.testing.expect(page.review_projection.cacheHas("/repo", "a", .combined_hunks, .unstaged, 0, 0));
+        var promoted = try controller.prepareProjection(allocator);
+        defer promoted.deinit(allocator);
+        try std.testing.expect(promoted.command == null);
+        try std.testing.expect(page.review_projection.displayed.ready.value == .inert_combined);
+    }
+}
+
+test "projection cache promotion and no-target clear wait for live drag release" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    page.review_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
+    page.review_projection.cacheOrClearDisplayed(allocator, "/repo", .unstaged, 0, 0);
+    page.selection_owner = .{ .diff = .init(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    var blocked_promotion = try controller.prepareProjection(allocator);
+    defer blocked_promotion.deinit(allocator);
+    try std.testing.expect(blocked_promotion.command == null);
+    try std.testing.expect(!page.review_projection.hasDisplayed());
+    try std.testing.expect(page.review_projection.cacheHas("/repo", "a", .generated_added_file, .unstaged, 0, 0));
+
+    page.selection_owner = .none;
+    var promoted = try controller.prepareProjection(allocator);
+    defer promoted.deinit(allocator);
+    try std.testing.expect(promoted.command == null);
+    try std.testing.expect(page.review_projection.hasDisplayed());
+
+    page.selection_owner = .{ .diff = .init(
+        .{ .generated_file = .{ .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    page.viewer.selected_target = .{ .diff_file = 0 };
+    var blocked_clear = try controller.prepareProjection(allocator);
+    defer blocked_clear.deinit(allocator);
+    try std.testing.expect(blocked_clear.command == null);
+    try std.testing.expect(page.review_projection.hasDisplayed());
+
+    page.selection_owner = .none;
+    var cleared = try controller.prepareProjection(allocator);
+    defer cleared.deinit(allocator);
+    try std.testing.expect(cleared.command == null);
+    try std.testing.expect(!page.review_projection.hasDisplayed());
+    try std.testing.expect(page.review_projection.cacheHas("/repo", "a", .generated_added_file, .unstaged, 0, 0));
+}
+
+test "source replacement before deferred projection rejects and frees the stale result" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const request = switch (command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    command = undefined;
+    page.selection_owner = .{ .diff = .init(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = request,
+        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "stale\n") } },
+    };
+    const applied = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(applied.result_transferred);
+
+    // This is the ordering used by App's common drain: source replacement
+    // advances the revision and clears projection state before the deferred
+    // projection is reconsidered.
+    controller.clearLoadedDiff(allocator);
+    try std.testing.expectEqual(@as(u64, 1), page.source_session_revision);
+    try controller.applyDeferredProjection(allocator);
+    try std.testing.expect(page.deferred_projection_apply == null);
+    try std.testing.expect(!page.review_projection.hasDisplayed());
+}
+
+test "projection candidate survives exact rebuild and clears on changed content basis" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    page.review_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
+    const displayed = &page.review_projection.displayed.ready.value.generated_added_file;
+    page.completed_selection = try testGeneratedCandidate(controller, allocator, displayed);
+
+    page.review_projection.pending = try review_projection.cloneRequest(
+        allocator,
+        page.activation.currentIdentity().?,
+        2,
+        "/repo",
+        "a",
+        .generated_added_file,
+        .unstaged,
+        0,
+        0,
+    );
+    var exact: app_load.ReviewProjectionFinished = .{
+        .request = try review_projection.cloneRequest(
+            allocator,
+            page.activation.currentIdentity().?,
+            2,
+            "/repo",
+            "a",
+            .generated_added_file,
+            .unstaged,
+            0,
+            0,
+        ),
+        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "one\ntwo\n") } },
+    };
+    var exact_owned = true;
+    defer if (exact_owned) exact.deinit(allocator);
+    const exact_apply = try controller.applyProjectionFinished(allocator, &exact);
+    try std.testing.expect(exact_apply.result_transferred);
+    exact_owned = false;
+    try std.testing.expect(page.completed_selection != null);
+
+    page.review_projection.pending = try review_projection.cloneRequest(
+        allocator,
+        page.activation.currentIdentity().?,
+        3,
+        "/repo",
+        "a",
+        .generated_added_file,
+        .unstaged,
+        0,
+        0,
+    );
+    var changed: app_load.ReviewProjectionFinished = .{
+        .request = try review_projection.cloneRequest(
+            allocator,
+            page.activation.currentIdentity().?,
+            3,
+            "/repo",
+            "a",
+            .generated_added_file,
+            .unstaged,
+            0,
+            0,
+        ),
+        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "changed\n") } },
+    };
+    var changed_owned = true;
+    defer if (changed_owned) changed.deinit(allocator);
+    const changed_apply = try controller.applyProjectionFinished(allocator, &changed);
+    try std.testing.expect(changed_apply.result_transferred);
+    changed_owned = false;
+    try std.testing.expect(page.completed_selection == null);
 }
 
 test "deferred source terminals consume blocked and accepted ownership" {

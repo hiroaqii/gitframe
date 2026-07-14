@@ -634,6 +634,9 @@ pub const App = struct {
         if (!self.pages.review.selection_owner.activeMouseSelection() and self.pages.review.deferred_source_apply != null) {
             try self.applyDeferredSource(ctx);
         }
+        if (!self.pages.review.selection_owner.activeMouseSelection() and self.pages.review.deferred_projection_apply != null) {
+            try self.reviewReload().applyDeferredProjection(ctx.allocator());
+        }
         try self.maybeStartQueuedReviewRevalidation(ctx);
         try self.maybeStartRepositoryManifest(ctx);
         try self.maybeStartRepositoryDocument(ctx);
