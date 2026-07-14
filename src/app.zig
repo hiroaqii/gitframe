@@ -731,7 +731,13 @@ pub const App = struct {
                     ctx.redraw().skip();
                     return;
                 }
-                _ = self.pages.repository.applyNavigation(ctx.allocator(), msg, self.shellLayout().bodySize());
+                var page_update = self.pages.repository.applyNavigation(ctx.allocator(), msg, self.shellLayout().bodySize());
+                defer page_update.deinit(ctx.allocator());
+                var command = page_update.takeCommand() orelse return;
+                defer command.deinit(ctx.allocator());
+                switch (command) {
+                    .copy_source_selection => |text| self.copySourceSelection(ctx, text),
+                }
             },
         }
     }
@@ -3818,6 +3824,14 @@ pub const App = struct {
         });
     }
 
+    fn copySourceSelection(self: *App, ctx: *chasen.Ctx(Msg), text: []const u8) void {
+        self.queueClipboardCopy(ctx, .{
+            .origin = .{ .page = self.repositoryPageEffectOrigin() },
+            .label = "source selection",
+            .text = text,
+        });
+    }
+
     fn copyDiffHeaderPath(self: *App, ctx: *chasen.Ctx(Msg), selection: diff_selection.HeaderPathSelection) void {
         const path = self.reviewContent().diffHeaderPath(selection) orelse return;
         self.queueClipboardCopy(ctx, .{
@@ -3941,7 +3955,9 @@ pub const App = struct {
             .page => |origin_page| switch (origin_page.page_id) {
                 .review => origin_page.repo_epoch == self.repo_epoch and
                     origin_page.activation_id == self.pages.review.activation.next_activation_id,
-                .repository, .history, .config => origin_page.repo_epoch == self.repo_epoch,
+                .repository => origin_page.repo_epoch == self.repo_epoch and
+                    origin_page.activation_id == self.pages.repository.activation_id,
+                .history, .config => origin_page.repo_epoch == self.repo_epoch,
             },
             .shell_surface => |origin_surface| switch (origin_surface.surface) {
                 .push_error => self.overlay.isPushError() and
@@ -3956,9 +3972,10 @@ pub const App = struct {
         switch (origin) {
             .page => |origin_page| switch (origin_page.page_id) {
                 .review => self.setReviewStatus(fmt, args),
+                .repository => self.pages.repository.status.set(fmt, args),
                 // Later page owners replace these placeholders with their own
                 // diagnostic slots without changing the effect completion tag.
-                .repository, .history, .config => self.setStatus(fmt, args),
+                .history, .config => self.setStatus(fmt, args),
             },
             .shell_surface => self.setStatus(fmt, args),
         }
@@ -3973,6 +3990,14 @@ pub const App = struct {
             // while inactive. A later reactivation increments it, so old
             // completions cannot present in the new page instance.
             .activation_id = if (identity) |value| value.activation_id else self.pages.review.activation.next_activation_id,
+        };
+    }
+
+    fn repositoryPageEffectOrigin(self: *const App) PageEffectOrigin {
+        return .{
+            .page_id = .repository,
+            .repo_epoch = self.pages.repository.repo_epoch,
+            .activation_id = self.pages.repository.activation_id,
         };
     }
 
@@ -5194,6 +5219,128 @@ test "inactive Review clipboard completion retains diagnostic without redraw" {
     app.finishClipboardCopy(&ctx, .{ .request_id = .{ .id = 4 }, .outcome = .sent });
 
     try std.testing.expectEqualStrings("clipboard copy sent: current line", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "repository selection slice C copy uses Repository origin without opening AI UI" {
+    var app: App = .{
+        .active_page = .repository,
+        .repo_epoch = 4,
+        .pages = .{ .repository = .{
+            .active = true,
+            .activation_id = 5,
+            .repo_epoch = 4,
+        } },
+    };
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    app.copySourceSelection(&ctx, "selected source");
+
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    const entry = ctx._pending_clipboard_copies[0];
+    try std.testing.expectEqualStrings("selected source", entry.text);
+    const state = app.clipboard_copy_states.get(entry.request_id.id) orelse return error.ExpectedClipboardState;
+    try std.testing.expectEqual(page.Id.repository, state.origin.page.page_id);
+    try std.testing.expectEqual(@as(u64, 4), state.origin.page.repo_epoch);
+    try std.testing.expectEqual(@as(u64, 5), state.origin.page.activation_id);
+    try std.testing.expectEqual(app_state.OverlayKind.none, app.overlay.kind);
+}
+
+test "repository selection slice C clipboard queue failure retains page candidate" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .active_page = .repository,
+        .repo_epoch = 4,
+        .pages = .{ .repository = .{
+            .active = true,
+            .activation_id = 5,
+            .repo_epoch = 4,
+            .completed_selection = .{
+                .token = .{
+                    .repo_epoch = 4,
+                    .root_identity = .{ .device = 6, .inode = 7 },
+                    .path = try allocator.dupe(u8, "main.zig"),
+                    .source_fingerprint = .init("selected source"),
+                },
+                .mode = .line,
+                .range = .{
+                    .start = repository_selection.pointFromLine(0),
+                    .end = repository_selection.pointFromLine(0),
+                },
+                .source_start = 1,
+                .source_end = 1,
+                .line_count = 1,
+                .text = try allocator.dupe(u8, "selected source"),
+            },
+        } },
+    };
+    defer app.pages.repository.deinit(allocator);
+    defer app.clipboard_copy_states.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+    for (0..4) |_| {
+        _ = try ctx.terminal().copyToClipboard(.{
+            .text = "occupied",
+            .finished = App.clipboardCopyDone,
+        });
+    }
+
+    app.copySourceSelection(&ctx, app.pages.repository.completed_selection.?.text);
+
+    try std.testing.expectEqual(@as(u8, 4), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_copy_states.count());
+    try std.testing.expectEqualStrings("selected source", app.pages.repository.completed_selection.?.text);
+    try std.testing.expectEqualStrings("clipboard copy already queued", app.pages.repository.status.text());
+}
+
+test "repository selection slice C late clipboard completion cannot target a new page instance" {
+    var app: App = .{
+        .active_page = .repository,
+        .repo_epoch = 4,
+        .pages = .{ .repository = .{
+            .active = true,
+            .activation_id = 5,
+            .repo_epoch = 4,
+        } },
+    };
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+    app.copySourceSelection(&ctx, "selected source");
+    const request_id = ctx._pending_clipboard_copies[0].request_id;
+    app.pages.repository.activation_id = 6;
+
+    app.finishClipboardCopy(&ctx, .{ .request_id = request_id, .outcome = .sent });
+
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_copy_states.count());
+    try std.testing.expectEqualStrings("", app.pages.repository.status.text());
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "repository selection slice C inactive page accepts same-instance clipboard completion" {
+    var app: App = .{
+        .active_page = .repository,
+        .repo_epoch = 4,
+        .pages = .{ .repository = .{
+            .active = true,
+            .activation_id = 5,
+            .repo_epoch = 4,
+        } },
+    };
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+    app.copySourceSelection(&ctx, "selected source");
+    const request_id = ctx._pending_clipboard_copies[0].request_id;
+    app.pages.repository.deactivate();
+    app.active_page = .review;
+
+    app.finishClipboardCopy(&ctx, .{ .request_id = request_id, .outcome = .sent });
+
+    try std.testing.expectEqualStrings("clipboard copy sent: source selection", app.pages.repository.status.text());
     try std.testing.expectEqualStrings("", app.status.text());
     try std.testing.expect(ctx._redraw_suppressed);
 }
