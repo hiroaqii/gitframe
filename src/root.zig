@@ -53,6 +53,7 @@ test {
     _ = @import("app/pages/repository/input.zig");
     _ = @import("app/pages/repository/model.zig");
     _ = @import("app/pages/repository/navigation.zig");
+    _ = @import("app/pages/repository/selection.zig");
     _ = @import("app/pages/repository/view.zig");
     _ = @import("app/prompt.zig");
     _ = @import("app/push_retry.zig");
