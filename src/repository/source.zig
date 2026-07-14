@@ -7,11 +7,9 @@
 //! separate coordinate systems.
 
 const std = @import("std");
-const chasen = @import("chasen");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const selected_document = @import("document.zig");
-
-pub const tab_width: usize = 4;
+const text_projection = @import("../text/projection.zig");
 
 pub const Match = struct {
     line: usize,
@@ -47,7 +45,7 @@ pub const Document = struct {
             .max_display_width = 0,
         };
         for (0..document.rowCount()) |line_index| {
-            document.max_display_width = @max(document.max_display_width, try displayWidth(document.lineBody(line_index).?));
+            document.max_display_width = @max(document.max_display_width, try text_projection.displayWidth(document.lineBody(line_index).?));
         }
         return document;
     }
@@ -149,25 +147,12 @@ pub const Document = struct {
 
     pub fn displayColumnForByte(self: *const Document, line_index: usize, byte_offset: usize) ?usize {
         const line = self.lineBody(line_index) orelse return null;
-        const target = @min(byte_offset, line.len);
-        var display_col: usize = 0;
-        var iter = chasen.text.graphemeIterator(line);
-        while (iter.next()) |grapheme| {
-            if (grapheme.start >= target) break;
-            if (target < grapheme.start + grapheme.len) break;
-            const bytes = grapheme.bytes(line);
-            if (bytes.len == 1 and bytes[0] == '\t') {
-                display_col += tab_width - (display_col % tab_width);
-            } else {
-                display_col += chasen.text.displayWidth(bytes);
-            }
-        }
-        return display_col;
+        return text_projection.leadingDisplayColumnForByte(line, byte_offset);
     }
 
     pub fn lineDisplayWidth(self: *const Document, line_index: usize) ?usize {
         const line = self.lineBody(line_index) orelse return null;
-        return displayWidth(line) catch null;
+        return text_projection.displayWidth(line) catch null;
     }
 
     pub fn maxDisplayWidth(self: *const Document) usize {
@@ -181,128 +166,6 @@ pub const Document = struct {
         return self.bytes.len +| self.line_starts.len *| @sizeOf(u32);
     }
 };
-
-pub const RangeWindow = struct {
-    column: usize,
-    text: []u8,
-};
-
-/// Builds only the visible display-cell window and expands TAB without
-/// changing the retained source or logical copy text.
-pub fn renderWindowAlloc(
-    allocator: std.mem.Allocator,
-    line: []const u8,
-    horizontal_scroll: usize,
-    width: usize,
-) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    if (width == 0) return out.toOwnedSlice(allocator);
-
-    var logical_col: usize = 0;
-    var output_width: usize = 0;
-    var iter = chasen.text.graphemeIterator(line);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(line);
-        if (bytes.len == 1 and bytes[0] == '\t') {
-            const cells = tab_width - (logical_col % tab_width);
-            const segment_end = logical_col + cells;
-            if (segment_end > horizontal_scroll) {
-                const visible_start = @max(logical_col, horizontal_scroll);
-                const visible_cells = @min(segment_end - visible_start, width - output_width);
-                try out.appendNTimes(allocator, ' ', visible_cells);
-                output_width += visible_cells;
-            }
-            logical_col = segment_end;
-        } else {
-            const cells = chasen.text.displayWidth(bytes);
-            const segment_end = logical_col + cells;
-            if (segment_end > horizontal_scroll and logical_col < horizontal_scroll) {
-                const visible_cells = @min(segment_end - horizontal_scroll, width - output_width);
-                try out.appendNTimes(allocator, ' ', visible_cells);
-                output_width += visible_cells;
-            } else if (logical_col >= horizontal_scroll) {
-                if (output_width + cells > width) break;
-                try out.appendSlice(allocator, bytes);
-                output_width += cells;
-            }
-            logical_col = segment_end;
-        }
-        if (output_width >= width) break;
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-/// Renders the visible portion of every complete grapheme intersected by a
-/// byte match. The returned column is relative to the source-text viewport.
-pub fn renderRangeWindowAlloc(
-    allocator: std.mem.Allocator,
-    line: []const u8,
-    byte_start: usize,
-    byte_end: usize,
-    horizontal_scroll: usize,
-    width: usize,
-) !?RangeWindow {
-    if (byte_start >= byte_end or byte_start >= line.len or width == 0) return null;
-    const clamped_end = @min(byte_end, line.len);
-    const viewport_end = std.math.add(usize, horizontal_scroll, width) catch std.math.maxInt(usize);
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var first_column: ?usize = null;
-    var logical_col: usize = 0;
-    var output_width: usize = 0;
-    var iter = chasen.text.graphemeIterator(line);
-    while (iter.next()) |grapheme| {
-        if (grapheme.start >= clamped_end or logical_col >= viewport_end) break;
-        const bytes = grapheme.bytes(line);
-        const cells = if (bytes.len == 1 and bytes[0] == '\t')
-            tab_width - (logical_col % tab_width)
-        else
-            chasen.text.displayWidth(bytes);
-        const segment_end = logical_col + cells;
-        defer logical_col = segment_end;
-        const grapheme_end = grapheme.start + grapheme.len;
-        if (grapheme_end <= byte_start) continue;
-        if (segment_end <= horizontal_scroll) continue;
-
-        const visible_start = @max(logical_col, horizontal_scroll);
-        const visible_end = @min(segment_end, viewport_end);
-        if (visible_start >= visible_end) continue;
-        if (first_column == null) first_column = visible_start - horizontal_scroll;
-        const visible_cells = visible_end - visible_start;
-        if (bytes.len == 1 and bytes[0] == '\t') {
-            try out.appendNTimes(allocator, ' ', visible_cells);
-            output_width += visible_cells;
-        } else if (logical_col < horizontal_scroll) {
-            try out.appendNTimes(allocator, ' ', visible_cells);
-            output_width += visible_cells;
-        } else if (segment_end > viewport_end) {
-            break;
-        } else {
-            try out.appendSlice(allocator, bytes);
-            output_width += cells;
-        }
-    }
-    if (first_column == null or output_width == 0) {
-        out.deinit(allocator);
-        return null;
-    }
-    return .{ .column = first_column.?, .text = try out.toOwnedSlice(allocator) };
-}
-
-fn displayWidth(line: []const u8) !usize {
-    var display_col: usize = 0;
-    var iter = chasen.text.graphemeIterator(line);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(line);
-        const cells = if (bytes.len == 1 and bytes[0] == '\t')
-            tab_width - (display_col % tab_width)
-        else
-            chasen.text.displayWidth(bytes);
-        display_col = try std.math.add(usize, display_col, cells);
-    }
-    return display_col;
-}
 
 fn lastIndexInRange(line: []const u8, query: []const u8, start: usize, end: usize) ?usize {
     const clamped_end = @min(end, line.len);
@@ -366,15 +229,15 @@ test "repository source search wraps both directions within one line" {
 
 test "repository source render window expands tabs and preserves graphemes" {
     const allocator = std.testing.allocator;
-    const rendered = try renderWindowAlloc(allocator, "a\tb界e\u{301}", 0, 12);
+    const rendered = try text_projection.renderWindowAlloc(allocator, "a\tb界e\u{301}", 0, 12);
     defer allocator.free(rendered);
     try std.testing.expectEqualStrings("a   b界e\u{301}", rendered);
 
-    const clipped = try renderWindowAlloc(allocator, "界x", 1, 2);
+    const clipped = try text_projection.renderWindowAlloc(allocator, "界x", 1, 2);
     defer allocator.free(clipped);
     try std.testing.expectEqualStrings(" x", clipped);
 
-    const preceded = try renderWindowAlloc(allocator, "a界x", 2, 2);
+    const preceded = try text_projection.renderWindowAlloc(allocator, "a界x", 2, 2);
     defer allocator.free(preceded);
     try std.testing.expectEqualStrings(" x", preceded);
 
@@ -386,22 +249,22 @@ test "repository source render window expands tabs and preserves graphemes" {
 
 test "repository source match window expands graphemes and preserves display columns" {
     const allocator = std.testing.allocator;
-    const after_tab = (try renderRangeWindowAlloc(allocator, "a\tneedle", 2, 8, 0, 20)).?;
+    const after_tab = (try text_projection.renderEnclosingRangeWindowAlloc(allocator, "a\tneedle", 2, 8, 0, 20)).?;
     defer allocator.free(after_tab.text);
     try std.testing.expectEqual(@as(usize, 4), after_tab.column);
     try std.testing.expectEqualStrings("needle", after_tab.text);
 
-    const combining = (try renderRangeWindowAlloc(allocator, "e\u{301}x", 1, 3, 0, 10)).?;
+    const combining = (try text_projection.renderEnclosingRangeWindowAlloc(allocator, "e\u{301}x", 1, 3, 0, 10)).?;
     defer allocator.free(combining.text);
     try std.testing.expectEqual(@as(usize, 0), combining.column);
     try std.testing.expectEqualStrings("e\u{301}", combining.text);
 
-    const clipped_wide = (try renderRangeWindowAlloc(allocator, "a界x", 1, 4, 2, 2)).?;
+    const clipped_wide = (try text_projection.renderEnclosingRangeWindowAlloc(allocator, "a界x", 1, 4, 2, 2)).?;
     defer allocator.free(clipped_wide.text);
     try std.testing.expectEqual(@as(usize, 0), clipped_wide.column);
     try std.testing.expectEqualStrings(" ", clipped_wide.text);
 
-    const after_wide = (try renderRangeWindowAlloc(allocator, "a界x", 4, 5, 2, 2)).?;
+    const after_wide = (try text_projection.renderEnclosingRangeWindowAlloc(allocator, "a界x", 4, 5, 2, 2)).?;
     defer allocator.free(after_wide.text);
     try std.testing.expectEqual(@as(usize, 1), after_wide.column);
     try std.testing.expectEqualStrings("x", after_wide.text);

@@ -7,6 +7,7 @@ const theme = @import("theme");
 const model = @import("model.zig");
 const navigation = @import("navigation.zig");
 const source = @import("../../../repository/source.zig");
+const text_projection = @import("../../../text/projection.zig");
 const repository_change_map = @import("../../../repository/change_map.zig");
 const source_syntax = @import("../../../syntax/source.zig");
 const syntax_style = @import("../../../syntax/style.zig");
@@ -62,7 +63,7 @@ pub fn drawSource(
         }
         if (text_width == 0) continue;
         const line = document.lineBody(line_index).?;
-        const visible = try source.renderWindowAlloc(surface.frameAllocator(), line, viewer.source_horizontal_scroll, text_width);
+        const visible = try text_projection.renderWindowAlloc(surface.frameAllocator(), line, viewer.source_horizontal_scroll, text_width);
         draw.copyClippedTextAt(surface, text_col, row, visible, base_style) catch {};
         if (syntax) |spans| applySyntaxLineStyles(
             surface,
@@ -77,7 +78,7 @@ pub fn drawSource(
             null,
         );
         if (search.match) |match| if (match.line == line_index) {
-            if (try source.renderRangeWindowAlloc(
+            if (try text_projection.renderEnclosingRangeWindowAlloc(
                 surface.frameAllocator(),
                 line,
                 match.start,
@@ -130,7 +131,7 @@ fn applySyntaxLineStyles(
 
         const bytes = grapheme.bytes(line);
         const cells = if (bytes.len == 1 and bytes[0] == '\t')
-            source.tab_width - (logical_col % source.tab_width)
+            text_projection.tab_width - (logical_col % text_projection.tab_width)
         else
             chasen.text.displayWidth(bytes);
         const segment_end = logical_col + cells;
@@ -391,7 +392,7 @@ test "repository source syntax projection visits dense line and spans only once"
     try test_surface.init(80, 1);
     defer test_surface.deinit();
     const horizontal_scroll = count - 80;
-    const visible = try source.renderWindowAlloc(test_surface.surface.frameAllocator(), line, horizontal_scroll, 80);
+    const visible = try text_projection.renderWindowAlloc(test_surface.surface.frameAllocator(), line, horizontal_scroll, 80);
     draw.copyClippedTextAt(&test_surface.surface, 0, 0, visible, .{}) catch {};
     var stats: SyntaxProjectionStats = .{};
     applySyntaxLineStyles(
@@ -425,7 +426,7 @@ test "repository source syntax projection preserves tab and clipped-wide cells" 
     var tab_surface: chasen.testing.TestSurface = undefined;
     try tab_surface.init(3, 1);
     defer tab_surface.deinit();
-    const tab_visible = try source.renderWindowAlloc(tab_surface.surface.frameAllocator(), line, 1, 3);
+    const tab_visible = try text_projection.renderWindowAlloc(tab_surface.surface.frameAllocator(), line, 1, 3);
     draw.copyClippedTextAt(&tab_surface.surface, 0, 0, tab_visible, .{}) catch {};
     applySyntaxLineStyles(&tab_surface.surface, 0, 0, line, 1, 3, .{ .spans = &spans }, .{}, palette, null);
     try std.testing.expectEqual(palette.color(.accent), tab_surface.surface.readCell(0, 0).?.style.fg);
@@ -434,7 +435,7 @@ test "repository source syntax projection preserves tab and clipped-wide cells" 
     var wide_surface: chasen.testing.TestSurface = undefined;
     try wide_surface.init(2, 1);
     defer wide_surface.deinit();
-    const wide_visible = try source.renderWindowAlloc(wide_surface.surface.frameAllocator(), line, 5, 2);
+    const wide_visible = try text_projection.renderWindowAlloc(wide_surface.surface.frameAllocator(), line, 5, 2);
     draw.copyClippedTextAt(&wide_surface.surface, 0, 0, wide_visible, .{}) catch {};
     applySyntaxLineStyles(&wide_surface.surface, 0, 0, line, 5, 2, .{ .spans = &spans }, .{}, palette, null);
     try std.testing.expectEqualStrings(" ", wide_surface.surface.readCell(0, 0).?.char.grapheme);
