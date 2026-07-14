@@ -5426,7 +5426,7 @@ test "mouse wheel routes through diff scroll cursor sync" {
     try std.testing.expect(app.reviewNavigationView().visibleDiffCursorOffset() != null);
 }
 
-test "diff mouse drag rejects unified fallback and clears on invalidation" {
+test "diff mouse drag supports unified fallback and clears on invalidation" {
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
@@ -5439,7 +5439,7 @@ test "diff mouse drag rejects unified fallback and clears on invalidation" {
     };
 
     app.reviewNavigation().pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
+    try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
 
     app.terminal_size.width = 140;
     app.reviewNavigation().pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });

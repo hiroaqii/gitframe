@@ -31,6 +31,7 @@ const file_tree = @import("../../../file_tree.zig");
 const git_status = @import("../../../git/status.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
 const sidebar_view_model = @import("../../../sidebar/view_model.zig");
+const text_projection = @import("../../../text/projection.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 const app_test_support = test_support;
 
@@ -57,6 +58,7 @@ pub const MousePoint = review_message.MousePoint;
 pub const DiffMouseHit = struct {
     identity: diff_selection.Identity,
     side: diff_selection.Side,
+    mode: diff_selection.Mode,
     point: diff_selection.Point,
 };
 
@@ -169,6 +171,13 @@ pub const NormalLoadedDiffSelectionTarget = struct {
     identity: diff_selection.Identity,
 };
 
+pub const ParsedSelectionTarget = struct {
+    file: diff_parser.FileDiff,
+    line_index: diff_view_model.RenderedLineIndex,
+    folded_hunks: []const bool,
+    identity: diff_selection.Identity,
+};
+
 pub const RawDiffPaneGeometry = struct { col: u16, width: u16 };
 
 pub const SearchTarget = struct {
@@ -230,7 +239,13 @@ pub const View = struct {
 
     pub fn diffSelectionView(self: View) ?diff_selection.View {
         const selection = self.page.selection_owner.activeDiff() orelse return null;
-        _ = self.normalLoadedDiffSelectionTarget(selection.identity) orelse return null;
+        switch (selection.identity) {
+            .generated_file => |generated| {
+                const bundle = self.activeGeneratedFileProjection() orelse return null;
+                if (!std.mem.eql(u8, generated.path_key, bundle.path)) return null;
+            },
+            .loaded_file, .projection_file => _ = self.parsedSelectionTarget(selection.identity) orelse return null,
+        }
         return selection.view();
     }
 
@@ -280,6 +295,45 @@ pub const View = struct {
             .folded_hunks = loaded.foldedHunksForFile(file_index),
             .identity = current_identity,
         };
+    }
+
+    pub fn parsedSelectionTarget(self: View, expected: ?diff_selection.Identity) ?ParsedSelectionTarget {
+        const target: ParsedSelectionTarget = switch (self.displayedReviewBody()) {
+            .primary => |primary| blk: {
+                const file = primary.loaded.document.files[primary.file_index];
+                const path_key = diff_file.canonicalPathKey(file) orelse return null;
+                const mode = self.effectiveDisplayMode();
+                break :blk .{
+                    .file = file,
+                    .line_index = primary.loaded.cachedRenderedLineIndex(primary.file_index, mode) orelse primary.loaded.renderedLineIndex(primary.file_index, mode),
+                    .folded_hunks = primary.loaded.foldedHunksForFile(primary.file_index),
+                    .identity = .{ .loaded_file = .{ .file_index = primary.file_index, .path_key = path_key } },
+                };
+            },
+            .cached => |bundle| blk: {
+                const file = bundle.loaded.document.files[0];
+                const path_key = diff_file.canonicalPathKey(file) orelse return null;
+                const mode = self.effectiveDisplayMode();
+                break :blk .{
+                    .file = file,
+                    .line_index = bundle.loaded.cachedRenderedLineIndex(0, mode) orelse bundle.loaded.renderedLineIndex(0, mode),
+                    .folded_hunks = &.{},
+                    .identity = .{ .projection_file = .{ .kind = .cached, .path_key = path_key } },
+                };
+            },
+            .combined => |bundle| blk: {
+                const path_key = diff_file.canonicalPathKey(bundle.projection.file) orelse return null;
+                break :blk .{
+                    .file = bundle.projection.file,
+                    .line_index = bundle.projection.lineIndex(self.effectiveDisplayMode()),
+                    .folded_hunks = &.{},
+                    .identity = .{ .projection_file = .{ .kind = .combined, .path_key = path_key } },
+                };
+            },
+            .none, .generated, .inert_invalid_utf8, .status, .pending => return null,
+        };
+        if (expected) |identity| if (!identity.eql(target.identity)) return null;
+        return target;
     }
 
     pub fn displayedDiffHeaderTarget(self: View, expected: ?diff_selection.HeaderIdentity) ?DiffHeaderTarget {
@@ -353,7 +407,14 @@ pub const View = struct {
     }
 
     pub fn diffMouseHit(self: View, point: MousePoint) ?DiffMouseHit {
-        const target = self.normalLoadedDiffSelectionTarget(null) orelse return null;
+        return self.diffMouseHitLocked(point, null);
+    }
+
+    pub fn diffMouseDragHit(self: View, point: MousePoint, selection: diff_selection.DragSelection) ?DiffMouseHit {
+        return self.diffMouseHitLocked(point, selection);
+    }
+
+    fn diffMouseHitLocked(self: View, point: MousePoint, locked: ?diff_selection.DragSelection) ?DiffMouseHit {
         const raw_diff = self.rawDiffPaneGeometry() orelse return null;
         if (point.col < raw_diff.col or point.col >= raw_diff.col + raw_diff.width) return null;
         if (point.row < diff_render.body_start_row) return null;
@@ -365,26 +426,40 @@ pub const View = struct {
         const render_col = local_col - content_gutter;
         if (render_col >= content_width or render_col < diff_render.cursor_gutter_width) return null;
 
-        const body_width = diff_render.bodyWidth(content_width);
-        if (diff_render.effectiveMode(body_width, self.page.viewer.display_mode) != .side_by_side) return null;
-
         const body_col = render_col - diff_render.cursor_gutter_width;
-        const geometry = diff_render.sideBySideGeometry(body_width);
-        const side = geometry.sideAt(body_col) orelse return null;
-
         const visible_body_row: usize = point.row - diff_render.body_start_row;
         if (visible_body_row >= self.diffVisibleRows()) return null;
         const offset = self.page.viewer.diff_scroll + visible_body_row;
-        const coordinate = diff_view_model.coordinateAtOffset(target.file, .side_by_side, offset, target.folded_hunks, target.line_index) orelse return null;
-        const hunk_line = switch (coordinate) {
-            .hunk_line => |line| line,
-            .metadata, .binary_marker, .hunk_header => return null,
-        };
+        const body_width = diff_render.bodyWidth(content_width);
+        const display_mode = diff_render.effectiveMode(body_width, self.page.viewer.display_mode);
 
+        if (self.parsedSelectionTarget(if (locked) |selection| selection.identity else null)) |target| {
+            const hit = parsedMouseLine(target, body_col, body_width, display_mode, offset, self.page.viewer.view_options.line_numbers, locked) orelse return null;
+            const model_mode = if (locked) |selection| selection.mode else hit.region.mode;
+            const point_value = if (hit.region.leading_boundary)
+                diff_selection.pointFromBoundary(hit.hunk_index, hit.line_index, 0)
+            else
+                pointForTextCell(hit.hunk_index, hit.line_index, hit.line.text, model_mode, hit.region.text_cell +| self.page.viewer.diff_horizontal_scroll) orelse return null;
+            return .{
+                .identity = target.identity,
+                .side = hit.region.side,
+                .mode = model_mode,
+                .point = point_value,
+            };
+        }
+
+        const generated = self.activeGeneratedFileProjection() orelse return null;
+        const line = generated.source.lineBody(offset) orelse return null;
+        const region = selectionRegionForGenerated(body_col, body_width, display_mode, self.page.viewer.view_options.line_numbers, locked) orelse return null;
+        const model_mode = if (locked) |selection| selection.mode else region.mode;
         return .{
-            .identity = target.identity,
-            .side = side,
-            .point = diff_selection.pointFromLine(hunk_line.hunk_index, hunk_line.line_index),
+            .identity = .{ .generated_file = .{ .path_key = generated.path } },
+            .side = .new,
+            .mode = model_mode,
+            .point = if (region.leading_boundary)
+                diff_selection.pointFromBoundary(0, offset, 0)
+            else
+                pointForTextCell(0, offset, line, model_mode, region.text_cell +| self.page.viewer.diff_horizontal_scroll) orelse return null,
         };
     }
 
@@ -930,7 +1005,13 @@ pub const Controller = struct {
             self.clearDiffSelection();
             return;
         };
-        self.page.selection_owner = .{ .diff = diff_selection.DragSelection.init(hit.identity, hit.side, hit.point) };
+        self.page.selection_owner = .{ .diff = diff_selection.DragSelection.initAtCell(
+            hit.identity,
+            hit.side,
+            hit.mode,
+            hit.point,
+            .{ .col = point.col, .row = point.row },
+        ) };
     }
 
     pub fn dragDiffMouse(self: Controller, point_opt: ?MousePoint) void {
@@ -939,9 +1020,9 @@ pub const Controller = struct {
             .none => return,
             .diff_header => |*selection| selection.update(),
             .diff => |*selection| {
-                const hit = self.view().diffMouseHit(point) orelse return;
+                const hit = self.view().diffMouseDragHit(point, selection.*) orelse return;
                 if (!selection.identity.eql(hit.identity)) return;
-                selection.update(hit.point);
+                selection.updateAtCell(hit.point, .{ .col = point.col, .row = point.row });
             },
         }
     }
@@ -1091,11 +1172,9 @@ pub const Controller = struct {
         const step: usize = 8;
         switch (direction) {
             .left => self.page.viewer.diff_horizontal_scroll -|= step,
-            .right => {
-                self.page.viewer.diff_horizontal_scroll += step;
-                self.clampDiffHorizontalScrollToVisibleRows();
-            },
+            .right => self.page.viewer.diff_horizontal_scroll += step,
         }
+        self.clampDiffHorizontalScrollToVisibleRows();
     }
 
     pub fn scrollSidebarHorizontal(self: Controller, direction: HorizontalDirection) void {
@@ -1897,6 +1976,134 @@ fn projectionSourceKind(source: diff_source.SourceMode) review_projection.Source
     };
 }
 
+const SelectionRegion = struct {
+    side: diff_selection.Side,
+    mode: diff_selection.Mode,
+    text_cell: usize,
+    leading_boundary: bool = false,
+};
+
+const ParsedMouseLine = struct {
+    hunk_index: usize,
+    line_index: usize,
+    line: diff_parser.DiffLine,
+    region: SelectionRegion,
+};
+
+fn parsedMouseLine(
+    target: ParsedSelectionTarget,
+    body_col: u16,
+    body_width: u16,
+    display_mode: diff_render.DisplayMode,
+    offset: usize,
+    line_numbers: bool,
+    locked: ?diff_selection.DragSelection,
+) ?ParsedMouseLine {
+    var rows = if (target.line_index.mode == display_mode and target.line_index.hunk_offsets.len == target.file.hunks.len)
+        diff_view_model.BodyRowIterator.initAtWithFolded(target.file, display_mode, target.line_index, offset, target.folded_hunks)
+    else
+        diff_view_model.BodyRowIterator.initWithFolded(target.file, display_mode, target.folded_hunks);
+    var skipped: usize = if (target.line_index.hunk_offsets.len == target.file.hunks.len) offset else 0;
+    var row = rows.next() orelse return null;
+    while (skipped < offset) : (skipped += 1) row = rows.next() orelse return null;
+    const hunk_index = rows.currentHunkIndex() orelse return null;
+    return switch (row) {
+        .unified_line => |line| blk: {
+            const line_index = rows.currentUnifiedLineIndex() orelse return null;
+            const region = selectionRegionForUnified(body_col, line_numbers, line, locked) orelse return null;
+            break :blk .{ .hunk_index = hunk_index, .line_index = line_index, .line = line, .region = region };
+        },
+        .side_by_side => blk: {
+            const indexed = rows.currentSideBySideRow() orelse return null;
+            const geometry = diff_render.sideBySideGeometry(body_width);
+            const side = geometry.sideAt(body_col) orelse return null;
+            if (locked) |selection| if (selection.side != side) return null;
+            const side_region = switch (side) {
+                .old => geometry.old,
+                .new => geometry.new,
+            };
+            const local_col = body_col - side_region.col;
+            const text_col = diff_render.lineTextStart(line_numbers, .side_by_side);
+            const mode: diff_selection.Mode = if (locked) |selection| selection.mode else if (local_col < text_col) .line else .character;
+            const text_cell: usize = if (local_col > text_col) local_col - text_col else 0;
+            const selected_line = indexedLineForSide(indexed, side) orelse return null;
+            break :blk .{
+                .hunk_index = hunk_index,
+                .line_index = selected_line.line_index,
+                .line = selected_line.line,
+                .region = .{
+                    .side = side,
+                    .mode = mode,
+                    .text_cell = text_cell,
+                    .leading_boundary = locked != null and mode == .character and local_col < text_col,
+                },
+            };
+        },
+        .metadata, .binary_marker, .hunk_header => null,
+    };
+}
+
+fn indexedLineForSide(row: diff_view_model.SideBySideIndexedRow, side: diff_selection.Side) ?diff_view_model.IndexedDiffLine {
+    return switch (row) {
+        .single => |line| if (diff_selection.lineVisibleOnSide(line.line, side)) line else null,
+        .paired => |pair| switch (side) {
+            .old => pair.removed,
+            .new => pair.added,
+        },
+    };
+}
+
+fn selectionRegionForUnified(body_col: u16, line_numbers: bool, line: diff_parser.DiffLine, locked: ?diff_selection.DragSelection) ?SelectionRegion {
+    const text_col = diff_render.lineTextStart(line_numbers, .unified);
+    const side: diff_selection.Side = if (locked) |selection|
+        selection.side
+    else if (line_numbers and body_col < 5)
+        .old
+    else if (line_numbers and body_col < 10)
+        .new
+    else switch (line.kind) {
+        .removed => .old,
+        .added, .context => .new,
+        .metadata => return null,
+    };
+    if (!diff_selection.lineVisibleOnSide(line, side)) return null;
+    const mode: diff_selection.Mode = if (locked) |selection| selection.mode else if (body_col < text_col) .line else .character;
+    return .{
+        .side = side,
+        .mode = mode,
+        .text_cell = if (body_col > text_col) body_col - text_col else 0,
+        .leading_boundary = locked != null and mode == .character and body_col < text_col,
+    };
+}
+
+fn selectionRegionForGenerated(body_col: u16, body_width: u16, display_mode: diff_render.DisplayMode, line_numbers: bool, locked: ?diff_selection.DragSelection) ?SelectionRegion {
+    if (locked) |selection| if (selection.side != .new) return null;
+    const local_col = switch (display_mode) {
+        .unified => body_col,
+        .side_by_side => blk: {
+            const geometry = diff_render.sideBySideGeometry(body_width);
+            if (geometry.sideAt(body_col) != .new) return null;
+            break :blk body_col - geometry.new.col;
+        },
+    };
+    const text_col = diff_render.lineTextStart(line_numbers, if (display_mode == .unified) .unified else .side_by_side);
+    const mode: diff_selection.Mode = if (locked) |selection| selection.mode else if (local_col < text_col) .line else .character;
+    return .{
+        .side = .new,
+        .mode = mode,
+        .text_cell = if (local_col > text_col) local_col - text_col else 0,
+        .leading_boundary = locked != null and mode == .character and local_col < text_col,
+    };
+}
+
+fn pointForTextCell(hunk_index: usize, line_index: usize, text: []const u8, mode: diff_selection.Mode, cell: usize) ?diff_selection.Point {
+    if (mode == .line) return diff_selection.pointFromLine(hunk_index, line_index);
+    return switch (text_projection.hitAtDisplayCell(text, cell) orelse return null) {
+        .token => |token| diff_selection.pointFromToken(hunk_index, line_index, token),
+        .boundary => |boundary| diff_selection.pointFromBoundary(hunk_index, line_index, boundary.offset),
+    };
+}
+
 fn contentWidth(width: u16) u16 {
     return review_layout.diffContentWidth(width);
 }
@@ -1945,7 +2152,7 @@ fn visibleTextWidth(total_width: u16, text_col: u16) u16 {
 }
 
 fn maxHorizontalScrollForText(text: []const u8, visible_width: u16) usize {
-    const width = chasen.text.displayWidth(text);
+    const width = text_projection.displayWidth(text) catch return 0;
     if (width <= visible_width) return 0;
     return width - visible_width;
 }
@@ -2112,7 +2319,7 @@ test "Review navigation initializes cursor at first rendered body row" {
     try std.testing.expectEqual(@as(?usize, 0), binary.view().visibleDiffCursorOffset());
 }
 
-test "Review mouse selection stays on its originating diff side" {
+test "Review mouse selection ignores the opposite side and resumes on its locked side" {
     var harness = TestHarness.init(.{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
@@ -2135,8 +2342,378 @@ test "Review mouse selection stays on its originating diff side" {
     });
     const dragged = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Side.old, dragged.side);
-    try std.testing.expectEqual(@as(usize, 2), dragged.focus.line_index);
-    try std.testing.expect(dragged.moved);
+    try std.testing.expectEqual(@as(usize, 0), dragged.focus.line_index);
+    try std.testing.expect(!dragged.moved);
+
+    harness.controller().dragDiffMouse(.{
+        .col = 10,
+        .row = diff_render.body_start_row + 3,
+    });
+    const resumed = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expectEqual(diff_selection.Side.old, resumed.side);
+    try std.testing.expectEqual(@as(usize, 2), resumed.focus.line_index);
+    try std.testing.expect(resumed.moved);
+}
+
+test "unified body selects characters while gutter keeps line gestures semantic" {
+    const lines = [_]diff_parser.DiffLine{
+        .{ .kind = .context, .text = "ABCDEFG", .old_line = 1, .new_line = 1 },
+        .{ .kind = .context, .text = "HIJKLMN", .old_line = 2, .new_line = 2 },
+    };
+    const files = [_]diff_parser.FileDiff{.{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 2,
+            .new_start = 1,
+            .new_count = 2,
+            .section = "",
+            .lines = &lines,
+        }},
+    }};
+    const eligibility = [_]loaded_diff.FileTextEligibility{.selectable_utf8};
+    const tree = [_]file_tree.Node{.{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } }};
+    const loaded: loaded_diff.LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &files },
+        .file_text_eligibility = &eligibility,
+        .tree = .{ .nodes = &tree },
+        .bytes = 0,
+        .lines = 0,
+    };
+    var harness = TestHarness.init(.{
+        .load = test_support.loadState(loaded),
+        .viewer = .{ .display_mode = .unified, .sidebar_hidden = true },
+    }, .{ .width = 100, .height = 12 });
+
+    const raw = harness.view().rawDiffPaneGeometry().?;
+    const content_width = contentWidth(raw.width);
+    const content_gutter = raw.width - content_width;
+    const text_start = raw.col + content_gutter + diff_render.cursor_gutter_width + diff_render.lineTextStart(true, .unified);
+
+    harness.controller().pressDiffMouse(.{ .col = text_start + 3, .row = diff_render.body_start_row + 1 });
+    harness.controller().dragDiffMouse(.{ .col = text_start + 4, .row = diff_render.body_start_row + 2 });
+    const characters = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expectEqual(diff_selection.Mode.character, characters.mode);
+    try std.testing.expectEqual(diff_selection.Side.new, characters.side);
+    const range = characters.range();
+    try std.testing.expectEqual(@as(usize, 3), range.start.leading);
+    try std.testing.expectEqual(@as(usize, 4), range.start.trailing);
+    try std.testing.expectEqual(@as(usize, 4), range.end.leading);
+    try std.testing.expectEqual(@as(usize, 5), range.end.trailing);
+    const copied = try diff_selection.copyText(std.testing.allocator, files[0], characters);
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings("DEFG\nHIJKL", copied);
+
+    // Continuing a character gesture into its own gutter means the leading
+    // line boundary; it does not silently switch to whole-line mode.
+    const new_line_number_col = raw.col + content_gutter + diff_render.cursor_gutter_width + 6;
+    harness.controller().dragDiffMouse(.{ .col = new_line_number_col, .row = diff_render.body_start_row + 1 });
+    const into_gutter = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expectEqual(diff_selection.Mode.character, into_gutter.mode);
+    try std.testing.expectEqual(@as(usize, 0), into_gutter.focus.leading);
+    try std.testing.expectEqual(@as(usize, 0), into_gutter.focus.trailing);
+
+    harness.controller().clearDiffSelection();
+    harness.controller().pressDiffMouse(.{ .col = text_start, .row = diff_render.body_start_row + 1 });
+    harness.controller().dragDiffMouse(.{ .col = new_line_number_col, .row = diff_render.body_start_row + 1 });
+    const first_token_to_gutter = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const first_token_copy = try diff_selection.copyText(std.testing.allocator, files[0], first_token_to_gutter);
+    defer std.testing.allocator.free(first_token_copy);
+    try std.testing.expectEqualStrings("A", first_token_copy);
+
+    harness.controller().clearDiffSelection();
+    harness.controller().pressDiffMouse(.{ .col = new_line_number_col, .row = diff_render.body_start_row + 1 });
+    harness.controller().dragDiffMouse(.{ .col = text_start + 4, .row = diff_render.body_start_row + 2 });
+    const lines_selected = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expectEqual(diff_selection.Mode.line, lines_selected.mode);
+    try std.testing.expectEqual(diff_selection.Side.new, lines_selected.side);
+}
+
+test "invalid primary file is inert while its valid sibling remains selectable" {
+    const eligibility = [_]loaded_diff.FileTextEligibility{ .selectable_utf8, .inert_invalid_utf8 };
+    var loaded = test_support.loadedDiffTwo();
+    loaded.file_text_eligibility = &eligibility;
+    var harness = TestHarness.init(.{
+        .load = test_support.loadState(loaded),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 1 },
+            .selected_file = 1,
+            .selected_node = 1,
+            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } },
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+        },
+    }, .{ .width = 100, .height = 12 });
+
+    try std.testing.expect(harness.view().displayedReviewBody() == .inert_invalid_utf8);
+    try std.testing.expect(!harness.view().bodyAllowsHunkInteraction());
+    try std.testing.expect(harness.view().selectedHunkIndex() == null);
+    try std.testing.expect(harness.view().displayedDiffFile() == null);
+    try std.testing.expect(harness.view().unsupportedSearchMessage() != null);
+    harness.pages.review.viewer.diff_scroll = 99;
+    harness.pages.review.viewer.diff_horizontal_scroll = 99;
+    harness.controller().clampDiffNavigation();
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
+    harness.controller().pageDiff(.down);
+    harness.controller().scrollDiff(.down);
+    harness.controller().scrollDiffHorizontal(.right);
+    harness.controller().selectHunkDelta(1);
+    harness.controller().toggleSelectedHunkFold();
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
+    harness.controller().pressDiffMouse(.{ .col = 12, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(harness.pages.review.selection_owner == .none);
+
+    harness.controller().selectFileAbsolute(0);
+    try std.testing.expect(harness.view().displayedReviewBody() == .primary);
+    try std.testing.expect(harness.view().bodyAllowsHunkInteraction());
+    harness.controller().pressDiffMouse(.{ .col = 12, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(harness.pages.review.selection_owner.activeDiff() != null);
+}
+
+test "invalid cached projection cannot fall through to primary hunk authority" {
+    const allocator = std.testing.allocator;
+    const invalid_patch =
+        "diff --git a/a b/a\n" ++
+        "index 1111111..2222222 100644\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+bad\xff\n";
+    var cached = try app_load.buildLoadedBundle(allocator, invalid_patch);
+    var cached_owned = true;
+    defer if (cached_owned) cached.deinit();
+
+    var harness = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .selected_target = .{ .status_only = 0 },
+            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } },
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+        },
+    }, .{ .width = 100, .height = 12 });
+    harness.repo_root = "/repo";
+    _ = harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try harness.pages.review.git_status.replace("/repo", &status_bundle);
+    harness.pages.review.review_projection.installReady(.{
+        .request = try review_projection.cloneRequest(
+            allocator,
+            harness.pages.review.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            0,
+            0,
+        ),
+        .value = .{ .cached_diff = cached },
+    });
+    cached_owned = false;
+    defer harness.pages.review.deinit(allocator);
+
+    try std.testing.expect(harness.view().displayedReviewBody() == .inert_invalid_utf8);
+    try std.testing.expect(!harness.view().bodyAllowsHunkInteraction());
+    try std.testing.expect(harness.view().activeCachedDiffProjection() == null);
+    try std.testing.expect(harness.view().displayedDiffFile() == null);
+    try std.testing.expect(harness.view().selectedHunkIndex() == null);
+    harness.pages.review.viewer.diff_scroll = 99;
+    harness.pages.review.viewer.diff_horizontal_scroll = 99;
+    harness.controller().clampDiffNavigation();
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
+    harness.controller().pageDiff(.down);
+    harness.controller().scrollDiff(.down);
+    harness.controller().scrollDiffHorizontal(.right);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
+    harness.controller().pressDiffMouse(.{ .col = 12, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(harness.pages.review.selection_owner == .none);
+}
+
+test "either invalid combined component remains inert without primary navigation fallback" {
+    const allocator = std.testing.allocator;
+    const valid_patch =
+        "diff --git a/a b/a\n" ++
+        "index 1111111..2222222 100644\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+valid\n";
+    const invalid_patch =
+        "diff --git a/a b/a\n" ++
+        "index 1111111..2222222 100644\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+bad\xff\n";
+
+    for ([_]bool{ true, false }) |cached_is_invalid| {
+        var cached = try app_load.buildLoadedBundle(allocator, if (cached_is_invalid) invalid_patch else valid_patch);
+        var cached_owned = true;
+        defer if (cached_owned) cached.deinit();
+        var unstaged = try app_load.buildLoadedBundle(allocator, if (cached_is_invalid) valid_patch else invalid_patch);
+        var unstaged_owned = true;
+        defer if (unstaged_owned) unstaged.deinit();
+
+        var harness = TestHarness.init(.{
+            .load = test_support.loadState(test_support.loadedDiffOne()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } },
+                .diff_scroll = 99,
+                .diff_horizontal_scroll = 99,
+                .display_mode = .unified,
+                .sidebar_hidden = true,
+            },
+        }, .{ .width = 100, .height = 12 });
+        harness.repo_root = "/repo";
+        _ = harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+        var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+        try harness.pages.review.git_status.replace("/repo", &status_bundle);
+        harness.pages.review.review_projection.installReady(.{
+            .request = try review_projection.cloneRequest(
+                allocator,
+                harness.pages.review.activation.currentIdentity().?,
+                1,
+                "/repo",
+                "a",
+                .combined_hunks,
+                .unstaged,
+                0,
+                0,
+            ),
+            .value = .{ .inert_combined = .{
+                .cached_bundle = cached,
+                .unstaged_bundle = unstaged,
+            } },
+        });
+        cached_owned = false;
+        unstaged_owned = false;
+        defer harness.pages.review.deinit(allocator);
+
+        try std.testing.expect(harness.view().displayedReviewBody() == .inert_invalid_utf8);
+        try std.testing.expect(harness.view().activeCombinedProjection() == null);
+        try std.testing.expect(harness.view().displayedDiffFile() == null);
+        try std.testing.expect(harness.view().selectedHunkIndex() == null);
+        try std.testing.expectEqual(HunkInteractionAvailability.inert_invalid_utf8, harness.view().hunkInteractionAvailability());
+        harness.controller().clampDiffNavigation();
+        harness.controller().pageDiff(.down);
+        harness.controller().scrollDiff(.down);
+        harness.controller().scrollDiffHorizontal(.right);
+        harness.controller().selectHunkDelta(1);
+        harness.controller().toggleSelectedHunkFold();
+        try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.review.viewer.diff_cursor);
+        try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
+        try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
+    }
+}
+
+test "cached combined and generated displayed bodies expose typed mouse identities" {
+    const allocator = std.testing.allocator;
+
+    // Staged-only cached projection.
+    var cached_harness = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .display_mode = .unified, .sidebar_hidden = true },
+    }, .{ .width = 100, .height = 12 });
+    cached_harness.repo_root = "/repo";
+    _ = cached_harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    var cached_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try cached_harness.pages.review.git_status.replace("/repo", &cached_status);
+    cached_harness.pages.review.review_projection.installReady(.{
+        .request = try review_projection.cloneRequest(allocator, cached_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .cached_diff, .unstaged, 0, 0),
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, test_support.diff_cached_projection) },
+    });
+    defer cached_harness.pages.review.deinit(allocator);
+    const cached_raw = cached_harness.view().rawDiffPaneGeometry().?;
+    const cached_content_width = contentWidth(cached_raw.width);
+    const cached_text = cached_raw.col + (cached_raw.width - cached_content_width) + diff_render.cursor_gutter_width + diff_render.lineTextStart(true, .unified);
+    cached_harness.controller().pressDiffMouse(.{ .col = cached_text + 1, .row = diff_render.body_start_row + 1 });
+    const cached_selection = cached_harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expectEqual(diff_selection.Mode.character, cached_selection.mode);
+    try std.testing.expect(cached_selection.identity == .projection_file);
+    try std.testing.expect(cached_selection.identity.projection_file.kind == .cached);
+
+    // Mixed cached/unstaged projection.
+    var combined_harness = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .display_mode = .unified, .sidebar_hidden = true },
+    }, .{ .width = 100, .height = 12 });
+    combined_harness.repo_root = "/repo";
+    _ = combined_harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    var combined_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try combined_harness.pages.review.git_status.replace("/repo", &combined_status);
+    var cached_bundle = try app_load.buildLoadedBundle(allocator, test_support.diff_cached_projection);
+    var cached_owned = true;
+    defer if (cached_owned) cached_bundle.deinit();
+    var unstaged_bundle = try app_load.buildLoadedBundle(allocator, test_support.diff_unstaged_projection);
+    var unstaged_owned = true;
+    defer if (unstaged_owned) unstaged_bundle.deinit();
+    var projection_arena = std.heap.ArenaAllocator.init(allocator);
+    var projection_owned = true;
+    defer if (projection_owned) projection_arena.deinit();
+    const projection = try diff_hunk_projection.build(
+        projection_arena.allocator(),
+        cached_bundle.loaded.document.files[0],
+        unstaged_bundle.loaded.document.files[0],
+    );
+    combined_harness.pages.review.review_projection.installReady(.{
+        .request = try review_projection.cloneRequest(allocator, combined_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .combined_hunks, .unstaged, 0, 0),
+        .value = .{ .combined_hunks = .{
+            .arena = projection_arena,
+            .projection = projection,
+            .cached_bundle = cached_bundle,
+            .unstaged_bundle = unstaged_bundle,
+        } },
+    });
+    projection_owned = false;
+    cached_owned = false;
+    unstaged_owned = false;
+    defer combined_harness.pages.review.deinit(allocator);
+    const combined_raw = combined_harness.view().rawDiffPaneGeometry().?;
+    const combined_content_width = contentWidth(combined_raw.width);
+    const combined_text = combined_raw.col + (combined_raw.width - combined_content_width) + diff_render.cursor_gutter_width + diff_render.lineTextStart(true, .unified);
+    combined_harness.controller().pressDiffMouse(.{ .col = combined_text + 1, .row = diff_render.body_start_row + 1 });
+    const combined_selection = combined_harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expect(combined_selection.identity == .projection_file);
+    try std.testing.expect(combined_selection.identity.projection_file.kind == .combined);
+
+    // Generated untracked preview uses its own non-hunk identity.
+    var generated_harness = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .display_mode = .unified, .sidebar_hidden = true },
+    }, .{ .width = 100, .height = 12 });
+    generated_harness.repo_root = "/repo";
+    _ = generated_harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    var generated_status = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try generated_harness.pages.review.git_status.replace("/repo", &generated_status);
+    generated_harness.pages.review.review_projection.installReady(.{
+        .request = try review_projection.cloneRequest(allocator, generated_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .generated_added_file, .unstaged, 0, 0),
+        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "ABCDEFG\n") },
+    });
+    defer generated_harness.pages.review.deinit(allocator);
+    const generated_raw = generated_harness.view().rawDiffPaneGeometry().?;
+    const generated_content_width = contentWidth(generated_raw.width);
+    const generated_text = generated_raw.col + (generated_raw.width - generated_content_width) + diff_render.cursor_gutter_width + diff_render.lineTextStart(true, .unified);
+    generated_harness.controller().pressDiffMouse(.{ .col = generated_text + 3, .row = diff_render.body_start_row });
+    const generated_selection = generated_harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expect(generated_selection.identity == .generated_file);
+    try std.testing.expectEqual(diff_selection.Mode.character, generated_selection.mode);
+    try std.testing.expectEqual(@as(usize, 3), generated_selection.anchor.leading);
 }
 
 test "Review navigation snapshot and reload restore share the page owner" {
