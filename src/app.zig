@@ -1342,6 +1342,19 @@ pub const App = struct {
         }
 
         self.status.clearIfEphemeral();
+        if (self.active_page == .review and target == .repository) {
+            const allocator = self.allocator orelse ctx.allocator();
+            var incoming = self.prepareReviewRepositoryHandoff(allocator) catch {
+                self.status.set("could not prepare page navigation", .{});
+                return;
+            };
+            var incoming_owned = true;
+            defer if (incoming_owned) incoming.deinit(allocator);
+            self.commitReviewRepositoryHandoff(allocator, &incoming);
+            incoming_owned = false;
+            return;
+        }
+
         if (self.active_page == .review) self.pages.review.activation.deactivate();
         if (self.active_page == .repository) self.pages.repository.deactivate();
         self.active_page = target;
@@ -8116,6 +8129,243 @@ test "review repository transition C1 no context bypasses identity and retains b
     try std.testing.expectEqual(retained_address, @intFromPtr(app.pages.repository.selected_path.?.ptr));
     try std.testing.expectEqualStrings("retained.zig", app.pages.repository.selected_path.?);
     try std.testing.expectEqual(@as(usize, 1), app.pages.repository.viewer.tree_cursor);
+}
+
+test "review repository transition C2 blocker precedes contextual handoff preparation" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var app: App = .{
+        .allocator = failing.allocator(),
+        .repo_epoch = 7,
+        .config = .{ .source = .unstaged },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+        } },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    defer app.pages.review.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    acceptTestSource(&app);
+    app.pages.review.search.mode = true;
+    const review_activation = app.pages.review.activation.state.active.activation_id;
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.requestPageSwitch(&ctx, .repository);
+
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expect(app.pages.review.search.mode);
+    try std.testing.expectEqual(review_activation, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqualStrings("finish search before switching pages", app.status.text());
+    try std.testing.expect(app.pages.repository.incoming == .none);
+}
+
+test "review repository transition C2 prepare failure stays on Review with bounded diagnostic" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .repo_epoch = 7,
+        .config = .{ .source = .unstaged },
+        .pages = .{
+            .review = .{
+                .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+                .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+            },
+            .repository = .{ .activation_id = 4 },
+        },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    defer app.pages.review.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    acceptTestSource(&app);
+    const review_activation = app.pages.review.activation.state.active.activation_id;
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.requestPageSwitch(&ctx, .repository);
+
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqual(review_activation, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqual(@as(u64, 4), app.pages.repository.activation_id);
+    try std.testing.expect(!app.pages.repository.active);
+    try std.testing.expect(app.pages.repository.incoming == .none);
+    try std.testing.expectEqualStrings("could not prepare page navigation", app.status.text());
+}
+
+test "review repository transition C2 post-commit manifest start failures stay on Repository" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    const cases = [_]struct {
+        fail_index: usize,
+        generation: u64,
+        status: []const u8,
+    }{
+        .{
+            .fail_index = 0,
+            .generation = 0,
+            .status = "Could not prepare repository manifest: OutOfMemory",
+        },
+        .{
+            .fail_index = 1,
+            .generation = 1,
+            .status = "Could not start repository manifest task",
+        },
+    };
+
+    for (cases) |case| {
+        var app: App = .{
+            // The handoff succeeds through the application allocator. Only
+            // destination task preparation uses the failing Ctx allocator,
+            // making this a post-commit failure rather than a prepare error.
+            .allocator = allocator,
+            .repo_epoch = 7,
+            .config = .{ .source = .unstaged },
+            .pages = .{ .review = .{
+                .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+                .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+            } },
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+        };
+        defer app.pages.review.deinit(allocator);
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+        acceptTestSource(&app);
+        const review_activation = app.pages.review.activation.state.active.activation_id;
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = case.fail_index });
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = failing.allocator() };
+
+        try std.testing.expectError(error.OutOfMemory, app.update(.{ .switch_page = .repository }, &ctx));
+
+        try std.testing.expectEqual(page.Id.repository, app.active_page);
+        try std.testing.expect(app.pages.review.activation.state == .inactive);
+        try std.testing.expectEqual(review_activation, app.pages.review.activation.next_activation_id);
+        try std.testing.expect(app.pages.repository.active);
+        try std.testing.expectEqual(@as(u64, 1), app.pages.repository.activation_id);
+        const unavailable = app.pages.repository.incomingUnavailable().?;
+        try std.testing.expectEqual(page_link.RepositoryUnavailableReason.request_failed, unavailable.reason);
+        try std.testing.expectEqualStrings("a", unavailable.path);
+        try std.testing.expectEqual(case.generation, app.pages.repository.generation);
+        try std.testing.expect(app.pages.repository.pending_generation == null);
+        try std.testing.expectEqualStrings(case.status, app.pages.repository.status.text());
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    }
+}
+
+test "review repository transition C2 keyboard opens exact retained path with line owner" {
+    const allocator = std.testing.allocator;
+    const repository_manifest = @import("repository/manifest.zig");
+    const repository_tree = @import("repository/tree.zig");
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var document = try repository_manifest.parseOwned(
+        allocator,
+        try allocator.dupe(u8, "a\x00other.zig\x00"),
+    );
+    var document_owned = true;
+    errdefer if (document_owned) document.deinit(allocator);
+    const tree = try repository_tree.Tree.build(allocator, &document);
+
+    var app: App = .{
+        .allocator = allocator,
+        .repo_epoch = 7,
+        .config = .{ .source = .unstaged },
+        .pages = .{
+            .review = .{
+                .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+                .viewer = .{ .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } },
+            },
+            .repository = .{
+                .repo_epoch = 7,
+                .bundle = .{ .document = document, .tree = tree },
+                .load_state = .loaded,
+                .manifest_revision = 2,
+                .viewer = .{ .tree_cursor = 1 },
+            },
+        },
+    };
+    document_owned = false;
+    defer app.pages.review.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.discovery = try testSingleRepoDiscovery(allocator, roots.a);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    app.pages.repository.root_identity = app.repo_state.activeIdentity();
+    app.pages.repository.selected_path = app.pages.repository.bundle.?.tree.filePath("other.zig", .all).?;
+    acceptTestSource(&app);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingRepositoryTasks(&ctx, allocator);
+
+    const keyboard = app.handleEvent(.{ .key_press = .{ .codepoint = '2' } }) orelse
+        return error.ExpectedPageSwitch;
+    try app.update(keyboard, &ctx);
+
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+    try std.testing.expect(app.pages.review.activation.state == .inactive);
+    try std.testing.expectEqualStrings("a", app.pages.repository.selected_path.?);
+    try std.testing.expect(app.pages.repository.incoming == .awaiting_document);
+    const pending = app.pages.repository.incoming.documentIntent().?;
+    try std.testing.expectEqualStrings("a", pending.location.path);
+    try std.testing.expectEqual(@as(?u32, 3), pending.location.line);
+    try std.testing.expectEqual(@as(u64, 2), pending.manifest_revision);
+    try std.testing.expect(std.meta.eql(
+        diff_view_model.BodyCoordinate{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } },
+        app.pages.review.viewer.diff_cursor,
+    ));
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+}
+
+test "review repository transition C2 page bar exposes deleted target as unavailable" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .repo_epoch = 3,
+        .terminal_size = .{ .width = 100, .height = 20 },
+        .config = .{ .source = .unstaged },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+            .viewer = .{
+                .selected_node = 1,
+                .selected_target = .{ .diff_file = 1 },
+            },
+        } },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    defer app.pages.review.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    acceptTestSource(&app);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingRepositoryTasks(&ctx, allocator);
+
+    const layout = app.shellLayout();
+    const repository_tab = page.tab(.repository);
+    const bar = layout.page_bar orelse return error.ExpectedPageBar;
+    const mouse = app.handleEvent(app_test_support.mouseEvent(
+        bar.col + repository_tab.col,
+        bar.row,
+        .left,
+    )) orelse return error.ExpectedPageSwitch;
+    try app.update(mouse, &ctx);
+
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+    try std.testing.expect(app.pages.review.activation.state == .inactive);
+    const unavailable = app.pages.repository.incomingUnavailable().?;
+    try std.testing.expectEqual(page_link.RepositoryUnavailableReason.no_current_path, unavailable.reason);
+    try std.testing.expectEqualStrings("src/deleted.zig", unavailable.path);
+    try std.testing.expect(app.pages.repository.selected_path == null);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
 }
 
 test "live review waiter blocks direct keyboard and mouse page switches with one reason" {
