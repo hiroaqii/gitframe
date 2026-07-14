@@ -10,6 +10,7 @@ const page = @import("page.zig");
 
 pub const Blocker = enum {
     review_mouse_selection,
+    repository_mouse_selection,
     review_deferred_apply,
     review_search,
     review_file_search,
@@ -30,6 +31,7 @@ pub const Blocker = enum {
     pub fn message(self: Blocker) []const u8 {
         return switch (self) {
             .review_mouse_selection => "finish mouse selection before switching pages",
+            .repository_mouse_selection => "finish Repository mouse selection before switching pages",
             .review_deferred_apply => "finish deferred Review update before switching pages",
             .review_search => "finish search before switching pages",
             .review_file_search => "finish file search before switching pages",
@@ -52,6 +54,7 @@ pub const Blocker = enum {
 
 pub const Snapshot = struct {
     review_mouse_selection: bool = false,
+    repository_mouse_selection: bool = false,
     review_deferred_apply: bool = false,
     review_search: bool = false,
     review_file_search: bool = false,
@@ -94,6 +97,7 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
     if (snapshot.repository_source_search) return .{ .blocked = .repository_source_search };
     if (snapshot.repository_file_search) return .{ .blocked = .repository_file_search };
     if (snapshot.review_mouse_selection) return .{ .blocked = .review_mouse_selection };
+    if (snapshot.repository_mouse_selection) return .{ .blocked = .repository_mouse_selection };
     if (snapshot.review_deferred_apply) return .{ .blocked = .review_deferred_apply };
     return .allowed;
 }
@@ -133,5 +137,12 @@ test "repository prompt modes block mouse initiated page transitions" {
     try std.testing.expectEqual(
         Disposition{ .blocked = .repository_file_search },
         disposition(.repository, .history, .{ .repository_file_search = true }),
+    );
+}
+
+test "repository selection slice B transition blocks every page switch" {
+    try std.testing.expectEqual(
+        Disposition{ .blocked = .repository_mouse_selection },
+        disposition(.repository, .review, .{ .repository_mouse_selection = true }),
     );
 }

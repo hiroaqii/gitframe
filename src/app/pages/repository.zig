@@ -19,7 +19,10 @@ const source_syntax_runtime = @import("../../syntax/source_runtime.zig");
 const repository_input = @import("repository/input.zig");
 const repository_model = @import("repository/model.zig");
 const repository_navigation = @import("repository/navigation.zig");
+const repository_selection = @import("repository/selection.zig");
+const repository_source_geometry = @import("repository/source_geometry.zig");
 const repository_view = @import("repository/view.zig");
+const text_projection = @import("../../text/projection.zig");
 
 pub const InputContext = repository_input.Context;
 
@@ -252,7 +255,10 @@ pub const Msg = union(enum) {
     scroll_right,
     mouse_row: usize,
     mouse_toggle_row: usize,
-    mouse_source_row: usize,
+    mouse_source_press: BodyPoint,
+    mouse_source_drag: ?BodyPoint,
+    mouse_source_release: ?BodyPoint,
+    cancel_source_selection,
     mouse_source_wheel_up,
     mouse_source_wheel_down,
     focus_tree,
@@ -765,6 +771,16 @@ pub fn bodyLayout(size: chasen.Size) BodyLayout {
     return .{ .tree_width = if (size.width < 24) size.width else @max(@as(u16, 12), size.width / 3) };
 }
 
+/// Converts shell-body coordinates to source-pane-local coordinates. A point
+/// in the tree, separator, or outside the body is intentionally `null`, which
+/// lets a live drag leave the pane without mutating its logical endpoint.
+pub fn sourceGesturePoint(point: ?BodyPoint, size: chasen.Size) ?BodyPoint {
+    const body_point = point orelse return null;
+    const layout = bodyLayout(size);
+    if (body_point.col <= layout.tree_width or body_point.col >= size.width) return null;
+    return .{ .col = body_point.col - layout.tree_width - 1, .row = body_point.row };
+}
+
 /// Page-owned state for the read-only current working-tree browser. The zero
 /// value allocates nothing and is safe to deinitialize before first activation.
 pub const RepositoryPageState = struct {
@@ -792,6 +808,9 @@ pub const RepositoryPageState = struct {
     bundle: ?Bundle = null,
     displayed_document: ?DisplayedDocument = null,
     selected_path: ?[]const u8 = null,
+    /// Live coordinates borrow `displayed_document`; every owner-replacement
+    /// path must cancel this value before freeing source/path storage.
+    source_selection: ?repository_selection.DragSelection = null,
     file_visibility: repository_tree.Visibility = .all,
     /// Owned raw path captured before entering Changed mode. It is deliberately
     /// independent from manifest generations so background replacement cannot
@@ -803,6 +822,7 @@ pub const RepositoryPageState = struct {
     status: app_state.StatusMessage = .{},
 
     pub fn deinit(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
+        self.cancelSourceSelection();
         if (self.bundle) |*bundle| bundle.deinit(allocator);
         if (self.displayed_document) |*document| document.deinit(allocator);
         if (self.all_selection_anchor) |anchor| allocator.free(anchor);
@@ -844,6 +864,7 @@ pub const RepositoryPageState = struct {
         repo_epoch: u64,
         identity: ?root_capability.Identity,
     ) void {
+        self.cancelSourceSelection();
         if (self.bundle) |*bundle| {
             const owner = allocator orelse @panic("Repository bundle replacement requires an allocator");
             bundle.deinit(owner);
@@ -1216,6 +1237,9 @@ pub const RepositoryPageState = struct {
         const selected = self.selected_path orelse return .discarded;
         if (!std.mem.eql(u8, selected, finished.path)) return .discarded;
 
+        // Even byte-identical accepted replacements own different storage.
+        // Slice B has no deferred apply, so end the borrow before deinit.
+        self.cancelSourceSelection();
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
         self.source_revision +%= 1;
@@ -1322,6 +1346,7 @@ pub const RepositoryPageState = struct {
     }
 
     fn replaceBundle(self: *RepositoryPageState, allocator: std.mem.Allocator, incoming: *Bundle) !void {
+        self.cancelSourceSelection();
         const previous_selected = self.selected_path;
         const selected = if (self.bundle) |*previous|
             try incoming.tree.restoreStateFrom(allocator, &previous.tree, previous_selected)
@@ -1437,18 +1462,28 @@ pub const RepositoryPageState = struct {
         msg: Msg,
         body_size: chasen.Size,
     ) bool {
+        // Drag/release are the only continuations of a live mouse owner.
+        // Any independent page command becomes an explicit cancel terminal so
+        // keyboard navigation/search cannot silently retarget the gesture.
+        switch (msg) {
+            .mouse_source_drag, .mouse_source_release, .cancel_source_selection => {},
+            else => self.cancelSourceSelection(),
+        }
         const previous = self.selected_path;
         const body_height = bodyLayout(body_size).treeRows(body_size.height);
         const source = self.currentSource();
         const right_width = body_size.width -| bodyLayout(body_size).tree_width -| 1;
-        const source_text_width = if (source) |document| repository_view.sourceTextWidth(right_width, document, self.viewer.line_numbers) else 0;
+        const source_geometry = if (source) |document|
+            repository_source_geometry.SourceGeometry.init(.{ .width = right_width, .height = body_size.height }, document, self.viewer.line_numbers)
+        else
+            null;
         switch (msg) {
             .move_up => if (self.viewer.focus == .source and source != null)
-                repository_navigation.moveSource(&self.viewer, source.?, -1, body_size.height)
+                repository_navigation.moveSource(&self.viewer, source.?, -1, source_geometry.?)
             else
                 self.moveCursor(-1, body_height),
             .move_down => if (self.viewer.focus == .source and source != null)
-                repository_navigation.moveSource(&self.viewer, source.?, 1, body_size.height)
+                repository_navigation.moveSource(&self.viewer, source.?, 1, source_geometry.?)
             else
                 self.moveCursor(1, body_height),
             .wheel_up => {
@@ -1460,21 +1495,21 @@ pub const RepositoryPageState = struct {
                 self.moveCursor(1, body_height);
             },
             .page_up => if (self.viewer.focus == .source and source != null)
-                repository_navigation.pageSource(&self.viewer, source.?, -1, body_size.height)
+                repository_navigation.pageSource(&self.viewer, source.?, -1, source_geometry.?)
             else
                 self.moveCursor(-@as(isize, @intCast(@max(body_height -| 1, 1))), body_height),
             .page_down => if (self.viewer.focus == .source and source != null)
-                repository_navigation.pageSource(&self.viewer, source.?, 1, body_size.height)
+                repository_navigation.pageSource(&self.viewer, source.?, 1, source_geometry.?)
             else
                 self.moveCursor(@intCast(@max(body_height -| 1, 1)), body_height),
             .toggle_directory => self.toggleCursor(body_height),
             .scroll_left => if (self.viewer.focus == .source and source != null) {
-                repository_navigation.scrollSourceHorizontal(&self.viewer, source.?, -8, source_text_width);
+                repository_navigation.scrollSourceHorizontal(&self.viewer, source.?, -8, source_geometry.?);
             } else {
                 self.viewer.tree_horizontal_scroll -|= 4;
             },
             .scroll_right => if (self.viewer.focus == .source and source != null) {
-                repository_navigation.scrollSourceHorizontal(&self.viewer, source.?, 8, source_text_width);
+                repository_navigation.scrollSourceHorizontal(&self.viewer, source.?, 8, source_geometry.?);
             } else {
                 self.viewer.tree_horizontal_scroll = @min(self.viewer.tree_horizontal_scroll +| 4, manifest.max_path_bytes * 4);
             },
@@ -1486,18 +1521,17 @@ pub const RepositoryPageState = struct {
                 self.viewer.focus = .tree;
                 self.setCursor(row, body_height, true);
             },
-            .mouse_source_row => |row| if (source) |document| {
-                self.viewer.focus = .source;
-                self.viewer.source_cursor = @min(self.viewer.source_vertical_scroll + row, document.rowCount() - 1);
-                repository_navigation.clampSource(&self.viewer, document, body_size.height, source_text_width);
-            },
+            .mouse_source_press => |point| self.pressSourceSelection(point, body_size),
+            .mouse_source_drag => |point| self.dragSourceSelection(point, body_size),
+            .mouse_source_release => |point| self.releaseSourceSelection(point, body_size),
+            .cancel_source_selection => self.cancelSourceSelection(),
             .mouse_source_wheel_up => if (source) |document| {
                 self.viewer.focus = .source;
-                repository_navigation.moveSource(&self.viewer, document, -1, body_size.height);
+                repository_navigation.moveSource(&self.viewer, document, -1, source_geometry.?);
             },
             .mouse_source_wheel_down => if (source) |document| {
                 self.viewer.focus = .source;
-                repository_navigation.moveSource(&self.viewer, document, 1, body_size.height);
+                repository_navigation.moveSource(&self.viewer, document, 1, source_geometry.?);
             },
             .focus_tree => self.viewer.focus = .tree,
             .focus_source => if (source != null) {
@@ -1508,12 +1542,16 @@ pub const RepositoryPageState = struct {
             },
             .tree_first => self.selectTreeEdge(false, body_height),
             .tree_last => self.selectTreeEdge(true, body_height),
-            .source_first => if (source) |document| repository_navigation.firstSource(&self.viewer, document, body_size.height),
-            .source_last => if (source) |document| repository_navigation.lastSource(&self.viewer, document, body_size.height),
+            .source_first => if (source) |document| repository_navigation.firstSource(&self.viewer, document, source_geometry.?),
+            .source_last => if (source) |document| repository_navigation.lastSource(&self.viewer, document, source_geometry.?),
             .toggle_changed_filter => self.toggleChangedFilter(allocator, body_height),
             .toggle_line_numbers => {
                 self.viewer.line_numbers = !self.viewer.line_numbers;
-                if (source) |document| repository_navigation.clampSource(&self.viewer, document, body_size.height, repository_view.sourceTextWidth(right_width, document, self.viewer.line_numbers));
+                if (source) |document| repository_navigation.clampSource(
+                    &self.viewer,
+                    document,
+                    self.sourceGeometry(body_size, document),
+                );
             },
             .enter_source_search => if (source != null) {
                 self.source_search.mode = true;
@@ -1528,16 +1566,16 @@ pub const RepositoryPageState = struct {
                 self.source_search.mode = false;
                 self.source_search.query = self.source_search.input;
                 self.source_search.match = document.findNext(self.source_search.query.slice(), null);
-                if (self.source_search.match) |match| repository_navigation.revealMatch(&self.viewer, document, match, body_size.height, source_text_width) else self.status.set("No source match", .{});
+                if (self.source_search.match) |match| repository_navigation.revealMatch(&self.viewer, document, match, source_geometry.?) else self.status.set("No source match", .{});
             },
             .clear_source_search => self.source_search.clear(),
             .next_source_match => if (source) |document| {
                 self.source_search.match = document.findNext(self.source_search.query.slice(), self.source_search.match);
-                if (self.source_search.match) |match| repository_navigation.revealMatch(&self.viewer, document, match, body_size.height, source_text_width);
+                if (self.source_search.match) |match| repository_navigation.revealMatch(&self.viewer, document, match, source_geometry.?);
             },
             .previous_source_match => if (source) |document| {
                 self.source_search.match = document.findPrevious(self.source_search.query.slice(), self.source_search.match);
-                if (self.source_search.match) |match| repository_navigation.revealMatch(&self.viewer, document, match, body_size.height, source_text_width);
+                if (self.source_search.match) |match| repository_navigation.revealMatch(&self.viewer, document, match, source_geometry.?);
             },
             .source_search_backspace => self.source_search.input.backspace(),
             .source_search_move_left => self.source_search.input.moveLeft(),
@@ -1579,6 +1617,7 @@ pub const RepositoryPageState = struct {
     }
 
     fn invalidateSelectedDocument(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
+        self.cancelSourceSelection();
         self.pending_document_generation = null;
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
@@ -1699,10 +1738,118 @@ pub const RepositoryPageState = struct {
         const layout = bodyLayout(body_size);
         self.clampScroll(layout.treeRows(body_size.height));
         if (self.currentSource()) |document| {
-            const right_width = body_size.width -| layout.tree_width -| 1;
-            const text_width = repository_view.sourceTextWidth(right_width, document, self.viewer.line_numbers);
-            repository_navigation.clampSource(&self.viewer, document, body_size.height, text_width);
+            repository_navigation.clampSource(
+                &self.viewer,
+                document,
+                self.sourceGeometry(body_size, document),
+            );
         }
+    }
+
+    pub fn activeSourceSelection(self: *const RepositoryPageState) bool {
+        return self.source_selection != null;
+    }
+
+    pub fn cancelSourceSelection(self: *RepositoryPageState) void {
+        self.source_selection = null;
+    }
+
+    fn sourceGeometry(self: *const RepositoryPageState, body_size: chasen.Size, document: *const source_document.Document) repository_source_geometry.SourceGeometry {
+        const layout = bodyLayout(body_size);
+        return .init(
+            .{ .width = body_size.width -| layout.tree_width -| 1, .height = body_size.height },
+            document,
+            self.viewer.line_numbers,
+        );
+    }
+
+    fn currentContentToken(self: *const RepositoryPageState) ?repository_selection.RepositoryContentToken {
+        const displayed = if (self.displayed_document) |*document| document else return null;
+        const source = self.currentSource() orelse return null;
+        return .{
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.root_identity orelse return null,
+            .path = displayed.path,
+            .source_fingerprint = source.fingerprint,
+        };
+    }
+
+    fn pointAtTextCell(
+        document: *const source_document.Document,
+        line_index: usize,
+        logical_cell: usize,
+    ) ?repository_selection.Point {
+        const line = document.lineBody(line_index) orelse return null;
+        return switch (text_projection.hitAtDisplayCell(line, logical_cell) orelse return null) {
+            .token => |token| repository_selection.pointFromToken(line_index, token),
+            .boundary => |boundary| repository_selection.pointFromBoundary(line_index, boundary.offset),
+        };
+    }
+
+    fn pressSourceSelection(self: *RepositoryPageState, point: BodyPoint, body_size: chasen.Size) void {
+        if (self.source_search.mode or self.file_search.mode) return;
+        const document = self.currentSource() orelse return;
+        const geometry = self.sourceGeometry(body_size, document);
+        const line_index = geometry.contentLineAt(point.row, self.viewer.source_vertical_scroll, document) orelse return;
+        const region = geometry.regionAt(point.col) orelse return;
+        const token = self.currentContentToken() orelse return;
+        const mode: repository_selection.Mode = switch (region) {
+            .gutter, .line_number => .line,
+            .text => .character,
+            .separator => return,
+        };
+        const logical_point = switch (mode) {
+            .line => repository_selection.pointFromLine(line_index),
+            .character => pointAtTextCell(
+                document,
+                line_index,
+                self.viewer.source_horizontal_scroll + @as(usize, point.col - geometry.text_col),
+            ) orelse return,
+        };
+        self.viewer.focus = .source;
+        self.viewer.source_cursor = line_index;
+        self.source_selection = repository_selection.DragSelection.initAtCell(token, mode, logical_point, .{ .col = point.col, .row = point.row });
+    }
+
+    fn dragSourceSelection(self: *RepositoryPageState, point: ?BodyPoint, body_size: chasen.Size) void {
+        const live = self.source_selection orelse return;
+        const local = point orelse return;
+        const document = self.currentSource() orelse {
+            self.cancelSourceSelection();
+            return;
+        };
+        const current_token = self.currentContentToken() orelse {
+            self.cancelSourceSelection();
+            return;
+        };
+        if (!live.token.eql(current_token)) {
+            self.cancelSourceSelection();
+            return;
+        }
+        const geometry = self.sourceGeometry(body_size, document);
+        const line_index = geometry.contentLineAt(local.row, self.viewer.source_vertical_scroll, document) orelse return;
+        const region = geometry.regionAt(local.col) orelse return;
+        const logical_point: repository_selection.Point = switch (live.mode) {
+            .line => repository_selection.pointFromLine(line_index),
+            .character => switch (region) {
+                .gutter, .line_number => repository_selection.pointFromBoundary(line_index, 0),
+                .separator => return,
+                .text => pointAtTextCell(
+                    document,
+                    line_index,
+                    self.viewer.source_horizontal_scroll + @as(usize, local.col - geometry.text_col),
+                ) orelse return,
+            },
+        };
+        self.viewer.source_cursor = line_index;
+        self.source_selection.?.updateAtCell(logical_point, .{ .col = local.col, .row = local.row });
+    }
+
+    fn releaseSourceSelection(self: *RepositoryPageState, point: ?BodyPoint, body_size: chasen.Size) void {
+        self.dragSourceSelection(point, body_size);
+        // Slice C owns candidate construction and clipboard delivery. At this
+        // checkpoint release is only the terminal for the borrowed live owner.
+        self.cancelSourceSelection();
     }
 
     pub fn mouseToMsg(self: *const RepositoryPageState, point: BodyPoint, button: MouseButton, size: chasen.Size) ?Msg {
@@ -1722,11 +1869,14 @@ pub const RepositoryPageState = struct {
                     .{ .mouse_row = body_row };
             },
         };
-        if (point.col == layout.tree_width or self.currentSource() == null) return null;
+        if (point.col == layout.tree_width) return null;
+        const document = self.currentSource() orelse return null;
+        const source_point = sourceGesturePoint(point, size) orelse return null;
+        const geometry = self.sourceGeometry(size, document);
         return switch (button) {
             .wheel_up => .mouse_source_wheel_up,
             .wheel_down => .mouse_source_wheel_down,
-            .left => if (point.row >= 2) .{ .mouse_source_row = point.row - 2 } else .focus_source,
+            .left => if (source_point.row >= geometry.body_first_row) .{ .mouse_source_press = source_point } else .focus_source,
         };
     }
 };
@@ -1862,6 +2012,13 @@ fn drawDocumentCheckpoint(
     }
     switch (displayed.value) {
         .source => |*source| {
+            const live_selection = if (state.source_selection) |selection|
+                if (state.currentContentToken()) |token|
+                    if (selection.token.eql(token)) selection else null
+                else
+                    null
+            else
+                null;
             try repository_view.drawSource(
                 surface,
                 source,
@@ -1869,6 +2026,7 @@ fn drawDocumentCheckpoint(
                 displayed.change_decoration.map(),
                 state.viewer,
                 state.source_search,
+                live_selection,
                 palette,
             );
             return;
@@ -2003,6 +2161,32 @@ fn bundleForTest(bytes: []const u8) !Bundle {
     var document = try manifest.parseOwned(std.testing.allocator, try std.testing.allocator.dupe(u8, bytes));
     errdefer document.deinit(std.testing.allocator);
     return .{ .tree = try repository_tree.Tree.build(std.testing.allocator, &document), .document = document };
+}
+
+fn selectionStateForTest(paths: []const u8, content: []const u8) !RepositoryPageState {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 2,
+        .repo_epoch = 3,
+        .root_identity = .{ .device = 4, .inode = 5 },
+        .bundle = try bundleForTest(paths),
+        .load_state = .loaded,
+        .manifest_revision = 6,
+    };
+    errdefer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    const bytes = try allocator.dupe(u8, content);
+    var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
+    errdefer document.deinit(allocator);
+    const path = try allocator.dupe(u8, state.selected_path.?);
+    state.displayed_document = .{
+        .path = path,
+        .manifest_revision = state.manifest_revision,
+        .source_revision = 7,
+        .value = .{ .source = document },
+    };
+    return state;
 }
 
 fn applyBundleStatusForTest(bundle: *Bundle, bytes: []const u8) !void {
@@ -3294,9 +3478,13 @@ test "repository page owns source focus navigation search and mouse geometry" {
     try std.testing.expect(state.source_search.match != null);
 
     const layout = bodyLayout(size);
-    try std.testing.expectEqual(Msg.focus_source, state.mouseToMsg(.{ .col = layout.tree_width + 1, .row = 1 }, .left, size).?);
-    try std.testing.expectEqual(Msg{ .mouse_source_row = 0 }, state.mouseToMsg(.{ .col = layout.tree_width + 1, .row = 2 }, .left, size).?);
-    try std.testing.expectEqual(Msg.mouse_source_wheel_down, state.mouseToMsg(.{ .col = layout.tree_width + 1, .row = 2 }, .wheel_down, size).?);
+    const geometry = state.sourceGeometry(size, state.currentSource().?);
+    try std.testing.expectEqual(Msg.focus_source, state.mouseToMsg(.{ .col = layout.tree_width + 1, .row = geometry.body_first_row - 1 }, .left, size).?);
+    try std.testing.expectEqual(
+        Msg{ .mouse_source_press = .{ .col = 0, .row = geometry.body_first_row } },
+        state.mouseToMsg(.{ .col = layout.tree_width + 1, .row = geometry.body_first_row }, .left, size).?,
+    );
+    try std.testing.expectEqual(Msg.mouse_source_wheel_down, state.mouseToMsg(.{ .col = layout.tree_width + 1, .row = geometry.body_first_row }, .wheel_down, size).?);
 
     state.viewer.focus = .source;
     state.viewer.source_cursor = 2;
@@ -3310,6 +3498,171 @@ test "repository page owns source focus navigation search and mouse geometry" {
     state.clampForBodySize(size);
     try std.testing.expectEqual(@as(usize, 3), state.viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_horizontal_scroll);
+}
+
+test "repository selection slice B live gesture fixes mode and resumes after leaving the pane" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "ABCDEFG\nHIJKLMN\nthird\nfourth\n");
+    defer state.deinit(allocator);
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    const document = state.currentSource().?;
+    const geometry = state.sourceGeometry(size, document);
+    const first_row = geometry.body_first_row;
+
+    state.source_search.mode = true;
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = first_row } }, size);
+    try std.testing.expect(!state.activeSourceSelection());
+    state.source_search.mode = false;
+    state.file_search.mode = true;
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = first_row } }, size);
+    try std.testing.expect(!state.activeSourceSelection());
+    state.file_search.mode = false;
+
+    // Separators are focus-only dead space and never create a selection.
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.separator_col.?, .row = first_row } }, size);
+    try std.testing.expect(!state.activeSourceSelection());
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col + 3, .row = first_row } }, size);
+    try std.testing.expect(state.activeSourceSelection());
+    try std.testing.expectEqual(repository_selection.Mode.character, state.source_selection.?.mode);
+    try std.testing.expectEqual(@as(usize, 3), state.source_selection.?.anchor.leading_byte);
+    try std.testing.expectEqual(@as(usize, 4), state.source_selection.?.anchor.trailing_byte);
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_drag = null }, size);
+    try std.testing.expect(!state.source_selection.?.moved);
+    _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{ .col = geometry.text_col + 4, .row = first_row + 1 } }, size);
+    try std.testing.expect(state.source_selection.?.moved);
+    try std.testing.expectEqual(@as(usize, 1), state.source_selection.?.focus.line_index);
+    try std.testing.expectEqual(@as(usize, 5), state.source_selection.?.focus.trailing_byte);
+    try std.testing.expectEqual(repository_selection.Mode.character, state.source_selection.?.mode);
+
+    // A character drag entering its own gutter clamps to the leading logical
+    // boundary; it does not switch to whole-line mode.
+    _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{ .col = geometry.gutter_col, .row = first_row + 1 } }, size);
+    try std.testing.expectEqual(repository_selection.Mode.character, state.source_selection.?.mode);
+    try std.testing.expectEqual(@as(usize, 0), state.source_selection.?.focus.leading_byte);
+    try std.testing.expectEqual(@as(usize, 0), state.source_selection.?.focus.trailing_byte);
+    _ = state.applyNavigation(allocator, .{ .mouse_source_release = null }, size);
+    try std.testing.expect(!state.activeSourceSelection());
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.gutter_col, .row = first_row } }, size);
+    try std.testing.expectEqual(repository_selection.Mode.line, state.source_selection.?.mode);
+    _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{ .col = geometry.text_col + 2, .row = first_row + 1 } }, size);
+    try std.testing.expectEqual(repository_selection.Mode.line, state.source_selection.?.mode);
+    try std.testing.expectEqual(@as(usize, 1), state.source_selection.?.focus.line_index);
+    _ = state.applyNavigation(allocator, .{ .mouse_source_release = .{ .col = geometry.text_col + 2, .row = first_row + 1 } }, size);
+    try std.testing.expect(!state.activeSourceSelection());
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.line_number_col, .row = first_row } }, size);
+    try std.testing.expectEqual(repository_selection.Mode.line, state.source_selection.?.mode);
+    state.cancelSourceSelection();
+}
+
+test "repository selection slice B hit testing applies scroll once and follows line number geometry" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "ABCDEFG\nHIJKLMN\nthird\nfourth\n");
+    defer state.deinit(allocator);
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    const document = state.currentSource().?;
+    var geometry = state.sourceGeometry(size, document);
+    const first_row = geometry.body_first_row;
+
+    state.viewer.source_horizontal_scroll = 2;
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col + 1, .row = first_row } }, size);
+    try std.testing.expectEqual(@as(usize, 3), state.source_selection.?.anchor.leading_byte);
+    state.cancelSourceSelection();
+
+    state.viewer.source_horizontal_scroll = 0;
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col + 20, .row = first_row } }, size);
+    try std.testing.expectEqual(@as(usize, "ABCDEFG".len), state.source_selection.?.anchor.leading_byte);
+    try std.testing.expectEqual(@as(usize, "ABCDEFG".len), state.source_selection.?.anchor.trailing_byte);
+    state.cancelSourceSelection();
+
+    state.viewer.source_vertical_scroll = 1;
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = first_row } }, size);
+    try std.testing.expectEqual(@as(usize, 1), state.source_selection.?.anchor.line_index);
+    state.cancelSourceSelection();
+
+    state.viewer.source_vertical_scroll = 0;
+    state.viewer.source_horizontal_scroll = 0;
+    _ = state.applyNavigation(allocator, .toggle_line_numbers, size);
+    geometry = state.sourceGeometry(size, document);
+    try std.testing.expectEqual(@as(u16, 1), geometry.text_col);
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
+    try std.testing.expectEqual(repository_selection.Mode.character, state.source_selection.?.mode);
+    try std.testing.expectEqual(@as(usize, 0), state.source_selection.?.anchor.leading_byte);
+}
+
+test "repository selection slice B synthetic empty row rejects every gesture stage" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("empty.zig\x00", "");
+    defer state.deinit(allocator);
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    const geometry = state.sourceGeometry(size, state.currentSource().?);
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.gutter_col, .row = geometry.body_first_row } }, size);
+    try std.testing.expect(!state.activeSourceSelection());
+    _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
+    try std.testing.expect(!state.activeSourceSelection());
+    _ = state.applyNavigation(allocator, .{ .mouse_source_release = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
+    try std.testing.expect(!state.activeSourceSelection());
+}
+
+test "repository selection slice B owner replacement cancels live borrowed selection first" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("a.zig\x00b.zig\x00", "first\nsecond\n");
+    defer state.deinit(allocator);
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    const geometry = state.sourceGeometry(size, state.currentSource().?);
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
+    try std.testing.expect(state.activeSourceSelection());
+    state.viewer.focus = .tree;
+    try std.testing.expect(state.applyNavigation(allocator, .move_down, size));
+    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(state.displayed_document == null);
+
+    state.repositoryChanged(allocator, 9, .{ .device = 10, .inode = 11 });
+    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(state.bundle == null);
+}
+
+test "repository selection slice B accepted manifest and document replacement cancel live borrow" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "old source\n");
+    defer state.deinit(allocator);
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    var geometry = state.sourceGeometry(size, state.currentSource().?);
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
+    try std.testing.expect(state.activeSourceSelection());
+    var incoming = try bundleForTest("main.zig\x00");
+    var incoming_owned = true;
+    defer if (incoming_owned) incoming.deinit(allocator);
+    try state.replaceBundle(allocator, &incoming);
+    incoming_owned = false;
+    try std.testing.expect(!state.activeSourceSelection());
+
+    geometry = state.sourceGeometry(size, state.currentSource().?);
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
+    try std.testing.expect(state.activeSourceSelection());
+    state.document_generation = 8;
+    state.pending_document_generation = 8;
+    // Byte-identical content still arrives in separately owned storage; Slice
+    // B cancels before replacement rather than borrowing across that swap.
+    const replacement_bytes = try allocator.dupe(u8, "old source\n");
+    var replacement: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = state.root_identity.?,
+        .generation = 8,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, state.selected_path.?),
+        .value = .{ .source = try source_document.Document.initOwned(allocator, replacement_bytes, .init(replacement_bytes)) },
+    };
+    defer replacement.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &replacement));
+    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expectEqualStrings("old source", state.currentSource().?.lineBody(0).?);
 }
 
 test "repository source completion rejects stale identity and frees undelivered payload" {

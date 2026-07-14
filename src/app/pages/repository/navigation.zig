@@ -2,58 +2,54 @@
 
 const std = @import("std");
 const model = @import("model.zig");
+const source_geometry = @import("source_geometry.zig");
 const source = @import("../../../repository/source.zig");
 const selected_document = @import("../../../repository/document.zig");
 const repository_tree = @import("../../../repository/tree.zig");
 
-pub fn sourceBodyRows(body_height: u16) usize {
-    return @max(@as(usize, body_height -| 2), 1);
-}
-
-pub fn moveSource(viewer: *model.ViewerState, document: *const source.Document, delta: isize, body_height: u16) void {
+pub fn moveSource(viewer: *model.ViewerState, document: *const source.Document, delta: isize, geometry: source_geometry.SourceGeometry) void {
     if (delta < 0)
         viewer.source_cursor -|= @intCast(-delta)
     else
         viewer.source_cursor = @min(viewer.source_cursor +| @as(usize, @intCast(delta)), document.rowCount() - 1);
-    clampSource(viewer, document, body_height, 0);
+    clampSource(viewer, document, geometry);
 }
 
-pub fn pageSource(viewer: *model.ViewerState, document: *const source.Document, direction: isize, body_height: u16) void {
-    const step: isize = @intCast(sourceBodyRows(body_height));
-    moveSource(viewer, document, if (direction < 0) -step else step, body_height);
+pub fn pageSource(viewer: *model.ViewerState, document: *const source.Document, direction: isize, geometry: source_geometry.SourceGeometry) void {
+    const step: isize = @intCast(geometry.navigationRows());
+    moveSource(viewer, document, if (direction < 0) -step else step, geometry);
 }
 
-pub fn firstSource(viewer: *model.ViewerState, document: *const source.Document, body_height: u16) void {
+pub fn firstSource(viewer: *model.ViewerState, document: *const source.Document, geometry: source_geometry.SourceGeometry) void {
     viewer.source_cursor = 0;
-    clampSource(viewer, document, body_height, 0);
+    clampSource(viewer, document, geometry);
 }
 
-pub fn lastSource(viewer: *model.ViewerState, document: *const source.Document, body_height: u16) void {
+pub fn lastSource(viewer: *model.ViewerState, document: *const source.Document, geometry: source_geometry.SourceGeometry) void {
     viewer.source_cursor = document.rowCount() - 1;
-    clampSource(viewer, document, body_height, 0);
+    clampSource(viewer, document, geometry);
 }
 
-pub fn scrollSourceHorizontal(viewer: *model.ViewerState, document: *const source.Document, delta: isize, text_width: u16) void {
+pub fn scrollSourceHorizontal(viewer: *model.ViewerState, document: *const source.Document, delta: isize, geometry: source_geometry.SourceGeometry) void {
     if (delta < 0)
         viewer.source_horizontal_scroll -|= @intCast(-delta)
     else
         viewer.source_horizontal_scroll +|= @intCast(delta);
-    const maximum = document.maxDisplayWidth() -| @as(usize, text_width);
+    const maximum = document.maxDisplayWidth() -| @as(usize, geometry.text_width);
     viewer.source_horizontal_scroll = @min(viewer.source_horizontal_scroll, maximum);
 }
 
 pub fn clampSource(
     viewer: *model.ViewerState,
     document: *const source.Document,
-    body_height: u16,
-    text_width: u16,
+    geometry: source_geometry.SourceGeometry,
 ) void {
+    const rows = geometry.navigationRows();
     viewer.source_cursor = @min(viewer.source_cursor, document.rowCount() - 1);
-    const rows = sourceBodyRows(body_height);
     if (viewer.source_cursor < viewer.source_vertical_scroll) viewer.source_vertical_scroll = viewer.source_cursor;
     if (viewer.source_cursor >= viewer.source_vertical_scroll + rows) viewer.source_vertical_scroll = viewer.source_cursor - rows + 1;
     viewer.source_vertical_scroll = @min(viewer.source_vertical_scroll, document.rowCount() -| rows);
-    const maximum = document.maxDisplayWidth() -| @as(usize, text_width);
+    const maximum = document.maxDisplayWidth() -| @as(usize, geometry.text_width);
     viewer.source_horizontal_scroll = @min(viewer.source_horizontal_scroll, maximum);
 }
 
@@ -61,17 +57,16 @@ pub fn revealMatch(
     viewer: *model.ViewerState,
     document: *const source.Document,
     match: source.Match,
-    body_height: u16,
-    text_width: u16,
+    geometry: source_geometry.SourceGeometry,
 ) void {
     viewer.focus = .source;
     viewer.source_cursor = match.line;
     const match_col = document.displayColumnForByte(match.line, match.start) orelse 0;
     if (match_col < viewer.source_horizontal_scroll) viewer.source_horizontal_scroll = match_col;
-    if (text_width > 0 and match_col >= viewer.source_horizontal_scroll + text_width) {
-        viewer.source_horizontal_scroll = match_col - text_width + 1;
+    if (geometry.text_width > 0 and match_col >= viewer.source_horizontal_scroll + geometry.text_width) {
+        viewer.source_horizontal_scroll = match_col - geometry.text_width + 1;
     }
-    clampSource(viewer, document, body_height, text_width);
+    clampSource(viewer, document, geometry);
 }
 
 /// File search follows the active tree projection even though it scans raw
@@ -98,16 +93,17 @@ pub fn refreshFileSearch(
     state.no_match = state.len == 0;
 }
 
-test "repository source navigation clamps cursor scroll and horizontal cells" {
+test "repository selection slice B navigation clamps cursor scroll and horizontal cells" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "one\ntwo\n0123456789\n");
     var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
     defer document.deinit(allocator);
+    const geometry = source_geometry.SourceGeometry.init(.{ .width = 7, .height = 3 }, &document, true);
     var viewer: model.ViewerState = .{ .focus = .source };
-    moveSource(&viewer, &document, 20, 3);
+    moveSource(&viewer, &document, 20, geometry);
     try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 2), viewer.source_vertical_scroll);
-    scrollSourceHorizontal(&viewer, &document, 8, 4);
+    scrollSourceHorizontal(&viewer, &document, 8, geometry);
     try std.testing.expectEqual(@as(usize, 6), viewer.source_horizontal_scroll);
 }
 
@@ -117,8 +113,9 @@ test "repository repeated navigation uses precomputed width for admitted worst s
     @memset(dense_bytes, '\n');
     var dense = try source.Document.initOwned(allocator, dense_bytes, .init(dense_bytes));
     defer dense.deinit(allocator);
+    const dense_geometry = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 10 }, &dense, true);
     var dense_viewer: model.ViewerState = .{ .focus = .source };
-    for (0..32) |_| moveSource(&dense_viewer, &dense, 1, 10);
+    for (0..32) |_| moveSource(&dense_viewer, &dense, 1, dense_geometry);
     try std.testing.expectEqual(@as(usize, 32), dense_viewer.source_cursor);
 
     const long_bytes = try allocator.alloc(u8, selected_document.max_text_bytes);
@@ -126,8 +123,9 @@ test "repository repeated navigation uses precomputed width for admitted worst s
     var long = try source.Document.initOwned(allocator, long_bytes, .init(long_bytes));
     defer long.deinit(allocator);
     try std.testing.expectEqual(selected_document.max_text_bytes, long.max_display_width);
+    const long_geometry = source_geometry.SourceGeometry.init(.{ .width = 5, .height = 10 }, &long, false);
     var long_viewer: model.ViewerState = .{ .focus = .source };
-    for (0..32) |_| scrollSourceHorizontal(&long_viewer, &long, 8, 80);
+    for (0..32) |_| scrollSourceHorizontal(&long_viewer, &long, 8, long_geometry);
     try std.testing.expectEqual(@as(usize, 256), long_viewer.source_horizontal_scroll);
 }
 

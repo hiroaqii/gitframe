@@ -5,7 +5,8 @@ const chasen = @import("chasen");
 const draw = @import("draw");
 const theme = @import("theme");
 const model = @import("model.zig");
-const navigation = @import("navigation.zig");
+const selection = @import("selection.zig");
+const source_geometry = @import("source_geometry.zig");
 const source = @import("../../../repository/source.zig");
 const text_projection = @import("../../../text/projection.zig");
 const repository_change_map = @import("../../../repository/change_map.zig");
@@ -16,8 +17,7 @@ const manifest = @import("../../../repository/manifest.zig");
 const repository_tree = @import("../../../repository/tree.zig");
 
 pub fn sourceTextWidth(width: u16, document: *const source.Document, line_numbers: bool) u16 {
-    const number_columns: usize = if (line_numbers) decimalDigits(document.rowCount()) + 1 else 0;
-    return width -| @as(u16, @intCast(1 + number_columns));
+    return source_geometry.SourceGeometry.init(.{ .width = width, .height = 0 }, document, line_numbers).text_width;
 }
 
 pub fn drawSource(
@@ -27,21 +27,20 @@ pub fn drawSource(
     changes: ?*const repository_change_map.Map,
     viewer: model.ViewerState,
     search: model.SourceSearchState,
+    live_selection: ?selection.DragSelection,
     palette: theme.Palette,
 ) !void {
     const size = surface.size();
     if (size.height == 0 or size.width == 0) return;
     drawSearchRow(surface, search, palette);
-    if (size.height <= 2) return;
+    const geometry = source_geometry.SourceGeometry.init(size, document, viewer.line_numbers);
+    if (size.height <= geometry.body_first_row) return;
 
-    const rows = navigation.sourceBodyRows(size.height);
-    const number_width = if (viewer.line_numbers) decimalDigits(document.rowCount()) else 0;
-    const text_col: u16 = @intCast(1 + if (viewer.line_numbers) number_width + 1 else 0);
-    const text_width = size.width -| text_col;
+    const rows = geometry.navigationRows();
     var body_row: usize = 0;
     while (body_row < rows and viewer.source_vertical_scroll + body_row < document.rowCount()) : (body_row += 1) {
         const line_index = viewer.source_vertical_scroll + body_row;
-        const row: u16 = @intCast(body_row + 2);
+        const row = geometry.body_first_row + @as(u16, @intCast(body_row));
         const current = line_index == viewer.source_cursor;
         const base_style = if (current)
             palette.boldStyle(.prompt)
@@ -58,20 +57,23 @@ pub fn drawSource(
         _ = surface.borrowTextAt(0, row, gutter, palette.style(gutter_role));
         if (viewer.line_numbers) {
             const number = try std.fmt.allocPrint(surface.frameAllocator(), "{d}", .{line_index + 1});
-            const number_col: u16 = @intCast(1 + number_width - chasen.text.displayWidth(number));
+            const number_col: u16 = @intCast(@as(usize, geometry.line_number_col) + geometry.line_number_width - chasen.text.displayWidth(number));
             draw.copyClippedTextAt(surface, number_col, row, number, if (current) palette.boldStyle(.diff_cursor) else palette.style(.diff_line_number)) catch {};
         }
-        if (text_width == 0) continue;
+        if (geometry.text_width == 0) {
+            applySelectionLineStyles(surface, geometry, row, document, line_index, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
+            continue;
+        }
         const line = document.lineBody(line_index).?;
-        const visible = try text_projection.renderWindowAlloc(surface.frameAllocator(), line, viewer.source_horizontal_scroll, text_width);
-        draw.copyClippedTextAt(surface, text_col, row, visible, base_style) catch {};
+        const visible = try text_projection.renderWindowAlloc(surface.frameAllocator(), line, viewer.source_horizontal_scroll, geometry.text_width);
+        draw.copyClippedTextAt(surface, geometry.text_col, row, visible, base_style) catch {};
         if (syntax) |spans| applySyntaxLineStyles(
             surface,
-            text_col,
+            geometry.text_col,
             row,
             line,
             viewer.source_horizontal_scroll,
-            text_width,
+            geometry.text_width,
             spans.lineSpans(line_index),
             base_style,
             palette,
@@ -84,13 +86,70 @@ pub fn drawSource(
                 match.start,
                 match.end,
                 viewer.source_horizontal_scroll,
-                text_width,
+                geometry.text_width,
             )) |range| {
-                const match_col: u16 = @intCast(@as(usize, text_col) + range.column);
+                const match_col: u16 = @intCast(@as(usize, geometry.text_col) + range.column);
                 draw.copyClippedTextAt(surface, match_col, row, range.text, palette.boldStyle(.warning)) catch {};
             }
         };
+        applySelectionLineStyles(surface, geometry, row, document, line_index, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
     }
+}
+
+fn applySelectionLineStyles(
+    surface: *chasen.Surface,
+    geometry: source_geometry.SourceGeometry,
+    row: u16,
+    document: *const source.Document,
+    line_index: usize,
+    horizontal_scroll: usize,
+    live_selection: ?selection.DragSelection,
+    background: chasen.Color,
+) void {
+    const selected = live_selection orelse return;
+    if (!selected.token.source_fingerprint.eql(document.fingerprint)) return;
+    const range = selected.range();
+    if (line_index < range.start.line_index or line_index > range.end.line_index) return;
+    if (selected.mode == .line) {
+        var col: u16 = 0;
+        while (col < geometry.width) : (col += 1) setCellBackground(surface, col, row, background);
+        return;
+    }
+
+    const line = document.lineBody(line_index) orelse return;
+    const byte_start = if (line_index == range.start.line_index) range.start.leading_byte else 0;
+    const byte_end = if (line_index == range.end.line_index) range.end.trailing_byte else line.len;
+    if (byte_start >= byte_end or geometry.text_width == 0) return;
+    const viewport_end = std.math.add(usize, horizontal_scroll, geometry.text_width) catch std.math.maxInt(usize);
+    var logical_col: usize = 0;
+    var graphemes = chasen.text.graphemeIterator(line);
+    while (graphemes.next()) |grapheme| {
+        if (logical_col >= viewport_end or grapheme.start >= byte_end) break;
+        const bytes = grapheme.bytes(line);
+        const cells = if (bytes.len == 1 and bytes[0] == '\t')
+            text_projection.tab_width - (logical_col % text_projection.tab_width)
+        else
+            chasen.text.displayWidth(bytes);
+        const segment_end = logical_col + cells;
+        defer logical_col = segment_end;
+        if (grapheme.start + grapheme.len <= byte_start or segment_end <= horizontal_scroll) continue;
+        const visible_start = @max(logical_col, horizontal_scroll);
+        const visible_end = @min(segment_end, viewport_end);
+        if (visible_start >= visible_end) continue;
+        const relative_start = visible_start - horizontal_scroll;
+        const visible_cells = visible_end - visible_start;
+        if (bytes.len == 1 and bytes[0] == '\t' or logical_col < horizontal_scroll) {
+            for (0..visible_cells) |offset| setCellBackground(surface, @intCast(@as(usize, geometry.text_col) + relative_start + offset), row, background);
+        } else if (segment_end <= viewport_end) {
+            setCellBackground(surface, @intCast(@as(usize, geometry.text_col) + relative_start), row, background);
+        }
+    }
+}
+
+fn setCellBackground(surface: *chasen.Surface, col: u16, row: u16, background: chasen.Color) void {
+    var cell = surface.readCell(col, row) orelse return;
+    cell.style.bg = background;
+    surface.writeCell(col, row, cell);
 }
 
 const SyntaxProjectionStats = struct {
@@ -215,13 +274,6 @@ fn drawSearchRow(surface: *chasen.Surface, search: model.SourceSearchState, pale
     }
 }
 
-fn decimalDigits(value: usize) usize {
-    var number = @max(value, 1);
-    var digits: usize = 1;
-    while (number >= 10) : (number /= 10) digits += 1;
-    return digits;
-}
-
 test "repository source view reserves gutter and renders plain text" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "const value = 1;\nsecond\n");
@@ -231,7 +283,7 @@ test "repository source view reserves gutter and renders plain text" {
     try test_surface.init(40, 6);
     defer test_surface.deinit();
 
-    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, .default());
+    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, null, .default());
     const snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 const value = 1;") != null);
@@ -250,7 +302,7 @@ test "repository source gutter renders added and modified rows without moving te
     try test_surface.init(40, 6);
     defer test_surface.deinit();
 
-    try drawSource(&test_surface.surface, &document, null, &map, .{ .focus = .source, .source_cursor = 1 }, .{}, palette);
+    try drawSource(&test_surface.surface, &document, null, &map, .{ .focus = .source, .source_cursor = 1 }, .{}, null, palette);
     try test_surface.expectCellText(0, 2, "│");
     try test_surface.expectCellText(0, 3, "│");
     try test_surface.expectCellText(0, 4, " ");
@@ -268,7 +320,7 @@ test "repository empty source keeps one synthetic viewer row" {
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(12, 4);
     defer test_surface.deinit();
-    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, .default());
+    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, null, .default());
     try test_surface.expectCellText(0, 2, " ");
     try test_surface.expectCellText(1, 2, "1");
 }
@@ -296,7 +348,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try test_surface.init(32, 6);
     defer test_surface.deinit();
 
-    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, .default());
+    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, null, .default());
     var snapshot = try test_surface.snapshot(allocator);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "/needle") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 first") != null);
@@ -306,7 +358,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try test_surface.init(32, 6);
     var search: model.SourceSearchState = .{ .mode = true };
     try search.input.insertSlice("needle");
-    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, search, .default());
+    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, search, null, .default());
     snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "/needle") != null);
@@ -325,7 +377,7 @@ test "repository source match overlay remains distinct on the cursor line" {
     const search: model.SourceSearchState = .{
         .match = .{ .line = 0, .start = 2, .end = 8 },
     };
-    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source, .source_cursor = 0 }, search, palette);
+    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source, .source_cursor = 0 }, search, null, palette);
     const match_cell = test_surface.surface.readCell(7, 2) orelse return error.ExpectedMatchCell;
     const plain_cell = test_surface.surface.readCell(3, 2) orelse return error.ExpectedPlainCell;
     try std.testing.expectEqual(palette.boldStyle(.warning), match_cell.style);
@@ -354,7 +406,7 @@ test "repository source syntax uses neutral styles below the search overlay" {
     var syntax_surface: chasen.testing.TestSurface = undefined;
     try syntax_surface.init(24, 6);
     defer syntax_surface.deinit();
-    try drawSource(&syntax_surface.surface, &document, &spans, null, .{ .focus = .source }, .{}, palette);
+    try drawSource(&syntax_surface.surface, &document, &spans, null, .{ .focus = .source }, .{}, null, palette);
     const keyword_cell = syntax_surface.surface.readCell(3, 2) orelse return error.ExpectedKeywordCell;
     const plain_cell = syntax_surface.surface.readCell(9, 2) orelse return error.ExpectedPlainCell;
     const comment_cell = syntax_surface.surface.readCell(3, 3) orelse return error.ExpectedCommentCell;
@@ -369,9 +421,91 @@ test "repository source syntax uses neutral styles below the search overlay" {
     defer search_surface.deinit();
     try drawSource(&search_surface.surface, &document, &spans, null, .{ .focus = .source }, .{
         .match = .{ .line = 0, .start = 0, .end = 5 },
-    }, palette);
+    }, null, palette);
     const match_cell = search_surface.surface.readCell(3, 2) orelse return error.ExpectedMatchCell;
     try std.testing.expectEqual(palette.color(.warning), match_cell.style.fg);
+}
+
+test "repository selection slice B background composes after cursor syntax and search styles" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "const value plain\n");
+    var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    var candidates = [_]source_syntax.Candidate{
+        .{ .line_index = 0, .span = .{ .start = 0, .end = 5, .role = .keyword } },
+        .{ .line_index = 0, .span = .{ .start = 6, .end = 11, .role = .type } },
+    };
+    var spans = try source_syntax.build(allocator, &document, &candidates);
+    defer spans.deinit(allocator);
+    const palette: theme.Palette = .default();
+    const token: selection.RepositoryContentToken = .{
+        .repo_epoch = 1,
+        .root_identity = .{ .device = 2, .inode = 3 },
+        .path = "main.zig",
+        .source_fingerprint = document.fingerprint,
+    };
+    var live = selection.DragSelection.init(token, .character, selection.pointFromBoundary(0, 0));
+    live.update(selection.pointFromBoundary(0, "const value plain".len));
+    const search: model.SourceSearchState = .{ .match = .{ .line = 0, .start = 6, .end = 11 } };
+
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(30, 4);
+    defer test_surface.deinit();
+    try drawSource(
+        &test_surface.surface,
+        &document,
+        &spans,
+        null,
+        .{ .focus = .source, .source_cursor = 0 },
+        search,
+        live,
+        palette,
+    );
+
+    const geometry = source_geometry.SourceGeometry.init(test_surface.surface.size(), &document, true);
+    const keyword = test_surface.surface.readCell(geometry.text_col, geometry.body_first_row) orelse return error.ExpectedKeywordCell;
+    const searched = test_surface.surface.readCell(geometry.text_col + 6, geometry.body_first_row) orelse return error.ExpectedSearchCell;
+    const plain = test_surface.surface.readCell(geometry.text_col + 12, geometry.body_first_row) orelse return error.ExpectedPlainCell;
+    try std.testing.expectEqual(palette.color(.accent), keyword.style.fg);
+    try std.testing.expectEqual(palette.color(.warning), searched.style.fg);
+    try std.testing.expect(searched.style.bold);
+    try std.testing.expectEqual(palette.color(.prompt), plain.style.fg);
+    try std.testing.expect(keyword.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(searched.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(plain.style.bg.eql(palette.color(.diff_cursor)));
+}
+
+test "repository selection slice B whole-line style covers gutter numbers body and trailing cells" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "one\ntwo\n");
+    var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    const palette: theme.Palette = .default();
+    const token: selection.RepositoryContentToken = .{
+        .repo_epoch = 1,
+        .root_identity = .{ .device = 2, .inode = 3 },
+        .path = "main.zig",
+        .source_fingerprint = document.fingerprint,
+    };
+    var live = selection.DragSelection.init(token, .line, selection.pointFromLine(0));
+    live.update(selection.pointFromLine(1));
+
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(20, 5);
+    defer test_surface.deinit();
+    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, live, palette);
+    const geometry = source_geometry.SourceGeometry.init(test_surface.surface.size(), &document, true);
+    for ([_]struct { col: u16, row: u16 }{
+        .{ .col = 0, .row = geometry.body_first_row },
+        .{ .col = 1, .row = geometry.body_first_row },
+        .{ .col = 3, .row = geometry.body_first_row },
+        .{ .col = 19, .row = geometry.body_first_row },
+        .{ .col = 0, .row = geometry.body_first_row + 1 },
+        .{ .col = 19, .row = geometry.body_first_row + 1 },
+    }) |point| {
+        const cell = test_surface.surface.readCell(point.col, point.row) orelse return error.ExpectedSelectedCell;
+        try std.testing.expect(cell.style.bg.eql(palette.color(.diff_cursor)));
+    }
 }
 
 test "repository source syntax projection visits dense line and spans only once" {
