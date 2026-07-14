@@ -5,6 +5,7 @@ const theme = @import("theme");
 const app_state = @import("../state.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const page = @import("../page.zig");
+const page_link = @import("../page_link.zig");
 const git_backend = @import("../../git/backend.zig");
 const process_runner = @import("../../process/runner.zig");
 const root_capability = @import("../../repo/root_capability.zig");
@@ -17,6 +18,7 @@ const repository_tree = @import("../../repository/tree.zig");
 const source_syntax = @import("../../syntax/source.zig");
 const source_syntax_runtime = @import("../../syntax/source_runtime.zig");
 const repository_input = @import("repository/input.zig");
+const repository_incoming = @import("repository/incoming.zig");
 const repository_model = @import("repository/model.zig");
 const repository_navigation = @import("repository/navigation.zig");
 const repository_selection = @import("repository/selection.zig");
@@ -838,6 +840,10 @@ pub const RepositoryPageState = struct {
     bundle: ?Bundle = null,
     displayed_document: ?DisplayedDocument = null,
     selected_path: ?[]const u8 = null,
+    /// Owned contextual navigation request or bounded unavailable terminal.
+    /// Activation/deactivation and manual reload retain it; an explicit newer
+    /// destination, repository replacement, or deinit releases it once.
+    incoming: repository_incoming.State = .none,
     /// Live coordinates borrow `displayed_document`; every owner-replacement
     /// path must cancel this value before freeing source/path storage.
     source_selection: ?repository_selection.DragSelection = null,
@@ -855,6 +861,7 @@ pub const RepositoryPageState = struct {
     status: app_state.StatusMessage = .{},
 
     pub fn deinit(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
+        self.incoming.deinit(allocator);
         self.cancelSourceSelection();
         self.clearCompletedSelection(allocator);
         if (self.bundle) |*bundle| bundle.deinit(allocator);
@@ -898,6 +905,10 @@ pub const RepositoryPageState = struct {
         repo_epoch: u64,
         identity: ?root_capability.Identity,
     ) void {
+        if (self.incoming != .none) {
+            const owner = allocator orelse @panic("Repository incoming replacement requires an allocator");
+            self.incoming.dismiss(owner);
+        }
         self.cancelSourceSelection();
         if (self.completed_selection != null) {
             const owner = allocator orelse @panic("Repository completed-selection replacement requires an allocator");
@@ -936,6 +947,33 @@ pub const RepositoryPageState = struct {
         self.needs_document_revalidation = false;
         self.needs_syntax_request = false;
         self.needs_change_map_request = false;
+    }
+
+    /// Infallible owner-installation half of the shell's two-phase transition.
+    /// This deliberately does not inspect the manifest, change selected_path,
+    /// or start tasks; Slice B2 resolves an accepted location afterwards.
+    pub fn acceptIncoming(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        incoming: *page_link.RepositoryIncoming,
+    ) void {
+        self.incoming.accept(allocator, incoming);
+    }
+
+    pub fn dismissIncoming(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
+        self.incoming.dismiss(allocator);
+    }
+
+    pub fn incomingIsPending(self: *const RepositoryPageState) bool {
+        return self.incoming.isPending();
+    }
+
+    pub fn incomingUnavailable(self: *const RepositoryPageState) ?*const page_link.RepositoryUnavailable {
+        return self.incoming.unavailableValue();
+    }
+
+    pub fn terminalizeIncoming(self: *RepositoryPageState, reason: page_link.RepositoryUnavailableReason) bool {
+        return self.incoming.terminalize(reason);
     }
 
     pub fn prepareRequest(
@@ -1508,6 +1546,11 @@ pub const RepositoryPageState = struct {
         body_size: chasen.Size,
     ) RepositoryUpdate {
         var result: RepositoryUpdate = .{};
+        // A contextual destination is subordinate to the user's next
+        // destination/navigation command. Dismiss it before that command can
+        // mutate retained browser state. Pure presentation/cancel commands do
+        // not retarget the browser and therefore retain the owner.
+        if (navigationDismissesIncoming(msg)) self.dismissIncoming(allocator);
         // Drag/release are the only continuations of a live mouse owner.
         // Any independent page command becomes an explicit cancel terminal so
         // keyboard navigation/search cannot silently retarget the gesture.
@@ -2021,6 +2064,21 @@ pub const RepositoryPageState = struct {
     }
 };
 
+fn navigationDismissesIncoming(msg: Msg) bool {
+    return switch (msg) {
+        .toggle_line_numbers,
+        .cancel_source_selection,
+        .cancel_source_search,
+        .cancel_file_search,
+        .manifest_finished,
+        .document_finished,
+        .syntax_finished,
+        .change_map_finished,
+        => false,
+        else => true,
+    };
+}
+
 fn optionalPathEql(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null or right == null) return left == null and right == null;
     return std.mem.eql(u8, left.?, right.?);
@@ -2043,6 +2101,10 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
     const state = context.page_state;
+    if (state.incomingUnavailable()) |unavailable| {
+        try drawIncomingUnavailable(unavailable, surface, context.palette);
+        return;
+    }
     switch (state.load_state) {
         .idle, .no_repository, .failed => {
             const label: []const u8 = switch (state.load_state) {
@@ -2129,6 +2191,22 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         if (size.height > 2) try drawDocumentCheckpoint(state, path, &right, context.palette);
     } else {
         draw.copyClippedTextAt(&right, 1, 0, "No file selected", context.palette.style(.muted)) catch {};
+    }
+}
+
+fn drawIncomingUnavailable(
+    unavailable: *const page_link.RepositoryUnavailable,
+    surface: *chasen.Surface,
+    palette: theme.Palette,
+) !void {
+    const size = surface.size();
+    draw.copyClippedTextAt(surface, 1, 0, "Repository target unavailable", palette.boldStyle(.danger)) catch {};
+    if (size.height > 1) {
+        const path = try manifest.displayWindowAlloc(surface.frameAllocator(), unavailable.path, 0, size.width -| 2);
+        draw.copyClippedTextAt(surface, 1, 1, path.text(), palette.boldStyle(.accent)) catch {};
+    }
+    if (size.height > 2) {
+        draw.copyClippedTextAt(surface, 1, 2, unavailable.reason.message(), palette.style(.muted)) catch {};
     }
 }
 
@@ -4320,6 +4398,109 @@ test "repository page layout and mouse mapping share tree geometry" {
     const narrow = chasen.Size{ .width = 20, .height = 6 };
     try std.testing.expectEqual(narrow.width, bodyLayout(narrow).tree_width);
     try std.testing.expectEqual(Msg{ .mouse_row = 1 }, state.mouseToMsg(.{ .col = 19, .row = 2 }, .left, narrow).?);
+}
+
+test "repository transition B1 incoming lifecycle keeps one destination owner" {
+    const allocator = std.testing.allocator;
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .selected_path = "retained.zig",
+    };
+    defer state.deinit(allocator);
+
+    var location = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .location = .{ .path = "target.zig", .line = 9 } },
+    );
+    state.acceptIncoming(allocator, &location);
+    try std.testing.expect(state.incomingIsPending());
+    try std.testing.expectEqualStrings("retained.zig", state.selected_path.?);
+
+    state.deactivate();
+    try std.testing.expect(state.incomingIsPending());
+    state.activate(4, identity);
+    try std.testing.expect(state.incomingIsPending());
+    state.requestReload(true);
+    try std.testing.expect(state.incomingIsPending());
+
+    _ = state.applyNavigation(allocator, .toggle_line_numbers, .{ .width = 80, .height = 10 });
+    try std.testing.expect(state.incomingIsPending());
+    _ = state.applyNavigation(allocator, .cancel_file_search, .{ .width = 80, .height = 10 });
+    try std.testing.expect(state.incomingIsPending());
+
+    _ = state.applyNavigation(allocator, .move_down, .{ .width = 80, .height = 10 });
+    try std.testing.expect(!state.incomingIsPending());
+    try std.testing.expect(state.incomingUnavailable() == null);
+    try std.testing.expectEqualStrings("retained.zig", state.selected_path.?);
+
+    var unavailable = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .unavailable = .{ .path = "deleted.zig", .reason = .no_current_path } },
+    );
+    state.acceptIncoming(allocator, &unavailable);
+    try std.testing.expectEqualStrings("deleted.zig", state.incomingUnavailable().?.path);
+    try std.testing.expectEqualStrings("retained.zig", state.selected_path.?);
+
+    var successor = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .location = .{ .path = "successor.zig", .line = null } },
+    );
+    state.acceptIncoming(allocator, &successor);
+    try std.testing.expect(state.incomingIsPending());
+    try std.testing.expectEqualStrings("successor.zig", state.incoming.awaiting_manifest.path);
+
+    state.repositoryChanged(allocator, 8, .{ .device = 13, .inode = 21 });
+    try std.testing.expect(!state.incomingIsPending());
+    try std.testing.expect(state.incomingUnavailable() == null);
+    try std.testing.expect(state.selected_path == null);
+}
+
+test "repository transition B1 direct unavailable renders byte-safe terminal" {
+    const allocator = std.testing.allocator;
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("retained.zig\x00"),
+        .load_state = .loaded,
+        .repo_epoch = 4,
+        .root_identity = identity,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+
+    const raw_path = [_]u8{ 'o', 'l', 'd', '/', 0xff };
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .unavailable = .{ .path = &raw_path, .reason = .no_current_path } },
+    );
+    state.acceptIncoming(allocator, &incoming);
+    try std.testing.expectEqualSlices(u8, &raw_path, state.incomingUnavailable().?.path);
+    try std.testing.expectEqualStrings("retained.zig", state.selected_path.?);
+
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(80, 6);
+    defer test_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    const snapshot = try test_surface.snapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository target unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, page_link.RepositoryUnavailableReason.no_current_path.message()) != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "retained.zig") == null);
+
+    _ = state.applyNavigation(allocator, .toggle_line_numbers, .{ .width = 80, .height = 6 });
+    try std.testing.expect(state.incomingUnavailable() != null);
+    _ = state.applyNavigation(allocator, .tree_first, .{ .width = 80, .height = 6 });
+    try std.testing.expect(state.incomingUnavailable() == null);
 }
 
 test "repository page owns reload state transitions" {

@@ -49,6 +49,11 @@ pub const RepositoryLocationIntent = struct {
     root_identity: root_capability.Identity,
     path: []u8,
     line: ?u32,
+
+    pub fn deinit(self: *RepositoryLocationIntent, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.* = undefined;
+    }
 };
 
 pub const RepositoryUnavailable = struct {
@@ -56,6 +61,11 @@ pub const RepositoryUnavailable = struct {
     root_identity: root_capability.Identity,
     path: []u8,
     reason: RepositoryUnavailableReason,
+
+    pub fn deinit(self: *RepositoryUnavailable, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.* = undefined;
+    }
 };
 
 /// Move-only shell handoff value.
@@ -94,8 +104,8 @@ pub const RepositoryIncoming = union(enum) {
     pub fn deinit(self: *RepositoryIncoming, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .no_context => {},
-            .location => |location| allocator.free(location.path),
-            .unavailable => |unavailable| allocator.free(unavailable.path),
+            .location => |*location| location.deinit(allocator),
+            .unavailable => |*unavailable| unavailable.deinit(allocator),
         }
         self.* = undefined;
     }
