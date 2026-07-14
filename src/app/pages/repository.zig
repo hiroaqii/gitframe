@@ -1124,6 +1124,28 @@ pub const RepositoryPageState = struct {
         };
     }
 
+    /// Classify a manifest completion which cannot be accepted by the current
+    /// request identity. A contextual destination may remain pending only when
+    /// an explicitly named successor can still resolve it: the current task, a
+    /// scheduled revalidation, or reactivation of an inactive page. Without
+    /// one of those successors, retaining `awaiting_manifest` would create an
+    /// unbounded owner, so the destination moves to its request-failed terminal.
+    fn classifyMismatchedManifestFinished(self: *RepositoryPageState) ApplyOutcome {
+        if (self.incoming.manifestIntent() == null) return .discarded;
+
+        const current_task_can_advance = if (self.pending_generation) |pending|
+            pending == self.generation
+        else
+            false;
+        const scheduled_successor = self.active and self.root_identity != null and self.needs_revalidation;
+        const dormant_successor = !self.active;
+        if (current_task_can_advance or scheduled_successor or dormant_successor) return .discarded;
+
+        const terminalized = self.terminalizeIncoming(.request_failed);
+        std.debug.assert(terminalized);
+        return .failed;
+    }
+
     pub fn prepareRequest(
         self: *RepositoryPageState,
         allocator: std.mem.Allocator,
@@ -1394,7 +1416,7 @@ pub const RepositoryPageState = struct {
             finished.generation != self.generation or
             self.pending_generation != finished.generation)
         {
-            return .discarded;
+            return self.classifyMismatchedManifestFinished();
         }
         self.pending_generation = null;
         const expected_root = self.root_identity orelse {
@@ -5459,6 +5481,137 @@ test "repository transition B2b2b1 reactivation invalidates manifest predecessor
     };
     defer stale_manifest.deinit(allocator);
     try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &stale_manifest));
+    try expectIncomingRequestFailureForTest(&state, owned_address);
+    try std.testing.expect(state.bundle == null);
+}
+
+test "repository transition B2b2b2a manifest mismatch keeps a current task successor" {
+    const allocator = std.testing.allocator;
+    const identity = root_capability.Identity{ .device = 5, .inode = 8 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 3,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .generation = 8,
+        .pending_generation = 8,
+    };
+    defer state.deinit(allocator);
+    const owned_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "target.zig");
+
+    var stale: ManifestFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = identity,
+        .generation = 7,
+        .result = .{ .failed_static = "stale manifest" },
+    };
+    defer stale.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &stale));
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+    try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.manifestIntent().?.path.ptr));
+
+    var current: ManifestFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = identity,
+        .generation = 8,
+        .result = .{ .loaded = try bundleForTest("target.zig\x00") },
+    };
+    defer current.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &current));
+    try std.testing.expect(state.incoming == .awaiting_document);
+    try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.documentIntent().?.location.path.ptr));
+
+    // A later unrelated manifest mismatch cannot consume a document-stage
+    // destination; document completion owns that remaining decision.
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &stale));
+    try std.testing.expect(state.incoming == .awaiting_document);
+}
+
+test "repository transition B2b2b2a manifest mismatch keeps a scheduled successor" {
+    const allocator = std.testing.allocator;
+    const identity = root_capability.Identity{ .device = 5, .inode = 8 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 3,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .generation = 8,
+        .needs_revalidation = true,
+    };
+    defer state.deinit(allocator);
+    const owned_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "scheduled.zig");
+
+    var unmatched: ManifestFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = identity,
+        .generation = 8,
+        .result = .{ .failed_static = "unmatched manifest" },
+    };
+    defer unmatched.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &unmatched));
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+    try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.manifestIntent().?.path.ptr));
+
+    // If the named scheduled attempt cannot be prepared, its existing
+    // start-failure contract closes the same owner instead of adding a retry.
+    state.markRequestPreparationFailed(error.OutOfMemory);
+    try expectIncomingRequestFailureForTest(&state, owned_address);
+}
+
+test "repository transition B2b2b2a manifest mismatch keeps a dormant successor" {
+    const allocator = std.testing.allocator;
+    const identity = root_capability.Identity{ .device = 5, .inode = 8 };
+    var state: RepositoryPageState = .{
+        .active = false,
+        .activation_id = 3,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .generation = 8,
+    };
+    defer state.deinit(allocator);
+    const owned_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "dormant.zig");
+
+    var unmatched: ManifestFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = 2 },
+        .root_identity = identity,
+        .generation = 7,
+        .result = .{ .failed_static = "old activation" },
+    };
+    defer unmatched.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &unmatched));
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+    try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.manifestIntent().?.path.ptr));
+
+    state.activate(state.repo_epoch, identity);
+    try std.testing.expect(state.needs_revalidation);
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+    state.markRequestPreparationFailed(error.OutOfMemory);
+    try expectIncomingRequestFailureForTest(&state, owned_address);
+}
+
+test "repository transition B2b2b2a manifest mismatch without successor closes owner" {
+    const allocator = std.testing.allocator;
+    const identity = root_capability.Identity{ .device = 5, .inode = 8 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 3,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .generation = 8,
+    };
+    defer state.deinit(allocator);
+    const owned_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "orphaned.zig");
+
+    // The completion names the current generation but no pending task owns
+    // that generation and no revalidation is scheduled.
+    var unmatched: ManifestFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = identity,
+        .generation = 8,
+        .result = .{ .failed_static = "unowned completion" },
+    };
+    defer unmatched.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(allocator, &unmatched));
     try expectIncomingRequestFailureForTest(&state, owned_address);
     try std.testing.expect(state.bundle == null);
 }
