@@ -1130,20 +1130,66 @@ pub const RepositoryPageState = struct {
     /// scheduled revalidation, or reactivation of an inactive page. Without
     /// one of those successors, retaining `awaiting_manifest` would create an
     /// unbounded owner, so the destination moves to its request-failed terminal.
-    fn classifyMismatchedManifestFinished(self: *RepositoryPageState) ApplyOutcome {
-        if (self.incoming.manifestIntent() == null) return .discarded;
-
+    fn manifestOwnerHasSuccessor(self: *const RepositoryPageState) bool {
         const current_task_can_advance = if (self.pending_generation) |pending|
             pending == self.generation
         else
             false;
         const scheduled_successor = self.active and self.root_identity != null and self.needs_revalidation;
         const dormant_successor = !self.active;
-        if (current_task_can_advance or scheduled_successor or dormant_successor) return .discarded;
+        return current_task_can_advance or scheduled_successor or dormant_successor;
+    }
 
+    /// A document-stage destination may outlive a rejected completion only
+    /// when another explicit authority can still settle it. Inactive state is
+    /// a named successor because activation rewinds the owner to manifest
+    /// authority. Active state instead requires the exact current selection
+    /// basis plus either its bound task or a request the page can start next.
+    fn documentOwnerHasSuccessor(
+        self: *const RepositoryPageState,
+        pending: *const repository_incoming.AwaitingDocument,
+    ) bool {
+        if (!self.active) return true;
+
+        const root = self.root_identity orelse return false;
+        const selected = self.selected_path orelse return false;
+        if (pending.location.repo_epoch != self.repo_epoch or
+            !pending.location.root_identity.eql(root) or
+            pending.manifest_revision != self.manifest_revision or
+            !std.mem.eql(u8, pending.location.path, selected))
+        {
+            return false;
+        }
+
+        const current_task_can_advance = if (pending.document_generation) |bound|
+            self.document_generation == bound and self.pending_document_generation == bound
+        else
+            false;
+        return current_task_can_advance or self.wantsDocumentRequest();
+    }
+
+    /// Apply liveness to the owner which remains after a rejected completion,
+    /// not to the completion's stage. A stale document result may coexist with
+    /// an awaiting-manifest owner after reload; that owner is retained only if
+    /// its own manifest authority names a successor.
+    fn terminalizeIncomingOwnerWithoutSuccessor(self: *RepositoryPageState) bool {
+        const has_successor = switch (self.incoming) {
+            .awaiting_manifest => self.manifestOwnerHasSuccessor(),
+            .awaiting_document => |*pending| self.documentOwnerHasSuccessor(pending),
+            .none, .unavailable => return false,
+        };
+        if (has_successor) return false;
         const terminalized = self.terminalizeIncoming(.request_failed);
         std.debug.assert(terminalized);
-        return .failed;
+        return true;
+    }
+
+    fn classifyMismatchedManifestFinished(self: *RepositoryPageState) ApplyOutcome {
+        return if (self.terminalizeIncomingOwnerWithoutSuccessor()) .failed else .discarded;
+    }
+
+    fn classifyMismatchedDocumentFinished(self: *RepositoryPageState) ApplyOutcome {
+        return if (self.terminalizeIncomingOwnerWithoutSuccessor()) .failed else .discarded;
     }
 
     pub fn prepareRequest(
@@ -1519,27 +1565,32 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn applyDocumentFinished(self: *RepositoryPageState, allocator: std.mem.Allocator, finished: *DocumentFinished) ApplyOutcome {
-        if (finished.identity.origin != .repository or
-            finished.identity.repo_epoch != self.repo_epoch or
-            finished.identity.activation_id != self.activation_id or
+        const completion_owns_pending = finished.identity.origin == .repository and
+            finished.identity.repo_epoch == self.repo_epoch and
+            finished.identity.activation_id == self.activation_id and
+            self.pending_document_generation == finished.generation;
+        if (!completion_owns_pending or
             finished.generation != self.document_generation or
-            self.pending_document_generation != finished.generation or
             finished.manifest_revision != self.manifest_revision)
         {
-            return .discarded;
+            // A delivered completion is the terminal event for the exact task
+            // identity it owns even when its accepted manifest basis is now
+            // stale. It cannot remain named as a future successor.
+            if (completion_owns_pending) self.pending_document_generation = null;
+            return self.classifyMismatchedDocumentFinished();
         }
         self.pending_document_generation = null;
         const expected_root = self.root_identity orelse {
-            _ = self.terminalizeIncoming(.request_failed);
+            _ = self.terminalizeIncomingOwnerWithoutSuccessor();
             return .failed;
         };
         if (!expected_root.eql(finished.root_identity)) {
             self.status.set("Repository root changed", .{});
-            _ = self.terminalizeIncoming(.request_failed);
+            _ = self.terminalizeIncomingOwnerWithoutSuccessor();
             return .failed;
         }
-        const selected = self.selected_path orelse return .discarded;
-        if (!std.mem.eql(u8, selected, finished.path)) return .discarded;
+        const selected = self.selected_path orelse return self.classifyMismatchedDocumentFinished();
+        if (!std.mem.eql(u8, selected, finished.path)) return self.classifyMismatchedDocumentFinished();
 
         // The live drag borrows the displayed document and must always end
         // before its storage is replaced. A completed candidate is independent
@@ -1572,6 +1623,10 @@ pub const RepositoryPageState = struct {
         self.needs_change_map_request = self.currentSource() != null;
         self.status.clear();
         _ = self.resolveIncomingDocument(allocator, finished.generation);
+        // A completion may be valid for the ordinary selected source while an
+        // inconsistent contextual owner names a different revision/generation.
+        // Keep the accepted source, but never leave that owner unbounded.
+        _ = self.terminalizeIncomingOwnerWithoutSuccessor();
         return .changed;
     }
 
@@ -5521,10 +5576,17 @@ test "repository transition B2b2b2a manifest mismatch keeps a current task succe
     try std.testing.expect(state.incoming == .awaiting_document);
     try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.documentIntent().?.location.path.ptr));
 
-    // A later unrelated manifest mismatch cannot consume a document-stage
-    // destination; document completion owns that remaining decision.
+    // The manifest payload has no document-acceptance authority, but its
+    // rejection still classifies the remaining owner's liveness. The accepted
+    // manifest scheduled document revalidation, so that successor retains it.
     try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &stale));
     try std.testing.expect(state.incoming == .awaiting_document);
+
+    // Without that named document successor, the same reverse cross-stage
+    // rejection closes the same path owner instead of retaining it forever.
+    state.needs_document_revalidation = false;
+    try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(allocator, &stale));
+    try expectIncomingRequestFailureForTest(&state, owned_address);
 }
 
 test "repository transition B2b2b2a manifest mismatch keeps a scheduled successor" {
@@ -5614,6 +5676,268 @@ test "repository transition B2b2b2a manifest mismatch without successor closes o
     try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(allocator, &unmatched));
     try expectIncomingRequestFailureForTest(&state, owned_address);
     try std.testing.expect(state.bundle == null);
+}
+
+test "repository transition B2b2b2b document mismatch keeps a current task successor" {
+    const allocator = std.testing.allocator;
+    const identity = root_capability.Identity{ .device = 5, .inode = 8 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 3,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 9,
+        .document_generation = 12,
+        .pending_document_generation = 12,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    const owned_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "main.zig");
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    try std.testing.expect(state.incoming.bindDocumentGeneration(state.manifest_revision, "main.zig", 12));
+
+    var stale: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = identity,
+        .generation = 11,
+        .manifest_revision = state.manifest_revision - 1,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .value = .{ .inert = .binary },
+    };
+    defer stale.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyDocumentFinished(allocator, &stale));
+    try std.testing.expect(state.incoming == .awaiting_document);
+    try std.testing.expectEqual(@as(?u64, 12), state.pending_document_generation);
+    try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.documentIntent().?.location.path.ptr));
+
+    const bytes = try allocator.dupe(u8, "one\ntwo\nthree\n");
+    var current: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = identity,
+        .generation = 12,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .value = .{ .source = try source_document.Document.initOwned(allocator, bytes, .init(bytes)) },
+    };
+    defer current.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &current));
+    try std.testing.expect(state.incoming == .none);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
+}
+
+test "repository transition B2b2b2b document mismatch keeps a scheduled successor" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 3,
+        .repo_epoch = 4,
+        .root_identity = root.capability.identity,
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 9,
+        .document_generation = 12,
+        .pending_document_generation = 12,
+        .needs_document_revalidation = true,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    const owned_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "main.zig");
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    try std.testing.expect(state.incoming.bindDocumentGeneration(state.manifest_revision, "main.zig", 12));
+
+    var stale: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = root.capability.identity,
+        .generation = 12,
+        .manifest_revision = state.manifest_revision - 1,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .value = .{ .inert = .binary },
+    };
+    defer stale.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyDocumentFinished(allocator, &stale));
+    try std.testing.expect(state.incoming == .awaiting_document);
+    try std.testing.expect(state.pending_document_generation == null);
+    try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.documentIntent().?.location.path.ptr));
+
+    var request = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer request.deinit(allocator);
+    try std.testing.expect(request.generation > 12);
+    const bytes = try allocator.dupe(u8, "new one\nnew two\nnew three\n");
+    var current: DocumentFinished = .{
+        .identity = request.identity,
+        .root_identity = request.root.identity,
+        .generation = request.generation,
+        .manifest_revision = request.manifest_revision,
+        .path = try allocator.dupe(u8, request.path),
+        .value = .{ .source = try source_document.Document.initOwned(allocator, bytes, .init(bytes)) },
+    };
+    defer current.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &current));
+    try std.testing.expect(state.incoming == .none);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
+}
+
+test "repository transition B2b2b2b document mismatch keeps a dormant successor" {
+    const allocator = std.testing.allocator;
+    const identity = root_capability.Identity{ .device = 5, .inode = 8 };
+    var state: RepositoryPageState = .{
+        .active = false,
+        .activation_id = 3,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .manifest_revision = 9,
+        .document_generation = 12,
+    };
+    defer state.deinit(allocator);
+    const owned_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "dormant.zig");
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    try std.testing.expect(state.incoming.bindDocumentGeneration(state.manifest_revision, "dormant.zig", 11));
+
+    var stale: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = 2 },
+        .root_identity = identity,
+        .generation = 11,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, "dormant.zig"),
+        .value = .{ .inert = .binary },
+    };
+    defer stale.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyDocumentFinished(allocator, &stale));
+    try std.testing.expect(state.incoming == .awaiting_document);
+    try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.documentIntent().?.location.path.ptr));
+
+    state.activate(state.repo_epoch, identity);
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+    state.markRequestPreparationFailed(error.OutOfMemory);
+    try expectIncomingRequestFailureForTest(&state, owned_address);
+}
+
+test "repository transition B2b2b2b document mismatch without successor closes owner" {
+    const allocator = std.testing.allocator;
+    const identity = root_capability.Identity{ .device = 5, .inode = 8 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 3,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 9,
+        .document_generation = 12,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    const owned_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "main.zig");
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    try std.testing.expect(state.incoming.bindDocumentGeneration(state.manifest_revision, "main.zig", 11));
+
+    var stale: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = identity,
+        .generation = 11,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .value = .{ .inert = .binary },
+    };
+    defer stale.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.failed, state.applyDocumentFinished(allocator, &stale));
+    try expectIncomingRequestFailureForTest(&state, owned_address);
+    try std.testing.expect(state.displayed_document == null);
+
+    state.dismissIncoming(allocator);
+    const wrong_path_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "main.zig");
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    state.document_generation = 13;
+    state.pending_document_generation = 13;
+    try std.testing.expect(state.incoming.bindDocumentGeneration(state.manifest_revision, "main.zig", 13));
+    var wrong_path: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = identity,
+        .generation = 13,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, "other.zig"),
+        .value = .{ .inert = .binary },
+    };
+    defer wrong_path.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.failed, state.applyDocumentFinished(allocator, &wrong_path));
+    try expectIncomingRequestFailureForTest(&state, wrong_path_address);
+
+    // Cross-stage rejection evaluates the manifest owner's own liveness. The
+    // document root failure is not its terminal reason, but a scheduled
+    // manifest revalidation is a valid reason to retain it.
+    state.dismissIncoming(allocator);
+    const manifest_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "main.zig");
+    state.needs_revalidation = true;
+    state.document_generation = 14;
+    state.pending_document_generation = 14;
+    var wrong_root: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = .{ .device = identity.device, .inode = identity.inode +% 1 },
+        .generation = 14,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .value = .{ .inert = .binary },
+    };
+    defer wrong_root.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.failed, state.applyDocumentFinished(allocator, &wrong_root));
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+    try std.testing.expectEqual(manifest_address, @intFromPtr(state.incoming.manifestIntent().?.path.ptr));
+
+    // Once that named successor disappears, a later cross-stage rejection
+    // closes the orphaned manifest owner rather than leaving it pending.
+    state.needs_revalidation = false;
+    state.document_generation = 15;
+    state.pending_document_generation = 15;
+    var no_successor_root: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = .{ .device = identity.device, .inode = identity.inode +% 1 },
+        .generation = 15,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .value = .{ .inert = .binary },
+    };
+    defer no_successor_root.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.failed, state.applyDocumentFinished(allocator, &no_successor_root));
+    try expectIncomingRequestFailureForTest(&state, manifest_address);
+}
+
+test "repository transition B2b2b2b accepted source closes inconsistent document owner" {
+    const allocator = std.testing.allocator;
+    const identity = root_capability.Identity{ .device = 5, .inode = 8 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 3,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 9,
+        .document_generation = 12,
+        .pending_document_generation = 12,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    const owned_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "main.zig");
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    try std.testing.expect(state.incoming.bindDocumentGeneration(state.manifest_revision, "main.zig", 11));
+
+    const bytes = try allocator.dupe(u8, "accepted source\n");
+    var finished: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = identity,
+        .generation = 12,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, "main.zig"),
+        .value = .{ .source = try source_document.Document.initOwned(allocator, bytes, .init(bytes)) },
+    };
+    defer finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &finished));
+    try expectIncomingRequestFailureForTest(&state, owned_address);
+    try std.testing.expectEqualStrings("accepted source\n", state.currentSource().?.bytes);
 }
 
 test "repository page owns reload state transitions" {
