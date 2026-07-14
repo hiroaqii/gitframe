@@ -5502,6 +5502,26 @@ test "terminal resize cancels live drag before geometry and retains completed se
     try std.testing.expectEqual(chasen.Size{ .width = 120, .height = 30 }, app.terminal_size);
 }
 
+test "inert diff hunk command reports bounded encoding diagnostic" {
+    const eligibility = [_]loaded_diff.FileTextEligibility{.inert_invalid_utf8};
+    var loaded = app_test_support.loadedDiffOne();
+    loaded.file_text_eligibility = &eligibility;
+    var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(loaded),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        } },
+        .allocator = std.testing.allocator,
+    };
+    defer app.reviewReload().clearLoadedDiff(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.update(.{ .review = .toggle_selected_hunk }, &ctx);
+
+    try std.testing.expectEqualStrings(git_ops.inert_hunk_action_message, app.pages.review.status.text());
+    try std.testing.expect(std.mem.indexOfScalar(u8, app.pages.review.status.text(), 0xff) == null);
+}
+
 test "hidden sidebar keeps tab from changing focus" {
     var app: App = .{
         .pages = .{ .review = .{
