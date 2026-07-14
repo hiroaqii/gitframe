@@ -6,10 +6,14 @@
 //! teardown return an explicit command to the App shell.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const message = @import("message.zig");
 const navigation = @import("navigation.zig");
+const review_selection = @import("selection.zig");
 const diff_selection = @import("../../../diff/selection.zig");
+const root_capability = @import("../../../repo/root_capability.zig");
 const review_session = @import("../../../review/session.zig");
+const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
 pub const Command = union(enum) {
     enter_commit_panel,
@@ -24,15 +28,16 @@ pub const Command = union(enum) {
     open_selected_file_in_editor,
     copy_current_line,
     copy_current_hunk,
-    /// Owns the cloned identity path until App consumes/deinitializes it.
-    copy_diff_selection: diff_selection.DragSelection,
+    /// Separately owned clipboard bytes assembled from the installed page
+    /// candidate. They never borrow the displayed diff/source owner.
+    copy_diff_selection: []u8,
     /// Owns the cloned identity path until App consumes/deinitializes it.
     copy_diff_header_path: diff_selection.HeaderPathSelection,
     finish_review: review_session.Decision,
 
     pub fn deinit(self: *Command, allocator: ?std.mem.Allocator) void {
         switch (self.*) {
-            .copy_diff_selection => |*selection| deinitDragSelection(allocator orelse unreachable, selection),
+            .copy_diff_selection => |text| (allocator orelse unreachable).free(text),
             .copy_diff_header_path => |*selection| (allocator orelse unreachable).free(selection.identity.path_key),
             else => {},
         }
@@ -58,6 +63,8 @@ pub const ReviewUpdate = struct {
 
 pub const Controller = struct {
     navigation: navigation.Controller,
+    repo_epoch: u64 = 0,
+    root_identity: ?root_capability.Identity = null,
 
     /// `allocator` may be null only for transitions that neither allocate nor
     /// return an owned command. Runtime App initialization always supplies one;
@@ -209,16 +216,78 @@ pub const Controller = struct {
 
     fn releaseDiffMouse(self: Controller, allocator: std.mem.Allocator) !?Command {
         const owner = self.navigation.page.selection_owner;
-        const command: ?Command = switch (owner) {
+        return switch (owner) {
             .none => null,
-            .diff => |selection| if (selection.moved)
-                .{ .copy_diff_selection = try cloneDragSelection(allocator, selection) }
-            else
-                null,
-            .diff_header => |selection| .{ .copy_diff_header_path = try cloneHeaderSelection(allocator, selection) },
+            .diff => |selection| blk: {
+                if (!selection.moved) {
+                    self.navigation.clearDiffSelection();
+                    break :blk null;
+                }
+
+                var candidate = self.buildCompletedSelection(allocator, selection) catch {
+                    if (self.navigation.page.completed_selection) |*prior| prior.deinit(allocator);
+                    self.navigation.page.completed_selection = null;
+                    self.navigation.clearDiffSelection();
+                    break :blk null;
+                };
+                if (self.navigation.page.completed_selection) |*prior| prior.deinit(allocator);
+                self.navigation.page.completed_selection = candidate;
+                candidate = undefined;
+                self.navigation.clearDiffSelection();
+
+                const clipboard = self.navigation.page.completed_selection.?.clipboardText(allocator) catch break :blk null;
+                break :blk .{ .copy_diff_selection = clipboard };
+            },
+            .diff_header => |selection| blk: {
+                const command: Command = .{ .copy_diff_header_path = try cloneHeaderSelection(allocator, selection) };
+                self.navigation.clearDiffSelection();
+                break :blk command;
+            },
         };
-        self.navigation.clearDiffSelection();
-        return command;
+    }
+
+    fn buildCompletedSelection(self: Controller, allocator: std.mem.Allocator, selection: diff_selection.DragSelection) !review_selection.CompletedSelection {
+        const token = self.contentToken(selection) orelse return error.StaleSelection;
+        return switch (selection.identity) {
+            .loaded_file, .projection_file => blk: {
+                const target = self.navigation.view().parsedSelectionTarget(selection.identity) orelse return error.StaleSelection;
+                break :blk try review_selection.buildParsed(allocator, token, target.file, selection);
+            },
+            .generated_file => |generated| blk: {
+                const bundle = self.navigation.view().activeGeneratedFileProjection() orelse return error.StaleSelection;
+                if (!std.mem.eql(u8, generated.path_key, bundle.path)) return error.StaleSelection;
+                break :blk try review_selection.buildGenerated(allocator, token, bundle.path, &bundle.source, selection);
+            },
+        };
+    }
+
+    fn contentToken(self: Controller, selection: diff_selection.DragSelection) ?review_selection.ReviewContentToken {
+        const page = self.navigation.page;
+        const display: review_selection.DisplayBasis = switch (self.navigation.view().displayedReviewBody()) {
+            .primary => |primary| .{ .loaded = .init(primary.loaded.text) },
+            .cached => |bundle| .{ .cached_projection = .{
+                .status_snapshot_revision = page.status_snapshot_revision,
+                .cached = bundle.fingerprint,
+            } },
+            .combined => |bundle| .{ .combined_projection = .{
+                .status_snapshot_revision = page.status_snapshot_revision,
+                .cached = bundle.cached_bundle.fingerprint,
+                .unstaged = bundle.unstaged_bundle.fingerprint,
+            } },
+            .generated => |bundle| .{ .generated_untracked = .{
+                .status_snapshot_revision = page.status_snapshot_revision,
+                .source = bundle.fingerprint(),
+            } },
+            .none, .inert_invalid_utf8, .status, .pending => return null,
+        };
+        _ = selection;
+        return .{
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.root_identity,
+            .source = review_selection.SourceBasis.init(self.navigation.source),
+            .source_session_revision = page.source_session_revision,
+            .display = display,
+        };
     }
 };
 
@@ -260,25 +329,6 @@ fn tracksDisplayNavigation(msg: message.Msg) bool {
     };
 }
 
-fn cloneDragSelection(allocator: std.mem.Allocator, selection: diff_selection.DragSelection) !diff_selection.DragSelection {
-    var cloned = selection;
-    switch (cloned.identity) {
-        .loaded_file => |*loaded| loaded.path_key = try allocator.dupe(u8, loaded.path_key),
-        .projection_file => |*projected| projected.path_key = try allocator.dupe(u8, projected.path_key),
-        .generated_file => |*generated| generated.path_key = try allocator.dupe(u8, generated.path_key),
-    }
-    return cloned;
-}
-
-fn deinitDragSelection(allocator: std.mem.Allocator, selection: *diff_selection.DragSelection) void {
-    switch (selection.identity) {
-        .loaded_file => |loaded| allocator.free(loaded.path_key),
-        .projection_file => |projected| allocator.free(projected.path_key),
-        .generated_file => |generated| allocator.free(generated.path_key),
-    }
-    selection.* = undefined;
-}
-
 fn cloneHeaderSelection(allocator: std.mem.Allocator, selection: diff_selection.HeaderPathSelection) !diff_selection.HeaderPathSelection {
     var cloned = selection;
     cloned.identity.path_key = try allocator.dupe(u8, selection.identity.path_key);
@@ -306,11 +356,14 @@ test "review update owns state transition and shell intent" {
 }
 
 test "review mouse release returns one owned copy command" {
-    var page: @import("../review.zig").ReviewPageState = .{};
+    var page: @import("../review.zig").ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+    };
+    defer page.deinit(std.testing.allocator);
     page.selection_owner = .{ .diff = .{
-        .identity = .{ .loaded_file = .{ .file_index = 2, .path_key = "src/app.zig" } },
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
         .side = .new,
-        .anchor = .{ .hunk_index = 0, .line_index = 1 },
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 3 },
         .moved = true,
     } };
@@ -329,10 +382,97 @@ test "review mouse release returns one owned copy command" {
     var command = update.takeCommand() orelse return error.ExpectedCopyCommand;
     defer command.deinit(std.testing.allocator);
     switch (command) {
-        .copy_diff_selection => |selection| switch (selection.identity) {
-            .loaded_file => |loaded| try std.testing.expectEqualStrings("src/app.zig", loaded.path_key),
-            .projection_file, .generated_file => return error.ExpectedCopyCommand,
-        },
+        .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\nnew\n", text),
         else => return error.ExpectedCopyCommand,
     }
+    try std.testing.expect(page.completed_selection != null);
+
+    const retained_token = page.completed_selection.?.token;
+    page.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 0 },
+        .moved = false,
+    } };
+    var click = try controller.apply(std.testing.allocator, .{ .mouse_diff_release = null });
+    defer click.deinit(std.testing.allocator);
+    try std.testing.expect(click.command == null);
+    try std.testing.expect(page.selection_owner == .none);
+    try std.testing.expect(page.completed_selection != null);
+    try std.testing.expect(page.completed_selection.?.token.eql(retained_token));
+}
+
+test "failed moved release clears prior candidate without emitting clipboard work" {
+    const allocator = std.testing.allocator;
+    var page: @import("../review.zig").ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+    };
+    defer page.deinit(allocator);
+    const controller: Controller = .{ .navigation = .{
+        .page = &page,
+        .repo_root = null,
+        .source = .unstaged,
+        .layout = .{ .width = 80, .height = 20 },
+        .diagnostics = .{ .target = &page.status },
+    } };
+
+    page.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 1 },
+        .moved = true,
+    } };
+    var accepted = try controller.apply(allocator, .{ .mouse_diff_release = null });
+    defer accepted.deinit(allocator);
+    try std.testing.expect(page.completed_selection != null);
+
+    page.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "different" } },
+        .side = .new,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 1 },
+        .moved = true,
+    } };
+    var rejected = try controller.apply(allocator, .{ .mouse_diff_release = null });
+    defer rejected.deinit(allocator);
+    try std.testing.expect(rejected.command == null);
+    try std.testing.expect(page.completed_selection == null);
+    try std.testing.expect(page.selection_owner == .none);
+}
+
+test "clipboard allocation failure retains the accepted candidate" {
+    const backing = std.testing.allocator;
+    var observed_clipboard_failure = false;
+    var fail_index: usize = 0;
+    while (fail_index < 16 and !observed_clipboard_failure) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        var page: @import("../review.zig").ReviewPageState = .{
+            .load = test_support.loadState(test_support.loadedDiffOne()),
+        };
+        defer page.deinit(failing.allocator());
+        page.selection_owner = .{ .diff = .{
+            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+            .side = .new,
+            .anchor = .{ .hunk_index = 0, .line_index = 0 },
+            .focus = .{ .hunk_index = 0, .line_index = 1 },
+            .moved = true,
+        } };
+        const controller: Controller = .{ .navigation = .{
+            .page = &page,
+            .repo_root = null,
+            .source = .unstaged,
+            .layout = .{ .width = 80, .height = 20 },
+            .diagnostics = .{ .target = &page.status },
+        } };
+
+        var update = try controller.apply(failing.allocator(), .{ .mouse_diff_release = null });
+        defer update.deinit(failing.allocator());
+        if (page.completed_selection != null and update.command == null) {
+            observed_clipboard_failure = true;
+            try std.testing.expect(page.selection_owner == .none);
+        }
+    }
+    try std.testing.expect(observed_clipboard_failure);
 }

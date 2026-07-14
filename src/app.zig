@@ -653,7 +653,11 @@ pub const App = struct {
     }
 
     fn updateReview(self: *App, ctx: *chasen.Ctx(Msg), msg: review_message.Msg) !void {
-        var page_update = try (review_page_update.Controller{ .navigation = self.reviewNavigation() }).apply(self.allocator, msg);
+        var page_update = try (review_page_update.Controller{
+            .navigation = self.reviewNavigation(),
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.repo_state.activeIdentity(),
+        }).apply(self.allocator, msg);
         defer page_update.deinit(self.allocator);
 
         if (page_update.capture_display_override) {
@@ -676,7 +680,7 @@ pub const App = struct {
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .copy_current_line => self.copyCurrentLine(ctx),
             .copy_current_hunk => try self.copyCurrentHunk(ctx),
-            .copy_diff_selection => |selection| try self.copyDiffSelection(ctx, selection),
+            .copy_diff_selection => |text| self.copyDiffSelection(ctx, text),
             .copy_diff_header_path => |selection| self.copyDiffHeaderPath(ctx, selection),
             .finish_review => |decision| try self.finishReview(ctx, decision),
         }
@@ -3775,9 +3779,7 @@ pub const App = struct {
         }
     }
 
-    fn copyDiffSelection(self: *App, ctx: *chasen.Ctx(Msg), selection: diff_selection.DragSelection) !void {
-        const text = try self.reviewContent().diffSelectionCopyText(ctx.allocator(), selection) orelse return;
-        defer ctx.allocator().free(text);
+    fn copyDiffSelection(self: *App, ctx: *chasen.Ctx(Msg), text: []const u8) void {
         self.queueClipboardCopy(ctx, .{
             .origin = .{ .page = self.reviewPageEffectOrigin() },
             .label = "diff selection",
