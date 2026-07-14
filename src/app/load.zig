@@ -1193,7 +1193,8 @@ fn buildLoadedBundleWithOptions(
     // diff text and parser-allocated arrays in the same arena.
     const copied = try arena_allocator.dupe(u8, bytes);
     const document = try diff_parser.parse(arena_allocator, copied);
-    const syntax_spans = try syntax_provider.buildDocumentSpans(arena_allocator, io, document);
+    const file_text_eligibility = try @import("../diff/text_eligibility.zig").classifyDocument(arena_allocator, document);
+    const syntax_spans = try syntax_provider.buildDocumentSpans(arena_allocator, io, document, file_text_eligibility);
     const tree = try file_tree.buildWithOptions(arena_allocator, document, null, tree_options);
     const rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document);
     const collapsed_hunks = try arena_allocator.alloc(bool, document.totalHunks());
@@ -1235,6 +1236,27 @@ pub fn countLines(bytes: []const u8) usize {
         if (byte == '\n') count += 1;
     }
     return count;
+}
+
+test "every invalid file remains admitted as a tree entry" {
+    const patch =
+        "diff --git a/a.zig b/a.zig\n" ++
+        "--- a/a.zig\n" ++
+        "+++ b/a.zig\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+bad\xff\n" ++
+        "diff --git a/b.zig b/b.zig\n" ++
+        "--- a/b.zig\n" ++
+        "+++ b/b.zig\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+truncated\xf0\x9f\n";
+    var bundle = try buildLoadedBundle(std.testing.allocator, patch);
+    defer bundle.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), bundle.loaded.document.files.len);
+    try std.testing.expectEqual(@as(usize, 2), bundle.loaded.visibleNodeCount());
 }
 
 test "expected raw fingerprint returns unchanged before diff parsing" {

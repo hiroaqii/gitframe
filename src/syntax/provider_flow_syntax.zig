@@ -3,10 +3,12 @@ const diff_parser = @import("../diff/parser.zig");
 const flow_syntax = @import("flow_syntax");
 const provider = @import("provider.zig");
 const token = @import("token.zig");
+const text_eligibility = @import("../diff/text_eligibility.zig");
 
 // `tools/projection_perf.zig` mirrors this hunk-side pipeline for stage-level
 // measurements. Keep that developer-only mirror in sync when this work order changes.
-pub fn buildDocumentSpans(allocator: std.mem.Allocator, io: std.Io, document: diff_parser.DiffDocument) !provider.DocumentSpans {
+pub fn buildDocumentSpans(allocator: std.mem.Allocator, io: std.Io, document: diff_parser.DiffDocument, eligibility: []const text_eligibility.FileTextEligibility) !provider.DocumentSpans {
+    std.debug.assert(eligibility.len == document.files.len);
     var spans = try provider.allocateEmptyForDocument(allocator, document);
     errdefer spans.deinit(allocator);
 
@@ -17,7 +19,7 @@ pub fn buildDocumentSpans(allocator: std.mem.Allocator, io: std.Io, document: di
     defer query_cache.deinit();
 
     for (document.files, 0..) |file, file_index| {
-        if (file.is_binary) continue;
+        if (file.is_binary or !eligibility[file_index].selectable()) continue;
         for (file.hunks, 0..) |hunk, hunk_index| {
             highlightHunkSide(allocator, &spans, query_cache, file, hunk, .{
                 .file_index = file_index,
@@ -123,3 +125,65 @@ const RenderContext = struct {
         };
     }
 };
+
+test "mixed eligibility skips invalid files without shifting valid span indices" {
+    const invalid_lines = [_]diff_parser.DiffLine{.{
+        .kind = .added,
+        .text = "bad\xff",
+        .new_line = 1,
+    }};
+    const valid_lines = [_]diff_parser.DiffLine{.{
+        .kind = .added,
+        .text = "const value: usize = 1;",
+        .new_line = 1,
+    }};
+    const files = [_]diff_parser.FileDiff{
+        .{
+            .header = "diff --git a/invalid.zig b/invalid.zig",
+            .old_path = "a/invalid.zig",
+            .new_path = "b/invalid.zig",
+            .metadata = &.{},
+            .hunks = &.{.{
+                .old_start = 1,
+                .old_count = 0,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "",
+                .lines = &invalid_lines,
+            }},
+        },
+        .{
+            .header = "diff --git a/valid.zig b/valid.zig",
+            .old_path = "a/valid.zig",
+            .new_path = "b/valid.zig",
+            .metadata = &.{},
+            .hunks = &.{.{
+                .old_start = 1,
+                .old_count = 0,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "",
+                .lines = &valid_lines,
+            }},
+        },
+    };
+    const eligibility = [_]text_eligibility.FileTextEligibility{ .inert_invalid_utf8, .selectable_utf8 };
+    var spans = try buildDocumentSpans(std.testing.allocator, std.testing.io, .{ .files = &files }, &eligibility);
+    defer spans.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), spans.files.len);
+    try std.testing.expectEqual(@as(usize, 0), spans.lineSpans(.{
+        .file_index = 0,
+        .hunk_index = 0,
+        .line_index = 0,
+        .side = .new,
+    }).spans.len);
+    const valid = spans.lineSpans(.{
+        .file_index = 1,
+        .hunk_index = 0,
+        .line_index = 0,
+        .side = .new,
+    });
+    try std.testing.expect(valid.spans.len > 0);
+    try std.testing.expectEqual(token.TokenRole.keyword, valid.spans[0].role);
+}
