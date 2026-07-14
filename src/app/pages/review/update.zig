@@ -264,6 +264,8 @@ fn cloneDragSelection(allocator: std.mem.Allocator, selection: diff_selection.Dr
     var cloned = selection;
     switch (cloned.identity) {
         .loaded_file => |*loaded| loaded.path_key = try allocator.dupe(u8, loaded.path_key),
+        .projection_file => |*projected| projected.path_key = try allocator.dupe(u8, projected.path_key),
+        .generated_file => |*generated| generated.path_key = try allocator.dupe(u8, generated.path_key),
     }
     return cloned;
 }
@@ -271,6 +273,8 @@ fn cloneDragSelection(allocator: std.mem.Allocator, selection: diff_selection.Dr
 fn deinitDragSelection(allocator: std.mem.Allocator, selection: *diff_selection.DragSelection) void {
     switch (selection.identity) {
         .loaded_file => |loaded| allocator.free(loaded.path_key),
+        .projection_file => |projected| allocator.free(projected.path_key),
+        .generated_file => |generated| allocator.free(generated.path_key),
     }
     selection.* = undefined;
 }
@@ -327,6 +331,7 @@ test "review mouse release returns one owned copy command" {
     switch (command) {
         .copy_diff_selection => |selection| switch (selection.identity) {
             .loaded_file => |loaded| try std.testing.expectEqualStrings("src/app.zig", loaded.path_key),
+            .projection_file, .generated_file => return error.ExpectedCopyCommand,
         },
         else => return error.ExpectedCopyCommand,
     }
