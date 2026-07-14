@@ -3,22 +3,36 @@
 //! The shell prepares `page_link.RepositoryIncoming` before page mutation.
 //! `State.accept` is the allocation-free, infallible commit boundary: it
 //! releases any previous owner and moves exactly one incoming arm into the
-//! Repository page. Manifest/document resolution is added by the next slice;
-//! this module first closes direct-unavailable presentation and every owner
-//! terminal that does not depend on async request generations.
+//! Repository page. The owner advances through explicit manifest and document
+//! stages so async completions cannot apply a location after a newer browser
+//! destination has won. Document-generation binding and accepted-source line
+//! application remain a separate slice from exact manifest resolution.
 
 const std = @import("std");
 const page_link = @import("../../page_link.zig");
 
+pub const AwaitingDocument = struct {
+    location: page_link.RepositoryLocationIntent,
+    manifest_revision: u64,
+    document_generation: ?u64 = null,
+
+    pub fn deinit(self: *AwaitingDocument, allocator: std.mem.Allocator) void {
+        self.location.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const State = union(enum) {
     none,
     awaiting_manifest: page_link.RepositoryLocationIntent,
+    awaiting_document: AwaitingDocument,
     unavailable: page_link.RepositoryUnavailable,
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .none => {},
             .awaiting_manifest => |*intent| intent.deinit(allocator),
+            .awaiting_document => |*pending| pending.deinit(allocator),
             .unavailable => |*unavailable| unavailable.deinit(allocator),
         }
         self.* = .none;
@@ -37,12 +51,27 @@ pub const State = union(enum) {
         };
     }
 
+    /// Move an exact manifest match into the document stage without copying
+    /// its byte-exact path. A later slice binds the selected-file generation.
+    pub fn advanceToDocument(self: *State, manifest_revision: u64) bool {
+        const location = switch (self.*) {
+            .awaiting_manifest => |location| location,
+            .none, .awaiting_document, .unavailable => return false,
+        };
+        self.* = .{ .awaiting_document = .{
+            .location = location,
+            .manifest_revision = manifest_revision,
+        } };
+        return true;
+    }
+
     /// Convert a destination-known failure into the same owner used by a
     /// source-known direct-unavailable handoff. The path allocation is moved,
     /// never duplicated.
     pub fn terminalize(self: *State, reason: page_link.RepositoryUnavailableReason) bool {
         const intent = switch (self.*) {
             .awaiting_manifest => |intent| intent,
+            .awaiting_document => |pending| pending.location,
             .none, .unavailable => return false,
         };
         self.* = .{ .unavailable = .{
@@ -59,13 +88,30 @@ pub const State = union(enum) {
     }
 
     pub fn isPending(self: *const State) bool {
-        return self.* == .awaiting_manifest;
+        return switch (self.*) {
+            .awaiting_manifest, .awaiting_document => true,
+            .none, .unavailable => false,
+        };
+    }
+
+    pub fn manifestIntent(self: *const State) ?*const page_link.RepositoryLocationIntent {
+        return switch (self.*) {
+            .awaiting_manifest => |*intent| intent,
+            .none, .awaiting_document, .unavailable => null,
+        };
+    }
+
+    pub fn documentIntent(self: *const State) ?*const AwaitingDocument {
+        return switch (self.*) {
+            .awaiting_document => |*pending| pending,
+            .none, .awaiting_manifest, .unavailable => null,
+        };
     }
 
     pub fn unavailableValue(self: *const State) ?*const page_link.RepositoryUnavailable {
         return switch (self.*) {
             .unavailable => |*unavailable| unavailable,
-            .none, .awaiting_manifest => null,
+            .none, .awaiting_manifest, .awaiting_document => null,
         };
     }
 };
@@ -125,4 +171,30 @@ test "Repository incoming terminal moves byte-exact path without allocation" {
     try std.testing.expectEqualSlices(u8, &raw_path, state.unavailable.path);
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.path_not_found, state.unavailable.reason);
     try std.testing.expect(!state.terminalize(.request_failed));
+}
+
+test "Repository incoming advances exact manifest owner then terminalizes by move" {
+    const allocator = std.testing.allocator;
+    var state: State = .none;
+    defer state.deinit(allocator);
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        7,
+        .{ .device = 11, .inode = 13 },
+        .{ .location = .{ .path = "src/main.zig", .line = 42 } },
+    );
+    state.accept(allocator, &incoming);
+    const owned_address = @intFromPtr(state.awaiting_manifest.path.ptr);
+
+    try std.testing.expect(state.advanceToDocument(9));
+    try std.testing.expect(state.isPending());
+    const pending = state.documentIntent().?;
+    try std.testing.expectEqual(@as(u64, 9), pending.manifest_revision);
+    try std.testing.expectEqual(@as(?u64, null), pending.document_generation);
+    try std.testing.expectEqual(@as(?u32, 42), pending.location.line);
+    try std.testing.expectEqual(owned_address, @intFromPtr(pending.location.path.ptr));
+    try std.testing.expect(!state.advanceToDocument(10));
+
+    try std.testing.expect(state.terminalize(.source_unavailable));
+    try std.testing.expectEqual(owned_address, @intFromPtr(state.unavailable.path.ptr));
 }

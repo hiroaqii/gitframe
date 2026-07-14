@@ -950,8 +950,8 @@ pub const RepositoryPageState = struct {
     }
 
     /// Infallible owner-installation half of the shell's two-phase transition.
-    /// This deliberately does not inspect the manifest, change selected_path,
-    /// or start tasks; Slice B2 resolves an accepted location afterwards.
+    /// Identity-dependent resolution must wait until Repository activation has
+    /// installed the current repo epoch/root under the approved commit order.
     pub fn acceptIncoming(
         self: *RepositoryPageState,
         allocator: std.mem.Allocator,
@@ -974,6 +974,79 @@ pub const RepositoryPageState = struct {
 
     pub fn terminalizeIncoming(self: *RepositoryPageState, reason: page_link.RepositoryUnavailableReason) bool {
         return self.incoming.terminalize(reason);
+    }
+
+    /// Continue a newly committed owner only after `activate` establishes the
+    /// destination identity. Slice C calls this allocation-free operation
+    /// after its owner-move/deactivate/activate sequence; accepted async
+    /// manifest completions use the same resolver while inactive or active.
+    pub fn resolveIncomingAfterActivation(self: *RepositoryPageState, allocator: std.mem.Allocator) bool {
+        std.debug.assert(self.active);
+        return self.resolveIncomingManifest(allocator);
+    }
+
+    /// Resolve only against the full accepted manifest. Normal Repository
+    /// restoration is intentionally not reused because it may choose a nearby
+    /// file when the preferred path is absent. An explicit cross-page target
+    /// either selects the byte-exact file or becomes unavailable.
+    fn resolveIncomingManifest(self: *RepositoryPageState, allocator: std.mem.Allocator) bool {
+        const location = if (self.incoming.manifestIntent()) |intent| intent.* else return false;
+        const active_root = self.root_identity orelse {
+            return self.incoming.terminalize(.request_failed);
+        };
+        if (location.repo_epoch != self.repo_epoch or !location.root_identity.eql(active_root)) {
+            return self.incoming.terminalize(.request_failed);
+        }
+
+        const bundle = if (self.bundle) |*owned| owned else return false;
+        const exact_path = bundle.tree.filePath(location.path, .all) orelse {
+            return self.incoming.terminalize(.path_not_found);
+        };
+        const node_index = bundle.tree.nodeIndexForPath(exact_path, .all) orelse {
+            return self.incoming.terminalize(.request_failed);
+        };
+
+        if (self.file_visibility == .changed and bundle.tree.filePath(exact_path, .changed) == null) {
+            self.file_visibility = .all;
+            if (self.all_selection_anchor) |anchor| allocator.free(anchor);
+            self.all_selection_anchor = null;
+            bundle.tree.rebuildVisibleFor(.all);
+            if (self.file_search.mode) {
+                repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree, .all);
+            }
+            self.status.set("Review target opened in All files", .{});
+        }
+
+        const visible_index = bundle.tree.revealNodeFor(node_index, self.file_visibility) orelse {
+            return self.incoming.terminalize(.request_failed);
+        };
+        const matching_document = if (self.displayed_document) |*displayed|
+            displayed.manifest_revision == self.manifest_revision and std.mem.eql(u8, displayed.path, exact_path)
+        else
+            false;
+
+        self.selected_path = exact_path;
+        self.viewer.tree_cursor = visible_index;
+        self.clampScroll(0);
+        if (!matching_document) {
+            self.invalidateSelectedDocument(allocator);
+        } else {
+            self.needs_document_revalidation = false;
+        }
+        std.debug.assert(self.incoming.advanceToDocument(self.manifest_revision));
+        return true;
+    }
+
+    fn applyIncomingManifestResolution(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        outcome: ApplyOutcome,
+    ) ApplyOutcome {
+        if (!self.resolveIncomingManifest(allocator)) return outcome;
+        return switch (outcome) {
+            .unchanged => .changed,
+            .discarded, .changed, .failed => outcome,
+        };
     }
 
     pub fn prepareRequest(
@@ -1207,10 +1280,12 @@ pub const RepositoryPageState = struct {
         self.pending_generation = null;
         const expected_root = self.root_identity orelse {
             self.acceptFailure("Repository root changed");
+            _ = self.terminalizeIncoming(.request_failed);
             return .failed;
         };
         if (!expected_root.eql(finished.root_identity)) {
             self.acceptFailure("Repository root changed");
+            _ = self.terminalizeIncoming(.request_failed);
             return .failed;
         }
         switch (finished.result) {
@@ -1220,7 +1295,10 @@ pub const RepositoryPageState = struct {
                 self.freshness = if (self.active) .fresh else .validating;
                 self.needs_document_revalidation = self.selected_path != null;
                 self.status.clear();
-                return if (changed_status_message) .changed else .unchanged;
+                return self.applyIncomingManifestResolution(
+                    allocator,
+                    if (changed_status_message) .changed else .unchanged,
+                );
             },
             .status_changed => |*update| {
                 const bundle = if (self.bundle) |*owned| owned else {
@@ -1229,7 +1307,7 @@ pub const RepositoryPageState = struct {
                     // its owned payload remains with `finished.deinit`.
                     self.freshness = if (self.active) .fresh else .validating;
                     self.status.clear();
-                    return .unchanged;
+                    return self.applyIncomingManifestResolution(allocator, .unchanged);
                 };
                 const previous_selected = self.selected_path;
                 const previous_status_available = bundle.status_available;
@@ -1265,11 +1343,15 @@ pub const RepositoryPageState = struct {
                 const status_availability_changed = self.file_visibility == .changed and
                     previous_status_available != bundle.status_available;
                 const changed_status_message = self.file_visibility == .changed and !bundle.status_available;
-                return if (visible_changed or selection_changed or status_availability_changed or changed_status_message) .changed else .unchanged;
+                return self.applyIncomingManifestResolution(
+                    allocator,
+                    if (visible_changed or selection_changed or status_availability_changed or changed_status_message) .changed else .unchanged,
+                );
             },
             .loaded => |*incoming| {
                 self.replaceBundle(allocator, incoming) catch |err| {
                     self.acceptFailure(@errorName(err));
+                    _ = self.terminalizeIncoming(.request_failed);
                     return .failed;
                 };
                 finished.result = .{ .unchanged = self.bundle.?.document.fingerprint };
@@ -1285,10 +1367,11 @@ pub const RepositoryPageState = struct {
                 self.displayed_document = null;
                 self.freshness = if (self.active) .fresh else .validating;
                 self.status.clear();
-                return .changed;
+                return self.applyIncomingManifestResolution(allocator, .changed);
             },
             .failed_static => |message| {
                 self.acceptFailure(message);
+                _ = self.terminalizeIncoming(.request_failed);
                 return .failed;
             },
         }
@@ -4501,6 +4584,177 @@ test "repository transition B1 direct unavailable renders byte-safe terminal" {
     try std.testing.expect(state.incomingUnavailable() != null);
     _ = state.applyNavigation(allocator, .tree_first, .{ .width = 80, .height = 6 });
     try std.testing.expect(state.incomingUnavailable() == null);
+}
+
+test "repository transition B2a resolves exact retained manifest through All and collapsed ancestors" {
+    const allocator = std.testing.allocator;
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 2,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .bundle = try bundleForTest("dir/target.zig\x00changed.zig\x00retained.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 6,
+        .file_visibility = .changed,
+    };
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, " M changed.zig\x00");
+    state.bundle.?.tree.nodes[state.bundle.?.tree.nodeIndexForPath("dir", .all).?].expanded = false;
+    state.bundle.?.tree.rebuildVisibleFor(.changed);
+    state.selected_path = state.bundle.?.tree.filePath("changed.zig", .changed);
+    state.all_selection_anchor = try allocator.dupe(u8, "retained.zig");
+
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .location = .{ .path = "dir/target.zig", .line = 9 } },
+    );
+    const owned_address = @intFromPtr(incoming.location.path.ptr);
+    state.acceptIncoming(allocator, &incoming);
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+
+    try std.testing.expect(state.incoming == .awaiting_document);
+    const pending = state.incoming.documentIntent().?;
+    try std.testing.expectEqual(owned_address, @intFromPtr(pending.location.path.ptr));
+    try std.testing.expectEqual(@as(u64, 6), pending.manifest_revision);
+    try std.testing.expectEqual(@as(?u32, 9), pending.location.line);
+    try std.testing.expectEqualStrings("dir/target.zig", state.selected_path.?);
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    try std.testing.expect(state.all_selection_anchor == null);
+    try std.testing.expect(state.bundle.?.tree.nodes[state.bundle.?.tree.nodeIndexForPath("dir", .all).?].expanded);
+    try std.testing.expectEqual(
+        state.bundle.?.tree.visibleIndexForPath("dir/target.zig").?,
+        state.viewer.tree_cursor,
+    );
+    try std.testing.expect(state.needs_document_revalidation);
+    try std.testing.expectEqualStrings("Review target opened in All files", state.status.text());
+}
+
+test "repository transition B2a exact failures retain prior browser location" {
+    const allocator = std.testing.allocator;
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .bundle = try bundleForTest("retained.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 6,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+
+    var missing = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .location = .{ .path = "missing.zig", .line = null } },
+    );
+    state.acceptIncoming(allocator, &missing);
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expectEqual(page_link.RepositoryUnavailableReason.path_not_found, state.incomingUnavailable().?.reason);
+    try std.testing.expectEqualStrings("missing.zig", state.incomingUnavailable().?.path);
+    try std.testing.expectEqualStrings("retained.zig", state.selected_path.?);
+
+    var wrong_repository = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        9,
+        identity,
+        .{ .location = .{ .path = "retained.zig", .line = 1 } },
+    );
+    state.acceptIncoming(allocator, &wrong_repository);
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expectEqual(page_link.RepositoryUnavailableReason.request_failed, state.incomingUnavailable().?.reason);
+    try std.testing.expectEqualStrings("retained.zig", state.selected_path.?);
+}
+
+test "repository transition B2a first owner install waits for activation identity" {
+    const allocator = std.testing.allocator;
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("retained.zig\x00target.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 6,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .location = .{ .path = "target.zig", .line = 3 } },
+    );
+    state.acceptIncoming(allocator, &incoming);
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+    try std.testing.expect(state.incomingUnavailable() == null);
+    try std.testing.expectEqualStrings("retained.zig", state.selected_path.?);
+
+    state.activate(4, identity);
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expect(state.incoming == .awaiting_document);
+    try std.testing.expectEqualStrings("target.zig", state.selected_path.?);
+    try std.testing.expectEqual(@as(?u32, 3), state.incoming.documentIntent().?.location.line);
+}
+
+test "repository transition B2a resolves or terminalizes matching manifest completion" {
+    const allocator = std.testing.allocator;
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 2,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .generation = 7,
+        .pending_generation = 7,
+        .load_state = .loading,
+    };
+    defer state.deinit(allocator);
+
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .location = .{ .path = "src/main.zig", .line = null } },
+    );
+    state.acceptIncoming(allocator, &incoming);
+    try std.testing.expect(state.incoming == .awaiting_manifest);
+
+    var finished: ManifestFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = 4, .activation_id = 2 },
+        .root_identity = identity,
+        .generation = 7,
+        .result = .{ .loaded = try bundleForTest("README.md\x00src/main.zig\x00") },
+    };
+    defer finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &finished));
+    try std.testing.expect(state.incoming == .awaiting_document);
+    try std.testing.expectEqualStrings("src/main.zig", state.selected_path.?);
+    try std.testing.expectEqual(@as(u64, 1), state.incoming.documentIntent().?.manifest_revision);
+    try std.testing.expect(state.needs_document_revalidation);
+
+    state.dismissIncoming(allocator);
+    state.generation = 8;
+    state.pending_generation = 8;
+    var failed_incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .location = .{ .path = "src/main.zig", .line = null } },
+    );
+    state.incoming.accept(allocator, &failed_incoming);
+    var failed: ManifestFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = 4, .activation_id = 2 },
+        .root_identity = identity,
+        .generation = 8,
+        .result = .{ .failed_static = "manifest failed" },
+    };
+    defer failed.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(allocator, &failed));
+    try std.testing.expectEqual(page_link.RepositoryUnavailableReason.request_failed, state.incomingUnavailable().?.reason);
 }
 
 test "repository page owns reload state transitions" {
