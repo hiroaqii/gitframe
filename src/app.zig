@@ -517,6 +517,10 @@ pub const App = struct {
         switch (msg) {
             .switch_page => |target| try self.requestPageSwitch(ctx, target),
             .terminal_resized => |size| {
+                // Mouse coordinates are relative to the old geometry. End the
+                // borrow before changing layout, then drain deferred owners at
+                // the common post-update boundary below.
+                self.reviewNavigation().terminateDiffSelection();
                 const previous_width = self.reviewNavigationView().diffPaneWidth();
                 const previous_mode = self.reviewNavigationView().effectiveDisplayMode();
                 self.terminal_size = size;
@@ -5458,6 +5462,44 @@ test "diff mouse drag supports unified fallback and clears on invalidation" {
     try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
     app.reviewReload().clearLoadedDiff(app.allocator);
     try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
+}
+
+test "terminal resize cancels live drag before geometry and retains completed selection" {
+    const allocator = std.testing.allocator;
+    const review_selection = @import("app/pages/review/selection.zig");
+    var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
+        .allocator = allocator,
+        .terminal_size = .{ .width = 80, .height = 20 },
+    };
+    defer app.reviewReload().clearLoadedDiff(allocator);
+
+    const selection: diff_selection.DragSelection = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 1 },
+        .moved = true,
+    };
+    app.pages.review.completed_selection = try review_selection.buildParsed(allocator, .{
+        .repo_epoch = 0,
+        .root_identity = null,
+        .source = review_selection.SourceBasis.init(.unstaged),
+        .source_session_revision = app.pages.review.source_session_revision,
+        .display = .{ .loaded = content_fingerprint.Fingerprint.init("") },
+    }, app_test_support.loadedDiffOne().document.files[0], selection);
+    const retained_token = app.pages.review.completed_selection.?.token;
+    app.pages.review.selection_owner = .{ .diff = selection };
+
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 30 } }, undefined);
+
+    try std.testing.expect(app.pages.review.selection_owner == .none);
+    try std.testing.expect(app.pages.review.completed_selection != null);
+    try std.testing.expect(app.pages.review.completed_selection.?.token.eql(retained_token));
+    try std.testing.expectEqual(chasen.Size{ .width = 120, .height = 30 }, app.terminal_size);
 }
 
 test "hidden sidebar keeps tab from changing focus" {
