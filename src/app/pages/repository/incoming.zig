@@ -5,8 +5,8 @@
 //! releases any previous owner and moves exactly one incoming arm into the
 //! Repository page. The owner advances through explicit manifest and document
 //! stages so async completions cannot apply a location after a newer browser
-//! destination has won. Document-generation binding and accepted-source line
-//! application remain a separate slice from exact manifest resolution.
+//! destination has won. Generation binding stays in this ownership model;
+//! accepted-source inspection and line application remain page-owned.
 
 const std = @import("std");
 const page_link = @import("../../page_link.zig");
@@ -62,6 +62,36 @@ pub const State = union(enum) {
             .location = location,
             .manifest_revision = manifest_revision,
         } };
+        return true;
+    }
+
+    /// Bind (or later rebind) the owner to the only selected-file completion
+    /// allowed to consume it. Path and manifest identity are checked before
+    /// the generation is recorded.
+    pub fn bindDocumentGeneration(
+        self: *State,
+        manifest_revision: u64,
+        path: []const u8,
+        generation: u64,
+    ) bool {
+        const pending = switch (self.*) {
+            .awaiting_document => |*pending| pending,
+            .none, .awaiting_manifest, .unavailable => return false,
+        };
+        if (pending.manifest_revision != manifest_revision or
+            !std.mem.eql(u8, pending.location.path, path)) return false;
+        pending.document_generation = generation;
+        return true;
+    }
+
+    /// Consume a successfully resolved document owner and release its request
+    /// path exactly once. The selected path/source remain Repository-owned.
+    pub fn completeDocument(self: *State, allocator: std.mem.Allocator) bool {
+        switch (self.*) {
+            .awaiting_document => |*pending| pending.deinit(allocator),
+            .none, .awaiting_manifest, .unavailable => return false,
+        }
+        self.* = .none;
         return true;
     }
 
@@ -197,4 +227,26 @@ test "Repository incoming advances exact manifest owner then terminalizes by mov
 
     try std.testing.expect(state.terminalize(.source_unavailable));
     try std.testing.expectEqual(owned_address, @intFromPtr(state.unavailable.path.ptr));
+}
+
+test "Repository incoming binds one document generation and completes owner" {
+    const allocator = std.testing.allocator;
+    var state: State = .none;
+    defer state.deinit(allocator);
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        7,
+        .{ .device = 11, .inode = 13 },
+        .{ .location = .{ .path = "src/main.zig", .line = 42 } },
+    );
+    state.accept(allocator, &incoming);
+    try std.testing.expect(state.advanceToDocument(9));
+
+    try std.testing.expect(!state.bindDocumentGeneration(8, "src/main.zig", 3));
+    try std.testing.expect(!state.bindDocumentGeneration(9, "src/other.zig", 3));
+    try std.testing.expect(state.bindDocumentGeneration(9, "src/main.zig", 3));
+    try std.testing.expectEqual(@as(?u64, 3), state.documentIntent().?.document_generation);
+    try std.testing.expect(state.completeDocument(allocator));
+    try std.testing.expect(state == .none);
+    try std.testing.expect(!state.completeDocument(allocator));
 }
