@@ -1,0 +1,411 @@
+//! Owned Review selection candidates and their stable content basis.
+//!
+//! Live drag coordinates borrow the currently displayed model. Release must
+//! convert them transactionally into this module's owned paths, fragments, and
+//! semantic token before any deferred source/projection replacement may free
+//! that model. Clipboard bytes are assembled as a separate owner afterwards.
+
+const std = @import("std");
+const content_fingerprint = @import("../../../content_fingerprint.zig");
+const diff_file = @import("../../../diff/file.zig");
+const diff_parser = @import("../../../diff/parser.zig");
+const diff_selection = @import("../../../diff/selection.zig");
+const diff_source = @import("../../../diff/source.zig");
+const path_key = @import("../../../path_key.zig");
+const repository_source = @import("../../../repository/source.zig");
+const root_capability = @import("../../../repo/root_capability.zig");
+const text_projection = @import("../../../text/projection.zig");
+
+const Fingerprint = content_fingerprint.Fingerprint;
+
+pub const SourceBasis = struct {
+    kind: std.meta.Tag(diff_source.SourceMode),
+    parameter_a: Fingerprint,
+    parameter_b: Fingerprint,
+
+    pub fn init(source: diff_source.SourceMode) SourceBasis {
+        const empty = Fingerprint.init("");
+        return switch (source) {
+            .unstaged => .{ .kind = .unstaged, .parameter_a = empty, .parameter_b = empty },
+            .cached => .{ .kind = .cached, .parameter_a = empty, .parameter_b = empty },
+            .stdin => .{ .kind = .stdin, .parameter_a = empty, .parameter_b = empty },
+            .pager => |value| .{ .kind = .pager, .parameter_a = Fingerprint.init(value), .parameter_b = empty },
+            .patch_file => |value| .{ .kind = .patch_file, .parameter_a = Fingerprint.init(value), .parameter_b = empty },
+            .range => |value| .{ .kind = .range, .parameter_a = Fingerprint.init(value), .parameter_b = empty },
+            .no_index => |paths| .{ .kind = .no_index, .parameter_a = Fingerprint.init(paths.left), .parameter_b = Fingerprint.init(paths.right) },
+        };
+    }
+
+    pub fn eql(self: SourceBasis, other: SourceBasis) bool {
+        return self.kind == other.kind and self.parameter_a.eql(other.parameter_a) and self.parameter_b.eql(other.parameter_b);
+    }
+};
+
+pub const DisplayBasis = union(enum) {
+    loaded: Fingerprint,
+    cached_projection: struct { status_snapshot_revision: u64, cached: Fingerprint },
+    combined_projection: struct { status_snapshot_revision: u64, cached: Fingerprint, unstaged: Fingerprint },
+    generated_untracked: struct { status_snapshot_revision: u64, source: Fingerprint },
+
+    pub fn eql(self: DisplayBasis, other: DisplayBasis) bool {
+        return switch (self) {
+            .loaded => |fingerprint| switch (other) {
+                .loaded => |other_fingerprint| fingerprint.eql(other_fingerprint),
+                else => false,
+            },
+            .cached_projection => |basis| switch (other) {
+                .cached_projection => |other_basis| basis.status_snapshot_revision == other_basis.status_snapshot_revision and basis.cached.eql(other_basis.cached),
+                else => false,
+            },
+            .combined_projection => |basis| switch (other) {
+                .combined_projection => |other_basis| basis.status_snapshot_revision == other_basis.status_snapshot_revision and basis.cached.eql(other_basis.cached) and basis.unstaged.eql(other_basis.unstaged),
+                else => false,
+            },
+            .generated_untracked => |basis| switch (other) {
+                .generated_untracked => |other_basis| basis.status_snapshot_revision == other_basis.status_snapshot_revision and basis.source.eql(other_basis.source),
+                else => false,
+            },
+        };
+    }
+};
+
+pub const ReviewContentToken = struct {
+    repo_epoch: u64,
+    root_identity: ?root_capability.Identity,
+    source: SourceBasis,
+    source_session_revision: u64,
+    display: DisplayBasis,
+
+    pub fn eql(self: ReviewContentToken, other: ReviewContentToken) bool {
+        return self.repo_epoch == other.repo_epoch and
+            optionalRootIdentityEql(self.root_identity, other.root_identity) and
+            self.source.eql(other.source) and
+            self.source_session_revision == other.source_session_revision and
+            self.display.eql(other.display);
+    }
+};
+
+pub const Parsed = struct {
+    canonical_path: []u8,
+    old_path: ?[]u8,
+    new_path: ?[]u8,
+    selected_path: []u8,
+    side: diff_selection.Side,
+    mode: diff_selection.Mode,
+    fragments: diff_selection.OwnedFragments,
+
+    fn deinit(self: *Parsed, allocator: std.mem.Allocator) void {
+        allocator.free(self.canonical_path);
+        if (self.old_path) |path| allocator.free(path);
+        if (self.new_path) |path| allocator.free(path);
+        allocator.free(self.selected_path);
+        self.fragments.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const GeneratedFragment = struct {
+    source_start: u32,
+    source_end: u32,
+    text: []u8,
+    line_count: usize,
+
+    fn deinit(self: *GeneratedFragment, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        self.* = undefined;
+    }
+};
+
+pub const Generated = struct {
+    path: []u8,
+    side: diff_selection.Side = .new,
+    mode: diff_selection.Mode,
+    fragment: GeneratedFragment,
+
+    fn deinit(self: *Generated, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.fragment.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const CompletedSelection = struct {
+    token: ReviewContentToken,
+    value: union(enum) {
+        parsed_diff: Parsed,
+        generated_untracked: Generated,
+    },
+
+    pub fn deinit(self: *CompletedSelection, allocator: std.mem.Allocator) void {
+        switch (self.value) {
+            .parsed_diff => |*parsed| parsed.deinit(allocator),
+            .generated_untracked => |*generated| generated.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+
+    pub fn clipboardText(self: CompletedSelection, allocator: std.mem.Allocator) ![]u8 {
+        return switch (self.value) {
+            .parsed_diff => |parsed| parsed.fragments.clipboardText(allocator),
+            .generated_untracked => |generated| blk: {
+                if (generated.mode != .line or generated.fragment.line_count < 2) {
+                    break :blk allocator.dupe(u8, generated.fragment.text);
+                }
+                const text = try allocator.alloc(u8, generated.fragment.text.len + 1);
+                @memcpy(text[0..generated.fragment.text.len], generated.fragment.text);
+                text[text.len - 1] = '\n';
+                break :blk text;
+            },
+        };
+    }
+};
+
+pub fn buildParsed(
+    allocator: std.mem.Allocator,
+    token: ReviewContentToken,
+    file: diff_parser.FileDiff,
+    selection: diff_selection.DragSelection,
+) !CompletedSelection {
+    var fragments = try diff_selection.buildFragments(allocator, file, selection);
+    errdefer fragments.deinit(allocator);
+    if (fragments.items.len == 0) return error.EmptySelection;
+
+    const canonical = diff_file.canonicalPathKey(file) orelse return error.NoPath;
+    const old_path = normalizedOptionalPath(file.old_path);
+    const new_path = normalizedOptionalPath(file.new_path);
+    const selected_borrowed = switch (selection.side) {
+        .old => old_path,
+        .new => new_path,
+    } orelse return error.NoSelectedSidePath;
+
+    const canonical_owned = try allocator.dupe(u8, canonical);
+    errdefer allocator.free(canonical_owned);
+    const old_owned = try dupeOptional(allocator, old_path);
+    errdefer if (old_owned) |path| allocator.free(path);
+    const new_owned = try dupeOptional(allocator, new_path);
+    errdefer if (new_owned) |path| allocator.free(path);
+    const selected_owned = try allocator.dupe(u8, selected_borrowed);
+    errdefer allocator.free(selected_owned);
+
+    return .{
+        .token = token,
+        .value = .{ .parsed_diff = .{
+            .canonical_path = canonical_owned,
+            .old_path = old_owned,
+            .new_path = new_owned,
+            .selected_path = selected_owned,
+            .side = selection.side,
+            .mode = selection.mode,
+            .fragments = fragments,
+        } },
+    };
+}
+
+pub fn buildGenerated(
+    allocator: std.mem.Allocator,
+    token: ReviewContentToken,
+    path: []const u8,
+    document: *const repository_source.Document,
+    selection: diff_selection.DragSelection,
+) !CompletedSelection {
+    if (selection.side != .new) return error.InvalidSide;
+    const range = selection.range();
+    if (range.start.hunk_index != 0 or range.end.hunk_index != 0 or range.start.line_index >= document.rowCount() or range.end.line_index >= document.rowCount()) return error.InvalidSelection;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var line_count: usize = 0;
+    var line_index = range.start.line_index;
+    while (line_index <= range.end.line_index) : (line_index += 1) {
+        const line = document.lineBody(line_index) orelse return error.InvalidSelection;
+        var start: usize = 0;
+        var end: usize = line.len;
+        if (selection.mode == .character) {
+            if (line_index == range.start.line_index) start = range.start.leading;
+            if (line_index == range.end.line_index) end = range.end.trailing;
+            if (!text_projection.validateBoundary(line, start) or !text_projection.validateBoundary(line, end) or start > end) return error.InvalidSelection;
+        }
+        if (start == end and range.start.line_index == range.end.line_index) continue;
+        if (line_count > 0) out.writer.writeByte('\n') catch return error.OutOfMemory;
+        out.writer.writeAll(line[start..end]) catch return error.OutOfMemory;
+        line_count += 1;
+    }
+    if (line_count == 0) return error.EmptySelection;
+    const text = try out.toOwnedSlice();
+    errdefer allocator.free(text);
+    const owned_path = try allocator.dupe(u8, path);
+    return .{
+        .token = token,
+        .value = .{ .generated_untracked = .{
+            .path = owned_path,
+            .mode = selection.mode,
+            .fragment = .{
+                .source_start = @intCast(range.start.line_index + 1),
+                .source_end = @intCast(range.end.line_index + 1),
+                .text = text,
+                .line_count = line_count,
+            },
+        } },
+    };
+}
+
+fn normalizedOptionalPath(path: ?[]const u8) ?[]const u8 {
+    const value = path orelse return null;
+    if (std.mem.eql(u8, value, "/dev/null")) return null;
+    return path_key.stripGitSidePrefix(value);
+}
+
+fn dupeOptional(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    return if (value) |bytes| try allocator.dupe(u8, bytes) else null;
+}
+
+fn optionalRootIdentityEql(left: ?root_capability.Identity, right: ?root_capability.Identity) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return left.?.eql(right.?);
+}
+
+test "content token ignores delivery identity by construction and separates source parameters" {
+    const base = ReviewContentToken{
+        .repo_epoch = 3,
+        .root_identity = .{ .device = 1, .inode = 2 },
+        .source = SourceBasis.init(.{ .range = "main...HEAD" }),
+        .source_session_revision = 7,
+        .display = .{ .loaded = Fingerprint.init("diff") },
+    };
+    try std.testing.expect(base.eql(base));
+    var changed = base;
+    changed.source = SourceBasis.init(.{ .range = "HEAD~1...HEAD" });
+    try std.testing.expect(!base.eql(changed));
+
+    changed = base;
+    changed.repo_epoch += 1;
+    try std.testing.expect(!base.eql(changed));
+    changed = base;
+    changed.root_identity = .{ .device = 1, .inode = 3 };
+    try std.testing.expect(!base.eql(changed));
+    changed = base;
+    changed.source_session_revision += 1;
+    try std.testing.expect(!base.eql(changed));
+    changed = base;
+    changed.display = .{ .loaded = Fingerprint.init("other diff") };
+    try std.testing.expect(!base.eql(changed));
+
+    const cached = ReviewContentToken{
+        .repo_epoch = base.repo_epoch,
+        .root_identity = base.root_identity,
+        .source = base.source,
+        .source_session_revision = base.source_session_revision,
+        .display = .{ .cached_projection = .{
+            .status_snapshot_revision = 9,
+            .cached = Fingerprint.init("cached"),
+        } },
+    };
+    changed = cached;
+    changed.display.cached_projection.status_snapshot_revision += 1;
+    try std.testing.expect(!cached.eql(changed));
+    changed = cached;
+    changed.display.cached_projection.cached = Fingerprint.init("changed cached");
+    try std.testing.expect(!cached.eql(changed));
+
+    const combined = ReviewContentToken{
+        .repo_epoch = base.repo_epoch,
+        .root_identity = base.root_identity,
+        .source = base.source,
+        .source_session_revision = base.source_session_revision,
+        .display = .{ .combined_projection = .{
+            .status_snapshot_revision = 9,
+            .cached = Fingerprint.init("cached"),
+            .unstaged = Fingerprint.init("unstaged"),
+        } },
+    };
+    changed = combined;
+    changed.display.combined_projection.unstaged = Fingerprint.init("changed unstaged");
+    try std.testing.expect(!combined.eql(changed));
+
+    const generated = ReviewContentToken{
+        .repo_epoch = base.repo_epoch,
+        .root_identity = base.root_identity,
+        .source = base.source,
+        .source_session_revision = base.source_session_revision,
+        .display = .{ .generated_untracked = .{
+            .status_snapshot_revision = 9,
+            .source = Fingerprint.init("generated"),
+        } },
+    };
+    changed = generated;
+    changed.display.generated_untracked.source = Fingerprint.init("changed generated");
+    try std.testing.expect(!generated.eql(changed));
+}
+
+test "generated candidate is not represented as a parser hunk" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "ABCDEFG\nHIJKLMN\n");
+    var document = try repository_source.Document.initOwned(allocator, bytes, Fingerprint.init(bytes));
+    defer document.deinit(allocator);
+    var completed = try buildGenerated(allocator, .{
+        .repo_epoch = 1,
+        .root_identity = null,
+        .source = SourceBasis.init(.unstaged),
+        .source_session_revision = 1,
+        .display = .{ .generated_untracked = .{ .status_snapshot_revision = 1, .source = document.fingerprint } },
+    }, "new.zig", &document, .{
+        .identity = .{ .generated_file = .{ .path_key = "new.zig" } },
+        .side = .new,
+        .mode = .character,
+        .anchor = .{ .hunk_index = 0, .line_index = 0, .leading = 3, .trailing = 4 },
+        .focus = .{ .hunk_index = 0, .line_index = 1, .leading = 4, .trailing = 5 },
+        .moved = true,
+    });
+    defer completed.deinit(allocator);
+    const clipboard = try completed.clipboardText(allocator);
+    defer allocator.free(clipboard);
+    try std.testing.expectEqualStrings("DEFG\nHIJKL", clipboard);
+    try std.testing.expect(completed.value == .generated_untracked);
+}
+
+test "parsed candidate owns byte-exact rename paths for the selected side" {
+    const allocator = std.testing.allocator;
+    const lines = [_]diff_parser.DiffLine{.{
+        .kind = .context,
+        .text = "valid text",
+        .old_line = 1,
+        .new_line = 1,
+    }};
+    const file: diff_parser.FileDiff = .{
+        .header = "rename with raw path bytes",
+        .old_path = "a/old-\xff.zig",
+        .new_path = "b/new-\xfe.zig",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &lines,
+        }},
+    };
+    var completed = try buildParsed(allocator, .{
+        .repo_epoch = 1,
+        .root_identity = null,
+        .source = SourceBasis.init(.unstaged),
+        .source_session_revision = 1,
+        .display = .{ .loaded = Fingerprint.init("rename diff") },
+    }, file, .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "new-\xfe.zig" } },
+        .side = .old,
+        .mode = .character,
+        .anchor = .{ .hunk_index = 0, .line_index = 0, .leading = 0, .trailing = 1 },
+        .focus = .{ .hunk_index = 0, .line_index = 0, .leading = 4, .trailing = 5 },
+        .moved = true,
+    });
+    defer completed.deinit(allocator);
+
+    try std.testing.expect(completed.value == .parsed_diff);
+    const parsed = completed.value.parsed_diff;
+    try std.testing.expectEqualStrings("new-\xfe.zig", parsed.canonical_path);
+    try std.testing.expectEqualStrings("old-\xff.zig", parsed.old_path.?);
+    try std.testing.expectEqualStrings("new-\xfe.zig", parsed.new_path.?);
+    try std.testing.expectEqualStrings("old-\xff.zig", parsed.selected_path);
+    try std.testing.expectEqual(diff_selection.Side.old, parsed.side);
+}

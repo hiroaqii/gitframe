@@ -7,6 +7,7 @@ const prompt = @import("../prompt.zig");
 const review_projection = @import("../review_projection.zig");
 const app_state = @import("../state.zig");
 const authority = @import("review/authority.zig");
+const review_selection = @import("review/selection.zig");
 const config = @import("../../config.zig");
 const context = @import("../../context.zig");
 const diff_render = @import("../../diff/render.zig");
@@ -168,6 +169,7 @@ pub const ReviewPageState = struct {
     pending_selection_restore: ?app_state.PendingSelectionRestore = null,
     reviewed_store: review_state.Store = .{},
     selection_owner: diff_selection.Owner = .none,
+    completed_selection: ?review_selection.CompletedSelection = null,
 
     pub fn init(
         self: *ReviewPageState,
@@ -180,6 +182,7 @@ pub const ReviewPageState = struct {
 
     pub fn deinit(self: *ReviewPageState, allocator: std.mem.Allocator) void {
         self.selection_owner = .none;
+        if (self.completed_selection) |*selection| selection.deinit(allocator);
         if (self.deferred_source_apply) |*deferred| deferred.deinit(allocator);
         self.load.clearCurrent(allocator);
         self.git_status.deinit();
