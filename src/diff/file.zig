@@ -42,12 +42,22 @@ pub fn displayPath(file: diff_parser.FileDiff) []const u8 {
 /// the old path. Metadata-only renames use `rename to`/`copy to` when no path
 /// headers are present.
 pub fn canonicalPathKey(file: diff_parser.FileDiff) ?[]const u8 {
+    if (currentPathKey(file)) |key| return key;
+    if (file.old_path) |path| return path_key.canonicalRepoPath(path);
+    return null;
+}
+
+/// Current-side repository path only.
+///
+/// Unlike `canonicalPathKey`, this never falls back to the old side of a
+/// deletion. Cross-page Repository navigation uses this distinction to avoid
+/// presenting a deleted path as a current working-tree destination.
+pub fn currentPathKey(file: diff_parser.FileDiff) ?[]const u8 {
     if (file.new_path) |path| {
         if (path_key.canonicalRepoPath(path)) |key| return key;
     }
     if (metadataPath(file, "rename to ")) |path| return path_key.canonicalRepoPath(path);
     if (metadataPath(file, "copy to ")) |path| return path_key.canonicalRepoPath(path);
-    if (file.old_path) |path| return path_key.canonicalRepoPath(path);
     return null;
 }
 
@@ -186,6 +196,40 @@ test "canonicalPathKey uses metadata-only rename target" {
         .old_path = null,
         .new_path = null,
         .metadata = &.{ "rename from src/old.zig", "rename to src/new.zig" },
+        .hunks = &.{},
+    }).?);
+}
+
+test "currentPathKey never falls back to deleted old side" {
+    try std.testing.expect(currentPathKey(.{
+        .header = "diff --git a/src/deleted.zig b/src/deleted.zig",
+        .old_path = "a/src/deleted.zig",
+        .new_path = "/dev/null",
+        .metadata = &.{"deleted file mode 100644"},
+        .hunks = &.{},
+    }) == null);
+    try std.testing.expectEqualStrings("src/deleted.zig", canonicalPathKey(.{
+        .header = "diff --git a/src/deleted.zig b/src/deleted.zig",
+        .old_path = "a/src/deleted.zig",
+        .new_path = "/dev/null",
+        .metadata = &.{"deleted file mode 100644"},
+        .hunks = &.{},
+    }).?);
+}
+
+test "currentPathKey accepts new and metadata-only rename paths" {
+    try std.testing.expectEqualStrings("src/current.zig", currentPathKey(.{
+        .header = "diff --git a/src/old.zig b/src/current.zig",
+        .old_path = "a/src/old.zig",
+        .new_path = "b/src/current.zig",
+        .metadata = &.{},
+        .hunks = &.{},
+    }).?);
+    try std.testing.expectEqualStrings("src/renamed.zig", currentPathKey(.{
+        .header = "diff --git a/src/old.zig b/src/renamed.zig",
+        .old_path = null,
+        .new_path = null,
+        .metadata = &.{ "rename from src/old.zig", "rename to src/renamed.zig" },
         .hunks = &.{},
     }).?);
 }
