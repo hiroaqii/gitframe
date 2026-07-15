@@ -1944,6 +1944,12 @@ pub const Controller = struct {
         unavailable: page_link.ReviewUnavailableReason,
     };
 
+    pub const ExactPathRevealResult = union(enum) {
+        selected: usize,
+        unchanged: usize,
+        unavailable: page_link.ReviewUnavailableReason,
+    };
+
     /// Classify one Repository path against the accepted retained Review
     /// without changing folds, filters, selection, search, or diff position.
     /// Slice D's mutation half consumes only the `ready` node synchronously;
@@ -1965,6 +1971,53 @@ pub const Controller = struct {
             self.page.review_display.changed_file_filter,
         )) return .{ .unavailable = .hidden_by_filters };
         return .{ .ready = node_index };
+    }
+
+    /// Reveal and select one D1-classified exact file without retaining the
+    /// borrowed request. Fallible visible-tree preparation completes before
+    /// collapsed ancestors or Review navigation state can change.
+    pub fn revealExactPath(self: Controller, intent: page_link.ReviewLocationIntent) !ExactPathRevealResult {
+        return self.revealExactPathWithAllocator(intent, null);
+    }
+
+    fn revealExactPathWithAllocator(
+        self: Controller,
+        intent: page_link.ReviewLocationIntent,
+        allocator_override: ?std.mem.Allocator,
+    ) !ExactPathRevealResult {
+        const node_index = switch (self.exactPathTarget(intent)) {
+            .unavailable => |reason| return .{ .unavailable = reason },
+            .ready => |ready| ready,
+        };
+        const loaded = self.activeLoadedDiff() orelse unreachable;
+        const selected_target_matches = if (self.page.viewer.selected_target) |selected| switch (loaded.tree.nodes[node_index].target) {
+            .diff_file => |file_index| selected == .diff_file and selected.diff_file == file_index,
+            .status_entry => |status_index| selected == .status_only and selected.status_only == status_index,
+            .repo_root, .directory => false,
+        } else false;
+        // Matching selection identity is insufficient when a retained fold
+        // currently hides that node from the materialized sidebar.
+        if (self.page.viewer.selected_node == node_index and
+            selected_target_matches and
+            loaded.visibleRowOfNode(node_index) != null)
+        {
+            return .{ .unchanged = node_index };
+        }
+
+        if (loaded.visibleRowOfNode(node_index) == null) {
+            const allocator = allocator_override orelse self.loadArenaAllocator() orelse unreachable;
+            var prepared = try loaded.prepareVisibleNodeRebuild(allocator);
+            file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
+            prepared.commit(
+                self.page.review_display.hide_reviewed_files,
+                self.page.review_display.changed_file_filter,
+            );
+        }
+
+        self.selectSidebarNode(loaded, node_index);
+        self.clampSelection(loaded.document.files.len);
+        self.clampDiffNavigation();
+        return .{ .selected = node_index };
     }
 
     pub fn loadArenaAllocator(self: Controller) ?std.mem.Allocator {
@@ -2306,6 +2359,33 @@ fn expectExactPathUnavailable(
             return error.TestUnexpectedResult;
         },
         .unavailable => |actual| try std.testing.expectEqual(expected, actual),
+    }
+}
+
+fn expectExactPathRevealSelected(result: Controller.ExactPathRevealResult, expected_node: usize) !void {
+    switch (result) {
+        .selected => |node_index| try std.testing.expectEqual(expected_node, node_index),
+        .unchanged => return error.TestUnexpectedUnchanged,
+        .unavailable => return error.TestUnexpectedUnavailable,
+    }
+}
+
+fn expectExactPathRevealUnchanged(result: Controller.ExactPathRevealResult, expected_node: usize) !void {
+    switch (result) {
+        .unchanged => |node_index| try std.testing.expectEqual(expected_node, node_index),
+        .selected => return error.TestUnexpectedSelection,
+        .unavailable => return error.TestUnexpectedUnavailable,
+    }
+}
+
+fn expectExactPathRevealUnavailable(
+    result: Controller.ExactPathRevealResult,
+    expected: page_link.ReviewUnavailableReason,
+) !void {
+    switch (result) {
+        .unavailable => |actual| try std.testing.expectEqual(expected, actual),
+        .selected => return error.TestUnexpectedSelection,
+        .unchanged => return error.TestUnexpectedUnchanged,
     }
 }
 
@@ -3728,6 +3808,243 @@ test "review transition D1 exact lookup rejects identity absence and non-file pa
         .path = "src/b",
     };
     try expectExactPathUnavailable(app.reviewNavigation().exactPathTarget(explicit_intent), .repository_mismatch);
+}
+
+test "review transition D2b exact reveal expands only target ancestors and selects normally" {
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
+                .tree = .{ .nodes = &app_test_support.tree_non_contiguous_nodes },
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_file = 0,
+                .selected_node = 3,
+                .focus = .diff,
+                .diff_scroll = 8,
+                .diff_horizontal_scroll = 3,
+                .sidebar_horizontal_scroll = 2,
+                .diff_cursor = .{ .hunk_header = 0 },
+                .display_mode = .unified,
+            },
+            .selection_owner = .{ .diff_header = .{ .identity = .{
+                .kind = .loaded_file,
+                .path_key = "src/a",
+            } } },
+        } },
+        .repo_epoch = 4,
+        .root_identity = identity,
+    };
+    defer app.clearLoadedDiff();
+    const allocator = app.reviewNavigation().loadArenaAllocator().?;
+    const loaded = app.reviewNavigation().loadedDiff().?;
+    try file_tree.collapse(allocator, &loaded.collapsed_dirs, "src");
+    try file_tree.collapse(allocator, &loaded.collapsed_dirs, "lib");
+    setDiffSearchQuery(&app, "target");
+
+    try expectExactPathRevealSelected(
+        try app.reviewNavigation().revealExactPath(exactReviewIntent(&app, "src/b")),
+        4,
+    );
+
+    try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
+    try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "lib"));
+    try std.testing.expectEqual(@as(?usize, 4), loaded.visibleNodeAt(3));
+    try std.testing.expectEqual(@as(usize, 4), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.sidebar_horizontal_scroll);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.pages.review.viewer.display_mode);
+    try std.testing.expectEqualStrings("target", app.pages.review.search.query.slice());
+    try std.testing.expect(app.pages.review.selection_owner == .none);
+}
+
+test "review transition D2b exact reveal selects status-only and reports unchanged" {
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
+        .{ .kind = .file, .name = "new.zig", .path = "new.zig", .depth = 0, .target = .{ .status_entry = 0 }, .status = .added },
+    };
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_one },
+                .file_text_eligibility = &.{.selectable_utf8},
+                .tree = .{ .nodes = &nodes },
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_file = 0,
+                .selected_node = 0,
+                .display_mode = .unified,
+            },
+        } },
+        .repo_epoch = 4,
+        .root_identity = identity,
+    };
+    defer app.clearLoadedDiff();
+    defer app.pages.review.git_status.deinit();
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? new.zig\x00");
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
+
+    try expectExactPathRevealSelected(
+        try app.reviewNavigation().revealExactPath(exactReviewIntent(&app, "new.zig")),
+        1,
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.pages.review.viewer.display_mode);
+
+    app.pages.review.viewer.diff_scroll = 9;
+    try expectExactPathRevealUnchanged(
+        try app.reviewNavigation().revealExactPath(exactReviewIntent(&app, "new.zig")),
+        1,
+    );
+    try std.testing.expectEqual(@as(usize, 9), app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
+}
+
+test "review transition D2b selected exact node still reveals collapsed ancestor" {
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 2,
+            },
+        } },
+        .repo_epoch = 4,
+        .root_identity = identity,
+    };
+    defer app.clearLoadedDiff();
+    const loaded = app.reviewNavigation().loadedDiff().?;
+    try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+    try std.testing.expectEqual(@as(?usize, null), loaded.visibleRowOfNode(2));
+
+    try expectExactPathRevealSelected(
+        try app.reviewNavigation().revealExactPath(exactReviewIntent(&app, "src/b")),
+        2,
+    );
+
+    try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
+    try std.testing.expectEqual(@as(?usize, 2), loaded.visibleRowOfNode(2));
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+}
+
+test "review transition D2b unavailable result preserves navigation folds and filters" {
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var reviewed = [_]bool{ true, false };
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
+                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 2,
+                .diff_scroll = 6,
+                .diff_horizontal_scroll = 2,
+                .diff_cursor = .{ .metadata = 1 },
+            },
+            .review_display = .{ .hide_reviewed_files = true },
+        } },
+        .repo_epoch = 4,
+        .root_identity = identity,
+    };
+    defer app.clearLoadedDiff();
+    const loaded = app.reviewNavigation().loadedDiff().?;
+    try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+
+    try expectExactPathRevealUnavailable(
+        try app.reviewNavigation().revealExactPath(exactReviewIntent(&app, "src/a")),
+        .hidden_by_filters,
+    );
+    try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
+    try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 6), app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expect(std.meta.eql(
+        diff_view_model.BodyCoordinate{ .metadata = 1 },
+        app.pages.review.viewer.diff_cursor,
+    ));
+}
+
+test "review transition D2b allocation failure rolls back before ancestor expansion" {
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_file = 0,
+                .selected_node = 1,
+                .focus = .diff,
+                .diff_scroll = 7,
+                .diff_horizontal_scroll = 4,
+                .sidebar_horizontal_scroll = 3,
+                .diff_cursor = .{ .hunk_header = 0 },
+                .display_mode = .unified,
+            },
+            .review_display = .{ .changed_file_filter = .all },
+            .selection_owner = .{ .diff_header = .{ .identity = .{
+                .kind = .loaded_file,
+                .path_key = "src/a",
+            } } },
+        } },
+        .repo_epoch = 4,
+        .root_identity = identity,
+    };
+    defer app.clearLoadedDiff();
+    const loaded = app.reviewNavigation().loadedDiff().?;
+    try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+    const visible_before = loaded.visibleNodeCount();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        app.reviewNavigation().revealExactPathWithAllocator(
+            exactReviewIntent(&app, "src/b"),
+            failing.allocator(),
+        ),
+    );
+
+    try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
+    try std.testing.expectEqual(visible_before, loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 7), app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 4), app.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.sidebar_horizontal_scroll);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.pages.review.viewer.display_mode);
+    try std.testing.expect(app.pages.review.selection_owner.activeHeader() != null);
 }
 
 test "file search keeps prompt open on no match" {
