@@ -44,6 +44,33 @@ pub const ReviewRepositoryTarget = union(enum) {
     unavailable: BorrowedRepositoryUnavailable,
 };
 
+/// Borrowed Repository -> Review request used only for synchronous exact
+/// lookup. The path remains Repository-owned until the shell finishes the
+/// transition; Review never retains this value for a later reload.
+pub const ReviewLocationIntent = struct {
+    repo_epoch: u64,
+    root_identity: root_capability.Identity,
+    path: []const u8,
+};
+
+pub const ReviewUnavailableReason = enum {
+    source_unavailable,
+    no_accepted_review,
+    repository_mismatch,
+    path_not_found,
+    hidden_by_filters,
+
+    pub fn message(self: ReviewUnavailableReason) []const u8 {
+        return switch (self) {
+            .source_unavailable => "Current Review source cannot link to Repository files",
+            .no_accepted_review => "No accepted Review is available",
+            .repository_mismatch => "Repository changed before Review navigation",
+            .path_not_found => "Repository file is not part of the current Review",
+            .hidden_by_filters => "Repository file is hidden by Review filters",
+        };
+    }
+};
+
 pub const RepositoryLocationIntent = struct {
     repo_epoch: u64,
     root_identity: root_capability.Identity,
@@ -173,6 +200,12 @@ test "RepositoryIncoming no context allocates nothing" {
 
 test "Repository unavailable diagnostics are closed static messages" {
     inline for (std.meta.tags(RepositoryUnavailableReason)) |reason| {
+        try std.testing.expect(reason.message().len > 0);
+    }
+}
+
+test "Review unavailable diagnostics are closed static messages" {
+    inline for (std.meta.tags(ReviewUnavailableReason)) |reason| {
         try std.testing.expect(reason.message().len > 0);
     }
 }

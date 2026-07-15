@@ -123,6 +123,16 @@ pub fn sourceAllowsEditorAction(source: SourceMode) bool {
     };
 }
 
+/// Whether a Review model has current-repository path authority for a direct
+/// Repository page link. Repository-backed history still lacks a claim about
+/// the current working-tree surface, so `range` remains intentionally false.
+pub fn sourceAllowsRepositoryLink(source: SourceMode) bool {
+    return switch (source) {
+        .unstaged, .cached => true,
+        .stdin, .pager, .patch_file, .range, .no_index => false,
+    };
+}
+
 pub const ParseArgsError = error{
     UnknownOption,
     MissingOptionValue,
@@ -627,6 +637,16 @@ test "stage action is narrower than stage projection" {
     try std.testing.expect(sourceAllowsEditorAction(.unstaged));
     try std.testing.expect(sourceAllowsEditorAction(.cached));
     try std.testing.expect(!sourceAllowsEditorAction(.{ .range = "main...HEAD" }));
+}
+
+test "repository link accepts only current repository review sources" {
+    try std.testing.expect(sourceAllowsRepositoryLink(.unstaged));
+    try std.testing.expect(sourceAllowsRepositoryLink(.cached));
+    try std.testing.expect(!sourceAllowsRepositoryLink(.stdin));
+    try std.testing.expect(!sourceAllowsRepositoryLink(.{ .pager = "pager" }));
+    try std.testing.expect(!sourceAllowsRepositoryLink(.{ .patch_file = "change.patch" }));
+    try std.testing.expect(!sourceAllowsRepositoryLink(.{ .range = "HEAD~1..HEAD" }));
+    try std.testing.expect(!sourceAllowsRepositoryLink(.{ .no_index = .{ .left = "a", .right = "b" } }));
 }
 
 test "cloneLoadRequest duplicates source payload and repo root" {

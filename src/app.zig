@@ -450,6 +450,8 @@ pub const App = struct {
         return .{
             .page = &self.pages.review,
             .repo_root = self.activeRepoRoot(),
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.repo_state.activeIdentity(),
             .source = self.config.source,
             .layout = .{ .width = size.width, .height = size.height },
             .diagnostics = .{ .target = &self.pages.review.status },

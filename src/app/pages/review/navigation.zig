@@ -11,6 +11,7 @@ const chasen = @import("chasen");
 const app_direction = @import("../../direction.zig");
 const app_load = @import("../../load.zig");
 const app_page = @import("../../page.zig");
+const page_link = @import("../../page_link.zig");
 const app_state = @import("../../state.zig");
 const shell_layout = if (builtin.is_test) @import("../../shell_layout.zig") else struct {};
 const review_layout = @import("layout.zig");
@@ -30,6 +31,7 @@ const diff_view_model = @import("../../../diff/view_model.zig");
 const file_tree = @import("../../../file_tree.zig");
 const git_status = @import("../../../git/status.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
+const root_capability = @import("../../../repo/root_capability.zig");
 const sidebar_view_model = @import("../../../sidebar/view_model.zig");
 const text_projection = @import("../../../text/projection.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
@@ -976,6 +978,8 @@ pub const View = struct {
 pub const Controller = struct {
     page: *review_page.ReviewPageState,
     repo_root: ?[]const u8,
+    repo_epoch: u64 = 0,
+    root_identity: ?root_capability.Identity = null,
     source: diff_source.SourceMode,
     layout: Layout,
     diagnostics: DiagnosticSink,
@@ -1935,6 +1939,34 @@ pub const Controller = struct {
         };
     }
 
+    pub const ExactPathTarget = union(enum) {
+        ready: usize,
+        unavailable: page_link.ReviewUnavailableReason,
+    };
+
+    /// Classify one Repository path against the accepted retained Review
+    /// without changing folds, filters, selection, search, or diff position.
+    /// Slice D's mutation half consumes only the `ready` node synchronously;
+    /// an unavailable result is never retained for a future reload.
+    pub fn exactPathTarget(self: Controller, intent: page_link.ReviewLocationIntent) ExactPathTarget {
+        if (!diff_source.sourceAllowsRepositoryLink(self.source)) {
+            return .{ .unavailable = .source_unavailable };
+        }
+        const active_root = self.root_identity orelse return .{ .unavailable = .repository_mismatch };
+        if (intent.repo_epoch != self.repo_epoch or !intent.root_identity.eql(active_root)) {
+            return .{ .unavailable = .repository_mismatch };
+        }
+        const loaded = self.activeLoadedDiff() orelse return .{ .unavailable = .no_accepted_review };
+        const node_index = findFileNodeByPathKey(loaded, intent.path) orelse
+            return .{ .unavailable = .path_not_found };
+        if (!loaded.shouldIncludeFileNode(
+            node_index,
+            self.page.review_display.hide_reviewed_files,
+            self.page.review_display.changed_file_filter,
+        )) return .{ .unavailable = .hidden_by_filters };
+        return .{ .ready = node_index };
+    }
+
     pub fn loadArenaAllocator(self: Controller) ?std.mem.Allocator {
         return switch (self.page.load.state) {
             .loaded => |*session| session.arena.allocator(),
@@ -1946,6 +1978,15 @@ pub const Controller = struct {
 
 pub fn findNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
     for (loaded.tree.nodes, 0..) |node, index| {
+        const node_key = if (node.path_key.len > 0) node.path_key else node.path;
+        if (std.mem.eql(u8, node_key, path_key)) return index;
+    }
+    return null;
+}
+
+fn findFileNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
+    for (loaded.tree.nodes, 0..) |node, index| {
+        if (node.kind != .file) continue;
         const node_key = if (node.path_key.len > 0) node.path_key else node.path;
         if (std.mem.eql(u8, node_key, path_key)) return index;
     }
@@ -2166,6 +2207,8 @@ const TestHarness = struct {
     status: app_state.StatusMessage = .{},
     source: diff_source.SourceMode = .unstaged,
     repo_root: ?[]const u8 = null,
+    repo_epoch: u64 = 0,
+    root_identity: ?root_capability.Identity = null,
     terminal_size: chasen.Size = .{ .width = 100, .height = 20 },
     allocator: ?std.mem.Allocator = null,
 
@@ -2181,6 +2224,8 @@ const TestHarness = struct {
         return .{
             .page = &self.pages.review,
             .repo_root = self.repo_root,
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.root_identity,
             .source = self.source,
             .layout = .{ .width = body_size.width, .height = body_size.height },
             .diagnostics = .{ .target = &self.status },
@@ -2232,6 +2277,37 @@ const TestHarness = struct {
         self.controller().clearSearchMatch();
     }
 };
+
+fn exactReviewIntent(app: *const TestHarness, path: []const u8) page_link.ReviewLocationIntent {
+    return .{
+        .repo_epoch = app.repo_epoch,
+        .root_identity = app.root_identity.?,
+        .path = path,
+    };
+}
+
+fn expectExactPathReady(target: Controller.ExactPathTarget, expected_node: usize) !void {
+    switch (target) {
+        .ready => |node_index| try std.testing.expectEqual(expected_node, node_index),
+        .unavailable => |reason| {
+            std.debug.print("expected exact Review path, found unavailable reason {s}\n", .{@tagName(reason)});
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
+fn expectExactPathUnavailable(
+    target: Controller.ExactPathTarget,
+    expected: page_link.ReviewUnavailableReason,
+) !void {
+    switch (target) {
+        .ready => |node_index| {
+            std.debug.print("expected unavailable Review path, found node {d}\n", .{node_index});
+            return error.TestUnexpectedResult;
+        },
+        .unavailable => |actual| try std.testing.expectEqual(expected, actual),
+    }
+}
 
 fn expectSearchCoordinate(app: *const TestHarness, expected: diff_view_model.BodyCoordinate) !void {
     try std.testing.expect(app.pages.review.search.match != null);
@@ -3347,6 +3423,311 @@ test "file search selects matching file and expands ancestors" {
     try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
     try std.testing.expect(!app.pages.review.file_search.mode);
+}
+
+test "review transition D1 exact lookup accepts diff status and collapsed raw paths" {
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    {
+        var app: TestHarness = .{
+            .pages = .{ .review = .{
+                .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+                .viewer = .{ .selected_node = 1, .selected_file = 0 },
+            } },
+            .repo_epoch = 4,
+            .root_identity = identity,
+        };
+        defer app.clearLoadedDiff();
+
+        const loaded = app.reviewNavigation().loadedDiff().?;
+        try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+
+        try expectExactPathReady(
+            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/b")),
+            2,
+        );
+        try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
+        try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    }
+
+    {
+        const raw_path = "new-\xff.zig";
+        const status_nodes = [_]file_tree.Node{.{
+            .kind = .file,
+            .name = "new-invalid.zig",
+            .path = "new-invalid.zig",
+            .path_key = raw_path,
+            .depth = 0,
+            .target = .{ .status_entry = 0 },
+            .status = .added,
+        }};
+        var app: TestHarness = .{
+            .pages = .{ .review = .{
+                .load = app_test_support.loadState(.{
+                    .text = "",
+                    .document = .{ .files = &.{} },
+                    .file_text_eligibility = &.{},
+                    .tree = .{ .nodes = &status_nodes },
+                    .collapsed_dirs = .{},
+                    .bytes = 0,
+                    .lines = 0,
+                }),
+            } },
+            .repo_epoch = 4,
+            .root_identity = identity,
+        };
+        defer app.clearLoadedDiff();
+
+        try expectExactPathReady(
+            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, raw_path)),
+            0,
+        );
+    }
+}
+
+test "review transition D1 exact lookup rejects non-current repository sources" {
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .viewer = .{ .selected_node = 1, .selected_file = 0 },
+        } },
+        .repo_epoch = 4,
+        .root_identity = identity,
+    };
+    defer app.clearLoadedDiff();
+
+    const unsupported = [_]diff_source.SourceMode{
+        .stdin,
+        .{ .pager = "external diff" },
+        .{ .patch_file = "change.patch" },
+        .{ .range = "HEAD~1..HEAD" },
+        .{ .no_index = .{ .left = "left", .right = "right" } },
+    };
+    for (unsupported) |source| {
+        app.source = source;
+        try expectExactPathUnavailable(
+            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/a")),
+            .source_unavailable,
+        );
+        try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    }
+
+    app.source = .cached;
+    try expectExactPathReady(
+        app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/a")),
+        1,
+    );
+}
+
+test "review transition D1 exact lookup skips colliding directories before files" {
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    const replacement_diff =
+        \\diff --git a/src/a b/src/a
+        \\deleted file mode 100644
+        \\--- a/src/a
+        \\+++ /dev/null
+        \\@@ -1 +0,0 @@
+        \\-old nested file
+        \\diff --git a/src b/src
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/src
+        \\@@ -0,0 +1 @@
+        \\+new top-level file
+        \\
+    ;
+    var replacement_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer replacement_arena.deinit();
+    const replacement_allocator = replacement_arena.allocator();
+    const replacement_document = try diff_parser.parse(replacement_allocator, replacement_diff);
+    const replacement_tree = try file_tree.build(replacement_allocator, replacement_document);
+    try std.testing.expectEqual(@as(usize, 3), replacement_tree.nodes.len);
+    try std.testing.expectEqual(file_tree.Node.Kind.directory, replacement_tree.nodes[0].kind);
+    try std.testing.expectEqualStrings("src", replacement_tree.nodes[0].path);
+    try std.testing.expectEqual(file_tree.Node.Kind.file, replacement_tree.nodes[2].kind);
+    try std.testing.expectEqualStrings("src", replacement_tree.nodes[2].path_key);
+
+    var replacement_app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = replacement_diff,
+                .document = replacement_document,
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
+                .tree = replacement_tree,
+                .collapsed_dirs = .{},
+                .bytes = replacement_diff.len,
+                .lines = 0,
+            }),
+        } },
+        .repo_epoch = 4,
+        .root_identity = identity,
+    };
+    defer replacement_app.clearLoadedDiff();
+    try expectExactPathReady(
+        replacement_app.reviewNavigation().exactPathTarget(exactReviewIntent(&replacement_app, "src")),
+        2,
+    );
+
+    const directory_only_diff =
+        \\diff --git a/src/a b/src/a
+        \\deleted file mode 100644
+        \\--- a/src/a
+        \\+++ /dev/null
+        \\@@ -1 +0,0 @@
+        \\-old nested file
+        \\
+    ;
+    var directory_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer directory_arena.deinit();
+    const directory_allocator = directory_arena.allocator();
+    const directory_document = try diff_parser.parse(directory_allocator, directory_only_diff);
+    const directory_tree = try file_tree.build(directory_allocator, directory_document);
+    var directory_app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = directory_only_diff,
+                .document = directory_document,
+                .file_text_eligibility = &.{.selectable_utf8},
+                .tree = directory_tree,
+                .collapsed_dirs = .{},
+                .bytes = directory_only_diff.len,
+                .lines = 0,
+            }),
+        } },
+        .repo_epoch = 4,
+        .root_identity = identity,
+    };
+    defer directory_app.clearLoadedDiff();
+    try expectExactPathUnavailable(
+        directory_app.reviewNavigation().exactPathTarget(exactReviewIntent(&directory_app, "src")),
+        .path_not_found,
+    );
+
+    const legacy_nodes = [_]file_tree.Node{
+        .{ .kind = .directory, .name = "legacy", .path = "legacy", .depth = 0 },
+        .{ .kind = .file, .name = "legacy", .path = "legacy", .depth = 0, .target = .{ .status_entry = 0 } },
+    };
+    var legacy_app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &.{} },
+                .file_text_eligibility = &.{},
+                .tree = .{ .nodes = &legacy_nodes },
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+        } },
+        .repo_epoch = 4,
+        .root_identity = identity,
+    };
+    defer legacy_app.clearLoadedDiff();
+    try expectExactPathReady(
+        legacy_app.reviewNavigation().exactPathTarget(exactReviewIntent(&legacy_app, "legacy")),
+        1,
+    );
+}
+
+test "review transition D1 exact lookup preserves reviewed and changed filters" {
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    {
+        var reviewed = [_]bool{ true, false };
+        var app: TestHarness = .{
+            .pages = .{ .review = .{
+                .load = app_test_support.loadState(.{
+                    .text = "",
+                    .document = .{ .files = &app_test_support.files_two },
+                    .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
+                    .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
+                    .reviewed_files = &reviewed,
+                    .collapsed_dirs = .{},
+                    .bytes = 0,
+                    .lines = 0,
+                }),
+                .review_display = .{ .hide_reviewed_files = true },
+            } },
+            .repo_epoch = 4,
+            .root_identity = identity,
+        };
+        defer app.clearLoadedDiff();
+
+        try expectExactPathUnavailable(
+            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/a")),
+            .hidden_by_filters,
+        );
+        try expectExactPathReady(
+            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/b")),
+            2,
+        );
+        try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
+    }
+
+    {
+        var app: TestHarness = .{
+            .pages = .{ .review = .{
+                .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+                .review_display = .{ .changed_file_filter = .added },
+            } },
+            .repo_epoch = 4,
+            .root_identity = identity,
+        };
+        defer app.clearLoadedDiff();
+
+        try expectExactPathUnavailable(
+            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/deleted.zig")),
+            .hidden_by_filters,
+        );
+        try expectExactPathReady(
+            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/added.zig")),
+            0,
+        );
+        try std.testing.expectEqual(ChangedFileFilter.added, app.pages.review.review_display.changed_file_filter);
+    }
+}
+
+test "review transition D1 exact lookup rejects identity absence and non-file paths" {
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .viewer = .{ .selected_node = 1, .selected_file = 0 },
+        } },
+        .repo_epoch = 4,
+        .root_identity = identity,
+    };
+    defer app.clearLoadedDiff();
+
+    var wrong_epoch = exactReviewIntent(&app, "src/b");
+    wrong_epoch.repo_epoch += 1;
+    try expectExactPathUnavailable(app.reviewNavigation().exactPathTarget(wrong_epoch), .repository_mismatch);
+
+    var wrong_root = exactReviewIntent(&app, "src/b");
+    wrong_root.root_identity.inode += 1;
+    try expectExactPathUnavailable(app.reviewNavigation().exactPathTarget(wrong_root), .repository_mismatch);
+    try expectExactPathUnavailable(
+        app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "missing.zig")),
+        .path_not_found,
+    );
+    try expectExactPathUnavailable(
+        app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src")),
+        .path_not_found,
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+
+    app.clearLoadedDiff();
+    try expectExactPathUnavailable(
+        app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/b")),
+        .no_accepted_review,
+    );
+
+    app.root_identity = null;
+    const explicit_intent: page_link.ReviewLocationIntent = .{
+        .repo_epoch = app.repo_epoch,
+        .root_identity = identity,
+        .path = "src/b",
+    };
+    try expectExactPathUnavailable(app.reviewNavigation().exactPathTarget(explicit_intent), .repository_mismatch);
 }
 
 test "file search keeps prompt open on no match" {

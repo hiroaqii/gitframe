@@ -82,7 +82,7 @@ pub const View = struct {
     /// scan to a nearby current line, and sources without current-repository
     /// authority return `no_context` rather than reusing coincidental paths.
     pub fn repositoryTarget(self: View) page_link.ReviewRepositoryTarget {
-        if (!sourceAllowsRepositoryLink(self.source)) return .no_context;
+        if (!diff_source.sourceAllowsRepositoryLink(self.source)) return .no_context;
         if (!self.page.activation.state.satisfiesAction(.read_diff)) return .no_context;
         const repo_root = self.repo_root orelse return .no_context;
 
@@ -264,13 +264,6 @@ const ParsedBasis = enum {
     cached,
     synthetic,
 };
-
-fn sourceAllowsRepositoryLink(source: diff_source.SourceMode) bool {
-    return switch (source) {
-        .unstaged, .cached => true,
-        .stdin, .pager, .patch_file, .range, .no_index => false,
-    };
-}
 
 fn repositoryTargetForParsedFile(
     file: diff_parser.FileDiff,
@@ -698,16 +691,6 @@ test "generated target maps only a real source row" {
     try expectRepositoryLocation(generatedRepositoryTarget("new.zig", 3, .{ .metadata = 1 }), "new.zig", 2);
     try expectRepositoryLocation(generatedRepositoryTarget("new.zig", 0, .{ .metadata = 0 }), "new.zig", null);
     try expectRepositoryLocation(generatedRepositoryTarget("new.zig", 3, .{ .hunk_header = 0 }), "new.zig", null);
-}
-
-test "repository link accepts only supported repository-backed source modes" {
-    try std.testing.expect(sourceAllowsRepositoryLink(.unstaged));
-    try std.testing.expect(sourceAllowsRepositoryLink(.cached));
-    try std.testing.expect(!sourceAllowsRepositoryLink(.stdin));
-    try std.testing.expect(!sourceAllowsRepositoryLink(.{ .pager = "pager" }));
-    try std.testing.expect(!sourceAllowsRepositoryLink(.{ .patch_file = "change.patch" }));
-    try std.testing.expect(!sourceAllowsRepositoryLink(.{ .range = "HEAD~1..HEAD" }));
-    try std.testing.expect(!sourceAllowsRepositoryLink(.{ .no_index = .{ .left = "a", .right = "b" } }));
 }
 
 test "opaque status target distinguishes current path from deletion" {
