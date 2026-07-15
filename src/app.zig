@@ -8197,6 +8197,124 @@ test "review repository transition E2b blocker retains page owner and Review sta
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
+test "review repository transition E3a keyboard and page bar open the same exact Review path" {
+    const allocator = std.testing.allocator;
+    const inputs = [_]enum { keyboard, page_bar }{ .keyboard, .page_bar };
+
+    for (inputs) |input| {
+        var roots = try TestRepoPair.init();
+        defer roots.deinit();
+        var app: App = .{
+            .allocator = allocator,
+            .active_page = .repository,
+            .repo_epoch = 7,
+            .terminal_size = .{ .width = 100, .height = 20 },
+            .config = .{ .source = .unstaged },
+            .pages = .{
+                .review = .{
+                    .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+                    .viewer = .{
+                        .selected_target = .{ .diff_file = 0 },
+                        .selected_file = 0,
+                        .selected_node = 0,
+                    },
+                },
+                .repository = .{
+                    .active = true,
+                    .repo_epoch = 7,
+                    .selected_path = "b",
+                },
+            },
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+        };
+        defer app.pages.review.deinit(allocator);
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+        app.pages.repository.root_identity = app.repo_state.activeIdentity();
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+
+        const message = switch (input) {
+            .keyboard => app.handleEvent(.{ .key_press = .{ .codepoint = '1' } }),
+            .page_bar => blk: {
+                const layout = app.shellLayout();
+                const review_tab = page.tab(.review);
+                const bar = layout.page_bar orelse return error.ExpectedPageBar;
+                break :blk app.handleEvent(app_test_support.mouseEvent(
+                    bar.col + review_tab.col,
+                    bar.row,
+                    .left,
+                ));
+            },
+        } orelse return error.ExpectedPageSwitch;
+        try std.testing.expectEqual(App.Msg{ .switch_page = .review }, message);
+
+        try app.update(message, &ctx);
+
+        try std.testing.expectEqual(page.Id.review, app.active_page);
+        try std.testing.expect(!app.pages.repository.active);
+        try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+        try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+        try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
+    }
+}
+
+test "review repository transition E3a active Repository controls remain same-page no-ops" {
+    const allocator = std.testing.allocator;
+    const identity: repo_root_capability.Identity = .{ .device = 5, .inode = 8 };
+    const inputs = [_]enum { keyboard, page_bar }{ .keyboard, .page_bar };
+
+    for (inputs) |input| {
+        var app: App = .{
+            .allocator = allocator,
+            .active_page = .repository,
+            .repo_epoch = 7,
+            .terminal_size = .{ .width = 100, .height = 20 },
+            .pages = .{ .repository = .{
+                .active = true,
+                .repo_epoch = 7,
+                .root_identity = identity,
+                .selected_path = "retained.zig",
+            } },
+        };
+        defer app.pages.repository.deinit(allocator);
+        var incoming = try page_link.RepositoryIncoming.initOwned(
+            allocator,
+            app.repo_epoch,
+            identity,
+            .{ .location = .{ .path = "pending.zig" } },
+        );
+        app.pages.repository.acceptIncoming(allocator, &incoming);
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+        const message = switch (input) {
+            .keyboard => app.handleEvent(.{ .key_press = .{ .codepoint = '2' } }),
+            .page_bar => blk: {
+                const layout = app.shellLayout();
+                const repository_tab = page.tab(.repository);
+                const bar = layout.page_bar orelse return error.ExpectedPageBar;
+                break :blk app.handleEvent(app_test_support.mouseEvent(
+                    bar.col + repository_tab.col,
+                    bar.row,
+                    .left,
+                ));
+            },
+        } orelse return error.ExpectedPageSwitch;
+        try std.testing.expectEqual(App.Msg{ .switch_page = .repository }, message);
+
+        try app.update(message, &ctx);
+
+        try std.testing.expectEqual(page.Id.repository, app.active_page);
+        try std.testing.expect(app.pages.repository.active);
+        try std.testing.expect(app.pages.repository.incoming == .awaiting_manifest);
+        try std.testing.expectEqualStrings("pending.zig", app.pages.repository.incoming.manifestIntent().?.path);
+        try std.testing.expectEqualStrings("retained.zig", app.pages.repository.selected_path.?);
+        try std.testing.expect(app.pages.review.activation.state == .inactive);
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    }
+}
+
 test "review repository transition C1 prepare failures leave both pages unchanged" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
