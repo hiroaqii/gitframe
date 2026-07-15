@@ -1328,6 +1328,36 @@ pub const App = struct {
         _ = self.pages.repository.resolveIncomingAfterActivation(allocator);
     }
 
+    /// Infallibly commit Repository -> Review contextual navigation after the
+    /// common shell policy has allowed the switch. The borrowed location is
+    /// consumed synchronously; no failed request survives for a later reload.
+    fn commitRepositoryReviewHandoff(self: *App, allocator: std.mem.Allocator) void {
+        std.debug.assert(self.active_page == .repository);
+        const target = self.pages.repository.reviewTarget();
+
+        // A location target implies `incoming == .none`, so its path borrows
+        // the retained manifest rather than storage released by this cleanup.
+        self.pages.repository.dismissIncoming(allocator);
+        self.pages.repository.deactivate();
+        self.active_page = .review;
+        _ = self.activateReview();
+
+        switch (target) {
+            .no_context => self.status.set("Repository has no resolved file to open in Review", .{}),
+            .location => |location| {
+                const outcome = self.reviewNavigation().revealExactPath(location) catch {
+                    self.status.set("could not prepare page navigation", .{});
+                    return;
+                };
+                switch (outcome) {
+                    .selected => {},
+                    .unchanged => self.status.set("Repository file is already selected in Review", .{}),
+                    .unavailable => |reason| self.status.set("{s}", .{reason.message()}),
+                }
+            },
+        }
+    }
+
     /// Single page-transition entry point for keyboard, mouse, and future
     /// Session API requests. It applies the policy before mutating either page.
     fn requestPageSwitch(self: *App, ctx: *chasen.Ctx(Msg), target: page.Id) !void {
@@ -7903,6 +7933,158 @@ test "page transition blocker leaves page and Review state unchanged" {
     try std.testing.expectEqual(activation_id, app.pages.review.activation.state.active.activation_id);
     try std.testing.expectEqualStrings("finish search before switching pages", app.status.text());
     try std.testing.expect(!app.pages.history.initialized);
+}
+
+test "review repository transition E2a commit selects exact retained Review path" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .repository,
+        .repo_epoch = 7,
+        .config = .{ .source = .unstaged },
+        .pages = .{
+            .review = .{
+                .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+                .viewer = .{
+                    .selected_target = .{ .diff_file = 0 },
+                    .selected_file = 0,
+                    .selected_node = 0,
+                },
+            },
+            .repository = .{
+                .active = true,
+                .repo_epoch = 7,
+                .selected_path = "b",
+            },
+        },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    defer app.pages.review.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    app.pages.repository.root_identity = app.repo_state.activeIdentity();
+
+    app.commitRepositoryReviewHandoff(allocator);
+
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expect(!app.pages.repository.active);
+    try std.testing.expect(app.pages.repository.incoming == .none);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 0), app.status.text().len);
+    try std.testing.expectEqual(@as(u64, 7), app.pages.review.activation.state.active.repo_epoch);
+}
+
+test "review repository transition E2a commit maps unchanged and unavailable outcomes" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    const cases = [_]struct {
+        path: []const u8,
+        status: []const u8,
+    }{
+        .{ .path = "b", .status = "Repository file is already selected in Review" },
+        .{ .path = "missing.zig", .status = "Repository file is not part of the current Review" },
+    };
+
+    for (cases) |case| {
+        var app: App = .{
+            .allocator = allocator,
+            .active_page = .repository,
+            .repo_epoch = 7,
+            .config = .{ .source = .unstaged },
+            .pages = .{
+                .review = .{
+                    .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+                    .viewer = .{
+                        .selected_target = .{ .diff_file = 1 },
+                        .selected_file = 1,
+                        .selected_node = 1,
+                        .diff_scroll = 9,
+                    },
+                },
+                .repository = .{
+                    .active = true,
+                    .repo_epoch = 7,
+                    .selected_path = case.path,
+                },
+            },
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+        };
+        defer app.pages.review.deinit(allocator);
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+        app.pages.repository.root_identity = app.repo_state.activeIdentity();
+
+        app.commitRepositoryReviewHandoff(allocator);
+
+        try std.testing.expectEqual(page.Id.review, app.active_page);
+        try std.testing.expect(!app.pages.repository.active);
+        try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+        try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+        try std.testing.expectEqual(@as(usize, 9), app.pages.review.viewer.diff_scroll);
+        try std.testing.expectEqualStrings(case.status, app.status.text());
+    }
+}
+
+test "review repository transition E2a no context dismisses pending and unavailable owners" {
+    const allocator = std.testing.allocator;
+    const identity: repo_root_capability.Identity = .{ .device = 5, .inode = 8 };
+    const cases = [_]enum { pending, unavailable }{ .pending, .unavailable };
+
+    for (cases) |case| {
+        var app: App = .{
+            .allocator = allocator,
+            .active_page = .repository,
+            .repo_epoch = 7,
+            .config = .{ .source = .unstaged },
+            .pages = .{
+                .review = .{
+                    .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+                    .viewer = .{
+                        .selected_target = .{ .diff_file = 0 },
+                        .selected_node = 0,
+                        .diff_scroll = 6,
+                    },
+                },
+                .repository = .{
+                    .active = true,
+                    .repo_epoch = 7,
+                    .root_identity = identity,
+                    .selected_path = "retained.zig",
+                },
+            },
+        };
+        defer app.pages.review.deinit(allocator);
+        defer app.pages.repository.deinit(allocator);
+        var incoming = try page_link.RepositoryIncoming.initOwned(
+            allocator,
+            app.repo_epoch,
+            identity,
+            switch (case) {
+                .pending => .{ .location = .{ .path = "pending.zig" } },
+                .unavailable => .{ .unavailable = .{
+                    .path = "missing.zig",
+                    .reason = .path_not_found,
+                } },
+            },
+        );
+        app.pages.repository.acceptIncoming(allocator, &incoming);
+
+        app.commitRepositoryReviewHandoff(allocator);
+
+        try std.testing.expectEqual(page.Id.review, app.active_page);
+        try std.testing.expect(!app.pages.repository.active);
+        try std.testing.expect(app.pages.repository.incoming == .none);
+        try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+        try std.testing.expectEqual(@as(usize, 6), app.pages.review.viewer.diff_scroll);
+        try std.testing.expectEqualStrings("Repository has no resolved file to open in Review", app.status.text());
+    }
 }
 
 test "review repository transition C1 prepare failures leave both pages unchanged" {
