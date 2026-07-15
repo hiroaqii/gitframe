@@ -979,6 +979,20 @@ pub const RepositoryPageState = struct {
         return self.incoming.unavailableValue();
     }
 
+    /// Export only a resolved, page-owned exact path for synchronous Review
+    /// lookup. A pending or unavailable contextual destination wins over any
+    /// older retained selection and therefore exports no context.
+    pub fn reviewTarget(self: *const RepositoryPageState) page_link.RepositoryReviewTarget {
+        if (self.incoming != .none) return .no_context;
+        const path = self.selected_path orelse return .no_context;
+        const identity = self.root_identity orelse return .no_context;
+        return .{ .location = .{
+            .repo_epoch = self.repo_epoch,
+            .root_identity = identity,
+            .path = path,
+        } };
+    }
+
     pub fn terminalizeIncoming(self: *RepositoryPageState, reason: page_link.RepositoryUnavailableReason) bool {
         return self.incoming.terminalize(reason);
     }
@@ -2605,6 +2619,66 @@ test "repository page zero state deinitializes and activation is lazy" {
     try std.testing.expect(state.initialized);
     try std.testing.expect(state.needs_revalidation);
     try std.testing.expectEqual(@as(u64, 3), state.repo_epoch);
+}
+
+test "repository transition E1 exports only resolved exact Review context" {
+    const allocator = std.testing.allocator;
+    const identity: root_capability.Identity = .{ .device = 5, .inode = 8 };
+    const exact_path = "src/\xff.zig";
+    var state: RepositoryPageState = .{
+        .repo_epoch = 13,
+        .root_identity = identity,
+        .selected_path = exact_path,
+    };
+    defer state.deinit(allocator);
+
+    switch (state.reviewTarget()) {
+        .no_context => return error.ExpectedReviewLocation,
+        .location => |location| {
+            try std.testing.expectEqual(@as(u64, 13), location.repo_epoch);
+            try std.testing.expect(location.root_identity.eql(identity));
+            try std.testing.expect(std.mem.eql(u8, exact_path, location.path));
+            try std.testing.expectEqual(@intFromPtr(state.selected_path.?.ptr), @intFromPtr(location.path.ptr));
+        },
+    }
+
+    state.selected_path = null;
+    try std.testing.expect(state.reviewTarget() == .no_context);
+    state.selected_path = exact_path;
+    state.root_identity = null;
+    try std.testing.expect(state.reviewTarget() == .no_context);
+}
+
+test "repository transition E1 pending and unavailable destinations suppress retained context" {
+    const allocator = std.testing.allocator;
+    const identity: root_capability.Identity = .{ .device = 5, .inode = 8 };
+    var state: RepositoryPageState = .{
+        .repo_epoch = 13,
+        .root_identity = identity,
+        .selected_path = "retained.zig",
+    };
+    defer state.deinit(allocator);
+
+    var pending = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        state.repo_epoch,
+        identity,
+        .{ .location = .{ .path = "requested.zig" } },
+    );
+    state.acceptIncoming(allocator, &pending);
+    try std.testing.expect(state.reviewTarget() == .no_context);
+
+    try std.testing.expect(state.incoming.advanceToDocument(21));
+    try std.testing.expect(state.reviewTarget() == .no_context);
+
+    try std.testing.expect(state.terminalizeIncoming(.path_not_found));
+    try std.testing.expect(state.reviewTarget() == .no_context);
+
+    state.dismissIncoming(allocator);
+    switch (state.reviewTarget()) {
+        .no_context => return error.ExpectedRetainedReviewLocation,
+        .location => |location| try std.testing.expectEqualStrings("retained.zig", location.path),
+    }
 }
 
 test "repository page navigation keeps sticky file selection on directory" {

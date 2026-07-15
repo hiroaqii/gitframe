@@ -53,6 +53,14 @@ pub const ReviewLocationIntent = struct {
     path: []const u8,
 };
 
+/// Allocation-free Repository classification for a synchronous Review link.
+/// `no_context` deliberately covers unresolved and unavailable incoming
+/// destinations so a retained browser selection cannot impersonate them.
+pub const RepositoryReviewTarget = union(enum) {
+    no_context,
+    location: ReviewLocationIntent,
+};
+
 pub const ReviewUnavailableReason = enum {
     source_unavailable,
     no_accepted_review,
