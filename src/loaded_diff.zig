@@ -97,17 +97,23 @@ pub const LoadedDiff = struct {
         hide_reviewed: bool,
         status_filter: ChangedFileFilter,
     ) !void {
-        if (self.visible_nodes.len < self.tree.nodes.len) {
-            self.visible_nodes = try allocator.alloc(usize, self.tree.nodes.len);
-        }
+        var prepared = try self.prepareVisibleNodeRebuild(allocator);
+        prepared.commit(hide_reviewed, status_filter);
+    }
 
-        var count: usize = 0;
-        for (self.tree.nodes, 0..) |_, index| {
-            if (!self.shouldIncludeVisibleNode(index, hide_reviewed, status_filter)) continue;
-            self.visible_nodes[count] = index;
-            count += 1;
-        }
-        self.visible_node_count = count;
+    /// Prepare rebuild storage without publishing it as the active
+    /// materialization. Dropping the returned value is a semantic no-op; its
+    /// commit method installs only a completely populated candidate.
+    pub fn prepareVisibleNodeRebuild(self: *LoadedDiff, allocator: std.mem.Allocator) !PreparedVisibleNodeRebuild {
+        const candidate = if (self.visible_nodes.len >= self.tree.nodes.len)
+            self.visible_nodes
+        else
+            try allocator.alloc(usize, self.tree.nodes.len);
+        return .{
+            .target = self,
+            .candidate = candidate,
+            .tree_node_count = self.tree.nodes.len,
+        };
     }
 
     fn shouldIncludeVisibleNode(self: *const LoadedDiff, node_index: usize, hide_reviewed: bool, status_filter: ChangedFileFilter) bool {
@@ -283,6 +289,31 @@ pub const LoadedDiff = struct {
     }
 };
 
+/// Move-only-by-convention rebuild transaction returned only by
+/// `LoadedDiff.prepareVisibleNodeRebuild`.
+///
+/// The captured node count closes the candidate-capacity obligation at
+/// preparation time. FileTree nodes are immutable for a LoadedDiff session.
+const PreparedVisibleNodeRebuild = struct {
+    target: *LoadedDiff,
+    candidate: []usize,
+    tree_node_count: usize,
+
+    pub fn commit(self: *PreparedVisibleNodeRebuild, hide_reviewed: bool, status_filter: ChangedFileFilter) void {
+        const target = self.target;
+        const candidate = self.candidate;
+        var count: usize = 0;
+        for (0..self.tree_node_count) |index| {
+            if (!target.shouldIncludeVisibleNode(index, hide_reviewed, status_filter)) continue;
+            candidate[count] = index;
+            count += 1;
+        }
+        target.visible_nodes = candidate;
+        target.visible_node_count = count;
+        self.* = undefined;
+    }
+};
+
 test "repository root visibility follows filtered file descendants" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -310,4 +341,102 @@ test "repository root visibility follows filtered file descendants" {
 
     try loaded.rebuildVisibleNodes(allocator, false, .modified);
     try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
+}
+
+test "visible node rebuild preparation failure preserves the retained materialization" {
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
+        .{ .kind = .file, .name = "b", .path = "b", .depth = 0, .target = .{ .diff_file = 1 } },
+    };
+    var retained = [_]usize{7};
+    var loaded: LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &.{} },
+        .file_text_eligibility = &.{},
+        .tree = .{ .nodes = &nodes },
+        .visible_nodes = &retained,
+        .visible_node_count = 1,
+        .bytes = 0,
+        .lines = 0,
+    };
+    const retained_ptr = loaded.visible_nodes.ptr;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try std.testing.expectError(error.OutOfMemory, loaded.prepareVisibleNodeRebuild(failing.allocator()));
+
+    try std.testing.expectEqual(retained_ptr, loaded.visible_nodes.ptr);
+    try std.testing.expectEqual(@as(usize, 1), loaded.visible_node_count);
+    try std.testing.expectEqual(@as(usize, 7), loaded.visible_nodes[0]);
+}
+
+test "discarded visible node rebuild preparation preserves active and fallback views" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
+        .{ .kind = .file, .name = "b", .path = "b", .depth = 0, .target = .{ .diff_file = 1 } },
+    };
+
+    var retained = [_]usize{1};
+    var active: LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &.{} },
+        .file_text_eligibility = &.{},
+        .tree = .{ .nodes = &nodes },
+        .visible_nodes = &retained,
+        .visible_node_count = 1,
+        .bytes = 0,
+        .lines = 0,
+    };
+    const retained_ptr = active.visible_nodes.ptr;
+    _ = try active.prepareVisibleNodeRebuild(allocator);
+    try std.testing.expectEqual(retained_ptr, active.visible_nodes.ptr);
+    try std.testing.expectEqual(@as(usize, 1), active.visibleNodeCount());
+    try std.testing.expectEqual(@as(?usize, 1), active.visibleNodeAt(0));
+
+    var fallback: LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &.{} },
+        .file_text_eligibility = &.{},
+        .tree = .{ .nodes = &nodes },
+        .bytes = 0,
+        .lines = 0,
+    };
+    try std.testing.expectEqual(@as(?[]const usize, null), fallback.materializedVisibleNodes());
+    _ = try fallback.prepareVisibleNodeRebuild(allocator);
+    try std.testing.expectEqual(@as(?[]const usize, null), fallback.materializedVisibleNodes());
+    try std.testing.expectEqual(@as(usize, 2), fallback.visibleNodeCount());
+    try std.testing.expectEqual(@as(?usize, 0), fallback.visibleNodeAt(0));
+    try std.testing.expectEqual(@as(?usize, 1), fallback.visibleNodeAt(1));
+}
+
+test "prepared visible node rebuild commits infallibly after fold changes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
+        .{ .kind = .file, .name = "main.zig", .path = "src/main.zig", .depth = 1, .target = .{ .diff_file = 0 } },
+    };
+    var loaded: LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &.{} },
+        .file_text_eligibility = &.{},
+        .tree = .{ .nodes = &nodes },
+        .bytes = 0,
+        .lines = 0,
+    };
+
+    var collapsed = try loaded.prepareVisibleNodeRebuild(allocator);
+    try file_tree.collapse(allocator, &loaded.collapsed_dirs, "src");
+    collapsed.commit(false, .all);
+    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
+
+    var expanded = try loaded.prepareVisibleNodeRebuild(allocator);
+    file_tree.expandAncestors(&loaded.collapsed_dirs, "src/main.zig");
+    expanded.commit(false, .all);
+    try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(?usize, 1), loaded.visibleNodeAt(1));
 }
