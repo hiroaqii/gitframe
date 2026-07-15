@@ -8315,6 +8315,143 @@ test "review repository transition E3a active Repository controls remain same-pa
     }
 }
 
+test "review repository transition E3b1 common switch maps retained-location outcomes" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        path: ?[]const u8,
+        retained_index: usize = 1,
+        hide_reviewed: bool = false,
+        identity_mismatch: bool = false,
+        status: []const u8,
+    }{
+        .{ .path = "b", .status = "Repository file is already selected in Review" },
+        .{ .path = "missing.zig", .status = "Repository file is not part of the current Review" },
+        .{ .path = "b", .retained_index = 0, .hide_reviewed = true, .status = "Repository file is hidden by Review filters" },
+        .{ .path = "b", .retained_index = 0, .identity_mismatch = true, .status = "Repository changed before Review navigation" },
+        .{ .path = null, .status = "Repository has no resolved file to open in Review" },
+    };
+
+    for (cases) |case| {
+        var roots = try TestRepoPair.init();
+        defer roots.deinit();
+        var reviewed = [_]bool{ false, true };
+        var loaded = app_test_support.loadedDiffTwo();
+        loaded.reviewed_files = &reviewed;
+        var app: App = .{
+            .allocator = allocator,
+            .active_page = .repository,
+            .repo_epoch = 7,
+            .config = .{ .source = .unstaged },
+            .pages = .{
+                .review = .{
+                    .load = app_test_support.loadState(loaded),
+                    .viewer = .{
+                        .selected_target = .{ .diff_file = case.retained_index },
+                        .selected_file = case.retained_index,
+                        .selected_node = case.retained_index,
+                        .diff_cursor = if (case.retained_index == 0) .{ .metadata = 0 } else .{ .metadata = 1 },
+                        .diff_scroll = 9,
+                    },
+                    .review_display = .{ .hide_reviewed_files = case.hide_reviewed },
+                },
+                .repository = .{
+                    .active = true,
+                    .repo_epoch = 7,
+                    .selected_path = case.path,
+                },
+            },
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+        };
+        defer app.pages.review.deinit(allocator);
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+        const identity = app.repo_state.activeIdentity().?;
+        app.pages.repository.root_identity = if (case.identity_mismatch)
+            .{ .device = identity.device, .inode = identity.inode +% 1 }
+        else
+            identity;
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+
+        try app.update(.{ .switch_page = .review }, &ctx);
+
+        try std.testing.expectEqual(page.Id.review, app.active_page);
+        try std.testing.expect(!app.pages.repository.active);
+        try std.testing.expectEqual(case.retained_index, app.pages.review.viewer.selected_node);
+        try std.testing.expectEqual(case.retained_index, app.pages.review.viewer.selected_file);
+        try std.testing.expectEqual(context.SelectedTarget{ .diff_file = case.retained_index }, app.pages.review.viewer.selected_target.?);
+        try std.testing.expect(std.meta.eql(
+            if (case.retained_index == 0)
+                diff_view_model.BodyCoordinate{ .metadata = 0 }
+            else
+                diff_view_model.BodyCoordinate{ .metadata = 1 },
+            app.pages.review.viewer.diff_cursor,
+        ));
+        try std.testing.expectEqual(@as(usize, 9), app.pages.review.viewer.diff_scroll);
+        try std.testing.expectEqual(case.hide_reviewed, app.pages.review.review_display.hide_reviewed_files);
+        try std.testing.expectEqualStrings(case.status, app.status.text());
+        try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
+    }
+}
+
+test "review repository transition E3b1 common switch consumes pending and unavailable no context" {
+    const allocator = std.testing.allocator;
+    const identity: repo_root_capability.Identity = .{ .device = 5, .inode = 8 };
+    const cases = [_]enum { pending, unavailable }{ .pending, .unavailable };
+
+    for (cases) |case| {
+        var app: App = .{
+            .allocator = allocator,
+            .active_page = .repository,
+            .repo_epoch = 7,
+            .config = .{ .source = .stdin },
+            .pages = .{
+                .review = .{
+                    .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+                    .viewer = .{
+                        .selected_target = .{ .diff_file = 0 },
+                        .selected_node = 0,
+                        .diff_scroll = 6,
+                    },
+                },
+                .repository = .{
+                    .active = true,
+                    .repo_epoch = 7,
+                    .root_identity = identity,
+                    .selected_path = "retained.zig",
+                },
+            },
+        };
+        defer app.pages.review.deinit(allocator);
+        defer app.pages.repository.deinit(allocator);
+        var incoming = try page_link.RepositoryIncoming.initOwned(
+            allocator,
+            app.repo_epoch,
+            identity,
+            switch (case) {
+                .pending => .{ .location = .{ .path = "pending.zig" } },
+                .unavailable => .{ .unavailable = .{
+                    .path = "missing.zig",
+                    .reason = .path_not_found,
+                } },
+            },
+        );
+        app.pages.repository.acceptIncoming(allocator, &incoming);
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+        try app.update(.{ .switch_page = .review }, &ctx);
+
+        try std.testing.expectEqual(page.Id.review, app.active_page);
+        try std.testing.expect(!app.pages.repository.active);
+        try std.testing.expect(app.pages.repository.incoming == .none);
+        try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+        try std.testing.expectEqual(@as(usize, 6), app.pages.review.viewer.diff_scroll);
+        try std.testing.expectEqualStrings("Repository has no resolved file to open in Review", app.status.text());
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    }
+}
+
 test "review repository transition C1 prepare failures leave both pages unchanged" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
