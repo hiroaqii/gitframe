@@ -146,3 +146,43 @@ test "repository selection slice B transition blocks every page switch" {
         disposition(.repository, .review, .{ .repository_mouse_selection = true }),
     );
 }
+
+test "Review Repository transitions reject every blocker in both directions" {
+    const cases = [_]struct {
+        blocker: Blocker,
+        snapshot: Snapshot,
+    }{
+        .{ .blocker = .review_mouse_selection, .snapshot = .{ .review_mouse_selection = true } },
+        .{ .blocker = .repository_mouse_selection, .snapshot = .{ .repository_mouse_selection = true } },
+        .{ .blocker = .review_deferred_apply, .snapshot = .{ .review_deferred_apply = true } },
+        .{ .blocker = .review_search, .snapshot = .{ .review_search = true } },
+        .{ .blocker = .review_file_search, .snapshot = .{ .review_file_search = true } },
+        .{ .blocker = .repository_source_search, .snapshot = .{ .repository_source_search = true } },
+        .{ .blocker = .repository_file_search, .snapshot = .{ .repository_file_search = true } },
+        .{ .blocker = .repo_picker, .snapshot = .{ .repo_picker = true } },
+        .{ .blocker = .help, .snapshot = .{ .help = true } },
+        .{ .blocker = .commit_input, .snapshot = .{ .commit_input = true } },
+        .{ .blocker = .confirmation, .snapshot = .{ .confirmation = true } },
+        .{ .blocker = .credential_input, .snapshot = .{ .credential_input = true } },
+        .{ .blocker = .branch_switch, .snapshot = .{ .branch_switch = true } },
+        .{ .blocker = .push_error, .snapshot = .{ .push_error = true } },
+        .{ .blocker = .git_action, .snapshot = .{ .git_action = true } },
+        .{ .blocker = .foreground_command, .snapshot = .{ .foreground_command = true } },
+        .{ .blocker = .live_review_waiter, .snapshot = .{ .live_review_waiter = true } },
+        .{ .blocker = .teardown, .snapshot = .{ .teardown = true } },
+    };
+    const directions = [_]struct { active: page.Id, target: page.Id }{
+        .{ .active = .review, .target = .repository },
+        .{ .active = .repository, .target = .review },
+    };
+
+    try std.testing.expectEqual(std.meta.fields(Blocker).len, cases.len);
+    for (cases) |case| {
+        for (directions) |direction| {
+            try std.testing.expectEqual(
+                Disposition{ .blocked = case.blocker },
+                disposition(direction.active, direction.target, case.snapshot),
+            );
+        }
+    }
+}

@@ -8568,6 +8568,88 @@ test "review repository transition E3b2 inactive Repository retains contextual s
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
 }
 
+test "review repository transition E3b3 active repository replacement rejects old owner and result" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .repository,
+    };
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, roots.a),
+        0,
+        .external_selection,
+    ));
+    app.pages.repository.activate(app.repo_epoch, app.repo_state.activeIdentity());
+    const root_a_identity = app.repo_state.activeIdentity().?;
+    try std.testing.expect(app.pages.repository.root_identity.?.eql(root_a_identity));
+    app.pages.repository.selected_path = "retained.zig";
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        app.repo_epoch,
+        app.repo_state.activeIdentity().?,
+        .{ .location = .{ .path = "pending.zig" } },
+    );
+    app.pages.repository.acceptIncoming(allocator, &incoming);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingRepositoryTasks(&ctx, allocator);
+
+    try app.maybeStartRepositoryManifest(&ctx);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    const old_task: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    const old_identity = old_task.identity;
+    const old_root_identity = old_task.root.identity;
+    const old_generation = old_task.generation;
+    try std.testing.expectEqual(page.Id.repository, old_identity.origin);
+    try std.testing.expectEqual(app.pages.repository.repo_epoch, old_identity.repo_epoch);
+    try std.testing.expectEqual(app.pages.repository.activation_id, old_identity.activation_id);
+    try std.testing.expectEqual(app.pages.repository.generation, old_generation);
+    try std.testing.expectEqual(old_generation, app.pages.repository.pending_generation.?);
+    try std.testing.expect(old_root_identity.eql(root_a_identity));
+    try std.testing.expectEqualStrings(roots.a, old_task.root_path);
+
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, roots.b),
+        0,
+        .external_selection,
+    ));
+    const root_b_identity = app.repo_state.activeIdentity().?;
+    try std.testing.expect(!root_a_identity.eql(root_b_identity));
+    try std.testing.expectEqualStrings(roots.b, app.activeRepoRoot().?);
+    try std.testing.expectEqual(@as(u64, 2), app.repo_epoch);
+    try std.testing.expect(app.pages.repository.active);
+    try std.testing.expect(app.pages.repository.root_identity.?.eql(root_b_identity));
+    try std.testing.expect(app.pages.repository.selected_path == null);
+    try std.testing.expect(app.pages.repository.incoming == .none);
+    try std.testing.expect(app.pages.repository.pending_generation == null);
+    try std.testing.expect(app.pages.repository.needs_revalidation);
+    try std.testing.expect(app.pages.repository.wantsManifestRequest());
+
+    try app.updateRepository(&ctx, .{ .manifest_finished = .{
+        .identity = old_identity,
+        .root_identity = old_root_identity,
+        .generation = old_generation,
+        .result = .{ .failed_static = "stale old manifest" },
+    } });
+
+    try std.testing.expectEqualStrings(roots.b, app.activeRepoRoot().?);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.repository.repo_epoch);
+    try std.testing.expect(app.pages.repository.root_identity.?.eql(root_b_identity));
+    try std.testing.expect(app.pages.repository.bundle == null);
+    try std.testing.expect(app.pages.repository.selected_path == null);
+    try std.testing.expect(app.pages.repository.incoming == .none);
+    try std.testing.expect(app.pages.repository.pending_generation == null);
+    try std.testing.expect(app.pages.repository.needs_revalidation);
+    try std.testing.expect(app.pages.repository.wantsManifestRequest());
+    try std.testing.expectEqual(@as(usize, 0), app.pages.repository.status.text().len);
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
 test "review repository transition C1 prepare failures leave both pages unchanged" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
