@@ -28,14 +28,15 @@ pub fn drawSourceHeader(
     surface: *chasen.Surface,
     path: []const u8,
     search: model.SourceSearchState,
+    active: bool,
     palette: theme.Palette,
 ) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
     const path_window = try manifest.displayWindowAlloc(surface.frameAllocator(), path, 0, size.width -| 1);
-    draw.copyClippedTextAt(surface, 1, source_geometry.source_path_row, path_window.text(), palette.boldStyle(.accent)) catch {};
+    draw.copyClippedTextAt(surface, 1, source_geometry.source_path_row, path_window.text(), sourcePaneStyle(palette.boldStyle(.accent), active)) catch {};
     if (size.height <= source_geometry.source_search_or_rule_row) return;
-    if (drawSearchRow(surface, search, palette)) return;
+    if (drawSearchRow(surface, search, active, palette)) return;
     const style = sourceHeaderRuleStyle(palette);
     for (0..size.width) |col| {
         _ = surface.borrowTextAt(@intCast(col), source_geometry.source_search_or_rule_row, "─", style);
@@ -59,6 +60,7 @@ pub fn drawSource(
     if (size.height == 0 or size.width == 0) return;
     const geometry = source_geometry.SourceGeometry.init(size, document, viewer.line_numbers);
     if (size.height <= geometry.body_first_row) return;
+    const source_active = viewer.focus == .source;
 
     const rows = geometry.navigationRows();
     var body_row: usize = 0;
@@ -66,10 +68,10 @@ pub fn drawSource(
         const line_index = viewer.source_vertical_scroll + body_row;
         const row = geometry.body_first_row + @as(u16, @intCast(body_row));
         const current = line_index == viewer.source_cursor;
-        const base_style = if (current)
+        const base_style = sourcePaneStyle(if (current)
             palette.boldStyle(.prompt)
         else
-            palette.style(.foreground);
+            palette.style(.foreground), source_active);
 
         const change = if (changes) |map| map.row(line_index) else .none;
         const gutter: []const u8 = if (change == .none) " " else "│";
@@ -78,11 +80,12 @@ pub fn drawSource(
             .added => .diff_added,
             .modified => .diff_modified,
         };
-        _ = surface.borrowTextAt(0, row, gutter, palette.style(gutter_role));
+        _ = surface.borrowTextAt(0, row, gutter, sourcePaneStyle(palette.style(gutter_role), source_active));
         if (viewer.line_numbers) {
             const number = try std.fmt.allocPrint(surface.frameAllocator(), "{d}", .{line_index + 1});
             const number_col: u16 = @intCast(@as(usize, geometry.line_number_col) + geometry.line_number_width - chasen.text.displayWidth(number));
-            draw.copyClippedTextAt(surface, number_col, row, number, if (current) palette.boldStyle(.diff_cursor) else palette.style(.diff_line_number)) catch {};
+            const number_style = if (current) palette.boldStyle(.diff_cursor) else palette.style(.diff_line_number);
+            draw.copyClippedTextAt(surface, number_col, row, number, sourcePaneStyle(number_style, source_active)) catch {};
         }
         if (geometry.text_width == 0) {
             applySelectionLineStyles(surface, geometry, row, document, line_index, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
@@ -113,7 +116,7 @@ pub fn drawSource(
                 geometry.text_width,
             )) |range| {
                 const match_col: u16 = @intCast(@as(usize, geometry.text_col) + range.column);
-                draw.copyClippedTextAt(surface, match_col, row, range.text, palette.boldStyle(.warning)) catch {};
+                draw.copyClippedTextAt(surface, match_col, row, range.text, sourcePaneStyle(palette.boldStyle(.warning), source_active)) catch {};
             }
         };
         applySelectionLineStyles(surface, geometry, row, document, line_index, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
@@ -290,22 +293,31 @@ fn fileSearchWindowStart(focused: usize, len: usize, visible_rows: usize) usize 
     return if (clamped_focus < visible_rows) 0 else clamped_focus - visible_rows + 1;
 }
 
-fn drawSearchRow(surface: *chasen.Surface, search: model.SourceSearchState, palette: theme.Palette) bool {
+fn drawSearchRow(surface: *chasen.Surface, search: model.SourceSearchState, active: bool, palette: theme.Palette) bool {
     if (!search.mode and search.query.len == 0) return false;
     if (surface.size().height <= source_geometry.source_search_or_rule_row) return true;
     if (search.mode) {
         const text = std.fmt.allocPrint(surface.frameAllocator(), "/{s}", .{search.input.slice()}) catch return true;
-        draw.copyClippedTextAt(surface, 1, source_geometry.source_search_or_rule_row, text, palette.boldStyle(.prompt)) catch {};
+        draw.copyClippedTextAt(surface, 1, source_geometry.source_search_or_rule_row, text, sourcePaneStyle(palette.boldStyle(.prompt), active)) catch {};
     } else if (search.query.len > 0) {
         const prefix = if (search.match != null) "match: " else "no match: ";
         const text = std.fmt.allocPrint(surface.frameAllocator(), "{s}{s}", .{ prefix, search.query.slice() }) catch return true;
-        draw.copyClippedTextAt(surface, 1, source_geometry.source_search_or_rule_row, text, palette.style(if (search.match != null) .muted else .warning)) catch {};
+        draw.copyClippedTextAt(surface, 1, source_geometry.source_search_or_rule_row, text, sourcePaneStyle(palette.style(if (search.match != null) .muted else .warning), active)) catch {};
     }
     return true;
 }
 
 fn sourceHeaderRuleStyle(palette: theme.Palette) chasen.TextStyle {
     return .{ .fg = palette.color(.muted), .dim = true };
+}
+
+/// Pane activity modifies an existing semantic style instead of choosing a
+/// replacement role. Syntax, change, search, and selection presentation can
+/// therefore keep their meaning when focus moves back to the tree.
+pub fn sourcePaneStyle(style: chasen.TextStyle, active: bool) chasen.TextStyle {
+    var composed = style;
+    composed.dim = !active;
+    return composed;
 }
 
 test "repository source view reserves gutter and renders plain text" {
@@ -379,7 +391,7 @@ test "repository source header renders path above a full fixed separator" {
     try test_surface.init(24, source_geometry.source_body_first_row);
     defer test_surface.deinit();
 
-    try drawSourceHeader(&test_surface.surface, "src/main.zig", .{}, palette);
+    try drawSourceHeader(&test_surface.surface, "src/main.zig", .{}, true, palette);
     const snapshot = try test_surface.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/main.zig") != null);
@@ -397,7 +409,7 @@ test "repository source header truncates safely to the path row" {
     try test_surface.init(2, 1);
     defer test_surface.deinit();
 
-    try drawSourceHeader(&test_surface.surface, "a", .{}, .default());
+    try drawSourceHeader(&test_surface.surface, "a", .{}, true, .default());
     try test_surface.expectCellText(1, source_geometry.source_path_row, "a");
     try std.testing.expect(test_surface.surface.readCell(0, source_geometry.source_search_or_rule_row) == null);
 }
@@ -411,7 +423,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try test_surface.init(32, 6);
     defer test_surface.deinit();
 
-    try drawSourceHeader(&test_surface.surface, "src/main.zig", .{}, .default());
+    try drawSourceHeader(&test_surface.surface, "src/main.zig", .{}, true, .default());
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, null, .default());
     var snapshot = try test_surface.snapshot(allocator);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "/needle") == null);
@@ -424,7 +436,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try test_surface.init(32, 6);
     var search: model.SourceSearchState = .{ .mode = true };
     try search.input.insertSlice("needle");
-    try drawSourceHeader(&test_surface.surface, "src/main.zig", search, .default());
+    try drawSourceHeader(&test_surface.surface, "src/main.zig", search, true, .default());
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, search, null, .default());
     snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
@@ -443,7 +455,7 @@ test "repository source retained search result replaces the normal separator" {
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(28, source_geometry.source_body_first_row);
     defer test_surface.deinit();
-    try drawSourceHeader(&test_surface.surface, "src/main.zig", search, palette);
+    try drawSourceHeader(&test_surface.surface, "src/main.zig", search, true, palette);
 
     const snapshot = try test_surface.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
@@ -513,6 +525,84 @@ test "repository source syntax uses neutral styles below the search overlay" {
     }, null, palette);
     const match_cell = search_surface.surface.readCell(3, 2) orelse return error.ExpectedMatchCell;
     try std.testing.expectEqual(palette.color(.warning), match_cell.style.fg);
+}
+
+test "repository inactive source dims without replacing semantic foregrounds" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "const value plain\n");
+    var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    var candidates = [_]source_syntax.Candidate{.{
+        .line_index = 0,
+        .span = .{ .start = 0, .end = 5, .role = .keyword },
+    }};
+    var spans = try source_syntax.build(allocator, &document, &candidates);
+    defer spans.deinit(allocator);
+    var changes = repository_change_map.Map{
+        .rows = try allocator.dupe(repository_change_map.Kind, &.{.added}),
+    };
+    defer changes.deinit(allocator);
+    var search: model.SourceSearchState = .{
+        .match = .{ .line = 0, .start = 6, .end = 11 },
+    };
+    try search.query.insertSlice("value");
+    const palette: theme.Palette = .default();
+
+    var active: chasen.testing.TestSurface = undefined;
+    try active.init(32, 4);
+    defer active.deinit();
+    try drawSourceHeader(&active.surface, "src/main.zig", search, true, palette);
+    try drawSource(
+        &active.surface,
+        &document,
+        &spans,
+        &changes,
+        .{ .focus = .source, .source_cursor = 99 },
+        search,
+        null,
+        palette,
+    );
+
+    var inactive: chasen.testing.TestSurface = undefined;
+    try inactive.init(32, 4);
+    defer inactive.deinit();
+    try drawSourceHeader(&inactive.surface, "src/main.zig", search, false, palette);
+    try drawSource(
+        &inactive.surface,
+        &document,
+        &spans,
+        &changes,
+        .{ .focus = .tree, .source_cursor = 99 },
+        search,
+        null,
+        palette,
+    );
+
+    const geometry = source_geometry.SourceGeometry.init(active.surface.size(), &document, true);
+    const body_row = geometry.body_first_row;
+    const points = [_]struct {
+        col: u16,
+        row: u16,
+        role: theme.Role,
+    }{
+        .{ .col = 1, .row = source_geometry.source_path_row, .role = .accent },
+        .{ .col = 1, .row = source_geometry.source_search_or_rule_row, .role = .muted },
+        .{ .col = 0, .row = body_row, .role = .diff_added },
+        .{ .col = geometry.line_number_col, .row = body_row, .role = .diff_line_number },
+        .{ .col = geometry.text_col, .row = body_row, .role = .accent },
+        .{ .col = geometry.text_col + 6, .row = body_row, .role = .warning },
+        .{ .col = geometry.text_col + 12, .row = body_row, .role = .foreground },
+    };
+    for (points) |point| {
+        const active_cell = active.surface.readCell(point.col, point.row) orelse return error.ExpectedActiveSourceCell;
+        const inactive_cell = inactive.surface.readCell(point.col, point.row) orelse return error.ExpectedInactiveSourceCell;
+        try std.testing.expect(active_cell.style.fg.eql(palette.color(point.role)));
+        try std.testing.expect(inactive_cell.style.fg.eql(palette.color(point.role)));
+        try std.testing.expect(!active_cell.style.dim);
+        try std.testing.expect(inactive_cell.style.dim);
+    }
+    try std.testing.expect(active.surface.readCell(geometry.text_col + 6, body_row).?.style.bold);
+    try std.testing.expect(inactive.surface.readCell(geometry.text_col + 6, body_row).?.style.bold);
 }
 
 test "repository selection slice B background composes after cursor syntax and search styles" {

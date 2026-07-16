@@ -2684,12 +2684,18 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         return;
     }
     if (state.selected_path) |path| {
-        try repository_view.drawSourceHeader(&right, path, state.source_search, context.palette);
+        try repository_view.drawSourceHeader(&right, path, state.source_search, state.viewer.focus == .source, context.palette);
         if (size.height > repository_source_geometry.source_body_first_row) {
             try drawDocumentCheckpoint(state, path, &right, context.palette);
         }
     } else {
-        draw.copyClippedTextAt(&right, 1, 0, "No file selected", context.palette.style(.muted)) catch {};
+        draw.copyClippedTextAt(
+            &right,
+            1,
+            0,
+            "No file selected",
+            repository_view.sourcePaneStyle(context.palette.style(.muted), state.viewer.focus == .source),
+        ) catch {};
     }
 }
 
@@ -2783,12 +2789,13 @@ fn drawDocumentCheckpoint(
     surface: *chasen.Surface,
     palette: theme.Palette,
 ) !void {
+    const source_active = state.viewer.focus == .source;
     const displayed = state.displayed_document orelse {
-        draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, "Loading selected file...", palette.style(.muted)) catch {};
+        draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, "Loading selected file...", repository_view.sourcePaneStyle(palette.style(.muted), source_active)) catch {};
         return;
     };
     if (displayed.manifest_revision != state.manifest_revision or !std.mem.eql(u8, displayed.path, selected_path)) {
-        draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, "Loading selected file...", palette.style(.muted)) catch {};
+        draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, "Loading selected file...", repository_view.sourcePaneStyle(palette.style(.muted), source_active)) catch {};
         return;
     }
     switch (displayed.value) {
@@ -2812,11 +2819,11 @@ fn drawDocumentCheckpoint(
             );
             return;
         },
-        .inert => |inert| drawInertCheckpoint(inert, surface, palette),
+        .inert => |inert| drawInertCheckpoint(inert, surface, source_active, palette),
     }
 }
 
-fn drawInertCheckpoint(value: selected_document.Value, surface: *chasen.Surface, palette: theme.Palette) void {
+fn drawInertCheckpoint(value: selected_document.Value, surface: *chasen.Surface, active: bool, palette: theme.Palette) void {
     const label: []const u8 = switch (value) {
         .text => unreachable,
         .symlink => |link| blk: {
@@ -2833,7 +2840,7 @@ fn drawInertCheckpoint(value: selected_document.Value, surface: *chasen.Surface,
         .missing_or_changed => "File changed or disappeared; press r to retry",
         .unreadable, .unsupported_platform => "Selected file could not be read",
     };
-    draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, label, palette.style(.muted)) catch {};
+    draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, label, repository_view.sourcePaneStyle(palette.style(.muted), active)) catch {};
 }
 
 fn treeRowTextAlloc(
@@ -5585,6 +5592,14 @@ test "repository page renders tree and selected-document loading checkpoint" {
         repository_source_geometry.source_body_first_row,
         "L",
     );
+    const loading_cell = test_surface.surface.readCell(layout.source_col + 1, repository_source_geometry.source_body_first_row) orelse
+        return error.ExpectedLoadingCheckpointCell;
+    try std.testing.expect(loading_cell.style.fg.eql(theme.Palette.default().color(.muted)));
+    try std.testing.expect(loading_cell.style.dim);
+    const inactive_path_cell = test_surface.surface.readCell(layout.source_col + 1, repository_source_geometry.source_path_row) orelse
+        return error.ExpectedInactiveSourcePathCell;
+    try std.testing.expect(inactive_path_cell.style.fg.eql(theme.Palette.default().color(.accent)));
+    try std.testing.expect(inactive_path_cell.style.dim);
     const source_rule = test_surface.surface.readCell(layout.tree_width + 1, repository_source_geometry.source_search_or_rule_row) orelse
         return error.ExpectedSourceHeaderRuleCell;
     try std.testing.expectEqualStrings("─", source_rule.char.grapheme);
@@ -5629,6 +5644,10 @@ test "repository page anchors inert checkpoint below source header rule" {
         repository_source_geometry.source_body_first_row,
         "B",
     );
+    const inert_cell = test_surface.surface.readCell(layout.source_col + 1, repository_source_geometry.source_body_first_row) orelse
+        return error.ExpectedInertCheckpointCell;
+    try std.testing.expect(inert_cell.style.fg.eql(theme.Palette.default().color(.muted)));
+    try std.testing.expect(inert_cell.style.dim);
     const source_rule = test_surface.surface.readCell(layout.tree_width + 1, repository_source_geometry.source_search_or_rule_row) orelse
         return error.ExpectedSourceHeaderRuleCell;
     try std.testing.expectEqualStrings("─", source_rule.char.grapheme);
