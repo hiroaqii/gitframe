@@ -251,7 +251,7 @@ fn restyleCell(surface: *chasen.Surface, col: u16, row: u16, style: chasen.TextS
 
 pub fn drawFileSearch(
     surface: *chasen.Surface,
-    tree: *const repository_tree.Tree,
+    tree: ?*const repository_tree.Tree,
     state: *const model.FileSearchState,
     palette: theme.Palette,
 ) !void {
@@ -262,18 +262,22 @@ pub fn drawFileSearch(
     if (size.height > 1) {
         const status = if (state.truncated)
             "512+ matches; refine search"
+        else if (!state.projection_available)
+            "File list unavailable; wait or press Esc"
         else if (state.no_match)
             "No matching files"
         else
             "Enter: open  Esc: cancel";
-        draw.copyClippedTextAt(surface, 1, 1, status, palette.style(if (state.no_match) .warning else .muted)) catch {};
+        draw.copyClippedTextAt(surface, 1, 1, status, palette.style(if (state.no_match or !state.projection_available) .warning else .muted)) catch {};
     }
+    const available_tree = tree orelse return;
+    if (!state.projection_available) return;
     const visible_rows = @as(usize, size.height -| 2);
     const start = fileSearchWindowStart(state.focused, state.len, visible_rows);
     var row: usize = 0;
     while (row < visible_rows and start + row < state.len) : (row += 1) {
         const result_index = start + row;
-        const node = tree.nodes[state.matches[result_index]];
+        const node = available_tree.nodes[state.matches[result_index]];
         const window = try manifest.displayWindowAlloc(surface.frameAllocator(), node.path, 0, size.width -| 2);
         const style = if (result_index == state.focused) palette.boldStyle(.prompt) else palette.style(.muted);
         draw.copyClippedTextAt(surface, 1, @intCast(row + 2), window.text(), style) catch {};
@@ -671,7 +675,7 @@ test "repository file search renders its bounded truncation message" {
     defer manifest_document.deinit(allocator);
     var tree = try repository_tree.Tree.build(allocator, &manifest_document);
     defer tree.deinit(allocator);
-    var search: model.FileSearchState = .{ .mode = true, .truncated = true, .len = 1 };
+    var search: model.FileSearchState = .{ .mode = true, .projection_available = true, .truncated = true, .len = 1 };
     search.matches[0] = 0;
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(40, 5);
@@ -691,7 +695,7 @@ test "repository file search keeps a focused result visible in a short pane" {
     defer manifest_document.deinit(allocator);
     var tree = try repository_tree.Tree.build(allocator, &manifest_document);
     defer tree.deinit(allocator);
-    var search: model.FileSearchState = .{ .mode = true, .len = 6, .focused = 5 };
+    var search: model.FileSearchState = .{ .mode = true, .projection_available = true, .len = 6, .focused = 5 };
     for (0..6) |index| search.matches[index] = index;
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(24, 4);
@@ -703,4 +707,19 @@ test "repository file search keeps a focused result visible in a short pane" {
     try std.testing.expectEqual(search.matches[5], search.selectedNode().?);
     const focused_cell = test_surface.surface.readCell(1, 3) orelse return error.ExpectedFocusedFile;
     try std.testing.expectEqual(theme.Palette.default().boldStyle(.prompt), focused_cell.style);
+}
+
+test "repository file search renders unavailable projection without stale results" {
+    const allocator = std.testing.allocator;
+    var search: model.FileSearchState = .{ .mode = true };
+    search.matches[0] = 99;
+    search.len = 1;
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(48, 4);
+    defer test_surface.deinit();
+
+    try drawFileSearch(&test_surface.surface, null, &search, .default());
+    const snapshot = try test_surface.snapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "File list unavailable; wait or press Esc") != null);
 }

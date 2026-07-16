@@ -9,6 +9,7 @@ const model = @import("model.zig");
 pub const Context = struct {
     focus: model.Focus = .tree,
     source_available: bool = false,
+    tree_hidden: bool = false,
     source_search_mode: bool = false,
     file_search_mode: bool = false,
     source_query_len: usize = 0,
@@ -35,9 +36,9 @@ pub fn keyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
         return publicActionToMsg(Msg, context, action);
     }
 
-    if (key.matches(chasen.Key.tab, .{}) and context.source_available) return voidMsg(Msg, "toggle_focus");
+    if (key.matches(chasen.Key.tab, .{}) and context.source_available and !context.tree_hidden) return voidMsg(Msg, "toggle_focus");
     if (key.matches(chasen.Key.escape, .{}) and context.source_query_len > 0) return voidMsg(Msg, "clear_source_search");
-    if (context.focus == .tree and (key.matches(chasen.Key.enter, .{}) or key.matches(' ', .{}))) return voidMsg(Msg, "toggle_directory");
+    if (!context.tree_hidden and context.focus == .tree and (key.matches(chasen.Key.enter, .{}) or key.matches(' ', .{}))) return voidMsg(Msg, "toggle_directory");
     if (key.matches(chasen.Key.home, .{})) {
         return if (context.focus == .source) voidMsg(Msg, "source_first") else voidMsg(Msg, "tree_first");
     }
@@ -68,6 +69,7 @@ fn publicActionToMsg(comptime Msg: type, context: Context, action: keymap.Public
         .last_file => voidMsg(Msg, "tree_last"),
         .page_up => voidMsg(Msg, "page_up"),
         .page_down => voidMsg(Msg, "page_down"),
+        .toggle_sidebar => voidMsg(Msg, "toggle_tree_visibility"),
         .decrease_sidebar_width => voidMsg(Msg, "decrease_tree_width"),
         .increase_sidebar_width => voidMsg(Msg, "increase_tree_width"),
         else => null,
@@ -115,6 +117,7 @@ const TestMsg = union(enum) {
     source_last,
     tree_first,
     tree_last,
+    toggle_tree_visibility,
     decrease_tree_width,
     increase_tree_width,
     enter_source_search,
@@ -148,6 +151,7 @@ test "repository input routes focus search and file search independently" {
     try std.testing.expectEqual(TestMsg.toggle_changed_filter, keyToMsg(TestMsg, .{}, .{ .codepoint = 'F' }).?);
     try std.testing.expectEqual(TestMsg{ .source_search_insert = 'F' }, keyToMsg(TestMsg, .{ .source_search_mode = true }, .{ .codepoint = 'F' }).?);
     try std.testing.expectEqual(TestMsg{ .file_search_insert = 'F' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = 'F' }).?);
+    try std.testing.expectEqual(TestMsg{ .file_search_insert = 'B' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = 'B' }).?);
     try std.testing.expectEqual(TestMsg.file_search_next, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = chasen.Key.down }).?);
     try std.testing.expectEqualStrings("needle", pasteToMsg(TestMsg, .{ .source_search_mode = true }, "needle").?.source_search_paste);
 }
@@ -169,6 +173,21 @@ test "repository input routes configured tree width actions" {
     const effective = keymap.Effective.fromConfig(config);
     try std.testing.expectEqual(TestMsg.increase_tree_width, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'z' }).?);
     try std.testing.expect(keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = ']' }) == null);
+}
+
+test "repository input routes configured tree visibility and suppresses hidden focus toggles" {
+    try std.testing.expectEqual(TestMsg.toggle_tree_visibility, keyToMsg(TestMsg, .{}, .{ .codepoint = 'B' }).?);
+    try std.testing.expectEqual(TestMsg.enter_file_search, keyToMsg(TestMsg, .{ .tree_hidden = true }, .{ .codepoint = 'f' }).?);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .source_available = true, .tree_hidden = true }, .{ .codepoint = chasen.Key.tab }) == null);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .tree, .tree_hidden = true }, .{ .codepoint = chasen.Key.enter }) == null);
+
+    var config: keymap.Config = .{};
+    config.set(.toggle_sidebar, .{ .plain_codepoint = 'z' });
+    const effective = keymap.Effective.fromConfig(config);
+    try std.testing.expectEqual(TestMsg.toggle_tree_visibility, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'z' }).?);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'B' }) == null);
+    try std.testing.expectEqual(TestMsg{ .file_search_insert = '[' }, keyToMsg(TestMsg, .{ .file_search_mode = true, .keymap = effective }, .{ .codepoint = '[' }).?);
+    try std.testing.expectEqual(TestMsg{ .file_search_insert = ']' }, keyToMsg(TestMsg, .{ .file_search_mode = true, .keymap = effective }, .{ .codepoint = ']' }).?);
 }
 
 test "repository configured Space action claims normal input but not prompts" {

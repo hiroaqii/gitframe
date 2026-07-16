@@ -270,6 +270,7 @@ pub const Msg = union(enum) {
     toggle_focus,
     tree_first,
     tree_last,
+    toggle_tree_visibility,
     decrease_tree_width,
     increase_tree_width,
     source_first,
@@ -791,6 +792,9 @@ pub const BodyPoint = struct { col: u16, row: u16 };
 
 pub const BodyLayout = struct {
     tree_width: u16,
+    tree_visible: bool,
+    source_col: u16,
+    source_width: u16,
     /// Rows 0-1 intentionally mirror Review's spacer before the row-2 Files
     /// heading. Projected root/tree navigation begins at row 3.
     header_rows: u16 = 3,
@@ -800,23 +804,36 @@ pub const BodyLayout = struct {
     }
 
     pub fn treeBodyRow(self: BodyLayout, point: BodyPoint) ?usize {
-        if (point.col >= self.tree_width or point.row < self.header_rows) return null;
+        if (!self.tree_visible or point.col >= self.tree_width or point.row < self.header_rows) return null;
         return point.row - self.header_rows;
     }
 };
 
-pub fn bodyLayout(size: chasen.Size, preferred_tree_width: ?u16) BodyLayout {
-    return .{ .tree_width = repository_layout.treeWidth(size.width, preferred_tree_width) };
+pub fn bodyLayout(size: chasen.Size, preferred_tree_width: ?u16, tree_hidden: bool) BodyLayout {
+    if (tree_hidden) return .{
+        .tree_width = 0,
+        .tree_visible = false,
+        .source_col = 0,
+        .source_width = size.width,
+    };
+    const tree_width = repository_layout.treeWidth(size.width, preferred_tree_width);
+    const source_col = if (tree_width < size.width) tree_width + 1 else size.width;
+    return .{
+        .tree_width = tree_width,
+        .tree_visible = true,
+        .source_col = source_col,
+        .source_width = size.width -| source_col,
+    };
 }
 
 /// Converts shell-body coordinates to source-pane-local coordinates. A point
 /// in the tree, separator, or outside the body is intentionally `null`, which
 /// lets a live drag leave the pane without mutating its logical endpoint.
-pub fn sourceGesturePoint(point: ?BodyPoint, size: chasen.Size, preferred_tree_width: ?u16) ?BodyPoint {
+pub fn sourceGesturePoint(point: ?BodyPoint, size: chasen.Size, preferred_tree_width: ?u16, tree_hidden: bool) ?BodyPoint {
     const body_point = point orelse return null;
-    const layout = bodyLayout(size, preferred_tree_width);
-    if (body_point.col <= layout.tree_width or body_point.col >= size.width) return null;
-    return .{ .col = body_point.col - layout.tree_width - 1, .row = body_point.row };
+    const layout = bodyLayout(size, preferred_tree_width, tree_hidden);
+    if (body_point.col < layout.source_col or body_point.col >= size.width) return null;
+    return .{ .col = body_point.col - layout.source_col, .row = body_point.row };
 }
 
 /// Page-owned state for the read-only current working-tree browser. The zero
@@ -949,7 +966,12 @@ pub const RepositoryPageState = struct {
         self.file_visibility = .all;
         self.tree_projection = .{};
         const retained_tree_width = self.viewer.tree_width;
-        self.viewer = .{ .tree_width = retained_tree_width };
+        const retained_tree_hidden = self.preferredTreeHidden();
+        self.viewer = .{
+            .focus = if (retained_tree_hidden) .source else .tree,
+            .tree_width = retained_tree_width,
+            .tree_hidden = retained_tree_hidden,
+        };
         self.source_search.clear();
         self.file_search.close();
         self.pending_generation = null;
@@ -1044,7 +1066,7 @@ pub const RepositoryPageState = struct {
             self.all_selection_anchor = null;
             bundle.tree.rebuildVisibleFor(.all);
             if (self.file_search.mode) {
-                repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree, .all);
+                self.refreshFileSearch();
             }
             self.status.set("Review target opened in All files", .{});
         }
@@ -1646,7 +1668,7 @@ pub const RepositoryPageState = struct {
         finished.path = &.{};
         finished.value = .{ .inert = .unreadable };
         self.viewer.resetSource();
-        if (self.currentSource() == null) self.viewer.focus = .tree;
+        self.reconcileNoSourceFocus();
         self.source_search.clear();
         self.needs_syntax_request = source_syntax_runtime.enabled and self.currentSource() != null;
         self.needs_change_map_request = self.currentSource() != null;
@@ -1781,9 +1803,9 @@ pub const RepositoryPageState = struct {
         self.selected_path = selected;
         self.load_state = if (self.bundle.?.document.paths.len == 0) .empty else .loaded;
         self.viewer.tree_cursor = next_cursor;
-        if (selected == null and self.currentSource() == null) self.viewer.focus = .tree;
+        if (selected == null) self.reconcileNoSourceFocus();
         if (self.file_search.mode) {
-            repository_navigation.refreshFileSearch(&self.file_search, &self.bundle.?.tree, self.file_visibility);
+            self.refreshFileSearch();
         }
         self.clampScroll(0);
     }
@@ -1844,10 +1866,10 @@ pub const RepositoryPageState = struct {
             selected_cursor orelse 0;
         if (selected == null) {
             self.viewer.tree_vertical_scroll = 0;
-            if (self.currentSource() == null) self.viewer.focus = .tree;
+            self.reconcileNoSourceFocus();
         }
         if (self.file_search.mode) {
-            repository_navigation.refreshFileSearch(&self.file_search, tree, self.file_visibility);
+            self.refreshFileSearch();
         }
         self.clampScroll(body_height);
         return !optionalPathEql(previous, self.selected_path);
@@ -1917,49 +1939,50 @@ pub const RepositoryPageState = struct {
             else => self.cancelSourceSelection(),
         }
         const previous = self.selected_path;
-        const layout = bodyLayout(body_size, self.viewer.tree_width);
+        const layout = bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
         const body_height = layout.treeRows(body_size.height);
         const source = self.currentSource();
-        const right_width = body_size.width -| layout.tree_width -| 1;
         const source_geometry = if (source) |document|
-            repository_source_geometry.SourceGeometry.init(.{ .width = right_width, .height = body_size.height }, document, self.viewer.line_numbers)
+            repository_source_geometry.SourceGeometry.init(.{ .width = layout.source_width, .height = body_size.height }, document, self.viewer.line_numbers)
         else
             null;
         switch (msg) {
-            .move_up => if (self.viewer.focus == .source and source != null)
-                repository_navigation.moveSource(&self.viewer, source.?, -1, source_geometry.?)
-            else
-                self.moveCursor(-1, body_height),
-            .move_down => if (self.viewer.focus == .source and source != null)
-                repository_navigation.moveSource(&self.viewer, source.?, 1, source_geometry.?)
-            else
-                self.moveCursor(1, body_height),
-            .wheel_up => {
+            .move_up => switch (self.viewer.focus) {
+                .source => if (source) |document| repository_navigation.moveSource(&self.viewer, document, -1, source_geometry.?),
+                .tree => if (!self.viewer.tree_hidden) self.moveCursor(-1, body_height),
+            },
+            .move_down => switch (self.viewer.focus) {
+                .source => if (source) |document| repository_navigation.moveSource(&self.viewer, document, 1, source_geometry.?),
+                .tree => if (!self.viewer.tree_hidden) self.moveCursor(1, body_height),
+            },
+            .wheel_up => if (!self.viewer.tree_hidden) {
                 self.viewer.focus = .tree;
                 self.moveCursor(-1, body_height);
             },
-            .wheel_down => {
+            .wheel_down => if (!self.viewer.tree_hidden) {
                 self.viewer.focus = .tree;
                 self.moveCursor(1, body_height);
             },
-            .page_up => if (self.viewer.focus == .source and source != null)
-                repository_navigation.pageSource(&self.viewer, source.?, -1, source_geometry.?)
-            else
-                self.moveCursor(-@as(isize, @intCast(@max(body_height -| 1, 1))), body_height),
-            .page_down => if (self.viewer.focus == .source and source != null)
-                repository_navigation.pageSource(&self.viewer, source.?, 1, source_geometry.?)
-            else
-                self.moveCursor(@intCast(@max(body_height -| 1, 1)), body_height),
-            .toggle_directory => self.toggleCursor(body_height),
-            .scroll_left => if (self.viewer.focus == .source and source != null) {
-                repository_navigation.scrollSourceHorizontal(&self.viewer, source.?, -8, source_geometry.?);
-            } else {
-                self.viewer.tree_horizontal_scroll -|= 4;
+            .page_up => switch (self.viewer.focus) {
+                .source => if (source) |document| repository_navigation.pageSource(&self.viewer, document, -1, source_geometry.?),
+                .tree => if (!self.viewer.tree_hidden) self.moveCursor(-@as(isize, @intCast(@max(body_height -| 1, 1))), body_height),
             },
-            .scroll_right => if (self.viewer.focus == .source and source != null) {
-                repository_navigation.scrollSourceHorizontal(&self.viewer, source.?, 8, source_geometry.?);
-            } else {
-                self.viewer.tree_horizontal_scroll = @min(self.viewer.tree_horizontal_scroll +| 4, manifest.max_path_bytes * 4);
+            .page_down => switch (self.viewer.focus) {
+                .source => if (source) |document| repository_navigation.pageSource(&self.viewer, document, 1, source_geometry.?),
+                .tree => if (!self.viewer.tree_hidden) self.moveCursor(@intCast(@max(body_height -| 1, 1)), body_height),
+            },
+            .toggle_directory => if (!self.viewer.tree_hidden) self.toggleCursor(body_height),
+            .scroll_left => switch (self.viewer.focus) {
+                .source => if (source) |document| repository_navigation.scrollSourceHorizontal(&self.viewer, document, -8, source_geometry.?),
+                .tree => if (!self.viewer.tree_hidden) {
+                    self.viewer.tree_horizontal_scroll -|= 4;
+                },
+            },
+            .scroll_right => switch (self.viewer.focus) {
+                .source => if (source) |document| repository_navigation.scrollSourceHorizontal(&self.viewer, document, 8, source_geometry.?),
+                .tree => if (!self.viewer.tree_hidden) {
+                    self.viewer.tree_horizontal_scroll = @min(self.viewer.tree_horizontal_scroll +| 4, manifest.max_path_bytes * 4);
+                },
             },
             .mouse_row => |row| {
                 self.viewer.focus = .tree;
@@ -1981,17 +2004,20 @@ pub const RepositoryPageState = struct {
                 self.viewer.focus = .source;
                 repository_navigation.moveSource(&self.viewer, document, 1, source_geometry.?);
             },
-            .focus_tree => self.viewer.focus = .tree,
+            .focus_tree => if (!self.viewer.tree_hidden) {
+                self.viewer.focus = .tree;
+            },
             .focus_source => if (source != null) {
                 self.viewer.focus = .source;
             },
-            .toggle_focus => if (source != null) {
+            .toggle_focus => if (source != null and !self.viewer.tree_hidden) {
                 self.viewer.focus = if (self.viewer.focus == .tree) .source else .tree;
             },
+            .toggle_tree_visibility => self.toggleTreeVisibility(body_size),
             .decrease_tree_width => self.adjustTreeWidth(.shrink, body_size),
             .increase_tree_width => self.adjustTreeWidth(.grow, body_size),
-            .tree_first => self.selectTreeEdge(false, body_height),
-            .tree_last => self.selectTreeEdge(true, body_height),
+            .tree_first => if (!self.viewer.tree_hidden) self.selectTreeEdge(false, body_height),
+            .tree_last => if (!self.viewer.tree_hidden) self.selectTreeEdge(true, body_height),
             .source_first => if (source) |document| repository_navigation.firstSource(&self.viewer, document, source_geometry.?),
             .source_last => if (source) |document| repository_navigation.lastSource(&self.viewer, document, source_geometry.?),
             .toggle_changed_filter => self.toggleChangedFilter(allocator, body_height),
@@ -2032,32 +2058,28 @@ pub const RepositoryPageState = struct {
             .source_search_move_right => self.source_search.input.moveRight(),
             .source_search_insert => |codepoint| self.source_search.input.insert(codepoint) catch self.status.set("Source search is too long", .{}),
             .source_search_paste => |text| self.source_search.input.insertSlice(text) catch self.status.set("Source search is too long", .{}),
-            .enter_file_search => {
-                self.file_search.mode = true;
-                self.file_search.input = .{};
-                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree, self.file_visibility);
-            },
-            .cancel_file_search => self.file_search.close(),
-            .submit_file_search => self.submitFileSearch(body_height),
+            .enter_file_search => self.enterFileSearch(),
+            .cancel_file_search => self.cancelFileSearch(body_size),
+            .submit_file_search => self.submitFileSearch(body_size),
             .file_search_previous => self.file_search.move(-1),
             .file_search_next => self.file_search.move(1),
             .file_search_backspace => {
                 self.file_search.input.backspace();
-                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree, self.file_visibility);
+                self.refreshFileSearch();
             },
             .file_search_insert => |codepoint| {
                 self.file_search.input.insert(codepoint) catch {
                     self.status.set("File search is too long", .{});
                     return result;
                 };
-                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree, self.file_visibility);
+                self.refreshFileSearch();
             },
             .file_search_paste => |text| {
                 self.file_search.input.insertSlice(text) catch {
                     self.status.set("File search is too long", .{});
                     return result;
                 };
-                if (self.bundle) |*bundle| repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree, self.file_visibility);
+                self.refreshFileSearch();
             },
             .manifest_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
         }
@@ -2092,11 +2114,20 @@ pub const RepositoryPageState = struct {
         };
     }
 
+    /// Keep raw page focus valid even when a selected document becomes an
+    /// inert checkpoint. Input derives an effective focus too, but lifecycle
+    /// reconciliation must never leave an invisible tree as the stored owner.
+    fn reconcileNoSourceFocus(self: *RepositoryPageState) void {
+        if (self.currentSource() != null) return;
+        self.viewer.focus = if (self.viewer.tree_hidden) .source else .tree;
+    }
+
     pub fn inputContext(self: *const RepositoryPageState, keymap: @import("keymap").Effective) repository_input.Context {
         const source_available = self.currentSource() != null;
         return .{
-            .focus = if (source_available) self.viewer.focus else .tree,
+            .focus = if (self.viewer.tree_hidden) .source else if (source_available) self.viewer.focus else .tree,
             .source_available = source_available,
+            .tree_hidden = self.viewer.tree_hidden,
             .source_search_mode = self.source_search.mode,
             .file_search_mode = self.file_search.mode,
             .source_query_len = self.source_search.query.len,
@@ -2147,7 +2178,76 @@ pub const RepositoryPageState = struct {
         self.clampForBodySize(body_size);
     }
 
-    fn submitFileSearch(self: *RepositoryPageState, body_height: u16) void {
+    fn preferredTreeHidden(self: *const RepositoryPageState) bool {
+        return self.viewer.tree_hidden or (self.file_search.mode and self.file_search.restore_tree_hidden);
+    }
+
+    fn toggleTreeVisibility(self: *RepositoryPageState, body_size: chasen.Size) void {
+        if (self.viewer.tree_hidden) {
+            self.viewer.tree_hidden = false;
+            self.viewer.focus = if (self.viewer.tree_return_focus == .source and self.currentSource() == null)
+                .tree
+            else
+                self.viewer.tree_return_focus;
+        } else {
+            self.viewer.tree_return_focus = self.viewer.focus;
+            self.viewer.tree_hidden = true;
+            self.viewer.focus = .source;
+        }
+        self.clampForBodySize(body_size);
+    }
+
+    fn enterFileSearch(self: *RepositoryPageState) void {
+        self.file_search = .{
+            .mode = true,
+            .return_focus = self.viewer.focus,
+            .restore_tree_hidden = self.viewer.tree_hidden,
+        };
+        // Search candidates are tree destinations. Revealing the tree for the
+        // prompt avoids displaying a focus target in an invisible pane; cancel
+        // still owns enough state to restore the user's hidden preference.
+        self.viewer.tree_hidden = false;
+        self.viewer.focus = .tree;
+        self.refreshFileSearch();
+    }
+
+    /// Publish candidates only when every basis required by the active lens
+    /// is authoritative. In Changed mode an accepted manifest alone is not
+    /// enough: missing status is unavailable, not an authoritative empty set.
+    fn refreshFileSearch(self: *RepositoryPageState) void {
+        if (!self.file_search.mode) return;
+        const bundle = if (self.bundle) |*bundle| bundle else {
+            self.file_search.resetResults();
+            return;
+        };
+        if (self.file_visibility == .changed and !bundle.status_available) {
+            self.file_search.resetResults();
+            return;
+        }
+        repository_navigation.refreshFileSearch(&self.file_search, &bundle.tree, self.file_visibility);
+    }
+
+    fn cancelFileSearch(self: *RepositoryPageState, body_size: chasen.Size) void {
+        const return_focus = self.file_search.return_focus;
+        const restore_tree_hidden = self.file_search.restore_tree_hidden;
+        self.file_search.close();
+        self.viewer.tree_hidden = restore_tree_hidden;
+        self.viewer.focus = if (restore_tree_hidden)
+            .source
+        else if (return_focus == .source and self.currentSource() == null)
+            .tree
+        else
+            return_focus;
+        self.clampForBodySize(body_size);
+    }
+
+    fn submitFileSearch(self: *RepositoryPageState, body_size: chasen.Size) void {
+        const query = std.mem.trim(u8, self.file_search.input.slice(), " \t\r\n");
+        if (query.len == 0) {
+            self.cancelFileSearch(body_size);
+            return;
+        }
+        if (!self.file_search.projection_available) return;
         const node_index = self.file_search.selectedNode() orelse {
             self.file_search.no_match = true;
             return;
@@ -2155,10 +2255,11 @@ pub const RepositoryPageState = struct {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
         const visible = self.tree_projection.revealManifestNode(tree, self.file_visibility, node_index) orelse return;
         self.viewer.tree_cursor = visible;
+        self.viewer.tree_hidden = false;
         self.viewer.focus = .tree;
         self.selected_path = tree.nodes[node_index].path;
         self.file_search.close();
-        self.clampScroll(body_height);
+        self.clampForBodySize(body_size);
     }
 
     fn moveCursor(self: *RepositoryPageState, delta: isize, body_height: u16) void {
@@ -2219,7 +2320,7 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn clampForBodySize(self: *RepositoryPageState, body_size: chasen.Size) void {
-        const layout = bodyLayout(body_size, self.viewer.tree_width);
+        const layout = bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
         self.clampScroll(layout.treeRows(body_size.height));
         if (self.currentSource()) |document| {
             repository_navigation.clampSource(
@@ -2271,9 +2372,9 @@ pub const RepositoryPageState = struct {
     }
 
     fn sourceGeometry(self: *const RepositoryPageState, body_size: chasen.Size, document: *const source_document.Document) repository_source_geometry.SourceGeometry {
-        const layout = bodyLayout(body_size, self.viewer.tree_width);
+        const layout = bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
         return .init(
-            .{ .width = body_size.width -| layout.tree_width -| 1, .height = body_size.height },
+            .{ .width = layout.source_width, .height = body_size.height },
             document,
             self.viewer.line_numbers,
         );
@@ -2429,8 +2530,8 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn mouseToMsg(self: *const RepositoryPageState, point: BodyPoint, button: MouseButton, size: chasen.Size) ?Msg {
-        const layout = bodyLayout(size, self.viewer.tree_width);
-        if (point.col < layout.tree_width) return switch (button) {
+        const layout = bodyLayout(size, self.viewer.tree_width, self.viewer.tree_hidden);
+        if (layout.tree_visible and point.col < layout.tree_width) return switch (button) {
             .wheel_up => .wheel_up,
             .wheel_down => .wheel_down,
             .left => blk: {
@@ -2447,9 +2548,9 @@ pub const RepositoryPageState = struct {
                     .{ .mouse_row = body_row };
             },
         };
-        if (point.col == layout.tree_width) return null;
+        if (point.col < layout.source_col) return null;
         const document = self.currentSource() orelse return null;
-        const source_point = sourceGesturePoint(point, size, self.viewer.tree_width) orelse return null;
+        const source_point = sourceGesturePoint(point, size, self.viewer.tree_width, self.viewer.tree_hidden) orelse return null;
         const geometry = self.sourceGeometry(size, document);
         return switch (button) {
             .wheel_up => .mouse_source_wheel_up,
@@ -2462,6 +2563,7 @@ pub const RepositoryPageState = struct {
 fn navigationDismissesIncoming(msg: Msg) bool {
     return switch (msg) {
         .toggle_line_numbers,
+        .toggle_tree_visibility,
         .decrease_tree_width,
         .increase_tree_width,
         .cancel_source_selection,
@@ -2505,6 +2607,10 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         try drawIncomingUnavailable(unavailable, surface, context.palette);
         return;
     }
+    if (state.file_search.mode and state.bundle == null) {
+        try repository_view.drawFileSearch(surface, null, &state.file_search, context.palette);
+        return;
+    }
     switch (state.load_state) {
         .idle, .no_repository, .failed => {
             const label: []const u8 = switch (state.load_state) {
@@ -2516,7 +2622,7 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             draw.copyClippedTextAt(surface, 1, size.height / 2, label, context.palette.style(if (state.load_state == .failed) .danger else .muted)) catch {};
             return;
         },
-        .loading => if (state.file_visibility == .all) {
+        .loading => if (state.file_visibility == .all and !state.file_search.mode) {
             draw.copyClippedTextAt(surface, 1, size.height / 2, "Loading repository files...", context.palette.style(.muted)) catch {};
             return;
         },
@@ -2524,51 +2630,52 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         .loaded => {},
     }
 
-    const layout = bodyLayout(size, state.viewer.tree_width);
-    const left_width = layout.tree_width;
-    var left = surface.child(.{ .col = 0, .row = 0, .width = left_width, .height = size.height });
-    const tree_header: []const u8 = if (state.file_visibility == .changed) "Files [changed]" else "Files";
-    if (size.height > 2) draw.copyClippedTextAt(&left, 0, 2, tree_header, context.palette.boldStyle(.accent)) catch {};
-    if (left_width < size.width) {
-        var separator_row: u16 = 0;
-        while (separator_row < size.height) : (separator_row += 1) _ = surface.borrowTextAt(left_width, separator_row, "│", context.palette.style(.muted));
-    }
-
+    const layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     const tree = &state.bundle.?.tree;
-    const rows = layout.treeRows(size.height);
-    const tree_message: ?[]const u8 = if (state.load_state == .empty and state.file_visibility == .all)
-        "Repository has no tracked or non-ignored files"
-    else if (state.load_state == .loading)
-        "Loading changed files..."
-    else if (state.file_visibility == .all)
-        null
-    else if (!treeStatusAvailable(state))
-        if (state.freshness == .validating) "Loading changed files..." else "Changed-file status unavailable; press r to retry"
-    else if (tree.visible_len == 0)
-        "No changed files"
-    else
-        null;
-    if (tree_message) |message| {
-        if (rows > 0) try drawTreeProjectionRow(context, &left, tree, 0, layout.header_rows);
-        if (rows > 1) draw.copyClippedTextAt(&left, 0, layout.header_rows + 1, message, context.palette.style(.muted)) catch {};
-    } else {
-        var body_row: usize = 0;
-        while (body_row < rows and
-            state.viewer.tree_vertical_scroll + body_row < state.tree_projection.visibleLen(tree)) : (body_row += 1)
-        {
-            const visible_index = state.viewer.tree_vertical_scroll + body_row;
-            try drawTreeProjectionRow(
-                context,
-                &left,
-                tree,
-                visible_index,
-                @intCast(body_row + layout.header_rows),
-            );
+    if (layout.tree_visible) {
+        var left = surface.child(.{ .col = 0, .row = 0, .width = layout.tree_width, .height = size.height });
+        const tree_header: []const u8 = if (state.file_visibility == .changed) "Files [changed]" else "Files";
+        if (size.height > 2) draw.copyClippedTextAt(&left, 0, 2, tree_header, context.palette.boldStyle(.accent)) catch {};
+        if (layout.tree_width < size.width) {
+            var separator_row: u16 = 0;
+            while (separator_row < size.height) : (separator_row += 1) _ = surface.borrowTextAt(layout.tree_width, separator_row, "│", context.palette.style(.muted));
+        }
+
+        const rows = layout.treeRows(size.height);
+        const tree_message: ?[]const u8 = if (state.load_state == .empty and state.file_visibility == .all)
+            "Repository has no tracked or non-ignored files"
+        else if (state.load_state == .loading)
+            "Loading changed files..."
+        else if (state.file_visibility == .all)
+            null
+        else if (!treeStatusAvailable(state))
+            if (state.freshness == .validating) "Loading changed files..." else "Changed-file status unavailable; press r to retry"
+        else if (tree.visible_len == 0)
+            "No changed files"
+        else
+            null;
+        if (tree_message) |message| {
+            if (rows > 0) try drawTreeProjectionRow(context, &left, tree, 0, layout.header_rows);
+            if (rows > 1) draw.copyClippedTextAt(&left, 0, layout.header_rows + 1, message, context.palette.style(.muted)) catch {};
+        } else {
+            var body_row: usize = 0;
+            while (body_row < rows and
+                state.viewer.tree_vertical_scroll + body_row < state.tree_projection.visibleLen(tree)) : (body_row += 1)
+            {
+                const visible_index = state.viewer.tree_vertical_scroll + body_row;
+                try drawTreeProjectionRow(
+                    context,
+                    &left,
+                    tree,
+                    visible_index,
+                    @intCast(body_row + layout.header_rows),
+                );
+            }
         }
     }
 
-    if (left_width + 1 >= size.width) return;
-    var right = surface.child(.{ .col = left_width + 1, .row = 0, .width = size.width - left_width - 1, .height = size.height });
+    if (layout.source_width == 0) return;
+    var right = surface.child(.{ .col = layout.source_col, .row = 0, .width = layout.source_width, .height = size.height });
     if (state.file_search.mode) {
         try repository_view.drawFileSearch(&right, tree, &state.file_search, context.palette);
         return;
@@ -2874,7 +2981,7 @@ test "repository manifest replacement refreshes active file search indices" {
     };
     defer state.deinit(allocator);
     try state.file_search.input.insertSlice("old");
-    repository_navigation.refreshFileSearch(&state.file_search, &state.bundle.?.tree, .all);
+    state.refreshFileSearch();
     try std.testing.expectEqual(@as(usize, 1), state.file_search.len);
 
     var incoming = try bundleForTest("new.zig\x00");
@@ -2914,6 +3021,8 @@ test "repository manifest replacement retains collapsed root and selected source
     state.tree_projection.root_disclosure = .collapsed;
     state.viewer.tree_cursor = 0;
     state.viewer.tree_width = 42;
+    state.viewer.tree_hidden = true;
+    state.viewer.focus = .source;
 
     var incoming = try bundleForTest("dir/selected.zig\x00root.zig\x00");
     var incoming_owned = true;
@@ -2924,6 +3033,8 @@ test "repository manifest replacement retains collapsed root and selected source
     try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
+    try std.testing.expect(state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     try std.testing.expectEqual(@as(usize, 1), state.tree_projection.visibleLen(&state.bundle.?.tree));
     try std.testing.expectEqualStrings("dir/selected.zig", state.selected_path.?);
 }
@@ -2942,6 +3053,8 @@ test "repository explicit reload restores typed root and directory across outcom
     state.tree_projection.root_disclosure = .collapsed;
     state.viewer.tree_cursor = 0;
     state.viewer.tree_width = 42;
+    state.viewer.tree_hidden = true;
+    state.viewer.focus = .source;
 
     state.requestReload(true);
     var unchanged_request = try state.prepareRequest(allocator, root.path, &root.capability);
@@ -2957,6 +3070,8 @@ test "repository explicit reload restores typed root and directory across outcom
     try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
+    try std.testing.expect(state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     try std.testing.expectEqualStrings("dir/selected.zig", state.selected_path.?);
 
     state.tree_projection.root_disclosure = .expanded;
@@ -2980,6 +3095,8 @@ test "repository explicit reload restores typed root and directory across outcom
     try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &changed));
     try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
+    try std.testing.expect(state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     const restored = state.tree_projection.targetAt(&state.bundle.?.tree, state.viewer.tree_cursor) orelse
         return error.ExpectedRestoredTarget;
     switch (restored) {
@@ -3029,7 +3146,7 @@ test "repository file search expands typed root before selecting result" {
     state.selected_path = state.bundle.?.tree.filePath("other.zig", .all);
     state.file_search.mode = true;
     try state.file_search.input.insertSlice("target");
-    repository_navigation.refreshFileSearch(&state.file_search, &state.bundle.?.tree, .all);
+    state.refreshFileSearch();
 
     _ = state.applyNavigation(allocator, .submit_file_search, .{ .width = 80, .height = 10 });
 
@@ -3041,6 +3158,307 @@ test "repository file search expands typed root before selecting result" {
         .repo_root => return error.ExpectedFileTarget,
         .manifest_node => |node_index| try std.testing.expectEqualStrings("dir/target.zig", state.bundle.?.tree.nodes[node_index].path),
     }
+}
+
+test "repository hidden tree gives source full geometry and restores retained focus" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest(
+        "a.zig\x00b.zig\x00c.zig\x00d.zig\x00e.zig\x00f.zig\x00",
+        "one\ntwo\nthree\n",
+    );
+    defer state.deinit(allocator);
+    const size: chasen.Size = .{ .width = 80, .height = 6 };
+    state.viewer.focus = .tree;
+    state.viewer.tree_width = 42;
+    state.viewer.tree_cursor = 4;
+    state.viewer.tree_vertical_scroll = 2;
+    state.viewer.tree_horizontal_scroll = 7;
+    const selected = state.selected_path.?;
+
+    _ = state.applyNavigation(allocator, .toggle_tree_visibility, size);
+    try std.testing.expect(state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
+    try std.testing.expectEqual(@as(usize, 4), state.viewer.tree_cursor);
+    try std.testing.expectEqual(@as(usize, 2), state.viewer.tree_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.tree_horizontal_scroll);
+    try std.testing.expectEqualStrings(selected, state.selected_path.?);
+    const hidden_layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    try std.testing.expect(!hidden_layout.tree_visible);
+    try std.testing.expectEqual(@as(u16, 0), hidden_layout.source_col);
+    try std.testing.expectEqual(size.width, hidden_layout.source_width);
+    try std.testing.expectEqual(size.width, state.sourceGeometry(size, state.currentSource().?).width);
+    try std.testing.expectEqual(
+        Msg.focus_source,
+        state.mouseToMsg(.{ .col = 0, .row = 0 }, .left, size).?,
+    );
+    try std.testing.expectEqual(
+        BodyPoint{ .col = 4, .row = 2 },
+        sourceGesturePoint(.{ .col = 4, .row = 2 }, size, state.viewer.tree_width, true).?,
+    );
+
+    var hidden_surface: chasen.testing.TestSurface = undefined;
+    try hidden_surface.init(size.width, size.height);
+    defer hidden_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/gitframe" }, &hidden_surface.surface);
+    const hidden_snapshot = try hidden_surface.snapshot(allocator);
+    defer allocator.free(hidden_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, hidden_snapshot, "Files") == null);
+    try hidden_surface.expectCellText(1, repository_source_geometry.source_path_row, "a");
+
+    _ = state.applyNavigation(allocator, .toggle_tree_visibility, size);
+    try std.testing.expect(!state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 4), state.viewer.tree_cursor);
+    try std.testing.expectEqual(@as(usize, 2), state.viewer.tree_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.tree_horizontal_scroll);
+
+    state.viewer.focus = .source;
+    _ = state.applyNavigation(allocator, .toggle_tree_visibility, size);
+    const repo_epoch = state.repo_epoch;
+    const root_identity = state.root_identity.?;
+    state.deactivate();
+    state.activate(repo_epoch, root_identity);
+    try std.testing.expect(state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
+    _ = state.applyNavigation(allocator, .toggle_tree_visibility, size);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+}
+
+test "repository hidden-tree file search restores on cancel and commits visible on success" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("dir/target.zig\x00other.zig\x00"),
+        .load_state = .loaded,
+        .tree_projection = .{ .root_disclosure = .collapsed },
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.filePath("other.zig", .all);
+    state.viewer.tree_hidden = true;
+    state.viewer.focus = .source;
+    const size: chasen.Size = .{ .width = 80, .height = 10 };
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    try state.file_search.input.insertSlice("missing");
+    state.refreshFileSearch();
+    try std.testing.expect(state.file_search.mode);
+    try std.testing.expect(state.file_search.restore_tree_hidden);
+    try std.testing.expect(!state.viewer.tree_hidden);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(state.file_search.mode);
+    try std.testing.expect(state.file_search.no_match);
+    try std.testing.expect(!state.viewer.tree_hidden);
+
+    _ = state.applyNavigation(allocator, .cancel_file_search, size);
+    try std.testing.expect(!state.file_search.mode);
+    try std.testing.expect(state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    try std.testing.expectEqualStrings("other.zig", state.selected_path.?);
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(!state.file_search.mode);
+    try std.testing.expect(state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    for ("target") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(!state.file_search.mode);
+    try std.testing.expect(!state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
+    try std.testing.expectEqualStrings("dir/target.zig", state.selected_path.?);
+}
+
+test "repository hidden-tree file search keeps unavailable prompt cancellable" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .load_state = .loading,
+        .viewer = .{ .focus = .source, .tree_width = 42, .tree_hidden = true },
+    };
+    defer state.deinit(allocator);
+    const size: chasen.Size = .{ .width = 80, .height = 8 };
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    _ = state.applyNavigation(allocator, .{ .file_search_insert = 'x' }, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(state.file_search.mode);
+    try std.testing.expect(!state.file_search.projection_available);
+    try std.testing.expect(!state.file_search.no_match);
+    try std.testing.expect(!state.viewer.tree_hidden);
+
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(size.width, size.height);
+    defer test_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    const snapshot = try test_surface.snapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Find file: x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "File list unavailable") != null);
+
+    _ = state.applyNavigation(allocator, .cancel_file_search, size);
+    try std.testing.expect(!state.file_search.mode);
+    try std.testing.expect(state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+}
+
+test "repository changed file search retains its transaction when status basis is unavailable" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("target.zig\x00"),
+        .load_state = .loaded,
+        .file_visibility = .changed,
+        .viewer = .{ .focus = .source, .tree_hidden = true },
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.filePath("target.zig", .all);
+    const size: chasen.Size = .{ .width = 80, .height = 8 };
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    for ("target") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
+    try std.testing.expect(!state.file_search.projection_available);
+    try std.testing.expect(!state.file_search.no_match);
+    try std.testing.expect(state.file_search.selectedNode() == null);
+
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(state.file_search.mode);
+    try std.testing.expectEqualStrings("target", state.file_search.input.slice());
+    try std.testing.expect(state.file_search.restore_tree_hidden);
+    try std.testing.expect(!state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+    try std.testing.expectEqualStrings("target.zig", state.selected_path.?);
+}
+
+test "repository changed file search reclassifies status-only availability transitions" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("target.zig\x00clean.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 7,
+    };
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, " M target.zig\x00");
+    state.activate(3, root.capability.identity);
+    state.selected_path = state.bundle.?.tree.filePath("target.zig", .all);
+    _ = state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 8 });
+    state.viewer.tree_hidden = true;
+    state.viewer.focus = .source;
+    _ = state.applyNavigation(allocator, .enter_file_search, .{ .width = 80, .height = 8 });
+    for ("target") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, .{ .width = 80, .height = 8 });
+    try std.testing.expect(state.file_search.projection_available);
+    try std.testing.expect(!state.file_search.no_match);
+    try std.testing.expect(state.file_search.selectedNode() != null);
+
+    var unavailable_request = try state.prepareRequest(allocator, root.path, &root.capability);
+    defer unavailable_request.deinit(allocator);
+    var unavailable = ManifestFinished{
+        .identity = unavailable_request.identity,
+        .root_identity = unavailable_request.root.identity,
+        .generation = unavailable_request.generation,
+        .result = .{ .status_changed = .unavailable },
+    };
+    defer unavailable.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &unavailable));
+    try std.testing.expect(state.file_search.mode);
+    try std.testing.expectEqualStrings("target", state.file_search.input.slice());
+    try std.testing.expect(!state.file_search.projection_available);
+    try std.testing.expect(!state.file_search.no_match);
+    try std.testing.expectEqual(@as(usize, 0), state.file_search.len);
+    try std.testing.expect(state.file_search.selectedNode() == null);
+    try std.testing.expect(state.file_search.restore_tree_hidden);
+    try std.testing.expect(!state.viewer.tree_hidden);
+
+    _ = state.applyNavigation(allocator, .submit_file_search, .{ .width = 80, .height = 8 });
+    try std.testing.expect(state.file_search.mode);
+    try std.testing.expect(!state.file_search.projection_available);
+
+    state.needs_revalidation = true;
+    var available_request = try state.prepareRequest(allocator, root.path, &root.capability);
+    defer available_request.deinit(allocator);
+    var available_empty = ManifestFinished{
+        .identity = available_request.identity,
+        .root_identity = available_request.root.identity,
+        .generation = available_request.generation,
+        .result = .{ .status_changed = .{ .loaded = try repository_change_index.parseOwned(
+            allocator,
+            try allocator.dupe(u8, ""),
+        ) } },
+    };
+    defer available_empty.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &available_empty));
+    try std.testing.expect(state.file_search.mode);
+    try std.testing.expectEqualStrings("target", state.file_search.input.slice());
+    try std.testing.expect(state.file_search.projection_available);
+    try std.testing.expect(state.file_search.no_match);
+    try std.testing.expectEqual(@as(usize, 0), state.file_search.len);
+    try std.testing.expect(state.file_search.selectedNode() == null);
+    try std.testing.expect(state.file_search.restore_tree_hidden);
+    try std.testing.expect(!state.viewer.tree_hidden);
+}
+
+test "repository hidden tree keeps source focus when document becomes inert" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "visible source\n");
+    defer state.deinit(allocator);
+    state.viewer.tree_hidden = true;
+    state.viewer.focus = .source;
+    state.document_generation = 8;
+    state.pending_document_generation = 8;
+
+    var finished: DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = state.root_identity.?,
+        .generation = 8,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, state.selected_path.?),
+        .value = .{ .inert = .binary },
+    };
+    defer finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &finished));
+    try std.testing.expect(state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    try std.testing.expectEqualStrings("main.zig", state.selected_path.?);
+    try std.testing.expect(state.currentSource() == null);
+    try std.testing.expect(state.displayed_document.?.value == .inert);
+
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(80, 8);
+    defer test_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    const snapshot = try test_surface.snapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Binary file is not shown") != null);
+}
+
+test "repository replacement retains hidden preference behind temporary search reveal" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("target.zig\x00"),
+        .load_state = .loaded,
+        .file_visibility = .changed,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    state.viewer.tree_width = 42;
+    state.viewer.tree_hidden = true;
+    state.viewer.focus = .source;
+    _ = state.applyNavigation(allocator, .enter_file_search, .{ .width = 80, .height = 10 });
+    try std.testing.expect(!state.viewer.tree_hidden);
+    try std.testing.expect(state.file_search.restore_tree_hidden);
+
+    state.repositoryChanged(allocator, 9, .{ .device = 8, .inode = 13 });
+    try std.testing.expect(state.viewer.tree_hidden);
+    try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    try std.testing.expect(!state.file_search.mode);
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
+    try std.testing.expect(state.selected_path == null);
 }
 
 fn bundleForTest(bytes: []const u8) !Bundle {
@@ -4419,7 +4837,7 @@ test "repository page owns source focus navigation search and mouse geometry" {
     try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
     try std.testing.expect(state.source_search.match != null);
 
-    const layout = bodyLayout(size, state.viewer.tree_width);
+    const layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     const geometry = state.sourceGeometry(size, state.currentSource().?);
     try std.testing.expectEqual(Msg.focus_source, state.mouseToMsg(.{ .col = layout.tree_width + 1, .row = geometry.body_first_row - 1 }, .left, size).?);
     try std.testing.expectEqual(
@@ -5036,7 +5454,7 @@ test "repository page renders tree and selected-document loading checkpoint" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading selected file") != null);
     const non_selected_file = test_surface.surface.readCell(4, 6) orelse return error.ExpectedFileCell;
     try std.testing.expectEqual(theme.Palette.default().color(.foreground), non_selected_file.style.fg);
-    const layout = bodyLayout(test_surface.surface.size(), state.viewer.tree_width);
+    const layout = bodyLayout(test_surface.surface.size(), state.viewer.tree_width, state.viewer.tree_hidden);
     try test_surface.expectCellText(
         layout.tree_width + 2,
         repository_source_geometry.source_body_first_row,
@@ -5080,7 +5498,7 @@ test "repository page anchors inert checkpoint below source header rule" {
     defer test_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
 
-    const layout = bodyLayout(test_surface.surface.size(), state.viewer.tree_width);
+    const layout = bodyLayout(test_surface.surface.size(), state.viewer.tree_width, state.viewer.tree_hidden);
     try test_surface.expectCellText(
         layout.tree_width + 2,
         repository_source_geometry.source_body_first_row,
@@ -5171,7 +5589,7 @@ test "repository page layout and mouse mapping share tree geometry" {
     defer state.deinit(std.testing.allocator);
 
     const wide = chasen.Size{ .width = 60, .height = 10 };
-    const wide_layout = bodyLayout(wide, state.viewer.tree_width);
+    const wide_layout = bodyLayout(wide, state.viewer.tree_width, state.viewer.tree_hidden);
     try std.testing.expectEqual(@as(u16, 28), wide_layout.tree_width);
     try std.testing.expectEqual(@as(u16, 3), wide_layout.header_rows);
     try std.testing.expectEqual(@as(u16, 7), wide_layout.treeRows(wide.height));
@@ -5190,7 +5608,7 @@ test "repository page layout and mouse mapping share tree geometry" {
     try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
 
     const narrow = chasen.Size{ .width = 20, .height = 6 };
-    try std.testing.expectEqual(narrow.width, bodyLayout(narrow, state.viewer.tree_width).tree_width);
+    try std.testing.expectEqual(narrow.width, bodyLayout(narrow, state.viewer.tree_width, state.viewer.tree_hidden).tree_width);
     try std.testing.expectEqual(Msg{ .mouse_row = 2 }, state.mouseToMsg(.{ .col = 19, .row = 5 }, .left, narrow).?);
 }
 
@@ -5201,14 +5619,14 @@ test "repository tree width controls share rendering mouse and source geometry" 
     state.viewer.focus = .source;
 
     const size = chasen.Size{ .width = 104, .height = 10 };
-    try std.testing.expectEqual(@as(u16, 34), bodyLayout(size, state.viewer.tree_width).tree_width);
+    try std.testing.expectEqual(@as(u16, 34), bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden).tree_width);
 
     _ = state.applyNavigation(allocator, .decrease_tree_width, size);
     try std.testing.expectEqual(@as(?u16, 30), state.viewer.tree_width);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     try std.testing.expectEqualStrings("main.zig", state.selected_path.?);
 
-    const adjusted = bodyLayout(size, state.viewer.tree_width);
+    const adjusted = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     try std.testing.expectEqual(@as(u16, 30), adjusted.tree_width);
     try std.testing.expectEqual(@as(u16, 73), state.sourceGeometry(size, state.currentSource().?).width);
     try std.testing.expect(state.mouseToMsg(.{ .col = adjusted.tree_width, .row = 0 }, .left, size) == null);
@@ -5218,7 +5636,7 @@ test "repository tree width controls share rendering mouse and source geometry" 
     );
     try std.testing.expectEqual(
         BodyPoint{ .col = 4, .row = 2 },
-        sourceGesturePoint(.{ .col = adjusted.tree_width + 1 + 4, .row = 2 }, size, state.viewer.tree_width).?,
+        sourceGesturePoint(.{ .col = adjusted.tree_width + 1 + 4, .row = 2 }, size, state.viewer.tree_width, state.viewer.tree_hidden).?,
     );
 
     var test_surface: chasen.testing.TestSurface = undefined;

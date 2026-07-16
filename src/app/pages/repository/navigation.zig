@@ -78,6 +78,7 @@ pub fn refreshFileSearch(
     visibility: repository_tree.Visibility,
 ) void {
     state.resetResults();
+    state.projection_available = true;
     const query = state.input.slice();
     for (tree.nodes, 0..) |node, node_index| {
         if (node.kind != .file) continue;

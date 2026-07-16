@@ -14,6 +14,13 @@ pub const ViewerState = struct {
     /// current terminal while the preference survives compatible reloads and
     /// physical repository replacement as page UI state.
     tree_width: ?u16 = null,
+    /// Effective user-selected visibility outside a temporary file-search
+    /// reveal. While that prompt is open, its owner carries the hidden
+    /// preference separately so physical repository replacement can retain it.
+    tree_hidden: bool = false,
+    /// Logical focus to restore when a user-hidden tree is shown again. Hiding
+    /// never discards whether the tree or source was active beforehand.
+    tree_return_focus: Focus = .tree,
     tree_cursor: usize = 0,
     tree_vertical_scroll: usize = 0,
     tree_horizontal_scroll: usize = 0,
@@ -42,14 +49,20 @@ pub const SourceSearchState = struct {
 
 pub const FileSearchState = struct {
     mode: bool = false,
+    /// Focus and visibility captured on entry. They are consumed only by a
+    /// cancel/empty-submit terminal; successful submit commits visible/tree.
+    return_focus: Focus = .tree,
+    restore_tree_hidden: bool = false,
     input: prompt.TextInput = .{},
     matches: [max_file_search_matches]usize = undefined,
+    projection_available: bool = false,
     len: usize = 0,
     focused: usize = 0,
     truncated: bool = false,
     no_match: bool = false,
 
     pub fn resetResults(self: *FileSearchState) void {
+        self.projection_available = false;
         self.len = 0;
         self.focused = 0;
         self.truncated = false;
