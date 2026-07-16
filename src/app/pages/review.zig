@@ -6,6 +6,7 @@ const page = @import("../page.zig");
 const prompt = @import("../prompt.zig");
 const review_projection = @import("../review_projection.zig");
 const app_state = @import("../state.zig");
+pub const action_cursor = @import("review/action_cursor.zig");
 const authority = @import("review/authority.zig");
 const review_selection = @import("review/selection.zig");
 const config = @import("../../config.zig");
