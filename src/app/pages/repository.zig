@@ -2778,7 +2778,7 @@ fn drawTreeProjectionRow(
         style.bold = true;
     }
     if (cursor_background_active) {
-        style.bg = context.palette.color(.repository_cursor_bg);
+        style.bg = context.palette.color(.pane_cursor_bg);
         fillTreeSelectionRow(surface, screen_row, style);
     }
     draw.copyClippedTextAt(surface, 0, screen_row, visible_text, style) catch {};
@@ -3229,8 +3229,8 @@ test "repository file search takeover suppresses and restores tree cursor backgr
     const initial_alpha = test_surface.surface.readCell(2, alpha_row) orelse return error.ExpectedAlphaFile;
     const initial_alpha_trailing = test_surface.surface.readCell(layout.tree_width - 1, alpha_row) orelse
         return error.ExpectedAlphaTrailingCell;
-    try std.testing.expect(initial_alpha.style.bg.eql(palette.color(.repository_cursor_bg)));
-    try std.testing.expect(initial_alpha_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(initial_alpha.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(initial_alpha_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     _ = state.applyNavigation(allocator, .enter_file_search, size);
     for ("zig") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
@@ -3243,8 +3243,8 @@ test "repository file search takeover suppresses and restores tree cursor backgr
         return error.ExpectedAlphaTrailingCell;
     const first_candidate = test_surface.surface.readCell(layout.source_col + 1, 2) orelse
         return error.ExpectedSearchCandidate;
-    try std.testing.expect(!search_alpha.style.bg.eql(palette.color(.repository_cursor_bg)));
-    try std.testing.expect(!search_alpha_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!search_alpha.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(!search_alpha_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(first_candidate.style.fg.eql(palette.color(.prompt)));
     try std.testing.expect(first_candidate.style.bold);
 
@@ -3263,7 +3263,7 @@ test "repository file search takeover suppresses and restores tree cursor backgr
     try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
     const restored_alpha_trailing = test_surface.surface.readCell(layout.tree_width - 1, alpha_row) orelse
         return error.ExpectedAlphaTrailingCell;
-    try std.testing.expect(restored_alpha_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(restored_alpha_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     _ = state.applyNavigation(allocator, .enter_file_search, size);
     _ = state.applyNavigation(allocator, .submit_file_search, size);
@@ -3272,7 +3272,7 @@ test "repository file search takeover suppresses and restores tree cursor backgr
     try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
     const empty_submit_alpha_trailing = test_surface.surface.readCell(layout.tree_width - 1, alpha_row) orelse
         return error.ExpectedAlphaTrailingCell;
-    try std.testing.expect(empty_submit_alpha_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(empty_submit_alpha_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     _ = state.applyNavigation(allocator, .enter_file_search, size);
     for ("beta") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
@@ -3287,7 +3287,7 @@ test "repository file search takeover suppresses and restores tree cursor backgr
     try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
     const accepted_beta_trailing = test_surface.surface.readCell(layout.tree_width - 1, beta_row) orelse
         return error.ExpectedBetaTrailingCell;
-    try std.testing.expect(accepted_beta_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(accepted_beta_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     _ = state.applyNavigation(allocator, .enter_file_search, size);
     for ("missing") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
@@ -3300,7 +3300,7 @@ test "repository file search takeover suppresses and restores tree cursor backgr
         return error.ExpectedBetaTrailingCell;
     const no_match_prompt = test_surface.surface.readCell(layout.source_col + 1, 0) orelse
         return error.ExpectedSearchPrompt;
-    try std.testing.expect(!no_match_beta_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!no_match_beta_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(no_match_prompt.style.fg.eql(palette.color(.prompt)));
     try std.testing.expect(no_match_prompt.style.bold);
 }
@@ -3398,8 +3398,8 @@ test "repository hidden-tree file search restores on cancel and commits visible 
         return error.ExpectedRepositoryRootTrailingCell;
     const focused_candidate = search_surface.surface.readCell(search_layout.source_col + 1, 2) orelse
         return error.ExpectedSearchCandidate;
-    try std.testing.expect(!retained_root.style.bg.eql(palette.color(.repository_cursor_bg)));
-    try std.testing.expect(!retained_root_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!retained_root.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(!retained_root_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(focused_candidate.style.fg.eql(palette.color(.prompt)));
     try std.testing.expect(focused_candidate.style.bold);
 
@@ -3444,7 +3444,7 @@ test "repository hidden-tree file search restores on cancel and commits visible 
     try view(.{ .page_state = &state, .palette = palette }, &search_surface.surface);
     const accepted_target_trailing = search_surface.surface.readCell(search_layout.tree_width - 1, target_row) orelse
         return error.ExpectedSearchTargetTrailingCell;
-    try std.testing.expect(accepted_target_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(accepted_target_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
 
 test "repository hidden-tree file search keeps unavailable prompt cancellable" {
@@ -3517,8 +3517,8 @@ test "repository changed file search retains its transaction when status basis i
         return error.ExpectedRepositoryRootTrailingCell;
     const prompt = test_surface.surface.readCell(layout.source_col + 1, 0) orelse
         return error.ExpectedSearchPrompt;
-    try std.testing.expect(!retained_root.style.bg.eql(palette.color(.repository_cursor_bg)));
-    try std.testing.expect(!retained_root_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!retained_root.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(!retained_root_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(prompt.style.fg.eql(palette.color(.prompt)));
     try std.testing.expect(prompt.style.bold);
 }
@@ -3658,7 +3658,7 @@ fn repositorySearchCursorPaletteForTest() theme.Palette {
         pub fn get(_: @This(), role: theme.Role) ?theme.ColorValue {
             return switch (role) {
                 .prompt => .{ .rgb = .{ .r = 31, .g = 32, .b = 33 } },
-                .repository_cursor_bg => .{ .rgb = .{ .r = 41, .g = 42, .b = 43 } },
+                .pane_cursor_bg => .{ .rgb = .{ .r = 41, .g = 42, .b = 43 } },
                 else => null,
             };
         }
@@ -4368,7 +4368,7 @@ test "repository tree cursor background follows active focus and preserves seman
                 .success => .{ .rgb = .{ .r = 10, .g = 11, .b = 12 } },
                 .info => .{ .rgb = .{ .r = 13, .g = 14, .b = 15 } },
                 .prompt => .{ .rgb = .{ .r = 16, .g = 17, .b = 18 } },
-                .repository_cursor_bg => .{ .rgb = .{ .r = 19, .g = 20, .b = 21 } },
+                .pane_cursor_bg => .{ .rgb = .{ .r = 19, .g = 20, .b = 21 } },
                 else => null,
             };
         }
@@ -4421,19 +4421,19 @@ test "repository tree cursor background follows active focus and preserves seman
     try std.testing.expect(active_selected.style.fg.eql(palette.color(.diff_modified)));
     try std.testing.expect(active_selected.style.bold);
     try std.testing.expect(!active_selected.style.reverse);
-    try std.testing.expect(active_selected.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(active_selected.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(!active_selected.style.dim);
     const active_selected_trailing = active_surface.surface.readCell(layout.tree_width - 1, selected_row) orelse
         return error.ExpectedSelectedTrailingCell;
     try std.testing.expect(active_selected_trailing.style.fg.eql(palette.color(.diff_modified)));
     try std.testing.expect(active_selected_trailing.style.bold);
     try std.testing.expect(!active_selected_trailing.style.reverse);
-    try std.testing.expect(active_selected_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(active_selected_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(!active_selected_trailing.style.dim);
     try std.testing.expect(active_separator.style.fg.eql(palette.color(.muted)));
     try std.testing.expect(active_separator.style.dim);
     try std.testing.expect(!active_separator.style.reverse);
-    try std.testing.expect(!active_separator.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!active_separator.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     state.viewer.tree_cursor = 0;
     active_surface.surface.clearAll();
@@ -4443,11 +4443,11 @@ test "repository tree cursor background follows active focus and preserves seman
     try std.testing.expect(selected_root.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(selected_root.style.bold);
     try std.testing.expect(!selected_root.style.reverse);
-    try std.testing.expect(selected_root.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(selected_root.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(selected_root_trailing.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(selected_root_trailing.style.bold);
     try std.testing.expect(!selected_root_trailing.style.reverse);
-    try std.testing.expect(selected_root_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(selected_root_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     state.viewer.tree_cursor = directory_visible;
     active_surface.surface.clearAll();
@@ -4458,11 +4458,11 @@ test "repository tree cursor background follows active focus and preserves seman
     try std.testing.expect(selected_directory.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(selected_directory.style.bold);
     try std.testing.expect(!selected_directory.style.reverse);
-    try std.testing.expect(selected_directory.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(selected_directory.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(selected_directory_trailing.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(selected_directory_trailing.style.bold);
     try std.testing.expect(!selected_directory_trailing.style.reverse);
-    try std.testing.expect(selected_directory_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(selected_directory_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     state.viewer.tree_cursor = selected_visible;
     state.viewer.focus = .source;
@@ -4497,16 +4497,16 @@ test "repository tree cursor background follows active focus and preserves seman
     try std.testing.expect(inactive_selected.style.bold);
     try std.testing.expect(!inactive_selected.style.dim);
     try std.testing.expect(!inactive_selected.style.reverse);
-    try std.testing.expect(!inactive_selected.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!inactive_selected.style.bg.eql(palette.color(.pane_cursor_bg)));
     const inactive_selected_trailing = inactive_surface.surface.readCell(layout.tree_width - 1, selected_row) orelse
         return error.ExpectedInactiveSelectedTrailingCell;
     try std.testing.expect(!inactive_selected_trailing.style.dim);
     try std.testing.expect(!inactive_selected_trailing.style.reverse);
-    try std.testing.expect(!inactive_selected_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!inactive_selected_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(inactive_separator.style.fg.eql(palette.color(.muted)));
     try std.testing.expect(inactive_separator.style.dim);
     try std.testing.expect(!inactive_separator.style.reverse);
-    try std.testing.expect(!inactive_separator.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!inactive_separator.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
 
 const TestRoot = struct {

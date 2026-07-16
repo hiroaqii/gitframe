@@ -935,6 +935,7 @@ test "loadConfig accepts theme color overrides" {
         \\success = "#010203"
         \\diff_added = "index:10"
         \\diff_modified = "index:12"
+        \\pane_cursor_bg = "#292a2b"
         \\repository_active_line_number = "#ffdaaa"
         \\
     });
@@ -947,7 +948,16 @@ test "loadConfig accepts theme color overrides" {
     try std.testing.expect(result.config.value.theme.get(.success).?.toChasen().eql(.{ .rgb = .{ 1, 2, 3 } }));
     try std.testing.expect(result.config.value.theme.get(.diff_added).?.toChasen().eql(.{ .index = 10 }));
     try std.testing.expect(result.config.value.theme.get(.diff_modified).?.toChasen().eql(.{ .index = 12 }));
+    try std.testing.expect(result.config.value.theme.get(.pane_cursor_bg).?.toChasen().eql(.{ .rgb = .{ 41, 42, 43 } }));
     try std.testing.expect(result.config.value.theme.get(.repository_active_line_number).?.toChasen().eql(.{ .rgb = .{ 255, 218, 170 } }));
+}
+
+test "parse config rejects removed repository cursor theme key" {
+    try std.testing.expectError(error.UnknownKey, parseConfigToml(
+        \\[theme]
+        \\repository_cursor_bg = "#2d303a"
+        \\
+    ));
 }
 
 test "loadConfig accepts keymap overrides" {

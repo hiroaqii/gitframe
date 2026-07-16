@@ -68,7 +68,7 @@ pub fn drawSource(
         const line_index = viewer.source_vertical_scroll + body_row;
         const row = geometry.body_first_row + @as(u16, @intCast(body_row));
         const current = line_index == viewer.source_cursor;
-        if (source_active and current) fillSourceCursorRow(surface, row, palette.color(.repository_cursor_bg));
+        if (source_active and current) fillSourceCursorRow(surface, row, palette.color(.pane_cursor_bg));
         const base_style = sourceRowStyle(palette.style(.foreground), source_active, current, palette);
 
         const change = if (changes) |map| map.row(line_index) else .none;
@@ -324,7 +324,7 @@ fn sourceHeaderRuleStyle(source_active: bool, palette: theme.Palette) chasen.Tex
 /// source content therefore has no false active-row signal.
 fn sourceRowStyle(style: chasen.TextStyle, active: bool, current: bool, palette: theme.Palette) chasen.TextStyle {
     var composed = style;
-    if (active and current) composed.bg = palette.color(.repository_cursor_bg);
+    if (active and current) composed.bg = palette.color(.pane_cursor_bg);
     return composed;
 }
 
@@ -373,10 +373,10 @@ test "repository source gutter renders added and modified rows without moving te
     try test_surface.expectCellText(3, 3, "m");
     try std.testing.expectEqual(palette.color(.diff_added), test_surface.surface.readCell(0, 2).?.style.fg);
     try std.testing.expectEqual(palette.color(.diff_modified), test_surface.surface.readCell(0, 3).?.style.fg);
-    try std.testing.expect(!test_surface.surface.readCell(0, 2).?.style.bg.eql(palette.color(.repository_cursor_bg)));
-    try std.testing.expect(test_surface.surface.readCell(0, 3).?.style.bg.eql(palette.color(.repository_cursor_bg)));
-    try std.testing.expect(test_surface.surface.readCell(3, 3).?.style.bg.eql(palette.color(.repository_cursor_bg)));
-    try std.testing.expect(test_surface.surface.readCell(39, 3).?.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!test_surface.surface.readCell(0, 2).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(test_surface.surface.readCell(0, 3).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(test_surface.surface.readCell(3, 3).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(test_surface.surface.readCell(39, 3).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
 
 test "repository empty source keeps one synthetic viewer row" {
@@ -541,10 +541,10 @@ test "repository source match overlay remains distinct on the cursor line" {
     const plain_cell = test_surface.surface.readCell(3, 2) orelse return error.ExpectedPlainCell;
     try std.testing.expect(match_cell.style.fg.eql(palette.color(.warning)));
     try std.testing.expect(match_cell.style.bold);
-    try std.testing.expect(match_cell.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(match_cell.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(plain_cell.style.fg.eql(palette.color(.foreground)));
     try std.testing.expect(!plain_cell.style.bold);
-    try std.testing.expect(plain_cell.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(plain_cell.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
 
 test "repository source syntax uses neutral styles below the search overlay" {
@@ -578,9 +578,9 @@ test "repository source syntax uses neutral styles below the search overlay" {
     try std.testing.expectEqual(palette.color(.foreground), plain_cell.style.fg);
     try std.testing.expectEqual(palette.color(.muted), comment_cell.style.fg);
     try std.testing.expectEqual(palette.color(.foreground), foreground_cell.style.fg);
-    try std.testing.expect(keyword_cell.style.bg.eql(palette.color(.repository_cursor_bg)));
-    try std.testing.expect(plain_cell.style.bg.eql(palette.color(.repository_cursor_bg)));
-    try std.testing.expect(!comment_cell.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(keyword_cell.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(plain_cell.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(!comment_cell.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     var search_surface: chasen.testing.TestSurface = undefined;
     try search_surface.init(24, 4);
@@ -701,7 +701,7 @@ test "repository source cursor row composes semantic overlays and active-only ba
     palette.colors[@intFromEnum(theme.Role.diff_line_number)] = .{ .rgb = .{ 31, 32, 33 } };
     palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 41, 42, 43 } };
     palette.colors[@intFromEnum(theme.Role.repository_active_line_number)] = .{ .rgb = .{ 51, 52, 53 } };
-    palette.colors[@intFromEnum(theme.Role.repository_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
     palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
 
     var active: chasen.testing.TestSurface = undefined;
@@ -732,16 +732,16 @@ test "repository source cursor row composes semantic overlays and active-only ba
     try std.testing.expect(line_number.style.fg.eql(palette.color(.repository_active_line_number)));
     try std.testing.expect(!line_number.style.bold);
     try std.testing.expect(non_current_line_number.style.fg.eql(palette.color(.diff_line_number)));
-    try std.testing.expect(!non_current_line_number.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!non_current_line_number.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(keyword.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(searched.style.fg.eql(palette.color(.warning)));
     try std.testing.expect(searched.style.bold);
     for ([_]chasen.TextStyle{ gutter.style, line_number.style, keyword.style, searched.style, trailing.style }) |style| {
-        try std.testing.expect(style.bg.eql(palette.color(.repository_cursor_bg)));
+        try std.testing.expect(style.bg.eql(palette.color(.pane_cursor_bg)));
     }
     try std.testing.expect(selected.style.fg.eql(palette.color(.foreground)));
     try std.testing.expect(selected.style.bg.eql(palette.color(.diff_cursor)));
-    try std.testing.expect(!active.surface.readCell(0, cursor_row + 1).?.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!active.surface.readCell(0, cursor_row + 1).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     var inactive: chasen.testing.TestSurface = undefined;
     try inactive.init(30, 5);
@@ -765,14 +765,14 @@ test "repository source cursor row composes semantic overlays and active-only ba
         const cell = inactive.surface.readCell(point.col, cursor_row) orelse return error.ExpectedInactiveCursorCell;
         try std.testing.expect(cell.style.fg.eql(palette.color(point.role)));
         try std.testing.expect(!cell.style.dim);
-        try std.testing.expect(!cell.style.bg.eql(palette.color(.repository_cursor_bg)));
+        try std.testing.expect(!cell.style.bg.eql(palette.color(.pane_cursor_bg)));
     }
-    try std.testing.expect(!inactive.surface.readCell(29, cursor_row).?.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!inactive.surface.readCell(29, cursor_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
 
 test "repository source row style preserves intrinsic flags while gating cursor background" {
     var palette: theme.Palette = .default();
-    palette.colors[@intFromEnum(theme.Role.repository_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
     const intrinsic: chasen.TextStyle = .{
         .bold = true,
         .italic = true,
@@ -786,7 +786,7 @@ test "repository source row style preserves intrinsic flags while gating cursor 
     };
 
     var expected_active = intrinsic;
-    expected_active.bg = palette.color(.repository_cursor_bg);
+    expected_active.bg = palette.color(.pane_cursor_bg);
     try std.testing.expect(sourceRowStyle(intrinsic, true, true, palette).eql(expected_active));
     try std.testing.expect(sourceRowStyle(intrinsic, false, true, palette).eql(intrinsic));
     try std.testing.expect(sourceRowStyle(intrinsic, true, false, palette).eql(intrinsic));
@@ -840,7 +840,7 @@ test "repository selection slice B background composes after cursor syntax and s
     try std.testing.expect(searched.style.bg.eql(palette.color(.diff_cursor)));
     try std.testing.expect(plain.style.bg.eql(palette.color(.diff_cursor)));
     const trailing = test_surface.surface.readCell(29, geometry.body_first_row) orelse return error.ExpectedCursorTrailingCell;
-    try std.testing.expect(trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
 
 test "repository selection slice B whole-line style covers gutter numbers body and trailing cells" {

@@ -13,7 +13,7 @@ pub const Role = enum {
     binary,
     staged,
     amend,
-    repository_cursor_bg,
+    pane_cursor_bg,
     repository_active_line_number,
 
     diff_added,
@@ -108,10 +108,10 @@ pub const Palette = struct {
         palette.set(.binary, .{ .index = 13 });
         palette.set(.staged, .{ .index = 10 });
         palette.set(.amend, .{ .rgb = .{ 203, 166, 247 } });
-        // Repository cursor location is deliberately neutral: tree/source
-        // semantics remain in the foreground, while diff_cursor stays
-        // available as the stronger mouse-selection background.
-        palette.set(.repository_cursor_bg, .{ .rgb = .{ 45, 48, 58 } });
+        // Pane cursor location is deliberately neutral: content semantics
+        // remain in the foreground, while diff_cursor stays available as the
+        // stronger mouse-selection background.
+        palette.set(.pane_cursor_bg, .{ .rgb = .{ 45, 48, 58 } });
         // Keep the active Repository line marker independent from syntax
         // accent colors so it stays distinct from adjacent source tokens.
         palette.set(.repository_active_line_number, .{ .rgb = .{ 255, 218, 170 } });
@@ -265,8 +265,9 @@ test "roleFromKey maps known theme keys" {
     try std.testing.expectEqual(Role.diff_added, roleFromKey("diff_added").?);
     try std.testing.expectEqual(Role.diff_modified, roleFromKey("diff_modified").?);
     try std.testing.expectEqual(Role.diff_added_bg, roleFromKey("diff_added_bg").?);
-    try std.testing.expectEqual(Role.repository_cursor_bg, roleFromKey("repository_cursor_bg").?);
+    try std.testing.expectEqual(Role.pane_cursor_bg, roleFromKey("pane_cursor_bg").?);
     try std.testing.expectEqual(Role.repository_active_line_number, roleFromKey("repository_active_line_number").?);
+    try std.testing.expect(roleFromKey("repository_cursor_bg") == null);
     try std.testing.expect(roleFromKey("diff-added") == null);
 }
 
@@ -274,6 +275,10 @@ test "Palette.default keeps repository active line number independent from accen
     const palette = Palette.default();
     try std.testing.expect(palette.color(.repository_active_line_number).eql(.{ .rgb = .{ 255, 218, 170 } }));
     try std.testing.expect(!palette.color(.repository_active_line_number).eql(palette.color(.accent)));
+}
+
+test "Palette.default preserves neutral pane cursor background" {
+    try std.testing.expect(Palette.default().color(.pane_cursor_bg).eql(.{ .rgb = .{ 45, 48, 58 } }));
 }
 
 test "Palette.fromConfig derives diff roles from base role overrides" {
@@ -301,7 +306,7 @@ test "Palette.fromConfig lets explicit role overrides win" {
                 .diff_added => .{ .index = 10 },
                 .diff_modified => .{ .index = 12 },
                 .diff_added_bg => .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } },
-                .repository_cursor_bg => .{ .rgb = .{ .r = 10, .g = 11, .b = 12 } },
+                .pane_cursor_bg => .{ .rgb = .{ .r = 10, .g = 11, .b = 12 } },
                 .repository_active_line_number => .{ .rgb = .{ .r = 13, .g = 14, .b = 15 } },
                 else => null,
             };
@@ -313,6 +318,6 @@ test "Palette.fromConfig lets explicit role overrides win" {
     try std.testing.expect(palette.color(.diff_added).eql(.{ .index = 10 }));
     try std.testing.expect(palette.color(.diff_modified).eql(.{ .index = 12 }));
     try std.testing.expect(palette.color(.diff_added_bg).eql(.{ .rgb = .{ 4, 5, 6 } }));
-    try std.testing.expect(palette.color(.repository_cursor_bg).eql(.{ .rgb = .{ 10, 11, 12 } }));
+    try std.testing.expect(palette.color(.pane_cursor_bg).eql(.{ .rgb = .{ 10, 11, 12 } }));
     try std.testing.expect(palette.color(.repository_active_line_number).eql(.{ .rgb = .{ 13, 14, 15 } }));
 }
