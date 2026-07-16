@@ -1582,7 +1582,11 @@ const ShellViewTestHarness = struct {
         const review = review_view.Context.init(&self.review, navigation, self.theme, self.keymap, "working tree", .unstaged, null, .{});
         return .{
             .review = review,
-            .repository = .{ .page_state = &self.repository, .palette = self.theme },
+            .repository = .{
+                .page_state = &self.repository,
+                .palette = self.theme,
+                .repo_root = self.repo_state.activeRoot(),
+            },
             .active_page = .review,
             .page_bar_visible = false,
             .theme = self.theme,

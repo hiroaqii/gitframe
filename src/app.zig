@@ -995,7 +995,11 @@ pub const App = struct {
     fn shellViewContext(self: *const App) app_view.Context {
         return .{
             .review = self.reviewViewContext(),
-            .repository = .{ .page_state = &self.pages.repository, .palette = self.theme },
+            .repository = .{
+                .page_state = &self.pages.repository,
+                .palette = self.theme,
+                .repo_root = self.activeRepoRoot(),
+            },
             .active_page = self.active_page,
             .page_bar_visible = true,
             .theme = self.theme,

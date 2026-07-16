@@ -23,6 +23,7 @@ const repository_model = @import("repository/model.zig");
 const repository_navigation = @import("repository/navigation.zig");
 const repository_selection = @import("repository/selection.zig");
 const repository_source_geometry = @import("repository/source_geometry.zig");
+const repository_tree_projection = @import("repository/tree_projection.zig");
 const repository_view = @import("repository/view.zig");
 const text_projection = @import("../../text/projection.zig");
 
@@ -787,7 +788,9 @@ pub const BodyPoint = struct { col: u16, row: u16 };
 
 pub const BodyLayout = struct {
     tree_width: u16,
-    header_rows: u16 = 1,
+    /// Rows 0-1 intentionally mirror Review's spacer before the row-2 Files
+    /// heading. Projected root/tree navigation begins at row 3.
+    header_rows: u16 = 3,
 
     pub fn treeRows(self: BodyLayout, body_height: u16) u16 {
         return body_height -| self.header_rows;
@@ -855,6 +858,9 @@ pub const RepositoryPageState = struct {
     /// independent from manifest generations so background replacement cannot
     /// leave a borrowed selection dangling before the user returns to All.
     all_selection_anchor: ?[]u8 = null,
+    /// Page-local root disclosure and typed row projection. The manifest tree
+    /// remains root-free and owns only repository-relative entries.
+    tree_projection: repository_tree_projection.State = .{},
     viewer: repository_model.ViewerState = .{},
     source_search: repository_model.SourceSearchState = .{},
     file_search: repository_model.FileSearchState = .{},
@@ -938,6 +944,7 @@ pub const RepositoryPageState = struct {
         }
         self.all_selection_anchor = null;
         self.file_visibility = .all;
+        self.tree_projection = .{};
         self.viewer = .{};
         self.source_search.clear();
         self.file_search.close();
@@ -1038,7 +1045,11 @@ pub const RepositoryPageState = struct {
             self.status.set("Review target opened in All files", .{});
         }
 
-        const visible_index = bundle.tree.revealNodeFor(node_index, self.file_visibility) orelse {
+        const visible_index = self.tree_projection.revealManifestNode(
+            &bundle.tree,
+            self.file_visibility,
+            node_index,
+        ) orelse {
             return self.incoming.terminalize(.request_failed);
         };
         const matching_document = if (self.displayed_document) |*displayed|
@@ -1726,10 +1737,36 @@ pub const RepositoryPageState = struct {
     fn replaceBundle(self: *RepositoryPageState, allocator: std.mem.Allocator, incoming: *Bundle) !void {
         self.cancelSourceSelection();
         const previous_selected = self.selected_path;
-        const selected = if (self.bundle) |*previous|
+        const previous_cursor_identity = if (self.bundle) |*previous|
+            self.tree_projection.cursorIdentity(&previous.tree, self.viewer.tree_cursor)
+        else
+            null;
+        var selected = if (self.bundle) |*previous|
             try incoming.tree.restoreStateFrom(allocator, &previous.tree, previous_selected)
         else
             incoming.tree.firstFilePath();
+
+        incoming.tree.rebuildVisibleFor(self.file_visibility);
+        if (self.file_visibility == .changed) {
+            const status_usable = incoming.status_available;
+            const retained = if (status_usable and selected != null)
+                incoming.tree.filePath(selected.?, .changed)
+            else
+                null;
+            selected = retained orelse if (status_usable)
+                incoming.tree.firstFilePathFor(.changed)
+            else
+                null;
+        }
+        // Resolve the borrowed predecessor identity before freeing its owner.
+        // An invalid predecessor cursor explicitly falls back to the selected
+        // incoming file when visible, then to the typed root.
+        const next_cursor = if (previous_cursor_identity) |identity|
+            self.tree_projection.cursorForIdentity(&incoming.tree, self.file_visibility, identity)
+        else if (selected) |path|
+            self.projectedCursorForPath(&incoming.tree, path) orelse 0
+        else
+            0;
 
         // A newly accepted manifest does not yet provide a complete selected
         // source fingerprint. Slice C therefore cannot prove candidate identity.
@@ -1739,16 +1776,12 @@ pub const RepositoryPageState = struct {
         incoming.* = undefined;
         self.selected_path = selected;
         self.load_state = if (self.bundle.?.document.paths.len == 0) .empty else .loaded;
-        if (self.file_visibility == .all) {
-            self.bundle.?.tree.rebuildVisible();
-            self.viewer.tree_cursor = if (selected) |path| self.bundle.?.tree.visibleIndexForPath(path) orelse 0 else 0;
-            if (self.file_search.mode) {
-                repository_navigation.refreshFileSearch(&self.file_search, &self.bundle.?.tree, .all);
-            }
-            self.clampScroll(0);
-        } else {
-            _ = self.rebuildTreeProjection(selected, false, 0);
+        self.viewer.tree_cursor = next_cursor;
+        if (selected == null and self.currentSource() == null) self.viewer.focus = .tree;
+        if (self.file_search.mode) {
+            repository_navigation.refreshFileSearch(&self.file_search, &self.bundle.?.tree, self.file_visibility);
         }
+        self.clampScroll(0);
     }
 
     /// Rebuilds only the page-visible tree and resolves selection against that
@@ -1769,6 +1802,7 @@ pub const RepositoryPageState = struct {
             return !optionalPathEql(previous, null);
         };
         const tree = &bundle.tree;
+        const cursor_identity = self.tree_projection.cursorIdentity(tree, self.viewer.tree_cursor);
         tree.rebuildVisibleFor(self.file_visibility);
 
         const status_usable = self.file_visibility == .all or bundle.status_available;
@@ -1782,16 +1816,29 @@ pub const RepositoryPageState = struct {
             null;
         self.selected_path = selected;
 
+        var selected_cursor: ?usize = null;
         if (selected) |path| {
-            var visible = tree.visibleIndexForPath(path);
-            if (visible == null and (reveal_preferred or retained == null)) {
+            selected_cursor = self.projectedCursorForPath(tree, path);
+            if (selected_cursor == null and (reveal_preferred or retained == null)) {
                 if (tree.nodeIndexForPath(path, self.file_visibility)) |node_index| {
-                    visible = tree.revealNodeFor(node_index, self.file_visibility);
+                    if (tree.revealNodeFor(node_index, self.file_visibility) != null) {
+                        // Internal lens reconciliation may reveal manifest
+                        // ancestors, but it does not override a collapsed root.
+                        if (self.tree_projection.root_disclosure == .expanded) {
+                            selected_cursor = self.tree_projection.visibleIndexForTarget(
+                                tree,
+                                .{ .manifest_node = node_index },
+                            );
+                        }
+                    }
                 }
             }
-            if (visible) |index| self.viewer.tree_cursor = index;
-        } else {
-            self.viewer.tree_cursor = 0;
+        }
+        self.viewer.tree_cursor = if (cursor_identity) |identity|
+            self.tree_projection.cursorForIdentity(tree, self.file_visibility, identity)
+        else
+            selected_cursor orelse 0;
+        if (selected == null) {
             self.viewer.tree_vertical_scroll = 0;
             if (self.currentSource() == null) self.viewer.focus = .tree;
         }
@@ -1800,6 +1847,15 @@ pub const RepositoryPageState = struct {
         }
         self.clampScroll(body_height);
         return !optionalPathEql(previous, self.selected_path);
+    }
+
+    fn projectedCursorForPath(
+        self: *const RepositoryPageState,
+        tree: *const repository_tree.Tree,
+        path: []const u8,
+    ) ?usize {
+        const node_index = tree.nodeIndexForPath(path, self.file_visibility) orelse return null;
+        return self.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = node_index });
     }
 
     fn toggleChangedFilter(self: *RepositoryPageState, allocator: std.mem.Allocator, body_height: u16) void {
@@ -2043,19 +2099,26 @@ pub const RepositoryPageState = struct {
 
     fn selectTreeEdge(self: *RepositoryPageState, last: bool, body_height: u16) void {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
-        if (tree.visible_len == 0) return;
-        if (last) {
+        self.viewer.tree_cursor = 0;
+        if (self.tree_projection.root_disclosure == .expanded and last) {
             var index = tree.visible_len;
             while (index > 0) {
                 index -= 1;
-                if (tree.nodes[tree.visible[index]].kind == .file) {
-                    self.viewer.tree_cursor = index;
+                const node_index = tree.visible[index];
+                if (tree.nodes[node_index].kind == .file) {
+                    self.viewer.tree_cursor = self.tree_projection.visibleIndexForTarget(
+                        tree,
+                        .{ .manifest_node = node_index },
+                    ) orelse 0;
                     break;
                 }
             }
-        } else {
-            for (tree.visibleNodes(), 0..) |node_index, visible_index| if (tree.nodes[node_index].kind == .file) {
-                self.viewer.tree_cursor = visible_index;
+        } else if (self.tree_projection.root_disclosure == .expanded) {
+            for (tree.visibleNodes()) |node_index| if (tree.nodes[node_index].kind == .file) {
+                self.viewer.tree_cursor = self.tree_projection.visibleIndexForTarget(
+                    tree,
+                    .{ .manifest_node = node_index },
+                ) orelse 0;
                 break;
             };
         }
@@ -2070,7 +2133,7 @@ pub const RepositoryPageState = struct {
             return;
         };
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
-        const visible = tree.revealNodeFor(node_index, self.file_visibility) orelse return;
+        const visible = self.tree_projection.revealManifestNode(tree, self.file_visibility, node_index) orelse return;
         self.viewer.tree_cursor = visible;
         self.viewer.focus = .tree;
         self.selected_path = tree.nodes[node_index].path;
@@ -2080,8 +2143,8 @@ pub const RepositoryPageState = struct {
 
     fn moveCursor(self: *RepositoryPageState, delta: isize, body_height: u16) void {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
-        if (tree.visible_len == 0) return;
-        if (delta < 0) self.viewer.tree_cursor -|= @intCast(-delta) else self.viewer.tree_cursor = @min(self.viewer.tree_cursor +| @as(usize, @intCast(delta)), tree.visible_len - 1);
+        const visible_len = self.tree_projection.visibleLen(tree);
+        if (delta < 0) self.viewer.tree_cursor -|= @intCast(-delta) else self.viewer.tree_cursor = @min(self.viewer.tree_cursor +| @as(usize, @intCast(delta)), visible_len - 1);
         self.selectCursor();
         self.clampScroll(body_height);
     }
@@ -2089,28 +2152,40 @@ pub const RepositoryPageState = struct {
     fn setCursor(self: *RepositoryPageState, body_row: usize, body_height: u16, toggle: bool) void {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
         const index = self.viewer.tree_vertical_scroll + body_row;
-        if (index >= tree.visible_len) return;
+        const target = self.tree_projection.targetAt(tree, index) orelse return;
         self.viewer.tree_cursor = index;
-        if (toggle and tree.nodes[tree.visible[index]].kind == .directory) self.toggleCursor(body_height) else self.selectCursor();
+        if (toggle and switch (target) {
+            .repo_root => true,
+            .manifest_node => |node_index| tree.nodes[node_index].kind == .directory,
+        }) self.toggleCursor(body_height) else self.selectCursor();
     }
 
     fn toggleCursor(self: *RepositoryPageState, body_height: u16) void {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
-        if (tree.toggleVisibleFor(self.viewer.tree_cursor, self.file_visibility)) {
-            if (tree.visible_len > 0) self.viewer.tree_cursor = @min(self.viewer.tree_cursor, tree.visible_len - 1);
+        const target = self.tree_projection.targetAt(tree, self.viewer.tree_cursor) orelse return;
+        if (self.tree_projection.toggleTarget(tree, self.file_visibility, target)) {
+            self.viewer.tree_cursor = @min(
+                self.viewer.tree_cursor,
+                self.tree_projection.visibleLen(tree) - 1,
+            );
             self.clampScroll(body_height);
         } else self.selectCursor();
     }
 
     fn selectCursor(self: *RepositoryPageState) void {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
-        if (self.viewer.tree_cursor >= tree.visible_len) return;
-        const node = tree.nodes[tree.visible[self.viewer.tree_cursor]];
-        if (node.kind == .file) self.selected_path = node.path;
+        const target = self.tree_projection.targetAt(tree, self.viewer.tree_cursor) orelse return;
+        switch (target) {
+            .repo_root => {},
+            .manifest_node => |node_index| {
+                const node = tree.nodes[node_index];
+                if (node.kind == .file) self.selected_path = node.path;
+            },
+        }
     }
 
     pub fn clampScroll(self: *RepositoryPageState, body_height: u16) void {
-        const visible_len = if (self.bundle) |*bundle| bundle.tree.visible_len else 0;
+        const visible_len = if (self.bundle) |*bundle| self.tree_projection.visibleLen(&bundle.tree) else 0;
         if (visible_len == 0) {
             self.viewer.tree_cursor = 0;
             self.viewer.tree_vertical_scroll = 0;
@@ -2342,9 +2417,11 @@ pub const RepositoryPageState = struct {
                 const body_row = layout.treeBodyRow(point) orelse return .focus_tree;
                 const tree = if (self.bundle) |*bundle| &bundle.tree else return null;
                 const visible_index = self.viewer.tree_vertical_scroll + body_row;
-                if (visible_index >= tree.visible_len) return null;
-                const node = tree.nodes[tree.visible[visible_index]];
-                break :blk if (node.kind == .directory)
+                const target = self.tree_projection.targetAt(tree, visible_index) orelse return null;
+                break :blk if (switch (target) {
+                    .repo_root => true,
+                    .manifest_node => |node_index| tree.nodes[node_index].kind == .directory,
+                })
                     .{ .mouse_toggle_row = body_row }
                 else
                     .{ .mouse_row = body_row };
@@ -2393,6 +2470,9 @@ pub fn pasteToMsg(context: repository_input.Context, text: []const u8) ?Msg {
 pub const ViewContext = struct {
     page_state: *const RepositoryPageState,
     palette: theme.Palette,
+    /// Borrowed active canonical root. The page owns object identity but does
+    /// not duplicate path metadata merely to render its safe basename.
+    repo_root: ?[]const u8 = null,
 };
 
 pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
@@ -2418,30 +2498,27 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             draw.copyClippedTextAt(surface, 1, size.height / 2, "Loading repository files...", context.palette.style(.muted)) catch {};
             return;
         },
-        .empty => if (state.file_visibility == .all) {
-            draw.copyClippedTextAt(surface, 1, size.height / 2, "Repository has no tracked or non-ignored files", context.palette.style(.muted)) catch {};
-            return;
-        },
+        .empty => {},
         .loaded => {},
     }
 
     const layout = bodyLayout(size);
     const left_width = layout.tree_width;
     var left = surface.child(.{ .col = 0, .row = 0, .width = left_width, .height = size.height });
-    const tree_header: []const u8 = if (state.file_visibility == .changed) "Repository files [changed]" else "Repository files";
-    draw.copyClippedTextAt(&left, 1, 0, tree_header, context.palette.boldStyle(.accent)) catch {};
+    const tree_header: []const u8 = if (state.file_visibility == .changed) "Files [changed]" else "Files";
+    if (size.height > 2) draw.copyClippedTextAt(&left, 0, 2, tree_header, context.palette.boldStyle(.accent)) catch {};
     if (left_width < size.width) {
         var separator_row: u16 = 0;
         while (separator_row < size.height) : (separator_row += 1) _ = surface.borrowTextAt(left_width, separator_row, "│", context.palette.style(.muted));
     }
-    if (state.load_state == .loading) {
-        if (size.height > 1) draw.copyClippedTextAt(&left, 1, 1, "Loading changed files...", context.palette.style(.muted)) catch {};
-        return;
-    }
 
     const tree = &state.bundle.?.tree;
     const rows = layout.treeRows(size.height);
-    const changed_message: ?[]const u8 = if (state.file_visibility == .all)
+    const tree_message: ?[]const u8 = if (state.load_state == .empty and state.file_visibility == .all)
+        "Repository has no tracked or non-ignored files"
+    else if (state.load_state == .loading)
+        "Loading changed files..."
+    else if (state.file_visibility == .all)
         null
     else if (!treeStatusAvailable(state))
         if (state.freshness == .validating) "Loading changed files..." else "Changed-file status unavailable; press r to retry"
@@ -2449,31 +2526,22 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         "No changed files"
     else
         null;
-    if (changed_message) |message| {
-        if (size.height > 1) draw.copyClippedTextAt(&left, 1, 1, message, context.palette.style(.muted)) catch {};
+    if (tree_message) |message| {
+        if (rows > 0) try drawTreeProjectionRow(context, &left, tree, 0, layout.header_rows);
+        if (rows > 1) draw.copyClippedTextAt(&left, 0, layout.header_rows + 1, message, context.palette.style(.muted)) catch {};
     } else {
         var body_row: usize = 0;
-        while (body_row < rows and state.viewer.tree_vertical_scroll + body_row < tree.visible_len) : (body_row += 1) {
+        while (body_row < rows and
+            state.viewer.tree_vertical_scroll + body_row < state.tree_projection.visibleLen(tree)) : (body_row += 1)
+        {
             const visible_index = state.viewer.tree_vertical_scroll + body_row;
-            const node = tree.nodes[tree.visible[visible_index]];
-            const visible_text = try treeRowTextAlloc(
-                surface.frameAllocator(),
-                node,
-                state.viewer.tree_horizontal_scroll,
-                left_width -| 1,
+            try drawTreeProjectionRow(
+                context,
+                &left,
+                tree,
+                visible_index,
+                @intCast(body_row + layout.header_rows),
             );
-            const style = if (visible_index == state.viewer.tree_cursor)
-                context.palette.boldStyle(.prompt)
-            else if (node.kind == .directory)
-                context.palette.boldStyle(.accent)
-            else if (node.file_change) |change|
-                context.palette.style(switch (change) {
-                    .added => .diff_added,
-                    .modified => .diff_modified,
-                })
-            else
-                context.palette.style(.foreground);
-            draw.copyClippedTextAt(&left, 1, @intCast(body_row + 1), visible_text, style) catch {};
         }
     }
 
@@ -2511,6 +2579,54 @@ fn drawIncomingUnavailable(
 
 fn treeStatusAvailable(state: *const RepositoryPageState) bool {
     return if (state.bundle) |bundle| bundle.status_available else false;
+}
+
+fn drawTreeProjectionRow(
+    context: ViewContext,
+    surface: *chasen.Surface,
+    tree: *const repository_tree.Tree,
+    visible_index: usize,
+    screen_row: u16,
+) !void {
+    const state = context.page_state;
+    const target = state.tree_projection.targetAt(tree, visible_index) orelse return;
+    const width = surface.size().width;
+    const visible_text: []const u8 = switch (target) {
+        .repo_root => try rootRowTextAlloc(
+            surface.frameAllocator(),
+            repositoryRootName(context.repo_root),
+            state.tree_projection.root_disclosure,
+            state.viewer.tree_horizontal_scroll,
+            width,
+        ),
+        .manifest_node => |node_index| try treeRowTextAlloc(
+            surface.frameAllocator(),
+            tree.nodes[node_index],
+            state.viewer.tree_horizontal_scroll,
+            width,
+        ),
+    };
+    const style = if (visible_index == state.viewer.tree_cursor)
+        context.palette.boldStyle(.prompt)
+    else switch (target) {
+        .repo_root => context.palette.boldStyle(.accent),
+        .manifest_node => |node_index| blk: {
+            const node = tree.nodes[node_index];
+            if (node.kind == .directory) break :blk context.palette.boldStyle(.accent);
+            if (node.file_change) |change| break :blk context.palette.style(switch (change) {
+                .added => .diff_added,
+                .modified => .diff_modified,
+            });
+            break :blk context.palette.style(.foreground);
+        },
+    };
+    draw.copyClippedTextAt(surface, 0, screen_row, visible_text, style) catch {};
+}
+
+fn repositoryRootName(root: ?[]const u8) []const u8 {
+    const path = root orelse return "Repository";
+    const base = std.fs.path.basename(path);
+    return if (base.len == 0) path else base;
 }
 
 fn drawDocumentCheckpoint(
@@ -2578,13 +2694,40 @@ fn treeRowTextAlloc(
     horizontal_scroll: usize,
     width: u16,
 ) ![]const u8 {
-    if (width == 0) return "";
-    const available: usize = width;
-    const logical_indent = node.depth * 2;
     const marker: []const u8 = switch (node.kind) {
         .file => "  ",
         .directory => if (node.expanded) "▾ " else "▸ ",
     };
+    return treeItemTextAlloc(
+        allocator,
+        (node.depth + 1) * 2,
+        marker,
+        node.name,
+        horizontal_scroll,
+        width,
+    );
+}
+
+fn rootRowTextAlloc(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    disclosure: repository_tree_projection.RootDisclosure,
+    horizontal_scroll: usize,
+    width: u16,
+) ![]const u8 {
+    return treeItemTextAlloc(allocator, 0, disclosure.glyph(), name, horizontal_scroll, width);
+}
+
+fn treeItemTextAlloc(
+    allocator: std.mem.Allocator,
+    logical_indent: usize,
+    marker: []const u8,
+    name: []const u8,
+    horizontal_scroll: usize,
+    width: u16,
+) ![]const u8 {
+    if (width == 0) return "";
+    const available: usize = width;
     const marker_width = chasen.text.displayWidth(marker);
     var skip = horizontal_scroll;
     var indent_columns: usize = 0;
@@ -2606,7 +2749,7 @@ fn treeRowTextAlloc(
     if (chasen.text.displayWidth(visible_marker) > available - indent_columns) visible_marker = "";
     const prefix_columns = @min(indent_columns + chasen.text.displayWidth(visible_marker), available);
     const name_width = available - prefix_columns;
-    const name_window = try manifest.displayWindowAlloc(allocator, node.name, skip, name_width);
+    const name_window = try manifest.displayWindowAlloc(allocator, name, skip, name_width);
     const indent = try allocator.alloc(u8, indent_columns);
     @memset(indent, ' ');
     return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ indent, visible_marker, name_window.text() });
@@ -2682,7 +2825,7 @@ test "repository transition E1 pending and unavailable destinations suppress ret
     }
 }
 
-test "repository page navigation keeps sticky file selection on directory" {
+test "repository page navigation keeps sticky file selection on directory and root" {
     var document = try manifest.parseOwned(std.testing.allocator, try std.testing.allocator.dupe(u8, "a/one.zig\x00b.zig\x00"));
     const tree = try repository_tree.Tree.build(std.testing.allocator, &document);
     var state: RepositoryPageState = .{ .bundle = .{ .document = document, .tree = tree }, .load_state = .loaded };
@@ -2694,6 +2837,10 @@ test "repository page navigation keeps sticky file selection on directory" {
     state.viewer.tree_cursor = 0;
     _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 11 });
     try std.testing.expectEqualStrings("a/one.zig", state.selected_path.?);
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
+    try std.testing.expectEqual(@as(usize, 1), state.tree_projection.visibleLen(&state.bundle.?.tree));
+    _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 11 });
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
 }
 
 test "repository manifest replacement refreshes active file search indices" {
@@ -2715,7 +2862,7 @@ test "repository manifest replacement refreshes active file search indices" {
     try std.testing.expect(state.file_search.no_match);
 }
 
-test "repository All replacement keeps pre-filter hidden-selection cursor fallback" {
+test "repository All replacement restores typed directory cursor beside hidden selection" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest("dir/selected.zig\x00root.zig\x00"),
@@ -2730,8 +2877,143 @@ test "repository All replacement keeps pre-filter hidden-selection cursor fallba
     errdefer incoming.deinit(allocator);
     try state.replaceBundle(allocator, &incoming);
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.tree_cursor);
+    try std.testing.expectEqualStrings("dir/selected.zig", state.selected_path.?);
+}
+
+test "repository manifest replacement retains collapsed root and selected source" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("dir/selected.zig\x00root.zig\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.filePath("dir/selected.zig", .all);
+    state.tree_projection.root_disclosure = .collapsed;
+    state.viewer.tree_cursor = 0;
+
+    var incoming = try bundleForTest("dir/selected.zig\x00root.zig\x00");
+    var incoming_owned = true;
+    defer if (incoming_owned) incoming.deinit(allocator);
+    try state.replaceBundle(allocator, &incoming);
+    incoming_owned = false;
+
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
+    try std.testing.expectEqual(@as(usize, 1), state.tree_projection.visibleLen(&state.bundle.?.tree));
+    try std.testing.expectEqualStrings("dir/selected.zig", state.selected_path.?);
+}
+
+test "repository explicit reload restores typed root and directory across outcomes" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("dir/selected.zig\x00root.zig\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    state.activate(7, root.capability.identity);
+    state.selected_path = state.bundle.?.tree.filePath("dir/selected.zig", .all);
+    state.tree_projection.root_disclosure = .collapsed;
+    state.viewer.tree_cursor = 0;
+
+    state.requestReload(true);
+    var unchanged_request = try state.prepareRequest(allocator, root.path, &root.capability);
+    defer unchanged_request.deinit(allocator);
+    var unchanged: ManifestFinished = .{
+        .identity = unchanged_request.identity,
+        .root_identity = unchanged_request.root.identity,
+        .generation = unchanged_request.generation,
+        .result = .{ .unchanged = state.bundle.?.document.fingerprint },
+    };
+    defer unchanged.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(allocator, &unchanged));
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
     try std.testing.expectEqualStrings("dir/selected.zig", state.selected_path.?);
+
+    state.tree_projection.root_disclosure = .expanded;
+    const directory = state.bundle.?.tree.nodeIndexForPath("dir", .all) orelse return error.ExpectedDirectory;
+    state.viewer.tree_cursor = state.tree_projection.visibleIndexForTarget(
+        &state.bundle.?.tree,
+        .{ .manifest_node = directory },
+    ) orelse return error.ExpectedVisibleDirectory;
+
+    state.requestReload(true);
+    var changed_request = try state.prepareRequest(allocator, root.path, &root.capability);
+    defer changed_request.deinit(allocator);
+    var changed: ManifestFinished = .{
+        .identity = changed_request.identity,
+        .root_identity = changed_request.root.identity,
+        .generation = changed_request.generation,
+        .result = .{ .loaded = try bundleForTest("dir/selected.zig\x00new.zig\x00root.zig\x00") },
+    };
+    defer changed.deinit(allocator);
+
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &changed));
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
+    const restored = state.tree_projection.targetAt(&state.bundle.?.tree, state.viewer.tree_cursor) orelse
+        return error.ExpectedRestoredTarget;
+    switch (restored) {
+        .repo_root => return error.ExpectedDirectory,
+        .manifest_node => |node_index| try std.testing.expectEqualStrings("dir", state.bundle.?.tree.nodes[node_index].path),
+    }
+    try std.testing.expectEqualStrings("dir/selected.zig", state.selected_path.?);
+    try std.testing.expect(state.needs_document_revalidation);
+}
+
+test "repository manifest replacement falls deleted directory cursor to visible ancestor" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("a/nested/selected.zig\x00a/kept.zig\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.filePath("a/nested/selected.zig", .all);
+    const nested = state.bundle.?.tree.nodeIndexForPath("a/nested", .all) orelse return error.ExpectedDirectory;
+    state.viewer.tree_cursor = state.tree_projection.visibleIndexForTarget(
+        &state.bundle.?.tree,
+        .{ .manifest_node = nested },
+    ) orelse return error.ExpectedVisibleDirectory;
+
+    var incoming = try bundleForTest("a/kept.zig\x00");
+    var incoming_owned = true;
+    defer if (incoming_owned) incoming.deinit(allocator);
+    try state.replaceBundle(allocator, &incoming);
+    incoming_owned = false;
+
+    const target = state.tree_projection.targetAt(&state.bundle.?.tree, state.viewer.tree_cursor) orelse
+        return error.ExpectedRestoredTarget;
+    switch (target) {
+        .repo_root => return error.ExpectedDirectoryAncestor,
+        .manifest_node => |node_index| try std.testing.expectEqualStrings("a", state.bundle.?.tree.nodes[node_index].path),
+    }
+}
+
+test "repository file search expands typed root before selecting result" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("dir/target.zig\x00other.zig\x00"),
+        .load_state = .loaded,
+        .tree_projection = .{ .root_disclosure = .collapsed },
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.filePath("other.zig", .all);
+    state.file_search.mode = true;
+    try state.file_search.input.insertSlice("target");
+    repository_navigation.refreshFileSearch(&state.file_search, &state.bundle.?.tree, .all);
+
+    _ = state.applyNavigation(allocator, .submit_file_search, .{ .width = 80, .height = 10 });
+
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
+    try std.testing.expectEqualStrings("dir/target.zig", state.selected_path.?);
+    const selected_target = state.tree_projection.targetAt(&state.bundle.?.tree, state.viewer.tree_cursor) orelse
+        return error.ExpectedSearchTarget;
+    switch (selected_target) {
+        .repo_root => return error.ExpectedFileTarget,
+        .manifest_node => |node_index| try std.testing.expectEqualStrings("dir/target.zig", state.bundle.?.tree.nodes[node_index].path),
+    }
 }
 
 fn bundleForTest(bytes: []const u8) !Bundle {
@@ -2753,6 +3035,7 @@ fn selectionStateForTest(paths: []const u8, content: []const u8) !RepositoryPage
     };
     errdefer state.deinit(allocator);
     state.selected_path = state.bundle.?.tree.firstFilePath();
+    state.viewer.tree_cursor = 1;
     const bytes = try allocator.dupe(u8, content);
     var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
     errdefer document.deinit(allocator);
@@ -2889,13 +3172,14 @@ test "repository changed navigation and mouse use only filtered visible rows" {
     defer state.deinit(allocator);
     try applyBundleStatusForTest(&state.bundle.?, " M a-change.zig\x00 M c-change.zig\x00");
     state.selected_path = state.bundle.?.tree.filePath("a-change.zig", .all);
+    state.viewer.tree_cursor = 1;
     const size = chasen.Size{ .width = 80, .height = 10 };
     _ = state.applyNavigation(allocator, .toggle_changed_filter, size);
     try std.testing.expectEqual(@as(usize, 2), state.bundle.?.tree.visible_len);
 
     _ = state.applyNavigation(allocator, .move_down, size);
     try std.testing.expectEqualStrings("c-change.zig", state.selected_path.?);
-    const mouse_msg = state.mouseToMsg(.{ .col = 1, .row = 1 }, .left, size) orelse return error.ExpectedFilteredMouseRow;
+    const mouse_msg = state.mouseToMsg(.{ .col = 1, .row = 4 }, .left, size) orelse return error.ExpectedFilteredMouseRow;
     _ = state.applyNavigation(allocator, mouse_msg, size);
     try std.testing.expectEqualStrings("a-change.zig", state.selected_path.?);
     _ = state.applyNavigation(allocator, .tree_last, size);
@@ -2903,8 +3187,8 @@ test "repository changed navigation and mouse use only filtered visible rows" {
     state.viewer.tree_cursor = 99;
     state.viewer.tree_vertical_scroll = 99;
     state.clampForBodySize(.{ .width = 24, .height = 2 });
-    try std.testing.expect(state.viewer.tree_cursor < state.bundle.?.tree.visible_len);
-    try std.testing.expect(state.viewer.tree_vertical_scroll < state.bundle.?.tree.visible_len);
+    try std.testing.expect(state.viewer.tree_cursor < state.tree_projection.visibleLen(&state.bundle.?.tree));
+    try std.testing.expect(state.viewer.tree_vertical_scroll < state.tree_projection.visibleLen(&state.bundle.?.tree));
 }
 
 test "repository changed no-match clears document and All restores anchor once" {
@@ -2977,15 +3261,20 @@ test "repository changed filter survives page activation and resets for reposito
     try applyBundleStatusForTest(&state.bundle.?, " M changed.zig\x00");
     state.selected_path = state.bundle.?.tree.filePath("clean.zig", .all);
     _ = state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 });
+    state.tree_projection.root_disclosure = .collapsed;
+    state.viewer.tree_cursor = 0;
 
     state.deactivate();
     state.activate(4, identity);
     try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
     try std.testing.expectEqualStrings("clean.zig", state.all_selection_anchor.?);
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
 
     state.repositoryChanged(allocator, 5, .{ .device = 3, .inode = 4 });
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
     try std.testing.expect(state.all_selection_anchor == null);
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
 }
 
 fn manifestResultForTest(bytes: []const u8) !git_backend.RepositoryManifestLoadResult {
@@ -3411,16 +3700,16 @@ test "repository tree file colors preserve directory and selection priority" {
     };
     defer state.deinit(allocator);
     state.selected_path = state.bundle.?.tree.nodes[2].path;
-    state.viewer.tree_cursor = 2;
+    state.viewer.tree_cursor = 3;
     const palette: theme.Palette = .default();
     var test_surface: chasen.testing.TestSurface = undefined;
-    try test_surface.init(60, 6);
+    try test_surface.init(60, 8);
     defer test_surface.deinit();
     try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
 
-    try std.testing.expectEqual(palette.color(.diff_added), test_surface.surface.readCell(1, 1).?.style.fg);
-    try std.testing.expectEqual(palette.color(.diff_modified), test_surface.surface.readCell(1, 2).?.style.fg);
-    try std.testing.expectEqual(palette.color(.prompt), test_surface.surface.readCell(1, 3).?.style.fg);
+    try std.testing.expectEqual(palette.color(.diff_added), test_surface.surface.readCell(4, 4).?.style.fg);
+    try std.testing.expectEqual(palette.color(.diff_modified), test_surface.surface.readCell(4, 5).?.style.fg);
+    try std.testing.expectEqual(palette.color(.prompt), test_surface.surface.readCell(4, 6).?.style.fg);
 }
 
 const TestRoot = struct {
@@ -4650,6 +4939,53 @@ test "repository manifest root liveness check rejects stable path replacement" {
     }
 }
 
+test "repository accepted empty manifest renders the typed root at its mouse target" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest(""),
+        .load_state = .empty,
+    };
+    defer state.deinit(allocator);
+
+    const full_size = chasen.Size{ .width = 60, .height = 8 };
+    var expanded_surface: chasen.testing.TestSurface = undefined;
+    try expanded_surface.init(full_size.width, full_size.height);
+    defer expanded_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &expanded_surface.surface);
+    try expanded_surface.expectCellText(0, 2, "F");
+    try expanded_surface.expectCellText(0, 3, "▾");
+    try expanded_surface.expectCellText(0, 4, "R");
+    const expanded_snapshot = try expanded_surface.snapshot(allocator);
+    defer allocator.free(expanded_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "Files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "▾ empty-repo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "Repository has no") != null);
+
+    const root_click = state.mouseToMsg(.{ .col = 0, .row = 3 }, .left, full_size) orelse
+        return error.ExpectedRootMouseTarget;
+    try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, root_click);
+    _ = state.applyNavigation(allocator, root_click, full_size);
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
+
+    var collapsed_surface: chasen.testing.TestSurface = undefined;
+    try collapsed_surface.init(full_size.width, full_size.height);
+    defer collapsed_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &collapsed_surface.surface);
+    try collapsed_surface.expectCellText(0, 3, "▸");
+    try collapsed_surface.expectCellText(0, 4, "R");
+
+    const compact_size = chasen.Size{ .width = 60, .height = 3 };
+    var compact_surface: chasen.testing.TestSurface = undefined;
+    try compact_surface.init(compact_size.width, compact_size.height);
+    defer compact_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &compact_surface.surface);
+    try compact_surface.expectCellText(0, 2, "F");
+    const compact_snapshot = try compact_surface.snapshot(allocator);
+    defer allocator.free(compact_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "empty-repo") == null);
+    try std.testing.expectEqual(Msg.focus_tree, state.mouseToMsg(.{ .col = 0, .row = 2 }, .left, compact_size).?);
+}
+
 test "repository page renders tree and selected-document loading checkpoint" {
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest("README.md\x00src/main.zig\x00"),
@@ -4661,13 +4997,14 @@ test "repository page renders tree and selected-document loading checkpoint" {
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(60, 10);
     defer test_surface.deinit();
-    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/gitframe" }, &test_surface.surface);
     const snapshot = try test_surface.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "▾ gitframe") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "README.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading selected file") != null);
-    const non_selected_file = test_surface.surface.readCell(7, 3) orelse return error.ExpectedFileCell;
+    const non_selected_file = test_surface.surface.readCell(4, 6) orelse return error.ExpectedFileCell;
     try std.testing.expectEqual(theme.Palette.default().color(.foreground), non_selected_file.style.fg);
     const layout = bodyLayout(test_surface.surface.size());
     try test_surface.expectCellText(
@@ -4680,6 +5017,18 @@ test "repository page renders tree and selected-document loading checkpoint" {
     try std.testing.expectEqualStrings("─", source_rule.char.grapheme);
     try std.testing.expect(source_rule.style.fg.eql(theme.Palette.default().color(.muted)));
     try std.testing.expect(source_rule.style.dim);
+
+    state.viewer.tree_cursor = 0;
+    _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 10 });
+    var collapsed_surface: chasen.testing.TestSurface = undefined;
+    try collapsed_surface.init(60, 10);
+    defer collapsed_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/gitframe" }, &collapsed_surface.surface);
+    const collapsed_snapshot = try collapsed_surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(collapsed_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "▸ gitframe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "README.md") == null);
+    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "Loading selected file") != null);
 }
 
 test "repository page anchors inert checkpoint below source header rule" {
@@ -4732,7 +5081,7 @@ test "repository changed view distinguishes loading unavailable and no-match sta
         try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
         const snapshot = try test_surface.snapshot(allocator);
         defer allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository files [changed]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [changed]") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading changed files...") != null);
     }
 
@@ -4760,7 +5109,7 @@ test "repository changed view distinguishes loading unavailable and no-match sta
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "No file selected") != null);
     }
 
-    // At the minimum split width and two rows the full prose is clipped, but
+    // At the minimum split width and five rows the full prose is clipped, but
     // each state still exposes a distinct leading label instead of falling
     // through to an empty All projection.
     const narrow_states = [_]struct { available: bool, freshness: @TypeOf(state.freshness), label: []const u8 }{
@@ -4772,7 +5121,7 @@ test "repository changed view distinguishes loading unavailable and no-match sta
         state.bundle.?.status_available = expected.available;
         state.freshness = expected.freshness;
         var test_surface: chasen.testing.TestSurface = undefined;
-        try test_surface.init(24, 2);
+        try test_surface.init(24, 5);
         defer test_surface.deinit();
         try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
         const snapshot = try test_surface.snapshot(allocator);
@@ -4791,15 +5140,25 @@ test "repository page layout and mouse mapping share tree geometry" {
     const wide = chasen.Size{ .width = 60, .height = 10 };
     const wide_layout = bodyLayout(wide);
     try std.testing.expectEqual(@as(u16, 20), wide_layout.tree_width);
+    try std.testing.expectEqual(@as(u16, 3), wide_layout.header_rows);
+    try std.testing.expectEqual(@as(u16, 7), wide_layout.treeRows(wide.height));
     try std.testing.expectEqual(Msg.focus_tree, state.mouseToMsg(.{ .col = 1, .row = 0 }, .left, wide).?);
     try std.testing.expect(state.mouseToMsg(.{ .col = 20, .row = 1 }, .left, wide) == null);
-    try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, state.mouseToMsg(.{ .col = 1, .row = 1 }, .left, wide).?);
-    try std.testing.expectEqual(Msg{ .mouse_row = 1 }, state.mouseToMsg(.{ .col = 1, .row = 2 }, .left, wide).?);
+    try std.testing.expectEqual(Msg.focus_tree, state.mouseToMsg(.{ .col = 1, .row = 2 }, .left, wide).?);
+    try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, wide).?);
+    try std.testing.expectEqual(Msg{ .mouse_toggle_row = 1 }, state.mouseToMsg(.{ .col = 1, .row = 4 }, .left, wide).?);
+    try std.testing.expectEqual(Msg{ .mouse_row = 2 }, state.mouseToMsg(.{ .col = 1, .row = 5 }, .left, wide).?);
     try std.testing.expectEqual(Msg.wheel_down, state.mouseToMsg(.{ .col = 1, .row = 0 }, .wheel_down, wide).?);
+
+    const root_toggle = state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, wide).?;
+    _ = state.applyNavigation(std.testing.allocator, root_toggle, wide);
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
+    _ = state.applyNavigation(std.testing.allocator, root_toggle, wide);
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
 
     const narrow = chasen.Size{ .width = 20, .height = 6 };
     try std.testing.expectEqual(narrow.width, bodyLayout(narrow).tree_width);
-    try std.testing.expectEqual(Msg{ .mouse_row = 1 }, state.mouseToMsg(.{ .col = 19, .row = 2 }, .left, narrow).?);
+    try std.testing.expectEqual(Msg{ .mouse_row = 2 }, state.mouseToMsg(.{ .col = 19, .row = 5 }, .left, narrow).?);
 }
 
 test "repository transition B1 incoming lifecycle keeps one destination owner" {
@@ -4924,6 +5283,8 @@ test "repository transition B2a resolves exact retained manifest through All and
     state.bundle.?.tree.rebuildVisibleFor(.changed);
     state.selected_path = state.bundle.?.tree.filePath("changed.zig", .changed);
     state.all_selection_anchor = try allocator.dupe(u8, "retained.zig");
+    state.tree_projection.root_disclosure = .collapsed;
+    state.viewer.tree_cursor = 0;
 
     var incoming = try page_link.RepositoryIncoming.initOwned(
         allocator,
@@ -4943,11 +5304,17 @@ test "repository transition B2a resolves exact retained manifest through All and
     try std.testing.expectEqualStrings("dir/target.zig", state.selected_path.?);
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
     try std.testing.expect(state.all_selection_anchor == null);
+    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
     try std.testing.expect(state.bundle.?.tree.nodes[state.bundle.?.tree.nodeIndexForPath("dir", .all).?].expanded);
-    try std.testing.expectEqual(
-        state.bundle.?.tree.visibleIndexForPath("dir/target.zig").?,
-        state.viewer.tree_cursor,
-    );
+    const selected_target = state.tree_projection.targetAt(&state.bundle.?.tree, state.viewer.tree_cursor) orelse
+        return error.ExpectedSelectedTarget;
+    switch (selected_target) {
+        .repo_root => return error.ExpectedFileTarget,
+        .manifest_node => |node_index| try std.testing.expectEqualStrings(
+            "dir/target.zig",
+            state.bundle.?.tree.nodes[node_index].path,
+        ),
+    }
     try std.testing.expect(state.needs_document_revalidation);
     try std.testing.expectEqualStrings("Review target opened in All files", state.status.text());
 }
@@ -6090,4 +6457,16 @@ test "repository page row rendering is bounded for multiple maximum names" {
         try std.testing.expect(text.len <= 20 * 4 + 8);
         try std.testing.expect(chasen.text.displayWidth(text) <= 20);
     }
+}
+
+test "repository root row renders disclosure and byte-safe basename" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const expanded = try rootRowTextAlloc(arena.allocator(), "repo\xff\n", .expanded, 0, 40);
+    try std.testing.expectEqualStrings("▾ repo\\xFF\\x0A", expanded);
+    const collapsed = try rootRowTextAlloc(arena.allocator(), "repo", .collapsed, 0, 40);
+    try std.testing.expectEqualStrings("▸ repo", collapsed);
+    const partial_glyph_scroll = try rootRowTextAlloc(arena.allocator(), "repo", .expanded, 1, 40);
+    try std.testing.expectEqualStrings("repo", partial_glyph_scroll);
 }
