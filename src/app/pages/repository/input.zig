@@ -68,6 +68,8 @@ fn publicActionToMsg(comptime Msg: type, context: Context, action: keymap.Public
         .last_file => voidMsg(Msg, "tree_last"),
         .page_up => voidMsg(Msg, "page_up"),
         .page_down => voidMsg(Msg, "page_down"),
+        .decrease_sidebar_width => voidMsg(Msg, "decrease_tree_width"),
+        .increase_sidebar_width => voidMsg(Msg, "increase_tree_width"),
         else => null,
     };
 }
@@ -113,6 +115,8 @@ const TestMsg = union(enum) {
     source_last,
     tree_first,
     tree_last,
+    decrease_tree_width,
+    increase_tree_width,
     enter_source_search,
     enter_file_search,
     toggle_changed_filter,
@@ -154,6 +158,17 @@ test "repository input uses configured changed-file filter binding" {
     const effective = keymap.Effective.fromConfig(config);
     try std.testing.expectEqual(TestMsg.toggle_changed_filter, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'z' }).?);
     try std.testing.expect(keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'F' }) == null);
+}
+
+test "repository input routes configured tree width actions" {
+    try std.testing.expectEqual(TestMsg.decrease_tree_width, keyToMsg(TestMsg, .{}, .{ .codepoint = '[' }).?);
+    try std.testing.expectEqual(TestMsg.increase_tree_width, keyToMsg(TestMsg, .{}, .{ .codepoint = ']' }).?);
+
+    var config: keymap.Config = .{};
+    config.set(.increase_sidebar_width, .{ .plain_codepoint = 'z' });
+    const effective = keymap.Effective.fromConfig(config);
+    try std.testing.expectEqual(TestMsg.increase_tree_width, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'z' }).?);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = ']' }) == null);
 }
 
 test "repository configured Space action claims normal input but not prompts" {

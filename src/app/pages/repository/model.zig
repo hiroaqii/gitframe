@@ -10,6 +10,10 @@ pub const Focus = enum { tree, source };
 
 pub const ViewerState = struct {
     focus: Focus = .tree,
+    /// Optional user preference. Effective width is always clamped against the
+    /// current terminal while the preference survives compatible reloads and
+    /// physical repository replacement as page UI state.
+    tree_width: ?u16 = null,
     tree_cursor: usize = 0,
     tree_vertical_scroll: usize = 0,
     tree_horizontal_scroll: usize = 0,

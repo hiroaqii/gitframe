@@ -1079,7 +1079,11 @@ pub const App = struct {
                 .{ .col = point.col, .row = point.row }
             else
                 null;
-            const source_point = repository_page.sourceGesturePoint(body_point, self.shellLayout().bodySize());
+            const source_point = repository_page.sourceGesturePoint(
+                body_point,
+                self.shellLayout().bodySize(),
+                self.pages.repository.viewer.tree_width,
+            );
             switch (mouse.type) {
                 .drag => return .{ .repository = .{ .mouse_source_drag = source_point } },
                 .release => return .{ .repository = .{ .mouse_source_release = source_point } },
@@ -7801,10 +7805,11 @@ test "repository selection slice B drag routes first and outside release termina
         .active_page = .repository,
         .terminal_size = .{ .width = 100, .height = 20 },
     };
+    app.pages.repository.viewer.tree_width = 42;
     app.pages.repository.source_selection = repositoryLiveSelectionForTest();
     const shell = app.shellLayout();
     const body_size = shell.bodySize();
-    const tree_width = repository_page.bodyLayout(body_size).tree_width;
+    const tree_width = repository_page.bodyLayout(body_size, app.pages.repository.viewer.tree_width).tree_width;
     const drag = app.handleEvent(app_test_support.mouseEventTyped(
         shell.body.col + tree_width + 1 + 4,
         shell.body.row + 2,
