@@ -935,6 +935,7 @@ test "loadConfig accepts theme color overrides" {
         \\success = "#010203"
         \\diff_added = "index:10"
         \\diff_modified = "index:12"
+        \\repository_active_line_number = "#ffdaaa"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
@@ -946,6 +947,7 @@ test "loadConfig accepts theme color overrides" {
     try std.testing.expect(result.config.value.theme.get(.success).?.toChasen().eql(.{ .rgb = .{ 1, 2, 3 } }));
     try std.testing.expect(result.config.value.theme.get(.diff_added).?.toChasen().eql(.{ .index = 10 }));
     try std.testing.expect(result.config.value.theme.get(.diff_modified).?.toChasen().eql(.{ .index = 12 }));
+    try std.testing.expect(result.config.value.theme.get(.repository_active_line_number).?.toChasen().eql(.{ .rgb = .{ 255, 218, 170 } }));
 }
 
 test "loadConfig accepts keymap overrides" {

@@ -28,6 +28,7 @@ pub fn drawSourceHeader(
     surface: *chasen.Surface,
     path: []const u8,
     search: model.SourceSearchState,
+    source_active: bool,
     palette: theme.Palette,
 ) !void {
     const size = surface.size();
@@ -36,7 +37,7 @@ pub fn drawSourceHeader(
     draw.copyClippedTextAt(surface, 1, source_geometry.source_path_row, path_window.text(), palette.boldStyle(.accent)) catch {};
     if (size.height <= source_geometry.source_search_or_rule_row) return;
     if (drawSearchRow(surface, search, palette)) return;
-    const style = sourceHeaderRuleStyle(palette);
+    const style = sourceHeaderRuleStyle(source_active, palette);
     for (0..size.width) |col| {
         _ = surface.borrowTextAt(@intCast(col), source_geometry.source_search_or_rule_row, "─", style);
     }
@@ -81,7 +82,12 @@ pub fn drawSource(
         if (viewer.line_numbers) {
             const number = try std.fmt.allocPrint(surface.frameAllocator(), "{d}", .{line_index + 1});
             const number_col: u16 = @intCast(@as(usize, geometry.line_number_col) + geometry.line_number_width - chasen.text.displayWidth(number));
-            draw.copyClippedTextAt(surface, number_col, row, number, sourceRowStyle(palette.style(.diff_line_number), source_active, current, palette)) catch {};
+            // Repository has no separate Review-style cursor gutter marker.
+            // Promote only the active current line-number digits so retained
+            // source position never looks focused while the tree is active.
+            // The dedicated role keeps this focus cue distinct from syntax.
+            const number_role: theme.Role = if (source_active and current) .repository_active_line_number else .diff_line_number;
+            draw.copyClippedTextAt(surface, number_col, row, number, sourceRowStyle(palette.style(number_role), source_active, current, palette)) catch {};
         }
         if (geometry.text_width == 0) {
             applySelectionLineStyles(surface, geometry, row, document, line_index, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
@@ -303,8 +309,13 @@ fn drawSearchRow(surface: *chasen.Surface, search: model.SourceSearchState, pale
     return true;
 }
 
-fn sourceHeaderRuleStyle(palette: theme.Palette) chasen.TextStyle {
-    return .{ .fg = palette.color(.muted), .dim = true };
+fn sourceHeaderRuleStyle(source_active: bool, palette: theme.Palette) chasen.TextStyle {
+    // Match Review's pane rule exactly: the active rule uses terminal-default
+    // foreground rather than the configurable semantic accent role.
+    return if (source_active)
+        .{ .dim = true }
+    else
+        .{ .fg = palette.color(.muted), .dim = true };
 }
 
 /// Current-row presentation is active-source chrome. It contributes only a
@@ -401,7 +412,7 @@ test "repository source header renders path above a full fixed separator" {
     try test_surface.init(24, source_geometry.source_body_first_row);
     defer test_surface.deinit();
 
-    try drawSourceHeader(&test_surface.surface, "src/main.zig", .{}, palette);
+    try drawSourceHeader(&test_surface.surface, "src/main.zig", .{}, false, palette);
     const snapshot = try test_surface.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/main.zig") != null);
@@ -414,12 +425,49 @@ test "repository source header renders path above a full fixed separator" {
     }
 }
 
+test "repository source normal header rule follows source focus" {
+    const RulePalette = struct {
+        pub fn get(_: @This(), role: theme.Role) ?theme.ColorValue {
+            return switch (role) {
+                .accent => .{ .rgb = .{ .r = 10, .g = 11, .b = 12 } },
+                .muted => .{ .rgb = .{ .r = 20, .g = 21, .b = 22 } },
+                else => null,
+            };
+        }
+    };
+    const palette = theme.Palette.fromConfig(RulePalette{});
+
+    var active: chasen.testing.TestSurface = undefined;
+    try active.init(12, source_geometry.source_body_first_row);
+    defer active.deinit();
+    try drawSourceHeader(&active.surface, "src/main.zig", .{}, true, palette);
+
+    var inactive: chasen.testing.TestSurface = undefined;
+    try inactive.init(12, source_geometry.source_body_first_row);
+    defer inactive.deinit();
+    try drawSourceHeader(&inactive.surface, "src/main.zig", .{}, false, palette);
+
+    for (0..active.surface.size().width) |col| {
+        const active_rule = active.surface.readCell(@intCast(col), source_geometry.source_search_or_rule_row) orelse
+            return error.ExpectedActiveSourceHeaderRule;
+        const inactive_rule = inactive.surface.readCell(@intCast(col), source_geometry.source_search_or_rule_row) orelse
+            return error.ExpectedInactiveSourceHeaderRule;
+        try std.testing.expectEqualStrings("─", active_rule.char.grapheme);
+        try std.testing.expect(active_rule.style.fg.eql(.default));
+        try std.testing.expect(!active_rule.style.fg.eql(palette.color(.accent)));
+        try std.testing.expect(active_rule.style.dim);
+        try std.testing.expectEqualStrings("─", inactive_rule.char.grapheme);
+        try std.testing.expect(inactive_rule.style.fg.eql(palette.color(.muted)));
+        try std.testing.expect(inactive_rule.style.dim);
+    }
+}
+
 test "repository source header truncates safely to the path row" {
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(2, 1);
     defer test_surface.deinit();
 
-    try drawSourceHeader(&test_surface.surface, "a", .{}, .default());
+    try drawSourceHeader(&test_surface.surface, "a", .{}, false, .default());
     try test_surface.expectCellText(1, source_geometry.source_path_row, "a");
     try std.testing.expect(test_surface.surface.readCell(0, source_geometry.source_search_or_rule_row) == null);
 }
@@ -433,7 +481,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try test_surface.init(32, 6);
     defer test_surface.deinit();
 
-    try drawSourceHeader(&test_surface.surface, "src/main.zig", .{}, .default());
+    try drawSourceHeader(&test_surface.surface, "src/main.zig", .{}, true, .default());
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, null, .default());
     var snapshot = try test_surface.snapshot(allocator);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "/needle") == null);
@@ -446,7 +494,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try test_surface.init(32, 6);
     var search: model.SourceSearchState = .{ .mode = true };
     try search.input.insertSlice("needle");
-    try drawSourceHeader(&test_surface.surface, "src/main.zig", search, .default());
+    try drawSourceHeader(&test_surface.surface, "src/main.zig", search, true, .default());
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, search, null, .default());
     snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
@@ -465,7 +513,7 @@ test "repository source retained search result replaces the normal separator" {
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(28, source_geometry.source_body_first_row);
     defer test_surface.deinit();
-    try drawSourceHeader(&test_surface.surface, "src/main.zig", search, palette);
+    try drawSourceHeader(&test_surface.surface, "src/main.zig", search, false, palette);
 
     const snapshot = try test_surface.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
@@ -568,7 +616,7 @@ test "repository source focus does not dim semantic foregrounds" {
     var active: chasen.testing.TestSurface = undefined;
     try active.init(32, 4);
     defer active.deinit();
-    try drawSourceHeader(&active.surface, "src/main.zig", search, palette);
+    try drawSourceHeader(&active.surface, "src/main.zig", search, true, palette);
     try drawSource(
         &active.surface,
         &document,
@@ -583,7 +631,7 @@ test "repository source focus does not dim semantic foregrounds" {
     var inactive: chasen.testing.TestSurface = undefined;
     try inactive.init(32, 4);
     defer inactive.deinit();
-    try drawSourceHeader(&inactive.surface, "src/main.zig", search, palette);
+    try drawSourceHeader(&inactive.surface, "src/main.zig", search, false, palette);
     try drawSource(
         &inactive.surface,
         &document,
@@ -649,6 +697,10 @@ test "repository source cursor row composes semantic overlays and active-only ba
     var live = selection.DragSelection.init(token, .character, selection.pointFromBoundary(0, 12));
     live.update(selection.pointFromBoundary(0, 17));
     var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.foreground)] = .{ .rgb = .{ 21, 22, 23 } };
+    palette.colors[@intFromEnum(theme.Role.diff_line_number)] = .{ .rgb = .{ 31, 32, 33 } };
+    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 41, 42, 43 } };
+    palette.colors[@intFromEnum(theme.Role.repository_active_line_number)] = .{ .rgb = .{ 51, 52, 53 } };
     palette.colors[@intFromEnum(theme.Role.repository_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
     palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
 
@@ -674,9 +726,13 @@ test "repository source cursor row composes semantic overlays and active-only ba
     const searched = active.surface.readCell(geometry.text_col + 6, cursor_row) orelse return error.ExpectedCursorSearch;
     const selected = active.surface.readCell(geometry.text_col + 12, cursor_row) orelse return error.ExpectedCursorSelection;
     const trailing = active.surface.readCell(29, cursor_row) orelse return error.ExpectedCursorTrailingCell;
+    const non_current_line_number = active.surface.readCell(geometry.line_number_col, cursor_row + 1) orelse
+        return error.ExpectedNonCurrentLineNumber;
     try std.testing.expect(gutter.style.fg.eql(palette.color(.diff_modified)));
-    try std.testing.expect(line_number.style.fg.eql(palette.color(.diff_line_number)));
+    try std.testing.expect(line_number.style.fg.eql(palette.color(.repository_active_line_number)));
     try std.testing.expect(!line_number.style.bold);
+    try std.testing.expect(non_current_line_number.style.fg.eql(palette.color(.diff_line_number)));
+    try std.testing.expect(!non_current_line_number.style.bg.eql(palette.color(.repository_cursor_bg)));
     try std.testing.expect(keyword.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(searched.style.fg.eql(palette.color(.warning)));
     try std.testing.expect(searched.style.bold);

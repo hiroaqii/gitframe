@@ -2685,7 +2685,13 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         return;
     }
     if (state.selected_path) |path| {
-        try repository_view.drawSourceHeader(&right, path, state.source_search, context.palette);
+        try repository_view.drawSourceHeader(
+            &right,
+            path,
+            state.source_search,
+            state.viewer.focus == .source,
+            context.palette,
+        );
         if (size.height > repository_source_geometry.source_body_first_row) {
             try drawDocumentCheckpoint(state, path, &right, context.palette);
         }
