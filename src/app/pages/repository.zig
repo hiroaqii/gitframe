@@ -2634,11 +2634,14 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     const tree = &state.bundle.?.tree;
     if (layout.tree_visible) {
         var left = surface.child(.{ .col = 0, .row = 0, .width = layout.tree_width, .height = size.height });
+        const tree_active = state.viewer.focus == .tree;
         const tree_header: []const u8 = if (state.file_visibility == .changed) "Files [changed]" else "Files";
-        if (size.height > 2) draw.copyClippedTextAt(&left, 0, 2, tree_header, context.palette.boldStyle(.accent)) catch {};
+        if (size.height > 2) draw.copyClippedTextAt(&left, 0, 2, tree_header, treePaneStyle(context.palette.boldStyle(.accent), tree_active)) catch {};
         if (layout.tree_width < size.width) {
+            var separator_style = context.palette.style(.muted);
+            separator_style.dim = true;
             var separator_row: u16 = 0;
-            while (separator_row < size.height) : (separator_row += 1) _ = surface.borrowTextAt(layout.tree_width, separator_row, "│", context.palette.style(.muted));
+            while (separator_row < size.height) : (separator_row += 1) _ = surface.borrowTextAt(layout.tree_width, separator_row, "│", separator_style);
         }
 
         const rows = layout.treeRows(size.height);
@@ -2656,7 +2659,7 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             null;
         if (tree_message) |message| {
             if (rows > 0) try drawTreeProjectionRow(context, &left, tree, 0, layout.header_rows);
-            if (rows > 1) draw.copyClippedTextAt(&left, 0, layout.header_rows + 1, message, context.palette.style(.muted)) catch {};
+            if (rows > 1) draw.copyClippedTextAt(&left, 0, layout.header_rows + 1, message, treePaneStyle(context.palette.style(.muted), tree_active)) catch {};
         } else {
             var body_row: usize = 0;
             while (body_row < rows and
@@ -2735,9 +2738,7 @@ fn drawTreeProjectionRow(
             width,
         ),
     };
-    const style = if (visible_index == state.viewer.tree_cursor)
-        context.palette.boldStyle(.prompt)
-    else switch (target) {
+    var style = switch (target) {
         .repo_root => context.palette.boldStyle(.accent),
         .manifest_node => |node_index| blk: {
             const node = tree.nodes[node_index];
@@ -2749,7 +2750,25 @@ fn drawTreeProjectionRow(
             break :blk context.palette.style(.foreground);
         },
     };
+    const selected = visible_index == state.viewer.tree_cursor;
+    const tree_active = state.viewer.focus == .tree;
+    // Selection contributes emphasis only. The target keeps ownership of its
+    // semantic foreground so added/modified files remain distinguishable in
+    // both active and retained-inactive tree states. Reverse remains the
+    // location signal across panes; dim alone communicates inactive focus.
+    if (selected) {
+        style.bold = true;
+        style.reverse = true;
+    }
+    style.dim = !tree_active;
     draw.copyClippedTextAt(surface, 0, screen_row, visible_text, style) catch {};
+}
+
+/// Pane activity is a presentation modifier, not a replacement palette role.
+fn treePaneStyle(style: chasen.TextStyle, active: bool) chasen.TextStyle {
+    var composed = style;
+    composed.dim = !active;
+    return composed;
 }
 
 fn repositoryRootName(root: ?[]const u8) []const u8 {
@@ -4134,9 +4153,9 @@ test "repository real reload updates status color and selected source" {
     try std.testing.expectEqualStrings("const value = 2;\n", state.currentSource().?.bytes);
 }
 
-test "repository tree file colors preserve directory and selection priority" {
+test "repository tree focus styles preserve semantic palette roles" {
     const allocator = std.testing.allocator;
-    var bundle = try bundleForTest("added.zig\x00modified.zig\x00selected.zig\x00");
+    var bundle = try bundleForTest("added.zig\x00dir/nested.zig\x00modified.zig\x00selected.zig\x00");
     var index = try repository_change_index.parseOwned(allocator, try allocator.dupe(u8, "?? added.zig\x00" ++
         " M modified.zig\x00" ++
         " M selected.zig\x00"));
@@ -4147,17 +4166,123 @@ test "repository tree file colors preserve directory and selection priority" {
         .load_state = .loaded,
     };
     defer state.deinit(allocator);
-    state.selected_path = state.bundle.?.tree.nodes[2].path;
-    state.viewer.tree_cursor = 3;
-    const palette: theme.Palette = .default();
-    var test_surface: chasen.testing.TestSurface = undefined;
-    try test_surface.init(60, 8);
-    defer test_surface.deinit();
-    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const tree = &state.bundle.?.tree;
+    state.selected_path = tree.filePath("selected.zig", .all);
+    const selected_node = tree.nodeIndexForPath("selected.zig", .all) orelse return error.ExpectedSelectedFile;
+    const selected_visible = state.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = selected_node }) orelse
+        return error.ExpectedSelectedFile;
+    state.viewer.tree_cursor = selected_visible;
 
-    try std.testing.expectEqual(palette.color(.diff_added), test_surface.surface.readCell(4, 4).?.style.fg);
-    try std.testing.expectEqual(palette.color(.diff_modified), test_surface.surface.readCell(4, 5).?.style.fg);
-    try std.testing.expectEqual(palette.color(.prompt), test_surface.surface.readCell(4, 6).?.style.fg);
+    const FocusPalette = struct {
+        pub fn get(_: @This(), role: theme.Role) ?theme.ColorValue {
+            return switch (role) {
+                .foreground => .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } },
+                .accent => .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } },
+                .muted => .{ .rgb = .{ .r = 7, .g = 8, .b = 9 } },
+                .success => .{ .rgb = .{ .r = 10, .g = 11, .b = 12 } },
+                .info => .{ .rgb = .{ .r = 13, .g = 14, .b = 15 } },
+                .prompt => .{ .rgb = .{ .r = 16, .g = 17, .b = 18 } },
+                else => null,
+            };
+        }
+    };
+    const palette = theme.Palette.fromConfig(FocusPalette{});
+    const size: chasen.Size = .{ .width = 60, .height = 10 };
+    const layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const directory_node = tree.nodeIndexForPath("dir", .all) orelse return error.ExpectedDirectory;
+    const directory_visible = state.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = directory_node }) orelse
+        return error.ExpectedDirectory;
+    const added_node = tree.nodeIndexForPath("added.zig", .all) orelse return error.ExpectedAddedFile;
+    const added_visible = state.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = added_node }) orelse
+        return error.ExpectedAddedFile;
+    const nested_node = tree.nodeIndexForPath("dir/nested.zig", .all) orelse return error.ExpectedNestedFile;
+    const nested_visible = state.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = nested_node }) orelse
+        return error.ExpectedNestedFile;
+    const root_row = layout.header_rows;
+    const directory_row = layout.header_rows + @as(u16, @intCast(directory_visible));
+    const added_row = layout.header_rows + @as(u16, @intCast(added_visible));
+    const nested_row = layout.header_rows + @as(u16, @intCast(nested_visible));
+    const selected_row = layout.header_rows + @as(u16, @intCast(selected_visible));
+
+    var active_surface: chasen.testing.TestSurface = undefined;
+    try active_surface.init(size.width, size.height);
+    defer active_surface.deinit();
+    try view(.{ .page_state = &state, .palette = palette }, &active_surface.surface);
+    const active_header = active_surface.surface.readCell(0, 2) orelse return error.ExpectedTreeHeader;
+    const active_root = active_surface.surface.readCell(0, root_row) orelse return error.ExpectedRoot;
+    const active_directory = active_surface.surface.readCell(4, directory_row) orelse return error.ExpectedDirectory;
+    const active_added = active_surface.surface.readCell(4, added_row) orelse return error.ExpectedAddedFile;
+    const active_nested = active_surface.surface.readCell(6, nested_row) orelse return error.ExpectedNestedFile;
+    const active_selected = active_surface.surface.readCell(4, selected_row) orelse return error.ExpectedSelectedFile;
+    const active_separator = active_surface.surface.readCell(layout.tree_width, 2) orelse return error.ExpectedTreeSeparator;
+    try std.testing.expect(active_header.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(active_header.style.bold);
+    try std.testing.expect(!active_header.style.dim);
+    try std.testing.expect(active_root.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(active_root.style.bold);
+    try std.testing.expect(!active_root.style.dim);
+    try std.testing.expect(!active_root.style.reverse);
+    try std.testing.expect(active_directory.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(active_directory.style.bold);
+    try std.testing.expect(!active_directory.style.dim);
+    try std.testing.expect(active_added.style.fg.eql(palette.color(.diff_added)));
+    try std.testing.expect(!active_added.style.dim);
+    try std.testing.expect(active_nested.style.fg.eql(palette.color(.foreground)));
+    try std.testing.expect(!active_nested.style.dim);
+    try std.testing.expect(active_selected.style.fg.eql(palette.color(.diff_modified)));
+    try std.testing.expect(active_selected.style.bold);
+    try std.testing.expect(active_selected.style.reverse);
+    try std.testing.expect(!active_selected.style.dim);
+    try std.testing.expect(active_separator.style.fg.eql(palette.color(.muted)));
+    try std.testing.expect(active_separator.style.dim);
+
+    state.viewer.tree_cursor = 0;
+    try view(.{ .page_state = &state, .palette = palette }, &active_surface.surface);
+    const selected_root = active_surface.surface.readCell(0, root_row) orelse return error.ExpectedRoot;
+    try std.testing.expect(selected_root.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(selected_root.style.bold);
+    try std.testing.expect(selected_root.style.reverse);
+
+    state.viewer.tree_cursor = directory_visible;
+    try view(.{ .page_state = &state, .palette = palette }, &active_surface.surface);
+    const selected_directory = active_surface.surface.readCell(4, directory_row) orelse return error.ExpectedDirectory;
+    try std.testing.expect(selected_directory.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(selected_directory.style.bold);
+    try std.testing.expect(selected_directory.style.reverse);
+
+    state.viewer.tree_cursor = selected_visible;
+    state.viewer.focus = .source;
+    var inactive_surface: chasen.testing.TestSurface = undefined;
+    try inactive_surface.init(size.width, size.height);
+    defer inactive_surface.deinit();
+    try view(.{ .page_state = &state, .palette = palette }, &inactive_surface.surface);
+    const inactive_header = inactive_surface.surface.readCell(0, 2) orelse return error.ExpectedTreeHeader;
+    const inactive_root = inactive_surface.surface.readCell(0, root_row) orelse return error.ExpectedRoot;
+    const inactive_directory = inactive_surface.surface.readCell(4, directory_row) orelse return error.ExpectedDirectory;
+    const inactive_added = inactive_surface.surface.readCell(4, added_row) orelse return error.ExpectedAddedFile;
+    const inactive_nested = inactive_surface.surface.readCell(6, nested_row) orelse return error.ExpectedNestedFile;
+    const inactive_selected = inactive_surface.surface.readCell(4, selected_row) orelse return error.ExpectedSelectedFile;
+    const inactive_separator = inactive_surface.surface.readCell(layout.tree_width, 2) orelse return error.ExpectedTreeSeparator;
+    try std.testing.expect(inactive_header.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(inactive_header.style.bold);
+    try std.testing.expect(inactive_header.style.dim);
+    try std.testing.expect(inactive_root.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(inactive_root.style.bold);
+    try std.testing.expect(inactive_root.style.dim);
+    try std.testing.expect(!inactive_root.style.reverse);
+    try std.testing.expect(inactive_directory.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(inactive_directory.style.bold);
+    try std.testing.expect(inactive_directory.style.dim);
+    try std.testing.expect(inactive_added.style.fg.eql(palette.color(.diff_added)));
+    try std.testing.expect(inactive_added.style.dim);
+    try std.testing.expect(inactive_nested.style.fg.eql(palette.color(.foreground)));
+    try std.testing.expect(inactive_nested.style.dim);
+    try std.testing.expect(inactive_selected.style.fg.eql(palette.color(.diff_modified)));
+    try std.testing.expect(inactive_selected.style.bold);
+    try std.testing.expect(inactive_selected.style.dim);
+    try std.testing.expect(inactive_selected.style.reverse);
+    try std.testing.expect(inactive_separator.style.fg.eql(palette.color(.muted)));
+    try std.testing.expect(inactive_separator.style.dim);
 }
 
 const TestRoot = struct {
