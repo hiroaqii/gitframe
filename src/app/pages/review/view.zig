@@ -683,13 +683,15 @@ fn drawTitlePath(surface: *chasen.Surface, path: []const u8, stats: ?file_tree.S
 
 fn drawStatusLineStats(surface: *chasen.Surface, col: u16, stats: file_tree.Stats, active: bool, palette: theme.Palette) !void {
     var cursor = col;
-    try draw.copyClippedTextAt(surface, cursor, 0, " ", palette.style(.muted));
+    var metadata_style = palette.style(.muted);
+    metadata_style.dim = metadata_style.dim or !active;
+    try draw.copyClippedTextAt(surface, cursor, 0, " ", metadata_style);
     cursor +|= 1;
     const added = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added});
     try draw.copyClippedTextAt(surface, cursor, 0, added, .{ .fg = palette.color(.success), .bold = true, .dim = !active });
     cursor +|= @intCast(chasen.text.displayWidth(added));
     if (cursor < surface.size().width) {
-        try draw.copyClippedTextAt(surface, cursor, 0, " ", palette.style(.muted));
+        try draw.copyClippedTextAt(surface, cursor, 0, " ", metadata_style);
         cursor +|= 1;
     }
     const removed = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed});
@@ -1241,6 +1243,49 @@ test "diff renderer owns header search marker gutter and input presentation" {
     try ts.expectCellText(1, 1, "s");
     try ts.expectCellText(9, 1, "m");
     try ts.expectCellText(16, 1, " ");
+}
+
+test "status-only header dims semantic statistics and metadata when inactive" {
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.danger)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.muted)] = .{ .rgb = .{ 7, 8, 9 } };
+
+    var active: chasen.testing.TestSurface = undefined;
+    try active.init(40, 4);
+    defer active.deinit();
+    try drawStatusBody(&active.surface, "src/new.zig", "status only", .{ .added = 12, .removed = 4 }, true, palette);
+
+    var inactive: chasen.testing.TestSurface = undefined;
+    try inactive.init(40, 4);
+    defer inactive.deinit();
+    try drawStatusBody(&inactive.surface, "src/new.zig", "status only", .{ .added = 12, .removed = 4 }, false, palette);
+
+    const suffix_width = chasen.text.displayWidth(" +12 -4");
+    const metadata_col: u16 = 40 - @as(u16, @intCast(suffix_width));
+    const added_col = metadata_col + 1;
+    const separator_col = added_col + 3;
+    const removed_col = separator_col + 1;
+    const points = [_]struct {
+        col: u16,
+        role: theme.Role,
+        bold: bool,
+    }{
+        .{ .col = metadata_col, .role = .muted, .bold = false },
+        .{ .col = added_col, .role = .success, .bold = true },
+        .{ .col = separator_col, .role = .muted, .bold = false },
+        .{ .col = removed_col, .role = .danger, .bold = true },
+    };
+    for (points) |point| {
+        const active_cell = active.surface.readCell(point.col, 0) orelse return error.ExpectedActiveStatusHeaderCell;
+        const inactive_cell = inactive.surface.readCell(point.col, 0) orelse return error.ExpectedInactiveStatusHeaderCell;
+        try std.testing.expect(active_cell.style.fg.eql(palette.color(point.role)));
+        try std.testing.expect(inactive_cell.style.fg.eql(palette.color(point.role)));
+        try std.testing.expectEqual(point.bold, active_cell.style.bold);
+        try std.testing.expectEqual(point.bold, inactive_cell.style.bold);
+        try std.testing.expect(!active_cell.style.dim);
+        try std.testing.expect(inactive_cell.style.dim);
+    }
 }
 
 test "reviewed sidebar marker and visible search marker are Review view concerns" {

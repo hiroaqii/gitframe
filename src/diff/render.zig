@@ -997,23 +997,22 @@ fn lineNumberStyle(kind: diff_parser.DiffLine.Kind, staged: bool, styles: Render
 
 fn fileHeaderStyle(pane_active: bool, styles: RenderStyles) chasen.TextStyle {
     var style = styles.file_header;
-    style.dim = !pane_active;
+    style.dim = style.dim or !pane_active;
     return style;
 }
 
 fn headerAddedStyle(pane_active: bool, styles: RenderStyles) chasen.TextStyle {
-    _ = pane_active;
-    return .{ .fg = styles.palette.color(.success), .bold = true };
+    return .{ .fg = styles.palette.color(.success), .bold = true, .dim = !pane_active };
 }
 
 fn headerRemovedStyle(pane_active: bool, styles: RenderStyles) chasen.TextStyle {
-    _ = pane_active;
-    return .{ .fg = styles.palette.color(.danger), .bold = true };
+    return .{ .fg = styles.palette.color(.danger), .bold = true, .dim = !pane_active };
 }
 
 fn headerMetadataStyle(pane_active: bool, styles: RenderStyles) chasen.TextStyle {
-    _ = pane_active;
-    return styles.metadata;
+    var style = styles.metadata;
+    style.dim = style.dim or !pane_active;
+    return style;
 }
 
 fn prefixForLine(kind: diff_parser.DiffLine.Kind, hunk_side_has_visible_syntax: bool) []const u8 {
@@ -1112,6 +1111,49 @@ test "fileStats counts added and removed hunk lines" {
     };
 
     try std.testing.expectEqual(FileStats{ .added = 1, .removed = 1 }, fileStats(file));
+}
+
+fn headerFocusTestPalette() theme.Palette {
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.danger)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.diff_metadata)] = .{ .rgb = .{ 10, 11, 12 } };
+    return palette;
+}
+
+fn expectHeaderFocusStyleMatrix(
+    active: *chasen.Surface,
+    inactive: *chasen.Surface,
+    layout: HeaderLayout,
+    added_text: []const u8,
+    removed_text: []const u8,
+    palette: theme.Palette,
+) !void {
+    const stats_col = layout.stats.?.col;
+    const removed_col = stats_col + @as(u16, @intCast(chasen.text.displayWidth(added_text))) + 1;
+    const detail_col = removed_col + @as(u16, @intCast(chasen.text.displayWidth(removed_text))) + 1;
+    const points = [_]struct {
+        col: u16,
+        role: theme.Role,
+        bold: bool,
+    }{
+        .{ .col = 0, .role = .accent, .bold = true },
+        .{ .col = stats_col, .role = .success, .bold = true },
+        .{ .col = removed_col, .role = .danger, .bold = true },
+        .{ .col = detail_col, .role = .diff_metadata, .bold = false },
+        .{ .col = layout.mode.?.col, .role = .diff_metadata, .bold = false },
+    };
+    for (points) |point| {
+        const active_cell = active.readCell(point.col, 0) orelse return error.ExpectedActiveHeaderCell;
+        const inactive_cell = inactive.readCell(point.col, 0) orelse return error.ExpectedInactiveHeaderCell;
+        try std.testing.expect(active_cell.style.fg.eql(palette.color(point.role)));
+        try std.testing.expect(inactive_cell.style.fg.eql(palette.color(point.role)));
+        try std.testing.expectEqual(point.bold, active_cell.style.bold);
+        try std.testing.expectEqual(point.bold, inactive_cell.style.bold);
+        try std.testing.expect(!active_cell.style.dim);
+        try std.testing.expect(inactive_cell.style.dim);
+    }
 }
 
 fn expectBgRange(surface: *chasen.Surface, row: u16, start_col: u16, end_col: u16, bg: chasen.Color) !void {
@@ -2352,25 +2394,71 @@ test "unified line numbers can be hidden while keeping prefix" {
     try ts.expectCellText(6, 4, "w");
 }
 
-test "inactive pane dims file header only" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(40, 5);
-    defer ts.deinit();
-
+test "parsed file header dims semantic statistics and metadata when inactive" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
         .old_path = "a/src/main.zig",
         .new_path = "b/src/main.zig",
         .metadata = &.{},
-        .hunks = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{
+                .{ .kind = .removed, .text = "old", .old_line = 1 },
+                .{ .kind = .added, .text = "new", .new_line = 1 },
+            },
+        }},
     };
+    const palette = headerFocusTestPalette();
 
-    try renderFile(&ts.surface, file, .{ .pane_active = false });
+    var active: chasen.testing.TestSurface = undefined;
+    try active.init(80, 6);
+    defer active.deinit();
+    try renderFile(&active.surface, file, .{ .pane_active = true, .palette = palette });
 
-    try ts.expectCellText(0, 0, "s");
-    try std.testing.expect(ts.surface.readCell(0, 0).?.style.dim);
-    try ts.expectCellText(32, 0, "u");
-    try std.testing.expect(!ts.surface.readCell(32, 0).?.style.dim);
+    var inactive: chasen.testing.TestSurface = undefined;
+    try inactive.init(80, 6);
+    defer inactive.deinit();
+    try renderFile(&inactive.surface, file, .{ .pane_active = false, .palette = palette });
+
+    try expectHeaderFocusStyleMatrix(
+        &active.surface,
+        &inactive.surface,
+        fileHeaderLayout(80, displayPath(file), file, .unified, bodyWidth(80)),
+        "+1",
+        "-1",
+        palette,
+    );
+}
+
+test "generated file header dims semantic statistics and metadata when inactive" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "one\ntwo");
+    var source = try repository_source.Document.initOwned(allocator, bytes, .init(bytes));
+    defer source.deinit(allocator);
+    const palette = headerFocusTestPalette();
+
+    var active: chasen.testing.TestSurface = undefined;
+    try active.init(80, 6);
+    defer active.deinit();
+    try renderGeneratedAddedFile(&active.surface, "src/new.zig", &source, .{ .pane_active = true, .palette = palette });
+
+    var inactive: chasen.testing.TestSurface = undefined;
+    try inactive.init(80, 6);
+    defer inactive.deinit();
+    try renderGeneratedAddedFile(&inactive.surface, "src/new.zig", &source, .{ .pane_active = false, .palette = palette });
+
+    try expectHeaderFocusStyleMatrix(
+        &active.surface,
+        &inactive.surface,
+        generatedHeaderLayout(80, "src/new.zig", source.contentLineCount(), .unified, bodyWidth(80)),
+        "+2",
+        "-0",
+        palette,
+    );
 }
 
 test "side-by-side horizontal scroll keeps gutter fixed" {
