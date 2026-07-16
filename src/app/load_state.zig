@@ -13,7 +13,7 @@ pub const BranchListAcceptance = enum {
 };
 
 pub const StatusSnapshotReplaceDecision = enum {
-    replace_pending_selection_restore,
+    replace_action_cursor,
     replace_pending_initial_selection,
     replace_no_snapshot,
     replace_root_mismatch,
@@ -73,13 +73,13 @@ pub fn acceptBranchListResult(
 /// helper only names the reasons so status refresh behavior is auditable without
 /// importing the Git status model into load_state.zig.
 pub fn statusSnapshotReplaceDecision(
-    has_pending_selection_restore: bool,
+    has_action_cursor: bool,
     pending_initial_first_visible_selection: bool,
     current_repo_root: ?[]const u8,
     result_repo_root: []const u8,
     documents_equal: bool,
 ) StatusSnapshotReplaceDecision {
-    if (has_pending_selection_restore) return .replace_pending_selection_restore;
+    if (has_action_cursor) return .replace_action_cursor;
     if (pending_initial_first_visible_selection) return .replace_pending_initial_selection;
     const root = current_repo_root orelse return .replace_no_snapshot;
     if (!std.mem.eql(u8, root, result_repo_root)) return .replace_root_mismatch;
@@ -292,7 +292,7 @@ test "acceptBranchListResult requires pending state generation and repo match" {
 
 test "statusSnapshotReplaceDecision names every replace and skip reason" {
     try std.testing.expectEqual(
-        StatusSnapshotReplaceDecision.replace_pending_selection_restore,
+        StatusSnapshotReplaceDecision.replace_action_cursor,
         statusSnapshotReplaceDecision(true, false, "/repo", "/repo", true),
     );
     try std.testing.expectEqual(

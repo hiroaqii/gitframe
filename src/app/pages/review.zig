@@ -184,7 +184,6 @@ pub const ReviewPageState = struct {
     pending_initial_first_visible_selection: bool = false,
     tree_order: file_tree.StableOrder = .{},
     tree_order_scope: ?[]u8 = null,
-    pending_selection_restore: ?app_state.PendingSelectionRestore = null,
     action_cursor: action_cursor.State = .{},
     reviewed_store: review_state.Store = .{},
     selection_owner: diff_selection.Owner = .none,
@@ -213,7 +212,6 @@ pub const ReviewPageState = struct {
         self.review_projection.deinit(allocator);
         self.tree_order.deinit(allocator);
         if (self.tree_order_scope) |scope| allocator.free(scope);
-        if (self.pending_selection_restore) |*restore| restore.deinit(allocator);
         self.action_cursor.deinit(allocator);
         if (self.pending_reload) |*pending| pending.deinit(allocator);
         if (self.pending_display_navigation_restore) |*restore| restore.deinit(allocator);
@@ -237,10 +235,6 @@ test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
         .cycle_id = 2,
     };
     state.tree_order_scope = try allocator.dupe(u8, "/repo");
-    state.pending_selection_restore = .{
-        .path_key = try allocator.dupe(u8, "src/main.zig"),
-        .visible_row = 3,
-    };
     var prepared_cursor = try action_cursor.Prepared.init(
         allocator,
         2,
@@ -300,7 +294,6 @@ test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
     try std.testing.expectEqual(Focus.sidebar, state.viewer.focus);
     try std.testing.expect(state.deferred_source_apply == null);
     try std.testing.expect(state.tree_order_scope == null);
-    try std.testing.expect(state.pending_selection_restore == null);
     try std.testing.expect(!state.action_cursor.hasOwner());
     try std.testing.expect(state.pending_reload == null);
     try std.testing.expect(state.pending_display_navigation_restore == null);

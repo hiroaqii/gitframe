@@ -15,7 +15,7 @@ pub fn hasPendingAction(action_state: actions.ActionState) bool {
     return action_state.pending != null;
 }
 
-pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: git_ops.StageTarget) !void {
+pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: git_ops.StageTarget) !actions.PendingAction {
     const pending = action_state.begin(.stage_file);
     errdefer _ = action_state.finish(pending);
 
@@ -35,9 +35,10 @@ pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *
     task.label = try ctx.allocator().dupe(u8, if (target.label.len > 0) target.label else target.path);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    return pending;
 }
 
-pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: git_ops.UnstageTarget) !void {
+pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: git_ops.UnstageTarget) !actions.PendingAction {
     const pending = action_state.begin(.unstage_file);
     errdefer _ = action_state.finish(pending);
 
@@ -57,6 +58,7 @@ pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
     task.label = try ctx.allocator().dupe(u8, if (target.label.len > 0) target.label else target.path);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    return pending;
 }
 
 pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: *git_ops.HunkStageTarget) !void {
@@ -112,7 +114,7 @@ pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
-pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, repo_root: []const u8, path: []const u8) !void {
+pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, repo_root: []const u8, path: []const u8) !actions.PendingAction {
     const pending = action_state.begin(.discard_file);
     errdefer _ = action_state.finish(pending);
 
@@ -129,6 +131,7 @@ pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
     task.path = try ctx.allocator().dupe(u8, path);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    return pending;
 }
 
 pub const CommitRequest = struct {

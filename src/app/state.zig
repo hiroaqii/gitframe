@@ -452,21 +452,6 @@ pub const ReviewDisplayState = struct {
     changed_file_filter: loaded_diff.ChangedFileFilter = .all,
 };
 
-/// Pending selection restore across a Git action triggered reload.
-///
-/// Git actions can move a file between diff/status projections. Keep the
-/// logical path and previous visible row outside the load arena so the next
-/// accepted load can restore the user's review position.
-pub const PendingSelectionRestore = struct {
-    path_key: []u8,
-    visible_row: usize,
-
-    pub fn deinit(self: *PendingSelectionRestore, allocator: std.mem.Allocator) void {
-        allocator.free(self.path_key);
-        self.* = undefined;
-    }
-};
-
 pub const StagedHunkMark = struct {
     repo_root: []u8,
     path_key: []u8,

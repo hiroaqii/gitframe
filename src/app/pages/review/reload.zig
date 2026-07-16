@@ -641,7 +641,6 @@ pub const Controller = struct {
         } else {
             self.dropStatusSnapshot(allocator);
         }
-        errdefer self.navigation.clearPendingSelectionRestore(allocator);
         const owned_root = try allocator.dupe(u8, repo_root);
         self.page.status_load.begin(background_cycle_id);
         self.page.activation.markPending(.status);
@@ -658,8 +657,7 @@ pub const Controller = struct {
         if (background_cycle_id) |cycle_id| _ = self.page.auto_reload.markMemberStarted(cycle_id, .status);
     }
 
-    pub fn rejectStatusSpawn(self: Controller, allocator: std.mem.Allocator, background_cycle_id: ?u64) void {
-        self.navigation.clearPendingSelectionRestore(allocator);
+    pub fn rejectStatusSpawn(self: Controller, background_cycle_id: ?u64) void {
         self.page.status_load.pending = null;
         self.page.status_load.markFailure(background_cycle_id != null and self.page.git_status.repo_root != null);
         self.failActiveMember(.status);
@@ -1096,7 +1094,7 @@ pub const Controller = struct {
             },
             .loaded => |*bundle| {
                 switch (load_state.statusSnapshotReplaceDecision(
-                    self.page.pending_selection_restore != null,
+                    self.page.action_cursor.hasOwner(),
                     self.page.pending_initial_first_visible_selection,
                     self.page.git_status.repo_root,
                     result.repo_root,
@@ -1107,7 +1105,7 @@ pub const Controller = struct {
                         _ = self.page.activation.finishMember(result.identity, .status, .fresh);
                         return .{ .skip_redraw = true };
                     },
-                    .replace_pending_selection_restore,
+                    .replace_action_cursor,
                     .replace_pending_initial_selection,
                     .replace_no_snapshot,
                     .replace_root_mismatch,
@@ -1139,7 +1137,6 @@ pub const Controller = struct {
             self.page.git_status.clear();
         }
         self.page.pending_initial_first_visible_selection = false;
-        self.navigation.clearPendingSelectionRestore(allocator);
         return .{ .diagnostic = .{ .status_load_failed = message } };
     }
 
@@ -1340,7 +1337,7 @@ pub const Controller = struct {
         defer if (pending_reload) |*pending| pending.deinit(allocator);
 
         const had_loaded_before = self.navigation.view().activeLoadedDiffConst() != null;
-        const had_pending_restore = self.page.pending_selection_restore != null;
+        const had_action_cursor = self.page.action_cursor.hasOwner();
         var can_project_status = false;
         var outcome: SourceApply = .{};
 
@@ -1378,7 +1375,7 @@ pub const Controller = struct {
                     .skip_rebuild_identical_text => {
                         outcome.recovered_failure = self.acceptSourceFingerprint(bundle.fingerprint);
                         _ = self.page.activation.finishMember(finished.identity, .source, self.acceptedSourceMember());
-                        const prefer_first = !had_loaded_before and !had_pending_restore;
+                        const prefer_first = !had_loaded_before and !had_action_cursor;
                         if (prefer_first and self.page.status_load.isPending()) {
                             self.page.pending_initial_first_visible_selection = true;
                         }
@@ -1431,8 +1428,10 @@ pub const Controller = struct {
                     self.navigation.clampSelection(active_loaded.document.files.len);
                     self.navigation.clampDiffNavigation();
                 } else {
-                    if (!had_loaded_before and !had_pending_restore) {
+                    if (!had_loaded_before and !had_action_cursor) {
                         self.navigation.selectFirstVisibleFile(active_loaded);
+                    } else if (self.page.action_cursor.hasOwner()) {
+                        _ = self.navigation.remapActionCursor(active_loaded);
                     } else {
                         self.navigation.syncSidebarNodeToSelectedFile(active_loaded);
                     }
@@ -1455,7 +1454,7 @@ pub const Controller = struct {
             },
         }
 
-        const prefer_first = !had_loaded_before and !had_pending_restore;
+        const prefer_first = !had_loaded_before and !had_action_cursor;
         if (prefer_first and self.page.status_load.isPending()) self.page.pending_initial_first_visible_selection = true;
         if (can_project_status) try self.applyStatusProjection(allocator, prefer_first);
         return outcome;
@@ -1477,7 +1476,6 @@ pub const Controller = struct {
             return .{ .redraw = .skip };
         }
         self.clearSourceDisplay(allocator);
-        self.navigation.clearPendingSelectionRestore(allocator);
         try self.storeFailedMessage(allocator, message);
         return .{};
     }
@@ -1589,18 +1587,19 @@ pub const Controller = struct {
 
         const status_document = self.page.git_status.document;
         if (status_document.entries.len == 0) {
-            if (self.page.pending_selection_restore != null and
+            if (self.page.action_cursor.hasOwner() and
                 (self.page.load.hasPending() or self.page.status_load.isPending())) return;
             if (self.navigation.activeLoadedDiff()) |loaded| {
                 if (loaded.document.files.len == 0) {
                     self.clearLoadedDiff(allocator);
                     self.page.load.replaceEmpty(allocator, .no_changes);
-                    self.navigation.clearPendingSelectionRestore(allocator);
                     return;
                 }
-                if (self.navigation.restorePendingSelectionByPath(allocator, loaded)) return;
+                if (self.page.action_cursor.hasOwner()) {
+                    _ = self.navigation.remapActionCursor(loaded);
+                    return;
+                }
             }
-            self.navigation.clearPendingSelectionRestore(allocator);
             return;
         }
 
@@ -1638,10 +1637,13 @@ pub const Controller = struct {
             self.page.review_display.hide_reviewed_files,
             self.page.review_display.changed_file_filter,
         );
-        if (self.page.pending_selection_restore != null and self.page.load.hasPending()) return;
+        if (self.page.action_cursor.hasOwner()) {
+            _ = self.navigation.remapActionCursor(loaded);
+            return;
+        }
         if (prefer_first_visible_file) {
             self.navigation.selectFirstVisibleFile(loaded);
-        } else if (!self.navigation.restorePendingSelectionOrFallback(app_allocator, loaded)) {
+        } else {
             if (previous_path_key) |path_key| {
                 if (navigation.findNodeByPathKey(loaded, path_key)) |node_index| {
                     self.navigation.selectSidebarNode(loaded, node_index);
@@ -1703,7 +1705,7 @@ pub const Controller = struct {
             self.navigation.selectSidebarNode(active_loaded, node_index);
             break;
         }
-        _ = self.navigation.restorePendingSelectionOrFallback(allocator, active_loaded);
+        if (self.page.action_cursor.hasOwner()) _ = self.navigation.remapActionCursor(active_loaded);
         if (self.page.pending_display_navigation_restore) |*restore| {
             _ = self.navigation.restoreReloadAnchor(active_loaded, restore.authoritative());
         }
@@ -2012,7 +2014,7 @@ test "read command reject terminals clear only matching page state" {
 
     _ = page.status_load.prepare(false);
     page.status_load.begin(null);
-    controller.rejectStatusSpawn(allocator, null);
+    controller.rejectStatusSpawn(null);
     try std.testing.expect(page.status_load.pending == null);
 
     _ = page.branch_status_load.prepare(false);

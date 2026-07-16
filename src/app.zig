@@ -169,7 +169,23 @@ const ActionFinishedMsg = union(enum) {
     }
 };
 
-const DiffLoadStartOptions = review_reload.SourceLoadOptions;
+const DiffLoadStartOptions = struct {
+    clear_visible_state: bool,
+    kind: review_page.ReloadKind,
+    background_cycle_id: ?u64 = null,
+    /// Present only for stage/unstage/discard refreshes which own a typed
+    /// Review sidebar cursor. Other action-result reads must not join that
+    /// exact source/status pair.
+    action_cursor_generation: ?u64 = null,
+
+    fn sourceOptions(self: DiffLoadStartOptions) review_reload.SourceLoadOptions {
+        return .{
+            .clear_visible_state = self.clear_visible_state,
+            .kind = self.kind,
+            .background_cycle_id = self.background_cycle_id,
+        };
+    }
+};
 
 const ShellSurface = enum {
     push_error,
@@ -623,14 +639,18 @@ pub const App = struct {
             .run_interactive_push => try self.runInteractivePush(ctx),
             .reload => switch (self.active_page) {
                 .review => {
-                    self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
-                    self.clearBranchSwitch(ctx.allocator());
-                    if (diff_source.sourceIsOneShotInput(self.config.source)) {
+                    if (self.pages.review.action_cursor.hasOwner()) {
+                        self.pages.review.activation.queueRevalidation();
                         ctx.redraw().skip();
-                    } else if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
-                        try self.startRepoDiscovery(ctx, null);
                     } else {
-                        try self.startDiffLoad(ctx, .manual);
+                        self.clearBranchSwitch(ctx.allocator());
+                        if (diff_source.sourceIsOneShotInput(self.config.source)) {
+                            ctx.redraw().skip();
+                        } else if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
+                            try self.startRepoDiscovery(ctx, null);
+                        } else {
+                            try self.startDiffLoad(ctx, .manual);
+                        }
                     }
                 },
                 .repository => self.pages.repository.requestReload(self.activeRepoRoot() != null),
@@ -644,6 +664,9 @@ pub const App = struct {
             },
             .git_action_spinner_tick => self.gitActionSpinnerTick(ctx),
             .quit => self.requestQuit(ctx),
+        }
+        if (self.pages.review.action_cursor.actionGeneration()) |generation| {
+            if (self.actions.generation > generation) self.reviewNavigation().clearActionCursor(ctx.allocator());
         }
         if (!self.pages.review.selection_owner.activeMouseSelection() and self.pages.review.deferred_source_apply != null) {
             try self.applyDeferredSource(ctx);
@@ -1418,7 +1441,8 @@ pub const App = struct {
     }
 
     fn reviewReadBusy(self: *const App) bool {
-        return self.pages.review.auto_reload.background_cycle != null or
+        return self.pages.review.action_cursor.hasOwner() or
+            self.pages.review.auto_reload.background_cycle != null or
             self.pages.review.load.hasPending() or self.pages.review.load.state == .loading or
             self.pages.review.status_load.isPending() or self.pages.review.branch_status_load.isPending() or
             self.pages.review.deferred_source_apply != null;
@@ -1556,15 +1580,40 @@ pub const App = struct {
     }
 
     fn startDiffLoadWithRepoRoot(self: *App, ctx: *chasen.Ctx(Msg), repo_root: ?[]const u8, options: DiffLoadStartOptions) !void {
+        const action_cursor_generation = if (options.action_cursor_generation) |generation|
+            if (self.pages.review.action_cursor.ownsRefresh(generation)) generation else null
+        else
+            null;
+        if (options.action_cursor_generation == null and self.pages.review.action_cursor.awaitingRefresh()) {
+            // A non-member foreground read explicitly supersedes the old
+            // action pair. Watch/manual paths are normally queued/skipped
+            // before reaching here; this closes other action-result callers.
+            self.reviewNavigation().clearActionCursor(ctx.allocator());
+        }
+        defer if (action_cursor_generation != null) {
+            _ = self.reviewNavigation().finalizeActionCursor(ctx.allocator());
+        };
         if (repo_root) |root| {
-            self.startStatusLoad(ctx, root, if (options.kind == .watch) .background else .foreground, options.background_cycle_id);
+            self.startStatusLoadTracked(
+                ctx,
+                root,
+                if (options.kind == .watch) .background else .foreground,
+                options.background_cycle_id,
+                action_cursor_generation,
+            );
             self.startBranchStatusLoad(ctx, root, options.background_cycle_id);
         } else {
+            if (action_cursor_generation) |generation| {
+                _ = self.pages.review.action_cursor.failMemberBeforeStart(generation, .status);
+            }
             self.reviewReload().dropStatusSnapshot(ctx.allocator());
             self.reviewReload().invalidateBranchStatusSnapshot();
         }
 
-        var review_update = self.reviewReload().prepareSourceLoad(ctx.allocator(), repo_root, options) catch |err| {
+        var review_update = self.reviewReload().prepareSourceLoad(ctx.allocator(), repo_root, options.sourceOptions()) catch |err| {
+            if (action_cursor_generation) |generation| {
+                _ = self.pages.review.action_cursor.failMemberBeforeStart(generation, .source);
+            }
             self.reviewReload().failActiveMember(.source);
             return err;
         };
@@ -1574,8 +1623,14 @@ pub const App = struct {
         defer if (!command_consumed) command.deinit(ctx.allocator());
         const source = &command.source_load;
         const generation = source.generation;
+        if (action_cursor_generation) |action_generation| {
+            _ = self.pages.review.action_cursor.startMember(action_generation, .source, generation);
+        }
         const task = ctx.allocator().create(DiffLoadTask) catch |err| {
             self.reviewReload().rejectSourceSpawn(ctx.allocator(), generation);
+            if (action_cursor_generation) |action_generation| {
+                _ = self.pages.review.action_cursor.rejectMemberSpawn(action_generation, .source, generation);
+            }
             return err;
         };
         task.* = .{
@@ -1590,6 +1645,9 @@ pub const App = struct {
             diff_source.freeLoadRequest(ctx.allocator(), task.request);
             ctx.allocator().destroy(task);
             self.reviewReload().rejectSourceSpawn(ctx.allocator(), generation);
+            if (action_cursor_generation) |action_generation| {
+                _ = self.pages.review.action_cursor.rejectMemberSpawn(action_generation, .source, generation);
+            }
             try self.reviewReload().storeFailedMessage(ctx.allocator(), "Could not start diff load task");
             return err;
         };
@@ -1603,12 +1661,29 @@ pub const App = struct {
         origin: git_backend.ReadOrigin,
         background_cycle_id: ?u64,
     ) void {
+        if (self.pages.review.action_cursor.hasOwner()) {
+            self.reviewNavigation().clearActionCursor(ctx.allocator());
+        }
+        self.startStatusLoadTracked(ctx, repo_root, origin, background_cycle_id, null);
+    }
+
+    fn startStatusLoadTracked(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        repo_root: []const u8,
+        origin: git_backend.ReadOrigin,
+        background_cycle_id: ?u64,
+        action_cursor_generation: ?u64,
+    ) void {
         var review_update = self.reviewReload().prepareStatusLoad(
             ctx.allocator(),
             repo_root,
             origin,
             background_cycle_id,
         ) catch {
+            if (action_cursor_generation) |generation| {
+                _ = self.pages.review.action_cursor.failMemberBeforeStart(generation, .status);
+            }
             self.reviewReload().failActiveMember(.status);
             self.setReviewStatus("could not allocate status repo root", .{});
             return;
@@ -1618,8 +1693,14 @@ pub const App = struct {
         var command_consumed = false;
         defer if (!command_consumed) command.deinit(ctx.allocator());
         const status_read = &command.status_load;
+        if (action_cursor_generation) |generation| {
+            _ = self.pages.review.action_cursor.startMember(generation, .status, status_read.generation);
+        }
         const task = ctx.allocator().create(StatusLoadTask) catch {
-            self.reviewReload().rejectStatusSpawn(ctx.allocator(), background_cycle_id);
+            self.reviewReload().rejectStatusSpawn(background_cycle_id);
+            if (action_cursor_generation) |generation| {
+                _ = self.pages.review.action_cursor.rejectMemberSpawn(generation, .status, status_read.generation);
+            }
             self.setReviewStatus("could not allocate status load task", .{});
             return;
         };
@@ -1638,7 +1719,10 @@ pub const App = struct {
             // in-flight status result from restoring a stale snapshot.
             ctx.allocator().free(task.repo_root);
             ctx.allocator().destroy(task);
-            self.reviewReload().rejectStatusSpawn(ctx.allocator(), background_cycle_id);
+            self.reviewReload().rejectStatusSpawn(background_cycle_id);
+            if (action_cursor_generation) |generation| {
+                _ = self.pages.review.action_cursor.rejectMemberSpawn(generation, .status, status_read.generation);
+            }
             self.setReviewStatus("could not start status load task", .{});
             return;
         };
@@ -1824,10 +1908,21 @@ pub const App = struct {
         var proposal = try self.reviewOperations().ownStageFileProposal(ctx.allocator(), target);
         defer proposal.deinit(ctx.allocator());
         const owned = proposal.stage_file;
-        try self.reviewNavigation().setPendingSelectionRestore(ctx.allocator(), owned.path);
-        errdefer self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
+        const root_identity = self.repo_state.activeIdentity() orelse {
+            self.setReviewStatus("stage unavailable: repository identity changed", .{});
+            return;
+        };
+        var cursor = try self.reviewNavigation().prepareActionCursor(
+            ctx.allocator(),
+            self.repo_epoch,
+            root_identity,
+            reviewActionCursorKind(owned.kind),
+            owned.path,
+        );
+        var cursor_owned = true;
+        defer if (cursor_owned) cursor.deinit(ctx.allocator());
 
-        app_git_requests.startStageFile(Msg, ctx, &self.actions, .{
+        const pending = app_git_requests.startStageFile(Msg, ctx, &self.actions, .{
             .repo_root = owned.repo_root,
             .path = owned.path,
             .kind = owned.kind,
@@ -1836,6 +1931,8 @@ pub const App = struct {
             self.setReviewStatus("could not start stage task", .{});
             return err;
         };
+        self.reviewNavigation().installActionCursor(ctx.allocator(), &cursor, pending.generation);
+        cursor_owned = false;
         self.setReviewStatus("staging: {s}", .{owned.label});
     }
 
@@ -2093,10 +2190,21 @@ pub const App = struct {
         var proposal = try self.reviewOperations().ownUnstageFileProposal(ctx.allocator(), target);
         defer proposal.deinit(ctx.allocator());
         const owned = proposal.unstage_file;
-        try self.reviewNavigation().setPendingSelectionRestore(ctx.allocator(), owned.path);
-        errdefer self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
+        const root_identity = self.repo_state.activeIdentity() orelse {
+            self.setReviewStatus("unstage unavailable: repository identity changed", .{});
+            return;
+        };
+        var cursor = try self.reviewNavigation().prepareActionCursor(
+            ctx.allocator(),
+            self.repo_epoch,
+            root_identity,
+            reviewActionCursorKind(owned.kind),
+            owned.path,
+        );
+        var cursor_owned = true;
+        defer if (cursor_owned) cursor.deinit(ctx.allocator());
 
-        app_git_requests.startUnstageFile(Msg, ctx, &self.actions, .{
+        const pending = app_git_requests.startUnstageFile(Msg, ctx, &self.actions, .{
             .repo_root = owned.repo_root,
             .path = owned.path,
             .kind = owned.kind,
@@ -2105,6 +2213,8 @@ pub const App = struct {
             self.setReviewStatus("could not start unstage task", .{});
             return err;
         };
+        self.reviewNavigation().installActionCursor(ctx.allocator(), &cursor, pending.generation);
+        cursor_owned = false;
         self.setReviewStatus("unstaging: {s}", .{owned.label});
     }
 
@@ -2171,13 +2281,26 @@ pub const App = struct {
             return;
         }
 
-        try self.reviewNavigation().setPendingSelectionRestore(ctx.allocator(), confirmation.path);
-        errdefer self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
+        const root_identity = self.repo_state.activeIdentity() orelse {
+            self.setReviewStatus("discard unavailable: repository identity changed", .{});
+            return;
+        };
+        var cursor = try self.reviewNavigation().prepareActionCursor(
+            ctx.allocator(),
+            self.repo_epoch,
+            root_identity,
+            .file,
+            confirmation.path,
+        );
+        var cursor_owned = true;
+        defer if (cursor_owned) cursor.deinit(ctx.allocator());
 
-        app_git_requests.startDiscardFile(Msg, ctx, &self.actions, confirmation.repo_root, confirmation.path) catch |err| {
+        const pending = app_git_requests.startDiscardFile(Msg, ctx, &self.actions, confirmation.repo_root, confirmation.path) catch |err| {
             self.setReviewStatus("could not start discard task", .{});
             return err;
         };
+        self.reviewNavigation().installActionCursor(ctx.allocator(), &cursor, pending.generation);
+        cursor_owned = false;
 
         self.setReviewStatus("discarding: {s}", .{confirmation.path});
         self.cancelDiscardConfirmation(ctx.allocator());
@@ -3222,17 +3345,19 @@ pub const App = struct {
         if (!self.actions.finish(result.pending)) return;
 
         if (self.setActionFailureStatus("stage", result.result)) {
-            self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
+            _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
             return;
         }
 
+        const active_matches = self.activeRepoMatches(result.repo_root);
         self.setReviewStatus("staged: {s}", .{result.path});
         const applied = try self.reviewOperationController().applyAcceptedOutcome(
             ctx.allocator(),
             .stage_file,
-            self.activeRepoMatches(result.repo_root),
+            active_matches,
         );
-        try self.applyReviewReloadIntent(ctx, applied.reload);
+        const cursor_generation = self.promoteActionCursorRefresh(ctx.allocator(), result.pending, active_matches);
+        try self.applyReviewReloadIntent(ctx, applied.reload, cursor_generation);
     }
 
     fn finishStageHunk(self: *App, ctx: *chasen.Ctx(Msg), finished: StageHunkFinished) !void {
@@ -3251,7 +3376,7 @@ pub const App = struct {
             .hunk_index = result.hunk_index,
             .mark_source = result.mark_source,
         } }, active_matches);
-        try self.applyReviewReloadIntent(ctx, applied.reload);
+        try self.applyReviewReloadIntent(ctx, applied.reload, null);
     }
 
     fn finishUnstageFile(self: *App, ctx: *chasen.Ctx(Msg), finished: UnstageFileFinished) !void {
@@ -3261,17 +3386,19 @@ pub const App = struct {
         if (!self.actions.finish(result.pending)) return;
 
         if (self.setActionFailureStatus("unstage", result.result)) {
-            self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
+            _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
             return;
         }
 
+        const active_matches = self.activeRepoMatches(result.repo_root);
         self.setReviewStatus("unstaged: {s}", .{result.path});
         const applied = try self.reviewOperationController().applyAcceptedOutcome(
             ctx.allocator(),
             .unstage_file,
-            self.activeRepoMatches(result.repo_root),
+            active_matches,
         );
-        try self.applyReviewReloadIntent(ctx, applied.reload);
+        const cursor_generation = self.promoteActionCursorRefresh(ctx.allocator(), result.pending, active_matches);
+        try self.applyReviewReloadIntent(ctx, applied.reload, cursor_generation);
     }
 
     fn finishUnstageHunk(self: *App, ctx: *chasen.Ctx(Msg), finished: UnstageHunkFinished) !void {
@@ -3291,7 +3418,7 @@ pub const App = struct {
             .mark_source = result.mark_source,
             .reload_after_success = result.reload_after_success,
         } }, active_matches);
-        try self.applyReviewReloadIntent(ctx, applied.reload);
+        try self.applyReviewReloadIntent(ctx, applied.reload, null);
     }
 
     fn finishDiscardFile(self: *App, ctx: *chasen.Ctx(Msg), finished: DiscardFileFinished) !void {
@@ -3301,21 +3428,23 @@ pub const App = struct {
         if (!self.actions.finish(result.pending)) return;
 
         if (self.setActionFailureStatus("discard", result.result)) {
-            self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
+            _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
             return;
         }
 
+        const active_matches = self.activeRepoMatches(result.repo_root);
         const applied = try self.reviewOperationController().applyAcceptedOutcome(ctx.allocator(), .{ .discard_file = .{
             .repo_root = result.repo_root,
             .path = result.path,
-        } }, self.activeRepoMatches(result.repo_root));
+        } }, active_matches);
+        const cursor_generation = self.promoteActionCursorRefresh(ctx.allocator(), result.pending, active_matches);
         if (applied.reviewed_clear_failed) {
             self.setReviewStatus("discarded: {s}; could not clear reviewed mark", .{result.path});
-            try self.applyReviewReloadIntent(ctx, applied.reload);
+            try self.applyReviewReloadIntent(ctx, applied.reload, cursor_generation);
             return;
         }
         self.setReviewStatus("discarded: {s}", .{result.path});
-        try self.applyReviewReloadIntent(ctx, applied.reload);
+        try self.applyReviewReloadIntent(ctx, applied.reload, cursor_generation);
     }
 
     fn setActionFailureStatus(self: *App, comptime prefix: []const u8, result: app_actions.FileActionTaskResult) bool {
@@ -3349,7 +3478,7 @@ pub const App = struct {
                     } else {
                         self.setReviewStatus("committed", .{});
                     }
-                    try self.applyReviewReloadIntent(ctx, applied.reload);
+                    try self.applyReviewReloadIntent(ctx, applied.reload, null);
                 } else {
                     if (applied.reviewed_clear_failed) {
                         self.setReviewStatus("committed: {s}; could not clear reviewed marks", .{result.repo_root});
@@ -3556,7 +3685,7 @@ pub const App = struct {
                 const reviewed_clear_failed = if (self.pages.review.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
                 self.pages.review.staged_hunks.clearRepo(ctx.allocator(), result.repo_root);
                 if (active_matches) {
-                    self.reviewNavigation().clearPendingSelectionRestore(ctx.allocator());
+                    self.reviewNavigation().clearActionCursor(ctx.allocator());
                     self.reviewNavigation().clearSearch();
                     self.setReviewStatus("switched branch: {s} -> {s}", .{ result.old_branch, result.new_branch });
                     if (reviewed_clear_failed) self.setReviewStatus("switched branch: {s} -> {s}; could not clear reviewed marks", .{ result.old_branch, result.new_branch });
@@ -3730,30 +3859,84 @@ pub const App = struct {
         return false;
     }
 
-    fn reloadAfterGitAction(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+    fn promoteActionCursorRefresh(
+        self: *App,
+        allocator: std.mem.Allocator,
+        pending: app_actions.PendingAction,
+        active_matches: bool,
+    ) ?u64 {
+        if (!active_matches) {
+            _ = self.pages.review.action_cursor.clearMatchingAction(allocator, pending.generation);
+            return null;
+        }
+        const root_identity = self.repo_state.activeIdentity() orelse {
+            _ = self.pages.review.action_cursor.clearMatchingAction(allocator, pending.generation);
+            return null;
+        };
+        if (!self.pages.review.action_cursor.promote(
+            pending.generation,
+            self.repo_epoch,
+            root_identity,
+        )) {
+            _ = self.pages.review.action_cursor.clearMatchingAction(allocator, pending.generation);
+            return null;
+        }
+        return pending.generation;
+    }
+
+    fn reloadAfterGitAction(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        action_cursor_generation: ?u64,
+    ) !void {
         if (diff_source.sourceIsOneShotInput(self.config.source)) {
+            if (action_cursor_generation) |generation| {
+                _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
+            }
             ctx.redraw().skip();
             return;
         }
         if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
+            if (action_cursor_generation) |generation| {
+                _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
+            }
             try self.startRepoDiscovery(ctx, null);
             return;
         }
         // Commit/amend can change HEAD and ahead/behind counts; this reload
         // path must continue to refresh branch status for remote workflow gates.
         try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
+            if (action_cursor_generation) |generation| {
+                _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
+            }
             ctx.redraw().skip();
             return;
-        }, .{ .clear_visible_state = false, .kind = .action_result });
+        }, .{
+            .clear_visible_state = false,
+            .kind = .action_result,
+            .action_cursor_generation = action_cursor_generation,
+        });
     }
 
     /// Shell effect adapter for Review-local action outcomes. Review decides
     /// which member must be revalidated; App owns the actual async spawn.
-    fn applyReviewReloadIntent(self: *App, ctx: *chasen.Ctx(Msg), intent: review_operations.ReloadIntent) !void {
+    fn applyReviewReloadIntent(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        intent: review_operations.ReloadIntent,
+        action_cursor_generation: ?u64,
+    ) !void {
         switch (intent) {
-            .none => {},
-            .source_and_aux => try self.reloadAfterGitAction(ctx),
-            .status => |repo_root| self.startStatusLoad(ctx, repo_root, .foreground, null),
+            .none => if (action_cursor_generation) |generation| {
+                _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
+            },
+            .source_and_aux => try self.reloadAfterGitAction(ctx, action_cursor_generation),
+            .status => |repo_root| {
+                if (action_cursor_generation) |generation| {
+                    _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
+                }
+                self.startStatusLoad(ctx, repo_root, .foreground, null);
+            },
         }
     }
 
@@ -4255,7 +4438,8 @@ pub const App = struct {
         if (!self.pages.review.auto_reload.enabled()) return;
         if (diff_source.sourceIsOneShotInput(self.config.source)) return;
         if (self.repo_picker.mode or self.pages.review.search.mode or self.pages.review.file_search.mode or self.commit_panel.is_open or
-            self.pages.review.selection_owner.activeMouseSelection() or app_git_requests.hasPendingAction(self.actions))
+            self.pages.review.selection_owner.activeMouseSelection() or app_git_requests.hasPendingAction(self.actions) or
+            self.pages.review.action_cursor.hasOwner())
         {
             ctx.redraw().skip();
             return;
@@ -4473,11 +4657,11 @@ pub const App = struct {
                 .idle, .foreground => {},
             }
             self.reviewReload().clearPendingReload(owner);
-            self.reviewNavigation().clearPendingSelectionRestore(owner);
+            self.reviewNavigation().clearActionCursor(owner);
         } else {
             std.debug.assert(self.push_retry.state == .idle or self.push_retry.state == .foreground);
             std.debug.assert(self.pages.review.pending_reload == null);
-            std.debug.assert(self.pages.review.pending_selection_restore == null);
+            std.debug.assert(!self.pages.review.action_cursor.hasOwner());
         }
         self.reviewReload().clearSourceDisplay(allocator);
         self.reviewReload().dropStatusSnapshot(allocator);
@@ -4493,18 +4677,52 @@ pub const App = struct {
         return self.repo_state.needsDiscovery();
     }
 
+    /// Closes cursor authority for one already-delivered exact task result.
+    /// The caller captures the token before applying the result and invokes
+    /// this from both its success path and `errdefer`: an application error
+    /// cannot be retried because the runtime has already consumed the task
+    /// completion, so it is a failure terminal for this member.
+    fn finishActionCursorCompletion(
+        self: *App,
+        allocator: std.mem.Allocator,
+        token: review_page.action_cursor.CompletionToken,
+        succeeded: bool,
+    ) bool {
+        if (!self.pages.review.action_cursor.finishCompletion(token, succeeded)) return false;
+        return self.reviewNavigation().finalizeActionCursor(allocator);
+    }
+
     fn finishDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: DiffLoadFinished) !void {
         if (self.allocator == null) self.allocator = ctx.allocator();
         var result = finished;
         var result_transferred = false;
         defer if (!result_transferred) result.deinit(ctx.allocator());
 
-        const applied = try self.reviewReload().applySourceFinished(
+        const action_completion = self.pages.review.action_cursor.captureCompletion(
+            result.identity.repo_epoch,
+            .source,
+            result.generation,
+        );
+        errdefer if (action_completion) |completion| {
+            _ = self.finishActionCursorCompletion(ctx.allocator(), completion, false);
+        };
+
+        var applied = try self.reviewReload().applySourceFinished(
             ctx.allocator(),
             &result,
             self.backgroundAcceptanceBlocked(result.background_cycle_id),
         );
         result_transferred = applied.result_transferred;
+
+        if (action_completion) |completion| {
+            const source_succeeded = switch (result.result) {
+                .empty, .unchanged, .loaded => true,
+                .failed, .failed_static => false,
+            };
+            if (self.finishActionCursorCompletion(ctx.allocator(), completion, source_succeeded)) {
+                applied.redraw = .normal;
+            }
+        }
 
         self.applySourceShellOutcome(ctx, applied);
     }
@@ -4535,17 +4753,34 @@ pub const App = struct {
     fn finishStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: StatusLoadFinished) !void {
         var result = finished;
         defer result.deinit(ctx.allocator());
+
+        const action_completion = self.pages.review.action_cursor.captureCompletion(
+            result.identity.repo_epoch,
+            .status,
+            result.generation,
+        );
+        errdefer if (action_completion) |completion| {
+            _ = self.finishActionCursorCompletion(ctx.allocator(), completion, false);
+        };
+
         const applied = try self.reviewReload().applyStatusFinished(
             ctx.allocator(),
             &result,
             self.backgroundAcceptanceBlocked(result.background_cycle_id),
         );
         if (applied.project_status) |prefer_first| try self.reviewReload().applyStatusProjection(ctx.allocator(), prefer_first);
+        const finalized_action_cursor = if (action_completion) |completion| blk: {
+            const status_succeeded = switch (result.result) {
+                .empty, .loaded => true,
+                .failed, .failed_static => false,
+            };
+            break :blk self.finishActionCursorCompletion(ctx.allocator(), completion, status_succeeded);
+        } else false;
         if (applied.diagnostic) |diagnostic| switch (diagnostic) {
             .status_load_failed => |message| self.setReviewStatus("status load failed: {s}", .{message}),
             else => unreachable,
         };
-        if (applied.skip_redraw or self.active_page != .review) ctx.redraw().skip();
+        if ((applied.skip_redraw and !finalized_action_cursor) or self.active_page != .review) ctx.redraw().skip();
     }
 
     fn finishBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: BranchStatusLoadFinished) void {
@@ -4796,7 +5031,7 @@ pub const App = struct {
         self.repo_picker.deinit(allocator);
         self.pending_repo_path_recent_source = null;
         self.clearRepoPickerItems(allocator);
-        self.reviewNavigation().clearPendingSelectionRestore(allocator);
+        self.reviewNavigation().clearActionCursor(allocator);
         self.reviewReload().clearPendingReload(allocator);
         self.clearBranchSwitch(allocator);
     }
@@ -5106,7 +5341,50 @@ fn pathLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.lessThan(u8, lhs, rhs);
 }
 
-test "file action repo mismatch clears pending selection restore without reload" {
+fn reviewActionCursorKind(kind: git_ops.TargetKind) review_page.action_cursor.TargetKind {
+    return switch (kind) {
+        .repository => .repository_root,
+        .directory => .directory,
+        .file => .file,
+    };
+}
+
+const test_action_root_identity: repo_root_capability.Identity = .{ .device = 41, .inode = 73 };
+
+fn installTestActionCursor(
+    app: *App,
+    allocator: std.mem.Allocator,
+    kind: review_page.action_cursor.TargetKind,
+    path_key: []const u8,
+    action_generation: u64,
+) !void {
+    const identity = app.repo_state.activeIdentity() orelse test_action_root_identity;
+    var prepared = try app.reviewNavigation().prepareActionCursor(
+        allocator,
+        app.repo_epoch,
+        identity,
+        kind,
+        path_key,
+    );
+    app.reviewNavigation().installActionCursor(allocator, &prepared, action_generation);
+}
+
+fn promoteTestActionCursor(app: *App, action_generation: u64) !void {
+    const owner = app.pages.review.action_cursor.owner orelse return error.ExpectedActionCursorOwner;
+    try std.testing.expect(app.pages.review.action_cursor.promote(
+        action_generation,
+        owner.repo_epoch,
+        owner.root_identity,
+    ));
+}
+
+test "Review Git target kinds map to typed action cursor kinds" {
+    try std.testing.expectEqual(review_page.action_cursor.TargetKind.repository_root, reviewActionCursorKind(.repository));
+    try std.testing.expectEqual(review_page.action_cursor.TargetKind.directory, reviewActionCursorKind(.directory));
+    try std.testing.expectEqual(review_page.action_cursor.TargetKind.file, reviewActionCursorKind(.file));
+}
+
+test "file action repository mismatch clears only its matching action cursor owner" {
     const allocator = std.testing.allocator;
     var app: App = .{
         .allocator = allocator,
@@ -5116,11 +5394,11 @@ test "file action repo mismatch clears pending selection restore without reload"
             .canonical_root = "/repo",
         } } },
     };
-    defer app.reviewNavigation().clearPendingSelectionRestore(allocator);
+    defer app.reviewNavigation().clearActionCursor(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
-    try app.reviewNavigation().setPendingSelectionRestore(allocator, "src/stage.zig");
     const stage_pending = app.actions.begin(.stage_file);
+    try installTestActionCursor(&app, allocator, .file, "src/stage.zig", stage_pending.generation);
     try app.finishStageFile(&ctx, .{
         .pending = stage_pending,
         .repo_root = try allocator.dupe(u8, "/other"),
@@ -5128,11 +5406,11 @@ test "file action repo mismatch clears pending selection restore without reload"
         .result = .ok,
     });
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(app.pages.review.pending_selection_restore == null);
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 
-    try app.reviewNavigation().setPendingSelectionRestore(allocator, "src/unstage.zig");
     const unstage_pending = app.actions.begin(.unstage_file);
+    try installTestActionCursor(&app, allocator, .file, "src/unstage.zig", unstage_pending.generation);
     try app.finishUnstageFile(&ctx, .{
         .pending = unstage_pending,
         .repo_root = try allocator.dupe(u8, "/other"),
@@ -5140,8 +5418,48 @@ test "file action repo mismatch clears pending selection restore without reload"
         .result = .ok,
     });
     try std.testing.expect(app.actions.pending == null);
-    try std.testing.expect(app.pages.review.pending_selection_restore == null);
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+}
+
+test "successful file action binds the exact source and status generations started by its refresh" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_state.deinit(allocator);
+    defer app.reviewReload().clearPendingReload(allocator);
+    defer app.reviewReload().clearLoadedDiff(app.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.reviewNavigation().clearActionCursor(allocator);
+    _ = app.activateReview();
+
+    const pending = app.actions.begin(.stage_file);
+    try installTestActionCursor(&app, allocator, .directory, "src", pending.generation);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    try app.finishStageFile(&ctx, .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .path = try allocator.dupe(u8, "src"),
+        .result = .ok,
+    });
+
+    const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
+    const source_task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
+    const basis = app.pages.review.action_cursor.owner.?.phase.awaiting_action_refresh;
+    try std.testing.expectEqual(pending.generation, app.pages.review.action_cursor.actionGeneration().?);
+    try std.testing.expectEqual(status_task.generation, basis.status.generation.?);
+    try std.testing.expectEqual(source_task.generation, basis.source.generation.?);
+    try std.testing.expectEqual(review_page.action_cursor.Terminal.pending, basis.status.terminal);
+    try std.testing.expectEqual(review_page.action_cursor.Terminal.pending, basis.source.terminal);
 }
 
 test "read task spawn failure rejects status branch and projection page state" {
@@ -5185,6 +5503,50 @@ test "read task spawn failure rejects status branch and projection page state" {
     try std.testing.expectError(error.TaskLimitExceeded, projection_app.ensureReviewProjection(&projection_ctx));
     projection_ctx._pending_tasks_with_len = 0;
     try std.testing.expect(projection_app.pages.review.review_projection.pending == null);
+}
+
+test "action refresh closes source rejection after its already-started status member finishes" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .stdin },
+    };
+    _ = app.activateReview();
+    defer app.reviewReload().clearPendingReload(allocator);
+    defer app.reviewReload().clearLoadedDiff(app.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.reviewNavigation().clearActionCursor(allocator);
+    try installTestActionCursor(&app, allocator, .file, "src/main.zig", 9);
+    try promoteTestActionCursor(&app, 9);
+
+    // Leave exactly one task slot. Status takes it first; branch and source
+    // spawn are then rejected. The action owner must retain the exact status
+    // generation and close only when that already-started member terminates.
+    var ctx: chasen.Ctx(App.Msg) = .{
+        ._allocator = allocator,
+        ._pending_tasks_with_len = 15,
+    };
+    try std.testing.expectError(error.TaskLimitExceeded, app.startDiffLoadWithRepoRoot(
+        &ctx,
+        "/repo",
+        .{
+            .clear_visible_state = false,
+            .kind = .action_result,
+            .action_cursor_generation = 9,
+        },
+    ));
+    try std.testing.expect(app.pages.review.action_cursor.hasOwner());
+    const basis = app.pages.review.action_cursor.owner.?.phase.awaiting_action_refresh;
+    try std.testing.expectEqual(review_page.action_cursor.Terminal.rejected_spawn, basis.source.terminal);
+    try std.testing.expectEqual(review_page.action_cursor.Terminal.pending, basis.status.terminal);
+
+    const status_entry = ctx._pending_tasks_with[15];
+    ctx._pending_tasks_with_len = 0;
+    const status_failure = status_entry.failed(status_entry.ctx, .runtime_abandoned, allocator);
+    try app.update(status_failure, &ctx);
+
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(app.pages.review.status_load.pending == null);
 }
 
 test "read task allocation failure rejects source status branch and projection page state" {
@@ -6468,7 +6830,270 @@ test "sidebar navigation moves between status-only nodes" {
     try std.testing.expectEqual(first_node, app.pages.review.viewer.selected_node);
 }
 
-test "pending selection restore waits for status projection after stage" {
+fn expectDirectoryCursorAfterActionRefresh(status_first: bool) !void {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    var current = app_test_support.loadedDiffRootedNested();
+    try current.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, current),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 1,
+            },
+            .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
+            .pending_reload = .{ .generation = 2, .kind = .action_result },
+        } },
+        .allocator = allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    defer app.reviewReload().clearPendingReload(allocator);
+    defer app.reviewReload().clearLoadedDiff(app.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
+    defer app.reviewNavigation().clearActionCursor(allocator);
+
+    try installTestActionCursor(&app, allocator, .directory, "src", 9);
+    try promoteTestActionCursor(&app, 9);
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .source, 2));
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 7));
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    if (status_first) {
+        const status_bundle = try git_status.StatusBundle.parseOwned(allocator, "M  src/a\x00M  src/b\x00");
+        try app.finishStatusLoad(&ctx, .{
+            .identity = page.RequestIdentity.review(0, 1),
+            .generation = 7,
+            .repo_root = try allocator.dupe(u8, "/repo"),
+            .result = .{ .loaded = status_bundle },
+        });
+        try std.testing.expect(app.pages.review.action_cursor.hasOwner());
+        try app.finishDiffLoad(&ctx, .{
+            .identity = page.RequestIdentity.review(0, 1),
+            .generation = 2,
+            .result = .empty,
+        });
+    } else {
+        try app.finishDiffLoad(&ctx, .{
+            .identity = page.RequestIdentity.review(0, 1),
+            .generation = 2,
+            .result = .empty,
+        });
+        try std.testing.expect(app.pages.review.action_cursor.hasOwner());
+        const status_bundle = try git_status.StatusBundle.parseOwned(allocator, "M  src/a\x00M  src/b\x00");
+        try app.finishStatusLoad(&ctx, .{
+            .identity = page.RequestIdentity.review(0, 1),
+            .generation = 7,
+            .repo_root = try allocator.dupe(u8, "/repo"),
+            .result = .{ .loaded = status_bundle },
+        });
+    }
+
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    const loaded = app.reviewNavigation().loadedDiff() orelse return error.ExpectedLoadedDiff;
+    const directory_node = review_navigation.findNodeByPathKey(loaded, "src") orelse return error.ExpectedDirectoryNode;
+    try std.testing.expectEqual(file_tree.Node.Kind.directory, loaded.tree.nodes[directory_node].kind);
+    try std.testing.expectEqual(directory_node, app.pages.review.viewer.selected_node);
+    // Directory restoration owns only the sidebar cursor. The body remains a
+    // file/status target rather than being converted into a fake directory body.
+    try std.testing.expect(app.pages.review.viewer.selected_target != null);
+}
+
+test "source-first action refresh restores directory after exact status completion" {
+    try expectDirectoryCursorAfterActionRefresh(false);
+}
+
+test "status-first action refresh restores directory after exact source completion" {
+    try expectDirectoryCursorAfterActionRefresh(true);
+}
+
+test "inactive Review consumes matching action refresh terminals without shell redraw" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .active_page = .repository,
+        .pages = .{ .review = .{
+            .load = .{ .generation = 2, .pending = .{ .diff_load = 2 } },
+            .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
+            .pending_reload = .{ .generation = 2, .kind = .action_result },
+        } },
+        .allocator = allocator,
+    };
+    defer app.reviewReload().clearPendingReload(allocator);
+    defer app.reviewReload().clearLoadedDiff(app.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.reviewNavigation().clearActionCursor(allocator);
+    try installTestActionCursor(&app, allocator, .file, "src/main.zig", 9);
+    try promoteTestActionCursor(&app, 9);
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .source, 2));
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 7));
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
+        .generation = 2,
+        .result = .{ .failed_static = "source failed" },
+    });
+    try std.testing.expect(app.pages.review.action_cursor.hasOwner());
+    try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
+        .generation = 7,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .failed_static = "status failed" },
+    });
+
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+const ActionCursorPeerState = enum {
+    pending,
+    terminal,
+};
+
+test "source apply allocation failure closes exact action cursor member for pending and terminal peers" {
+    const backing = std.testing.allocator;
+    for ([_]ActionCursorPeerState{ .pending, .terminal }) |peer_state| {
+        var failing = std.testing.FailingAllocator.init(backing, .{});
+        const allocator = failing.allocator();
+        var app: App = .{
+            .allocator = allocator,
+            .config = .{ .source = .unstaged },
+            .pages = .{ .review = .{
+                .load = .{ .generation = 1, .pending = .{ .diff_load = 1 } },
+                .status_load = if (peer_state == .pending)
+                    .{ .generation = 2, .pending = .{ .generation = 2 } }
+                else
+                    .{},
+            } },
+        };
+        const activation_id = app.activateReview();
+        defer app.reviewReload().clearLoadedDiff(allocator);
+        defer app.pages.review.git_status.deinit();
+        defer app.reviewNavigation().clearActionCursor(allocator);
+
+        try installTestActionCursor(&app, allocator, .file, "src/main.zig", 9);
+        try promoteTestActionCursor(&app, 9);
+        try std.testing.expect(app.pages.review.action_cursor.startMember(9, .source, 1));
+        try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 2));
+        if (peer_state == .terminal) {
+            try std.testing.expect(app.pages.review.action_cursor.finishMember(9, app.repo_epoch, .status, 2, false));
+        }
+        app.pages.review.activation.queueRevalidation();
+
+        // applySourceFailure has already consumed the task generation before
+        // storing its owned diagnostic. Fail that allocation and prove the
+        // captured completion still becomes a failure terminal.
+        failing.fail_index = failing.alloc_index;
+        var failing_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        try std.testing.expectError(error.OutOfMemory, app.finishDiffLoad(&failing_ctx, .{
+            .identity = page.RequestIdentity.review(app.repo_epoch, activation_id),
+            .generation = 1,
+            .result = .{ .failed_static = "source apply failed" },
+        }));
+        try std.testing.expect(failing.has_induced_failure);
+
+        if (peer_state == .pending) {
+            const basis = app.pages.review.action_cursor.owner.?.phase.awaiting_action_refresh;
+            try std.testing.expectEqual(review_page.action_cursor.Terminal.failed, basis.source.terminal);
+            try std.testing.expectEqual(review_page.action_cursor.Terminal.pending, basis.status.terminal);
+
+            var peer_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = backing };
+            try app.finishStatusLoad(&peer_ctx, .{
+                .identity = page.RequestIdentity.review(app.repo_epoch, activation_id),
+                .generation = 2,
+                .repo_root = try backing.dupe(u8, "/repo"),
+                .result = .{ .failed_static = "status failed" },
+            });
+        }
+
+        try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+        try std.testing.expect(!app.reviewReadBusy());
+        try std.testing.expect(app.pages.review.activation.takeQueuedRevalidation());
+    }
+}
+
+test "status apply allocation failure closes exact action cursor member for pending and terminal peers" {
+    const backing = std.testing.allocator;
+    for ([_]ActionCursorPeerState{ .pending, .terminal }) |peer_state| {
+        var failing = std.testing.FailingAllocator.init(backing, .{});
+        const allocator = failing.allocator();
+        var app: App = .{
+            .allocator = allocator,
+            .config = .{ .source = .unstaged },
+            .pages = .{ .review = .{
+                .load = if (peer_state == .pending)
+                    .{ .generation = 1, .pending = .{ .diff_load = 1 } }
+                else
+                    .{},
+                .status_load = .{ .generation = 2, .pending = .{ .generation = 2 } },
+            } },
+        };
+        const activation_id = app.activateReview();
+        defer app.reviewReload().clearLoadedDiff(allocator);
+        defer app.pages.review.git_status.deinit();
+        defer app.reviewNavigation().clearActionCursor(allocator);
+
+        try installTestActionCursor(&app, allocator, .file, "src/main.zig", 9);
+        try promoteTestActionCursor(&app, 9);
+        try std.testing.expect(app.pages.review.action_cursor.startMember(9, .source, 1));
+        try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 2));
+        if (peer_state == .terminal) {
+            try std.testing.expect(app.pages.review.action_cursor.finishMember(9, app.repo_epoch, .source, 1, false));
+        }
+        app.pages.review.activation.queueRevalidation();
+
+        var bundle = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
+        var bundle_owned = true;
+        defer if (bundle_owned) bundle.deinit();
+        const repo_root = try allocator.alloc(u8, 64 * 1024);
+        var repo_root_owned = true;
+        defer if (repo_root_owned) allocator.free(repo_root);
+        @memset(repo_root, 'r');
+        // GitStatusState.replace must copy this root into the result arena.
+        // Its size forces a fresh arena allocation, which is the next and
+        // deliberately failing allocation below.
+        failing.fail_index = failing.alloc_index;
+        var failing_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        bundle_owned = false;
+        repo_root_owned = false;
+        try std.testing.expectError(error.OutOfMemory, app.finishStatusLoad(&failing_ctx, .{
+            .identity = page.RequestIdentity.review(app.repo_epoch, activation_id),
+            .generation = 2,
+            .repo_root = repo_root,
+            .result = .{ .loaded = bundle },
+        }));
+        try std.testing.expect(failing.has_induced_failure);
+
+        if (peer_state == .pending) {
+            const basis = app.pages.review.action_cursor.owner.?.phase.awaiting_action_refresh;
+            try std.testing.expectEqual(review_page.action_cursor.Terminal.pending, basis.source.terminal);
+            try std.testing.expectEqual(review_page.action_cursor.Terminal.failed, basis.status.terminal);
+
+            var peer_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = backing };
+            try app.finishDiffLoad(&peer_ctx, .{
+                .identity = page.RequestIdentity.review(app.repo_epoch, activation_id),
+                .generation = 1,
+                .result = .{ .failed_static = "source failed" },
+            });
+        }
+
+        try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+        try std.testing.expect(!app.reviewReadBusy());
+        try std.testing.expect(app.pages.review.activation.takeQueuedRevalidation());
+    }
+}
+
+test "action cursor waits for the exact status member after source is terminal" {
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffOne()),
@@ -6485,22 +7110,28 @@ test "pending selection restore waits for status projection after stage" {
     defer app.pages.review.git_status.deinit();
     defer app.pages.review.tree_order.deinit(std.testing.allocator);
     defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
-    defer app.reviewNavigation().clearPendingSelectionRestore(std.testing.allocator);
+    defer app.reviewNavigation().clearActionCursor(std.testing.allocator);
 
-    try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "b");
+    try installTestActionCursor(&app, std.testing.allocator, .file, "b", 9);
+    try promoteTestActionCursor(&app, 9);
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .source, 2));
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 1));
+    try std.testing.expect(app.pages.review.action_cursor.finishMember(9, app.repo_epoch, .source, 2, true));
     app.pages.review.status_load.pending = .{ .generation = 1 };
 
-    // Diff reload can finish before the status reload. In that intermediate
-    // tree the staged file is absent, so do not consume the pending restore yet.
+    // The source half may complete first. Retained pre-action status is not a
+    // coherent final projection and therefore cannot consume the owner.
     try app.reviewReload().applyStatusProjection(std.testing.allocator, false);
-    try std.testing.expect(app.pages.review.pending_selection_restore != null);
+    try std.testing.expect(app.pages.review.action_cursor.hasOwner());
 
     app.pages.review.status_load.pending = null;
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
     try app.reviewReload().applyStatusProjection(std.testing.allocator, false);
+    try std.testing.expect(app.pages.review.action_cursor.finishMember(9, app.repo_epoch, .status, 1, true));
+    try std.testing.expect(app.reviewNavigation().finalizeActionCursor(std.testing.allocator));
 
-    try std.testing.expect(app.pages.review.pending_selection_restore == null);
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
@@ -6821,7 +7452,7 @@ test "resolveCommitMessageAction reports missing and multiple configs" {
     try std.testing.expectError(error.Multiple, multiple.resolveImproveCommitMessageAction());
 }
 
-test "pending selection restore survives status projection while diff reload is pending" {
+test "action cursor survives exact status projection while source member is pending" {
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffTwo()),
@@ -6838,21 +7469,25 @@ test "pending selection restore survives status projection while diff reload is 
     defer app.pages.review.git_status.deinit();
     defer app.pages.review.tree_order.deinit(std.testing.allocator);
     defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
-    defer app.reviewNavigation().clearPendingSelectionRestore(std.testing.allocator);
+    defer app.reviewNavigation().clearActionCursor(std.testing.allocator);
 
-    try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "b");
+    try installTestActionCursor(&app, std.testing.allocator, .file, "b", 9);
+    try promoteTestActionCursor(&app, 9);
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .source, 2));
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 1));
+    try std.testing.expect(app.pages.review.action_cursor.finishMember(9, app.repo_epoch, .status, 1, true));
     app.pages.review.load.pending = .{ .diff_load = app.pages.review.load.generation + 1 };
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
     try app.reviewReload().applyStatusProjection(std.testing.allocator, false);
 
-    try std.testing.expect(app.pages.review.pending_selection_restore != null);
+    try std.testing.expect(app.pages.review.action_cursor.hasOwner());
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
 }
 
-test "pending selection restore clears when status finishes empty after reload" {
+test "action cursor closes after status completion when source failed before generation" {
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffOne()),
@@ -6861,15 +7496,18 @@ test "pending selection restore clears when status finishes empty after reload" 
                 .selected_file = 0,
                 .selected_node = 0,
             },
-            .status_load = .{ .generation = 7 },
+            .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
         } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 12 },
     };
     defer app.reviewReload().clearLoadedDiff(app.allocator);
-    defer app.reviewNavigation().clearPendingSelectionRestore(std.testing.allocator);
+    defer app.reviewNavigation().clearActionCursor(std.testing.allocator);
 
-    try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "missing.zig");
+    try installTestActionCursor(&app, std.testing.allocator, .file, "missing.zig", 9);
+    try promoteTestActionCursor(&app, 9);
+    try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(9, .source));
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 7));
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.finishStatusLoad(&ctx, .{
@@ -6879,7 +7517,7 @@ test "pending selection restore clears when status finishes empty after reload" 
         .result = .empty,
     });
 
-    try std.testing.expect(app.pages.review.pending_selection_restore == null);
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
 }
 
 const BranchStatusBundleSpec = struct {
@@ -7456,13 +8094,13 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
     _ = app.activateReview();
     defer app.pages.review.reviewed_store.deinit(allocator);
     defer app.pages.review.staged_hunks.deinit(allocator);
-    defer app.reviewNavigation().clearPendingSelectionRestore(allocator);
+    defer app.reviewNavigation().clearActionCursor(allocator);
     defer app.pages.review.tree_order.deinit(allocator);
     defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
 
     try app.pages.review.reviewed_store.set(allocator, app.activeRepoRoot(), app_test_support.files_two[0], true);
     try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 0);
-    try app.reviewNavigation().setPendingSelectionRestore(allocator, "a");
+    try installTestActionCursor(&app, allocator, .file, "a", 99);
     setDiffSearchQuery(&app, "needle");
 
     const pending = app.actions.begin(.switch_branch);
@@ -7480,7 +8118,7 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(!try app.pages.review.reviewed_store.containsFile(allocator, app.activeRepoRoot(), app_test_support.files_two[0]));
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.staged_hunks.items.items.len);
-    try std.testing.expect(app.pages.review.pending_selection_restore == null);
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.search.query.len);
     try std.testing.expectEqualStrings("switched branch: main -> feature", app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
@@ -10654,19 +11292,25 @@ test "prompt allocation failure restores and later replaces owned remote URL" {
     app.cancelPushCredentialPrompt(allocator);
 }
 
-test "manual reload clears action selection restore" {
+test "manual reload queues revalidation without superseding an action cursor pair" {
     var app: App = .{
         .allocator = std.testing.allocator,
         .config = .{ .source = .stdin },
     };
-    defer app.reviewNavigation().clearPendingSelectionRestore(std.testing.allocator);
+    _ = app.activateReview();
+    defer app.reviewNavigation().clearActionCursor(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "src/main.zig");
+    try installTestActionCursor(&app, std.testing.allocator, .file, "src/main.zig", 9);
+    try promoteTestActionCursor(&app, 9);
 
     try app.update(.reload, &ctx);
 
-    try std.testing.expect(app.pages.review.pending_selection_restore == null);
+    try std.testing.expect(app.pages.review.action_cursor.hasOwner());
+    try std.testing.expectEqual(
+        app.pages.review.activation.currentIdentity().?.activation_id,
+        app.pages.review.activation.revalidation_requested.?,
+    );
 }
 
 test "repository syntax task allocation and spawn failures release owners and remain retryable" {
@@ -12460,6 +13104,75 @@ test "directory unstage target scans staged subtree" {
     }
 }
 
+fn abandonSingleQueuedAction(app: *App, ctx: *chasen.Ctx(App.Msg)) !void {
+    const entries = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    const message = entries[0].failed(entries[0].ctx, .runtime_abandoned, ctx.allocator());
+    try app.update(message, ctx);
+}
+
+test "stage unstage and discard launch typed action cursor owners with task generations" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 0,
+            },
+        } },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_state.deinit(allocator);
+    defer app.reviewReload().clearLoadedDiff(app.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.reviewNavigation().clearActionCursor(allocator);
+    acceptTestSource(&app);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    var stageable = try git_status.StatusBundle.parseOwned(allocator, " M src/a\x00?? src/b\x00");
+    try app.pages.review.git_status.replace(roots.a, &stageable);
+    try app.stageSelectedFile(&ctx);
+    const stage_pending = app.actions.pending orelse return error.ExpectedStageAction;
+    try std.testing.expectEqual(app_actions.ActionKind.stage_file, stage_pending.kind);
+    try std.testing.expectEqual(stage_pending.generation, app.pages.review.action_cursor.actionGeneration().?);
+    try std.testing.expectEqual(review_page.action_cursor.TargetKind.directory, app.pages.review.action_cursor.target().?.kind);
+    try std.testing.expectEqualStrings("src", app.pages.review.action_cursor.target().?.path_key);
+    try abandonSingleQueuedAction(&app, &ctx);
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+
+    var staged = try git_status.StatusBundle.parseOwned(allocator, "M  src/a\x00M  src/b\x00");
+    try app.pages.review.git_status.replace(roots.a, &staged);
+    try app.unstageSelectedFile(&ctx);
+    const unstage_pending = app.actions.pending orelse return error.ExpectedUnstageAction;
+    try std.testing.expectEqual(app_actions.ActionKind.unstage_file, unstage_pending.kind);
+    try std.testing.expectEqual(unstage_pending.generation, app.pages.review.action_cursor.actionGeneration().?);
+    try std.testing.expectEqual(review_page.action_cursor.TargetKind.directory, app.pages.review.action_cursor.target().?.kind);
+    try std.testing.expectEqualStrings("src", app.pages.review.action_cursor.target().?.path_key);
+    try abandonSingleQueuedAction(&app, &ctx);
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+
+    app.discard_confirmation = .{
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .path = try allocator.dupe(u8, "src/a"),
+    };
+    app.overlay.openDiscardFile();
+    try app.confirmDiscardFile(&ctx);
+    const discard_pending = app.actions.pending orelse return error.ExpectedDiscardAction;
+    try std.testing.expectEqual(app_actions.ActionKind.discard_file, discard_pending.kind);
+    try std.testing.expectEqual(discard_pending.generation, app.pages.review.action_cursor.actionGeneration().?);
+    try std.testing.expectEqual(review_page.action_cursor.TargetKind.file, app.pages.review.action_cursor.target().?.kind);
+    try std.testing.expectEqualStrings("src/a", app.pages.review.action_cursor.target().?.path_key);
+    try abandonSingleQueuedAction(&app, &ctx);
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+}
+
 test "initialSelectionContext selects first diff file and hunk" {
     const loaded = app_test_support.loadedDiffTwo();
     const selection = App.initialSelectionContext(.{ .patch_file = "changes.diff" }, null, &loaded, null);
@@ -12965,7 +13678,7 @@ test "expandUserPath expands current user's home shorthand" {
     try std.testing.expectEqualStrings("~someone/repo", named_user);
 }
 
-test "repo switch clears action selection restore" {
+test "repository switch clears the Review action cursor owner" {
     const allocator = std.testing.allocator;
     const repos = try allocator.alloc(repo_discovery.RepoEntry, 2);
     repos[0] = .{
@@ -12993,15 +13706,15 @@ test "repo switch clears action selection restore" {
     defer app.repo_picker.deinit(allocator);
     defer app.deinitRepoPickerItems(allocator);
     defer app.recent_repos.deinit(allocator);
-    defer app.reviewNavigation().clearPendingSelectionRestore(allocator);
+    defer app.reviewNavigation().clearActionCursor(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
-    try app.reviewNavigation().setPendingSelectionRestore(allocator, "src/main.zig");
+    try installTestActionCursor(&app, allocator, .file, "src/main.zig", 9);
     try app.enterRepoPickerMode(allocator);
 
     try app.submitRepoPicker(&ctx);
 
-    try std.testing.expect(app.pages.review.pending_selection_restore == null);
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
 }
 
 test "load empty state shows actionable no changes message" {
@@ -13547,7 +14260,7 @@ test "status projection retains collapsed Review root and sticky diff target" {
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
-test "status acceptance reconciles pending file restore under collapsed Review root" {
+test "status-first action refresh remaps a hidden directory cursor to typed root without consuming it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var current = app_test_support.loadedDiffRootedNested();
     try current.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
@@ -13572,12 +14285,17 @@ test "status acceptance reconciles pending file restore under collapsed Review r
     defer app.pages.review.git_status.deinit();
     defer app.pages.review.tree_order.deinit(std.testing.allocator);
     defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
-    defer app.reviewNavigation().clearPendingSelectionRestore(std.testing.allocator);
+    defer app.reviewNavigation().clearActionCursor(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    // A file action records the file while the expanded tree is visible. The
-    // user may collapse the root before the following status read completes.
-    try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "b");
+    try installTestActionCursor(&app, std.testing.allocator, .directory, "src", 9);
+    try promoteTestActionCursor(&app, 9);
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .source, 2));
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 1));
+
+    // The root can be folded while the exact pair is in flight. Status-first
+    // replacement must remap to a typed ancestor, not retain the old numeric
+    // file row and not consume the directory intent before source completes.
     var loaded = app.reviewNavigation().loadedDiff().?;
     app.reviewNavigation().selectSidebarNode(loaded, 0);
     try app.reviewNavigation().toggleSelectedDirectory();
@@ -13593,7 +14311,7 @@ test "status acceptance reconciles pending file restore under collapsed Review r
     });
 
     loaded = app.reviewNavigation().loadedDiff().?;
-    try std.testing.expect(app.pages.review.pending_selection_restore == null);
+    try std.testing.expect(app.pages.review.action_cursor.hasOwner());
     try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, app.pages.review.viewer.root_disclosure);
     try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
     try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
@@ -13828,6 +14546,16 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     try app.autoReloadTick(&action_ctx);
     try std.testing.expectEqual(@as(usize, 0), action_ctx._pending_tasks_with_len);
     try std.testing.expect(action_ctx._redraw_suppressed);
+
+    app.actions.clear();
+    try installTestActionCursor(&app, std.testing.allocator, .directory, "src", 9);
+    try promoteTestActionCursor(&app, 9);
+    defer app.reviewNavigation().clearActionCursor(std.testing.allocator);
+    var action_refresh_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try app.autoReloadTick(&action_refresh_ctx);
+    try std.testing.expectEqual(@as(usize, 0), action_refresh_ctx._pending_tasks_with_len);
+    try std.testing.expect(action_refresh_ctx._redraw_suppressed);
+    try std.testing.expect(app.pages.review.action_cursor.hasOwner());
 }
 
 test "stale diff result does not clear newer pending reload metadata" {
@@ -15179,24 +15907,38 @@ test "finishDiffLoad copies and frees current failed message" {
     try std.testing.expectEqualStrings("failed", app.pages.review.load.state.failed.message);
 }
 
-test "finishDiffLoad failure clears pending selection restore" {
+test "action cursor waits for status terminal after matching source failure" {
     var app: App = .{
-        .pages = .{ .review = .{ .load = .{ .generation = 1 } } },
+        .pages = .{ .review = .{
+            .load = .{ .generation = 1 },
+            .status_load = .{ .generation = 2, .pending = .{ .generation = 2 } },
+        } },
         .allocator = std.testing.allocator,
     };
     defer app.reviewReload().clearLoadedDiff(app.allocator);
-    defer app.reviewNavigation().clearPendingSelectionRestore(std.testing.allocator);
+    defer app.reviewNavigation().clearActionCursor(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "src/main.zig");
+    try installTestActionCursor(&app, std.testing.allocator, .file, "src/main.zig", 9);
+    try promoteTestActionCursor(&app, 9);
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .source, 1));
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 2));
 
     try app.finishDiffLoad(&ctx, .{
         .identity = page.RequestIdentity.review(0, 1),
         .generation = 1,
         .result = .{ .failed_static = "failed" },
     });
+    try std.testing.expect(app.pages.review.action_cursor.hasOwner());
 
-    try std.testing.expect(app.pages.review.pending_selection_restore == null);
+    try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
+        .generation = 2,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .failed_static = "status failed" },
+    });
+
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
 }
 
 test "saveRecentRepositoriesState writes reloadable state atomically" {

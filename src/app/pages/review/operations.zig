@@ -638,17 +638,11 @@ pub const Controller = struct {
     ) !OutcomeApply {
         return switch (outcome) {
             .stage_file => blk: {
-                if (!active_repo_matches) {
-                    self.navigation.clearPendingSelectionRestore(allocator);
-                    break :blk .{};
-                }
+                if (!active_repo_matches) break :blk .{};
                 break :blk .{ .reload = .source_and_aux };
             },
             .unstage_file => blk: {
-                if (!active_repo_matches) {
-                    self.navigation.clearPendingSelectionRestore(allocator);
-                    break :blk .{};
-                }
+                if (!active_repo_matches) break :blk .{};
                 break :blk .{ .reload = .source_and_aux };
             },
             .discard_file => |value| blk: {
