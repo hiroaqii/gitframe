@@ -2758,16 +2758,28 @@ fn drawTreeProjectionRow(
     };
     const selected = visible_index == state.viewer.tree_cursor;
     const tree_active = state.viewer.focus == .tree;
-    // Selection contributes emphasis only. The target keeps ownership of its
-    // semantic foreground so added/modified files remain distinguishable in
-    // both active and retained-inactive tree states. Reverse remains the
-    // location signal across panes; dim alone communicates inactive focus.
+    // Selection contributes neutral cursor chrome only. The target keeps
+    // ownership of its semantic foreground so directories and changed files
+    // remain distinguishable in both active and retained-inactive tree states.
+    // The same low-intensity background as the source cursor avoids the much
+    // stronger terminal-dependent foreground/background swap from reverse.
     if (selected) {
         style.bold = true;
-        style.reverse = true;
+        style.bg = context.palette.color(.repository_cursor_bg);
     }
     style.dim = !tree_active;
+    if (selected) fillTreeSelectionRow(surface, screen_row, style);
     draw.copyClippedTextAt(surface, 0, screen_row, visible_text, style) catch {};
+}
+
+/// Extend the selected row's composed semantic foreground and neutral cursor
+/// background through the physical tree viewport. The separator is outside
+/// this child surface, so it remains fixed chrome rather than becoming part of
+/// the selection signal.
+fn fillTreeSelectionRow(surface: *chasen.Surface, row: u16, style: chasen.TextStyle) void {
+    for (0..surface.size().width) |col| {
+        _ = surface.borrowTextAt(@intCast(col), row, " ", style);
+    }
 }
 
 /// Pane activity is a presentation modifier, not a replacement palette role.
@@ -4189,6 +4201,7 @@ test "repository tree focus styles preserve semantic palette roles" {
                 .success => .{ .rgb = .{ .r = 10, .g = 11, .b = 12 } },
                 .info => .{ .rgb = .{ .r = 13, .g = 14, .b = 15 } },
                 .prompt => .{ .rgb = .{ .r = 16, .g = 17, .b = 18 } },
+                .repository_cursor_bg => .{ .rgb = .{ .r = 19, .g = 20, .b = 21 } },
                 else => null,
             };
         }
@@ -4238,24 +4251,49 @@ test "repository tree focus styles preserve semantic palette roles" {
     try std.testing.expect(!active_nested.style.dim);
     try std.testing.expect(active_selected.style.fg.eql(palette.color(.diff_modified)));
     try std.testing.expect(active_selected.style.bold);
-    try std.testing.expect(active_selected.style.reverse);
+    try std.testing.expect(!active_selected.style.reverse);
+    try std.testing.expect(active_selected.style.bg.eql(palette.color(.repository_cursor_bg)));
     try std.testing.expect(!active_selected.style.dim);
+    const active_selected_trailing = active_surface.surface.readCell(layout.tree_width - 1, selected_row) orelse
+        return error.ExpectedSelectedTrailingCell;
+    try std.testing.expect(active_selected_trailing.style.fg.eql(palette.color(.diff_modified)));
+    try std.testing.expect(active_selected_trailing.style.bold);
+    try std.testing.expect(!active_selected_trailing.style.reverse);
+    try std.testing.expect(active_selected_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!active_selected_trailing.style.dim);
     try std.testing.expect(active_separator.style.fg.eql(palette.color(.muted)));
     try std.testing.expect(active_separator.style.dim);
+    try std.testing.expect(!active_separator.style.reverse);
+    try std.testing.expect(!active_separator.style.bg.eql(palette.color(.repository_cursor_bg)));
 
     state.viewer.tree_cursor = 0;
+    active_surface.surface.clearAll();
     try view(.{ .page_state = &state, .palette = palette }, &active_surface.surface);
     const selected_root = active_surface.surface.readCell(0, root_row) orelse return error.ExpectedRoot;
+    const selected_root_trailing = active_surface.surface.readCell(layout.tree_width - 1, root_row) orelse return error.ExpectedRootTrailingCell;
     try std.testing.expect(selected_root.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(selected_root.style.bold);
-    try std.testing.expect(selected_root.style.reverse);
+    try std.testing.expect(!selected_root.style.reverse);
+    try std.testing.expect(selected_root.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(selected_root_trailing.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(selected_root_trailing.style.bold);
+    try std.testing.expect(!selected_root_trailing.style.reverse);
+    try std.testing.expect(selected_root_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
 
     state.viewer.tree_cursor = directory_visible;
+    active_surface.surface.clearAll();
     try view(.{ .page_state = &state, .palette = palette }, &active_surface.surface);
     const selected_directory = active_surface.surface.readCell(4, directory_row) orelse return error.ExpectedDirectory;
+    const selected_directory_trailing = active_surface.surface.readCell(layout.tree_width - 1, directory_row) orelse
+        return error.ExpectedDirectoryTrailingCell;
     try std.testing.expect(selected_directory.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(selected_directory.style.bold);
-    try std.testing.expect(selected_directory.style.reverse);
+    try std.testing.expect(!selected_directory.style.reverse);
+    try std.testing.expect(selected_directory.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(selected_directory_trailing.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(selected_directory_trailing.style.bold);
+    try std.testing.expect(!selected_directory_trailing.style.reverse);
+    try std.testing.expect(selected_directory_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
 
     state.viewer.tree_cursor = selected_visible;
     state.viewer.focus = .source;
@@ -4287,9 +4325,19 @@ test "repository tree focus styles preserve semantic palette roles" {
     try std.testing.expect(inactive_selected.style.fg.eql(palette.color(.diff_modified)));
     try std.testing.expect(inactive_selected.style.bold);
     try std.testing.expect(inactive_selected.style.dim);
-    try std.testing.expect(inactive_selected.style.reverse);
+    try std.testing.expect(!inactive_selected.style.reverse);
+    try std.testing.expect(inactive_selected.style.bg.eql(palette.color(.repository_cursor_bg)));
+    const inactive_selected_trailing = inactive_surface.surface.readCell(layout.tree_width - 1, selected_row) orelse
+        return error.ExpectedInactiveSelectedTrailingCell;
+    try std.testing.expect(inactive_selected_trailing.style.fg.eql(palette.color(.diff_modified)));
+    try std.testing.expect(inactive_selected_trailing.style.bold);
+    try std.testing.expect(inactive_selected_trailing.style.dim);
+    try std.testing.expect(!inactive_selected_trailing.style.reverse);
+    try std.testing.expect(inactive_selected_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
     try std.testing.expect(inactive_separator.style.fg.eql(palette.color(.muted)));
     try std.testing.expect(inactive_separator.style.dim);
+    try std.testing.expect(!inactive_separator.style.reverse);
+    try std.testing.expect(!inactive_separator.style.bg.eql(palette.color(.repository_cursor_bg)));
 }
 
 const TestRoot = struct {
