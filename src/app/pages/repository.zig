@@ -2634,9 +2634,8 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     const tree = &state.bundle.?.tree;
     if (layout.tree_visible) {
         var left = surface.child(.{ .col = 0, .row = 0, .width = layout.tree_width, .height = size.height });
-        const tree_active = state.viewer.focus == .tree;
         const tree_header: []const u8 = if (state.file_visibility == .changed) "Files [changed]" else "Files";
-        if (size.height > 2) draw.copyClippedTextAt(&left, 0, 2, tree_header, treePaneStyle(context.palette.boldStyle(.accent), tree_active)) catch {};
+        if (size.height > 2) draw.copyClippedTextAt(&left, 0, 2, tree_header, context.palette.boldStyle(.accent)) catch {};
         if (layout.tree_width < size.width) {
             var separator_style = context.palette.style(.muted);
             separator_style.dim = true;
@@ -2659,7 +2658,7 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             null;
         if (tree_message) |message| {
             if (rows > 0) try drawTreeProjectionRow(context, &left, tree, 0, layout.header_rows);
-            if (rows > 1) draw.copyClippedTextAt(&left, 0, layout.header_rows + 1, message, treePaneStyle(context.palette.style(.muted), tree_active)) catch {};
+            if (rows > 1) draw.copyClippedTextAt(&left, 0, layout.header_rows + 1, message, context.palette.style(.muted)) catch {};
         } else {
             var body_row: usize = 0;
             while (body_row < rows and
@@ -2757,18 +2756,23 @@ fn drawTreeProjectionRow(
         },
     };
     const selected = visible_index == state.viewer.tree_cursor;
-    const tree_active = state.viewer.focus == .tree;
+    const cursor_background_active = selected and
+        state.viewer.focus == .tree and
+        !state.file_search.mode;
     // Selection contributes neutral cursor chrome only. The target keeps
     // ownership of its semantic foreground so directories and changed files
     // remain distinguishable in both active and retained-inactive tree states.
+    // File search temporarily owns navigation while retaining the tree cursor,
+    // so its candidate emphasis—not that stored destination—owns focus chrome.
     // The same low-intensity background as the source cursor avoids the much
     // stronger terminal-dependent foreground/background swap from reverse.
     if (selected) {
         style.bold = true;
-        style.bg = context.palette.color(.repository_cursor_bg);
     }
-    style.dim = !tree_active;
-    if (selected) fillTreeSelectionRow(surface, screen_row, style);
+    if (cursor_background_active) {
+        style.bg = context.palette.color(.repository_cursor_bg);
+        fillTreeSelectionRow(surface, screen_row, style);
+    }
     draw.copyClippedTextAt(surface, 0, screen_row, visible_text, style) catch {};
 }
 
@@ -2780,13 +2784,6 @@ fn fillTreeSelectionRow(surface: *chasen.Surface, row: u16, style: chasen.TextSt
     for (0..surface.size().width) |col| {
         _ = surface.borrowTextAt(@intCast(col), row, " ", style);
     }
-}
-
-/// Pane activity is a presentation modifier, not a replacement palette role.
-fn treePaneStyle(style: chasen.TextStyle, active: bool) chasen.TextStyle {
-    var composed = style;
-    composed.dim = !active;
-    return composed;
 }
 
 fn repositoryRootName(root: ?[]const u8) []const u8 {
@@ -3198,6 +3195,109 @@ test "repository file search expands typed root before selecting result" {
     }
 }
 
+test "repository file search takeover suppresses and restores tree cursor background" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("alpha.zig\x00beta.zig\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    const tree = &state.bundle.?.tree;
+    state.selected_path = tree.filePath("alpha.zig", .all);
+    const alpha_node = tree.nodeIndexForPath("alpha.zig", .all) orelse return error.ExpectedAlphaFile;
+    const alpha_visible = state.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = alpha_node }) orelse
+        return error.ExpectedAlphaFile;
+    state.viewer.tree_cursor = alpha_visible;
+    state.viewer.focus = .tree;
+
+    const palette = repositorySearchCursorPaletteForTest();
+    const size: chasen.Size = .{ .width = 60, .height = 10 };
+    const layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const alpha_row = layout.header_rows + @as(u16, @intCast(alpha_visible));
+
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(size.width, size.height);
+    defer test_surface.deinit();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const initial_alpha = test_surface.surface.readCell(2, alpha_row) orelse return error.ExpectedAlphaFile;
+    const initial_alpha_trailing = test_surface.surface.readCell(layout.tree_width - 1, alpha_row) orelse
+        return error.ExpectedAlphaTrailingCell;
+    try std.testing.expect(initial_alpha.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(initial_alpha_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    for ("zig") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
+    try std.testing.expectEqual(@as(usize, 2), state.file_search.len);
+    const retained_tree_cursor = state.viewer.tree_cursor;
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const search_alpha = test_surface.surface.readCell(2, alpha_row) orelse return error.ExpectedAlphaFile;
+    const search_alpha_trailing = test_surface.surface.readCell(layout.tree_width - 1, alpha_row) orelse
+        return error.ExpectedAlphaTrailingCell;
+    const first_candidate = test_surface.surface.readCell(layout.source_col + 1, 2) orelse
+        return error.ExpectedSearchCandidate;
+    try std.testing.expect(!search_alpha.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!search_alpha_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(first_candidate.style.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(first_candidate.style.bold);
+
+    _ = state.applyNavigation(allocator, .file_search_next, size);
+    try std.testing.expectEqual(retained_tree_cursor, state.viewer.tree_cursor);
+    try std.testing.expectEqual(@as(usize, 1), state.file_search.focused);
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const moved_candidate = test_surface.surface.readCell(layout.source_col + 1, 3) orelse
+        return error.ExpectedSearchCandidate;
+    try std.testing.expect(moved_candidate.style.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(moved_candidate.style.bold);
+
+    _ = state.applyNavigation(allocator, .cancel_file_search, size);
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const restored_alpha_trailing = test_surface.surface.readCell(layout.tree_width - 1, alpha_row) orelse
+        return error.ExpectedAlphaTrailingCell;
+    try std.testing.expect(restored_alpha_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(!state.file_search.mode);
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const empty_submit_alpha_trailing = test_surface.surface.readCell(layout.tree_width - 1, alpha_row) orelse
+        return error.ExpectedAlphaTrailingCell;
+    try std.testing.expect(empty_submit_alpha_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    for ("beta") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(!state.file_search.mode);
+    try std.testing.expectEqualStrings("beta.zig", state.selected_path.?);
+    const beta_node = tree.nodeIndexForPath("beta.zig", .all) orelse return error.ExpectedBetaFile;
+    const beta_visible = state.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = beta_node }) orelse
+        return error.ExpectedBetaFile;
+    const beta_row = layout.header_rows + @as(u16, @intCast(beta_visible));
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const accepted_beta_trailing = test_surface.surface.readCell(layout.tree_width - 1, beta_row) orelse
+        return error.ExpectedBetaTrailingCell;
+    try std.testing.expect(accepted_beta_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    for ("missing") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(state.file_search.mode);
+    try std.testing.expect(state.file_search.no_match);
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const no_match_beta_trailing = test_surface.surface.readCell(layout.tree_width - 1, beta_row) orelse
+        return error.ExpectedBetaTrailingCell;
+    const no_match_prompt = test_surface.surface.readCell(layout.source_col + 1, 0) orelse
+        return error.ExpectedSearchPrompt;
+    try std.testing.expect(!no_match_beta_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(no_match_prompt.style.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(no_match_prompt.style.bold);
+}
+
 test "repository hidden tree gives source full geometry and restores retained focus" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest(
@@ -3276,8 +3376,28 @@ test "repository hidden-tree file search restores on cancel and commits visible 
     state.viewer.tree_hidden = true;
     state.viewer.focus = .source;
     const size: chasen.Size = .{ .width = 80, .height = 10 };
+    const palette = repositorySearchCursorPaletteForTest();
 
     _ = state.applyNavigation(allocator, .enter_file_search, size);
+    for ("target") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
+    const search_layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    var search_surface: chasen.testing.TestSurface = undefined;
+    try search_surface.init(size.width, size.height);
+    defer search_surface.deinit();
+    try view(.{ .page_state = &state, .palette = palette }, &search_surface.surface);
+    const retained_root = search_surface.surface.readCell(0, search_layout.header_rows) orelse
+        return error.ExpectedRepositoryRoot;
+    const retained_root_trailing = search_surface.surface.readCell(search_layout.tree_width - 1, search_layout.header_rows) orelse
+        return error.ExpectedRepositoryRootTrailingCell;
+    const focused_candidate = search_surface.surface.readCell(search_layout.source_col + 1, 2) orelse
+        return error.ExpectedSearchCandidate;
+    try std.testing.expect(!retained_root.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!retained_root_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(focused_candidate.style.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(focused_candidate.style.bold);
+
+    state.file_search.input.clear();
+    state.refreshFileSearch();
     try state.file_search.input.insertSlice("missing");
     state.refreshFileSearch();
     try std.testing.expect(state.file_search.mode);
@@ -3308,6 +3428,16 @@ test "repository hidden-tree file search restores on cancel and commits visible 
     try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
     try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
     try std.testing.expectEqualStrings("dir/target.zig", state.selected_path.?);
+    const tree = &state.bundle.?.tree;
+    const target_node = tree.nodeIndexForPath("dir/target.zig", .all) orelse return error.ExpectedSearchTarget;
+    const target_visible = state.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = target_node }) orelse
+        return error.ExpectedSearchTarget;
+    const target_row = search_layout.header_rows + @as(u16, @intCast(target_visible));
+    search_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = palette }, &search_surface.surface);
+    const accepted_target_trailing = search_surface.surface.readCell(search_layout.tree_width - 1, target_row) orelse
+        return error.ExpectedSearchTargetTrailingCell;
+    try std.testing.expect(accepted_target_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
 }
 
 test "repository hidden-tree file search keeps unavailable prompt cancellable" {
@@ -3353,6 +3483,7 @@ test "repository changed file search retains its transaction when status basis i
     defer state.deinit(allocator);
     state.selected_path = state.bundle.?.tree.filePath("target.zig", .all);
     const size: chasen.Size = .{ .width = 80, .height = 8 };
+    const palette = repositorySearchCursorPaletteForTest();
 
     _ = state.applyNavigation(allocator, .enter_file_search, size);
     for ("target") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
@@ -3367,6 +3498,22 @@ test "repository changed file search retains its transaction when status basis i
     try std.testing.expect(!state.viewer.tree_hidden);
     try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
     try std.testing.expectEqualStrings("target.zig", state.selected_path.?);
+
+    const layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(size.width, size.height);
+    defer test_surface.deinit();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const retained_root = test_surface.surface.readCell(0, layout.header_rows) orelse
+        return error.ExpectedRepositoryRoot;
+    const retained_root_trailing = test_surface.surface.readCell(layout.tree_width - 1, layout.header_rows) orelse
+        return error.ExpectedRepositoryRootTrailingCell;
+    const prompt = test_surface.surface.readCell(layout.source_col + 1, 0) orelse
+        return error.ExpectedSearchPrompt;
+    try std.testing.expect(!retained_root.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!retained_root_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(prompt.style.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(prompt.style.bold);
 }
 
 test "repository changed file search reclassifies status-only availability transitions" {
@@ -3497,6 +3644,19 @@ test "repository replacement retains hidden preference behind temporary search r
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
     try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
     try std.testing.expect(state.selected_path == null);
+}
+
+fn repositorySearchCursorPaletteForTest() theme.Palette {
+    const Config = struct {
+        pub fn get(_: @This(), role: theme.Role) ?theme.ColorValue {
+            return switch (role) {
+                .prompt => .{ .rgb = .{ .r = 31, .g = 32, .b = 33 } },
+                .repository_cursor_bg => .{ .rgb = .{ .r = 41, .g = 42, .b = 43 } },
+                else => null,
+            };
+        }
+    };
+    return theme.Palette.fromConfig(Config{});
 }
 
 fn bundleForTest(bytes: []const u8) !Bundle {
@@ -4172,7 +4332,7 @@ test "repository real reload updates status color and selected source" {
     try std.testing.expectEqualStrings("const value = 2;\n", state.currentSource().?.bytes);
 }
 
-test "repository tree focus styles preserve semantic palette roles" {
+test "repository tree cursor background follows active focus and preserves semantic palette roles" {
     const allocator = std.testing.allocator;
     var bundle = try bundleForTest("added.zig\x00dir/nested.zig\x00modified.zig\x00selected.zig\x00");
     var index = try repository_change_index.parseOwned(allocator, try allocator.dupe(u8, "?? added.zig\x00" ++
@@ -4310,30 +4470,28 @@ test "repository tree focus styles preserve semantic palette roles" {
     const inactive_separator = inactive_surface.surface.readCell(layout.tree_width, 2) orelse return error.ExpectedTreeSeparator;
     try std.testing.expect(inactive_header.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(inactive_header.style.bold);
-    try std.testing.expect(inactive_header.style.dim);
+    try std.testing.expect(!inactive_header.style.dim);
     try std.testing.expect(inactive_root.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(inactive_root.style.bold);
-    try std.testing.expect(inactive_root.style.dim);
+    try std.testing.expect(!inactive_root.style.dim);
     try std.testing.expect(!inactive_root.style.reverse);
     try std.testing.expect(inactive_directory.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(inactive_directory.style.bold);
-    try std.testing.expect(inactive_directory.style.dim);
+    try std.testing.expect(!inactive_directory.style.dim);
     try std.testing.expect(inactive_added.style.fg.eql(palette.color(.diff_added)));
-    try std.testing.expect(inactive_added.style.dim);
+    try std.testing.expect(!inactive_added.style.dim);
     try std.testing.expect(inactive_nested.style.fg.eql(palette.color(.foreground)));
-    try std.testing.expect(inactive_nested.style.dim);
+    try std.testing.expect(!inactive_nested.style.dim);
     try std.testing.expect(inactive_selected.style.fg.eql(palette.color(.diff_modified)));
     try std.testing.expect(inactive_selected.style.bold);
-    try std.testing.expect(inactive_selected.style.dim);
+    try std.testing.expect(!inactive_selected.style.dim);
     try std.testing.expect(!inactive_selected.style.reverse);
-    try std.testing.expect(inactive_selected.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!inactive_selected.style.bg.eql(palette.color(.repository_cursor_bg)));
     const inactive_selected_trailing = inactive_surface.surface.readCell(layout.tree_width - 1, selected_row) orelse
         return error.ExpectedInactiveSelectedTrailingCell;
-    try std.testing.expect(inactive_selected_trailing.style.fg.eql(palette.color(.diff_modified)));
-    try std.testing.expect(inactive_selected_trailing.style.bold);
-    try std.testing.expect(inactive_selected_trailing.style.dim);
+    try std.testing.expect(!inactive_selected_trailing.style.dim);
     try std.testing.expect(!inactive_selected_trailing.style.reverse);
-    try std.testing.expect(inactive_selected_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
+    try std.testing.expect(!inactive_selected_trailing.style.bg.eql(palette.color(.repository_cursor_bg)));
     try std.testing.expect(inactive_separator.style.fg.eql(palette.color(.muted)));
     try std.testing.expect(inactive_separator.style.dim);
     try std.testing.expect(!inactive_separator.style.reverse);
@@ -5712,13 +5870,20 @@ test "repository changed view distinguishes loading unavailable and no-match sta
         .freshness = .validating,
     };
     defer state.deinit(allocator);
+    state.viewer.focus = .source;
     _ = state.rebuildTreeProjection(null, false, 0);
 
     {
         var test_surface: chasen.testing.TestSurface = undefined;
         try test_surface.init(120, 8);
         defer test_surface.deinit();
-        try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+        const palette: theme.Palette = .default();
+        try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+        const layout = bodyLayout(.{ .width = 120, .height = 8 }, state.viewer.tree_width, state.viewer.tree_hidden);
+        const message_cell = test_surface.surface.readCell(0, layout.header_rows + 1) orelse
+            return error.ExpectedChangedFilesMessage;
+        try std.testing.expect(message_cell.style.fg.eql(palette.color(.muted)));
+        try std.testing.expect(!message_cell.style.dim);
         const snapshot = try test_surface.snapshot(allocator);
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [changed]") != null);
