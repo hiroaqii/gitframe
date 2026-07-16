@@ -70,7 +70,7 @@ fn printReport(path: []const u8, report: source_adapter.CapacityReport) void {
         report.diagnostic_limits.entries orelse unreachable,
         report.diagnostic_limits.spans,
         report.diagnostic_limits.bytes,
-        source_spans.max_spans,
+        source_spans.absolute_max_retained_spans,
         source_spans.max_retained_bytes,
         @tagName(report.production_decision),
     });

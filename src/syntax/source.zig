@@ -9,7 +9,6 @@ const std = @import("std");
 const source_document = @import("../repository/source.zig");
 const token = @import("token.zig");
 
-pub const max_spans: usize = 131_072;
 pub const max_retained_bytes: usize = 8 * 1024 * 1024;
 
 pub const LineEntry = struct {
@@ -17,6 +16,21 @@ pub const LineEntry = struct {
     span_start: u32,
     span_count: u32,
 };
+
+comptime {
+    if (max_retained_bytes < @sizeOf(LineEntry))
+        @compileError("source syntax metadata budget must fit one line entry");
+    if (@sizeOf(token.TokenSpan) == 0)
+        @compileError("source syntax token spans must have a nonzero retained size");
+}
+
+/// Allocation/index guard for a shape with the minimum one line entry. Actual
+/// next entry/span counts are still checked against `max_retained_bytes`; this
+/// ceiling must not reject a denser shape that fits the byte budget.
+pub const absolute_max_retained_spans: usize = @min(
+    (max_retained_bytes - @sizeOf(LineEntry)) / @sizeOf(token.TokenSpan),
+    @as(usize, std.math.maxInt(u32)),
+);
 
 pub const Candidate = struct {
     line_index: usize,
@@ -31,7 +45,7 @@ pub const LimitKind = enum {
 
 pub const Limits = struct {
     entries: ?usize = null,
-    spans: usize = max_spans,
+    spans: usize = absolute_max_retained_spans,
     bytes: usize = max_retained_bytes,
 };
 
@@ -245,6 +259,64 @@ test "source syntax metadata limit fails atomically" {
     );
 }
 
+test "source syntax custom span limit accepts boundary and rejects next" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "a b c\n");
+    var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    const original = [_]Candidate{
+        .{ .line_index = 0, .span = .{ .start = 0, .end = 1, .role = .variable } },
+        .{ .line_index = 0, .span = .{ .start = 2, .end = 3, .role = .variable } },
+        .{ .line_index = 0, .span = .{ .start = 4, .end = 5, .role = .variable } },
+    };
+
+    var at_limit = original;
+    var accepted = try buildWithLimits(allocator, &document, &at_limit, .{ .spans = 3 });
+    defer accepted.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), accepted.spans.len);
+
+    var over_limit = original;
+    try std.testing.expectError(
+        error.SyntaxMetadataLimit,
+        buildWithLimits(allocator, &document, &over_limit, .{ .spans = 2 }),
+    );
+}
+
+test "source syntax actual bytes accept dense line and reject same spans across lines" {
+    const allocator = std.testing.allocator;
+    const span_count = 3;
+    const byte_budget = try retainedSize(1, span_count);
+    try std.testing.expect(span_count > byte_budget / (@sizeOf(LineEntry) + @sizeOf(token.TokenSpan)));
+
+    const dense_bytes = try allocator.dupe(u8, "a b c");
+    var dense_document = try source_document.Document.initOwned(allocator, dense_bytes, .init(dense_bytes));
+    defer dense_document.deinit(allocator);
+    var dense_candidates = [_]Candidate{
+        .{ .line_index = 0, .span = .{ .start = 0, .end = 1, .role = .variable } },
+        .{ .line_index = 0, .span = .{ .start = 2, .end = 3, .role = .variable } },
+        .{ .line_index = 0, .span = .{ .start = 4, .end = 5, .role = .variable } },
+    };
+    var dense = try buildWithLimits(allocator, &dense_document, &dense_candidates, .{ .bytes = byte_budget });
+    defer dense.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), dense.line_entries.len);
+    try std.testing.expectEqual(span_count, dense.spans.len);
+    try std.testing.expect(dense.line_entries.len <= dense.spans.len);
+    try std.testing.expectEqual(byte_budget, dense.retainedBytes());
+
+    const spread_bytes = try allocator.dupe(u8, "a\nb\nc");
+    var spread_document = try source_document.Document.initOwned(allocator, spread_bytes, .init(spread_bytes));
+    defer spread_document.deinit(allocator);
+    var spread_candidates = [_]Candidate{
+        .{ .line_index = 0, .span = .{ .start = 0, .end = 1, .role = .variable } },
+        .{ .line_index = 1, .span = .{ .start = 0, .end = 1, .role = .variable } },
+        .{ .line_index = 2, .span = .{ .start = 0, .end = 1, .role = .variable } },
+    };
+    try std.testing.expectError(
+        error.SyntaxMetadataLimit,
+        buildWithLimits(allocator, &spread_document, &spread_candidates, .{ .bytes = byte_budget }),
+    );
+}
+
 test "source syntax reports named custom metadata limits" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "a b\n");
@@ -315,25 +387,13 @@ test "source syntax allocation failure frees partial metadata" {
     try std.testing.expect(observed_success);
 }
 
-test "declared source syntax maximum fits retained byte budget" {
-    const worst = try retainedSize(max_spans, max_spans);
-    try std.testing.expect(worst <= max_retained_bytes);
-}
-
-test "source syntax rejects candidate count beyond the declared maximum" {
-    const allocator = std.testing.allocator;
-    const bytes = try allocator.alloc(u8, max_spans + 1);
-    @memset(bytes, 'x');
-    var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
-    defer document.deinit(allocator);
-    const candidates = try allocator.alloc(Candidate, max_spans + 1);
-    defer allocator.free(candidates);
-    for (candidates, 0..) |*candidate, index| candidate.* = .{
-        .line_index = 0,
-        .span = .{ .start = index, .end = index + 1, .role = .variable },
-    };
-    try std.testing.expectError(
-        error.SyntaxMetadataLimit,
-        build(allocator, &document, candidates),
+test "source syntax absolute span maximum is budget and representation derived" {
+    const budget_maximum = (max_retained_bytes - @sizeOf(LineEntry)) / @sizeOf(token.TokenSpan);
+    try std.testing.expectEqual(
+        @min(budget_maximum, @as(usize, std.math.maxInt(u32))),
+        absolute_max_retained_spans,
     );
+    try std.testing.expect(absolute_max_retained_spans < std.math.maxInt(u32));
+    try std.testing.expect(try retainedSize(1, absolute_max_retained_spans) <= max_retained_bytes);
+    try std.testing.expect(try retainedSize(1, absolute_max_retained_spans + 1) > max_retained_bytes);
 }

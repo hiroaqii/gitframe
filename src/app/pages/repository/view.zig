@@ -595,7 +595,9 @@ test "repository selection slice B whole-line style covers gutter numbers body a
 
 test "repository source syntax projection visits dense line and spans only once" {
     const allocator = std.testing.allocator;
-    const count = source_syntax.max_spans;
+    // Keep this renderer-complexity fixture independent of the production
+    // metadata budget; it only needs a line much denser than the viewport.
+    const count = 4096;
     const line = try allocator.alloc(u8, count);
     defer allocator.free(line);
     @memset(line, 'x');
