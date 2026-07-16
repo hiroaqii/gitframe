@@ -23,9 +23,22 @@ pub const Candidate = struct {
     span: token.TokenSpan,
 };
 
+pub const LimitKind = enum {
+    entries,
+    spans,
+    bytes,
+};
+
 pub const Limits = struct {
+    entries: ?usize = null,
     spans: usize = max_spans,
     bytes: usize = max_retained_bytes,
+};
+
+pub const ProductionDecision = enum {
+    accept,
+    reject_span,
+    reject_bytes,
 };
 
 pub const SourceSpans = struct {
@@ -82,6 +95,30 @@ pub fn buildWithLimits(
     candidates: []Candidate,
     limits: Limits,
 ) !SourceSpans {
+    return buildWithLimitsInternal(allocator, document, candidates, limits, null);
+}
+
+/// Diagnostic entry point for callers that must distinguish which named
+/// metadata ceiling rejected an otherwise sanitized result. Production keeps
+/// using `build`/`buildWithLimits` and therefore pays for no retained stats.
+pub fn buildWithLimitsReporting(
+    allocator: std.mem.Allocator,
+    document: *const source_document.Document,
+    candidates: []Candidate,
+    limits: Limits,
+    limit_hit: *?LimitKind,
+) !SourceSpans {
+    limit_hit.* = null;
+    return buildWithLimitsInternal(allocator, document, candidates, limits, limit_hit);
+}
+
+fn buildWithLimitsInternal(
+    allocator: std.mem.Allocator,
+    document: *const source_document.Document,
+    candidates: []Candidate,
+    limits: Limits,
+    limit_hit: ?*?LimitKind,
+) !SourceSpans {
     std.mem.sort(Candidate, candidates, {}, candidateLessThan);
 
     var entries: std.ArrayList(LineEntry) = .empty;
@@ -107,11 +144,12 @@ pub fn buildWithLimits(
             const sanitized = try token.sanitizeLineSpans(allocator, line, raw.items);
             defer allocator.free(sanitized.spans);
             if (sanitized.spans.len > 0) {
-                if (sanitized.spans.len > limits.spans or spans.items.len > limits.spans - sanitized.spans.len) return error.SyntaxMetadataLimit;
                 const next_entry_count = try std.math.add(usize, entries.items.len, 1);
                 const next_span_count = try std.math.add(usize, spans.items.len, sanitized.spans.len);
-                const retained_bytes = try retainedSize(next_entry_count, next_span_count);
-                if (retained_bytes > limits.bytes) return error.SyntaxMetadataLimit;
+                if (try firstExceededLimit(limits, next_entry_count, next_span_count)) |kind| {
+                    if (limit_hit) |hit| hit.* = kind;
+                    return error.SyntaxMetadataLimit;
+                }
                 try entries.append(allocator, .{
                     .line_index = @intCast(line_index),
                     .span_start = @intCast(spans.items.len),
@@ -127,6 +165,36 @@ pub fn buildWithLimits(
     errdefer allocator.free(owned_entries);
     const owned_spans = try spans.toOwnedSlice(allocator);
     return .{ .line_entries = owned_entries, .spans = owned_spans };
+}
+
+/// The relaxed diagnostic result is still finite: after sanitization every
+/// retained span consumes at least one source byte and every entry represents
+/// one content line. This does not bound provider-emitted raw candidates or
+/// sanitizer temporaries; those retain the production adapter's behavior.
+pub fn sourceDerivedDiagnosticLimits(document: *const source_document.Document) !Limits {
+    const entries = document.contentLineCount();
+    const spans = document.bytes.len;
+    return .{
+        .entries = entries,
+        .spans = spans,
+        .bytes = try retainedSize(entries, spans),
+    };
+}
+
+pub fn productionDecision(entry_count: usize, span_count: usize) !ProductionDecision {
+    if (try firstExceededLimit(.{}, entry_count, span_count)) |kind| return switch (kind) {
+        .entries => unreachable,
+        .spans => .reject_span,
+        .bytes => .reject_bytes,
+    };
+    return .accept;
+}
+
+fn firstExceededLimit(limits: Limits, entry_count: usize, span_count: usize) !?LimitKind {
+    if (limits.entries) |maximum| if (entry_count > maximum) return .entries;
+    if (span_count > limits.spans) return .spans;
+    if (try retainedSize(entry_count, span_count) > limits.bytes) return .bytes;
+    return null;
 }
 
 fn retainedSize(entry_count: usize, span_count: usize) !usize {
@@ -175,6 +243,50 @@ test "source syntax metadata limit fails atomically" {
         error.SyntaxMetadataLimit,
         buildWithLimits(allocator, &document, &candidates, .{ .bytes = 1 }),
     );
+}
+
+test "source syntax reports named custom metadata limits" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "a b\n");
+    var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    const original = [_]Candidate{
+        .{ .line_index = 0, .span = .{ .start = 0, .end = 1, .role = .variable } },
+        .{ .line_index = 0, .span = .{ .start = 2, .end = 3, .role = .variable } },
+    };
+
+    var entry_limited = original;
+    var limit_hit: ?LimitKind = null;
+    try std.testing.expectError(
+        error.SyntaxMetadataLimit,
+        buildWithLimitsReporting(allocator, &document, &entry_limited, .{ .entries = 0 }, &limit_hit),
+    );
+    try std.testing.expectEqual(LimitKind.entries, limit_hit.?);
+
+    var span_limited = original;
+    try std.testing.expectError(
+        error.SyntaxMetadataLimit,
+        buildWithLimitsReporting(allocator, &document, &span_limited, .{ .spans = 1 }, &limit_hit),
+    );
+    try std.testing.expectEqual(LimitKind.spans, limit_hit.?);
+
+    var byte_limited = original;
+    try std.testing.expectError(
+        error.SyntaxMetadataLimit,
+        buildWithLimitsReporting(allocator, &document, &byte_limited, .{ .bytes = 1 }, &limit_hit),
+    );
+    try std.testing.expectEqual(LimitKind.bytes, limit_hit.?);
+}
+
+test "source syntax diagnostic limits derive from accepted source shape" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "a\nb");
+    var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    const limits = try sourceDerivedDiagnosticLimits(&document);
+    try std.testing.expectEqual(@as(?usize, 2), limits.entries);
+    try std.testing.expectEqual(bytes.len, limits.spans);
+    try std.testing.expectEqual(try retainedSize(2, bytes.len), limits.bytes);
 }
 
 test "source syntax allocation failure frees partial metadata" {

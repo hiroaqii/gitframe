@@ -10,6 +10,21 @@ const source_document = @import("../repository/source.zig");
 const source_spans = @import("source.zig");
 const token = @import("token.zig");
 
+pub const RoleHistogram = [@typeInfo(token.TokenRole).@"enum".fields.len]usize;
+
+pub const CapacityReport = struct {
+    source_bytes: usize,
+    content_lines: usize,
+    diagnostic_limits: source_spans.Limits,
+    raw_candidates: usize,
+    retained_entries: usize,
+    retained_spans: usize,
+    retained_bytes: usize,
+    raw_roles: RoleHistogram,
+    retained_roles: RoleHistogram,
+    production_decision: source_spans.ProductionDecision,
+};
+
 pub fn buildSourceSpans(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -17,6 +32,79 @@ pub fn buildSourceSpans(
     path: []const u8,
 ) !source_spans.SourceSpans {
     if (document.bytes.len == 0) return .empty();
+    var candidates = try collectCandidates(allocator, io, document, path);
+    defer candidates.deinit(allocator);
+    return source_spans.build(allocator, document, candidates.items);
+}
+
+/// Runs the production capture and sanitizer pipeline under a relaxed but
+/// source-derived final-metadata ceiling. Raw provider candidates and
+/// sanitizer temporaries intentionally retain production behavior; only the
+/// resulting `SourceSpans` receives the diagnostic ceiling.
+pub fn inspectSourceCapacity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    document: *const source_document.Document,
+    path: []const u8,
+) !CapacityReport {
+    const diagnostic_limits = try source_spans.sourceDerivedDiagnosticLimits(document);
+    if (document.bytes.len == 0) return .{
+        .source_bytes = 0,
+        .content_lines = 0,
+        .diagnostic_limits = diagnostic_limits,
+        .raw_candidates = 0,
+        .retained_entries = 0,
+        .retained_spans = 0,
+        .retained_bytes = 0,
+        .raw_roles = @splat(0),
+        .retained_roles = @splat(0),
+        .production_decision = .accept,
+    };
+
+    var candidates = try collectCandidates(allocator, io, document, path);
+    defer candidates.deinit(allocator);
+    var raw_roles: RoleHistogram = @splat(0);
+    for (candidates.items) |candidate| raw_roles[@intFromEnum(candidate.span.role)] += 1;
+
+    var limit_hit: ?source_spans.LimitKind = null;
+    var spans = source_spans.buildWithLimitsReporting(
+        allocator,
+        document,
+        candidates.items,
+        diagnostic_limits,
+        &limit_hit,
+    ) catch |err| switch (err) {
+        error.SyntaxMetadataLimit => return switch (limit_hit orelse return error.MissingDiagnosticLimit) {
+            .entries => error.SyntaxDiagnosticEntryLimit,
+            .spans => error.SyntaxDiagnosticSpanLimit,
+            .bytes => error.SyntaxDiagnosticByteLimit,
+        },
+        else => return err,
+    };
+    defer spans.deinit(allocator);
+
+    var retained_roles: RoleHistogram = @splat(0);
+    for (spans.spans) |span| retained_roles[@intFromEnum(span.role)] += 1;
+    return .{
+        .source_bytes = document.bytes.len,
+        .content_lines = document.contentLineCount(),
+        .diagnostic_limits = diagnostic_limits,
+        .raw_candidates = candidates.items.len,
+        .retained_entries = spans.line_entries.len,
+        .retained_spans = spans.spans.len,
+        .retained_bytes = spans.retainedBytes(),
+        .raw_roles = raw_roles,
+        .retained_roles = retained_roles,
+        .production_decision = try source_spans.productionDecision(spans.line_entries.len, spans.spans.len),
+    };
+}
+
+fn collectCandidates(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    document: *const source_document.Document,
+    path: []const u8,
+) !std.ArrayList(source_spans.Candidate) {
     const query_cache = try flow_syntax.QueryCache.create(io, allocator, .{});
     defer query_cache.deinit();
     var syntax = try flow_syntax.create_guess_file_type_static(allocator, document.bytes, path, query_cache);
@@ -24,7 +112,7 @@ pub fn buildSourceSpans(
     try syntax.refresh_full(document.bytes);
 
     var candidates: std.ArrayList(source_spans.Candidate) = .empty;
-    defer candidates.deinit(allocator);
+    errdefer candidates.deinit(allocator);
     var context: RenderContext = .{
         .allocator = allocator,
         .document = document,
@@ -34,7 +122,7 @@ pub fn buildSourceSpans(
         error.Stop => if (context.failure) |failure| return failure,
         else => return err,
     };
-    return source_spans.build(allocator, document, candidates.items);
+    return candidates;
 }
 
 const RenderContext = struct {
@@ -112,6 +200,45 @@ test "flow syntax builds source-shaped spans from one full file instance" {
     defer spans.deinit(allocator);
     try std.testing.expect(spans.spans.len > 0);
     try std.testing.expect(spans.lineSpans(0).spans.len > 0);
+}
+
+test "flow syntax capacity inspection reports raw and retained roles" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "const value: usize = 42;\n// comment\n");
+    var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    const report = try inspectSourceCapacity(allocator, std.testing.io, &document, "main.zig");
+    try std.testing.expectEqual(bytes.len, report.source_bytes);
+    try std.testing.expectEqual(document.contentLineCount(), report.content_lines);
+    try std.testing.expect(report.raw_candidates >= report.retained_spans);
+    try std.testing.expect(report.retained_entries > 0);
+    try std.testing.expect(report.retained_spans > 0);
+    try std.testing.expectEqual(source_spans.ProductionDecision.accept, report.production_decision);
+    try std.testing.expectEqual(@as(?usize, document.contentLineCount()), report.diagnostic_limits.entries);
+    try std.testing.expectEqual(document.bytes.len, report.diagnostic_limits.spans);
+    try std.testing.expectEqual(report.raw_candidates, histogramTotal(report.raw_roles));
+    try std.testing.expectEqual(report.retained_spans, histogramTotal(report.retained_roles));
+    try std.testing.expect(report.retained_roles[@intFromEnum(token.TokenRole.keyword)] > 0);
+    try std.testing.expect(report.retained_roles[@intFromEnum(token.TokenRole.comment)] > 0);
+}
+
+test "flow syntax capacity inspection treats empty source as accepted zero metadata" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "");
+    var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    const report = try inspectSourceCapacity(allocator, std.testing.io, &document, "empty.zig");
+    try std.testing.expectEqual(@as(usize, 0), report.raw_candidates);
+    try std.testing.expectEqual(@as(usize, 0), report.retained_entries);
+    try std.testing.expectEqual(@as(usize, 0), report.retained_spans);
+    try std.testing.expectEqual(@as(usize, 0), report.retained_bytes);
+    try std.testing.expectEqual(source_spans.ProductionDecision.accept, report.production_decision);
+}
+
+fn histogramTotal(histogram: RoleHistogram) usize {
+    var total: usize = 0;
+    for (histogram) |count| total += count;
+    return total;
 }
 
 test "flow syntax splits multiline captures into CRLF-safe line spans" {

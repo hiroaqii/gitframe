@@ -283,6 +283,10 @@ pub fn build(b: *std.Build) void {
         "source-syntax-perf",
         "Profile Repository full-file syntax parsing and no-cache revisit",
     );
+    const source_syntax_capacity_step = b.step(
+        "source-syntax-capacity",
+        "Inspect bounded Repository full-file syntax metadata capacity",
+    );
     if (syntax_provider == .flow_syntax) {
         const flow_syntax_dep = b.lazyDependency("flow_syntax", .{
             .target = target,
@@ -325,12 +329,32 @@ pub fn build(b: *std.Build) void {
         const run_source_syntax_perf = b.addRunArtifact(source_syntax_perf_exe);
         if (b.args) |args| run_source_syntax_perf.addArgs(args);
         source_syntax_perf_step.dependOn(&run_source_syntax_perf.step);
+
+        const source_syntax_capacity_exe = b.addExecutable(.{
+            .name = "gitframe-source-syntax-capacity",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/source_syntax_capacity.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "flow_syntax", .module = flow_syntax_dep.module("syntax") },
+                    .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+                },
+            }),
+        });
+        configureFlowSyntaxArtifact(source_syntax_capacity_exe, target, true);
+        const run_source_syntax_capacity = b.addRunArtifact(source_syntax_capacity_exe);
+        if (b.args) |args| run_source_syntax_capacity.addArgs(args);
+        source_syntax_capacity_step.dependOn(&run_source_syntax_capacity.step);
     } else {
         projection_perf_step.dependOn(&b.addFail(
             "run `zig build projection-perf -Dsyntax-provider=flow_syntax -- <patch-file> [iterations]` on macOS or Linux",
         ).step);
         source_syntax_perf_step.dependOn(&b.addFail(
             "run `zig build source-syntax-perf -Dsyntax-provider=flow_syntax -- <file-a> <file-b> [iterations]` on macOS or Linux",
+        ).step);
+        source_syntax_capacity_step.dependOn(&b.addFail(
+            "run `zig build source-syntax-capacity -Dsyntax-provider=flow_syntax -- <file>` on macOS or Linux",
         ).step);
     }
 

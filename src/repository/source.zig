@@ -23,6 +23,8 @@ pub const Document = struct {
     line_starts: []u32,
     max_display_width: usize,
 
+    /// Takes ownership of `bytes` only when construction succeeds. On error,
+    /// the caller still owns the input and must release or otherwise consume it.
     pub fn initOwned(
         allocator: std.mem.Allocator,
         bytes: []u8,
@@ -48,6 +50,17 @@ pub const Document = struct {
             document.max_display_width = @max(document.max_display_width, try text_projection.displayWidth(document.lineBody(line_index).?));
         }
         return document;
+    }
+
+    /// Consumes `bytes` on both success and failure. This is the ownership
+    /// terminal for callers that have no useful recovery path for the input.
+    pub fn initOwnedOrFree(
+        allocator: std.mem.Allocator,
+        bytes: []u8,
+        fingerprint: content_fingerprint.Fingerprint,
+    ) !Document {
+        errdefer allocator.free(bytes);
+        return initOwned(allocator, bytes, fingerprint);
     }
 
     pub fn deinit(self: *Document, allocator: std.mem.Allocator) void {
@@ -286,5 +299,14 @@ test "repository source model enforces one MiB and newline dense bounds" {
     try std.testing.expectError(
         error.SourceTooLarge,
         Document.initOwned(allocator, oversized, content_fingerprint.Fingerprint.init(oversized)),
+    );
+}
+
+test "repository source consuming initializer frees invalid UTF-8 input" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, &.{0xff});
+    try std.testing.expectError(
+        error.InvalidUtf8,
+        Document.initOwnedOrFree(allocator, bytes, content_fingerprint.Fingerprint.init(bytes)),
     );
 }

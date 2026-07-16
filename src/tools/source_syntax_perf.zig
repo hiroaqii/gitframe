@@ -74,7 +74,7 @@ fn profileSource(
 ) !u64 {
     const started = nowNs(io);
     const owned = try allocator.dupe(u8, bytes);
-    var document = try source_document.Document.initOwned(allocator, owned, .init(owned));
+    var document = try source_document.Document.initOwnedOrFree(allocator, owned, .init(owned));
     defer document.deinit(allocator);
     var spans = try source_adapter.buildSourceSpans(allocator, io, &document, path);
     defer spans.deinit(allocator);
