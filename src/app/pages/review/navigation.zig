@@ -2441,7 +2441,7 @@ test "Review navigation keeps selected hunk visible across mode changes" {
             .display_mode = .unified,
             .diff_cursor = .{ .hunk_header = 1 },
         },
-    }, .{ .width = 100, .height = 8 });
+    }, .{ .width = 100, .height = 9 });
 
     harness.controller().scrollSelectedHunkIntoView();
     try std.testing.expect(harness.pages.review.viewer.diff_scroll > 0);
@@ -2482,7 +2482,7 @@ test "Review mouse selection ignores the opposite side and resumes on its locked
             .display_mode = .side_by_side,
             .sidebar_hidden = true,
         },
-    }, .{ .width = 140, .height = 11 });
+    }, .{ .width = 140, .height = 12 });
 
     harness.controller().pressDiffMouse(.{
         .col = 4,
@@ -2889,7 +2889,7 @@ test "Review navigation snapshot and reload restore share the page owner" {
             .match = .{ .coordinate = .{ .hunk_header = 1 } },
             .match_offset = 6,
         },
-    }, .{ .width = 100, .height = 8 });
+    }, .{ .width = 100, .height = 9 });
 
     const snapshot = harness.view().displayNavigationSnapshot();
     try std.testing.expectEqual(@as(usize, 4), snapshot.diff_scroll);
@@ -3080,7 +3080,7 @@ test "mouse diff scroll keeps cursor in the viewport" {
                 .diff_cursor = .{ .hunk_header = 0 },
             },
         } },
-        .terminal_size = .{ .width = 140, .height = 8 },
+        .terminal_size = .{ .width = 140, .height = 9 },
     };
 
     try std.testing.expect(app.visibleDiffCursorOffset() == null);
@@ -3100,7 +3100,7 @@ test "diff scroll keeps visible cursor screen position stable" {
                 .diff_scroll = 3,
             },
         } },
-        .terminal_size = .{ .width = 140, .height = 9 },
+        .terminal_size = .{ .width = 140, .height = 10 },
     };
     const old_scroll = app.pages.review.viewer.diff_scroll;
     const old_offset = old_scroll + 1;
@@ -3121,7 +3121,7 @@ test "diff scroll syncs invisible cursor to scrolloff margin" {
                 .sidebar_hidden = true,
             },
         } },
-        .terminal_size = .{ .width = 140, .height = 8 },
+        .terminal_size = .{ .width = 140, .height = 9 },
     };
     const line_count = app.reviewNavigationView().selectedFileLineIndex(app.reviewNavigationView().effectiveDisplayMode()).lineCount();
     const visible_rows = app.reviewNavigationView().diffVisibleRows();
@@ -3147,7 +3147,7 @@ test "diff row movement continues from wheel-synced visible cursor" {
                 .sidebar_hidden = true,
             },
         } },
-        .terminal_size = .{ .width = 140, .height = 8 },
+        .terminal_size = .{ .width = 140, .height = 9 },
     };
     const line_count = app.reviewNavigationView().selectedFileLineIndex(app.reviewNavigationView().effectiveDisplayMode()).lineCount();
     app.pages.review.viewer.diff_scroll = 0;

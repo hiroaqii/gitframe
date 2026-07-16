@@ -1,15 +1,17 @@
 //! Shared shell geometry and terminal-to-page coordinate conversion.
 //!
-//! Rendering and input both consume this value so frame, page-bar, body, and
-//! footer boundaries cannot drift. Slice B keeps the page bar disabled until
-//! the Slice C transition/authority policy makes page switching user-visible.
+//! Rendering and input both consume this value so frame, page-bar chrome,
+//! page body, and footer boundaries cannot drift. The page bar deliberately
+//! owns a label row followed by a non-interactive rule row.
 
 const std = @import("std");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 
 pub const footer_rows: u16 = 1;
-pub const page_bar_rows: u16 = 1;
+pub const page_bar_label_row: u16 = 0;
+pub const page_bar_rule_row: u16 = 1;
+pub const page_bar_rows: u16 = page_bar_rule_row + 1;
 
 const frame_min_width: u16 = 30;
 const frame_min_height: u16 = 6;
@@ -160,23 +162,43 @@ test "layout reserves page bar without exposing it by default" {
     const visible = compute(.{ .width = 80, .height = 24 }, .{ .page_bar_visible = true });
     try std.testing.expect(hidden.page_bar == null);
     try std.testing.expect(visible.page_bar != null);
-    try std.testing.expectEqual(hidden.body.height - 1, visible.body.height);
-    try std.testing.expectEqual(visible.content.row + 1, visible.body.row);
+    try std.testing.expectEqual(page_bar_rows, visible.page_bar.?.height);
+    try std.testing.expectEqual(hidden.body.height - page_bar_rows, visible.body.height);
+    try std.testing.expectEqual(visible.content.row + page_bar_rows, visible.body.row);
 }
 
 test "terminal conversion rejects frame page bar and footer points" {
     const layout = compute(.{ .width = 80, .height = 24 }, .{ .page_bar_visible = true });
+    const page_bar = layout.page_bar orelse return error.ExpectedPageBar;
     try std.testing.expect(layout.terminalToBody(0, 0) == null);
-    try std.testing.expect(layout.terminalToBody(1, 1) == null);
-    try std.testing.expectEqual(Point{ .col = 0, .row = 0 }, layout.terminalToBody(1, 2).?);
+    for (0..page_bar.height) |row| {
+        try std.testing.expect(layout.terminalToBody(
+            @intCast(page_bar.col),
+            @intCast(@as(usize, page_bar.row) + row),
+        ) == null);
+    }
+    try std.testing.expectEqual(Point{ .col = 0, .row = 0 }, layout.terminalToBody(
+        @intCast(layout.body.col),
+        @intCast(layout.body.row),
+    ).?);
     try std.testing.expect(layout.terminalToBody(1, @intCast(layout.footer.row)) == null);
     try std.testing.expectEqual(Point{ .col = 0, .row = 0 }, layout.terminalToContent(1, 1).?);
 }
 
 test "tiny layout keeps rectangles bounded" {
-    const layout = compute(.{ .width = 1, .height = 1 }, .{ .page_bar_visible = true });
-    try std.testing.expectEqual(@as(u16, 1), layout.content.height);
-    try std.testing.expectEqual(@as(u16, 1), layout.page_bar.?.height);
-    try std.testing.expectEqual(@as(u16, 0), layout.body.height);
-    try std.testing.expectEqual(@as(u16, 0), layout.footer.height);
+    const one_row = compute(.{ .width = 1, .height = 1 }, .{ .page_bar_visible = true });
+    try std.testing.expectEqual(@as(u16, 1), one_row.content.height);
+    try std.testing.expectEqual(@as(u16, 1), one_row.page_bar.?.height);
+    try std.testing.expectEqual(@as(u16, 0), one_row.body.height);
+    try std.testing.expectEqual(@as(u16, 0), one_row.footer.height);
+
+    const two_rows = compute(.{ .width = 1, .height = 2 }, .{ .page_bar_visible = true });
+    try std.testing.expectEqual(page_bar_rows, two_rows.page_bar.?.height);
+    try std.testing.expectEqual(@as(u16, 0), two_rows.body.height);
+    try std.testing.expectEqual(@as(u16, 0), two_rows.footer.height);
+
+    const four_rows = compute(.{ .width = 1, .height = 4 }, .{ .page_bar_visible = true });
+    try std.testing.expectEqual(page_bar_rows, four_rows.page_bar.?.height);
+    try std.testing.expectEqual(@as(u16, 1), four_rows.body.height);
+    try std.testing.expectEqual(@as(u16, 1), four_rows.footer.height);
 }

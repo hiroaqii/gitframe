@@ -1107,7 +1107,7 @@ pub const App = struct {
             const layout = self.shellLayout();
             if (layout.page_bar) |bar| {
                 if (layout.terminalToContent(mouse.col, mouse.row)) |point| {
-                    if (point.row == 0) {
+                    if (point.row == app_shell_layout.page_bar_label_row) {
                         const compact = layout.body.height == 0 or layout.footer.height == 0;
                         const target = if (compact)
                             if (point.col >= 1 and point.col < @min(bar.width, self.active_page.label().len + 3)) self.active_page else null
@@ -5672,7 +5672,7 @@ test "display mode toggle brings cursor back into view after wheel scroll" {
                 .diff_cursor = .{ .hunk_header = 0 },
             },
         } },
-        .terminal_size = .{ .width = 140, .height = 8 },
+        .terminal_size = .{ .width = 140, .height = 9 },
     };
 
     try std.testing.expect(app.reviewNavigationView().visibleDiffCursorOffset() == null);
@@ -5694,7 +5694,7 @@ test "mouse wheel routes through diff scroll cursor sync" {
                 .diff_cursor = .{ .hunk_header = 0 },
             },
         } },
-        .terminal_size = .{ .width = 140, .height = 8 },
+        .terminal_size = .{ .width = 140, .height = 9 },
     };
 
     try app.update(.{ .review = .mouse_diff_wheel_down }, undefined);
@@ -6130,13 +6130,13 @@ test "mouse click on sidebar header or blank body focuses only" {
     };
 
     const content = app_shell_layout.contentRect(app.terminal_size);
-    const header_msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 1, .left)) orelse return error.ExpectedSidebarHeaderClickMessage;
+    const header_msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + app_shell_layout.page_bar_rows, .left)) orelse return error.ExpectedSidebarHeaderClickMessage;
     try app.update(header_msg, undefined);
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
 
     app.pages.review.viewer.focus = .diff;
-    const blank_row = content.row + sidebar_header_rows + 2;
+    const blank_row = content.row + app_shell_layout.page_bar_rows + sidebar_header_rows + 2;
     const blank_msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, blank_row, .left)) orelse return error.ExpectedSidebarBlankClickMessage;
     try app.update(blank_msg, undefined);
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
@@ -7742,6 +7742,39 @@ test "keyboard and page bar mouse share the page switch transition" {
     try std.testing.expectEqual(page.Id.review, app.active_page);
     try std.testing.expect(app.pages.review.activation.state.satisfiesAction(.read_diff));
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+}
+
+test "page bar rule is dead chrome in normal and compact layouts" {
+    var app: App = .{ .terminal_size = .{ .width = 100, .height = 20 } };
+    const normal = app.shellLayout();
+    const normal_bar = normal.page_bar orelse return error.ExpectedPageBar;
+    try std.testing.expectEqual(app_shell_layout.page_bar_rows, normal_bar.height);
+    const repository_tab = page.tab(.repository);
+    try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(
+        normal_bar.col + repository_tab.col,
+        normal_bar.row + app_shell_layout.page_bar_rule_row,
+        .left,
+    )) == null);
+
+    app.terminal_size = .{ .width = 20, .height = 3 };
+    const compact = app.shellLayout();
+    const compact_bar = compact.page_bar orelse return error.ExpectedCompactPageBar;
+    try std.testing.expectEqual(@as(u16, 0), compact.body.height);
+    try std.testing.expectEqual(App.Msg{ .switch_page = .review }, app.handleEvent(app_test_support.mouseEvent(
+        compact_bar.col + 1,
+        compact_bar.row + app_shell_layout.page_bar_label_row,
+        .left,
+    )).?);
+    try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(
+        compact_bar.col + repository_tab.col,
+        compact_bar.row + app_shell_layout.page_bar_label_row,
+        .left,
+    )) == null);
+    try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(
+        compact_bar.col + 1,
+        compact_bar.row + app_shell_layout.page_bar_rule_row,
+        .left,
+    )) == null);
 }
 
 fn repositoryLiveSelectionForTest() repository_selection.DragSelection {

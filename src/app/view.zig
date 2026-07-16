@@ -176,17 +176,33 @@ fn viewBody(app: Context, surface: *chasen.Surface) !void {
 }
 
 fn viewPageBar(active: page.Id, compact: bool, palette: theme.Palette, surface: *chasen.Surface) void {
+    if (surface.size().width == 0 or surface.size().height == 0) return;
     if (compact) {
         const label = std.fmt.allocPrint(surface.frameAllocator(), " {s} ", .{active.label()}) catch active.label();
-        draw.copyClippedTextAt(surface, 1, 0, label, palette.boldStyle(.accent)) catch {};
-        return;
+        draw.copyClippedTextAt(surface, 1, shell_layout.page_bar_label_row, label, palette.boldStyle(.accent)) catch {};
+    } else {
+        for (page.all) |id| {
+            const tab = page.tab(id);
+            if (tab.col >= surface.size().width) break;
+            const label = std.fmt.allocPrint(surface.frameAllocator(), " {s} ", .{id.label()}) catch id.label();
+            draw.copyClippedTextAt(surface, tab.col, shell_layout.page_bar_label_row, label, if (id == active) palette.boldStyle(.accent) else palette.style(.muted)) catch {};
+        }
     }
-    for (page.all) |id| {
-        const tab = page.tab(id);
-        if (tab.col >= surface.size().width) return;
-        const label = std.fmt.allocPrint(surface.frameAllocator(), " {s} ", .{id.label()}) catch id.label();
-        draw.copyClippedTextAt(surface, tab.col, 0, label, if (id == active) palette.boldStyle(.accent) else palette.style(.muted)) catch {};
+
+    if (surface.size().height <= shell_layout.page_bar_rule_row) return;
+    const rule_style = pageBarRuleStyle(palette);
+    for (0..surface.size().width) |col| {
+        _ = surface.borrowTextAt(
+            @intCast(col),
+            shell_layout.page_bar_rule_row,
+            "─",
+            rule_style,
+        );
     }
+}
+
+fn pageBarRuleStyle(palette: theme.Palette) chasen.TextStyle {
+    return .{ .fg = palette.color(.muted), .dim = true };
 }
 
 fn viewPlaceholderPage(id: page.Id, has_repository: bool, palette: theme.Palette, surface: *chasen.Surface) void {
@@ -1629,6 +1645,67 @@ test "page bar dispatch shows repository requirement for unavailable placeholder
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository required") != null);
+}
+
+test "page bar renders labels above a full muted rule" {
+    const palette = theme.Palette.default();
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(60, shell_layout.page_bar_rows);
+    defer ts.deinit();
+
+    viewPageBar(.repository, false, palette, &ts.surface);
+
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Repository ") != null);
+    try expectFullPageBarRule(&ts.surface, palette);
+}
+
+test "normal narrow page bar keeps its full rule after clipping later tabs" {
+    const palette = theme.Palette.default();
+    const width = page.tab(.repository).col;
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(width, shell_layout.page_bar_rows);
+    defer ts.deinit();
+
+    viewPageBar(.review, false, palette, &ts.surface);
+
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Repository ") == null);
+    try expectFullPageBarRule(&ts.surface, palette);
+}
+
+test "compact page bar keeps only the active label and draws a rule when available" {
+    var two_rows: chasen.testing.TestSurface = undefined;
+    try two_rows.init(30, shell_layout.page_bar_rows);
+    defer two_rows.deinit();
+
+    viewPageBar(.history, true, .default(), &two_rows.surface);
+    const snapshot = try two_rows.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " History ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") == null);
+    try two_rows.expectCellText(0, shell_layout.page_bar_rule_row, "─");
+
+    var one_row: chasen.testing.TestSurface = undefined;
+    try one_row.init(30, 1);
+    defer one_row.deinit();
+    viewPageBar(.history, true, .default(), &one_row.surface);
+    try one_row.expectCellText(2, shell_layout.page_bar_label_row, "H");
+    try std.testing.expect(one_row.surface.readCell(0, shell_layout.page_bar_rule_row) == null);
+}
+
+fn expectFullPageBarRule(surface: *const chasen.Surface, palette: theme.Palette) !void {
+    for (0..surface.size().width) |col| {
+        const cell = surface.readCell(@intCast(col), shell_layout.page_bar_rule_row) orelse
+            return error.ExpectedPageBarRuleCell;
+        try std.testing.expectEqualStrings("─", cell.char.grapheme);
+        try std.testing.expect(cell.style.fg.eql(palette.color(.muted)));
+        try std.testing.expect(cell.style.dim);
+    }
 }
 
 test "shell content size matches panel content surface" {
