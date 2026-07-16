@@ -25,7 +25,6 @@ pub const Row = struct {
 };
 
 pub const RowLayout = struct {
-    marker_col: u16 = 0,
     reviewed_col: ?u16,
     badge_col: ?u16,
     mode_col: ?u16,
@@ -104,33 +103,36 @@ fn visibleRowAt(
 
 pub fn layout(row: Row, width: u16) RowLayout {
     const indent: u16 = row.depth *| 2;
-    // Sidebar rows reserve fixed positions for marker, optional reviewed mark,
-    // optional status/mode badges, optional fold marker, name text, and
-    // right-aligned stats. The indent shifts tree-specific columns while
-    // keeping marker, reviewed mark, and stats fixed.
+    // Root and directory content starts at the tree's left edge. File-only
+    // reviewed/status/mode columns stay fixed so removing the old selection
+    // marker does not make semantic badges jump between rows.
     const reviewed_col: ?u16 = if (row.kind == .file and row.reviewed) 1 else null;
     const badge_col: ?u16 = if (row.status != null) 2 else null;
     const mode_col: ?u16 = if (row.kind == .file and row.mode_changed)
         if (row.status != null) 4 else 2
     else
         null;
-    const name_col: u16 = if (row.kind == .directory)
-        4 +| indent
+    const tree_content_col: u16 = if (row.kind == .repo_root or row.kind == .directory)
+        0
     else if (row.mode_changed and row.status != null)
-        6 +| indent
-    else if (row.mode_changed or row.status != null)
-        4 +| indent
-    else
-        3 +| indent;
-    const stats_width: u16 = if (shouldShowStats(row, width, name_col)) 12 else 0;
-    const name_width: u16 = if (width > name_col + stats_width) width - name_col - stats_width else 0;
-    const stats_col: ?u16 = if (stats_width > 0) width - stats_width else null;
-    const tree_content_col: u16 = if (row.mode_changed and row.status != null)
         6
     else if (row.mode_changed or row.status != null)
         4
     else
         2;
+    const name_col: u16 = if (row.kind == .repo_root)
+        indent
+    else if (row.kind == .directory)
+        2 +| indent
+    else if (row.mode_changed and row.status != null)
+        6 +| indent
+    else if (row.mode_changed or row.status != null)
+        4 +| indent
+    else
+        2 +| indent;
+    const stats_width: u16 = if (shouldShowStats(row, width, name_col)) 12 else 0;
+    const name_width: u16 = if (width > name_col + stats_width) width - name_col - stats_width else 0;
+    const stats_col: ?u16 = if (stats_width > 0) width - stats_width else null;
     const tree_content_width: u16 = if (width > tree_content_col + stats_width) width - tree_content_col - stats_width else 0;
 
     return .{
@@ -286,6 +288,7 @@ test "layout reserves reviewed gutter for status-less file rows" {
 
     try std.testing.expectEqual(@as(?u16, null), unreviewed_layout.reviewed_col);
     try std.testing.expectEqual(@as(u16, 1), reviewed_layout.reviewed_col.?);
+    try std.testing.expectEqual(@as(u16, 2), reviewed_layout.name_col);
     try std.testing.expectEqual(unreviewed_layout.name_col, reviewed_layout.name_col);
     try std.testing.expectEqual(unreviewed_layout.name_width, reviewed_layout.name_width);
 }
@@ -356,6 +359,10 @@ test "layout shows stats only for repository root rows" {
     const root_layout = layout(rowForNode(tree, &collapsed, &.{}, 0, 0).?, 40);
     const directory_layout = layout(rowForNode(tree, &collapsed, &.{}, 1, 0).?, 40);
 
-    try std.testing.expect(root_layout.stats_col != null);
+    try std.testing.expectEqual(@as(u16, 0), root_layout.tree_content_col);
+    try std.testing.expectEqual(@as(u16, 0), root_layout.name_col);
+    try std.testing.expectEqual(@as(?u16, 28), root_layout.stats_col);
+    try std.testing.expectEqual(@as(u16, 0), directory_layout.tree_content_col);
+    try std.testing.expectEqual(@as(u16, 4), directory_layout.name_col);
     try std.testing.expectEqual(@as(?u16, null), directory_layout.stats_col);
 }

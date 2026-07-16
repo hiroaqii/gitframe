@@ -368,11 +368,6 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
     const width = surface.size().width;
     const row_layout = sidebar_view_model.layout(row_model, width);
     const style = sidebarRowStyle(row_model, pane_active, palette);
-    const marker = if (row_model.selected) "▌" else " ";
-
-    if (width > row_layout.marker_col) {
-        _ = surface.borrowTextAt(0, row, marker, style);
-    }
 
     if (row_model.status) |status| {
         if (row_layout.badge_col) |badge_col| {
@@ -1118,12 +1113,12 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
     try ts.expectCellText(2, review_layout.sidebar_header_rows, "A");
     try ts.expectCellText(2, review_layout.sidebar_header_rows + 1, "D");
     try ts.expectCellText(1, 2, "F");
-    try std.testing.expect(ts.surface.readCell(0, review_layout.sidebar_header_rows).?.style.reverse);
+    try std.testing.expect(ts.surface.readCell(6, review_layout.sidebar_header_rows).?.style.reverse);
 
     page.viewer.focus = .diff;
     try viewSidebar(testContext(&page, .default(), 80, 9), &ts.surface, page.load.state.loaded.loaded);
-    try std.testing.expect(ts.surface.readCell(0, review_layout.sidebar_header_rows).?.style.dim);
-    try std.testing.expect(!ts.surface.readCell(0, review_layout.sidebar_header_rows).?.style.reverse);
+    try std.testing.expect(ts.surface.readCell(6, review_layout.sidebar_header_rows).?.style.dim);
+    try std.testing.expect(!ts.surface.readCell(6, review_layout.sidebar_header_rows).?.style.reverse);
 
     const overridden = paletteWithOverride(.success, .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } });
     try viewSidebar(testContext(&page, overridden, 80, 9), &ts.surface, page.load.state.loaded.loaded);
@@ -1161,6 +1156,43 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
     const snapshot = try narrow.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "very_long") != null);
+}
+
+test "sidebar renderer left-aligns root and directory without a selection marker" {
+    const nodes = [_]file_tree.Node{
+        .{
+            .kind = .repo_root,
+            .name = "gitframe",
+            .path = "",
+            .depth = 0,
+            .stats = .{ .added = 51, .removed = 25 },
+            .target = .repo_root,
+        },
+        .{
+            .kind = .directory,
+            .name = "src",
+            .path = "src",
+            .depth = 1,
+        },
+    };
+    const tree: file_tree.FileTree = .{ .nodes = &nodes };
+    const collapsed: file_tree.CollapsedSet = .empty;
+    const root = sidebar_view_model.rowForNode(tree, &collapsed, &.{}, 0, 0).?;
+    const directory = sidebar_view_model.rowForNode(tree, &collapsed, &.{}, 1, 0).?;
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(40, 2);
+    defer ts.deinit();
+
+    try drawSidebarRow(&ts.surface, 0, root, true, 0, .default());
+    try drawSidebarRow(&ts.surface, 1, directory, true, 0, .default());
+
+    try ts.expectCellText(0, 0, "g");
+    try std.testing.expect(ts.surface.readCell(0, 0).?.style.reverse);
+    try ts.expectCellText(28, 0, "+");
+    try ts.expectCellText(32, 0, "-");
+    try ts.expectCellText(2, 1, "▾");
+    try ts.expectCellText(4, 1, "s");
 }
 
 test "diff renderer owns header search marker gutter and input presentation" {
