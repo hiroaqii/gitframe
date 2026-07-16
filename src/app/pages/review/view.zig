@@ -334,6 +334,7 @@ pub fn viewSidebar(app: Context, surface: *chasen.Surface, loaded: loaded_diff.L
         const row_model = sidebar_view_model.rowAt(.{
             .tree = loaded.tree,
             .collapsed = &loaded.collapsed_dirs,
+            .root_disclosure = loaded.root_disclosure,
             .reviewed_files = loaded.reviewed_files,
             .visible_nodes = loaded.materializedVisibleNodes(),
         }, visible_index, app.page.viewer.selected_node) orelse continue;
@@ -1177,22 +1178,27 @@ test "sidebar renderer left-aligns root and directory without a selection marker
     };
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
     const collapsed: file_tree.CollapsedSet = .empty;
-    const root = sidebar_view_model.rowForNode(tree, &collapsed, &.{}, 0, 0).?;
-    const directory = sidebar_view_model.rowForNode(tree, &collapsed, &.{}, 1, 0).?;
+    const root = sidebar_view_model.rowForNode(tree, &collapsed, .expanded, &.{}, 0, 0).?;
+    const collapsed_root = sidebar_view_model.rowForNode(tree, &collapsed, .collapsed, &.{}, 0, 0).?;
+    const directory = sidebar_view_model.rowForNode(tree, &collapsed, .expanded, &.{}, 1, 0).?;
 
     var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(40, 2);
+    try ts.init(40, 3);
     defer ts.deinit();
 
     try drawSidebarRow(&ts.surface, 0, root, true, 0, .default());
     try drawSidebarRow(&ts.surface, 1, directory, true, 0, .default());
+    try drawSidebarRow(&ts.surface, 2, collapsed_root, true, 0, .default());
 
-    try ts.expectCellText(0, 0, "g");
+    try ts.expectCellText(0, 0, "▾");
     try std.testing.expect(ts.surface.readCell(0, 0).?.style.reverse);
+    try ts.expectCellText(2, 0, "g");
     try ts.expectCellText(28, 0, "+");
     try ts.expectCellText(32, 0, "-");
     try ts.expectCellText(2, 1, "▾");
     try ts.expectCellText(4, 1, "s");
+    try ts.expectCellText(0, 2, "▸");
+    try ts.expectCellText(2, 2, "g");
 }
 
 test "diff renderer owns header search marker gutter and input presentation" {

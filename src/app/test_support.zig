@@ -95,6 +95,18 @@ pub fn loadedDiffNested() LoadedDiff {
     };
 }
 
+pub fn loadedDiffRootedNested() LoadedDiff {
+    return .{
+        .text = "",
+        .document = .{ .files = &files_two },
+        .file_text_eligibility = &selectable_two,
+        .tree = .{ .nodes = &tree_rooted_nested_nodes },
+        .collapsed_dirs = .{},
+        .bytes = 0,
+        .lines = 0,
+    };
+}
+
 pub fn loadedDiffTwoWithStatuses() LoadedDiff {
     return .{
         .text = "",
@@ -173,6 +185,13 @@ pub const tree_nested_nodes = [_]file_tree.Node{
     .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
     .{ .kind = .file, .name = "a", .path = "src/a", .depth = 1, .target = .{ .diff_file = 0 } },
     .{ .kind = .file, .name = "b", .path = "src/b", .depth = 1, .target = .{ .diff_file = 1 } },
+};
+
+pub const tree_rooted_nested_nodes = [_]file_tree.Node{
+    .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root },
+    .{ .kind = .directory, .name = "src", .path = "src", .depth = 1 },
+    .{ .kind = .file, .name = "a", .path = "src/a", .depth = 2, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "src/b", .depth = 2, .target = .{ .diff_file = 1 } },
 };
 
 pub const tree_non_contiguous_nodes = [_]file_tree.Node{

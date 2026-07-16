@@ -1233,7 +1233,7 @@ fn buildLoadedBundleWithOptions(
         .collapsed_hunks = collapsed_hunks,
         .collapsed_dirs = .empty,
     };
-    try loaded.rebuildVisibleNodes(arena_allocator, false, .all);
+    try loaded.rebuildVisibleNodes(arena_allocator, .expanded, false, .all);
 
     // Do not store `arena_allocator` in the result: its interface points at
     // this local arena value, while the arena itself is moved by value across

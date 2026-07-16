@@ -4415,8 +4415,10 @@ pub const App = struct {
     fn finishRepoPickerCommit(self: *App, ctx: *chasen.Ctx(Msg), outcome: RepoCommitOutcome) !void {
         switch (outcome) {
             .changed => {
-                if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
+                // The identity is already committed. Page-local reset must not
+                // depend on allocation or task-spawn success for its first load.
                 self.reviewNavigation().resetAfterRepositorySwitch();
+                if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
             },
             .unchanged => {},
             .rejected => self.setStatus("Repository root could not be opened safely", .{}),
@@ -6148,7 +6150,7 @@ test "mouse click uses filtered sidebar projection" {
     var loaded = app_test_support.loadedDiffTwoWithStatuses();
     loaded.reviewed_files = try arena.allocator().alloc(bool, loaded.document.files.len);
     @memset(loaded.reviewed_files, false);
-    try loaded.rebuildVisibleNodes(arena.allocator(), false, .deleted);
+    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .deleted);
 
     var app: App = .{
         .pages = .{ .review = .{
@@ -9369,6 +9371,51 @@ test "repo picker capability rejection preserves Review navigation and does not 
     try std.testing.expectEqual(@as(usize, 7), app.pages.review.viewer.selected_node);
     try std.testing.expect(app.pages.review.search.mode);
     try std.testing.expectEqualStrings("Repository root could not be opened safely", app.status.text());
+}
+
+test "committed repository replacement resets Review before source spawn failure" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{ .allocator = allocator, .active_page = .review };
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+
+    try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, roots.a),
+        0,
+        .external_selection,
+    ));
+    app.pages.review.viewer.selected_target = .{ .diff_file = 3 };
+    app.pages.review.viewer.selected_file = 3;
+    app.pages.review.viewer.selected_node = 7;
+    app.pages.review.viewer.root_disclosure = .collapsed;
+    app.pages.review.search.mode = true;
+    setDiffSearchQuery(&app, "needle");
+
+    const outcome = app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, roots.b),
+        0,
+        .external_selection,
+    );
+    try std.testing.expectEqual(RepoCommitOutcome.changed, outcome);
+    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, app.pages.review.viewer.root_disclosure);
+    try std.testing.expect(app.pages.review.search.mode);
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._pending_tasks_with_len = 16 };
+    try std.testing.expectError(error.TaskLimitExceeded, app.finishRepoPickerCommit(&ctx, outcome));
+    ctx._pending_tasks_with_len = 0;
+
+    try std.testing.expectEqualStrings(roots.b, app.activeRepoRoot().?);
+    try std.testing.expectEqual(file_tree.RootDisclosure.expanded, app.pages.review.viewer.root_disclosure);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expect(!app.pages.review.search.mode);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.search.input.len);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.search.query.len);
 }
 
 fn testSingleRepoDiscovery(allocator: std.mem.Allocator, root: []const u8) !repo_discovery.DiscoveryResult {
@@ -13234,7 +13281,7 @@ test "loaded diff with empty visible filter shows local empty state" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var loaded = app_test_support.loadedDiffTwoWithStatuses();
-    try loaded.rebuildVisibleNodes(arena.allocator(), false, .binary);
+    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .binary);
 
     var app: App = .{
         .pages = .{ .review = .{
@@ -13440,6 +13487,105 @@ test "status projection rebuild keeps selected node on same path key" {
 
     const after_path = app.reviewNavigationView().selectedStagePathKey() orelse return error.ExpectedSelectedPath;
     try std.testing.expectEqualStrings("b", after_path);
+}
+
+test "status projection retains collapsed Review root and sticky diff target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var current = app_test_support.loadedDiffRootedNested();
+    try current.rebuildVisibleNodes(arena.allocator(), .collapsed, false, .all);
+    var app: App = .{
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, current),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 0,
+                .root_disclosure = .collapsed,
+            },
+            .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
+        } },
+        .allocator = std.testing.allocator,
+    };
+    defer app.reviewReload().clearLoadedDiff(app.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? aa\x00");
+    try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
+        .generation = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = status_bundle },
+    });
+
+    const loaded = app.reviewNavigation().loadedDiff().?;
+    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, app.pages.review.viewer.root_disclosure);
+    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
+    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+}
+
+test "status acceptance reconciles pending file restore under collapsed Review root" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var current = app_test_support.loadedDiffRootedNested();
+    try current.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    var app: App = .{
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, current),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 3,
+            },
+            .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
+        } },
+        .allocator = std.testing.allocator,
+    };
+    defer app.reviewReload().clearLoadedDiff(app.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
+    defer app.reviewNavigation().clearPendingSelectionRestore(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    // A file action records the file while the expanded tree is visible. The
+    // user may collapse the root before the following status read completes.
+    try app.reviewNavigation().setPendingSelectionRestore(std.testing.allocator, "b");
+    var loaded = app.reviewNavigation().loadedDiff().?;
+    app.reviewNavigation().selectSidebarNode(loaded, 0);
+    try app.reviewNavigation().toggleSelectedDirectory();
+    loaded = app.reviewNavigation().loadedDiff().?;
+    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
+
+    const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
+    try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
+        .generation = 1,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = status_bundle },
+    });
+
+    loaded = app.reviewNavigation().loadedDiff().?;
+    try std.testing.expect(app.pages.review.pending_selection_restore == null);
+    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, app.pages.review.viewer.root_disclosure);
+    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
+    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "status load skips identical snapshot without rebuilding active tree" {
@@ -14514,6 +14660,53 @@ test "manual reload restores anchor after visible state is cleared" {
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, app.pages.review.viewer.diff_cursor);
+}
+
+test "manual reload retains collapsed Review repository root" {
+    var current_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var current = app_test_support.loadedDiffRootedNested();
+    current.text = "old";
+    try current.rebuildVisibleNodes(current_arena.allocator(), .collapsed, false, .all);
+    var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(current_arena, current),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 0,
+                .root_disclosure = .collapsed,
+            },
+        } },
+        .allocator = std.testing.allocator,
+    };
+    defer app.reviewReload().clearLoadedDiff(app.allocator);
+    defer app.reviewReload().clearPendingReload(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    app.pages.review.load.generation = 2;
+    try app.reviewReload().beginPendingReload(std.testing.allocator, 2, .manual);
+    app.reviewReload().clearLoadedDiff(app.allocator);
+    app.pages.review.load.state = .loading;
+
+    var changed = app_test_support.loadedDiffRootedNested();
+    changed.text = "changed";
+    const bundle = app_load.LoadedDiffBundle{
+        .arena = .init(std.testing.allocator),
+        .loaded = changed,
+    };
+
+    try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(0, 1),
+        .generation = 2,
+        .result = .{ .loaded = bundle },
+    });
+
+    const loaded = app.reviewNavigation().loadedDiff().?;
+    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, app.pages.review.viewer.root_disclosure);
+    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
+    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "watch no-op preserves selected path when status finishes before diff" {

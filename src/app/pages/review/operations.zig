@@ -906,6 +906,46 @@ test "stage toggle resolves file operation from fresh status" {
     try std.testing.expect(testView(&page, .{ .range = "main...HEAD" }).toggleStageTarget() == .unavailable_source);
 }
 
+test "collapsed repository root retains whole-repository stage authority" {
+    var loaded = test_support.loadedDiffRootedNested();
+    loaded.root_disclosure = .collapsed;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(loaded),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 1 },
+            .selected_node = 0,
+            .root_disclosure = .collapsed,
+        },
+    };
+    defer page.git_status.deinit();
+    acceptTestSource(&page);
+
+    const target = testView(&page, .unstaged).selectedSidebarActionTarget() orelse
+        return error.ExpectedRepositoryActionTarget;
+    try std.testing.expectEqual(git_ops.TargetKind.repository, target.kind);
+    try std.testing.expectEqualStrings("", target.path);
+
+    var unstaged = try @import("../../../git/status.zig").StatusBundle.parseOwned(
+        std.testing.allocator,
+        " M src/a\x00",
+    );
+    try page.git_status.replace("/repo", &unstaged);
+    try std.testing.expectEqual(
+        git_ops.ToggleStageTargetResult{ .operation = .stage },
+        testView(&page, .unstaged).toggleStageTarget(),
+    );
+
+    var staged = try @import("../../../git/status.zig").StatusBundle.parseOwned(
+        std.testing.allocator,
+        "A  src/a\x00",
+    );
+    try page.git_status.replace("/repo", &staged);
+    try std.testing.expectEqual(
+        git_ops.ToggleStageTargetResult{ .operation = .unstage },
+        testView(&page, .unstaged).toggleStageTarget(),
+    );
+}
+
 test "unstage target requires fresh staged status" {
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwoWithStatuses()),

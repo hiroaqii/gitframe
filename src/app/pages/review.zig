@@ -57,6 +57,10 @@ pub const ViewerState = struct {
     sidebar_hidden: bool = false,
     sidebar_width: ?u16 = null,
     sidebar_horizontal_scroll: usize = 0,
+    /// Page-local authority for the repository-root disclosure. Directory
+    /// folds remain per-load path state; the path-less root must not be stored
+    /// in that map under an empty-string key.
+    root_disclosure: file_tree.RootDisclosure = .expanded,
     diff_scroll: usize = 0,
     diff_horizontal_scroll: usize = 0,
     diff_cursor: diff_view_model.BodyCoordinate = .{ .metadata = 0 },

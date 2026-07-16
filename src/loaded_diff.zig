@@ -78,6 +78,10 @@ pub const LoadedDiff = struct {
     /// Rebuild only when those rules change, not on every frame.
     visible_nodes: []usize = &.{},
     visible_node_count: usize = 0,
+    /// Root disclosure applied to `visible_nodes`. Review page state is the
+    /// authority; this per-load value keeps the materialized projection and
+    /// rendering vocabulary self-consistent.
+    root_disclosure: file_tree.RootDisclosure = .expanded,
     bytes: usize,
     lines: usize,
 
@@ -94,11 +98,12 @@ pub const LoadedDiff = struct {
     pub fn rebuildVisibleNodes(
         self: *LoadedDiff,
         allocator: std.mem.Allocator,
+        root_disclosure: file_tree.RootDisclosure,
         hide_reviewed: bool,
         status_filter: ChangedFileFilter,
     ) !void {
         var prepared = try self.prepareVisibleNodeRebuild(allocator);
-        prepared.commit(hide_reviewed, status_filter);
+        prepared.commit(root_disclosure, hide_reviewed, status_filter);
     }
 
     /// Prepare rebuild storage without publishing it as the active
@@ -116,11 +121,19 @@ pub const LoadedDiff = struct {
         };
     }
 
-    fn shouldIncludeVisibleNode(self: *const LoadedDiff, node_index: usize, hide_reviewed: bool, status_filter: ChangedFileFilter) bool {
+    fn shouldIncludeVisibleNode(
+        self: *const LoadedDiff,
+        node_index: usize,
+        root_disclosure: file_tree.RootDisclosure,
+        hide_reviewed: bool,
+        status_filter: ChangedFileFilter,
+    ) bool {
         if (!self.tree.isVisible(node_index, &self.collapsed_dirs)) return false;
+        const node = self.tree.nodes[node_index];
+        const has_root = self.tree.nodes.len > 0 and self.tree.nodes[0].kind == .repo_root;
+        if (has_root and root_disclosure == .collapsed and node.kind != .repo_root) return false;
         if (!hide_reviewed and status_filter == .all) return true;
 
-        const node = self.tree.nodes[node_index];
         return switch (node.kind) {
             .file => self.shouldIncludeFileNode(node_index, hide_reviewed, status_filter),
             .repo_root, .directory => self.hasMatchingFileDescendant(node_index, hide_reviewed, status_filter),
@@ -299,17 +312,23 @@ const PreparedVisibleNodeRebuild = struct {
     candidate: []usize,
     tree_node_count: usize,
 
-    pub fn commit(self: *PreparedVisibleNodeRebuild, hide_reviewed: bool, status_filter: ChangedFileFilter) void {
+    pub fn commit(
+        self: *PreparedVisibleNodeRebuild,
+        root_disclosure: file_tree.RootDisclosure,
+        hide_reviewed: bool,
+        status_filter: ChangedFileFilter,
+    ) void {
         const target = self.target;
         const candidate = self.candidate;
         var count: usize = 0;
         for (0..self.tree_node_count) |index| {
-            if (!target.shouldIncludeVisibleNode(index, hide_reviewed, status_filter)) continue;
+            if (!target.shouldIncludeVisibleNode(index, root_disclosure, hide_reviewed, status_filter)) continue;
             candidate[count] = index;
             count += 1;
         }
         target.visible_nodes = candidate;
         target.visible_node_count = count;
+        target.root_disclosure = root_disclosure;
         self.* = undefined;
     }
 };
@@ -334,13 +353,19 @@ test "repository root visibility follows filtered file descendants" {
         .lines = 0,
     };
 
-    try loaded.rebuildVisibleNodes(allocator, false, .added);
+    try loaded.rebuildVisibleNodes(allocator, .expanded, false, .added);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeAt(0).?);
     try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeAt(1).?);
 
-    try loaded.rebuildVisibleNodes(allocator, false, .modified);
+    try loaded.rebuildVisibleNodes(allocator, .expanded, false, .modified);
     try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
+
+    try loaded.rebuildVisibleNodes(allocator, .collapsed, false, .added);
+    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
+    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
+    try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, ""));
 }
 
 test "visible node rebuild preparation failure preserves the retained materialization" {
@@ -430,13 +455,13 @@ test "prepared visible node rebuild commits infallibly after fold changes" {
 
     var collapsed = try loaded.prepareVisibleNodeRebuild(allocator);
     try file_tree.collapse(allocator, &loaded.collapsed_dirs, "src");
-    collapsed.commit(false, .all);
+    collapsed.commit(.expanded, false, .all);
     try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
 
     var expanded = try loaded.prepareVisibleNodeRebuild(allocator);
     file_tree.expandAncestors(&loaded.collapsed_dirs, "src/main.zig");
-    expanded.commit(false, .all);
+    expanded.commit(.expanded, false, .all);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 1), loaded.visibleNodeAt(1));
 }

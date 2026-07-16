@@ -7,6 +7,22 @@ const git_status = @import("git/status.zig");
 
 pub const CollapsedSet = std.StringHashMapUnmanaged(void);
 
+/// Page-owned disclosure state for the synthetic repository boundary.
+///
+/// This is intentionally separate from `CollapsedSet`: the repository root
+/// has no ordinary relative path and must not be encoded as the empty string.
+pub const RootDisclosure = enum {
+    expanded,
+    collapsed,
+
+    pub fn toggled(self: RootDisclosure) RootDisclosure {
+        return switch (self) {
+            .expanded => .collapsed,
+            .collapsed => .expanded,
+        };
+    }
+};
+
 pub const Stats = diff_file.Stats;
 pub const Status = diff_file.Status;
 
@@ -193,9 +209,9 @@ pub const FileTree = struct {
         while (index > 0) {
             index -= 1;
             const candidate = self.nodes[index];
-            if (candidate.kind != .directory) continue;
+            if (candidate.kind != .directory and candidate.kind != .repo_root) continue;
             if (candidate.depth >= node.depth) continue;
-            if (!isPathAncestor(candidate.path, node.path)) continue;
+            if (candidate.kind == .directory and !isPathAncestor(candidate.path, node.path)) continue;
             return index;
         }
         return null;
@@ -1070,6 +1086,21 @@ test "parentDirectoryNodeIndex finds nearest directory ancestor" {
     try std.testing.expectEqual(@as(?usize, null), tree.parentDirectoryNodeIndex(0));
     try std.testing.expectEqual(@as(?usize, null), tree.parentDirectoryNodeIndex(3));
     try std.testing.expectEqual(@as(?usize, null), tree.parentDirectoryNodeIndex(99));
+}
+
+test "parentDirectoryNodeIndex treats repository root as the top-level parent" {
+    const nodes = [_]Node{
+        .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root },
+        .{ .kind = .directory, .name = "src", .path = "src", .depth = 1 },
+        .{ .kind = .file, .name = "main.zig", .path = "src/main.zig", .depth = 2, .target = .{ .diff_file = 0 } },
+        .{ .kind = .file, .name = "README.md", .path = "README.md", .depth = 1, .target = .{ .diff_file = 1 } },
+    };
+    const tree = FileTree{ .nodes = &nodes };
+
+    try std.testing.expectEqual(@as(?usize, 1), tree.parentDirectoryNodeIndex(2));
+    try std.testing.expectEqual(@as(?usize, 0), tree.parentDirectoryNodeIndex(1));
+    try std.testing.expectEqual(@as(?usize, 0), tree.parentDirectoryNodeIndex(3));
+    try std.testing.expectEqual(@as(?usize, null), tree.parentDirectoryNodeIndex(0));
 }
 
 test "expandAncestors reveals nested file path" {

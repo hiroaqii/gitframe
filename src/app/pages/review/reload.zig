@@ -1399,9 +1399,15 @@ pub const Controller = struct {
                 errdefer arena.deinit();
                 try self.navigation.materializeReviewedFiles(allocator, &loaded);
                 errdefer allocator.free(loaded.reviewed_files);
-                if (self.page.review_display.hide_reviewed_files or self.page.review_display.changed_file_filter != .all) {
-                    try loaded.rebuildVisibleNodes(arena.allocator(), self.page.review_display.hide_reviewed_files, self.page.review_display.changed_file_filter);
-                }
+                // The Review page owns root disclosure across compatible
+                // reloads. Always rematerialize the accepted load with that
+                // state, even when no file filter is active.
+                try loaded.rebuildVisibleNodes(
+                    arena.allocator(),
+                    self.page.viewer.root_disclosure,
+                    self.page.review_display.hide_reviewed_files,
+                    self.page.review_display.changed_file_filter,
+                );
                 self.page.load.replaceLoaded(allocator, .{
                     .arena = arena,
                     .loaded = loaded,
@@ -1626,7 +1632,12 @@ pub const Controller = struct {
             .root = self.navigation.view().fileTreeRootOptions(),
             .stable_order = self.navigation.stableOrderOptions(app_allocator),
         });
-        try loaded.rebuildVisibleNodes(allocator, self.page.review_display.hide_reviewed_files, self.page.review_display.changed_file_filter);
+        try loaded.rebuildVisibleNodes(
+            allocator,
+            self.page.viewer.root_disclosure,
+            self.page.review_display.hide_reviewed_files,
+            self.page.review_display.changed_file_filter,
+        );
         if (self.page.pending_selection_restore != null and self.page.load.hasPending()) return;
         if (prefer_first_visible_file) {
             self.navigation.selectFirstVisibleFile(loaded);
@@ -1634,6 +1645,7 @@ pub const Controller = struct {
             if (previous_path_key) |path_key| {
                 if (navigation.findNodeByPathKey(loaded, path_key)) |node_index| {
                     self.navigation.selectSidebarNode(loaded, node_index);
+                    self.navigation.reconcileSelectionAfterVisibleNodeChange(loaded);
                     return;
                 }
             }
@@ -1665,7 +1677,12 @@ pub const Controller = struct {
             .bytes = 0,
             .lines = 0,
         };
-        try loaded.rebuildVisibleNodes(arena_allocator, false, self.page.review_display.changed_file_filter);
+        try loaded.rebuildVisibleNodes(
+            arena_allocator,
+            self.page.viewer.root_disclosure,
+            false,
+            self.page.review_display.changed_file_filter,
+        );
 
         self.advanceSourceSessionRevision(allocator);
         if (self.page.pending_display_navigation_restore) |*restore| {
