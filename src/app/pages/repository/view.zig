@@ -68,10 +68,8 @@ pub fn drawSource(
         const line_index = viewer.source_vertical_scroll + body_row;
         const row = geometry.body_first_row + @as(u16, @intCast(body_row));
         const current = line_index == viewer.source_cursor;
-        const base_style = sourcePaneStyle(if (current)
-            palette.boldStyle(.prompt)
-        else
-            palette.style(.foreground), source_active);
+        if (source_active and current) fillSourceCursorRow(surface, row, palette.color(.source_cursor_bg));
+        const base_style = sourceRowStyle(palette.style(.foreground), source_active, current, palette);
 
         const change = if (changes) |map| map.row(line_index) else .none;
         const gutter: []const u8 = if (change == .none) " " else "│";
@@ -80,12 +78,11 @@ pub fn drawSource(
             .added => .diff_added,
             .modified => .diff_modified,
         };
-        _ = surface.borrowTextAt(0, row, gutter, sourcePaneStyle(palette.style(gutter_role), source_active));
+        _ = surface.borrowTextAt(0, row, gutter, sourceRowStyle(palette.style(gutter_role), source_active, current, palette));
         if (viewer.line_numbers) {
             const number = try std.fmt.allocPrint(surface.frameAllocator(), "{d}", .{line_index + 1});
             const number_col: u16 = @intCast(@as(usize, geometry.line_number_col) + geometry.line_number_width - chasen.text.displayWidth(number));
-            const number_style = if (current) palette.boldStyle(.diff_cursor) else palette.style(.diff_line_number);
-            draw.copyClippedTextAt(surface, number_col, row, number, sourcePaneStyle(number_style, source_active)) catch {};
+            draw.copyClippedTextAt(surface, number_col, row, number, sourceRowStyle(palette.style(.diff_line_number), source_active, current, palette)) catch {};
         }
         if (geometry.text_width == 0) {
             applySelectionLineStyles(surface, geometry, row, document, line_index, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
@@ -116,7 +113,7 @@ pub fn drawSource(
                 geometry.text_width,
             )) |range| {
                 const match_col: u16 = @intCast(@as(usize, geometry.text_col) + range.column);
-                draw.copyClippedTextAt(surface, match_col, row, range.text, sourcePaneStyle(palette.boldStyle(.warning), source_active)) catch {};
+                draw.copyClippedTextAt(surface, match_col, row, range.text, sourceRowStyle(palette.boldStyle(.warning), source_active, current, palette)) catch {};
             }
         };
         applySelectionLineStyles(surface, geometry, row, document, line_index, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
@@ -320,6 +317,24 @@ pub fn sourcePaneStyle(style: chasen.TextStyle, active: bool) chasen.TextStyle {
     return composed;
 }
 
+/// Current-row presentation is active-source chrome. It contributes only a
+/// background, leaving semantic foreground ownership to gutter, syntax, and
+/// search. Inactive source content therefore has no false active-row signal.
+fn sourceRowStyle(style: chasen.TextStyle, active: bool, current: bool, palette: theme.Palette) chasen.TextStyle {
+    var composed = sourcePaneStyle(style, active);
+    if (active and current) composed.bg = palette.color(.source_cursor_bg);
+    return composed;
+}
+
+/// Prefill the whole physical row before semantic content is drawn so the
+/// cursor background also covers gutter lead-in and trailing blank cells.
+fn fillSourceCursorRow(surface: *chasen.Surface, row: u16, background: chasen.Color) void {
+    const style = chasen.TextStyle{ .bg = background };
+    for (0..surface.size().width) |col| {
+        _ = surface.borrowTextAt(@intCast(col), row, " ", style);
+    }
+}
+
 test "repository source view reserves gutter and renders plain text" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "const value = 1;\nsecond\n");
@@ -356,6 +371,10 @@ test "repository source gutter renders added and modified rows without moving te
     try test_surface.expectCellText(3, 3, "m");
     try std.testing.expectEqual(palette.color(.diff_added), test_surface.surface.readCell(0, 2).?.style.fg);
     try std.testing.expectEqual(palette.color(.diff_modified), test_surface.surface.readCell(0, 3).?.style.fg);
+    try std.testing.expect(!test_surface.surface.readCell(0, 2).?.style.bg.eql(palette.color(.source_cursor_bg)));
+    try std.testing.expect(test_surface.surface.readCell(0, 3).?.style.bg.eql(palette.color(.source_cursor_bg)));
+    try std.testing.expect(test_surface.surface.readCell(3, 3).?.style.bg.eql(palette.color(.source_cursor_bg)));
+    try std.testing.expect(test_surface.surface.readCell(39, 3).?.style.bg.eql(palette.color(.source_cursor_bg)));
 }
 
 test "repository empty source keeps one synthetic viewer row" {
@@ -481,8 +500,12 @@ test "repository source match overlay remains distinct on the cursor line" {
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source, .source_cursor = 0 }, search, null, palette);
     const match_cell = test_surface.surface.readCell(7, 2) orelse return error.ExpectedMatchCell;
     const plain_cell = test_surface.surface.readCell(3, 2) orelse return error.ExpectedPlainCell;
-    try std.testing.expectEqual(palette.boldStyle(.warning), match_cell.style);
-    try std.testing.expectEqual(palette.boldStyle(.prompt), plain_cell.style);
+    try std.testing.expect(match_cell.style.fg.eql(palette.color(.warning)));
+    try std.testing.expect(match_cell.style.bold);
+    try std.testing.expect(match_cell.style.bg.eql(palette.color(.source_cursor_bg)));
+    try std.testing.expect(plain_cell.style.fg.eql(palette.color(.foreground)));
+    try std.testing.expect(!plain_cell.style.bold);
+    try std.testing.expect(plain_cell.style.bg.eql(palette.color(.source_cursor_bg)));
 }
 
 test "repository source syntax uses neutral styles below the search overlay" {
@@ -513,9 +536,12 @@ test "repository source syntax uses neutral styles below the search overlay" {
     const comment_cell = syntax_surface.surface.readCell(3, 3) orelse return error.ExpectedCommentCell;
     const foreground_cell = syntax_surface.surface.readCell(3, 4) orelse return error.ExpectedForegroundCell;
     try std.testing.expectEqual(palette.color(.accent), keyword_cell.style.fg);
-    try std.testing.expectEqual(palette.color(.prompt), plain_cell.style.fg);
+    try std.testing.expectEqual(palette.color(.foreground), plain_cell.style.fg);
     try std.testing.expectEqual(palette.color(.muted), comment_cell.style.fg);
     try std.testing.expectEqual(palette.color(.foreground), foreground_cell.style.fg);
+    try std.testing.expect(keyword_cell.style.bg.eql(palette.color(.source_cursor_bg)));
+    try std.testing.expect(plain_cell.style.bg.eql(palette.color(.source_cursor_bg)));
+    try std.testing.expect(!comment_cell.style.bg.eql(palette.color(.source_cursor_bg)));
 
     var search_surface: chasen.testing.TestSurface = undefined;
     try search_surface.init(24, 4);
@@ -605,6 +631,98 @@ test "repository inactive source dims without replacing semantic foregrounds" {
     try std.testing.expect(inactive.surface.readCell(geometry.text_col + 6, body_row).?.style.bold);
 }
 
+test "repository source cursor row composes semantic overlays and active-only background" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "const value plain\nsecond\n");
+    var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    var candidates = [_]source_syntax.Candidate{.{
+        .line_index = 0,
+        .span = .{ .start = 0, .end = 5, .role = .keyword },
+    }};
+    var spans = try source_syntax.build(allocator, &document, &candidates);
+    defer spans.deinit(allocator);
+    var changes = repository_change_map.Map{
+        .rows = try allocator.dupe(repository_change_map.Kind, &.{ .modified, .none }),
+    };
+    defer changes.deinit(allocator);
+    const search: model.SourceSearchState = .{
+        .match = .{ .line = 0, .start = 6, .end = 11 },
+    };
+    const token: selection.RepositoryContentToken = .{
+        .repo_epoch = 1,
+        .root_identity = .{ .device = 2, .inode = 3 },
+        .path = "main.zig",
+        .source_fingerprint = document.fingerprint,
+    };
+    var live = selection.DragSelection.init(token, .character, selection.pointFromBoundary(0, 12));
+    live.update(selection.pointFromBoundary(0, 17));
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.source_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
+
+    var active: chasen.testing.TestSurface = undefined;
+    try active.init(30, 5);
+    defer active.deinit();
+    try drawSource(
+        &active.surface,
+        &document,
+        &spans,
+        &changes,
+        .{ .focus = .source, .source_cursor = 0 },
+        search,
+        live,
+        palette,
+    );
+
+    const geometry = source_geometry.SourceGeometry.init(active.surface.size(), &document, true);
+    const cursor_row = geometry.body_first_row;
+    const gutter = active.surface.readCell(0, cursor_row) orelse return error.ExpectedCursorGutter;
+    const line_number = active.surface.readCell(geometry.line_number_col, cursor_row) orelse return error.ExpectedCursorLineNumber;
+    const keyword = active.surface.readCell(geometry.text_col, cursor_row) orelse return error.ExpectedCursorKeyword;
+    const searched = active.surface.readCell(geometry.text_col + 6, cursor_row) orelse return error.ExpectedCursorSearch;
+    const selected = active.surface.readCell(geometry.text_col + 12, cursor_row) orelse return error.ExpectedCursorSelection;
+    const trailing = active.surface.readCell(29, cursor_row) orelse return error.ExpectedCursorTrailingCell;
+    try std.testing.expect(gutter.style.fg.eql(palette.color(.diff_modified)));
+    try std.testing.expect(line_number.style.fg.eql(palette.color(.diff_line_number)));
+    try std.testing.expect(!line_number.style.bold);
+    try std.testing.expect(keyword.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(searched.style.fg.eql(palette.color(.warning)));
+    try std.testing.expect(searched.style.bold);
+    for ([_]chasen.TextStyle{ gutter.style, line_number.style, keyword.style, searched.style, trailing.style }) |style| {
+        try std.testing.expect(style.bg.eql(palette.color(.source_cursor_bg)));
+    }
+    try std.testing.expect(selected.style.fg.eql(palette.color(.foreground)));
+    try std.testing.expect(selected.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(!active.surface.readCell(0, cursor_row + 1).?.style.bg.eql(palette.color(.source_cursor_bg)));
+
+    var inactive: chasen.testing.TestSurface = undefined;
+    try inactive.init(30, 5);
+    defer inactive.deinit();
+    try drawSource(
+        &inactive.surface,
+        &document,
+        &spans,
+        &changes,
+        .{ .focus = .tree, .source_cursor = 0 },
+        search,
+        null,
+        palette,
+    );
+    for ([_]struct { col: u16, role: theme.Role }{
+        .{ .col = 0, .role = .diff_modified },
+        .{ .col = geometry.line_number_col, .role = .diff_line_number },
+        .{ .col = geometry.text_col, .role = .accent },
+        .{ .col = geometry.text_col + 6, .role = .warning },
+    }) |point| {
+        const cell = inactive.surface.readCell(point.col, cursor_row) orelse return error.ExpectedInactiveCursorCell;
+        try std.testing.expect(cell.style.fg.eql(palette.color(point.role)));
+        try std.testing.expect(cell.style.dim);
+        try std.testing.expect(!cell.style.bg.eql(palette.color(.source_cursor_bg)));
+    }
+    try std.testing.expect(!inactive.surface.readCell(29, cursor_row).?.style.bg.eql(palette.color(.source_cursor_bg)));
+}
+
 test "repository selection slice B background composes after cursor syntax and search styles" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "const value plain\n");
@@ -648,10 +766,12 @@ test "repository selection slice B background composes after cursor syntax and s
     try std.testing.expectEqual(palette.color(.accent), keyword.style.fg);
     try std.testing.expectEqual(palette.color(.warning), searched.style.fg);
     try std.testing.expect(searched.style.bold);
-    try std.testing.expectEqual(palette.color(.prompt), plain.style.fg);
+    try std.testing.expectEqual(palette.color(.foreground), plain.style.fg);
     try std.testing.expect(keyword.style.bg.eql(palette.color(.diff_cursor)));
     try std.testing.expect(searched.style.bg.eql(palette.color(.diff_cursor)));
     try std.testing.expect(plain.style.bg.eql(palette.color(.diff_cursor)));
+    const trailing = test_surface.surface.readCell(29, geometry.body_first_row) orelse return error.ExpectedCursorTrailingCell;
+    try std.testing.expect(trailing.style.bg.eql(palette.color(.source_cursor_bg)));
 }
 
 test "repository selection slice B whole-line style covers gutter numbers body and trailing cells" {
