@@ -8,10 +8,13 @@ const std = @import("std");
 const chasen = @import("chasen");
 const source = @import("../../../repository/source.zig");
 
-// Search and status occupy the two rows above the source body. Keep the
-// literal here so drawing, input, navigation, and tests consume the accepted
-// geometry value instead of independently knowing the header height.
-const source_body_first_row: u16 = 2;
+/// Fixed Repository source chrome. The accepted path owns row 0, while source
+/// search presentation or the normal separator exclusively owns row 1.
+/// Drawing and input both consume `source_body_first_row`, so neither chrome
+/// row can accidentally become selectable source content.
+pub const source_path_row: u16 = 0;
+pub const source_search_or_rule_row: u16 = 1;
+pub const source_body_first_row: u16 = 2;
 
 pub const Region = enum {
     gutter,
@@ -102,6 +105,8 @@ test "repository selection slice B geometry shares narrow line number and body b
     try std.testing.expectEqual(Region.line_number, numbered.regionAt(2).?);
     try std.testing.expectEqual(Region.separator, numbered.regionAt(3).?);
     try std.testing.expectEqual(Region.text, numbered.regionAt(4).?);
+    try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(source_path_row, 0, &document));
+    try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(source_search_or_rule_row, 0, &document));
     try std.testing.expectEqual(@as(?usize, 0), numbered.contentLineAt(numbered.body_first_row, 0, &document));
     try std.testing.expectEqual(@as(?usize, 1), numbered.contentLineAt(numbered.body_first_row + 1, 0, &document));
     try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(numbered.height, 0, &document));

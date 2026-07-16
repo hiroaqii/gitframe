@@ -20,6 +20,31 @@ pub fn sourceTextWidth(width: u16, document: *const source.Document, line_number
     return source_geometry.SourceGeometry.init(.{ .width = width, .height = 0 }, document, line_numbers).text_width;
 }
 
+/// Draws the fixed two-row Repository source header. Search presentation owns
+/// row 1 whenever a query is active or retained; otherwise the row is a
+/// non-interactive separator. Keeping the choice here prevents the normal rule
+/// from being painted underneath search text by separate callers.
+pub fn drawSourceHeader(
+    surface: *chasen.Surface,
+    path: []const u8,
+    search: model.SourceSearchState,
+    palette: theme.Palette,
+) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+    const path_window = try manifest.displayWindowAlloc(surface.frameAllocator(), path, 0, size.width -| 1);
+    draw.copyClippedTextAt(surface, 1, source_geometry.source_path_row, path_window.text(), palette.boldStyle(.accent)) catch {};
+    if (size.height <= source_geometry.source_search_or_rule_row) return;
+    if (drawSearchRow(surface, search, palette)) return;
+    const style = sourceHeaderRuleStyle(palette);
+    for (0..size.width) |col| {
+        _ = surface.borrowTextAt(@intCast(col), source_geometry.source_search_or_rule_row, "─", style);
+    }
+}
+
+/// Draws source content only. Header rendering stays separate so file-search
+/// takeover can replace the entire right pane without partially drawing the
+/// accepted path or separator first.
 pub fn drawSource(
     surface: *chasen.Surface,
     document: *const source.Document,
@@ -32,7 +57,6 @@ pub fn drawSource(
 ) !void {
     const size = surface.size();
     if (size.height == 0 or size.width == 0) return;
-    drawSearchRow(surface, search, palette);
     const geometry = source_geometry.SourceGeometry.init(size, document, viewer.line_numbers);
     if (size.height <= geometry.body_first_row) return;
 
@@ -262,16 +286,22 @@ fn fileSearchWindowStart(focused: usize, len: usize, visible_rows: usize) usize 
     return if (clamped_focus < visible_rows) 0 else clamped_focus - visible_rows + 1;
 }
 
-fn drawSearchRow(surface: *chasen.Surface, search: model.SourceSearchState, palette: theme.Palette) void {
-    if (surface.size().height <= 1) return;
+fn drawSearchRow(surface: *chasen.Surface, search: model.SourceSearchState, palette: theme.Palette) bool {
+    if (!search.mode and search.query.len == 0) return false;
+    if (surface.size().height <= source_geometry.source_search_or_rule_row) return true;
     if (search.mode) {
-        const text = std.fmt.allocPrint(surface.frameAllocator(), "/{s}", .{search.input.slice()}) catch return;
-        draw.copyClippedTextAt(surface, 1, 1, text, palette.boldStyle(.prompt)) catch {};
+        const text = std.fmt.allocPrint(surface.frameAllocator(), "/{s}", .{search.input.slice()}) catch return true;
+        draw.copyClippedTextAt(surface, 1, source_geometry.source_search_or_rule_row, text, palette.boldStyle(.prompt)) catch {};
     } else if (search.query.len > 0) {
         const prefix = if (search.match != null) "match: " else "no match: ";
-        const text = std.fmt.allocPrint(surface.frameAllocator(), "{s}{s}", .{ prefix, search.query.slice() }) catch return;
-        draw.copyClippedTextAt(surface, 1, 1, text, palette.style(if (search.match != null) .muted else .warning)) catch {};
+        const text = std.fmt.allocPrint(surface.frameAllocator(), "{s}{s}", .{ prefix, search.query.slice() }) catch return true;
+        draw.copyClippedTextAt(surface, 1, source_geometry.source_search_or_rule_row, text, palette.style(if (search.match != null) .muted else .warning)) catch {};
     }
+    return true;
+}
+
+fn sourceHeaderRuleStyle(palette: theme.Palette) chasen.TextStyle {
+    return .{ .fg = palette.color(.muted), .dim = true };
 }
 
 test "repository source view reserves gutter and renders plain text" {
@@ -339,6 +369,35 @@ test "repository source geometry handles narrow line-number transitions" {
     try std.testing.expectEqual(@as(u16, 0), sourceTextWidth(1, &ten, true));
 }
 
+test "repository source header renders path above a full fixed separator" {
+    const palette: theme.Palette = .default();
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(24, source_geometry.source_body_first_row);
+    defer test_surface.deinit();
+
+    try drawSourceHeader(&test_surface.surface, "src/main.zig", .{}, palette);
+    const snapshot = try test_surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/main.zig") != null);
+    for (0..test_surface.surface.size().width) |col| {
+        const cell = test_surface.surface.readCell(@intCast(col), source_geometry.source_search_or_rule_row) orelse
+            return error.ExpectedSourceHeaderRuleCell;
+        try std.testing.expectEqualStrings("─", cell.char.grapheme);
+        try std.testing.expect(cell.style.fg.eql(palette.color(.muted)));
+        try std.testing.expect(cell.style.dim);
+    }
+}
+
+test "repository source header truncates safely to the path row" {
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(2, 1);
+    defer test_surface.deinit();
+
+    try drawSourceHeader(&test_surface.surface, "a", .{}, .default());
+    try test_surface.expectCellText(1, source_geometry.source_path_row, "a");
+    try std.testing.expect(test_surface.surface.readCell(0, source_geometry.source_search_or_rule_row) == null);
+}
+
 test "repository source search checkpoint appears without moving source rows" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "first\nsecond\n");
@@ -348,9 +407,12 @@ test "repository source search checkpoint appears without moving source rows" {
     try test_surface.init(32, 6);
     defer test_surface.deinit();
 
+    try drawSourceHeader(&test_surface.surface, "src/main.zig", .{}, .default());
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, null, .default());
     var snapshot = try test_surface.snapshot(allocator);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "/needle") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/main.zig") != null);
+    try test_surface.expectCellText(0, source_geometry.source_search_or_rule_row, "─");
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 first") != null);
     allocator.free(snapshot);
 
@@ -358,11 +420,34 @@ test "repository source search checkpoint appears without moving source rows" {
     try test_surface.init(32, 6);
     var search: model.SourceSearchState = .{ .mode = true };
     try search.input.insertSlice("needle");
+    try drawSourceHeader(&test_surface.surface, "src/main.zig", search, .default());
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, search, null, .default());
     snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "/needle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "─") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 first") != null);
+}
+
+test "repository source retained search result replaces the normal separator" {
+    const palette: theme.Palette = .default();
+    var search: model.SourceSearchState = .{
+        .match = .{ .line = 0, .start = 0, .end = 6 },
+    };
+    try search.query.insertSlice("needle");
+
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(28, source_geometry.source_body_first_row);
+    defer test_surface.deinit();
+    try drawSourceHeader(&test_surface.surface, "src/main.zig", search, palette);
+
+    const snapshot = try test_surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "match: needle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "─") == null);
+    const status_cell = test_surface.surface.readCell(1, source_geometry.source_search_or_rule_row) orelse
+        return error.ExpectedSourceSearchStatusCell;
+    try std.testing.expect(status_cell.style.fg.eql(palette.color(.muted)));
 }
 
 test "repository source match overlay remains distinct on the cursor line" {

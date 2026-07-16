@@ -2484,9 +2484,10 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         return;
     }
     if (state.selected_path) |path| {
-        const path_window = try manifest.displayWindowAlloc(surface.frameAllocator(), path, 0, right.size().width -| 1);
-        draw.copyClippedTextAt(&right, 1, 0, path_window.text(), context.palette.boldStyle(.accent)) catch {};
-        if (size.height > 2) try drawDocumentCheckpoint(state, path, &right, context.palette);
+        try repository_view.drawSourceHeader(&right, path, state.source_search, context.palette);
+        if (size.height > repository_source_geometry.source_body_first_row) {
+            try drawDocumentCheckpoint(state, path, &right, context.palette);
+        }
     } else {
         draw.copyClippedTextAt(&right, 1, 0, "No file selected", context.palette.style(.muted)) catch {};
     }
@@ -2519,11 +2520,11 @@ fn drawDocumentCheckpoint(
     palette: theme.Palette,
 ) !void {
     const displayed = state.displayed_document orelse {
-        draw.copyClippedTextAt(surface, 1, 2, "Loading selected file...", palette.style(.muted)) catch {};
+        draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, "Loading selected file...", palette.style(.muted)) catch {};
         return;
     };
     if (displayed.manifest_revision != state.manifest_revision or !std.mem.eql(u8, displayed.path, selected_path)) {
-        draw.copyClippedTextAt(surface, 1, 2, "Loading selected file...", palette.style(.muted)) catch {};
+        draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, "Loading selected file...", palette.style(.muted)) catch {};
         return;
     }
     switch (displayed.value) {
@@ -2568,7 +2569,7 @@ fn drawInertCheckpoint(value: selected_document.Value, surface: *chasen.Surface,
         .missing_or_changed => "File changed or disappeared; press r to retry",
         .unreadable, .unsupported_platform => "Selected file could not be read",
     };
-    draw.copyClippedTextAt(surface, 1, 2, label, palette.style(.muted)) catch {};
+    draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, label, palette.style(.muted)) catch {};
 }
 
 fn treeRowTextAlloc(
@@ -4668,6 +4669,49 @@ test "repository page renders tree and selected-document loading checkpoint" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading selected file") != null);
     const non_selected_file = test_surface.surface.readCell(7, 3) orelse return error.ExpectedFileCell;
     try std.testing.expectEqual(theme.Palette.default().color(.foreground), non_selected_file.style.fg);
+    const layout = bodyLayout(test_surface.surface.size());
+    try test_surface.expectCellText(
+        layout.tree_width + 2,
+        repository_source_geometry.source_body_first_row,
+        "L",
+    );
+    const source_rule = test_surface.surface.readCell(layout.tree_width + 1, repository_source_geometry.source_search_or_rule_row) orelse
+        return error.ExpectedSourceHeaderRuleCell;
+    try std.testing.expectEqualStrings("─", source_rule.char.grapheme);
+    try std.testing.expect(source_rule.style.fg.eql(theme.Palette.default().color(.muted)));
+    try std.testing.expect(source_rule.style.dim);
+}
+
+test "repository page anchors inert checkpoint below source header rule" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("binary.dat\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    state.displayed_document = .{
+        .path = try allocator.dupe(u8, state.selected_path.?),
+        .manifest_revision = state.manifest_revision,
+        .value = .{ .inert = .binary },
+    };
+
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(60, 8);
+    defer test_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+
+    const layout = bodyLayout(test_surface.surface.size());
+    try test_surface.expectCellText(
+        layout.tree_width + 2,
+        repository_source_geometry.source_body_first_row,
+        "B",
+    );
+    const source_rule = test_surface.surface.readCell(layout.tree_width + 1, repository_source_geometry.source_search_or_rule_row) orelse
+        return error.ExpectedSourceHeaderRuleCell;
+    try std.testing.expectEqualStrings("─", source_rule.char.grapheme);
+    try std.testing.expect(source_rule.style.fg.eql(theme.Palette.default().color(.muted)));
+    try std.testing.expect(source_rule.style.dim);
 }
 
 test "repository changed view distinguishes loading unavailable and no-match states" {
