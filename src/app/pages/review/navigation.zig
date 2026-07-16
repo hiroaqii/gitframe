@@ -1683,6 +1683,137 @@ pub const Controller = struct {
         return false;
     }
 
+    pub fn prepareActionCursor(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        repo_epoch: u64,
+        root_identity: root_capability.Identity,
+        kind: review_page.action_cursor.TargetKind,
+        path_key: []const u8,
+    ) !review_page.action_cursor.Prepared {
+        const visible_row = if (self.view().activeLoadedDiffConst()) |loaded|
+            loaded.visibleRowOfNode(self.page.viewer.selected_node) orelse 0
+        else
+            0;
+        return review_page.action_cursor.Prepared.init(
+            allocator,
+            repo_epoch,
+            root_identity,
+            kind,
+            path_key,
+            visible_row,
+        );
+    }
+
+    pub fn installActionCursor(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        prepared: *review_page.action_cursor.Prepared,
+        action_generation: u64,
+    ) void {
+        self.page.action_cursor.install(allocator, prepared, action_generation);
+    }
+
+    pub fn clearActionCursor(self: Controller, allocator: std.mem.Allocator) void {
+        self.page.action_cursor.clear(allocator);
+    }
+
+    /// Rebind the tree cursor after one member replaces the tree, but retain
+    /// the action owner until the exact source/status pair is terminal.
+    pub fn remapActionCursor(self: Controller, loaded: *LoadedDiff) bool {
+        const target = self.page.action_cursor.target() orelse return false;
+        return self.restoreTypedActionTarget(loaded, target, false);
+    }
+
+    /// Consume one terminal action owner and restore its typed target exactly
+    /// once against the final coherent projection.
+    pub fn finalizeActionCursor(self: Controller, allocator: std.mem.Allocator) bool {
+        var owner = self.page.action_cursor.takeTerminal() orelse return false;
+        defer owner.deinit(allocator);
+        const loaded = self.activeLoadedDiff() orelse return true;
+        _ = self.restoreTypedActionTarget(loaded, &owner.target, true);
+        self.clampSelection(loaded.document.files.len);
+        self.clampDiffNavigation();
+        return true;
+    }
+
+    fn restoreTypedActionTarget(
+        self: Controller,
+        loaded: *LoadedDiff,
+        target: *const review_page.action_cursor.Target,
+        final: bool,
+    ) bool {
+        if (typedActionNode(loaded, target)) |node_index| {
+            if (loaded.visibleRowOfNode(node_index) != null) {
+                self.selectSidebarNode(loaded, node_index);
+                return true;
+            }
+            if (final and self.actionTargetIncludedByFilters(loaded, node_index)) {
+                if (self.revealActionNode(loaded, node_index)) {
+                    self.selectSidebarNode(loaded, node_index);
+                    return true;
+                }
+            }
+        }
+
+        if (target.kind == .directory or target.kind == .repository_root) {
+            if (deepestVisibleTypedAncestor(loaded, target.path_key)) |node_index| {
+                self.selectSidebarNode(loaded, node_index);
+                return true;
+            }
+            return false;
+        }
+
+        if (loaded.visibleNodeCount() == 0) {
+            self.page.viewer.selected_target = null;
+            self.page.viewer.selected_node = 0;
+            return true;
+        }
+        const row = @min(target.visible_row, loaded.visibleNodeCount() - 1);
+        if (nearestVisibleFileNode(loaded, row)) |node_index| {
+            self.selectSidebarNode(loaded, node_index);
+            return true;
+        }
+        return false;
+    }
+
+    fn actionTargetIncludedByFilters(self: Controller, loaded: *const LoadedDiff, node_index: usize) bool {
+        if (node_index >= loaded.tree.nodes.len) return false;
+        const node = loaded.tree.nodes[node_index];
+        return switch (node.kind) {
+            .file => loaded.shouldIncludeFileNode(
+                node_index,
+                self.page.review_display.hide_reviewed_files,
+                self.page.review_display.changed_file_filter,
+            ),
+            .repo_root, .directory => blk: {
+                for (loaded.tree.nodes, 0..) |candidate, candidate_index| {
+                    if (candidate.kind != .file) continue;
+                    if (node.kind == .directory and !file_tree.isPathAncestor(node.path, candidate.path)) continue;
+                    if (loaded.shouldIncludeFileNode(
+                        candidate_index,
+                        self.page.review_display.hide_reviewed_files,
+                        self.page.review_display.changed_file_filter,
+                    )) break :blk true;
+                }
+                break :blk false;
+            },
+        };
+    }
+
+    fn revealActionNode(self: Controller, loaded: *LoadedDiff, node_index: usize) bool {
+        const allocator = self.loadArenaAllocator() orelse return false;
+        var prepared = loaded.prepareVisibleNodeRebuild(allocator) catch return false;
+        self.page.viewer.root_disclosure = .expanded;
+        file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
+        prepared.commit(
+            self.page.viewer.root_disclosure,
+            self.page.review_display.hide_reviewed_files,
+            self.page.review_display.changed_file_filter,
+        );
+        return loaded.visibleRowOfNode(node_index) != null;
+    }
+
     pub fn restoreReloadAnchor(self: Controller, loaded: *LoadedDiff, anchor: *const review_page.ReloadAnchor) bool {
         const selected_same_path = if (findNodeByPathKey(loaded, anchor.path_key)) |node_index| blk: {
             self.selectSidebarNode(loaded, node_index);
@@ -2098,6 +2229,48 @@ pub fn findNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize
         if (std.mem.eql(u8, node_key, path_key)) return index;
     }
     return null;
+}
+
+fn typedActionNode(
+    loaded: *const LoadedDiff,
+    target: *const review_page.action_cursor.Target,
+) ?usize {
+    for (loaded.tree.nodes, 0..) |node, index| {
+        const kind_matches = switch (target.kind) {
+            .repository_root => node.kind == .repo_root,
+            .directory => node.kind == .directory,
+            .file => node.kind == .file,
+        };
+        if (!kind_matches) continue;
+        if (target.kind == .repository_root) return index;
+        const node_key = if (node.path_key.len > 0) node.path_key else node.path;
+        if (std.mem.eql(u8, node_key, target.path_key)) return index;
+    }
+    return null;
+}
+
+/// Honest transient/final fallback for directory-like action targets. The
+/// deepest materialized directory ancestor wins; the typed repository root is
+/// the last fallback. A nearby file is never substituted.
+fn deepestVisibleTypedAncestor(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
+    var best_directory: ?usize = null;
+    var best_len: usize = 0;
+    var root: ?usize = null;
+    for (loaded.tree.nodes, 0..) |node, index| {
+        if (loaded.visibleRowOfNode(index) == null) continue;
+        switch (node.kind) {
+            .repo_root => root = index,
+            .directory => {
+                if (!file_tree.isPathAncestor(node.path, path_key)) continue;
+                if (node.path.len >= best_len) {
+                    best_directory = index;
+                    best_len = node.path.len;
+                }
+            },
+            .file => {},
+        }
+    }
+    return best_directory orelse root;
 }
 
 fn findFileNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
@@ -4823,6 +4996,197 @@ test "pending file restore keeps cursor on materialized collapsed repository roo
     loaded = app.reviewNavigation().loadedDiff().?;
     try std.testing.expect(app.reviewNavigation().restorePendingSelectionByPath(std.testing.allocator, loaded));
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+}
+
+test "typed action cursor remaps a directory without changing the sticky diff target" {
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_node = 1,
+            },
+        } },
+    };
+    defer app.pages.review.action_cursor.deinit(std.testing.allocator);
+
+    var prepared = try review_page.action_cursor.Prepared.init(
+        std.testing.allocator,
+        3,
+        .{ .device = 5, .inode = 8 },
+        .directory,
+        "src",
+        1,
+    );
+    app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
+    const loaded = app.reviewNavigation().loadedDiff().?;
+
+    try std.testing.expect(app.reviewNavigation().remapActionCursor(loaded));
+    try std.testing.expect(app.pages.review.action_cursor.hasOwner());
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+}
+
+test "typed action cursor remaps a repository root without changing the sticky diff target" {
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root },
+        .{ .kind = .file, .name = "main.zig", .path = "src/main.zig", .path_key = "src/main.zig", .depth = 1, .target = .{ .diff_file = 0 } },
+    };
+    var visible_nodes = [_]usize{ 0, 1 };
+    const loaded: LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &app_test_support.files_one },
+        .file_text_eligibility = &.{.selectable_utf8},
+        .tree = .{ .nodes = &nodes },
+        .visible_nodes = &visible_nodes,
+        .visible_node_count = 2,
+        .bytes = 0,
+        .lines = 0,
+    };
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(loaded),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_node = 1,
+            },
+        } },
+    };
+    defer app.pages.review.action_cursor.deinit(std.testing.allocator);
+
+    var prepared = try review_page.action_cursor.Prepared.init(
+        std.testing.allocator,
+        3,
+        .{ .device = 5, .inode = 8 },
+        .repository_root,
+        "",
+        1,
+    );
+    app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
+
+    try std.testing.expect(app.reviewNavigation().remapActionCursor(app.reviewNavigation().loadedDiff().?));
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+}
+
+test "terminal directory action cursor reveals exact target under collapsed repository root" {
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 1 },
+                .selected_file = 1,
+                .selected_node = 0,
+            },
+        } },
+    };
+    defer app.clearLoadedDiff();
+    defer app.pages.review.action_cursor.deinit(std.testing.allocator);
+
+    try app.reviewNavigation().toggleSelectedDirectory();
+    const loaded = app.reviewNavigation().loadedDiff().?;
+    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
+
+    var prepared = try review_page.action_cursor.Prepared.init(
+        std.testing.allocator,
+        3,
+        .{ .device = 5, .inode = 8 },
+        .directory,
+        "src",
+        0,
+    );
+    app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
+    try std.testing.expect(app.pages.review.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }));
+    try std.testing.expect(app.pages.review.action_cursor.startMember(7, .source, 11));
+    try std.testing.expect(app.pages.review.action_cursor.startMember(7, .status, 12));
+    try std.testing.expect(app.pages.review.action_cursor.finishMember(7, 3, .status, 12, true));
+    try std.testing.expect(app.pages.review.action_cursor.finishMember(7, 3, .source, 11, true));
+
+    try std.testing.expect(app.reviewNavigation().finalizeActionCursor(std.testing.allocator));
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expectEqual(file_tree.RootDisclosure.expanded, loaded.root_disclosure);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+}
+
+test "filtered directory action cursor falls back to repository root instead of another file" {
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root },
+        .{ .kind = .directory, .name = "src", .path = "src", .depth = 1 },
+        .{ .kind = .file, .name = "a", .path = "src/a", .depth = 2, .target = .{ .diff_file = 0 }, .status = .modified },
+        .{ .kind = .directory, .name = "lib", .path = "lib", .depth = 1 },
+        .{ .kind = .file, .name = "b", .path = "lib/b", .depth = 2, .target = .{ .diff_file = 1 }, .status = .added },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var loaded = app_test_support.loadedDiffTwo();
+    loaded.tree = .{ .nodes = &nodes };
+    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .added);
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, loaded),
+            .review_display = .{ .changed_file_filter = .added },
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_file = 0,
+                .selected_node = 0,
+            },
+        } },
+    };
+    defer app.clearLoadedDiff();
+    defer app.pages.review.action_cursor.deinit(std.testing.allocator);
+
+    var prepared = try review_page.action_cursor.Prepared.init(
+        std.testing.allocator,
+        3,
+        .{ .device = 5, .inode = 8 },
+        .directory,
+        "src",
+        0,
+    );
+    app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
+    try std.testing.expect(app.pages.review.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }));
+    try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(7, .source));
+    try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(7, .status));
+
+    try std.testing.expect(app.reviewNavigation().finalizeActionCursor(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(file_tree.Node.Kind.repo_root, app.reviewNavigation().loadedDiff().?.tree.nodes[0].kind);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+}
+
+test "disappeared file action cursor keeps the existing nearest-file fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var loaded = app_test_support.loadedDiffRootedNested();
+    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, loaded),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_file = 0,
+                .selected_node = 2,
+            },
+        } },
+    };
+    defer app.clearLoadedDiff();
+    defer app.pages.review.action_cursor.deinit(std.testing.allocator);
+
+    var prepared = try review_page.action_cursor.Prepared.init(
+        std.testing.allocator,
+        3,
+        .{ .device = 5, .inode = 8 },
+        .file,
+        "src/discarded.zig",
+        3,
+    );
+    app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
+    try std.testing.expect(app.pages.review.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }));
+    try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(7, .source));
+    try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(7, .status));
+
+    try std.testing.expect(app.reviewNavigation().finalizeActionCursor(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 

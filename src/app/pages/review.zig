@@ -185,6 +185,7 @@ pub const ReviewPageState = struct {
     tree_order: file_tree.StableOrder = .{},
     tree_order_scope: ?[]u8 = null,
     pending_selection_restore: ?app_state.PendingSelectionRestore = null,
+    action_cursor: action_cursor.State = .{},
     reviewed_store: review_state.Store = .{},
     selection_owner: diff_selection.Owner = .none,
     completed_selection: ?review_selection.CompletedSelection = null,
@@ -213,6 +214,7 @@ pub const ReviewPageState = struct {
         self.tree_order.deinit(allocator);
         if (self.tree_order_scope) |scope| allocator.free(scope);
         if (self.pending_selection_restore) |*restore| restore.deinit(allocator);
+        self.action_cursor.deinit(allocator);
         if (self.pending_reload) |*pending| pending.deinit(allocator);
         if (self.pending_display_navigation_restore) |*restore| restore.deinit(allocator);
         self.* = .{};
@@ -239,6 +241,15 @@ test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
         .path_key = try allocator.dupe(u8, "src/main.zig"),
         .visible_row = 3,
     };
+    var prepared_cursor = try action_cursor.Prepared.init(
+        allocator,
+        2,
+        .{ .device = 3, .inode = 5 },
+        .file,
+        "src/main.zig",
+        3,
+    );
+    state.action_cursor.install(allocator, &prepared_cursor, 11);
     state.pending_reload = .{
         .generation = 7,
         .kind = .manual,
@@ -290,6 +301,7 @@ test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
     try std.testing.expect(state.deferred_source_apply == null);
     try std.testing.expect(state.tree_order_scope == null);
     try std.testing.expect(state.pending_selection_restore == null);
+    try std.testing.expect(!state.action_cursor.hasOwner());
     try std.testing.expect(state.pending_reload == null);
     try std.testing.expect(state.pending_display_navigation_restore == null);
 }
