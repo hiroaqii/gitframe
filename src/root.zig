@@ -56,6 +56,7 @@ test {
     _ = @import("app/pages/repository/navigation.zig");
     _ = @import("app/pages/repository/selection.zig");
     _ = @import("app/pages/repository/source_geometry.zig");
+    _ = @import("app/pages/repository/tree_projection.zig");
     _ = @import("app/pages/repository/view.zig");
     _ = @import("app/prompt.zig");
     _ = @import("app/push_retry.zig");
