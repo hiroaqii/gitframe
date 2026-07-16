@@ -2634,8 +2634,10 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     const tree = &state.bundle.?.tree;
     if (layout.tree_visible) {
         var left = surface.child(.{ .col = 0, .row = 0, .width = layout.tree_width, .height = size.height });
-        const tree_header: []const u8 = if (state.file_visibility == .changed) "Files [changed]" else "Files";
-        if (size.height > 2) draw.copyClippedTextAt(&left, 0, 2, tree_header, context.palette.boldStyle(.accent)) catch {};
+        const tree_header: []const u8 = if (state.file_visibility == .changed) " Files [changed]" else " Files";
+        // Match Review's literal leading-cell clipping. The ellipsis-producing
+        // text helper would turn a width-one title into `…` instead of blank.
+        if (size.height > 2) _ = left.borrowTextAt(0, 2, tree_header, context.palette.boldStyle(.accent));
         if (layout.tree_width < size.width) {
             var separator_style = context.palette.style(.muted);
             separator_style.dim = true;
@@ -4388,6 +4390,8 @@ test "repository tree cursor background follows active focus and preserves seman
     try active_surface.init(size.width, size.height);
     defer active_surface.deinit();
     try view(.{ .page_state = &state, .palette = palette }, &active_surface.surface);
+    try active_surface.expectCellText(0, 2, " ");
+    try active_surface.expectCellText(1, 2, "F");
     const active_header = active_surface.surface.readCell(0, 2) orelse return error.ExpectedTreeHeader;
     const active_root = active_surface.surface.readCell(0, root_row) orelse return error.ExpectedRoot;
     const active_directory = active_surface.surface.readCell(4, directory_row) orelse return error.ExpectedDirectory;
@@ -4461,6 +4465,8 @@ test "repository tree cursor background follows active focus and preserves seman
     try inactive_surface.init(size.width, size.height);
     defer inactive_surface.deinit();
     try view(.{ .page_state = &state, .palette = palette }, &inactive_surface.surface);
+    try inactive_surface.expectCellText(0, 2, " ");
+    try inactive_surface.expectCellText(1, 2, "F");
     const inactive_header = inactive_surface.surface.readCell(0, 2) orelse return error.ExpectedTreeHeader;
     const inactive_root = inactive_surface.surface.readCell(0, root_row) orelse return error.ExpectedRoot;
     const inactive_directory = inactive_surface.surface.readCell(4, directory_row) orelse return error.ExpectedDirectory;
@@ -5738,7 +5744,8 @@ test "repository accepted empty manifest renders the typed root at its mouse tar
     try expanded_surface.init(full_size.width, full_size.height);
     defer expanded_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &expanded_surface.surface);
-    try expanded_surface.expectCellText(0, 2, "F");
+    try expanded_surface.expectCellText(0, 2, " ");
+    try expanded_surface.expectCellText(1, 2, "F");
     try expanded_surface.expectCellText(0, 3, "▾");
     try expanded_surface.expectCellText(0, 4, "R");
     const expanded_snapshot = try expanded_surface.snapshot(allocator);
@@ -5765,11 +5772,25 @@ test "repository accepted empty manifest renders the typed root at its mouse tar
     try compact_surface.init(compact_size.width, compact_size.height);
     defer compact_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &compact_surface.surface);
-    try compact_surface.expectCellText(0, 2, "F");
+    try compact_surface.expectCellText(0, 2, " ");
+    try compact_surface.expectCellText(1, 2, "F");
     const compact_snapshot = try compact_surface.snapshot(allocator);
     defer allocator.free(compact_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "empty-repo") == null);
     try std.testing.expectEqual(Msg.focus_tree, state.mouseToMsg(.{ .col = 0, .row = 2 }, .left, compact_size).?);
+
+    var width_one: chasen.testing.TestSurface = undefined;
+    try width_one.init(1, compact_size.height);
+    defer width_one.deinit();
+    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &width_one.surface);
+    try width_one.expectCellText(0, 2, " ");
+
+    var width_two: chasen.testing.TestSurface = undefined;
+    try width_two.init(2, compact_size.height);
+    defer width_two.deinit();
+    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &width_two.surface);
+    try width_two.expectCellText(0, 2, " ");
+    try width_two.expectCellText(1, 2, "F");
 }
 
 test "repository page renders tree and selected-document loading checkpoint" {
@@ -5879,6 +5900,8 @@ test "repository changed view distinguishes loading unavailable and no-match sta
         defer test_surface.deinit();
         const palette: theme.Palette = .default();
         try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+        try test_surface.expectCellText(0, 2, " ");
+        try test_surface.expectCellText(1, 2, "F");
         const layout = bodyLayout(.{ .width = 120, .height = 8 }, state.viewer.tree_width, state.viewer.tree_hidden);
         const message_cell = test_surface.surface.readCell(0, layout.header_rows + 1) orelse
             return error.ExpectedChangedFilesMessage;
