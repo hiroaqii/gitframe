@@ -2685,7 +2685,7 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         return;
     }
     if (state.selected_path) |path| {
-        try repository_view.drawSourceHeader(&right, path, state.source_search, state.viewer.focus == .source, context.palette);
+        try repository_view.drawSourceHeader(&right, path, state.source_search, context.palette);
         if (size.height > repository_source_geometry.source_body_first_row) {
             try drawDocumentCheckpoint(state, path, &right, context.palette);
         }
@@ -2695,7 +2695,7 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             1,
             0,
             "No file selected",
-            repository_view.sourcePaneStyle(context.palette.style(.muted), state.viewer.focus == .source),
+            context.palette.style(.muted),
         ) catch {};
     }
 }
@@ -2800,13 +2800,12 @@ fn drawDocumentCheckpoint(
     surface: *chasen.Surface,
     palette: theme.Palette,
 ) !void {
-    const source_active = state.viewer.focus == .source;
     const displayed = state.displayed_document orelse {
-        draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, "Loading selected file...", repository_view.sourcePaneStyle(palette.style(.muted), source_active)) catch {};
+        draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, "Loading selected file...", palette.style(.muted)) catch {};
         return;
     };
     if (displayed.manifest_revision != state.manifest_revision or !std.mem.eql(u8, displayed.path, selected_path)) {
-        draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, "Loading selected file...", repository_view.sourcePaneStyle(palette.style(.muted), source_active)) catch {};
+        draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, "Loading selected file...", palette.style(.muted)) catch {};
         return;
     }
     switch (displayed.value) {
@@ -2830,11 +2829,11 @@ fn drawDocumentCheckpoint(
             );
             return;
         },
-        .inert => |inert| drawInertCheckpoint(inert, surface, source_active, palette),
+        .inert => |inert| drawInertCheckpoint(inert, surface, palette),
     }
 }
 
-fn drawInertCheckpoint(value: selected_document.Value, surface: *chasen.Surface, active: bool, palette: theme.Palette) void {
+fn drawInertCheckpoint(value: selected_document.Value, surface: *chasen.Surface, palette: theme.Palette) void {
     const label: []const u8 = switch (value) {
         .text => unreachable,
         .symlink => |link| blk: {
@@ -2851,7 +2850,7 @@ fn drawInertCheckpoint(value: selected_document.Value, surface: *chasen.Surface,
         .missing_or_changed => "File changed or disappeared; press r to retry",
         .unreadable, .unsupported_platform => "Selected file could not be read",
     };
-    draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, label, repository_view.sourcePaneStyle(palette.style(.muted), active)) catch {};
+    draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, label, palette.style(.muted)) catch {};
 }
 
 fn treeRowTextAlloc(
@@ -5753,6 +5752,11 @@ test "repository accepted empty manifest renders the typed root at its mouse tar
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "Files") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "▾ empty-repo") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "Repository has no") != null);
+    const expanded_layout = bodyLayout(full_size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const no_file_cell = expanded_surface.surface.readCell(expanded_layout.source_col + 1, repository_source_geometry.source_path_row) orelse
+        return error.ExpectedNoFileSelectedCell;
+    try std.testing.expect(no_file_cell.style.fg.eql(theme.Palette.default().color(.muted)));
+    try std.testing.expect(!no_file_cell.style.dim);
 
     const root_click = state.mouseToMsg(.{ .col = 0, .row = 3 }, .left, full_size) orelse
         return error.ExpectedRootMouseTarget;
@@ -5822,11 +5826,11 @@ test "repository page renders tree and selected-document loading checkpoint" {
     const loading_cell = test_surface.surface.readCell(layout.source_col + 1, repository_source_geometry.source_body_first_row) orelse
         return error.ExpectedLoadingCheckpointCell;
     try std.testing.expect(loading_cell.style.fg.eql(theme.Palette.default().color(.muted)));
-    try std.testing.expect(loading_cell.style.dim);
+    try std.testing.expect(!loading_cell.style.dim);
     const inactive_path_cell = test_surface.surface.readCell(layout.source_col + 1, repository_source_geometry.source_path_row) orelse
         return error.ExpectedInactiveSourcePathCell;
     try std.testing.expect(inactive_path_cell.style.fg.eql(theme.Palette.default().color(.accent)));
-    try std.testing.expect(inactive_path_cell.style.dim);
+    try std.testing.expect(!inactive_path_cell.style.dim);
     const source_rule = test_surface.surface.readCell(layout.tree_width + 1, repository_source_geometry.source_search_or_rule_row) orelse
         return error.ExpectedSourceHeaderRuleCell;
     try std.testing.expectEqualStrings("─", source_rule.char.grapheme);
@@ -5874,7 +5878,7 @@ test "repository page anchors inert checkpoint below source header rule" {
     const inert_cell = test_surface.surface.readCell(layout.source_col + 1, repository_source_geometry.source_body_first_row) orelse
         return error.ExpectedInertCheckpointCell;
     try std.testing.expect(inert_cell.style.fg.eql(theme.Palette.default().color(.muted)));
-    try std.testing.expect(inert_cell.style.dim);
+    try std.testing.expect(!inert_cell.style.dim);
     const source_rule = test_surface.surface.readCell(layout.tree_width + 1, repository_source_geometry.source_search_or_rule_row) orelse
         return error.ExpectedSourceHeaderRuleCell;
     try std.testing.expectEqualStrings("─", source_rule.char.grapheme);
