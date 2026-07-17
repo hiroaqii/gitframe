@@ -211,13 +211,20 @@ pub const State = struct {
         self.filter.update(if (delta < 0) .move_prev else .move_next);
     }
 
-    pub fn focusedCandidate(self: *const State) ?Candidate {
+    /// Resolve one visible filter row through the owned candidate map.
+    /// Rendering and activation both use this boundary so neither can treat a
+    /// borrowed label as an independently authoritative destination.
+    pub fn candidateAt(self: *const State, visible_index: usize) ?Candidate {
         if (!self.projection_available) return null;
-        const candidate_index = self.filter.sourceIndex(self.filter.list.focusedIndex()) orelse return null;
+        const candidate_index = self.filter.sourceIndex(visible_index) orelse return null;
         if (candidate_index >= self.candidates.len) return null;
         const candidate = self.candidates[candidate_index];
         const basis = self.basis orelse return null;
         return if (candidate.basis.eql(basis)) candidate else null;
+    }
+
+    pub fn focusedCandidate(self: *const State) ?Candidate {
+        return self.candidateAt(self.filter.list.focusedIndex());
     }
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
@@ -263,6 +270,9 @@ test "review file search publishes and focuses one exact typed candidate" {
     defer state.deinit(allocator);
     state.publish(allocator, &projection);
 
+    try std.testing.expectEqualStrings("src/a.zig", state.candidateAt(0).?.path_key);
+    try std.testing.expectEqualStrings("src/b.zig", state.candidateAt(1).?.path_key);
+    try std.testing.expect(state.candidateAt(2) == null);
     try std.testing.expectEqual(TargetKind.diff_file, state.focusedCandidate().?.target_kind);
     state.move(1);
     const focused = state.focusedCandidate().?;

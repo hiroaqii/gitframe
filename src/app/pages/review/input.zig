@@ -130,9 +130,10 @@ test "search input owns editing navigation and paste" {
     try std.testing.expectEqualStrings("needle", pasteToMsg(context, "needle").?.search_paste);
 }
 
-test "file search input rejects non text modes" {
+test "file search input owns printable text and rejects unsupported navigation" {
     const context: Context = .{ .file_search_mode = true };
     try std.testing.expectEqual(Msg.file_search_backspace, keyToMsg(context, chasen.Key{ .codepoint = chasen.Key.backspace }).?);
+    try std.testing.expectEqual(Msg{ .file_search_insert = 'q' }, keyToMsg(context, chasen.Key{ .codepoint = 'q' }).?);
     try std.testing.expect(keyToMsg(context, chasen.Key{ .codepoint = chasen.Key.up }) == null);
 }
 

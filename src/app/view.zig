@@ -222,25 +222,17 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
     if (width == 0) return;
     const review_footer = app.review.footer();
 
-    if (app.active_page == .review and review_footer.file_search_mode) {
-        const label = "file: ";
-        const label_col: u16 = 1;
-        _ = surface.borrowTextAt(label_col, 0, label, app.theme.boldStyle(.prompt));
-        const input_col: u16 = label_col + @as(u16, @intCast(label.len));
-        _ = surface.copyTextAt(input_col, 0, review_footer.file_search_text, app.theme.style(.prompt)) catch {};
-        if (review_footer.file_search_no_match) {
-            const col: u16 = @intCast(@min(input_col + chasen.text.displayWidth(review_footer.file_search_text) + 1, std.math.maxInt(u16)));
-            if (surface.size().width > col) _ = surface.borrowTextAt(col, 0, "(no match)", app.theme.style(.danger));
-        }
-        return;
-    }
-
     var footer_item_storage: [8]ui.key_hint.Item = undefined;
     var footer_key_buffers: [8][16]u8 = undefined;
     const hint_items = footerItems(app, &footer_item_storage, &footer_key_buffers);
     const hint_width = ui.key_hint.width(hint_items, footerKeyHintOptions(app.theme));
-    const hint_col = if (width > hint_width + 1) width - hint_width - 1 else 0;
-    const left_limit = if (hint_col > 0) hint_col else width;
+    const hint_col = if (hint_items.len == 0)
+        width
+    else if (width > hint_width + 1)
+        width - hint_width - 1
+    else
+        0;
+    const left_limit = if (hint_items.len == 0 or hint_col == 0) width else hint_col;
 
     var footer_segments = FooterSegments{};
     footer_segments.append(.{
@@ -292,7 +284,7 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
     footer_segments.render(&left_area, left_limit);
 
     const draw_col = if (hint_col > 0) hint_col else footer_segments.endCol();
-    if (width > draw_col) {
+    if (hint_items.len > 0 and width > draw_col) {
         var hint_area = surface.child(.{
             .col = draw_col,
             .row = 0,
@@ -1230,7 +1222,9 @@ fn footerItems(app: Context, storage: *[8]ui.key_hint.Item, key_buffers: *[8][16
         len += 1;
         return storage[0..len];
     }
-    if (app.review.footer().sidebar_hidden) {
+    const review_footer = app.review.footer();
+    if (!review_footer.normal_action_hints_enabled) return storage[0..0];
+    if (review_footer.sidebar_hidden) {
         appendFooterItem(app, storage, key_buffers, &len, .toggle_sidebar, "sidebar");
     } else {
         storage[len] = ui.key_hint.item("Tab", "focus");
@@ -1552,6 +1546,32 @@ test "footer labels enabled automatic reload as auto" {
     defer std.testing.allocator.free(snapshot);
 
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "auto") != null);
+}
+
+test "review file search keeps footer status but suppresses unreachable action hints" {
+    var app: ShellViewTestHarness = .{};
+    app.review.file_search.mode = true;
+    try app.review.file_search.input.insertSlice("src/main.zig");
+    app.status.set("search active", .{});
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 1);
+    defer ts.deinit();
+
+    viewFooter(app.context(), &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "file: src/main.zig") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "search active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "quit") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "focus") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "help") == null);
+
+    var item_storage: [8]ui.key_hint.Item = undefined;
+    var key_buffers: [8][16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), footerItems(app.context(), &item_storage, &key_buffers).len);
 }
 
 const ShellViewTestHarness = struct {

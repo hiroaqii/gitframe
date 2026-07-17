@@ -1,12 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const chasen = @import("chasen");
+const ui = @import("chasen_ui");
 const draw = @import("draw");
 const app_load_state = @import("../../load_state.zig");
 const app_page = @import("../../page.zig");
 const review_projection = @import("../../review_projection.zig");
 const view_primitives = @import("../../view_primitives.zig");
 const review_page = @import("../review.zig");
+const review_file_search = @import("file_search.zig");
 const review_layout = @import("layout.zig");
 const review_navigation = @import("navigation.zig");
 const diff_render = @import("../../../diff/render.zig");
@@ -27,9 +29,9 @@ pub const EmptyRemoteActionHints = struct {
 };
 
 pub const FooterView = struct {
-    file_search_mode: bool,
-    file_search_text: []const u8,
-    file_search_no_match: bool,
+    /// Page-local text input consumes printable keys before shell actions.
+    /// Suppress ordinary shell hints while those actions are unreachable.
+    normal_action_hints_enabled: bool,
     sidebar_hidden: bool,
     auto_reload_enabled: bool,
     source_label: ?[]const u8,
@@ -75,9 +77,7 @@ pub const Context = struct {
 
     pub fn footer(self: Context) FooterView {
         return .{
-            .file_search_mode = self.page.file_search.mode,
-            .file_search_text = self.page.file_search.input.slice(),
-            .file_search_no_match = self.page.file_search.no_match,
+            .normal_action_hints_enabled = !self.page.file_search.mode,
             .sidebar_hidden = self.page.viewer.sidebar_hidden,
             .auto_reload_enabled = self.page.auto_reload.enabled(),
             .source_label = sourceFooterLabel(self.source),
@@ -186,6 +186,19 @@ const StateMessage = struct {
 pub fn view(app: Context, surface: *chasen.Surface) !void {
     switch (app.page.load.state) {
         .loaded => |session| return viewLoadedDiff(app, surface, session.loaded),
+        else => {},
+    }
+
+    // Without an accepted load there is no sidebar owner from which search
+    // candidates may borrow paths. Keep the prompt usable, but render the
+    // explicit unavailable terminal instead of leaving the old page body
+    // visible behind a footer-only input.
+    if (app.page.file_search.mode) {
+        try drawFileSearch(surface, &app.page.file_search, app.theme);
+        return;
+    }
+
+    switch (app.page.load.state) {
         .empty => |reason| if (reason == .no_changes) return viewNoChanges(app, surface),
         else => {},
     }
@@ -264,6 +277,10 @@ fn viewLoadedDiff(app: Context, surface: *chasen.Surface, loaded: loaded_diff.Lo
     if (size.width == 0 or size.height == 0) return;
 
     if (app.page.viewer.sidebar_hidden) {
+        if (app.page.file_search.mode) {
+            try drawFileSearch(surface, &app.page.file_search, app.theme);
+            return;
+        }
         if (loaded.visibleNodeCount() == 0) {
             drawStateMessage(surface, filterEmptyMessage(app), app.theme);
             return;
@@ -273,6 +290,11 @@ fn viewLoadedDiff(app: Context, surface: *chasen.Surface, loaded: loaded_diff.Lo
     }
 
     const sidebar_width = review_layout.sidebarWidth(size.width, app.page.viewer.sidebar_width);
+    const search_pane_width = size.width -| (sidebar_width +| 1);
+    if (app.page.file_search.mode and search_pane_width < file_search_min_pane_width) {
+        try drawFileSearch(surface, &app.page.file_search, app.theme);
+        return;
+    }
     var sidebar = surface.child(.{
         .col = 0,
         .row = 0,
@@ -295,12 +317,69 @@ fn viewLoadedDiff(app: Context, surface: *chasen.Surface, loaded: loaded_diff.Lo
         .width = size.width - sidebar_width - 1,
         .height = size.height,
     });
+    if (app.page.file_search.mode) {
+        try drawFileSearch(&diff_pane, &app.page.file_search, app.theme);
+        return;
+    }
     if (loaded.visibleNodeCount() == 0) {
         drawStateMessage(&diff_pane, filterEmptyMessage(app), app.theme);
         return;
     }
     try viewDiffPane(app, &diff_pane, loaded);
 }
+
+/// Draw Review's bounded file-search projection in the diff-pane position.
+///
+/// Search intentionally replaces the diff body while the sidebar remains as
+/// stable context. Each visible label is validated through the typed candidate
+/// mapping before it is drawn, so rendering cannot expose a stale path borrow
+/// which a later submit would reject.
+fn drawFileSearch(surface: *chasen.Surface, state: *const review_file_search.State, palette: theme.Palette) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    const label_col: u16 = 1;
+    const prompt_style = palette.boldStyle(.prompt);
+    draw.copyClippedTextAt(surface, label_col, 0, file_search_label, prompt_style) catch {};
+    const label_width = chasen.text.displayWidth(file_search_label);
+    if (size.width > label_col + label_width) {
+        const input_col = label_col + label_width;
+        try drawInputLine(surface, input_col, 0, state.input.slice(), state.input.cursor, prompt_style);
+        view_primitives.showInputCursor(surface, input_col, 0, state.input.slice(), state.input.cursor);
+    }
+
+    if (size.height > 1) {
+        const status = if (state.truncated)
+            "512+ matches; refine search"
+        else if (!state.projection_available)
+            "File list unavailable; wait or press Esc"
+        else if (state.no_match)
+            "No matching files"
+        else
+            "Type to filter  Esc: cancel";
+        const role: theme.Role = if (state.no_match or !state.projection_available) .warning else .muted;
+        draw.copyClippedTextAt(surface, 1, 1, status, palette.style(role)) catch {};
+    }
+
+    if (!state.projection_available) return;
+    const visible_rows: usize = size.height -| 2;
+    const focused = state.filter.list.focusedIndex();
+    const range = ui.ListViewport.visibleRange(state.filter.labels.len, focused, visible_rows);
+    var result_index = range.start;
+    while (result_index < range.end) : (result_index += 1) {
+        const candidate = state.candidateAt(result_index) orelse continue;
+
+        const row: u16 = @intCast(2 + result_index - range.start);
+        const style = if (result_index == focused) palette.boldStyle(.prompt) else palette.style(.muted);
+        try draw.copyTailClippedTextAt(surface, 1, row, candidate.path_key, style);
+    }
+}
+
+const file_search_label = "Find file: ";
+// Keep enough room for the fixed label and a short visible input tail. Below
+// this width the sidebar is less useful than the active prompt, so search uses
+// the full body until normal pane geometry becomes usable again.
+const file_search_min_pane_width: u16 = 1 + file_search_label.len + 4;
 
 /// Draw the file tree side pane from the materialized sidebar view-model.
 pub fn viewSidebar(app: Context, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
@@ -1134,6 +1213,152 @@ test "sidebar chrome stays semantic while inactive diff path title stays dim" {
     try std.testing.expect(inactive_diff_title.dim);
 }
 
+test "review file search renders a bounded typed candidate window" {
+    const allocator = std.testing.allocator;
+    const basis: review_file_search.Basis = .{
+        .repo_epoch = 1,
+        .source_session_revision = 2,
+        .accepted_sidebar_revision = 3,
+    };
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .file, .name = "alpha.zig", .path = "src/alpha.zig", .path_key = "src/alpha.zig", .depth = 1, .target = .{ .diff_file = 0 } },
+        .{ .kind = .file, .name = "bravo.zig", .path = "src/bravo.zig", .path_key = "src/bravo.zig", .depth = 1, .target = .{ .diff_file = 1 } },
+        .{ .kind = .file, .name = "charlie.zig", .path = "src/charlie.zig", .path_key = "src/charlie.zig", .depth = 1, .target = .{ .status_entry = 2 } },
+    };
+    const loaded: loaded_diff.LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &.{} },
+        .file_text_eligibility = &.{},
+        .tree = .{ .nodes = &nodes },
+        .bytes = 0,
+        .lines = 0,
+    };
+
+    var state: review_file_search.State = .{ .mode = true };
+    defer state.deinit(allocator);
+    try state.input.insertSlice("src/");
+    var projection = try review_file_search.buildProjection(allocator, &loaded, "src/", .{ .basis = basis });
+    var projection_live = true;
+    defer if (projection_live) projection.deinit(allocator);
+    state.publish(allocator, &projection);
+    projection_live = false;
+    state.move(1);
+    state.move(1);
+
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 1, 2, 3 } };
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(24, 4);
+    defer ts.deinit();
+
+    try drawFileSearch(&ts.surface, &state, palette);
+
+    const snapshot = try ts.snapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Find file: src/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Type to filter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Enter: open") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/alpha.zig") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/bravo.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/charlie.zig") != null);
+    const focused = ts.surface.readCell(1, 3) orelse return error.ExpectedFocusedSearchCandidate;
+    try std.testing.expect(focused.style.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(focused.style.bold);
+}
+
+test "review file search renders unavailable and no-match terminals" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(48, 3);
+    defer ts.deinit();
+
+    const unavailable: review_file_search.State = .{ .mode = true };
+    try drawFileSearch(&ts.surface, &unavailable, .default());
+    var snapshot = try ts.snapshot(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "File list unavailable; wait or press Esc") != null);
+    std.testing.allocator.free(snapshot);
+
+    ts.surface.clearAll();
+    const no_match: review_file_search.State = .{
+        .mode = true,
+        .basis = .{ .repo_epoch = 1, .source_session_revision = 1, .accepted_sidebar_revision = 1 },
+        .projection_available = true,
+        .no_match = true,
+    };
+    try drawFileSearch(&ts.surface, &no_match, .default());
+    snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "No matching files") != null);
+}
+
+test "review file search keeps long ASCII and Unicode input cursor visible" {
+    var state: review_file_search.State = .{ .mode = true };
+    try state.input.insertSlice("abcdefghijklmnopqrstuvwxyz");
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(18, 3);
+    defer ts.deinit();
+
+    try drawFileSearch(&ts.surface, &state, .default());
+    var snapshot = try ts.snapshot(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "vwxyz") != null);
+    try std.testing.expect(ts.screen.cursor_vis);
+    try std.testing.expectEqual(@as(u16, 0), ts.screen.cursor.row);
+    try std.testing.expect(ts.screen.cursor.col < ts.surface.size().width);
+    std.testing.allocator.free(snapshot);
+
+    state.input = .{};
+    try state.input.insertSlice("prefix-長い🐈末尾");
+    ts.surface.clearAll();
+    try drawFileSearch(&ts.surface, &state, .default());
+    snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try ts.expectCellText(12, 0, "末");
+    try ts.expectCellText(14, 0, "尾");
+    try std.testing.expect(ts.screen.cursor_vis);
+    try std.testing.expectEqual(@as(u16, 0), ts.screen.cursor.row);
+    try std.testing.expect(ts.screen.cursor.col < ts.surface.size().width);
+}
+
+test "review file search unavailable terminal replaces no-changes body" {
+    const page: review_page.ReviewPageState = .{
+        .load = .{ .state = .{ .empty = .no_changes } },
+        .file_search = .{ .mode = true },
+    };
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(60, 6);
+    defer ts.deinit();
+
+    try view(testContext(&page, .default(), 60, 6), &ts.surface);
+
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Find file:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "File list unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "No changes") == null);
+}
+
+test "review file search uses full body when compact sidebar leaves no prompt pane" {
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffTwo()),
+        .file_search = .{ .mode = true },
+    };
+    defer page.deinit(std.testing.allocator);
+
+    for ([_]u16{ 24, 25 }) |width| {
+        var ts: chasen.testing.TestSurface = undefined;
+        try ts.init(width, 6);
+        defer ts.deinit();
+
+        try view(testContext(&page, .default(), width, 6), &ts.surface);
+
+        try ts.expectCellText(1, 0, "F");
+        const snapshot = try ts.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Find file:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "File list unavailable") != null);
+    }
+}
+
 test "sidebar renderer owns badges titles selection styles and horizontal scroll" {
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwoWithStatuses()),
@@ -1195,9 +1420,19 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
     try std.testing.expect(!ts.surface.readCell(6, selected_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(!ts.surface.readCell(33, selected_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 
-    // Before Slice G, cancel/empty submit and sidebar-entry success restore
-    // sidebar focus, while the inactive rendering above also represents a
-    // successful search entered from the diff pane.
+    var search_full: chasen.testing.TestSurface = undefined;
+    try search_full.init(80, 9);
+    defer search_full.deinit();
+    try view(testContext(&page, palette, 80, 9), &search_full.surface);
+    const search_separator_col = review_layout.sidebarWidth(80, page.viewer.sidebar_width);
+    try search_full.expectCellText(search_separator_col + 2, 0, "F");
+    const search_snapshot = try search_full.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(search_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, search_snapshot, "File list unavailable") != null);
+
+    // Cancel/empty submit and sidebar-entry success restore sidebar focus,
+    // while the inactive rendering above also represents a successful search
+    // entered from the diff pane.
     page.file_search.mode = false;
     ts.surface.clearAll();
     try viewSidebar(testContext(&page, palette, 80, 9), &ts.surface, page.load.state.loaded.loaded);
