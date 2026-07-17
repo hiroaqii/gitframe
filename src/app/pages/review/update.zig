@@ -185,8 +185,8 @@ pub const Controller = struct {
                 self.navigation.page.file_search.input.backspace();
             },
             .toggle_reviewed_file => try self.navigation.toggleReviewedFile(allocator orelse return error.MissingAllocator),
-            .toggle_hide_reviewed_files => try self.navigation.toggleHideReviewedFiles(),
-            .cycle_changed_file_filter => try self.navigation.cycleChangedFileFilter(),
+            .toggle_hide_reviewed_files => try self.navigation.toggleHideReviewedFiles(allocator orelse return error.MissingAllocator),
+            .cycle_changed_file_filter => try self.navigation.cycleChangedFileFilter(allocator orelse return error.MissingAllocator),
             .enter_commit_panel => result.command = .enter_commit_panel,
             .enter_amend_panel => result.command = .enter_amend_panel,
             .toggle_selected_file => result.command = .toggle_selected_file,

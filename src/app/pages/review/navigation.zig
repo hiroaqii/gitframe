@@ -1483,32 +1483,80 @@ pub const Controller = struct {
         if (self.repo_root != null and diff_file.canonicalPathKey(file) == null) return;
 
         const reviewed = !loaded.reviewed_files[file_index];
-        try self.page.reviewed_store.set(allocator, self.repo_root, file, reviewed);
-        loaded.reviewed_files[file_index] = reviewed;
         if (self.page.review_display.hide_reviewed_files) {
-            try self.rebuildVisibleNodes(loaded, self.loadArenaAllocator() orelse return);
+            // Prepare the primary visible-tree replacement before changing
+            // reviewed authority. Once that primary operation can commit, the
+            // old search projection must be revoked before eligibility changes.
+            var prepared = try loaded.prepareVisibleNodeRebuild(self.loadArenaAllocator() orelse unreachable);
+            try self.page.reviewed_store.set(allocator, self.repo_root, file, reviewed);
+            self.page.advanceAcceptedSidebarRevision(allocator);
+            loaded.reviewed_files[file_index] = reviewed;
+            prepared.commit(
+                self.page.viewer.root_disclosure,
+                self.page.review_display.hide_reviewed_files,
+                self.page.review_display.changed_file_filter,
+            );
             self.reconcileSelectionAfterVisibleNodeChange(loaded);
             self.clampSidebarHorizontalScroll();
             self.clampDiffNavigation();
+            self.rebuildFileSearchProjection(allocator);
+            return;
         }
+
+        try self.page.reviewed_store.set(allocator, self.repo_root, file, reviewed);
+        loaded.reviewed_files[file_index] = reviewed;
     }
 
-    pub fn toggleHideReviewedFiles(self: Controller) !void {
-        self.page.review_display.hide_reviewed_files = !self.page.review_display.hide_reviewed_files;
-        const loaded = self.activeLoadedDiff() orelse return;
-        try self.rebuildVisibleNodes(loaded, self.loadArenaAllocator() orelse return);
-        self.reconcileSelectionAfterVisibleNodeChange(loaded);
-        self.clampSidebarHorizontalScroll();
-        self.clampDiffNavigation();
+    pub fn toggleHideReviewedFiles(self: Controller, allocator: std.mem.Allocator) !void {
+        try self.replaceFileVisibilityLens(
+            allocator,
+            self.loadArenaAllocator() orelse allocator,
+            !self.page.review_display.hide_reviewed_files,
+            self.page.review_display.changed_file_filter,
+        );
     }
 
-    pub fn cycleChangedFileFilter(self: Controller) !void {
-        self.page.review_display.changed_file_filter = self.page.review_display.changed_file_filter.next();
-        const loaded = self.activeLoadedDiff() orelse return;
-        try self.rebuildVisibleNodes(loaded, self.loadArenaAllocator() orelse return);
-        self.reconcileSelectionAfterVisibleNodeChange(loaded);
-        self.clampSidebarHorizontalScroll();
-        self.clampDiffNavigation();
+    pub fn cycleChangedFileFilter(self: Controller, allocator: std.mem.Allocator) !void {
+        try self.replaceFileVisibilityLens(
+            allocator,
+            self.loadArenaAllocator() orelse allocator,
+            self.page.review_display.hide_reviewed_files,
+            self.page.review_display.changed_file_filter.next(),
+        );
+    }
+
+    /// Replace the accepted Review file-visibility lens transactionally.
+    /// Search allocation is deliberately after the primary commit: failure
+    /// may make the prompt unavailable, but cannot reject a valid lens change.
+    fn replaceFileVisibilityLens(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        visible_allocator: std.mem.Allocator,
+        hide_reviewed_files: bool,
+        changed_file_filter: ChangedFileFilter,
+    ) !void {
+        if (self.activeLoadedDiff()) |loaded| {
+            var prepared = try loaded.prepareVisibleNodeRebuild(visible_allocator);
+            self.page.advanceAcceptedSidebarRevision(allocator);
+            self.page.review_display.hide_reviewed_files = hide_reviewed_files;
+            self.page.review_display.changed_file_filter = changed_file_filter;
+            prepared.commit(
+                self.page.viewer.root_disclosure,
+                hide_reviewed_files,
+                changed_file_filter,
+            );
+            self.reconcileSelectionAfterVisibleNodeChange(loaded);
+            self.clampSidebarHorizontalScroll();
+            self.clampDiffNavigation();
+        } else {
+            // Lens state is retained across unloaded states. Revoke any
+            // projection defensively and give the next accepted sidebar a new
+            // namespace even though there is no visible tree to rebuild now.
+            self.page.advanceAcceptedSidebarRevision(allocator);
+            self.page.review_display.hide_reviewed_files = hide_reviewed_files;
+            self.page.review_display.changed_file_filter = changed_file_filter;
+        }
+        self.rebuildFileSearchProjection(allocator);
     }
 
     pub fn submitFileSearch(self: Controller, allocator: std.mem.Allocator) !void {
@@ -2628,6 +2676,11 @@ fn setFileSearchInput(app: *TestHarness, query: []const u8) void {
     app.pages.review.file_search.input.len = query.len;
     app.pages.review.file_search.input.cursor = query.len;
 }
+
+const file_search_lens_nodes = [_]file_tree.Node{
+    .{ .kind = .file, .name = "a", .path = "a", .path_key = "a", .depth = 0, .status = .modified, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "b", .path_key = "b", .depth = 0, .status = .added, .target = .{ .diff_file = 1 } },
+};
 
 test "Review navigation keeps diff position at file selection boundary" {
     var harness = TestHarness.init(.{
@@ -5123,13 +5176,139 @@ test "cycling changed file filter rebuilds visible nodes and reconciles selectio
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().cycleChangedFileFilter();
+    try app.reviewNavigation().cycleChangedFileFilter(std.testing.allocator);
 
     const loaded = app.reviewNavigation().loadedDiff().?;
     try std.testing.expectEqual(ChangedFileFilter.modified, app.pages.review.review_display.changed_file_filter);
     try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+}
+
+test "file visibility lens replaces candidate basis and rebuilds retained query" {
+    var reviewed = [_]bool{ true, false };
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
+                .tree = .{ .nodes = &file_search_lens_nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .file_search = .{ .mode = true },
+        } },
+    };
+    defer app.clearLoadedDiff();
+    defer app.pages.review.file_search.deinit(std.testing.allocator);
+    setFileSearchInput(&app, "");
+    app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.file_search.candidates.len);
+
+    try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
+
+    try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.review.accepted_sidebar_revision);
+    try std.testing.expect(app.pages.review.file_search.mode);
+    try std.testing.expect(app.pages.review.file_search.projection_available);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.file_search.candidates.len);
+    try std.testing.expectEqualStrings("b", app.pages.review.file_search.focusedCandidate().?.path_key);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.review.file_search.basis.?.accepted_sidebar_revision);
+
+    try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
+    try app.reviewNavigation().cycleChangedFileFilter(std.testing.allocator);
+
+    try std.testing.expect(!app.pages.review.review_display.hide_reviewed_files);
+    try std.testing.expectEqual(ChangedFileFilter.modified, app.pages.review.review_display.changed_file_filter);
+    try std.testing.expectEqual(@as(u64, 4), app.pages.review.accepted_sidebar_revision);
+    try std.testing.expect(app.pages.review.file_search.projection_available);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.file_search.candidates.len);
+    try std.testing.expectEqualStrings("a", app.pages.review.file_search.focusedCandidate().?.path_key);
+    try std.testing.expectEqual(@as(u64, 4), app.pages.review.file_search.basis.?.accepted_sidebar_revision);
+}
+
+test "file visibility lens preparation failure preserves old lens and candidates" {
+    var reviewed = [_]bool{ false, false };
+    var partial_visible_nodes = [_]usize{0};
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
+                .tree = .{ .nodes = &file_search_lens_nodes },
+                .reviewed_files = &reviewed,
+                .visible_nodes = &partial_visible_nodes,
+                .visible_node_count = 1,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .file_search = .{ .mode = true },
+        } },
+    };
+    defer app.clearLoadedDiff();
+    defer app.pages.review.file_search.deinit(std.testing.allocator);
+    app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        app.reviewNavigation().replaceFileVisibilityLens(
+            std.testing.allocator,
+            failing.allocator(),
+            true,
+            .all,
+        ),
+    );
+
+    try std.testing.expect(!app.pages.review.review_display.hide_reviewed_files);
+    try std.testing.expectEqual(@as(u64, 1), app.pages.review.accepted_sidebar_revision);
+    try std.testing.expect(app.pages.review.file_search.projection_available);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.file_search.candidates.len);
+    try std.testing.expectEqual(@as(usize, 1), app.reviewNavigation().loadedDiff().?.visibleNodeCount());
+}
+
+test "candidate rebuild failure cannot reject committed file visibility lens" {
+    var reviewed = [_]bool{ true, false };
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
+                .tree = .{ .nodes = &file_search_lens_nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .file_search = .{ .mode = true },
+        } },
+    };
+    defer app.clearLoadedDiff();
+    defer app.pages.review.file_search.deinit(std.testing.allocator);
+    setFileSearchInput(&app, "b");
+    app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try app.reviewNavigation().replaceFileVisibilityLens(
+        failing.allocator(),
+        app.reviewNavigation().loadArenaAllocator().?,
+        true,
+        .all,
+    );
+
+    try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.review.accepted_sidebar_revision);
+    try std.testing.expectEqual(@as(usize, 1), app.reviewNavigation().loadedDiff().?.visibleNodeCount());
+    try std.testing.expect(app.pages.review.file_search.mode);
+    try std.testing.expectEqualStrings("b", app.pages.review.file_search.input.slice());
+    try std.testing.expect(!app.pages.review.file_search.projection_available);
+    try std.testing.expect(app.pages.review.file_search.focusedCandidate() == null);
 }
 
 test "file search skips files outside active changed filter" {
@@ -5294,7 +5473,7 @@ test "hide reviewed files removes reviewed file rows from visible list" {
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().toggleHideReviewedFiles();
+    try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
 
     const loaded = app.reviewNavigation().loadedDiff().?;
     try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
@@ -5327,7 +5506,7 @@ test "hide reviewed files removes directories with no visible file descendants" 
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().toggleHideReviewedFiles();
+    try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
 
     const loaded = app.reviewNavigation().loadedDiff().?;
     try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
@@ -5355,7 +5534,7 @@ test "hide reviewed files keeps directories for non-contiguous unreviewed descen
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().toggleHideReviewedFiles();
+    try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
 
     const loaded = app.reviewNavigation().loadedDiff().?;
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
@@ -5402,6 +5581,51 @@ test "marking a visible file as reviewed while hidden moves selection" {
     try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
     try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+}
+
+test "marking reviewed under hidden lens rebuilds file search eligibility" {
+    var reviewed = [_]bool{ false, false };
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_two },
+                .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
+                .tree = .{ .nodes = &file_search_lens_nodes },
+                .reviewed_files = &reviewed,
+                .collapsed_dirs = .{},
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{
+                .selected_node = 0,
+                .selected_target = .{ .diff_file = 0 },
+                .selected_file = 0,
+            },
+            .file_search = .{ .mode = true },
+            .review_display = .{ .hide_reviewed_files = true },
+        } },
+    };
+    defer app.clearLoadedDiff();
+    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
+    defer app.pages.review.file_search.deinit(std.testing.allocator);
+    try app.reviewNavigation().loadedDiff().?.rebuildVisibleNodes(
+        app.reviewNavigation().loadArenaAllocator().?,
+        app.pages.review.viewer.root_disclosure,
+        true,
+        .all,
+    );
+    app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.file_search.candidates.len);
+
+    try app.reviewNavigation().toggleReviewedFile(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.review.accepted_sidebar_revision);
+    try std.testing.expect(app.pages.review.file_search.projection_available);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.file_search.candidates.len);
+    try std.testing.expectEqualStrings("b", app.pages.review.file_search.focusedCandidate().?.path_key);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.review.file_search.basis.?.accepted_sidebar_revision);
 }
 
 test "canceling edited search restores committed query and match" {
