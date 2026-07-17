@@ -18,6 +18,7 @@ const repository_tree = @import("../../repository/tree.zig");
 const source_syntax = @import("../../syntax/source.zig");
 const source_syntax_runtime = @import("../../syntax/source_runtime.zig");
 const repository_input = @import("repository/input.zig");
+const repository_file_search_focus = @import("repository/file_search_focus.zig");
 const repository_incoming = @import("repository/incoming.zig");
 const repository_layout = @import("repository/layout.zig");
 const repository_model = @import("repository/model.zig");
@@ -859,6 +860,14 @@ pub const RepositoryPageState = struct {
     manifest_revision: u64 = 0,
     document_generation: u64 = 0,
     pending_document_generation: ?u64 = null,
+    /// Basis and generation of the request currently named by
+    /// `pending_document_generation`. Its path borrows the accepted manifest,
+    /// so every selected-path/manifest replacement clears it first.
+    pending_document_request: ?repository_file_search_focus.PendingDocumentRequest = null,
+    /// One-shot handoff installed by a successful file-search submit. Content
+    /// acceptance remains owned by `applyDocumentFinished`; this value only
+    /// decides whether that accepted source may move focus.
+    file_search_source_focus: repository_file_search_focus.State = .none,
     source_revision: u64 = 0,
     syntax_generation: u64 = 0,
     pending_syntax_generation: ?u64 = null,
@@ -896,7 +905,41 @@ pub const RepositoryPageState = struct {
     file_search: repository_model.FileSearchState = .{},
     status: app_state.StatusMessage = .{},
 
+    fn currentFileSearchFocusBasis(self: *const RepositoryPageState) ?repository_file_search_focus.Basis {
+        const root_identity = self.root_identity orelse return null;
+        const path = self.selected_path orelse return null;
+        return .{
+            .repo_epoch = self.repo_epoch,
+            .activation_id = self.activation_id,
+            .root_identity = root_identity,
+            .manifest_revision = self.manifest_revision,
+            .path = path,
+        };
+    }
+
+    /// Close both parts of the pending document owner together. The separate
+    /// scalar remains the existing task-admission API; the typed value supplies
+    /// the exact basis needed by file-search direct binding.
+    fn clearPendingDocumentAuthority(self: *RepositoryPageState) void {
+        self.pending_document_generation = null;
+        self.pending_document_request = null;
+    }
+
+    fn clearPendingDocumentAuthorityIfGeneration(self: *RepositoryPageState, generation: u64) bool {
+        if (self.pending_document_generation != generation) return false;
+        self.clearPendingDocumentAuthority();
+        return true;
+    }
+
+    /// Clear borrowed focus/request bases before their selected path or
+    /// manifest owner can move or be released.
+    fn clearFileSearchDocumentAuthority(self: *RepositoryPageState) void {
+        self.file_search_source_focus.clear();
+        self.clearPendingDocumentAuthority();
+    }
+
     pub fn deinit(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
+        self.clearFileSearchDocumentAuthority();
         self.incoming.deinit(allocator);
         self.cancelSourceSelection();
         self.clearCompletedSelection(allocator);
@@ -907,6 +950,7 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn activate(self: *RepositoryPageState, repo_epoch: u64, identity: ?root_capability.Identity) void {
+        self.clearFileSearchDocumentAuthority();
         self.initialized = true;
         self.active = true;
         self.activation_id +%= 1;
@@ -914,7 +958,6 @@ pub const RepositoryPageState = struct {
         if (self.repo_epoch != repo_epoch) self.repo_epoch = repo_epoch;
         self.root_identity = identity;
         self.pending_generation = null;
-        self.pending_document_generation = null;
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
         self.needs_syntax_request = false;
@@ -939,6 +982,7 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn deactivate(self: *RepositoryPageState) void {
+        self.file_search_source_focus.clear();
         self.active = false;
         if (self.bundle != null) self.freshness = .validating;
     }
@@ -949,6 +993,7 @@ pub const RepositoryPageState = struct {
         repo_epoch: u64,
         identity: ?root_capability.Identity,
     ) void {
+        self.clearFileSearchDocumentAuthority();
         if (self.incoming != .none) {
             const owner = allocator orelse @panic("Repository incoming replacement requires an allocator");
             self.incoming.dismiss(owner);
@@ -986,7 +1031,6 @@ pub const RepositoryPageState = struct {
         self.source_search.clear();
         self.file_search.close();
         self.pending_generation = null;
-        self.pending_document_generation = null;
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
         self.repo_epoch = repo_epoch;
@@ -1094,6 +1138,9 @@ pub const RepositoryPageState = struct {
         else
             false;
 
+        if (!optionalPathEql(self.selected_path, exact_path)) {
+            self.clearFileSearchDocumentAuthority();
+        }
         self.selected_path = exact_path;
         self.viewer.tree_cursor = visible_index;
         self.clampScroll(0);
@@ -1247,6 +1294,11 @@ pub const RepositoryPageState = struct {
         repo_root: []const u8,
         capability: *const root_capability.RootCapability,
     ) !Request {
+        // A manifest attempt supersedes pane-focus handoff immediately, but a
+        // descriptor-allocation failure must not revoke the still-valid
+        // predecessor document task. Close that pending owner only after all
+        // fallible request preparation has succeeded below.
+        self.file_search_source_focus.clear();
         self.invalidateDisplayedDocumentAuthority();
         const owned_root = try allocator.dupe(u8, repo_root);
         errdefer allocator.free(owned_root);
@@ -1255,7 +1307,7 @@ pub const RepositoryPageState = struct {
         self.generation +%= 1;
         if (self.generation == 0) self.generation = 1;
         self.pending_generation = self.generation;
-        self.pending_document_generation = null;
+        self.clearPendingDocumentAuthority();
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
         self.needs_document_revalidation = false;
@@ -1292,6 +1344,20 @@ pub const RepositoryPageState = struct {
         self.document_generation +%= 1;
         if (self.document_generation == 0) self.document_generation = 1;
         self.pending_document_generation = self.document_generation;
+        const pending_request: repository_file_search_focus.PendingDocumentRequest = .{
+            .basis = .{
+                .repo_epoch = self.repo_epoch,
+                .activation_id = self.activation_id,
+                // Record the descriptor's root, independently from current
+                // page authority, so direct binding must prove they agree.
+                .root_identity = root.identity,
+                .manifest_revision = self.manifest_revision,
+                .path = selected,
+            },
+            .generation = self.document_generation,
+        };
+        self.pending_document_request = pending_request;
+        _ = self.file_search_source_focus.bindPrepared(pending_request);
         self.needs_document_revalidation = false;
         if (self.incoming.documentIntent() != null) {
             const bound = self.incoming.bindDocumentGeneration(
@@ -1389,9 +1455,9 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn rejectDocumentSpawn(self: *RepositoryPageState, generation: u64) void {
-        if (self.pending_document_generation != generation) return;
+        if (!self.clearPendingDocumentAuthorityIfGeneration(generation)) return;
         self.invalidateDisplayedDocumentAuthority();
-        self.pending_document_generation = null;
+        _ = self.file_search_source_focus.clearGeneration(generation);
         self.status.set("Could not start selected file task", .{});
         const pending = self.incoming.documentIntent() orelse return;
         if (pending.document_generation == generation) {
@@ -1415,8 +1481,8 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn requestReload(self: *RepositoryPageState, has_repository: bool) void {
+        self.clearFileSearchDocumentAuthority();
         self.invalidateDisplayedDocumentAuthority();
-        self.pending_document_generation = null;
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
         self.needs_document_revalidation = false;
@@ -1476,12 +1542,14 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn markDocumentRequestPreparationFailed(self: *RepositoryPageState, err: anyerror) void {
+        self.file_search_source_focus.clear();
         self.invalidateDisplayedDocumentAuthority();
         self.status.set("Could not prepare selected file: {s}", .{@errorName(err)});
         _ = self.terminalizeIncoming(.request_failed);
     }
 
     pub fn markDocumentCapabilityUnavailable(self: *RepositoryPageState) void {
+        self.file_search_source_focus.clear();
         self.invalidateDisplayedDocumentAuthority();
         // Capability lookup used to be an inert retry edge for ordinary
         // browsing. Only a committed contextual destination converts it into
@@ -1602,7 +1670,6 @@ pub const RepositoryPageState = struct {
                 finished.result = .{ .unchanged = self.bundle.?.document.fingerprint };
                 self.manifest_revision +%= 1;
                 if (self.manifest_revision == 0) self.manifest_revision = 1;
-                self.pending_document_generation = null;
                 self.pending_syntax_generation = null;
                 self.pending_change_map_generation = null;
                 self.needs_syntax_request = false;
@@ -1634,21 +1701,33 @@ pub const RepositoryPageState = struct {
             // A delivered completion is the terminal event for the exact task
             // identity it owns even when its accepted manifest basis is now
             // stale. It cannot remain named as a future successor.
-            if (completion_owns_pending) self.pending_document_generation = null;
+            if (completion_owns_pending) {
+                _ = self.clearPendingDocumentAuthorityIfGeneration(finished.generation);
+                _ = self.file_search_source_focus.clearGeneration(finished.generation);
+            }
             return self.classifyMismatchedDocumentFinished();
         }
-        self.pending_document_generation = null;
+        const cleared_pending = self.clearPendingDocumentAuthorityIfGeneration(finished.generation);
+        std.debug.assert(cleared_pending);
         const expected_root = self.root_identity orelse {
+            _ = self.file_search_source_focus.clearGeneration(finished.generation);
             _ = self.terminalizeIncomingOwnerWithoutSuccessor();
             return .failed;
         };
         if (!expected_root.eql(finished.root_identity)) {
+            _ = self.file_search_source_focus.clearGeneration(finished.generation);
             self.status.set("Repository root changed", .{});
             _ = self.terminalizeIncomingOwnerWithoutSuccessor();
             return .failed;
         }
-        const selected = self.selected_path orelse return self.classifyMismatchedDocumentFinished();
-        if (!std.mem.eql(u8, selected, finished.path)) return self.classifyMismatchedDocumentFinished();
+        const selected = self.selected_path orelse {
+            _ = self.file_search_source_focus.clearGeneration(finished.generation);
+            return self.classifyMismatchedDocumentFinished();
+        };
+        if (!std.mem.eql(u8, selected, finished.path)) {
+            _ = self.file_search_source_focus.clearGeneration(finished.generation);
+            return self.classifyMismatchedDocumentFinished();
+        }
 
         // The live drag borrows the displayed document and must always end
         // before its storage is replaced. A completed candidate is independent
@@ -1681,12 +1760,27 @@ pub const RepositoryPageState = struct {
         self.needs_syntax_request = source_syntax_runtime.enabled and self.currentSource() != null;
         self.needs_change_map_request = self.currentSource() != null;
         self.status.clear();
+        self.resolveFileSearchSourceFocus(finished.generation);
         _ = self.resolveIncomingDocument(allocator, finished.generation);
         // A completion may be valid for the ordinary selected source while an
         // inconsistent contextual owner names a different revision/generation.
         // Keep the accepted source, but never leave that owner unbounded.
         _ = self.terminalizeIncomingOwnerWithoutSuccessor();
         return .changed;
+    }
+
+    /// Move focus only after the ordinary document admission path has installed
+    /// an accepted source for the exact bound Repository basis. Inert content is
+    /// an accepting document terminal but cannot own source focus.
+    fn resolveFileSearchSourceFocus(self: *RepositoryPageState, generation: u64) void {
+        if (self.currentSource() == null) {
+            _ = self.file_search_source_focus.clearGeneration(generation);
+            return;
+        }
+        const basis = self.currentFileSearchFocusBasis() orelse return;
+        if (self.file_search_source_focus.consumeAccepted(basis, generation)) {
+            self.viewer.focus = .source;
+        }
     }
 
     pub fn applySyntaxFinished(self: *RepositoryPageState, allocator: std.mem.Allocator, finished: *SyntaxFinished) ApplyOutcome {
@@ -1769,6 +1863,7 @@ pub const RepositoryPageState = struct {
     }
 
     fn replaceBundle(self: *RepositoryPageState, allocator: std.mem.Allocator, incoming: *Bundle) !void {
+        self.clearFileSearchDocumentAuthority();
         self.cancelSourceSelection();
         const previous_selected = self.selected_path;
         const previous_cursor_identity = if (self.bundle) |*previous|
@@ -1829,6 +1924,7 @@ pub const RepositoryPageState = struct {
     ) bool {
         const previous = self.selected_path;
         const bundle = if (self.bundle) |*owned| owned else {
+            if (previous != null) self.clearFileSearchDocumentAuthority();
             self.selected_path = null;
             self.viewer.tree_cursor = 0;
             self.viewer.tree_vertical_scroll = 0;
@@ -1848,6 +1944,9 @@ pub const RepositoryPageState = struct {
             tree.firstFilePathFor(self.file_visibility)
         else
             null;
+        if (!optionalPathEql(previous, selected)) {
+            self.clearFileSearchDocumentAuthority();
+        }
         self.selected_path = selected;
 
         var selected_cursor: ?usize = null;
@@ -1934,6 +2033,7 @@ pub const RepositoryPageState = struct {
         body_size: chasen.Size,
     ) RepositoryUpdate {
         var result: RepositoryUpdate = .{};
+        var file_search_submitted = false;
         // A contextual destination is subordinate to the user's next
         // destination/navigation command. Dismiss it before that command can
         // mutate retained browser state. Pure presentation/cancel commands do
@@ -2068,7 +2168,7 @@ pub const RepositoryPageState = struct {
             .source_search_paste => |text| self.source_search.input.insertSlice(text) catch self.status.set("Source search is too long", .{}),
             .enter_file_search => self.enterFileSearch(),
             .cancel_file_search => self.cancelFileSearch(body_size),
-            .submit_file_search => self.submitFileSearch(body_size),
+            .submit_file_search => file_search_submitted = self.submitFileSearch(body_size),
             .file_search_previous => self.file_search.move(-1),
             .file_search_next => self.file_search.move(1),
             .file_search_backspace => {
@@ -2091,16 +2191,18 @@ pub const RepositoryPageState = struct {
             },
             .manifest_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
         }
-        if (optionalPathEql(previous, self.selected_path)) return result;
-        self.invalidateSelectedDocument(allocator);
-        result.selected_path_changed = true;
+        if (!optionalPathEql(previous, self.selected_path)) {
+            self.invalidateSelectedDocument(allocator);
+            result.selected_path_changed = true;
+        }
+        if (file_search_submitted) self.commitFileSearchSourceFocus();
         return result;
     }
 
     fn invalidateSelectedDocument(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
+        self.clearFileSearchDocumentAuthority();
         self.cancelSourceSelection();
         self.clearCompletedSelection(allocator);
-        self.pending_document_generation = null;
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
         self.needs_syntax_request = false;
@@ -2285,20 +2387,54 @@ pub const RepositoryPageState = struct {
         self.clampForBodySize(body_size);
     }
 
-    fn submitFileSearch(self: *RepositoryPageState, body_size: chasen.Size) void {
-        if (!self.file_search.projection_available) return;
+    fn submitFileSearch(self: *RepositoryPageState, body_size: chasen.Size) bool {
+        if (!self.file_search.projection_available) return false;
         const node_index = self.file_search.selectedNode() orelse {
             self.file_search.no_match = true;
-            return;
+            return false;
         };
-        const tree = if (self.bundle) |*bundle| &bundle.tree else return;
-        const visible = self.tree_projection.revealManifestNode(tree, self.file_visibility, node_index) orelse return;
+        const tree = if (self.bundle) |*bundle| &bundle.tree else return false;
+        const visible = self.tree_projection.revealManifestNode(tree, self.file_visibility, node_index) orelse return false;
+        const selected = tree.nodes[node_index].path;
+        // A new successful submit always supersedes an older pane-focus intent.
+        // Preserve a typed pending request only for the same-path direct-bind
+        // case; changing paths invalidates that request authority immediately.
+        self.file_search_source_focus.clear();
+        if (!optionalPathEql(self.selected_path, selected)) {
+            self.clearPendingDocumentAuthority();
+        }
         self.viewer.tree_cursor = visible;
         self.viewer.tree_hidden = false;
         self.viewer.focus = .tree;
-        self.selected_path = tree.nodes[node_index].path;
+        self.selected_path = selected;
         self.file_search.close();
         self.clampForBodySize(body_size);
+        return true;
+    }
+
+    /// Classify a successful exact candidate after generic selection
+    /// invalidation has committed the new path. Until one of these authority
+    /// cases succeeds, tree focus is the bounded and truthful terminal.
+    fn commitFileSearchSourceFocus(self: *RepositoryPageState) void {
+        if (!self.active) return;
+        const basis = self.currentFileSearchFocusBasis() orelse return;
+        if (self.acceptedCurrentSourceForSelection() != null) {
+            self.file_search_source_focus.clear();
+            self.viewer.focus = .source;
+            return;
+        }
+
+        if (self.pending_document_generation) |generation| {
+            if (self.pending_document_request) |pending| {
+                if (self.file_search_source_focus.bindExisting(basis, generation, pending)) return;
+            }
+        }
+
+        if (self.wantsDocumentRequest()) {
+            self.file_search_source_focus.awaitDocumentRequest(basis);
+        } else {
+            self.file_search_source_focus.clear();
+        }
     }
 
     fn moveCursor(self: *RepositoryPageState, delta: isize, body_height: u16) void {
@@ -2339,7 +2475,12 @@ pub const RepositoryPageState = struct {
             .repo_root => {},
             .manifest_node => |node_index| {
                 const node = tree.nodes[node_index];
-                if (node.kind == .file) self.selected_path = node.path;
+                if (node.kind == .file) {
+                    if (!optionalPathEql(self.selected_path, node.path)) {
+                        self.clearFileSearchDocumentAuthority();
+                    }
+                    self.selected_path = node.path;
+                }
             },
         }
     }
@@ -6538,6 +6679,254 @@ test "repository accepted source authority requires a matching completion after 
         state.displayed_document.?.authority,
     );
     try std.testing.expect(state.acceptedCurrentSourceForSelection() != null);
+}
+
+fn fileSearchDocumentFinishedForTest(
+    allocator: std.mem.Allocator,
+    request: *const DocumentRequest,
+    content: ?[]const u8,
+) !DocumentFinished {
+    var value: DocumentValue = if (content) |source| blk: {
+        const bytes = try allocator.dupe(u8, source);
+        errdefer allocator.free(bytes);
+        break :blk .{ .source = try source_document.Document.initOwned(
+            allocator,
+            bytes,
+            .init(bytes),
+        ) };
+    } else .{ .inert = .binary };
+    errdefer switch (value) {
+        .source => |*document| document.deinit(allocator),
+        .inert => {},
+    };
+    return .{
+        .identity = request.identity,
+        .root_identity = request.root.identity,
+        .generation = request.generation,
+        .manifest_revision = request.manifest_revision,
+        .path = try allocator.dupe(u8, request.path),
+        .value = value,
+    };
+}
+
+test "repository file search focus uses an already accepted same-path source immediately" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("alpha.zig\x00beta.zig\x00", "accepted source\n");
+    defer state.deinit(allocator);
+    state.freshness = .fresh;
+    state.viewer.focus = .tree;
+    const size: chasen.Size = .{ .width = 80, .height = 10 };
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+
+    try std.testing.expectEqualStrings("alpha.zig", state.selected_path.?);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    try std.testing.expect(state.file_search_source_focus == .none);
+    try std.testing.expect(state.pending_document_request == null);
+}
+
+test "repository file search focus binds a prepared successor and consumes accepted source" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state = try selectionStateForTest("alpha.zig\x00beta.zig\x00", "old alpha\n");
+    defer state.deinit(allocator);
+    state.root_identity = root.capability.identity;
+    state.freshness = .fresh;
+    const size: chasen.Size = .{ .width = 80, .height = 10 };
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    _ = state.applyNavigation(allocator, .file_search_next, size);
+    var update = state.applyNavigation(allocator, .submit_file_search, size);
+    defer update.deinit(allocator);
+
+    try std.testing.expect(update.selected_path_changed);
+    try std.testing.expectEqualStrings("beta.zig", state.selected_path.?);
+    try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+    try std.testing.expect(state.currentSource() == null);
+    try std.testing.expect(state.file_search_source_focus.awaitingRequest() != null);
+
+    var request = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer request.deinit(allocator);
+    try std.testing.expectEqual(
+        request.generation,
+        state.file_search_source_focus.awaitingGeneration().?.generation,
+    );
+    try std.testing.expectEqual(
+        request.generation,
+        state.pending_document_request.?.generation,
+    );
+
+    var finished = try fileSearchDocumentFinishedForTest(allocator, &request, "accepted beta\n");
+    defer finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &finished));
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    try std.testing.expectEqualStrings("accepted beta\n", state.currentSource().?.bytes);
+    try std.testing.expect(state.file_search_source_focus == .none);
+    try std.testing.expect(state.pending_document_request == null);
+}
+
+test "repository file search focus directly binds an exact pending request" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state = try selectionStateForTest("main.zig\x00", "last good\n");
+    defer state.deinit(allocator);
+    state.root_identity = root.capability.identity;
+    state.freshness = .fresh;
+    state.requireDocumentRevalidation();
+
+    var request = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer request.deinit(allocator);
+    const size: chasen.Size = .{ .width = 80, .height = 10 };
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+
+    try std.testing.expectEqual(
+        request.generation,
+        state.file_search_source_focus.awaitingGeneration().?.generation,
+    );
+    try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+
+    var stale = try fileSearchDocumentFinishedForTest(allocator, &request, "stale\n");
+    stale.generation -|= 1;
+    defer stale.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyDocumentFinished(allocator, &stale));
+    try std.testing.expectEqual(
+        request.generation,
+        state.file_search_source_focus.awaitingGeneration().?.generation,
+    );
+    try std.testing.expectEqual(@as(?u64, request.generation), state.pending_document_generation);
+
+    var accepted = try fileSearchDocumentFinishedForTest(allocator, &request, "accepted\n");
+    defer accepted.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &accepted));
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    try std.testing.expect(state.file_search_source_focus == .none);
+}
+
+test "repository file search focus rejects an incompatible pending request basis" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state = try selectionStateForTest("main.zig\x00", "last good\n");
+    defer state.deinit(allocator);
+    state.root_identity = root.capability.identity;
+    state.freshness = .fresh;
+    state.requireDocumentRevalidation();
+
+    var request = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer request.deinit(allocator);
+    const size: chasen.Size = .{ .width = 80, .height = 10 };
+    const exact = state.pending_document_request.?;
+    var mismatches = [_]repository_file_search_focus.PendingDocumentRequest{ exact, exact, exact, exact };
+    mismatches[0].basis.activation_id +%= 1;
+    mismatches[1].basis.root_identity.inode +%= 1;
+    mismatches[2].basis.manifest_revision +%= 1;
+    mismatches[3].basis.path = "other.zig";
+    for (mismatches) |mismatch| {
+        state.pending_document_request = mismatch;
+        _ = state.applyNavigation(allocator, .enter_file_search, size);
+        _ = state.applyNavigation(allocator, .submit_file_search, size);
+
+        try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+        try std.testing.expect(state.file_search_source_focus == .none);
+        try std.testing.expectEqual(@as(?u64, request.generation), state.pending_document_generation);
+    }
+
+    state.pending_document_request = exact;
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expectEqual(
+        request.generation,
+        state.file_search_source_focus.awaitingGeneration().?.generation,
+    );
+}
+
+test "repository file search focus clears borrowed intent on selection reload and deactivation" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state = try selectionStateForTest("alpha.zig\x00beta.zig\x00", "alpha\n");
+    defer state.deinit(allocator);
+    state.root_identity = root.capability.identity;
+    state.freshness = .fresh;
+    const size: chasen.Size = .{ .width = 80, .height = 10 };
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    _ = state.applyNavigation(allocator, .file_search_next, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(state.file_search_source_focus.awaitingRequest() != null);
+
+    _ = state.applyNavigation(allocator, .move_up, size);
+    try std.testing.expectEqualStrings("alpha.zig", state.selected_path.?);
+    try std.testing.expect(state.file_search_source_focus == .none);
+
+    state.file_search_source_focus.awaitDocumentRequest(state.currentFileSearchFocusBasis().?);
+    state.requestReload(true);
+    try std.testing.expect(state.file_search_source_focus == .none);
+    try std.testing.expect(state.pending_document_request == null);
+
+    state.file_search_source_focus.awaitDocumentRequest(state.currentFileSearchFocusBasis().?);
+    state.deactivate();
+    try std.testing.expect(state.file_search_source_focus == .none);
+}
+
+test "repository file search focus closes preparation spawn and inert terminals" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    const size: chasen.Size = .{ .width = 80, .height = 10 };
+
+    {
+        var state = try selectionStateForTest("alpha.zig\x00beta.zig\x00", "alpha\n");
+        defer state.deinit(allocator);
+        state.root_identity = root.capability.identity;
+        state.freshness = .fresh;
+        _ = state.applyNavigation(allocator, .enter_file_search, size);
+        _ = state.applyNavigation(allocator, .file_search_next, size);
+        _ = state.applyNavigation(allocator, .submit_file_search, size);
+        try std.testing.expect(state.file_search_source_focus.awaitingRequest() != null);
+
+        state.markDocumentRequestPreparationFailed(error.OutOfMemory);
+        try std.testing.expect(state.file_search_source_focus == .none);
+        try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+    }
+
+    {
+        var state = try selectionStateForTest("alpha.zig\x00beta.zig\x00", "alpha\n");
+        defer state.deinit(allocator);
+        state.root_identity = root.capability.identity;
+        state.freshness = .fresh;
+        _ = state.applyNavigation(allocator, .enter_file_search, size);
+        _ = state.applyNavigation(allocator, .file_search_next, size);
+        _ = state.applyNavigation(allocator, .submit_file_search, size);
+        var request = try state.prepareDocumentRequest(allocator, &root.capability);
+        defer request.deinit(allocator);
+        state.rejectDocumentSpawn(request.generation);
+        try std.testing.expect(state.file_search_source_focus == .none);
+        try std.testing.expect(state.pending_document_request == null);
+        try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+    }
+
+    {
+        var state = try selectionStateForTest("alpha.zig\x00beta.zig\x00", "alpha\n");
+        defer state.deinit(allocator);
+        state.root_identity = root.capability.identity;
+        state.freshness = .fresh;
+        _ = state.applyNavigation(allocator, .enter_file_search, size);
+        _ = state.applyNavigation(allocator, .file_search_next, size);
+        _ = state.applyNavigation(allocator, .submit_file_search, size);
+        var request = try state.prepareDocumentRequest(allocator, &root.capability);
+        defer request.deinit(allocator);
+        var inert = try fileSearchDocumentFinishedForTest(allocator, &request, null);
+        defer inert.deinit(allocator);
+        try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &inert));
+        try std.testing.expect(state.file_search_source_focus == .none);
+        try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+        try std.testing.expect(state.displayed_document.?.value == .inert);
+    }
 }
 
 test "repository capability terminal cannot promote retained source authority" {
