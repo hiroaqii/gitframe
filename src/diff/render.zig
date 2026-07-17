@@ -218,7 +218,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     const styles = stylesForOptions(options);
     const content_width = bodyWidth(size.width);
     const mode = effectiveMode(content_width, options.requested_mode);
-    try renderFileHeader(surface, file, options.requested_mode, content_width, options.pane_active, options.header_selection, styles);
+    try renderFileHeader(surface, file, options.requested_mode, content_width, options.header_selection, styles);
     var body_surface = surface.child(.{
         .col = cursor_gutter_width,
         .row = 0,
@@ -291,7 +291,7 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, sour
     const styles = stylesForOptions(options);
     const content_width = bodyWidth(size.width);
     const mode = effectiveMode(content_width, options.requested_mode);
-    try renderGeneratedFileHeader(surface, path, source.contentLineCount(), options.requested_mode, content_width, options.pane_active, options.header_selection, styles);
+    try renderGeneratedFileHeader(surface, path, source.contentLineCount(), options.requested_mode, content_width, options.header_selection, styles);
     var body_surface = surface.child(.{
         .col = cursor_gutter_width,
         .row = 0,
@@ -336,7 +336,6 @@ fn renderFileHeader(
     file: diff_parser.FileDiff,
     requested_mode: DisplayMode,
     mode_width: u16,
-    pane_active: bool,
     header_selected: bool,
     styles: RenderStyles,
 ) !void {
@@ -346,7 +345,7 @@ fn renderFileHeader(
         .added = stats.added,
         .removed = stats.removed,
         .detail = detail,
-    }, modeLabel(mode_width, requested_mode), pane_active, header_selected, styles);
+    }, modeLabel(mode_width, requested_mode), header_selected, styles);
 }
 
 fn renderGeneratedFileHeader(
@@ -355,7 +354,6 @@ fn renderGeneratedFileHeader(
     added_lines: usize,
     requested_mode: DisplayMode,
     mode_width: u16,
-    pane_active: bool,
     header_selected: bool,
     styles: RenderStyles,
 ) !void {
@@ -363,7 +361,7 @@ fn renderGeneratedFileHeader(
         .added = added_lines,
         .removed = 0,
         .detail = "generated",
-    }, modeLabel(mode_width, requested_mode), pane_active, header_selected, styles);
+    }, modeLabel(mode_width, requested_mode), header_selected, styles);
 }
 
 const HeaderStatsText = struct {
@@ -372,7 +370,7 @@ const HeaderStatsText = struct {
     detail: []const u8,
 };
 
-fn drawHeaderLine(surface: *chasen.Surface, path: []const u8, stats: HeaderStatsText, mode_label: []const u8, pane_active: bool, header_selected: bool, styles: RenderStyles) !void {
+fn drawHeaderLine(surface: *chasen.Surface, path: []const u8, stats: HeaderStatsText, mode_label: []const u8, header_selected: bool, styles: RenderStyles) !void {
     const size = surface.size();
     if (size.width == 0) return;
 
@@ -385,11 +383,11 @@ fn drawHeaderLine(surface: *chasen.Surface, path: []const u8, stats: HeaderStats
     const path_width = if (layout.stats) |region| region.col -| 1 else if (layout.mode) |region| region.col -| 2 else size.width;
     if (path_width > 0) {
         var path_area = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
-        try drawHeaderPath(&path_area, path, fileHeaderStyle(pane_active, styles));
+        try drawHeaderPath(&path_area, path, fileHeaderStyle(styles));
     }
 
-    if (layout.stats) |region| try drawHeaderStats(surface, region.col, stats, pane_active, styles);
-    if (layout.mode) |region| try draw.copyClippedTextAt(surface, region.col, 0, mode_label, headerMetadataStyle(pane_active, styles));
+    if (layout.stats) |region| try drawHeaderStats(surface, region.col, stats, styles);
+    if (layout.mode) |region| try draw.copyClippedTextAt(surface, region.col, 0, mode_label, headerMetadataStyle(styles));
 
     if (header_selected) {
         if (layout.path_target) |region| applyHeaderRegionStyle(surface, region, styles.selection);
@@ -400,25 +398,25 @@ fn drawHeaderPath(surface: *chasen.Surface, path: []const u8, style: chasen.Text
     try draw.copyTailClippedTextAt(surface, 0, 0, path, style);
 }
 
-fn drawHeaderStats(surface: *chasen.Surface, col: u16, stats: HeaderStatsText, pane_active: bool, styles: RenderStyles) !void {
+fn drawHeaderStats(surface: *chasen.Surface, col: u16, stats: HeaderStatsText, styles: RenderStyles) !void {
     var cursor = col;
     const added_text = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added});
-    try draw.copyClippedTextAt(surface, cursor, 0, added_text, headerAddedStyle(pane_active, styles));
+    try draw.copyClippedTextAt(surface, cursor, 0, added_text, headerAddedStyle(styles));
     cursor +|= @intCast(chasen.text.displayWidth(added_text));
     if (cursor < surface.size().width) {
-        try draw.copyClippedTextAt(surface, cursor, 0, " ", headerMetadataStyle(pane_active, styles));
+        try draw.copyClippedTextAt(surface, cursor, 0, " ", headerMetadataStyle(styles));
         cursor +|= 1;
     }
 
     const removed_text = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed});
-    try draw.copyClippedTextAt(surface, cursor, 0, removed_text, headerRemovedStyle(pane_active, styles));
+    try draw.copyClippedTextAt(surface, cursor, 0, removed_text, headerRemovedStyle(styles));
     cursor +|= @intCast(chasen.text.displayWidth(removed_text));
     if (cursor < surface.size().width) {
-        try draw.copyClippedTextAt(surface, cursor, 0, " ", headerMetadataStyle(pane_active, styles));
+        try draw.copyClippedTextAt(surface, cursor, 0, " ", headerMetadataStyle(styles));
         cursor +|= 1;
     }
 
-    try draw.copyClippedTextAt(surface, cursor, 0, stats.detail, headerMetadataStyle(pane_active, styles));
+    try draw.copyClippedTextAt(surface, cursor, 0, stats.detail, headerMetadataStyle(styles));
 }
 
 fn applyHeaderRegionStyle(surface: *chasen.Surface, region: HeaderRegion, style: chasen.TextStyle) void {
@@ -995,24 +993,22 @@ fn lineNumberStyle(kind: diff_parser.DiffLine.Kind, staged: bool, styles: Render
     return style;
 }
 
-fn fileHeaderStyle(pane_active: bool, styles: RenderStyles) chasen.TextStyle {
-    var style = styles.file_header;
-    style.dim = style.dim or !pane_active;
-    return style;
+/// Row-0 file identity and statistics remain readable across pane focus.
+/// The row-1 rule and body cursor own the active-pane signal instead.
+fn fileHeaderStyle(styles: RenderStyles) chasen.TextStyle {
+    return styles.file_header;
 }
 
-fn headerAddedStyle(pane_active: bool, styles: RenderStyles) chasen.TextStyle {
-    return .{ .fg = styles.palette.color(.success), .bold = true, .dim = !pane_active };
+fn headerAddedStyle(styles: RenderStyles) chasen.TextStyle {
+    return .{ .fg = styles.palette.color(.success), .bold = true };
 }
 
-fn headerRemovedStyle(pane_active: bool, styles: RenderStyles) chasen.TextStyle {
-    return .{ .fg = styles.palette.color(.danger), .bold = true, .dim = !pane_active };
+fn headerRemovedStyle(styles: RenderStyles) chasen.TextStyle {
+    return .{ .fg = styles.palette.color(.danger), .bold = true };
 }
 
-fn headerMetadataStyle(pane_active: bool, styles: RenderStyles) chasen.TextStyle {
-    var style = styles.metadata;
-    style.dim = style.dim or !pane_active;
-    return style;
+fn headerMetadataStyle(styles: RenderStyles) chasen.TextStyle {
+    return styles.metadata;
 }
 
 fn prefixForLine(kind: diff_parser.DiffLine.Kind, hunk_side_has_visible_syntax: bool) []const u8 {
@@ -1122,7 +1118,7 @@ fn headerFocusTestPalette() theme.Palette {
     return palette;
 }
 
-fn expectHeaderFocusStyleMatrix(
+fn expectFocusStableHeaderStyleMatrix(
     active: *chasen.Surface,
     inactive: *chasen.Surface,
     layout: HeaderLayout,
@@ -1152,7 +1148,7 @@ fn expectHeaderFocusStyleMatrix(
         try std.testing.expectEqual(point.bold, active_cell.style.bold);
         try std.testing.expectEqual(point.bold, inactive_cell.style.bold);
         try std.testing.expect(!active_cell.style.dim);
-        try std.testing.expect(inactive_cell.style.dim);
+        try std.testing.expect(!inactive_cell.style.dim);
     }
 }
 
@@ -2394,7 +2390,7 @@ test "unified line numbers can be hidden while keeping prefix" {
     try ts.expectCellText(6, 4, "w");
 }
 
-test "parsed file header dims semantic statistics and metadata when inactive" {
+test "parsed file header keeps semantic statistics and metadata when inactive" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
         .old_path = "a/src/main.zig",
@@ -2424,7 +2420,7 @@ test "parsed file header dims semantic statistics and metadata when inactive" {
     defer inactive.deinit();
     try renderFile(&inactive.surface, file, .{ .pane_active = false, .palette = palette });
 
-    try expectHeaderFocusStyleMatrix(
+    try expectFocusStableHeaderStyleMatrix(
         &active.surface,
         &inactive.surface,
         fileHeaderLayout(80, displayPath(file), file, .unified, bodyWidth(80)),
@@ -2434,7 +2430,7 @@ test "parsed file header dims semantic statistics and metadata when inactive" {
     );
 }
 
-test "generated file header dims semantic statistics and metadata when inactive" {
+test "generated file header keeps semantic statistics and metadata when inactive" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "one\ntwo");
     var source = try repository_source.Document.initOwned(allocator, bytes, .init(bytes));
@@ -2451,7 +2447,7 @@ test "generated file header dims semantic statistics and metadata when inactive"
     defer inactive.deinit();
     try renderGeneratedAddedFile(&inactive.surface, "src/new.zig", &source, .{ .pane_active = false, .palette = palette });
 
-    try expectHeaderFocusStyleMatrix(
+    try expectFocusStableHeaderStyleMatrix(
         &active.surface,
         &inactive.surface,
         generatedHeaderLayout(80, "src/new.zig", source.contentLineCount(), .unified, bodyWidth(80)),

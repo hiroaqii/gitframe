@@ -728,7 +728,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
         .none, .primary => {},
     }
 
-    try drawTitlePath(&content, path, app.selectedStatusLineStats(), paneTitleStyle(active, app.theme), active, app.theme);
+    try drawTitlePath(&content, path, app.selectedStatusLineStats(), paneTitleStyle(app.theme), app.theme);
     const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "status: {s}{s}", .{ statusName(entry.index), statusSuffix(entry) });
     try draw.copyClippedTextAt(&content, 0, 2, status_text, .{ .fg = app.theme.color(.muted), .dim = !active });
     switch (file_tree.stagePresenceFromEntry(entry)) {
@@ -753,11 +753,11 @@ fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool, palette: theme.Pal
 }
 
 fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u8, stats: ?file_tree.Stats, active: bool, palette: theme.Palette) !void {
-    try drawTitlePath(surface, path, stats, paneTitleStyle(active, palette), active, palette);
+    try drawTitlePath(surface, path, stats, paneTitleStyle(palette), palette);
     try draw.copyClippedTextAt(surface, 0, 2, message, .{ .fg = palette.color(.muted), .dim = !active });
 }
 
-fn drawTitlePath(surface: *chasen.Surface, path: []const u8, stats: ?file_tree.Stats, style: chasen.TextStyle, active: bool, palette: theme.Palette) !void {
+fn drawTitlePath(surface: *chasen.Surface, path: []const u8, stats: ?file_tree.Stats, style: chasen.TextStyle, palette: theme.Palette) !void {
     if (stats) |line_stats| {
         if (line_stats.added != 0 or line_stats.removed != 0) {
             const suffix = try std.fmt.allocPrint(surface.frameAllocator(), " +{d} -{d}", .{ line_stats.added, line_stats.removed });
@@ -767,7 +767,7 @@ fn drawTitlePath(surface: *chasen.Surface, path: []const u8, stats: ?file_tree.S
                 var path_surface = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
                 try draw.copyTailClippedTextAt(&path_surface, 0, 0, path, style);
                 const suffix_col: u16 = @intCast(path_width);
-                try drawStatusLineStats(surface, suffix_col, line_stats, active, palette);
+                try drawStatusLineStats(surface, suffix_col, line_stats, palette);
                 return;
             }
         }
@@ -775,21 +775,20 @@ fn drawTitlePath(surface: *chasen.Surface, path: []const u8, stats: ?file_tree.S
     try draw.copyTailClippedTextAt(surface, 0, 0, path, style);
 }
 
-fn drawStatusLineStats(surface: *chasen.Surface, col: u16, stats: file_tree.Stats, active: bool, palette: theme.Palette) !void {
+fn drawStatusLineStats(surface: *chasen.Surface, col: u16, stats: file_tree.Stats, palette: theme.Palette) !void {
     var cursor = col;
-    var metadata_style = palette.style(.muted);
-    metadata_style.dim = metadata_style.dim or !active;
+    const metadata_style = palette.style(.muted);
     try draw.copyClippedTextAt(surface, cursor, 0, " ", metadata_style);
     cursor +|= 1;
     const added = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added});
-    try draw.copyClippedTextAt(surface, cursor, 0, added, .{ .fg = palette.color(.success), .bold = true, .dim = !active });
+    try draw.copyClippedTextAt(surface, cursor, 0, added, .{ .fg = palette.color(.success), .bold = true });
     cursor +|= @intCast(chasen.text.displayWidth(added));
     if (cursor < surface.size().width) {
         try draw.copyClippedTextAt(surface, cursor, 0, " ", metadata_style);
         cursor +|= 1;
     }
     const removed = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed});
-    try draw.copyClippedTextAt(surface, cursor, 0, removed, .{ .fg = palette.color(.danger), .bold = true, .dim = !active });
+    try draw.copyClippedTextAt(surface, cursor, 0, removed, .{ .fg = palette.color(.danger), .bold = true });
 }
 
 fn statusName(status: git_status.StatusCode) []const u8 {
@@ -1149,11 +1148,10 @@ fn sidebarBranchStyle(palette: theme.Palette) chasen.TextStyle {
     return palette.style(.info);
 }
 
-fn paneTitleStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
-    return if (active)
-        palette.boldStyle(.accent)
-    else
-        .{ .bold = true, .fg = palette.color(.muted), .dim = true };
+/// Selected-file identity is stable chrome rather than a pane-focus signal.
+/// Focus remains visible through the row-1 rule and diff body cursor.
+fn paneTitleStyle(palette: theme.Palette) chasen.TextStyle {
+    return palette.boldStyle(.accent);
 }
 
 fn paneSearchStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
@@ -1197,20 +1195,36 @@ fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette 
     return theme.Palette.fromConfig(FakeConfig{ .role = role, .color = color });
 }
 
-test "sidebar chrome stays semantic while inactive diff path title stays dim" {
+test "review pane title stays stable while rule and search keep focus treatment" {
     var palette: theme.Palette = .default();
     palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
     palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.muted)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 10, 11, 12 } };
 
     const title = sidebarTitleStyle(palette);
     const branch = sidebarBranchStyle(palette);
-    const inactive_diff_title = paneTitleStyle(false, palette);
+    const inactive_diff_title = paneTitleStyle(palette);
+    const active_rule = paneHeaderRuleStyle(true, palette);
+    const inactive_rule = paneHeaderRuleStyle(false, palette);
+    const active_search = paneSearchStyle(true, palette);
+    const inactive_search = paneSearchStyle(false, palette);
     try std.testing.expect(title.fg.eql(palette.color(.accent)));
     try std.testing.expect(title.bold);
     try std.testing.expect(!title.dim);
     try std.testing.expect(branch.fg.eql(palette.color(.info)));
     try std.testing.expect(!branch.dim);
-    try std.testing.expect(inactive_diff_title.dim);
+    try std.testing.expect(inactive_diff_title.fg.eql(palette.color(.accent)));
+    try std.testing.expect(inactive_diff_title.bold);
+    try std.testing.expect(!inactive_diff_title.dim);
+    try std.testing.expect(active_rule.fg.eql(.default));
+    try std.testing.expect(active_rule.dim);
+    try std.testing.expect(inactive_rule.fg.eql(palette.color(.muted)));
+    try std.testing.expect(inactive_rule.dim);
+    try std.testing.expect(active_search.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(active_search.bold);
+    try std.testing.expect(inactive_search.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(!inactive_search.bold);
 }
 
 test "review file search renders a bounded typed candidate window" {
@@ -1700,7 +1714,7 @@ test "diff renderer owns header search marker gutter and input presentation" {
     try ts.expectCellText(16, 1, " ");
 }
 
-test "status-only header dims semantic statistics and metadata when inactive" {
+test "status-only header keeps semantic statistics and metadata when inactive" {
     var palette: theme.Palette = .default();
     palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 1, 2, 3 } };
     palette.colors[@intFromEnum(theme.Role.danger)] = .{ .rgb = .{ 4, 5, 6 } };
@@ -1739,11 +1753,17 @@ test "status-only header dims semantic statistics and metadata when inactive" {
         try std.testing.expectEqual(point.bold, active_cell.style.bold);
         try std.testing.expectEqual(point.bold, inactive_cell.style.bold);
         try std.testing.expect(!active_cell.style.dim);
-        try std.testing.expect(inactive_cell.style.dim);
+        try std.testing.expect(!inactive_cell.style.dim);
     }
+
+    const active_body = active.surface.readCell(0, 2) orelse return error.ExpectedActiveStatusBodyCell;
+    const inactive_body = inactive.surface.readCell(0, 2) orelse return error.ExpectedInactiveStatusBodyCell;
+    try std.testing.expect(!active_body.style.dim);
+    try std.testing.expect(inactive_body.style.dim);
 }
 
-test "inactive status-only pending and inert diff path headers remain dim" {
+test "inactive status-only pending and inert diff path headers keep semantic intensity" {
+    const palette = theme.Palette.default();
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
@@ -1758,11 +1778,14 @@ test "inactive status-only pending and inert diff path headers remain dim" {
     var status_only: chasen.testing.TestSurface = undefined;
     try status_only.init(40, 6);
     defer status_only.deinit();
-    var status_context = testContext(&page, .default(), 40, 7);
+    var status_context = testContext(&page, palette, 40, 7);
     status_context.repo_root = "/repo";
     status_context.navigation.repo_root = "/repo";
     try viewDiffPane(status_context, &status_only.surface, page.load.state.loaded.loaded);
-    try std.testing.expect(status_only.surface.readCell(1, 0).?.style.dim);
+    const status_path = status_only.surface.readCell(1, 0) orelse return error.ExpectedStatusOnlyPath;
+    try std.testing.expect(status_path.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(status_path.style.bold);
+    try std.testing.expect(!status_path.style.dim);
 
     page.review_projection.pending = try review_projection.cloneRequest(
         std.testing.allocator,
@@ -1780,7 +1803,10 @@ test "inactive status-only pending and inert diff path headers remain dim" {
     try pending.init(40, 6);
     defer pending.deinit();
     try viewDiffPane(status_context, &pending.surface, page.load.state.loaded.loaded);
-    try std.testing.expect(pending.surface.readCell(1, 0).?.style.dim);
+    const pending_path = pending.surface.readCell(1, 0) orelse return error.ExpectedPendingPath;
+    try std.testing.expect(pending_path.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(pending_path.style.bold);
+    try std.testing.expect(!pending_path.style.dim);
     page.review_projection.clearPending(std.testing.allocator);
 
     const inert_eligibility = [_]loaded_diff.FileTextEligibility{.inert_invalid_utf8};
@@ -1792,9 +1818,12 @@ test "inactive status-only pending and inert diff path headers remain dim" {
     var inert: chasen.testing.TestSurface = undefined;
     try inert.init(40, 6);
     defer inert.deinit();
-    const inert_context = testContext(&page, .default(), 40, 7);
+    const inert_context = testContext(&page, palette, 40, 7);
     try viewDiffPane(inert_context, &inert.surface, page.load.state.loaded.loaded);
-    try std.testing.expect(inert.surface.readCell(1, 0).?.style.dim);
+    const inert_path = inert.surface.readCell(1, 0) orelse return error.ExpectedInertPath;
+    try std.testing.expect(inert_path.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(inert_path.style.bold);
+    try std.testing.expect(!inert_path.style.dim);
 }
 
 test "reviewed sidebar marker and visible search marker are Review view concerns" {
