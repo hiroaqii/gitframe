@@ -8,6 +8,7 @@ const review_projection = @import("../review_projection.zig");
 const app_state = @import("../state.zig");
 pub const action_cursor = @import("review/action_cursor.zig");
 const authority = @import("review/authority.zig");
+pub const file_search = @import("review/file_search.zig");
 const review_selection = @import("review/selection.zig");
 const config = @import("../../config.zig");
 const context = @import("../../context.zig");
@@ -166,13 +167,16 @@ pub const ReviewPageState = struct {
     deferred_projection_apply: ?DeferredProjectionApply = null,
     viewer: ViewerState = .{},
     search: DiffSearchState = .{},
-    file_search: prompt.FilterPromptState = .{},
+    file_search: file_search.State = .{},
     file_search_return_focus: Focus = .sidebar,
     review_display: app_state.ReviewDisplayState = .{},
     staged_hunks: app_state.StagedHunkMarks = .{},
     review_projection: review_projection.State = .{},
     review_projection_next_id: u64 = 0,
     source_session_revision: u64 = 0,
+    /// Semantic generation of accepted sidebar rows. Zero is reserved as an
+    /// invalid candidate basis, so the first accepted namespace starts at one.
+    accepted_sidebar_revision: u64 = 1,
     status_snapshot_revision: u64 = 0,
     pending_display_navigation_restore: ?PendingDisplayNavigationRestore = null,
     display_navigation_input_revision: u64 = 0,
