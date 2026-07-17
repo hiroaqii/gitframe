@@ -1540,7 +1540,7 @@ pub const App = struct {
         ctx.task().spawnWith(.{ .ctx = task, .run = RepoDiscoveryTask.run, .failed = RepoDiscoveryTask.failed }) catch |err| {
             ctx.allocator().destroy(task);
             self.reviewReload().rejectRepoDiscoverySpawn(generation);
-            try self.reviewReload().storeFailedMessage(ctx.allocator(), "Could not start repo discovery task");
+            try self.reviewReload().replaceSourceFailure(ctx.allocator(), "Could not start repo discovery task");
             return err;
         };
         self.reviewReload().acceptRepoDiscoverySpawn(background_cycle_id);
@@ -1648,7 +1648,7 @@ pub const App = struct {
             if (action_cursor_generation) |action_generation| {
                 _ = self.pages.review.action_cursor.rejectMemberSpawn(action_generation, .source, generation);
             }
-            try self.reviewReload().storeFailedMessage(ctx.allocator(), "Could not start diff load task");
+            try self.reviewReload().replaceSourceFailure(ctx.allocator(), "Could not start diff load task");
             return err;
         };
         self.reviewReload().acceptSourceSpawn(options.background_cycle_id);

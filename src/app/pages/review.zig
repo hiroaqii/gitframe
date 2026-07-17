@@ -202,15 +202,33 @@ pub const ReviewPageState = struct {
         self.auto_reload = .init(cli, user, source);
     }
 
+    /// Invalidate every candidate borrow before the accepted sidebar owner is
+    /// replaced, then open a new semantic namespace for later publication.
+    /// Prompt mode and input intentionally survive so the replacement path can
+    /// rebuild the same query after its primary model has committed.
+    pub fn advanceAcceptedSidebarRevision(self: *ReviewPageState, allocator: ?std.mem.Allocator) void {
+        if (allocator) |owner| {
+            self.file_search.markProjectionUnavailable(owner);
+        } else {
+            std.debug.assert(!self.file_search.projection_available);
+            std.debug.assert(self.file_search.candidates.len == 0);
+            std.debug.assert(self.file_search.basis == null);
+            std.debug.assert(self.file_search.filter.labels.len == 0);
+        }
+        self.accepted_sidebar_revision = file_search.nextAcceptedSidebarRevision(self.accepted_sidebar_revision);
+    }
+
     pub fn deinit(self: *ReviewPageState, allocator: std.mem.Allocator) void {
         self.selection_owner = .none;
         if (self.completed_selection) |*selection| selection.deinit(allocator);
         if (self.deferred_source_apply) |*deferred| deferred.deinit(allocator);
         if (self.deferred_projection_apply) |*deferred| deferred.deinit(allocator);
+        // File-search candidates borrow paths from the accepted load arena.
+        // Release their containers before load teardown frees that owner.
+        self.file_search.deinit(allocator);
         self.load.clearCurrent(allocator);
         self.git_status.deinit();
         self.branch_status.deinit();
-        self.file_search.deinit(allocator);
         self.reviewed_store.deinit(allocator);
         self.staged_hunks.deinit(allocator);
         self.review_projection.deinit(allocator);

@@ -16,6 +16,7 @@ const root_capability = @import("../../../repo/root_capability.zig");
 const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
 const review_page = @import("../review.zig");
 const review_selection = @import("selection.zig");
+const file_search = @import("file_search.zig");
 const authority = @import("authority.zig");
 const navigation = @import("navigation.zig");
 const diff_file = @import("../../../diff/file.zig");
@@ -1032,8 +1033,8 @@ pub const Controller = struct {
                 result.result = .empty;
                 return .{ .commit_discovery = discovery };
             },
-            .failed => |message| try self.storeFailedMessage(allocator, std.mem.trim(u8, message, " \t\r\n")),
-            .failed_static => |message| try self.storeFailedMessage(allocator, message),
+            .failed => |message| try self.replaceSourceFailure(allocator, std.mem.trim(u8, message, " \t\r\n")),
+            .failed_static => |message| try self.replaceSourceFailure(allocator, message),
         }
         return .{};
     }
@@ -1475,8 +1476,7 @@ pub const Controller = struct {
             }
             return .{ .redraw = .skip };
         }
-        self.clearSourceDisplay(allocator);
-        try self.storeFailedMessage(allocator, message);
+        try self.replaceSourceFailure(allocator, message);
         return .{};
     }
 
@@ -1512,6 +1512,9 @@ pub const Controller = struct {
     }
 
     pub fn advanceSourceSessionRevision(self: Controller, allocator: ?std.mem.Allocator) void {
+        // Candidate paths borrow the accepted load arena. Revoke that complete
+        // namespace before any source transition can free or replace it.
+        self.page.advanceAcceptedSidebarRevision(allocator);
         if (allocator) |owner| {
             self.clearCompletedSelection(owner);
             self.page.review_projection.clearCache(owner);
@@ -1539,8 +1542,18 @@ pub const Controller = struct {
         self.page.status_snapshot_revision +%= 1;
     }
 
-    pub fn storeFailedMessage(self: Controller, allocator: std.mem.Allocator, message: []const u8) !void {
-        try self.page.load.replaceFailed(allocator, message);
+    /// Replace the visible source with a prepared failure without allowing the
+    /// low-level load-state commit to free an accepted sidebar owner directly.
+    /// Preparing first preserves the current display if message allocation
+    /// fails; an already-cleared caller does not advance revisions twice.
+    pub fn replaceSourceFailure(self: Controller, allocator: std.mem.Allocator, message: []const u8) !void {
+        var failed = try load_state.FailedLoad.init(allocator, message);
+        if (self.page.load.state == .loaded) {
+            self.clearSourceDisplay(allocator);
+        } else {
+            self.page.load.clearCurrent(allocator);
+        }
+        self.page.load.installPreparedFailed(&failed);
     }
 
     /// Projection/session teardown for the current Review display. This does
@@ -2396,6 +2409,107 @@ test "source session replacement clears populated projection cache" {
     try std.testing.expectEqual(@as(u64, 1), page.source_session_revision);
     try std.testing.expectEqual(@as(usize, 0), page.review_projection.cacheLen());
     try std.testing.expect(!page.review_projection.cacheHas("/repo", "a", .generated_added_file, .unstaged, 0, 0));
+}
+
+fn testPageWithOwnedFileSearchCandidate(allocator: std.mem.Allocator) !review_page.ReviewPageState {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    var arena_transferred = false;
+    errdefer if (!arena_transferred) arena.deinit();
+    const arena_allocator = arena.allocator();
+    const path = try arena_allocator.dupe(u8, "src/owned.zig");
+    const nodes = try arena_allocator.alloc(file_tree.Node, 1);
+    nodes[0] = .{
+        .kind = .file,
+        .name = path[4..],
+        .path = path,
+        .path_key = path,
+        .depth = 1,
+        .status = .modified,
+        .target = .{ .status_entry = 0 },
+    };
+    const loaded: loaded_diff.LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &.{} },
+        .file_text_eligibility = &.{},
+        .tree = .{ .nodes = nodes },
+        .bytes = 0,
+        .lines = 0,
+    };
+
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadStateWithArena(arena, loaded),
+    };
+    arena_transferred = true;
+    errdefer page.deinit(allocator);
+    const basis: file_search.Basis = .{
+        .repo_epoch = 0,
+        .source_session_revision = page.source_session_revision,
+        .accepted_sidebar_revision = page.accepted_sidebar_revision,
+    };
+    const active_loaded = switch (page.load.state) {
+        .loaded => |*session| &session.loaded,
+        else => unreachable,
+    };
+    var projection = try file_search.buildProjection(
+        allocator,
+        active_loaded,
+        "owned",
+        .{ .basis = basis },
+    );
+    page.file_search.mode = true;
+    try page.file_search.input.insertSlice("owned");
+    page.file_search.publish(allocator, &projection);
+    try std.testing.expect(page.file_search.projection_available);
+    try std.testing.expectEqualStrings("src/owned.zig", page.file_search.focusedCandidate().?.path_key);
+    return page;
+}
+
+test "source replacement clears file search borrows before advancing its sidebar namespace" {
+    const allocator = std.testing.allocator;
+    var page = try testPageWithOwnedFileSearchCandidate(allocator);
+    defer page.deinit(allocator);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    controller.clearLoadedDiff(allocator);
+
+    try std.testing.expectEqual(@as(u64, 1), page.source_session_revision);
+    try std.testing.expectEqual(@as(u64, 2), page.accepted_sidebar_revision);
+    try std.testing.expect(page.file_search.mode);
+    try std.testing.expectEqualStrings("owned", page.file_search.input.slice());
+    try std.testing.expect(!page.file_search.projection_available);
+    try std.testing.expect(page.file_search.focusedCandidate() == null);
+    try std.testing.expectEqual(@as(usize, 0), page.file_search.candidates.len);
+}
+
+test "source failure prepares its message then clears file search before freeing the load owner" {
+    const allocator = std.testing.allocator;
+    var page = try testPageWithOwnedFileSearchCandidate(allocator);
+    defer page.deinit(allocator);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, controller.replaceSourceFailure(failing.allocator(), "load failed"));
+    try std.testing.expect(page.load.state == .loaded);
+    try std.testing.expect(page.file_search.projection_available);
+    try std.testing.expectEqual(@as(u64, 0), page.source_session_revision);
+    try std.testing.expectEqual(@as(u64, 1), page.accepted_sidebar_revision);
+
+    try controller.replaceSourceFailure(allocator, "load failed");
+
+    try std.testing.expect(page.load.state == .failed);
+    switch (page.load.state) {
+        .failed => |failed| try std.testing.expectEqualStrings("load failed", failed.message),
+        else => unreachable,
+    }
+    try std.testing.expectEqual(@as(u64, 1), page.source_session_revision);
+    try std.testing.expectEqual(@as(u64, 2), page.accepted_sidebar_revision);
+    try std.testing.expect(page.file_search.mode);
+    try std.testing.expectEqualStrings("owned", page.file_search.input.slice());
+    try std.testing.expect(!page.file_search.projection_available);
+    try std.testing.expect(page.file_search.focusedCandidate() == null);
+    try std.testing.expectEqual(@as(usize, 0), page.file_search.candidates.len);
 }
 
 test "old revision display is not admitted when fresh completion replaces it" {

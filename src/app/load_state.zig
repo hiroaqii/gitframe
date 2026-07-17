@@ -173,15 +173,17 @@ pub const LoadRuntimeState = struct {
     }
 
     pub fn replaceFailed(self: *LoadRuntimeState, allocator: std.mem.Allocator, message: []const u8) !void {
-        var arena: std.heap.ArenaAllocator = .init(allocator);
-        errdefer arena.deinit();
-
-        const copied = try arena.allocator().dupe(u8, message);
+        var failed = try FailedLoad.init(allocator, message);
         self.clearCurrent(allocator);
-        self.state = .{ .failed = .{
-            .arena = arena,
-            .message = if (copied.len > 0) copied else "Unknown diff load error",
-        } };
+        self.installPreparedFailed(&failed);
+    }
+
+    /// Commit an already allocated failure after a higher-level owner has
+    /// completed every clear-before-free transition for the previous state.
+    pub fn installPreparedFailed(self: *LoadRuntimeState, failed: *FailedLoad) void {
+        std.debug.assert(self.state == .idle);
+        self.state = .{ .failed = failed.* };
+        failed.* = undefined;
     }
 
     pub fn replaceEmpty(self: *LoadRuntimeState, allocator: std.mem.Allocator, reason: EmptyReason) void {
@@ -227,6 +229,16 @@ pub const LoadedSession = struct {
 pub const FailedLoad = struct {
     arena: std.heap.ArenaAllocator,
     message: []const u8,
+
+    pub fn init(allocator: std.mem.Allocator, message: []const u8) !FailedLoad {
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        errdefer arena.deinit();
+        const copied = try arena.allocator().dupe(u8, message);
+        return .{
+            .arena = arena,
+            .message = if (copied.len > 0) copied else "Unknown diff load error",
+        };
+    }
 
     pub fn deinit(self: *FailedLoad) void {
         self.arena.deinit();
