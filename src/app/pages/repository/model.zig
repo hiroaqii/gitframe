@@ -50,7 +50,7 @@ pub const SourceSearchState = struct {
 pub const FileSearchState = struct {
     mode: bool = false,
     /// Focus and visibility captured on entry. They are consumed only by a
-    /// cancel/empty-submit terminal; successful submit commits visible/tree.
+    /// cancel terminal; successful submit commits visible/tree.
     return_focus: Focus = .tree,
     restore_tree_hidden: bool = false,
     input: prompt.TextInput = .{},

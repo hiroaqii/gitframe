@@ -2242,11 +2242,6 @@ pub const RepositoryPageState = struct {
     }
 
     fn submitFileSearch(self: *RepositoryPageState, body_size: chasen.Size) void {
-        const query = std.mem.trim(u8, self.file_search.input.slice(), " \t\r\n");
-        if (query.len == 0) {
-            self.cancelFileSearch(body_size);
-            return;
-        }
         if (!self.file_search.projection_available) return;
         const node_index = self.file_search.selectedNode() orelse {
             self.file_search.no_match = true;
@@ -3202,6 +3197,60 @@ test "repository file search expands typed root before selecting result" {
     }
 }
 
+test "repository empty file search accepts the focused exact candidate" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("alpha.zig\x00beta.zig\x00"),
+        .load_state = .loaded,
+        .viewer = .{ .focus = .source, .tree_hidden = true },
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.filePath("beta.zig", .all);
+    const size: chasen.Size = .{ .width = 80, .height = 10 };
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(!state.file_search.mode);
+    try std.testing.expect(!state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+    try std.testing.expectEqualStrings("alpha.zig", state.selected_path.?);
+
+    state.viewer.tree_hidden = true;
+    state.viewer.focus = .source;
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    _ = state.applyNavigation(allocator, .file_search_previous, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(!state.file_search.mode);
+    try std.testing.expect(!state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+    try std.testing.expectEqualStrings("alpha.zig", state.selected_path.?);
+}
+
+test "repository empty file search retains authoritative zero-candidate prompt" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest(""),
+        .load_state = .loaded,
+        .viewer = .{ .focus = .source, .tree_hidden = true },
+    };
+    defer state.deinit(allocator);
+    const size: chasen.Size = .{ .width = 80, .height = 8 };
+
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    try std.testing.expect(state.file_search.projection_available);
+    try std.testing.expect(state.file_search.no_match);
+    try std.testing.expectEqual(@as(usize, 0), state.file_search.len);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(state.file_search.mode);
+    try std.testing.expect(state.file_search.no_match);
+    try std.testing.expect(!state.viewer.tree_hidden);
+
+    _ = state.applyNavigation(allocator, .cancel_file_search, size);
+    try std.testing.expect(!state.file_search.mode);
+    try std.testing.expect(state.viewer.tree_hidden);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+}
+
 test "repository file search takeover suppresses and restores tree cursor background" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
@@ -3270,9 +3319,9 @@ test "repository file search takeover suppresses and restores tree cursor backgr
     try std.testing.expect(!state.file_search.mode);
     test_surface.surface.clearAll();
     try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
-    const empty_submit_alpha_trailing = test_surface.surface.readCell(layout.tree_width - 1, alpha_row) orelse
+    const empty_accept_alpha_trailing = test_surface.surface.readCell(layout.tree_width - 1, alpha_row) orelse
         return error.ExpectedAlphaTrailingCell;
-    try std.testing.expect(empty_submit_alpha_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(empty_accept_alpha_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     _ = state.applyNavigation(allocator, .enter_file_search, size);
     for ("beta") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
@@ -3422,7 +3471,7 @@ test "repository hidden-tree file search restores on cancel and commits visible 
     try std.testing.expectEqualStrings("other.zig", state.selected_path.?);
 
     _ = state.applyNavigation(allocator, .enter_file_search, size);
-    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    _ = state.applyNavigation(allocator, .cancel_file_search, size);
     try std.testing.expect(!state.file_search.mode);
     try std.testing.expect(state.viewer.tree_hidden);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
@@ -3457,6 +3506,13 @@ test "repository hidden-tree file search keeps unavailable prompt cancellable" {
     const size: chasen.Size = .{ .width = 80, .height = 8 };
 
     _ = state.applyNavigation(allocator, .enter_file_search, size);
+    _ = state.applyNavigation(allocator, .submit_file_search, size);
+    try std.testing.expect(state.file_search.mode);
+    try std.testing.expectEqualStrings("", state.file_search.input.slice());
+    try std.testing.expect(!state.file_search.projection_available);
+    try std.testing.expect(!state.file_search.no_match);
+    try std.testing.expect(!state.viewer.tree_hidden);
+
     _ = state.applyNavigation(allocator, .{ .file_search_insert = 'x' }, size);
     _ = state.applyNavigation(allocator, .submit_file_search, size);
     try std.testing.expect(state.file_search.mode);
