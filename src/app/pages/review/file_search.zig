@@ -11,6 +11,7 @@ const ui = @import("chasen_ui");
 const prompt = @import("../../prompt.zig");
 const context = @import("../../../context.zig");
 const file_tree = @import("../../../file_tree.zig");
+const loaded_diff = @import("../../../loaded_diff.zig");
 
 pub const max_candidates: usize = 512;
 
@@ -85,6 +86,74 @@ pub const Projection = struct {
         self.* = undefined;
     }
 };
+
+pub const BuildOptions = struct {
+    basis: Basis,
+    hide_reviewed_files: bool = false,
+    changed_file_filter: loaded_diff.ChangedFileFilter = .all,
+};
+
+/// Prepare one bounded projection without mutating the live prompt state.
+///
+/// The scan intentionally uses every accepted tree node rather than only the
+/// materialized visible rows: a matching file remains discoverable below a
+/// collapsed root/directory, while Review's hide-reviewed and changed-file
+/// lenses still define candidate eligibility. Only matching rows consume the
+/// fixed result budget, so an early non-match cannot hide a later match.
+pub fn buildProjection(
+    allocator: std.mem.Allocator,
+    loaded: *const loaded_diff.LoadedDiff,
+    query: []const u8,
+    options: BuildOptions,
+) !Projection {
+    if (!options.basis.valid()) return error.InvalidBasis;
+
+    var candidates: std.ArrayList(Candidate) = .empty;
+    errdefer candidates.deinit(allocator);
+    var labels: std.ArrayList([]const u8) = .empty;
+    defer labels.deinit(allocator);
+
+    var truncated = false;
+    for (loaded.tree.nodes, 0..) |node, node_index| {
+        if (node.kind != .file or node.path_key.len == 0) continue;
+        const target_kind = TargetKind.fromSidebarTarget(node.target) orelse continue;
+        if (!loaded.shouldIncludeFileNode(
+            node_index,
+            options.hide_reviewed_files,
+            options.changed_file_filter,
+        )) continue;
+        if (!ui.list_filter.matchesLabel(node.path, query)) continue;
+        if (candidates.items.len == max_candidates) {
+            truncated = true;
+            break;
+        }
+
+        try candidates.append(allocator, .{
+            .basis = options.basis,
+            .target_kind = target_kind,
+            .node_index = node_index,
+            .path_key = node.path_key,
+        });
+        try labels.append(allocator, node.path);
+    }
+
+    const owned_candidates = try candidates.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_candidates);
+    var filter: ui.ListFilter = .{};
+    errdefer filter.deinit(allocator);
+    // The pre-scan enforces the result budget. Applying the same matcher again
+    // gives ListFilter ownership of its query/index/label containers and keeps
+    // its source indexes aligned exactly with `owned_candidates`.
+    try filter.apply(allocator, labels.items, query);
+    std.debug.assert(filter.labels.len == owned_candidates.len);
+
+    return .{
+        .basis = options.basis,
+        .candidates = owned_candidates,
+        .filter = filter,
+        .truncated = truncated,
+    };
+}
 
 /// Review-owned prompt and candidate projection.
 ///
@@ -169,7 +238,9 @@ test "review file search basis requires a nonzero accepted sidebar revision" {
     try std.testing.expect(!invalid.valid());
     try std.testing.expect(valid.valid());
     try std.testing.expect(valid.eql(valid));
+    try std.testing.expect(!valid.eql(.{ .repo_epoch = 5, .source_session_revision = 9, .accepted_sidebar_revision = 1 }));
     try std.testing.expect(!valid.eql(.{ .repo_epoch = 4, .source_session_revision = 10, .accepted_sidebar_revision = 1 }));
+    try std.testing.expect(!valid.eql(.{ .repo_epoch = 4, .source_session_revision = 9, .accepted_sidebar_revision = 2 }));
     try std.testing.expectEqual(@as(u64, 1), nextAcceptedSidebarRevision(std.math.maxInt(u64)));
 }
 
@@ -208,6 +279,17 @@ test "review file search publishes and focuses one exact typed candidate" {
     };
     try std.testing.expect(focused.matchesNode(basis, 2, matching_node));
     try std.testing.expect(!focused.matchesNode(basis, 1, matching_node));
+    try std.testing.expect(!focused.matchesNode(
+        .{ .repo_epoch = 2, .source_session_revision = 3, .accepted_sidebar_revision = 5 },
+        2,
+        matching_node,
+    ));
+    var wrong_target = matching_node;
+    wrong_target.target = .{ .diff_file = 7 };
+    try std.testing.expect(!focused.matchesNode(basis, 2, wrong_target));
+    var wrong_path = matching_node;
+    wrong_path.path_key = "src/c.zig";
+    try std.testing.expect(!focused.matchesNode(basis, 2, wrong_path));
 }
 
 test "review file search unavailable terminal keeps prompt and owns no stale candidates" {
@@ -238,4 +320,108 @@ test "review file search unavailable terminal keeps prompt and owns no stale can
     try std.testing.expect(!state.no_match);
     try std.testing.expectEqual(@as(usize, 0), state.candidates.len);
     try std.testing.expect(state.focusedCandidate() == null);
+}
+
+test "review file search builder applies lenses but searches collapsed descendants" {
+    const allocator = std.testing.allocator;
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root },
+        .{ .kind = .directory, .name = "src", .path = "src", .path_key = "src", .depth = 0, .target = .{ .directory = "src" } },
+        .{ .kind = .file, .name = "a.zig", .path = "src/a.zig", .path_key = "src/a.zig", .depth = 1, .status = .modified, .target = .{ .diff_file = 0 } },
+        .{ .kind = .file, .name = "b.zig", .path = "src/b.zig", .path_key = "src/b.zig", .depth = 1, .status = .added, .target = .{ .status_entry = 4 } },
+        .{ .kind = .file, .name = "reviewed.zig", .path = "src/reviewed.zig", .path_key = "src/reviewed.zig", .depth = 1, .status = .modified, .target = .{ .diff_file = 1 } },
+    };
+    const reviewed = [_]bool{ false, true };
+    var loaded: loaded_diff.LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &.{} },
+        .file_text_eligibility = &.{},
+        .tree = .{ .nodes = &nodes },
+        .reviewed_files = @constCast(&reviewed),
+        .bytes = 0,
+        .lines = 0,
+    };
+    try loaded.collapsed_dirs.put(allocator, "src", {});
+    defer loaded.collapsed_dirs.deinit(allocator);
+    const basis: Basis = .{ .repo_epoch = 7, .source_session_revision = 8, .accepted_sidebar_revision = 9 };
+
+    var all = try buildProjection(allocator, &loaded, "SRC/", .{
+        .basis = basis,
+        .hide_reviewed_files = true,
+    });
+    defer all.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), all.candidates.len);
+    try std.testing.expectEqual(TargetKind.diff_file, all.candidates[0].target_kind);
+    try std.testing.expectEqual(TargetKind.status_only, all.candidates[1].target_kind);
+    try std.testing.expectEqualStrings("src/a.zig", all.filter.labels[0]);
+    try std.testing.expectEqualStrings("src/b.zig", all.filter.labels[1]);
+    try std.testing.expect(!all.truncated);
+
+    var modified = try buildProjection(allocator, &loaded, "src/", .{
+        .basis = basis,
+        .changed_file_filter = .modified,
+    });
+    defer modified.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), modified.candidates.len);
+    try std.testing.expectEqualStrings("src/a.zig", modified.filter.labels[0]);
+    try std.testing.expectEqualStrings("src/reviewed.zig", modified.filter.labels[1]);
+}
+
+test "review file search builder bounds matching candidates and reports truncation" {
+    const allocator = std.testing.allocator;
+    const nodes = try allocator.alloc(file_tree.Node, max_candidates + 1);
+    defer allocator.free(nodes);
+    for (nodes, 0..) |*node, index| node.* = .{
+        .kind = .file,
+        .name = "match.zig",
+        .path = "match.zig",
+        .path_key = "match.zig",
+        .depth = 0,
+        .target = .{ .status_entry = index },
+    };
+    const loaded: loaded_diff.LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &.{} },
+        .file_text_eligibility = &.{},
+        .tree = .{ .nodes = nodes },
+        .bytes = 0,
+        .lines = 0,
+    };
+    const basis: Basis = .{ .repo_epoch = 1, .source_session_revision = 1, .accepted_sidebar_revision = 1 };
+
+    var projection = try buildProjection(allocator, &loaded, "match", .{ .basis = basis });
+    defer projection.deinit(allocator);
+    try std.testing.expectEqual(max_candidates, projection.candidates.len);
+    try std.testing.expect(projection.truncated);
+}
+
+test "review file search builder releases every partial allocation" {
+    const nodes = [_]file_tree.Node{.{
+        .kind = .file,
+        .name = "main.zig",
+        .path = "src/main.zig",
+        .path_key = "src/main.zig",
+        .depth = 1,
+        .target = .{ .diff_file = 0 },
+    }};
+    const loaded: loaded_diff.LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &.{} },
+        .file_text_eligibility = &.{},
+        .tree = .{ .nodes = &nodes },
+        .bytes = 0,
+        .lines = 0,
+    };
+    const basis: Basis = .{ .repo_epoch = 1, .source_session_revision = 2, .accepted_sidebar_revision = 3 };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn build(
+            allocator: std.mem.Allocator,
+            source: *const loaded_diff.LoadedDiff,
+            expected_basis: Basis,
+        ) !void {
+            var projection = try buildProjection(allocator, source, "main", .{ .basis = expected_basis });
+            defer projection.deinit(allocator);
+        }
+    }.build, .{ &loaded, basis });
 }
