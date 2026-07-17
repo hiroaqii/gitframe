@@ -19,6 +19,7 @@ const review_message = @import("message.zig");
 const review_projection = @import("../../review_projection.zig");
 const app_review_projection = review_projection;
 const review_page = @import("../review.zig");
+const file_search = @import("file_search.zig");
 const context = @import("../../../context.zig");
 const diff_file = @import("../../../diff/file.zig");
 const diff_hunk_projection = @import("../../../diff/hunk_projection.zig");
@@ -1440,6 +1441,36 @@ pub const Controller = struct {
     pub fn cancelFileSearchMode(self: Controller, allocator: std.mem.Allocator) void {
         self.page.file_search.deinit(allocator);
         self.page.viewer.focus = if (self.page.viewer.sidebar_hidden) .diff else self.page.file_search_return_focus;
+    }
+
+    /// Rebuild the candidate projection from the current accepted sidebar
+    /// without making a model replacement depend on search allocation. A
+    /// failed rebuild keeps the prompt/input alive but publishes no candidate,
+    /// so render and submit cannot observe a stale path borrow.
+    pub fn rebuildFileSearchProjection(self: Controller, allocator: std.mem.Allocator) void {
+        if (!self.page.file_search.mode) {
+            self.page.file_search.markProjectionUnavailable(allocator);
+            return;
+        }
+        const loaded = self.activeLoadedDiff() orelse {
+            self.page.file_search.markProjectionUnavailable(allocator);
+            return;
+        };
+        const basis: file_search.Basis = .{
+            .repo_epoch = self.repo_epoch,
+            .source_session_revision = self.page.source_session_revision,
+            .accepted_sidebar_revision = self.page.accepted_sidebar_revision,
+        };
+        const query = std.mem.trim(u8, self.page.file_search.input.slice(), " \t\r\n");
+        var projection = file_search.buildProjection(allocator, loaded, query, .{
+            .basis = basis,
+            .hide_reviewed_files = self.page.review_display.hide_reviewed_files,
+            .changed_file_filter = self.page.review_display.changed_file_filter,
+        }) catch {
+            self.page.file_search.markProjectionUnavailable(allocator);
+            return;
+        };
+        self.page.file_search.publish(allocator, &projection);
     }
 
     pub fn toggleReviewedFile(self: Controller, allocator: std.mem.Allocator) !void {

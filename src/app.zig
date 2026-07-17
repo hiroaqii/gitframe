@@ -4687,8 +4687,19 @@ pub const App = struct {
         allocator: std.mem.Allocator,
         token: review_page.action_cursor.CompletionToken,
         succeeded: bool,
-    ) bool {
+    ) !bool {
         if (!self.pages.review.action_cursor.finishCompletion(token, succeeded)) return false;
+        if (!self.pages.review.action_cursor.terminal()) return false;
+
+        // The last delivered member has already committed (or rejected) its
+        // accepted model, but the cursor owner must remain alive while the
+        // source/status tree is reconciled. This lets status projection remap
+        // the typed target and republish the retained file-search query from
+        // the final tree before finalize consumes the owner.
+        self.reviewReload().applyStatusProjection(allocator, false, .terminal_action) catch |err| {
+            _ = self.reviewNavigation().finalizeActionCursor(allocator);
+            return err;
+        };
         return self.reviewNavigation().finalizeActionCursor(allocator);
     }
 
@@ -4704,7 +4715,7 @@ pub const App = struct {
             result.generation,
         );
         errdefer if (action_completion) |completion| {
-            _ = self.finishActionCursorCompletion(ctx.allocator(), completion, false);
+            _ = self.finishActionCursorCompletion(ctx.allocator(), completion, false) catch false;
         };
 
         var applied = try self.reviewReload().applySourceFinished(
@@ -4719,7 +4730,7 @@ pub const App = struct {
                 .empty, .unchanged, .loaded => true,
                 .failed, .failed_static => false,
             };
-            if (self.finishActionCursorCompletion(ctx.allocator(), completion, source_succeeded)) {
+            if (try self.finishActionCursorCompletion(ctx.allocator(), completion, source_succeeded)) {
                 applied.redraw = .normal;
             }
         }
@@ -4760,7 +4771,7 @@ pub const App = struct {
             result.generation,
         );
         errdefer if (action_completion) |completion| {
-            _ = self.finishActionCursorCompletion(ctx.allocator(), completion, false);
+            _ = self.finishActionCursorCompletion(ctx.allocator(), completion, false) catch false;
         };
 
         const applied = try self.reviewReload().applyStatusFinished(
@@ -4768,13 +4779,15 @@ pub const App = struct {
             &result,
             self.backgroundAcceptanceBlocked(result.background_cycle_id),
         );
-        if (applied.project_status) |prefer_first| try self.reviewReload().applyStatusProjection(ctx.allocator(), prefer_first);
+        if (applied.project_status) |prefer_first| {
+            try self.reviewReload().applyStatusProjection(ctx.allocator(), prefer_first, .accepted_status);
+        }
         const finalized_action_cursor = if (action_completion) |completion| blk: {
             const status_succeeded = switch (result.result) {
                 .empty, .loaded => true,
                 .failed, .failed_static => false,
             };
-            break :blk self.finishActionCursorCompletion(ctx.allocator(), completion, status_succeeded);
+            break :blk try self.finishActionCursorCompletion(ctx.allocator(), completion, status_succeeded);
         } else false;
         if (applied.diagnostic) |diagnostic| switch (diagnostic) {
             .status_load_failed => |message| self.setReviewStatus("status load failed: {s}", .{message}),
@@ -6783,7 +6796,7 @@ test "sidebar navigation keeps status-only target through clamp" {
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/status-only.zig\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
-    try app.reviewReload().applyStatusProjection(std.testing.allocator, false);
+    try app.reviewReload().applyStatusProjection(std.testing.allocator, false, .accepted_status);
 
     const loaded = app.reviewNavigation().loadedDiff().?;
     const status_node = blk: {
@@ -6914,6 +6927,110 @@ test "source-first action refresh restores directory after exact status completi
 
 test "status-first action refresh restores directory after exact source completion" {
     try expectDirectoryCursorAfterActionRefresh(true);
+}
+
+fn expectTerminalActionRefreshRepublishesFileSearch(status_first: bool) !void {
+    const allocator = std.testing.allocator;
+    var initial = try app_load.buildLoadedBundle(allocator, app_test_support.diff_one);
+    defer initial.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    app.pages.review.load.replaceLoaded(allocator, .{
+        .arena = initial.takeArena(),
+        .loaded = initial.loaded,
+        .reviewed_files_owned = false,
+    });
+    defer app.reviewReload().clearPendingReload(allocator);
+    defer app.reviewReload().clearLoadedDiff(allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
+    defer app.reviewNavigation().clearActionCursor(allocator);
+
+    var old_status = try git_status.StatusBundle.parseOwned(allocator, "?? legacy.zig\x00");
+    try app.pages.review.git_status.replace("/repo", &old_status);
+    try app.reviewReload().applyStatusProjection(allocator, false, .accepted_status);
+    app.pages.review.file_search.mode = true;
+    try app.pages.review.file_search.input.insertSlice("legacy");
+    app.reviewNavigation().rebuildFileSearchProjection(allocator);
+    try std.testing.expectEqual(
+        review_page.file_search.TargetKind.status_only,
+        app.pages.review.file_search.focusedCandidate().?.target_kind,
+    );
+
+    app.pages.review.load.generation = 2;
+    app.pages.review.load.pending = .{ .diff_load = 2 };
+    app.pages.review.status_load = .{ .generation = 7, .pending = .{ .generation = 7 } };
+    app.pages.review.pending_reload = .{ .generation = 2, .kind = .action_result };
+    try installTestActionCursor(&app, allocator, .file, "a", 9);
+    try promoteTestActionCursor(&app, 9);
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .source, 2));
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 7));
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    if (status_first) {
+        try app.finishStatusLoad(&ctx, .{
+            .identity = page.RequestIdentity.review(0, 1),
+            .generation = 7,
+            .repo_root = try allocator.dupe(u8, "/repo"),
+            .result = .empty,
+        });
+        try std.testing.expect(app.pages.review.action_cursor.hasOwner());
+        try std.testing.expect(!app.pages.review.file_search.projection_available);
+
+        const successor = try app_load.buildLoadedBundle(allocator, app_test_support.diff_one);
+        try app.finishDiffLoad(&ctx, .{
+            .identity = page.RequestIdentity.review(0, 1),
+            .generation = 2,
+            .result = .{ .loaded = successor },
+        });
+    } else {
+        const successor = try app_load.buildLoadedBundle(allocator, app_test_support.diff_one);
+        try app.finishDiffLoad(&ctx, .{
+            .identity = page.RequestIdentity.review(0, 1),
+            .generation = 2,
+            .result = .{ .loaded = successor },
+        });
+        try std.testing.expect(app.pages.review.action_cursor.hasOwner());
+        try std.testing.expect(!app.pages.review.file_search.projection_available);
+
+        try app.finishStatusLoad(&ctx, .{
+            .identity = page.RequestIdentity.review(0, 1),
+            .generation = 7,
+            .repo_root = try allocator.dupe(u8, "/repo"),
+            .result = .empty,
+        });
+    }
+
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    const loaded = app.reviewNavigation().loadedDiff() orelse return error.ExpectedLoadedDiff;
+    for (loaded.tree.nodes) |node| {
+        try std.testing.expect(!std.mem.eql(u8, node.path_key, "legacy.zig"));
+    }
+    try std.testing.expect(app.pages.review.file_search.mode);
+    try std.testing.expectEqualStrings("legacy", app.pages.review.file_search.input.slice());
+    try std.testing.expect(app.pages.review.file_search.projection_available);
+    try std.testing.expect(app.pages.review.file_search.no_match);
+    try std.testing.expect(app.pages.review.file_search.focusedCandidate() == null);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.file_search.candidates.len);
+    try std.testing.expectEqual(
+        app.pages.review.accepted_sidebar_revision,
+        app.pages.review.file_search.basis.?.accepted_sidebar_revision,
+    );
+}
+
+test "source-first action refresh republishes file search from terminal empty status tree" {
+    try expectTerminalActionRefreshRepublishesFileSearch(false);
+}
+
+test "status-first action refresh republishes file search from terminal source tree" {
+    try expectTerminalActionRefreshRepublishesFileSearch(true);
 }
 
 test "inactive Review consumes matching action refresh terminals without shell redraw" {
@@ -7121,13 +7238,13 @@ test "action cursor waits for the exact status member after source is terminal" 
 
     // The source half may complete first. Retained pre-action status is not a
     // coherent final projection and therefore cannot consume the owner.
-    try app.reviewReload().applyStatusProjection(std.testing.allocator, false);
+    try app.reviewReload().applyStatusProjection(std.testing.allocator, false, .accepted_source);
     try std.testing.expect(app.pages.review.action_cursor.hasOwner());
 
     app.pages.review.status_load.pending = null;
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
-    try app.reviewReload().applyStatusProjection(std.testing.allocator, false);
+    try app.reviewReload().applyStatusProjection(std.testing.allocator, false, .accepted_status);
     try std.testing.expect(app.pages.review.action_cursor.finishMember(9, app.repo_epoch, .status, 1, true));
     try std.testing.expect(app.reviewNavigation().finalizeActionCursor(std.testing.allocator));
 
@@ -7480,7 +7597,7 @@ test "action cursor survives exact status projection while source member is pend
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
-    try app.reviewReload().applyStatusProjection(std.testing.allocator, false);
+    try app.reviewReload().applyStatusProjection(std.testing.allocator, false, .accepted_status);
 
     try std.testing.expect(app.pages.review.action_cursor.hasOwner());
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
@@ -7502,6 +7619,9 @@ test "action cursor closes after status completion when source failed before gen
         .terminal_size = .{ .width = 100, .height = 12 },
     };
     defer app.reviewReload().clearLoadedDiff(app.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer app.pages.review.tree_order.deinit(std.testing.allocator);
+    defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     defer app.reviewNavigation().clearActionCursor(std.testing.allocator);
 
     try installTestActionCursor(&app, std.testing.allocator, .file, "missing.zig", 9);

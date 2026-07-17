@@ -76,6 +76,25 @@ pub const RedrawDisposition = enum {
     skip_unless_recovered_failure_cleared,
 };
 
+const StatusProjectionOutcome = enum {
+    /// The active sidebar corresponds to the accepted source/status model.
+    current_sidebar,
+    /// An action refresh intentionally retains an older intermediate tree.
+    deferred_sidebar,
+};
+
+pub const StatusProjectionTrigger = enum {
+    /// A newly accepted source already materialized the empty-status tree; the
+    /// projection step only needs to merge a non-empty retained status.
+    accepted_source,
+    /// A newly accepted status may remove the last status-only rows, so even
+    /// an empty document is an authoritative sidebar replacement.
+    accepted_status,
+    /// The exact action source/status pair is terminal. Reconcile both
+    /// accepted members before the action cursor owner is consumed.
+    terminal_action,
+};
+
 pub const SourceApply = struct {
     result_transferred: bool = false,
     recovered_failure: ?auto_reload.FailureIdentity = null,
@@ -1380,7 +1399,7 @@ pub const Controller = struct {
                         if (prefer_first and self.page.status_load.isPending()) {
                             self.page.pending_initial_first_visible_selection = true;
                         }
-                        try self.applyStatusProjection(allocator, prefer_first);
+                        try self.applyStatusProjection(allocator, prefer_first, .accepted_source);
                         return outcome;
                     },
                     .rebuild_not_watch, .rebuild_no_current_loaded, .rebuild_text_changed => {},
@@ -1457,7 +1476,7 @@ pub const Controller = struct {
 
         const prefer_first = !had_loaded_before and !had_action_cursor;
         if (prefer_first and self.page.status_load.isPending()) self.page.pending_initial_first_visible_selection = true;
-        if (can_project_status) try self.applyStatusProjection(allocator, prefer_first);
+        if (can_project_status) try self.applyStatusProjection(allocator, prefer_first, .accepted_source);
         return outcome;
     }
 
@@ -1529,6 +1548,11 @@ pub const Controller = struct {
     /// staged and unstaged line statistics. A line-stat-only change must advance
     /// this revision and invalidate every retained projection.
     pub fn advanceStatusSnapshotRevision(self: Controller, allocator: ?std.mem.Allocator) void {
+        // Status acceptance can replace sidebar target kinds, node indexes,
+        // and active changed-file eligibility. Revoke the old candidate basis
+        // before the status owner is committed; the later sidebar projection
+        // republishes the retained query from the accepted model.
+        self.page.advanceAcceptedSidebarRevision(allocator);
         if (allocator) |owner| {
             self.clearProjectionCompletedSelection(owner);
             self.page.review_projection.clearCache(owner);
@@ -1595,30 +1619,63 @@ pub const Controller = struct {
         self.clearLoadedDiff(allocator);
     }
 
-    pub fn applyStatusProjection(self: Controller, allocator: std.mem.Allocator, prefer_first_visible_file: bool) !void {
-        if (!diff_source.sourceAllowsStageProjection(self.source)) return;
+    pub fn applyStatusProjection(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        prefer_first_visible_file: bool,
+        trigger: StatusProjectionTrigger,
+    ) !void {
+        const outcome = self.applyStatusProjectionPrimary(allocator, prefer_first_visible_file, trigger) catch |err| {
+            // The accepted status/source transition remains authoritative even
+            // when its derived sidebar or search projection cannot be built.
+            self.page.file_search.markProjectionUnavailable(allocator);
+            return err;
+        };
+        switch (outcome) {
+            .current_sidebar => self.navigation.rebuildFileSearchProjection(allocator),
+            .deferred_sidebar => self.page.file_search.markProjectionUnavailable(allocator),
+        }
+    }
+
+    fn applyStatusProjectionPrimary(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        prefer_first_visible_file: bool,
+        trigger: StatusProjectionTrigger,
+    ) !StatusProjectionOutcome {
+        if (!diff_source.sourceAllowsStageProjection(self.source)) return .current_sidebar;
 
         const status_document = self.page.git_status.document;
+        const action_projection_deferred = self.page.action_cursor.hasOwner() and
+            !self.page.action_cursor.terminal();
         if (status_document.entries.len == 0) {
-            if (self.page.action_cursor.hasOwner() and
-                (self.page.load.hasPending() or self.page.status_load.isPending())) return;
+            if (action_projection_deferred and
+                (self.page.load.hasPending() or self.page.status_load.isPending())) return .deferred_sidebar;
             if (self.navigation.activeLoadedDiff()) |loaded| {
                 if (loaded.document.files.len == 0) {
                     self.clearLoadedDiff(allocator);
                     self.page.load.replaceEmpty(allocator, .no_changes);
-                    return;
+                    return if (action_projection_deferred) .deferred_sidebar else .current_sidebar;
                 }
-                if (self.page.action_cursor.hasOwner()) {
+                if (action_projection_deferred) {
                     _ = self.navigation.remapActionCursor(loaded);
-                    return;
+                    return .deferred_sidebar;
+                }
+                if (trigger != .accepted_source) {
+                    // Empty status is authoritative after status acceptance
+                    // and when an action pair reaches its terminal boundary.
+                    // Rebuild so prior status-only rows cannot be reauthorized.
+                    // Source acceptance alone already supplies a tree without
+                    // status-only rows and keeps its navigation materialization.
+                    try self.rebuildLoadedTreeWithStatus(allocator, loaded, prefer_first_visible_file);
                 }
             }
-            return;
+            return if (action_projection_deferred) .deferred_sidebar else .current_sidebar;
         }
 
         if (self.navigation.activeLoadedDiff()) |loaded| {
             try self.rebuildLoadedTreeWithStatus(allocator, loaded, prefer_first_visible_file);
-            return;
+            return if (action_projection_deferred) .deferred_sidebar else .current_sidebar;
         }
 
         switch (self.page.load.state) {
@@ -1629,6 +1686,7 @@ pub const Controller = struct {
             },
             else => {},
         }
+        return if (action_projection_deferred) .deferred_sidebar else .current_sidebar;
     }
 
     fn rebuildLoadedTreeWithStatus(
@@ -2464,6 +2522,77 @@ fn testPageWithOwnedFileSearchCandidate(allocator: std.mem.Allocator) !review_pa
     return page;
 }
 
+fn testPageWithDiffAndStatusOnlyFileSearchCandidate(allocator: std.mem.Allocator) !review_page.ReviewPageState {
+    const text =
+        \\diff --git a/src/current.zig b/src/current.zig
+        \\--- a/src/current.zig
+        \\+++ b/src/current.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? src/legacy.zig\x00");
+    errdefer status_bundle.deinit();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    var arena_transferred = false;
+    errdefer if (!arena_transferred) arena.deinit();
+    const arena_allocator = arena.allocator();
+    const document = try diff_parser.parse(arena_allocator, text);
+    const eligibility = try arena_allocator.alloc(loaded_diff.FileTextEligibility, document.files.len);
+    @memset(eligibility, .selectable_utf8);
+    var loaded: loaded_diff.LoadedDiff = .{
+        .text = text,
+        .document = document,
+        .file_text_eligibility = eligibility,
+        .tree = try file_tree.buildWithOptions(arena_allocator, document, status_bundle.document, .{
+            .root = .{ .name = "repo" },
+        }),
+        .bytes = text.len,
+        .lines = std.mem.count(u8, text, "\n"),
+    };
+    try loaded.rebuildVisibleNodes(arena_allocator, .expanded, false, .all);
+
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadStateWithArena(arena, loaded),
+    };
+    arena_transferred = true;
+    errdefer page.deinit(allocator);
+    try page.git_status.replace("/repo", &status_bundle);
+    const basis: file_search.Basis = .{
+        .repo_epoch = 0,
+        .source_session_revision = page.source_session_revision,
+        .accepted_sidebar_revision = page.accepted_sidebar_revision,
+    };
+    const active_loaded = switch (page.load.state) {
+        .loaded => |*session| &session.loaded,
+        else => unreachable,
+    };
+    var projection = try file_search.buildProjection(allocator, active_loaded, "legacy", .{ .basis = basis });
+    page.file_search.mode = true;
+    try page.file_search.input.insertSlice("legacy");
+    page.file_search.publish(allocator, &projection);
+    try std.testing.expectEqual(file_search.TargetKind.status_only, page.file_search.focusedCandidate().?.target_kind);
+    return page;
+}
+
+fn acceptEmptyStatus(
+    allocator: std.mem.Allocator,
+    controller: Controller,
+    page: *review_page.ReviewPageState,
+) !CompletionApply {
+    _ = page.status_load.prepare(false);
+    page.status_load.begin(null);
+    var finished: app_load.StatusLoadFinished = .{
+        .identity = page.activation.currentIdentity().?,
+        .generation = page.status_load.generation,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .empty,
+    };
+    defer finished.deinit(allocator);
+    return controller.applyStatusFinished(allocator, &finished, false);
+}
+
 test "source replacement clears file search borrows before advancing its sidebar namespace" {
     const allocator = std.testing.allocator;
     var page = try testPageWithOwnedFileSearchCandidate(allocator);
@@ -2510,6 +2639,123 @@ test "source failure prepares its message then clears file search before freeing
     try std.testing.expect(!page.file_search.projection_available);
     try std.testing.expect(page.file_search.focusedCandidate() == null);
     try std.testing.expectEqual(@as(usize, 0), page.file_search.candidates.len);
+}
+
+test "accepted status replacement clears then republishes the retained file search query" {
+    const allocator = std.testing.allocator;
+    var page = try testPageWithOwnedFileSearchCandidate(allocator);
+    defer page.deinit(allocator);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    _ = page.status_load.prepare(false);
+    page.status_load.begin(null);
+    var incoming = try git_status.StatusBundle.parseOwned(allocator, "?? src/owned.zig\x00");
+    var finished: app_load.StatusLoadFinished = .{
+        .identity = page.activation.currentIdentity().?,
+        .generation = page.status_load.generation,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .loaded = incoming },
+    };
+    incoming = undefined;
+    defer finished.deinit(allocator);
+
+    const applied = try controller.applyStatusFinished(allocator, &finished, false);
+    try std.testing.expect(applied.project_status != null);
+    try std.testing.expectEqual(@as(u64, 2), page.accepted_sidebar_revision);
+    try std.testing.expect(page.file_search.mode);
+    try std.testing.expectEqualStrings("owned", page.file_search.input.slice());
+    try std.testing.expect(!page.file_search.projection_available);
+    try std.testing.expect(page.file_search.focusedCandidate() == null);
+
+    try controller.applyStatusProjection(allocator, applied.project_status.?, .accepted_status);
+
+    try std.testing.expect(page.file_search.projection_available);
+    const candidate = page.file_search.focusedCandidate() orelse return error.ExpectedFileSearchCandidate;
+    try std.testing.expectEqual(file_search.TargetKind.status_only, candidate.target_kind);
+    try std.testing.expectEqualStrings("src/owned.zig", candidate.path_key);
+    try std.testing.expectEqual(@as(u64, 2), candidate.basis.accepted_sidebar_revision);
+    try std.testing.expectEqual(page.source_session_revision, candidate.basis.source_session_revision);
+}
+
+test "file search rebuild failure keeps prompt and publishes no stale candidate" {
+    const allocator = std.testing.allocator;
+    var page = try testPageWithOwnedFileSearchCandidate(allocator);
+    defer page.deinit(allocator);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    page.advanceAcceptedSidebarRevision(allocator);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    controller.navigation.rebuildFileSearchProjection(failing.allocator());
+
+    try std.testing.expect(page.file_search.mode);
+    try std.testing.expectEqualStrings("owned", page.file_search.input.slice());
+    try std.testing.expect(!page.file_search.projection_available);
+    try std.testing.expect(page.file_search.focusedCandidate() == null);
+    try std.testing.expectEqual(@as(usize, 0), page.file_search.candidates.len);
+}
+
+test "empty status rebuild removes old status-only candidate before new basis publication" {
+    const allocator = std.testing.allocator;
+    var page = try testPageWithDiffAndStatusOnlyFileSearchCandidate(allocator);
+    defer page.deinit(allocator);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    const applied = try acceptEmptyStatus(allocator, controller, &page);
+    try std.testing.expect(applied.project_status != null);
+    try std.testing.expectEqual(@as(u64, 2), page.accepted_sidebar_revision);
+    try std.testing.expect(!page.file_search.projection_available);
+
+    try controller.applyStatusProjection(allocator, applied.project_status.?, .accepted_status);
+
+    const loaded = controller.navigation.activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
+    var found_current = false;
+    for (loaded.tree.nodes) |node| {
+        try std.testing.expect(!std.mem.eql(u8, node.path_key, "src/legacy.zig"));
+        found_current = found_current or std.mem.eql(u8, node.path_key, "src/current.zig");
+    }
+    try std.testing.expect(found_current);
+    try std.testing.expect(page.file_search.projection_available);
+    try std.testing.expect(page.file_search.no_match);
+    try std.testing.expect(page.file_search.focusedCandidate() == null);
+    try std.testing.expectEqual(@as(usize, 0), page.file_search.candidates.len);
+    try std.testing.expectEqual(@as(u64, 2), page.file_search.basis.?.accepted_sidebar_revision);
+}
+
+test "empty status action refresh keeps retained tree candidate unavailable" {
+    const allocator = std.testing.allocator;
+    var page = try testPageWithDiffAndStatusOnlyFileSearchCandidate(allocator);
+    defer page.deinit(allocator);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    var prepared = try review_page.action_cursor.Prepared.init(
+        allocator,
+        0,
+        .{ .device = 1, .inode = 2 },
+        .file,
+        "src/legacy.zig",
+        0,
+    );
+    page.action_cursor.install(allocator, &prepared, 7);
+
+    const applied = try acceptEmptyStatus(allocator, controller, &page);
+    try std.testing.expect(applied.project_status != null);
+    try controller.applyStatusProjection(allocator, applied.project_status.?, .accepted_status);
+
+    const loaded = controller.navigation.activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
+    var retained_legacy = false;
+    for (loaded.tree.nodes) |node| {
+        retained_legacy = retained_legacy or std.mem.eql(u8, node.path_key, "src/legacy.zig");
+    }
+    try std.testing.expect(retained_legacy);
+    try std.testing.expect(page.file_search.mode);
+    try std.testing.expectEqualStrings("legacy", page.file_search.input.slice());
+    try std.testing.expect(!page.file_search.projection_available);
+    try std.testing.expect(page.file_search.focusedCandidate() == null);
+    try std.testing.expectEqual(@as(usize, 0), page.file_search.candidates.len);
+    try std.testing.expect(page.file_search.basis == null);
 }
 
 test "old revision display is not admitted when fresh completion replaces it" {
