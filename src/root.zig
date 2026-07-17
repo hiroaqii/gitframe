@@ -51,6 +51,7 @@ test {
     _ = @import("app/pages/review/update.zig");
     _ = @import("app/pages/review/view.zig");
     _ = @import("app/pages/repository.zig");
+    _ = @import("app/pages/repository/file_search_focus.zig");
     _ = @import("app/pages/repository/input.zig");
     _ = @import("app/pages/repository/model.zig");
     _ = @import("app/pages/repository/navigation.zig");
