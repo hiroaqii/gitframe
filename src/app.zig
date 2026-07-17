@@ -11356,6 +11356,7 @@ test "repository syntax task allocation and spawn failures release owners and re
             .path = displayed_path,
             .manifest_revision = 5,
             .source_revision = 6,
+            .authority = .accepted,
             .value = .{ .source = source_value },
         },
     };
@@ -11434,6 +11435,7 @@ test "repository change map task allocation and spawn failures release owners an
             .path = displayed_path,
             .manifest_revision = 5,
             .source_revision = 6,
+            .authority = .accepted,
             .value = .{ .source = source_value },
             .change_decoration = .eligible,
         },

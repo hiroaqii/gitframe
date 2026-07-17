@@ -90,9 +90,19 @@ pub const ManifestFinished = struct {
 };
 
 pub const DisplayedDocument = struct {
+    /// Whether the visible bytes are also usable as current interaction
+    /// authority. A retained last-good document remains renderable while
+    /// revalidation is pending or has terminally failed, but only an exact
+    /// accepted document completion may restore `.accepted`.
+    pub const Authority = enum {
+        accepted,
+        revalidation_required,
+    };
+
     path: []u8,
     manifest_revision: u64,
     source_revision: u64 = 0,
+    authority: Authority,
     value: DocumentValue,
     syntax_spans: source_syntax.SourceSpans = .empty(),
     change_decoration: ChangeDecoration = .terminal_plain,
@@ -910,6 +920,7 @@ pub const RepositoryPageState = struct {
         self.needs_syntax_request = false;
         self.needs_change_map_request = false;
         self.needs_document_revalidation = false;
+        self.invalidateDisplayedDocumentAuthority();
         // The activation identity changes even when the repository does not,
         // so old manifest/document generations can no longer complete. Rewind
         // the same destination owner to the manifest authority that can name
@@ -1119,20 +1130,7 @@ pub const RepositoryPageState = struct {
             if (pending.document_generation != generation) return false;
         } else {
             if (pending.document_generation != null) return false;
-            // A retained last-good source is not current authority merely
-            // because its manifest/path still match. Activation and manifest
-            // refresh deliberately keep that display visible while requiring
-            // selected-file revalidation; retain the navigation owner until
-            // the matching successor completion is accepted.
-            if (!self.active or
-                self.freshness != .fresh or
-                self.needs_revalidation or
-                self.needs_document_revalidation or
-                self.pending_generation != null or
-                self.pending_document_generation != null)
-            {
-                return false;
-            }
+            if (self.acceptedCurrentSourceForSelection() == null) return false;
         }
 
         const displayed = if (self.displayed_document) |*document| document else return false;
@@ -1249,6 +1247,7 @@ pub const RepositoryPageState = struct {
         repo_root: []const u8,
         capability: *const root_capability.RootCapability,
     ) !Request {
+        self.invalidateDisplayedDocumentAuthority();
         const owned_root = try allocator.dupe(u8, repo_root);
         errdefer allocator.free(owned_root);
         var root = try capability.duplicate();
@@ -1282,6 +1281,10 @@ pub const RepositoryPageState = struct {
         capability: *const root_capability.RootCapability,
     ) !DocumentRequest {
         const selected = self.selected_path orelse return error.NoSelectedDocument;
+        // Request preparation transfers authority away from retained visible
+        // bytes before allocation/spawn can fail. Only the matching accepted
+        // completion below may restore it.
+        self.invalidateDisplayedDocumentAuthority();
         const path = try allocator.dupe(u8, selected);
         errdefer allocator.free(path);
         var root = try capability.duplicate();
@@ -1387,6 +1390,7 @@ pub const RepositoryPageState = struct {
 
     pub fn rejectDocumentSpawn(self: *RepositoryPageState, generation: u64) void {
         if (self.pending_document_generation != generation) return;
+        self.invalidateDisplayedDocumentAuthority();
         self.pending_document_generation = null;
         self.status.set("Could not start selected file task", .{});
         const pending = self.incoming.documentIntent() orelse return;
@@ -1411,6 +1415,7 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn requestReload(self: *RepositoryPageState, has_repository: bool) void {
+        self.invalidateDisplayedDocumentAuthority();
         self.pending_document_generation = null;
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
@@ -1471,11 +1476,13 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn markDocumentRequestPreparationFailed(self: *RepositoryPageState, err: anyerror) void {
+        self.invalidateDisplayedDocumentAuthority();
         self.status.set("Could not prepare selected file: {s}", .{@errorName(err)});
         _ = self.terminalizeIncoming(.request_failed);
     }
 
     pub fn markDocumentCapabilityUnavailable(self: *RepositoryPageState) void {
+        self.invalidateDisplayedDocumentAuthority();
         // Capability lookup used to be an inert retry edge for ordinary
         // browsing. Only a committed contextual destination converts it into
         // a bounded destination-page terminal.
@@ -1531,7 +1538,7 @@ pub const RepositoryPageState = struct {
                 const changed_status_message = self.file_visibility == .changed and
                     self.bundle != null and !self.bundle.?.status_available;
                 self.freshness = if (self.active) .fresh else .validating;
-                self.needs_document_revalidation = self.selected_path != null;
+                self.requireDocumentRevalidation();
                 self.status.clear();
                 return self.applyIncomingManifestResolution(
                     allocator,
@@ -1575,7 +1582,7 @@ pub const RepositoryPageState = struct {
                 if (selection_changed)
                     self.invalidateSelectedDocument(allocator)
                 else
-                    self.needs_document_revalidation = self.selected_path != null;
+                    self.requireDocumentRevalidation();
                 self.freshness = if (self.active) .fresh else .validating;
                 self.status.clear();
                 const status_availability_changed = self.file_visibility == .changed and
@@ -1659,6 +1666,7 @@ pub const RepositoryPageState = struct {
             .path = finished.path,
             .manifest_revision = finished.manifest_revision,
             .source_revision = self.source_revision,
+            .authority = .accepted,
             .value = finished.value,
             .change_decoration = switch (finished.value) {
                 .source => .eligible,
@@ -1741,7 +1749,7 @@ pub const RepositoryPageState = struct {
             // The independent task snapshot observed a newer file than the
             // accepted source. Do not attach its rows to old coordinates;
             // request a fresh primary document before trying decoration again.
-            self.needs_document_revalidation = true;
+            self.requireDocumentRevalidation();
             return .discarded;
         }
         if (!displayed.change_decoration.isEligible()) return .discarded;
@@ -2104,6 +2112,20 @@ pub const RepositoryPageState = struct {
         self.source_search.clear();
     }
 
+    /// Separates scheduling intent from the authority of retained visible
+    /// bytes. A terminal request failure may consume retry intent, but it must
+    /// never promote the last-good document back to accepted authority.
+    fn invalidateDisplayedDocumentAuthority(self: *RepositoryPageState) void {
+        if (self.displayed_document) |*document| {
+            document.authority = .revalidation_required;
+        }
+    }
+
+    fn requireDocumentRevalidation(self: *RepositoryPageState) void {
+        self.invalidateDisplayedDocumentAuthority();
+        self.needs_document_revalidation = self.selected_path != null;
+    }
+
     fn currentSource(self: *const RepositoryPageState) ?*const source_document.Document {
         const displayed = if (self.displayed_document) |*document| document else return null;
         const selected = self.selected_path orelse return null;
@@ -2112,6 +2134,28 @@ pub const RepositoryPageState = struct {
             .source => |*source| source,
             .inert => null,
         };
+    }
+
+    /// Returns a displayed source only when it is also the current accepted
+    /// Repository authority. `currentSource()` alone deliberately exposes a
+    /// retained last-good document during reload/reactivation; consumers which
+    /// commit a new interaction to source focus must not treat that visible
+    /// fallback as a validated destination.
+    fn acceptedCurrentSourceForSelection(self: *const RepositoryPageState) ?*const source_document.Document {
+        if (!self.active or
+            self.activation_id == 0 or
+            self.root_identity == null or
+            self.freshness != .fresh or
+            self.needs_revalidation or
+            self.needs_document_revalidation or
+            self.pending_generation != null or
+            self.pending_document_generation != null)
+        {
+            return null;
+        }
+        const displayed = if (self.displayed_document) |*document| document else return null;
+        if (displayed.authority != .accepted) return null;
+        return self.currentSource();
     }
 
     /// Keep raw page focus valid even when a selected document becomes an
@@ -3750,6 +3794,7 @@ fn selectionStateForTest(paths: []const u8, content: []const u8) !RepositoryPage
         .path = path,
         .manifest_revision = state.manifest_revision,
         .source_revision = 7,
+        .authority = .accepted,
         .value = .{ .source = document },
     };
     return state;
@@ -3825,6 +3870,7 @@ test "repository changed filter retains changed selection without document reloa
     state.displayed_document = .{
         .path = try allocator.dupe(u8, "changed.zig"),
         .manifest_revision = 3,
+        .authority = .accepted,
         .value = .{ .inert = .binary },
     };
 
@@ -3855,6 +3901,7 @@ test "repository changed filter falls back and restores owned All selection" {
     state.displayed_document = .{
         .path = try allocator.dupe(u8, "clean.zig"),
         .manifest_revision = 3,
+        .authority = .accepted,
         .value = .{ .inert = .binary },
     };
 
@@ -3910,6 +3957,7 @@ test "repository changed no-match clears document and All restores anchor once" 
     state.displayed_document = .{
         .path = try allocator.dupe(u8, "clean.zig"),
         .manifest_revision = 3,
+        .authority = .accepted,
         .value = .{ .inert = .binary },
     };
 
@@ -4120,6 +4168,7 @@ test "repository status-only completion preserves source and revisions" {
             .path = try allocator.dupe(u8, "a.zig"),
             .manifest_revision = 7,
             .source_revision = 11,
+            .authority = .accepted,
             .value = .{ .inert = .unreadable },
         },
     };
@@ -4178,6 +4227,7 @@ test "repository changed status loss clears projection and All restores anchor" 
         .displayed_document = .{
             .path = try allocator.dupe(u8, "a.zig"),
             .manifest_revision = 7,
+            .authority = .accepted,
             .value = .{ .inert = .binary },
         },
     };
@@ -4691,6 +4741,7 @@ test "repository syntax task is plain-first and accepts only matching source ide
         .path = try allocator.dupe(u8, "main.zig"),
         .manifest_revision = 5,
         .source_revision = 6,
+        .authority = .accepted,
         .value = .{ .source = try source_document.Document.initOwned(allocator, owned, .init(owned)) },
     };
     try std.testing.expectEqual(@as(usize, 0), state.displayed_document.?.syntax_spans.spans.len);
@@ -4808,6 +4859,7 @@ test "repository change decoration accepts only the exact displayed source ident
         .path = try allocator.dupe(u8, "main.zig"),
         .manifest_revision = 5,
         .source_revision = 6,
+        .authority = .accepted,
         .value = .{ .source = try source_document.Document.initOwned(allocator, owned, .init(owned)) },
         .change_decoration = .eligible,
     };
@@ -4935,6 +4987,7 @@ fn expectRepositoryDecorationCompletionOrder(map_first: bool) !void {
         .path = try allocator.dupe(u8, "main.zig"),
         .manifest_revision = 5,
         .source_revision = 6,
+        .authority = .accepted,
         .value = .{ .source = try source_document.Document.initOwned(allocator, owned, .init(owned)) },
         .change_decoration = .eligible,
     };
@@ -5170,6 +5223,7 @@ test "repository syntax start failures preserve retryable source intent" {
         .path = try allocator.dupe(u8, "main.zig"),
         .manifest_revision = 5,
         .source_revision = 6,
+        .authority = .accepted,
         .value = .{ .source = try source_document.Document.initOwned(allocator, bytes, .init(bytes)) },
     };
 
@@ -5223,6 +5277,7 @@ test "repository page owns source focus navigation search and mouse geometry" {
     state.displayed_document = .{
         .path = try allocator.dupe(u8, state.selected_path.?),
         .manifest_revision = state.manifest_revision,
+        .authority = .accepted,
         .value = .{ .source = try source_document.Document.initOwned(allocator, bytes, .init(bytes)) },
     };
 
@@ -5923,6 +5978,7 @@ test "repository page anchors inert checkpoint below source header rule" {
     state.displayed_document = .{
         .path = try allocator.dupe(u8, state.selected_path.?),
         .manifest_revision = state.manifest_revision,
+        .authority = .accepted,
         .value = .{ .inert = .binary },
     };
 
@@ -6375,6 +6431,139 @@ test "repository transition B2a resolves or terminalizes matching manifest compl
     defer failed.deinit(allocator);
     try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(allocator, &failed));
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.request_failed, state.incomingUnavailable().?.reason);
+}
+
+test "repository accepted current source excludes retained revalidation authority" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "one\ntwo\n");
+    defer state.deinit(allocator);
+    state.freshness = .fresh;
+
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() != null);
+
+    state.needs_revalidation = true;
+    try std.testing.expect(state.currentSource() != null);
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+    state.needs_revalidation = false;
+
+    state.needs_document_revalidation = true;
+    try std.testing.expect(state.currentSource() != null);
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+    state.needs_document_revalidation = false;
+
+    state.pending_generation = 9;
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+    state.pending_generation = null;
+
+    state.pending_document_generation = 11;
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+    state.pending_document_generation = null;
+
+    state.freshness = .validating;
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+    state.freshness = .fresh;
+
+    state.active = false;
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+    state.active = true;
+
+    state.activation_id = 0;
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+    state.activation_id = 2;
+
+    const root_identity = state.root_identity.?;
+    state.root_identity = null;
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+    state.root_identity = root_identity;
+
+    state.displayed_document.?.authority = .revalidation_required;
+    try std.testing.expect(state.currentSource() != null);
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+    state.displayed_document.?.authority = .accepted;
+
+    state.displayed_document.?.manifest_revision += 1;
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+}
+
+test "repository accepted source authority requires a matching completion after spawn rejection" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state = try selectionStateForTest("main.zig\x00", "old source\n");
+    defer state.deinit(allocator);
+    state.root_identity = root.capability.identity;
+    state.freshness = .fresh;
+
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() != null);
+    state.requireDocumentRevalidation();
+    try std.testing.expect(state.currentSource() != null);
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+
+    var rejected_request = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer rejected_request.deinit(allocator);
+    try std.testing.expectEqual(
+        DisplayedDocument.Authority.revalidation_required,
+        state.displayed_document.?.authority,
+    );
+    state.rejectDocumentSpawn(rejected_request.generation);
+    try std.testing.expect(state.pending_document_generation == null);
+    try std.testing.expect(!state.needs_document_revalidation);
+    try std.testing.expect(state.currentSource() != null);
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+
+    // A later explicit retry may schedule work, but scheduling alone still
+    // cannot promote the retained bytes.
+    state.requireDocumentRevalidation();
+    var accepted_request = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer accepted_request.deinit(allocator);
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+
+    const replacement = try allocator.dupe(u8, "accepted replacement\n");
+    var finished: DocumentFinished = .{
+        .identity = accepted_request.identity,
+        .root_identity = root.capability.identity,
+        .generation = accepted_request.generation,
+        .manifest_revision = accepted_request.manifest_revision,
+        .path = try allocator.dupe(u8, accepted_request.path),
+        .value = .{ .source = try source_document.Document.initOwned(
+            allocator,
+            replacement,
+            .init(replacement),
+        ) },
+    };
+    defer finished.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &finished));
+    try std.testing.expectEqual(
+        DisplayedDocument.Authority.accepted,
+        state.displayed_document.?.authority,
+    );
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() != null);
+}
+
+test "repository capability terminal cannot promote retained source authority" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "retained source\n");
+    defer state.deinit(allocator);
+    state.freshness = .fresh;
+
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        state.repo_epoch,
+        state.root_identity.?,
+        .{ .location = .{ .path = "main.zig", .line = null } },
+    );
+    state.acceptIncoming(allocator, &incoming);
+    try std.testing.expect(state.incoming.advanceToDocument(state.manifest_revision));
+    state.requireDocumentRevalidation();
+    state.markDocumentCapabilityUnavailable();
+
+    try std.testing.expectEqual(
+        page_link.RepositoryUnavailableReason.request_failed,
+        state.incomingUnavailable().?.reason,
+    );
+    try std.testing.expect(!state.needs_document_revalidation);
+    try std.testing.expect(state.currentSource() != null);
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
 }
 
 test "repository transition B2b1 resolves an already accepted source without a task" {
