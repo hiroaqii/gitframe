@@ -50,6 +50,8 @@ fn fileSearchKeyToMsg(key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{})) return .cancel_file_search;
     if (key.matches(chasen.Key.enter, .{})) return .submit_file_search;
     if (key.matches(chasen.Key.backspace, .{})) return .file_search_backspace;
+    if (key.matches(chasen.Key.up, .{})) return .file_search_previous;
+    if (key.matches(chasen.Key.down, .{})) return .file_search_next;
     if (key_input.textInputCodepoint(key)) |codepoint| return .{ .file_search_insert = codepoint };
     return null;
 }
@@ -130,11 +132,13 @@ test "search input owns editing navigation and paste" {
     try std.testing.expectEqualStrings("needle", pasteToMsg(context, "needle").?.search_paste);
 }
 
-test "file search input owns printable text and rejects unsupported navigation" {
+test "file search input owns printable text and candidate movement" {
     const context: Context = .{ .file_search_mode = true };
     try std.testing.expectEqual(Msg.file_search_backspace, keyToMsg(context, chasen.Key{ .codepoint = chasen.Key.backspace }).?);
+    try std.testing.expectEqual(Msg.file_search_previous, keyToMsg(context, chasen.Key{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(Msg.file_search_next, keyToMsg(context, chasen.Key{ .codepoint = chasen.Key.down }).?);
     try std.testing.expectEqual(Msg{ .file_search_insert = 'q' }, keyToMsg(context, chasen.Key{ .codepoint = 'q' }).?);
-    try std.testing.expect(keyToMsg(context, chasen.Key{ .codepoint = chasen.Key.up }) == null);
+    try std.testing.expectEqual(Msg{ .file_search_insert = 'j' }, keyToMsg(context, chasen.Key{ .codepoint = 'j' }).?);
 }
 
 test "normal mapping is focus and review-mode aware" {

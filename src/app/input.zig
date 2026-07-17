@@ -679,7 +679,9 @@ test "keyToMsg ignores special keys in text input modes" {
         if (key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right) {
             try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .review = .{ .search_mode = true } }, key));
         }
-        try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .review = .{ .file_search_mode = true } }, key));
+        if (!key.matches(chasen.Key.up, .{}) and !key.matches(chasen.Key.down, .{})) {
+            try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .review = .{ .file_search_mode = true } }, key));
+        }
         if (key.codepoint != chasen.Key.tab and key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right and key.codepoint != chasen.Key.up and key.codepoint != chasen.Key.down) {
             try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .commit_panel_mode = true }, key));
         }
@@ -723,6 +725,14 @@ test "keyToMsg ignores special keys in text input modes" {
     for (picker_list_text_cases) |key| {
         try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, key));
     }
+}
+
+test "keyToMsg maps review file search candidate movement" {
+    const context: KeyContext = .{ .review = .{ .file_search_mode = true } };
+    try std.testing.expectEqual(reviewMsg(.file_search_previous), keyToMsg(TestMsg, context, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(reviewMsg(.file_search_next), keyToMsg(TestMsg, context, .{ .codepoint = chasen.Key.down }).?);
+    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = 'k' }), keyToMsg(TestMsg, context, .{ .codepoint = 'k' }).?);
+    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = 'j' }), keyToMsg(TestMsg, context, .{ .codepoint = 'j' }).?);
 }
 
 test "keyToMsg maps repo picker cursor movement" {

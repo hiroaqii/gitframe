@@ -17,6 +17,8 @@ pub const Msg = union(enum) {
     search_paste: []const u8,
     cancel_file_search,
     submit_file_search,
+    file_search_previous,
+    file_search_next,
     file_search_backspace,
     file_search_insert: u21,
     /// Borrowed from the synchronous Chasen paste event dispatch.

@@ -169,6 +169,8 @@ pub const Controller = struct {
             .enter_file_search => self.navigation.enterFileSearchMode(allocator orelse return error.MissingAllocator),
             .cancel_file_search => self.navigation.cancelFileSearchMode(allocator orelse return error.MissingAllocator),
             .submit_file_search => try self.navigation.submitFileSearch(allocator orelse return error.MissingAllocator),
+            .file_search_previous => self.navigation.page.file_search.move(-1),
+            .file_search_next => self.navigation.page.file_search.move(1),
             // Prepare fixed-capacity edits by value so overflow and a missing
             // runtime allocator cannot publish input from a newer query than
             // the still-live candidate projection.
@@ -410,6 +412,25 @@ test "review file search publishes candidates from enter and input edits" {
         .accepted_sidebar_revision = 7,
     }));
 
+    const basis_before_movement = page.file_search.basis.?;
+    var previous_at_start = try controller.apply(null, .file_search_previous);
+    previous_at_start.deinit(null);
+    try std.testing.expectEqualStrings("a", page.file_search.focusedCandidate().?.path_key);
+
+    var next = try controller.apply(null, .file_search_next);
+    next.deinit(null);
+    try std.testing.expectEqualStrings("b", page.file_search.focusedCandidate().?.path_key);
+
+    var next_at_end = try controller.apply(null, .file_search_next);
+    next_at_end.deinit(null);
+    try std.testing.expectEqualStrings("b", page.file_search.focusedCandidate().?.path_key);
+
+    var previous = try controller.apply(null, .file_search_previous);
+    previous.deinit(null);
+    try std.testing.expectEqualStrings("a", page.file_search.focusedCandidate().?.path_key);
+    try std.testing.expectEqualStrings("", page.file_search.input.slice());
+    try std.testing.expect(page.file_search.basis.?.eql(basis_before_movement));
+
     var inserted = try controller.apply(allocator, .{ .file_search_insert = 'b' });
     inserted.deinit(allocator);
     try std.testing.expectEqualStrings("b", page.file_search.input.slice());
@@ -428,6 +449,12 @@ test "review file search publishes candidates from enter and input edits" {
     try std.testing.expect(page.file_search.projection_available);
     try std.testing.expect(page.file_search.no_match);
     try std.testing.expectEqual(@as(usize, 0), page.file_search.candidates.len);
+    try std.testing.expect(page.file_search.focusedCandidate() == null);
+
+    var no_match_movement = try controller.apply(null, .file_search_next);
+    no_match_movement.deinit(null);
+    try std.testing.expectEqualStrings("missing", page.file_search.input.slice());
+    try std.testing.expect(page.file_search.no_match);
     try std.testing.expect(page.file_search.focusedCandidate() == null);
 
     var suffix: [512]u8 = undefined;
@@ -489,6 +516,12 @@ test "review file search candidate failure retains edited input as unavailable" 
     try std.testing.expect(!page.file_search.no_match);
     try std.testing.expectEqual(@as(usize, 0), page.file_search.candidates.len);
     try std.testing.expect(page.file_search.basis == null);
+    try std.testing.expect(page.file_search.focusedCandidate() == null);
+
+    var unavailable_movement = try controller.apply(null, .file_search_next);
+    unavailable_movement.deinit(null);
+    try std.testing.expectEqualStrings("b", page.file_search.input.slice());
+    try std.testing.expect(!page.file_search.projection_available);
     try std.testing.expect(page.file_search.focusedCandidate() == null);
 }
 
