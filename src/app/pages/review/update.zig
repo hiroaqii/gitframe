@@ -168,7 +168,7 @@ pub const Controller = struct {
             .select_previous_search_match => self.navigation.selectSearchMatch(.backward),
             .enter_file_search => self.navigation.enterFileSearchMode(allocator orelse return error.MissingAllocator),
             .cancel_file_search => self.navigation.cancelFileSearchMode(allocator orelse return error.MissingAllocator),
-            .submit_file_search => try self.navigation.submitFileSearch(allocator orelse return error.MissingAllocator),
+            .submit_file_search => self.navigation.submitFileSearch(allocator orelse return error.MissingAllocator),
             .file_search_previous => self.navigation.page.file_search.move(-1),
             .file_search_next => self.navigation.page.file_search.move(1),
             // Prepare fixed-capacity edits by value so overflow and a missing

@@ -356,7 +356,7 @@ fn drawFileSearch(surface: *chasen.Surface, state: *const review_file_search.Sta
         else if (state.no_match)
             "No matching files"
         else
-            "Type to filter  Esc: cancel";
+            "Enter: open  Esc: cancel";
         const role: theme.Role = if (state.no_match or !state.projection_available) .warning else .muted;
         draw.copyClippedTextAt(surface, 1, 1, status, palette.style(role)) catch {};
     }
@@ -1256,8 +1256,7 @@ test "review file search renders a bounded typed candidate window" {
     const snapshot = try ts.snapshot(allocator);
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Find file: src/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Type to filter") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Enter: open") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Enter: open") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/alpha.zig") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/bravo.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/charlie.zig") != null);

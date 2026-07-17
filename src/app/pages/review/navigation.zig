@@ -1460,10 +1460,9 @@ pub const Controller = struct {
             self.page.file_search.markProjectionUnavailable(allocator);
             return;
         };
-        const basis: file_search.Basis = .{
-            .repo_epoch = self.repo_epoch,
-            .source_session_revision = self.page.source_session_revision,
-            .accepted_sidebar_revision = self.page.accepted_sidebar_revision,
+        const basis = self.currentFileSearchBasis() orelse {
+            self.page.file_search.markProjectionUnavailable(allocator);
+            return;
         };
         const query = std.mem.trim(u8, self.page.file_search.input.slice(), " \t\r\n");
         var projection = file_search.buildProjection(allocator, loaded, query, .{
@@ -1475,6 +1474,16 @@ pub const Controller = struct {
             return;
         };
         self.page.file_search.publish(allocator, &projection);
+    }
+
+    fn currentFileSearchBasis(self: Controller) ?file_search.Basis {
+        _ = self.view().activeLoadedDiffConst() orelse return null;
+        const basis: file_search.Basis = .{
+            .repo_epoch = self.repo_epoch,
+            .source_session_revision = self.page.source_session_revision,
+            .accepted_sidebar_revision = self.page.accepted_sidebar_revision,
+        };
+        return if (basis.valid()) basis else null;
     }
 
     pub fn toggleReviewedFile(self: Controller, allocator: std.mem.Allocator) !void {
@@ -1563,46 +1572,55 @@ pub const Controller = struct {
         self.rebuildFileSearchProjection(allocator);
     }
 
-    pub fn submitFileSearch(self: Controller, allocator: std.mem.Allocator) !void {
-        const query = std.mem.trim(u8, self.page.file_search.input.slice(), " \t\r\n");
-        if (query.len == 0) {
-            self.cancelFileSearchMode(allocator);
+    pub fn submitFileSearch(self: Controller, allocator: std.mem.Allocator) void {
+        self.submitFileSearchWithVisibleAllocator(allocator, null);
+    }
+
+    fn submitFileSearchWithVisibleAllocator(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        visible_allocator_override: ?std.mem.Allocator,
+    ) void {
+        if (!self.page.file_search.projection_available) return;
+        const candidate = self.page.file_search.focusedCandidate() orelse {
+            if (self.page.file_search.filter.labels.len == 0) {
+                self.page.file_search.no_match = true;
+            } else {
+                self.page.file_search.markProjectionUnavailable(allocator);
+            }
+            return;
+        };
+        const loaded = self.activeLoadedDiff() orelse {
+            self.page.file_search.markProjectionUnavailable(allocator);
+            return;
+        };
+        const basis = self.currentFileSearchBasis() orelse {
+            self.page.file_search.markProjectionUnavailable(allocator);
+            return;
+        };
+        const node_index = candidate.node_index;
+        if (node_index >= loaded.tree.nodes.len or
+            !candidate.matchesNode(basis, node_index, loaded.tree.nodes[node_index]) or
+            !loaded.shouldIncludeFileNode(
+                node_index,
+                self.page.review_display.hide_reviewed_files,
+                self.page.review_display.changed_file_filter,
+            ))
+        {
+            self.page.file_search.markProjectionUnavailable(allocator);
             return;
         }
 
-        const loaded = self.activeLoadedDiff() orelse {
-            self.page.file_search.no_match = true;
+        self.revealAndSelectExactNode(
+            loaded,
+            node_index,
+            visible_allocator_override orelse self.loadArenaAllocator(),
+        ) catch {
+            self.setStatus("Could not reveal file search result", .{});
             return;
         };
-        const node_index = try self.findFileNodeWithFilter(allocator, loaded, query) orelse {
-            self.page.file_search.clearFilter(allocator);
-            self.page.file_search.no_match = true;
-            return;
-        };
-
-        const load_allocator = self.loadArenaAllocator() orelse {
-            self.page.file_search.clearFilter(allocator);
-            return;
-        };
-        // Prepare before changing either root or directory disclosure so an
-        // allocation failure cannot leave page authority and the retained
-        // visible projection out of sync.
-        var prepared = loaded.prepareVisibleNodeRebuild(load_allocator) catch {
-            self.page.file_search.clearFilter(allocator);
-            self.page.file_search.no_match = true;
-            return;
-        };
-        self.page.viewer.root_disclosure = .expanded;
-        file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
-        prepared.commit(
-            self.page.viewer.root_disclosure,
-            self.page.review_display.hide_reviewed_files,
-            self.page.review_display.changed_file_filter,
-        );
-        self.selectSidebarNode(loaded, node_index);
-        self.clampSelection(loaded.document.files.len);
-        self.clampDiffNavigation();
-        self.cancelFileSearchMode(allocator);
+        self.page.file_search.deinit(allocator);
+        self.page.viewer.focus = .diff;
     }
 
     pub fn submitSearch(self: Controller) void {
@@ -2131,25 +2149,6 @@ pub const Controller = struct {
         loaded.reviewed_files = reviewed_files;
     }
 
-    pub fn findFileNodeWithFilter(self: Controller, allocator: std.mem.Allocator, loaded: *const LoadedDiff, query: []const u8) !?usize {
-        var labels: std.ArrayList([]const u8) = .empty;
-        defer labels.deinit(allocator);
-        var node_indexes: std.ArrayList(usize) = .empty;
-        defer node_indexes.deinit(allocator);
-
-        for (loaded.tree.nodes, 0..) |node, index| {
-            if (node.kind != .file) continue;
-            if (!loaded.shouldIncludeFileNode(index, self.page.review_display.hide_reviewed_files, self.page.review_display.changed_file_filter)) continue;
-            try labels.append(allocator, node.path);
-            try node_indexes.append(allocator, index);
-        }
-
-        // ListFilter owns the filtered index arrays, while file path labels
-        // remain borrowed from the active LoadedDiff.
-        try self.page.file_search.filter.applyWithSourceIndexes(allocator, labels.items, node_indexes.items, query);
-        return self.page.file_search.filter.sourceIndex(0);
-    }
-
     pub fn loadedDiff(self: Controller) ?*LoadedDiff {
         return self.activeLoadedDiff();
     }
@@ -2226,8 +2225,27 @@ pub const Controller = struct {
             return .{ .unchanged = node_index };
         }
 
+        try self.revealAndSelectExactNode(
+            loaded,
+            node_index,
+            allocator_override orelse self.loadArenaAllocator(),
+        );
+        return .{ .selected = node_index };
+    }
+
+    /// Commit one already validated exact file node through the single Review
+    /// disclosure and navigation transaction. Candidate/path admission and
+    /// caller-specific failure policy deliberately remain outside this helper.
+    fn revealAndSelectExactNode(
+        self: Controller,
+        loaded: *LoadedDiff,
+        node_index: usize,
+        visible_allocator: ?std.mem.Allocator,
+    ) !void {
+        std.debug.assert(node_index < loaded.tree.nodes.len);
+        std.debug.assert(loaded.tree.nodes[node_index].kind == .file);
         if (loaded.visibleRowOfNode(node_index) == null) {
-            const allocator = allocator_override orelse self.loadArenaAllocator() orelse unreachable;
+            const allocator = visible_allocator orelse return error.MissingVisibleNodeAllocator;
             var prepared = try loaded.prepareVisibleNodeRebuild(allocator);
             self.page.viewer.root_disclosure = .expanded;
             file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
@@ -2241,7 +2259,6 @@ pub const Controller = struct {
         self.selectSidebarNode(loaded, node_index);
         self.clampSelection(loaded.document.files.len);
         self.clampDiffNavigation();
-        return .{ .selected = node_index };
     }
 
     pub fn loadArenaAllocator(self: Controller) ?std.mem.Allocator {
@@ -2676,9 +2693,40 @@ fn setDiffSearchInput(app: *TestHarness, query: []const u8) void {
 }
 
 fn setFileSearchInput(app: *TestHarness, query: []const u8) void {
+    app.pages.review.file_search.input = .{};
     @memcpy(app.pages.review.file_search.input.buffer[0..query.len], query);
     app.pages.review.file_search.input.len = query.len;
     app.pages.review.file_search.input.cursor = query.len;
+}
+
+fn setAndRebuildFileSearch(app: *TestHarness, query: []const u8) void {
+    setFileSearchInput(app, query);
+    app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
+}
+
+const file_search_nested_nodes = [_]file_tree.Node{
+    .{ .kind = .directory, .name = "src", .path = "src", .path_key = "src", .depth = 0 },
+    .{ .kind = .file, .name = "a", .path = "src/a", .path_key = "src/a", .depth = 1, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "src/b", .path_key = "src/b", .depth = 1, .target = .{ .diff_file = 1 } },
+};
+
+const file_search_rooted_nested_nodes = [_]file_tree.Node{
+    .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root },
+    .{ .kind = .directory, .name = "src", .path = "src", .path_key = "src", .depth = 1 },
+    .{ .kind = .file, .name = "a", .path = "src/a", .path_key = "src/a", .depth = 2, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "src/b", .path_key = "src/b", .depth = 2, .target = .{ .diff_file = 1 } },
+};
+
+fn fileSearchLoadedNested() LoadedDiff {
+    var loaded = app_test_support.loadedDiffNested();
+    loaded.tree.nodes = &file_search_nested_nodes;
+    return loaded;
+}
+
+fn fileSearchLoadedRootedNested() LoadedDiff {
+    var loaded = app_test_support.loadedDiffRootedNested();
+    loaded.tree.nodes = &file_search_rooted_nested_nodes;
+    return loaded;
 }
 
 const file_search_lens_nodes = [_]file_tree.Node{
@@ -3869,7 +3917,7 @@ test "left and right navigation use repository root as a directory parent" {
 test "file search selects matching file and expands ancestors" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), fileSearchLoadedNested()),
             .viewer = .{
                 .selected_file = 0,
                 .selected_node = 0,
@@ -3882,21 +3930,22 @@ test "file search selects matching file and expands ancestors" {
 
     var loaded = app.reviewNavigation().loadedDiff().?;
     try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
-    setFileSearchInput(&app, "src/b");
+    setAndRebuildFileSearch(&app, "src/b");
 
-    try app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.reviewNavigation().submitFileSearch(std.testing.allocator);
 
     loaded = app.reviewNavigation().loadedDiff().?;
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
     try std.testing.expect(!app.pages.review.file_search.mode);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
 
 test "file search expands collapsed repository root before selecting its match" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), fileSearchLoadedRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_file = 0,
@@ -3917,9 +3966,9 @@ test "file search expands collapsed repository root before selecting its match" 
         .all,
     );
     try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
-    setFileSearchInput(&app, "src/b");
+    setAndRebuildFileSearch(&app, "src/b");
 
-    try app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.reviewNavigation().submitFileSearch(std.testing.allocator);
 
     try std.testing.expectEqual(file_tree.RootDisclosure.expanded, app.pages.review.viewer.root_disclosure);
     try std.testing.expectEqual(file_tree.RootDisclosure.expanded, loaded.root_disclosure);
@@ -3928,6 +3977,7 @@ test "file search expands collapsed repository root before selecting its match" 
     try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expect(!app.pages.review.file_search.mode);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
 
 test "review transition D1 exact lookup accepts diff status and collapsed raw paths" {
@@ -4510,16 +4560,16 @@ test "review transition D2b allocation failure rolls back before ancestor expans
 test "file search keeps prompt open on no match" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .load = app_test_support.loadState(fileSearchLoadedNested()),
             .file_search = .{ .mode = true },
         } },
         .terminal_size = .{ .width = 100, .height = 12 },
     };
-    setFileSearchInput(&app, "missing");
+    setAndRebuildFileSearch(&app, "missing");
 
     defer app.pages.review.file_search.deinit(std.testing.allocator);
 
-    try app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.reviewNavigation().submitFileSearch(std.testing.allocator);
 
     try std.testing.expect(app.pages.review.file_search.mode);
     try std.testing.expect(app.pages.review.file_search.no_match);
@@ -4534,7 +4584,7 @@ test "file search skips hidden reviewed matches" {
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
                 .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
-                .tree = .{ .nodes = &app_test_support.tree_nested_nodes },
+                .tree = .{ .nodes = &file_search_nested_nodes },
                 .reviewed_files = &reviewed,
                 .collapsed_dirs = .{},
                 .bytes = 0,
@@ -4551,20 +4601,21 @@ test "file search skips hidden reviewed matches" {
         true,
         .all,
     );
-    setFileSearchInput(&app, "src");
+    setAndRebuildFileSearch(&app, "src");
 
-    try app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.reviewNavigation().submitFileSearch(std.testing.allocator);
 
     try std.testing.expect(!app.pages.review.file_search.mode);
     try std.testing.expect(!app.pages.review.file_search.no_match);
     try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
 
-test "file search trims empty input and restores focus on cancel" {
+test "file search empty Enter accepts the first exact candidate" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
+            .load = app_test_support.loadState(fileSearchLoadedNested()),
             .viewer = .{ .focus = .diff },
         } },
         .terminal_size = .{ .width = 100, .height = 12 },
@@ -4572,19 +4623,134 @@ test "file search trims empty input and restores focus on cancel" {
 
     app.reviewNavigation().enterFileSearchMode(std.testing.allocator);
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
-    setFileSearchInput(&app, "   ");
+    setAndRebuildFileSearch(&app, "   ");
 
-    try app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.reviewNavigation().submitFileSearch(std.testing.allocator);
 
     try std.testing.expect(!app.pages.review.file_search.mode);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+}
+
+test "file search Enter commits the displayed moved candidate" {
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(fileSearchLoadedNested()),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_file = 0, .selected_node = 1, .focus = .diff },
+        } },
+        .terminal_size = .{ .width = 100, .height = 12 },
+    };
+    defer app.clearLoadedDiff();
+
+    app.reviewNavigation().enterFileSearchMode(std.testing.allocator);
+    app.pages.review.file_search.move(1);
+    try std.testing.expectEqualStrings("src/b", app.pages.review.file_search.focusedCandidate().?.path_key);
+
+    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+
+    try std.testing.expect(!app.pages.review.file_search.mode);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+}
+
+test "file search Enter keeps unavailable and stale projections inert" {
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(fileSearchLoadedNested()),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_file = 0, .selected_node = 1 },
+            .file_search = .{ .mode = true },
+        } },
+    };
+    defer app.clearLoadedDiff();
+
+    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    try std.testing.expect(app.pages.review.file_search.mode);
+    try std.testing.expect(!app.pages.review.file_search.projection_available);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+
+    app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
+    try std.testing.expect(app.pages.review.file_search.projection_available);
+    app.pages.review.accepted_sidebar_revision += 1;
+
+    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+
+    try std.testing.expect(app.pages.review.file_search.mode);
+    try std.testing.expect(!app.pages.review.file_search.projection_available);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.file_search.candidates.len);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
+}
+
+test "file search disclosure allocation failure preserves prompt folds and selection" {
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), fileSearchLoadedNested()),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_file = 0, .selected_node = 1 },
+            .file_search = .{ .mode = true },
+        } },
+    };
+    defer app.clearLoadedDiff();
+    defer app.pages.review.file_search.deinit(std.testing.allocator);
+
+    const loaded = app.reviewNavigation().loadedDiff().?;
+    try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+    setAndRebuildFileSearch(&app, "src/b");
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    app.reviewNavigation().submitFileSearchWithVisibleAllocator(std.testing.allocator, failing.allocator());
+
+    try std.testing.expect(app.pages.review.file_search.mode);
+    try std.testing.expect(app.pages.review.file_search.projection_available);
+    try std.testing.expectEqualStrings("src/b", app.pages.review.file_search.focusedCandidate().?.path_key);
+    try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
+    try std.testing.expectEqualStrings("Could not reveal file search result", app.status.text());
+}
+
+test "file search Enter commits an exact status-only candidate" {
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .file, .name = "a", .path = "a", .path_key = "a", .depth = 0, .target = .{ .diff_file = 0 } },
+        .{ .kind = .file, .name = "new.zig", .path = "new.zig", .path_key = "new.zig", .depth = 0, .target = .{ .status_entry = 0 }, .status = .added },
+    };
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(.{
+                .text = "",
+                .document = .{ .files = &app_test_support.files_one },
+                .file_text_eligibility = &.{.selectable_utf8},
+                .tree = .{ .nodes = &nodes },
+                .bytes = 0,
+                .lines = 0,
+            }),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+            .file_search = .{ .mode = true },
+        } },
+        .repo_root = "/repo",
+    };
+    defer app.clearLoadedDiff();
+    defer app.pages.review.git_status.deinit();
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? new.zig\x00");
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    setAndRebuildFileSearch(&app, "new.zig");
+
+    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+
+    try std.testing.expect(!app.pages.review.file_search.mode);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
 
 test "file search keeps diff focus while sidebar is hidden" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
-            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
+            .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), fileSearchLoadedNested()),
             .viewer = .{ .focus = .diff, .sidebar_hidden = true },
         } },
         .terminal_size = .{ .width = 100, .height = 12 },
@@ -4593,17 +4759,17 @@ test "file search keeps diff focus while sidebar is hidden" {
 
     app.reviewNavigation().enterFileSearchMode(std.testing.allocator);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    setFileSearchInput(&app, "   ");
+    setAndRebuildFileSearch(&app, "   ");
 
-    try app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.reviewNavigation().submitFileSearch(std.testing.allocator);
 
     try std.testing.expect(!app.pages.review.file_search.mode);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 
     app.reviewNavigation().enterFileSearchMode(std.testing.allocator);
-    setFileSearchInput(&app, "src/b");
+    setAndRebuildFileSearch(&app, "src/b");
 
-    try app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.reviewNavigation().submitFileSearch(std.testing.allocator);
 
     try std.testing.expect(!app.pages.review.file_search.mode);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
@@ -5316,17 +5482,23 @@ test "candidate rebuild failure cannot reject committed file visibility lens" {
 }
 
 test "file search skips files outside active changed filter" {
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .file, .name = "added.zig", .path = "src/added.zig", .path_key = "src/added.zig", .depth = 1, .target = .{ .diff_file = 0 }, .status = .added },
+        .{ .kind = .file, .name = "deleted.zig", .path = "src/deleted.zig", .path_key = "src/deleted.zig", .depth = 1, .target = .{ .diff_file = 1 }, .status = .deleted },
+    };
+    var loaded = app_test_support.loadedDiffTwoWithStatuses();
+    loaded.tree.nodes = &nodes;
     var app: TestHarness = .{
         .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
+            .load = app_test_support.loadState(loaded),
             .file_search = .{ .mode = true },
             .review_display = .{ .changed_file_filter = .added },
         } },
     };
-    setFileSearchInput(&app, "deleted");
+    setAndRebuildFileSearch(&app, "deleted");
     defer app.pages.review.file_search.deinit(std.testing.allocator);
 
-    try app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.reviewNavigation().submitFileSearch(std.testing.allocator);
 
     try std.testing.expect(app.pages.review.file_search.mode);
     try std.testing.expect(app.pages.review.file_search.no_match);
