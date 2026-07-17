@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const chasen = @import("chasen");
 const draw = @import("draw");
 const app_load_state = @import("../../load_state.zig");
+const app_page = @import("../../page.zig");
+const review_projection = @import("../../review_projection.zig");
 const view_primitives = @import("../../view_primitives.zig");
 const review_page = @import("../review.zig");
 const review_layout = @import("layout.zig");
@@ -245,12 +247,12 @@ fn viewEmptySidebarChrome(app: Context, surface: *chasen.Surface) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    const active = app.page.viewer.focus == .sidebar;
-    try drawSidebarDetailRow(app, surface, 0, active);
+    try drawSidebarDetailRow(app, surface, 0);
 
     if (size.height <= 2) return;
-    _ = surface.borrowTextAt(0, 2, paneTitleText("Files", active), paneTitleStyle(active, app.theme));
-    const title_width = chasen.text.displayWidth(paneTitleText("Files", active));
+    const title = " Files";
+    _ = surface.borrowTextAt(0, 2, title, sidebarTitleStyle(app.theme));
+    const title_width = chasen.text.displayWidth(title);
     const stats_col = title_width + 1;
     if (stats_col < size.width) {
         _ = try surface.printAt(stats_col, 2, app.theme.style(.muted), "0 files / 0 hunks", .{});
@@ -305,12 +307,12 @@ pub fn viewSidebar(app: Context, surface: *chasen.Surface, loaded: loaded_diff.L
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    const active = app.page.viewer.focus == .sidebar;
-    try drawSidebarDetailRow(app, surface, 0, active);
+    try drawSidebarDetailRow(app, surface, 0);
 
     if (size.height <= 2) return;
-    _ = surface.borrowTextAt(0, 2, paneTitleText("Files", active), paneTitleStyle(active, app.theme));
-    const title_width = chasen.text.displayWidth(paneTitleText("Files", active));
+    const title = " Files";
+    _ = surface.borrowTextAt(0, 2, title, sidebarTitleStyle(app.theme));
+    const title_width = chasen.text.displayWidth(title);
     const stats_col = title_width + 1;
     if (stats_col < size.width) {
         _ = try surface.printAt(stats_col, 2, app.theme.style(.muted), "{d} files / {d} hunks", .{
@@ -338,11 +340,12 @@ pub fn viewSidebar(app: Context, surface: *chasen.Surface, loaded: loaded_diff.L
             .reviewed_files = loaded.reviewed_files,
             .visible_nodes = loaded.materializedVisibleNodes(),
         }, visible_index, app.page.viewer.selected_node) orelse continue;
-        try drawSidebarRow(surface, row, row_model, app.page.viewer.focus == .sidebar, app.page.viewer.sidebar_horizontal_scroll, app.theme);
+        const cursor_active = app.page.viewer.focus == .sidebar and !app.page.file_search.mode;
+        try drawSidebarRow(surface, row, row_model, cursor_active, app.page.viewer.sidebar_horizontal_scroll, app.theme);
     }
 }
 
-fn drawSidebarDetailRow(app: Context, surface: *chasen.Surface, row: u16, active: bool) !void {
+fn drawSidebarDetailRow(app: Context, surface: *chasen.Surface, row: u16) !void {
     const size = surface.size();
     if (size.width <= 2 or row >= size.height) return;
 
@@ -361,32 +364,38 @@ fn drawSidebarDetailRow(app: Context, surface: *chasen.Surface, row: u16, active
     }
 
     if (branchStatusSidebarText(app.page, app.repo_root, surface.frameAllocator(), size.width - 1)) |text| {
-        try draw.copyClippedTextAt(surface, 1, row, text, paneBranchStyle(active, app.theme));
+        try draw.copyClippedTextAt(surface, 1, row, text, sidebarBranchStyle(app.theme));
     }
 }
 
-fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_model.Row, pane_active: bool, horizontal_scroll: usize, palette: theme.Palette) !void {
+fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_model.Row, cursor_active: bool, horizontal_scroll: usize, palette: theme.Palette) !void {
     const width = surface.size().width;
     const row_layout = sidebar_view_model.layout(row_model, width);
-    const style = sidebarRowStyle(row_model, pane_active, palette);
+    const cursor_bg: ?chasen.Color = if (cursor_active and row_model.selected) palette.color(.pane_cursor_bg) else null;
+    const style = withCursorBackground(sidebarRowStyle(row_model, palette), cursor_bg);
+
+    // Cursor chrome is a row-level concern, separate from path/badge Git
+    // semantics. Fill first so trailing cells share the same signal, then
+    // compose the same background into every semantic cell written below.
+    if (cursor_bg != null) fillSidebarCursorRow(surface, row, style);
 
     if (row_model.status) |status| {
         if (row_layout.badge_col) |badge_col| {
             if (width > badge_col) {
-                _ = surface.borrowTextAt(badge_col, row, status.badge(), statusStyle(row_model, status, pane_active, palette));
+                _ = surface.borrowTextAt(badge_col, row, status.badge(), statusStyle(row_model, status, palette, cursor_bg));
             }
         }
     }
 
     if (row_layout.mode_col) |mode_col| {
         if (width > mode_col) {
-            _ = surface.borrowTextAt(mode_col, row, "m", modeBadgeStyle(row_model.selected, pane_active, palette));
+            _ = surface.borrowTextAt(mode_col, row, "m", modeBadgeStyle(palette, cursor_bg));
         }
     }
 
     if (row_layout.reviewed_col) |reviewed_col| {
         if (width > reviewed_col) {
-            _ = surface.borrowTextAt(reviewed_col, row, "✓", reviewedStyle(row_model.selected, pane_active, palette));
+            _ = surface.borrowTextAt(reviewed_col, row, "✓", reviewedStyle(palette, cursor_bg));
         }
     }
 
@@ -410,15 +419,21 @@ fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_mo
             .width = row_layout.stats_width,
             .height = 1,
         });
-        try drawSidebarStats(&stats_area, row_model, pane_active, palette);
+        try drawSidebarStats(&stats_area, row_model, palette, cursor_bg);
     }
 }
 
-fn drawSidebarStats(surface: *chasen.Surface, row: sidebar_view_model.Row, pane_active: bool, palette: theme.Palette) !void {
+fn fillSidebarCursorRow(surface: *chasen.Surface, row: u16, style: chasen.TextStyle) void {
+    for (0..surface.size().width) |col| {
+        _ = surface.borrowTextAt(@intCast(col), row, " ", style);
+    }
+}
+
+fn drawSidebarStats(surface: *chasen.Surface, row: sidebar_view_model.Row, palette: theme.Palette, cursor_bg: ?chasen.Color) !void {
     const added_text = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{row.stats.added});
     const removed_text = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{row.stats.removed});
-    const added_style = sidebarStatStyle(row, pane_active, palette.color(.success));
-    const removed_style = sidebarStatStyle(row, pane_active, palette.color(.danger));
+    const added_style = sidebarStatStyle(palette.color(.success), cursor_bg);
+    const removed_style = sidebarStatStyle(palette.color(.danger), cursor_bg);
 
     try draw.copyClippedTextAt(surface, 0, 0, added_text, added_style);
     const removed_col = chasen.text.displayWidth(added_text) + 1;
@@ -427,13 +442,11 @@ fn drawSidebarStats(surface: *chasen.Surface, row: sidebar_view_model.Row, pane_
     }
 }
 
-fn sidebarStatStyle(row: sidebar_view_model.Row, pane_active: bool, fg: chasen.Color) chasen.TextStyle {
-    return .{
+fn sidebarStatStyle(fg: chasen.Color, cursor_bg: ?chasen.Color) chasen.TextStyle {
+    return withCursorBackground(.{
         .fg = fg,
         .bold = true,
-        .dim = !pane_active,
-        .reverse = pane_active and row.selected,
-    };
+    }, cursor_bg);
 }
 
 fn sidebarTreeContent(allocator: std.mem.Allocator, row: sidebar_view_model.Row) ![]const u8 {
@@ -451,15 +464,17 @@ fn sidebarTreeContent(allocator: std.mem.Allocator, row: sidebar_view_model.Row)
     return buf;
 }
 
-fn sidebarRowStyle(row: sidebar_view_model.Row, pane_active: bool, palette: theme.Palette) chasen.TextStyle {
-    if (row.selected) return .{ .reverse = pane_active, .bold = true, .dim = !pane_active };
-    if (row.kind == .directory or row.kind == .repo_root) return .{ .bold = true, .dim = !pane_active };
-    return switch (row.stage_presence) {
-        .staged_only => .{ .fg = palette.color(.staged), .dim = !pane_active },
-        .mixed => .{ .fg = palette.color(.prompt), .dim = !pane_active },
-        .conflict => .{ .fg = palette.color(.danger), .bold = true, .dim = !pane_active },
-        else => .{ .dim = !pane_active },
+fn sidebarRowStyle(row: sidebar_view_model.Row, palette: theme.Palette) chasen.TextStyle {
+    var style: chasen.TextStyle = if (row.kind == .directory or row.kind == .repo_root)
+        .{ .bold = true }
+    else switch (row.stage_presence) {
+        .staged_only => .{ .fg = palette.color(.staged) },
+        .mixed => .{ .fg = palette.color(.prompt) },
+        .conflict => .{ .fg = palette.color(.danger), .bold = true },
+        else => .{},
     };
+    if (row.selected) style.bold = true;
+    return style;
 }
 
 /// Draw the selected file's diff pane.
@@ -1017,7 +1032,13 @@ fn diffContentSurface(surface: *chasen.Surface) chasen.Surface {
     });
 }
 
-fn statusStyle(row: sidebar_view_model.Row, status: file_tree.Status, pane_active: bool, palette: theme.Palette) chasen.TextStyle {
+fn withCursorBackground(style: chasen.TextStyle, cursor_bg: ?chasen.Color) chasen.TextStyle {
+    var composed = style;
+    if (cursor_bg) |background| composed.bg = background;
+    return composed;
+}
+
+fn statusStyle(row: sidebar_view_model.Row, status: file_tree.Status, palette: theme.Palette, cursor_bg: ?chasen.Color) chasen.TextStyle {
     const fg: chasen.Color = switch (row.stage_presence) {
         .staged_only => palette.color(.staged),
         .mixed => palette.color(.prompt),
@@ -1030,15 +1051,23 @@ fn statusStyle(row: sidebar_view_model.Row, status: file_tree.Status, pane_activ
             .binary => palette.color(.binary),
         },
     };
-    return .{ .fg = fg, .bold = true, .dim = !pane_active, .reverse = pane_active and row.selected };
+    return withCursorBackground(.{ .fg = fg, .bold = true }, cursor_bg);
 }
 
-fn reviewedStyle(selected: bool, pane_active: bool, palette: theme.Palette) chasen.TextStyle {
-    return .{ .fg = palette.color(.success), .bold = true, .dim = !pane_active, .reverse = pane_active and selected };
+fn reviewedStyle(palette: theme.Palette, cursor_bg: ?chasen.Color) chasen.TextStyle {
+    return withCursorBackground(.{ .fg = palette.color(.success), .bold = true }, cursor_bg);
 }
 
-fn modeBadgeStyle(selected: bool, pane_active: bool, palette: theme.Palette) chasen.TextStyle {
-    return .{ .fg = palette.color(.info), .bold = true, .dim = !pane_active, .reverse = pane_active and selected };
+fn modeBadgeStyle(palette: theme.Palette, cursor_bg: ?chasen.Color) chasen.TextStyle {
+    return withCursorBackground(.{ .fg = palette.color(.info), .bold = true }, cursor_bg);
+}
+
+fn sidebarTitleStyle(palette: theme.Palette) chasen.TextStyle {
+    return palette.boldStyle(.accent);
+}
+
+fn sidebarBranchStyle(palette: theme.Palette) chasen.TextStyle {
+    return palette.style(.info);
 }
 
 fn paneTitleStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
@@ -1055,13 +1084,6 @@ fn paneSearchStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
         palette.style(.prompt);
 }
 
-fn paneBranchStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
-    return if (active)
-        palette.style(.info)
-    else
-        .{ .fg = palette.color(.info), .dim = true };
-}
-
 fn paneHeaderRuleStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
     return if (active)
         .{ .dim = true }
@@ -1071,13 +1093,6 @@ fn paneHeaderRuleStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
 
 fn shellSeparatorStyle() chasen.TextStyle {
     return .{ .dim = true };
-}
-
-fn paneTitleText(label: []const u8, active: bool) []const u8 {
-    if (std.mem.eql(u8, label, "Files")) return " Files";
-    if (!active) return label;
-    if (std.mem.eql(u8, label, "Diff")) return "▸ Diff";
-    return label;
 }
 
 fn testContext(page: *const review_page.ReviewPageState, palette: theme.Palette, width: u16, height: u16) Context {
@@ -1103,33 +1118,106 @@ fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette 
     return theme.Palette.fromConfig(FakeConfig{ .role = role, .color = color });
 }
 
+test "sidebar chrome stays semantic while inactive diff path title stays dim" {
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 4, 5, 6 } };
+
+    const title = sidebarTitleStyle(palette);
+    const branch = sidebarBranchStyle(palette);
+    const inactive_diff_title = paneTitleStyle(false, palette);
+    try std.testing.expect(title.fg.eql(palette.color(.accent)));
+    try std.testing.expect(title.bold);
+    try std.testing.expect(!title.dim);
+    try std.testing.expect(branch.fg.eql(palette.color(.info)));
+    try std.testing.expect(!branch.dim);
+    try std.testing.expect(inactive_diff_title.dim);
+}
+
 test "sidebar renderer owns badges titles selection styles and horizontal scroll" {
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwoWithStatuses()),
         .viewer = .{ .focus = .sidebar },
     };
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 7, 8, 9 } };
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(34, 8);
     defer ts.deinit();
 
-    try viewSidebar(testContext(&page, .default(), 80, 9), &ts.surface, page.load.state.loaded.loaded);
+    const selected_row = review_layout.sidebar_header_rows;
+    try viewSidebar(testContext(&page, palette, 80, 9), &ts.surface, page.load.state.loaded.loaded);
     try ts.expectCellText(2, review_layout.sidebar_header_rows, "A");
     try ts.expectCellText(2, review_layout.sidebar_header_rows + 1, "D");
     try ts.expectCellText(1, 2, "F");
-    try std.testing.expect(ts.surface.readCell(6, review_layout.sidebar_header_rows).?.style.reverse);
+    const active_badge = ts.surface.readCell(2, selected_row) orelse return error.ExpectedActiveBadge;
+    const active_path = ts.surface.readCell(6, selected_row) orelse return error.ExpectedActivePath;
+    const active_trailing = ts.surface.readCell(33, selected_row) orelse return error.ExpectedActiveTrailingCell;
+    const active_title = ts.surface.readCell(1, 2) orelse return error.ExpectedActiveTitle;
+    try std.testing.expect(active_badge.style.fg.eql(palette.color(.success)));
+    for ([_]chasen.Cell{ active_badge, active_path, active_trailing }) |cell| {
+        try std.testing.expect(cell.style.bg.eql(palette.color(.pane_cursor_bg)));
+        try std.testing.expect(!cell.style.dim);
+        try std.testing.expect(!cell.style.reverse);
+    }
+    try std.testing.expect(active_path.style.bold);
+    try std.testing.expect(active_trailing.style.bold);
+    try std.testing.expect(active_title.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(active_title.style.bold);
+    try std.testing.expect(!active_title.style.dim);
 
     page.viewer.focus = .diff;
-    try viewSidebar(testContext(&page, .default(), 80, 9), &ts.surface, page.load.state.loaded.loaded);
-    try std.testing.expect(ts.surface.readCell(6, review_layout.sidebar_header_rows).?.style.dim);
-    try std.testing.expect(!ts.surface.readCell(6, review_layout.sidebar_header_rows).?.style.reverse);
+    ts.surface.clearAll();
+    try viewSidebar(testContext(&page, palette, 80, 9), &ts.surface, page.load.state.loaded.loaded);
+    const inactive_badge = ts.surface.readCell(2, selected_row) orelse return error.ExpectedInactiveBadge;
+    const inactive_path = ts.surface.readCell(6, selected_row) orelse return error.ExpectedInactivePath;
+    const inactive_trailing = ts.surface.readCell(33, selected_row) orelse return error.ExpectedInactiveTrailingCell;
+    const inactive_title = ts.surface.readCell(1, 2) orelse return error.ExpectedInactiveTitle;
+    try std.testing.expect(inactive_badge.style.fg.eql(palette.color(.success)));
+    for ([_]chasen.Cell{ inactive_badge, inactive_path, inactive_trailing }) |cell| {
+        try std.testing.expect(!cell.style.bg.eql(palette.color(.pane_cursor_bg)));
+        try std.testing.expect(!cell.style.dim);
+        try std.testing.expect(!cell.style.reverse);
+    }
+    try std.testing.expect(inactive_path.style.bold);
+    try std.testing.expect(inactive_title.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(inactive_title.style.bold);
+    try std.testing.expect(!inactive_title.style.dim);
 
-    const overridden = paletteWithOverride(.success, .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } });
-    try viewSidebar(testContext(&page, overridden, 80, 9), &ts.surface, page.load.state.loaded.loaded);
-    try std.testing.expect(ts.surface.readCell(2, review_layout.sidebar_header_rows).?.style.fg.eql(.{ .rgb = .{ 1, 2, 3 } }));
     page.viewer.focus = .sidebar;
-    const accent = paletteWithOverride(.accent, .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } });
-    try viewSidebar(testContext(&page, accent, 80, 9), &ts.surface, page.load.state.loaded.loaded);
-    try std.testing.expect(ts.surface.readCell(1, 2).?.style.fg.eql(.{ .rgb = .{ 4, 5, 6 } }));
+    page.file_search.mode = true;
+    ts.surface.clearAll();
+    try viewSidebar(testContext(&page, palette, 80, 9), &ts.surface, page.load.state.loaded.loaded);
+    // Search enter, no-match, and unavailable terminals all retain mode and
+    // therefore let the search candidate presentation own attention.
+    try std.testing.expect(!ts.surface.readCell(6, selected_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(!ts.surface.readCell(33, selected_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+
+    // Before Slice G, cancel/empty submit and sidebar-entry success restore
+    // sidebar focus, while the inactive rendering above also represents a
+    // successful search entered from the diff pane.
+    page.file_search.mode = false;
+    ts.surface.clearAll();
+    try viewSidebar(testContext(&page, palette, 80, 9), &ts.surface, page.load.state.loaded.loaded);
+    try std.testing.expect(ts.surface.readCell(33, selected_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+
+    var full: chasen.testing.TestSurface = undefined;
+    try full.init(80, 9);
+    defer full.deinit();
+    try view(testContext(&page, palette, 80, 9), &full.surface);
+    const separator_col = review_layout.sidebarWidth(80, page.viewer.sidebar_width);
+    const separator = full.surface.readCell(separator_col, selected_row) orelse return error.ExpectedSidebarSeparator;
+    try std.testing.expect(separator.style.dim);
+    try std.testing.expect(!separator.style.reverse);
+    try std.testing.expect(!separator.style.bg.eql(palette.color(.pane_cursor_bg)));
+
+    var short: chasen.testing.TestSurface = undefined;
+    try short.init(12, review_layout.sidebar_header_rows);
+    defer short.deinit();
+    try viewSidebar(testContext(&page, palette, 80, 9), &short.surface, page.load.state.loaded.loaded);
+    try short.expectCellText(1, 2, "F");
 
     const nodes = [_]file_tree.Node{.{
         .kind = .file,
@@ -1153,9 +1241,11 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
     var narrow: chasen.testing.TestSurface = undefined;
     try narrow.init(24, 8);
     defer narrow.deinit();
-    try viewSidebar(testContext(&page, .default(), 80, 9), &narrow.surface, page.load.state.loaded.loaded);
+    try viewSidebar(testContext(&page, palette, 80, 9), &narrow.surface, page.load.state.loaded.loaded);
     try narrow.expectCellText(2, review_layout.sidebar_header_rows, "M");
     try narrow.expectCellText(4, review_layout.sidebar_header_rows, "m");
+    try std.testing.expect(narrow.surface.readCell(4, review_layout.sidebar_header_rows).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(narrow.surface.readCell(23, review_layout.sidebar_header_rows).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     const snapshot = try narrow.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "very_long") != null);
@@ -1182,25 +1272,156 @@ test "sidebar renderer left-aligns root and directory without a selection marker
     const collapsed: file_tree.CollapsedSet = .empty;
     const root = sidebar_view_model.rowForNode(tree, &collapsed, .expanded, &.{}, 0, 0).?;
     const collapsed_root = sidebar_view_model.rowForNode(tree, &collapsed, .collapsed, &.{}, 0, 0).?;
-    const directory = sidebar_view_model.rowForNode(tree, &collapsed, .expanded, &.{}, 1, 0).?;
+    const directory = sidebar_view_model.rowForNode(tree, &collapsed, .expanded, &.{}, 1, 1).?;
 
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(40, 3);
     defer ts.deinit();
+    const palette = paletteWithOverride(.pane_cursor_bg, .{ .rgb = .{ .r = 10, .g = 11, .b = 12 } });
 
-    try drawSidebarRow(&ts.surface, 0, root, true, 0, .default());
-    try drawSidebarRow(&ts.surface, 1, directory, true, 0, .default());
-    try drawSidebarRow(&ts.surface, 2, collapsed_root, true, 0, .default());
+    try drawSidebarRow(&ts.surface, 0, root, true, 0, palette);
+    try drawSidebarRow(&ts.surface, 1, directory, true, 0, palette);
+    try drawSidebarRow(&ts.surface, 2, collapsed_root, true, 0, palette);
 
     try ts.expectCellText(0, 0, "▾");
-    try std.testing.expect(ts.surface.readCell(0, 0).?.style.reverse);
+    try std.testing.expect(!ts.surface.readCell(0, 0).?.style.reverse);
+    try std.testing.expect(ts.surface.readCell(0, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(ts.surface.readCell(39, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try ts.expectCellText(2, 0, "g");
     try ts.expectCellText(28, 0, "+");
     try ts.expectCellText(32, 0, "-");
+    try std.testing.expect(ts.surface.readCell(28, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(ts.surface.readCell(32, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try ts.expectCellText(2, 1, "▾");
     try ts.expectCellText(4, 1, "s");
+    try std.testing.expect(ts.surface.readCell(39, 1).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try ts.expectCellText(0, 2, "▸");
     try ts.expectCellText(2, 2, "g");
+
+    ts.surface.clearAll();
+    try drawSidebarRow(&ts.surface, 0, root, false, 0, palette);
+    const retained_root = ts.surface.readCell(0, 0) orelse return error.ExpectedRetainedRoot;
+    const retained_trailing = ts.surface.readCell(39, 0) orelse return error.ExpectedRetainedRootTrailingCell;
+    try std.testing.expect(retained_root.style.bold);
+    try std.testing.expect(!retained_root.style.dim);
+    try std.testing.expect(!retained_root.style.reverse);
+    try std.testing.expect(!retained_root.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(!retained_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
+}
+
+test "sidebar cursor background composes reviewed status mode and path semantics" {
+    const row: sidebar_view_model.Row = .{
+        .node_index = 0,
+        .kind = .file,
+        .selected = true,
+        .depth = 0,
+        .name = "script.sh",
+        .path = "script.sh",
+        .stats = .{},
+        .status = .modified,
+        .stage_presence = .mixed,
+        .mode_changed = true,
+        .reviewed = true,
+        .fold = .none,
+    };
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 10, 11, 12 } };
+
+    var active: chasen.testing.TestSurface = undefined;
+    try active.init(40, 1);
+    defer active.deinit();
+    try drawSidebarRow(&active.surface, 0, row, true, 0, palette);
+
+    const points = [_]struct {
+        col: u16,
+        role: theme.Role,
+    }{
+        .{ .col = 1, .role = .success },
+        .{ .col = 2, .role = .prompt },
+        .{ .col = 4, .role = .info },
+        .{ .col = 6, .role = .prompt },
+    };
+    for (points) |point| {
+        const cell = active.surface.readCell(point.col, 0) orelse return error.ExpectedActiveSemanticCell;
+        try std.testing.expect(cell.style.fg.eql(palette.color(point.role)));
+        try std.testing.expect(cell.style.bg.eql(palette.color(.pane_cursor_bg)));
+        try std.testing.expect(!cell.style.dim);
+        try std.testing.expect(!cell.style.reverse);
+    }
+    const active_trailing = active.surface.readCell(39, 0) orelse return error.ExpectedActiveTrailingCell;
+    try std.testing.expect(active_trailing.style.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(active_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
+
+    var inactive: chasen.testing.TestSurface = undefined;
+    try inactive.init(40, 1);
+    defer inactive.deinit();
+    try drawSidebarRow(&inactive.surface, 0, row, false, 0, palette);
+    for (points) |point| {
+        const cell = inactive.surface.readCell(point.col, 0) orelse return error.ExpectedInactiveSemanticCell;
+        try std.testing.expect(cell.style.fg.eql(palette.color(point.role)));
+        try std.testing.expect(!cell.style.bg.eql(palette.color(.pane_cursor_bg)));
+        try std.testing.expect(!cell.style.dim);
+        try std.testing.expect(!cell.style.reverse);
+    }
+    const inactive_trailing = inactive.surface.readCell(39, 0) orelse return error.ExpectedInactiveTrailingCell;
+    try std.testing.expect(!inactive_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(!inactive_trailing.style.dim);
+    try std.testing.expect(!inactive_trailing.style.reverse);
+}
+
+test "sidebar row stage matrix keeps semantic foreground independent of cursor chrome" {
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.staged)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.danger)] = .{ .rgb = .{ 10, 11, 12 } };
+
+    const cases = [_]struct {
+        stage_presence: file_tree.StagePresence,
+        path_color: chasen.Color,
+        status_color: chasen.Color,
+    }{
+        .{ .stage_presence = .clean_or_unknown, .path_color = .default, .status_color = palette.color(.prompt) },
+        .{ .stage_presence = .staged_only, .path_color = palette.color(.staged), .status_color = palette.color(.staged) },
+        .{ .stage_presence = .mixed, .path_color = palette.color(.prompt), .status_color = palette.color(.prompt) },
+        .{ .stage_presence = .conflict, .path_color = palette.color(.danger), .status_color = palette.color(.danger) },
+    };
+    for (cases) |case| {
+        const row: sidebar_view_model.Row = .{
+            .node_index = 0,
+            .kind = .file,
+            .selected = true,
+            .depth = 0,
+            .name = "file.zig",
+            .path = "file.zig",
+            .stats = .{},
+            .status = .modified,
+            .stage_presence = case.stage_presence,
+            .mode_changed = false,
+            .reviewed = false,
+            .fold = .none,
+        };
+        const inactive_path = sidebarRowStyle(row, palette);
+        const active_path = withCursorBackground(inactive_path, palette.color(.pane_cursor_bg));
+        const active_status = statusStyle(row, .modified, palette, palette.color(.pane_cursor_bg));
+
+        try std.testing.expect(inactive_path.fg.eql(case.path_color));
+        try std.testing.expect(inactive_path.bold);
+        try std.testing.expect(!inactive_path.dim);
+        try std.testing.expect(!inactive_path.reverse);
+        try std.testing.expect(!inactive_path.bg.eql(palette.color(.pane_cursor_bg)));
+        try std.testing.expect(active_path.fg.eql(case.path_color));
+        try std.testing.expect(active_path.bg.eql(palette.color(.pane_cursor_bg)));
+        try std.testing.expect(!active_path.dim);
+        try std.testing.expect(!active_path.reverse);
+        try std.testing.expect(active_status.fg.eql(case.status_color));
+        try std.testing.expect(active_status.bg.eql(palette.color(.pane_cursor_bg)));
+        try std.testing.expect(!active_status.dim);
+        try std.testing.expect(!active_status.reverse);
+    }
 }
 
 test "diff renderer owns header search marker gutter and input presentation" {
@@ -1286,6 +1507,60 @@ test "status-only header dims semantic statistics and metadata when inactive" {
         try std.testing.expect(!active_cell.style.dim);
         try std.testing.expect(inactive_cell.style.dim);
     }
+}
+
+test "inactive status-only pending and inert diff path headers remain dim" {
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .selected_target = .{ .status_only = 0 },
+            .focus = .sidebar,
+        },
+    };
+    defer page.git_status.deinit();
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? new.zig\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+
+    var status_only: chasen.testing.TestSurface = undefined;
+    try status_only.init(40, 6);
+    defer status_only.deinit();
+    var status_context = testContext(&page, .default(), 40, 7);
+    status_context.repo_root = "/repo";
+    status_context.navigation.repo_root = "/repo";
+    try viewDiffPane(status_context, &status_only.surface, page.load.state.loaded.loaded);
+    try std.testing.expect(status_only.surface.readCell(1, 0).?.style.dim);
+
+    page.review_projection.pending = try review_projection.cloneRequest(
+        std.testing.allocator,
+        app_page.RequestIdentity.review(0, 1),
+        1,
+        "/repo",
+        "new.zig",
+        .generated_added_file,
+        .unstaged,
+        0,
+        0,
+    );
+    defer page.review_projection.clearPending(std.testing.allocator);
+    var pending: chasen.testing.TestSurface = undefined;
+    try pending.init(40, 6);
+    defer pending.deinit();
+    try viewDiffPane(status_context, &pending.surface, page.load.state.loaded.loaded);
+    try std.testing.expect(pending.surface.readCell(1, 0).?.style.dim);
+    page.review_projection.clearPending(std.testing.allocator);
+
+    const inert_eligibility = [_]loaded_diff.FileTextEligibility{.inert_invalid_utf8};
+    var inert_loaded = test_support.loadedDiffOne();
+    inert_loaded.file_text_eligibility = &inert_eligibility;
+    page.load = test_support.loadState(inert_loaded);
+    page.viewer.selected_target = .{ .diff_file = 0 };
+    page.viewer.selected_file = 0;
+    var inert: chasen.testing.TestSurface = undefined;
+    try inert.init(40, 6);
+    defer inert.deinit();
+    const inert_context = testContext(&page, .default(), 40, 7);
+    try viewDiffPane(inert_context, &inert.surface, page.load.state.loaded.loaded);
+    try std.testing.expect(inert.surface.readCell(1, 0).?.style.dim);
 }
 
 test "reviewed sidebar marker and visible search marker are Review view concerns" {
