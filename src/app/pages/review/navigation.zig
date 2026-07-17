@@ -1429,13 +1429,17 @@ pub const Controller = struct {
         self.clearSearch();
     }
 
-    pub fn enterFileSearchMode(self: Controller) void {
+    pub fn enterFileSearchMode(self: Controller, allocator: std.mem.Allocator) void {
         self.clearDiffSelection();
         self.page.file_search_return_focus = if (self.page.viewer.sidebar_hidden) .diff else self.page.viewer.focus;
         if (!self.page.viewer.sidebar_hidden) self.page.viewer.focus = .sidebar;
         self.page.file_search.mode = true;
         self.page.file_search.input = .{};
         self.page.file_search.resetNoMatch();
+        // Empty input is an authoritative all-eligible-files projection, not
+        // a sentinel state. This also establishes the unavailable terminal
+        // immediately when no accepted sidebar can supply candidates.
+        self.rebuildFileSearchProjection(allocator);
     }
 
     pub fn cancelFileSearchMode(self: Controller, allocator: std.mem.Allocator) void {
@@ -4566,7 +4570,7 @@ test "file search trims empty input and restores focus on cancel" {
         .terminal_size = .{ .width = 100, .height = 12 },
     };
 
-    app.reviewNavigation().enterFileSearchMode();
+    app.reviewNavigation().enterFileSearchMode(std.testing.allocator);
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
     setFileSearchInput(&app, "   ");
 
@@ -4587,7 +4591,7 @@ test "file search keeps diff focus while sidebar is hidden" {
     };
     defer app.clearLoadedDiff();
 
-    app.reviewNavigation().enterFileSearchMode();
+    app.reviewNavigation().enterFileSearchMode(std.testing.allocator);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
     setFileSearchInput(&app, "   ");
 
@@ -4596,7 +4600,7 @@ test "file search keeps diff focus while sidebar is hidden" {
     try std.testing.expect(!app.pages.review.file_search.mode);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 
-    app.reviewNavigation().enterFileSearchMode();
+    app.reviewNavigation().enterFileSearchMode(std.testing.allocator);
     setFileSearchInput(&app, "src/b");
 
     try app.reviewNavigation().submitFileSearch(std.testing.allocator);

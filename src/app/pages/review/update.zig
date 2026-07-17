@@ -11,6 +11,7 @@ const message = @import("message.zig");
 const navigation = @import("navigation.zig");
 const review_selection = @import("selection.zig");
 const diff_selection = @import("../../../diff/selection.zig");
+const file_tree = if (builtin.is_test) @import("../../../file_tree.zig") else struct {};
 const root_capability = @import("../../../repo/root_capability.zig");
 const review_session = @import("../../../review/session.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
@@ -165,24 +166,38 @@ pub const Controller = struct {
             .search_move_right => self.navigation.page.search.input.moveRight(),
             .select_next_search_match => self.navigation.selectSearchMatch(.forward),
             .select_previous_search_match => self.navigation.selectSearchMatch(.backward),
-            .enter_file_search => self.navigation.enterFileSearchMode(),
+            .enter_file_search => self.navigation.enterFileSearchMode(allocator orelse return error.MissingAllocator),
             .cancel_file_search => self.navigation.cancelFileSearchMode(allocator orelse return error.MissingAllocator),
             .submit_file_search => try self.navigation.submitFileSearch(allocator orelse return error.MissingAllocator),
-            .file_search_insert => |codepoint| {
-                self.navigation.page.file_search.resetNoMatch();
-                self.navigation.page.file_search.input.insert(codepoint) catch {
+            // Prepare fixed-capacity edits by value so overflow and a missing
+            // runtime allocator cannot publish input from a newer query than
+            // the still-live candidate projection.
+            .file_search_insert => |codepoint| insert: {
+                var prepared = self.navigation.page.file_search.input;
+                prepared.insert(codepoint) catch {
                     self.navigation.page.status.set("file search query is too long", .{});
+                    break :insert;
                 };
+                const owner = allocator orelse return error.MissingAllocator;
+                self.navigation.page.file_search.input = prepared;
+                self.navigation.rebuildFileSearchProjection(owner);
             },
-            .file_search_paste => |text| {
-                self.navigation.page.file_search.resetNoMatch();
-                self.navigation.page.file_search.input.insertSlice(text) catch {
+            .file_search_paste => |text| paste: {
+                var prepared = self.navigation.page.file_search.input;
+                prepared.insertSlice(text) catch {
                     self.navigation.page.status.set("file search query is too long", .{});
+                    break :paste;
                 };
+                const owner = allocator orelse return error.MissingAllocator;
+                self.navigation.page.file_search.input = prepared;
+                self.navigation.rebuildFileSearchProjection(owner);
             },
             .file_search_backspace => {
-                self.navigation.page.file_search.resetNoMatch();
-                self.navigation.page.file_search.input.backspace();
+                var prepared = self.navigation.page.file_search.input;
+                prepared.backspace();
+                const owner = allocator orelse return error.MissingAllocator;
+                self.navigation.page.file_search.input = prepared;
+                self.navigation.rebuildFileSearchProjection(owner);
             },
             .toggle_reviewed_file => try self.navigation.toggleReviewedFile(allocator orelse return error.MissingAllocator),
             .toggle_hide_reviewed_files => try self.navigation.toggleHideReviewedFiles(allocator orelse return error.MissingAllocator),
@@ -353,6 +368,177 @@ test "review update owns state transition and shell intent" {
     var shell_update = try controller.apply(std.testing.allocator, .request_push);
     defer shell_update.deinit(std.testing.allocator);
     try std.testing.expectEqual(Command.request_push, shell_update.command.?);
+}
+
+const file_search_input_nodes = [_]file_tree.Node{
+    .{ .kind = .file, .name = "a", .path = "a", .path_key = "a", .depth = 0, .status = .modified, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "b", .path_key = "b", .depth = 0, .status = .added, .target = .{ .diff_file = 1 } },
+};
+
+test "review file search publishes candidates from enter and input edits" {
+    const allocator = std.testing.allocator;
+    var loaded = test_support.loadedDiffTwo();
+    loaded.tree.nodes = &file_search_input_nodes;
+    var page: @import("../review.zig").ReviewPageState = .{
+        .load = test_support.loadState(loaded),
+        .source_session_revision = 5,
+        .accepted_sidebar_revision = 7,
+    };
+    defer page.deinit(allocator);
+    const controller: Controller = .{
+        .navigation = .{
+            .page = &page,
+            .repo_root = null,
+            .repo_epoch = 3,
+            .source = .unstaged,
+            .layout = .{ .width = 80, .height = 20 },
+            .diagnostics = .{ .target = &page.status },
+        },
+        .repo_epoch = 3,
+    };
+
+    var entered = try controller.apply(allocator, .enter_file_search);
+    entered.deinit(allocator);
+    try std.testing.expect(page.file_search.mode);
+    try std.testing.expect(page.file_search.projection_available);
+    try std.testing.expectEqualStrings("", page.file_search.input.slice());
+    try std.testing.expectEqual(@as(usize, 2), page.file_search.candidates.len);
+    try std.testing.expectEqualStrings("a", page.file_search.focusedCandidate().?.path_key);
+    try std.testing.expect(page.file_search.basis.?.eql(.{
+        .repo_epoch = 3,
+        .source_session_revision = 5,
+        .accepted_sidebar_revision = 7,
+    }));
+
+    var inserted = try controller.apply(allocator, .{ .file_search_insert = 'b' });
+    inserted.deinit(allocator);
+    try std.testing.expectEqualStrings("b", page.file_search.input.slice());
+    try std.testing.expectEqual(@as(usize, 1), page.file_search.candidates.len);
+    try std.testing.expectEqualStrings("b", page.file_search.focusedCandidate().?.path_key);
+
+    var erased = try controller.apply(allocator, .file_search_backspace);
+    erased.deinit(allocator);
+    try std.testing.expectEqualStrings("", page.file_search.input.slice());
+    try std.testing.expectEqual(@as(usize, 2), page.file_search.candidates.len);
+    try std.testing.expectEqualStrings("a", page.file_search.focusedCandidate().?.path_key);
+
+    var pasted = try controller.apply(allocator, .{ .file_search_paste = "missing" });
+    pasted.deinit(allocator);
+    try std.testing.expectEqualStrings("missing", page.file_search.input.slice());
+    try std.testing.expect(page.file_search.projection_available);
+    try std.testing.expect(page.file_search.no_match);
+    try std.testing.expectEqual(@as(usize, 0), page.file_search.candidates.len);
+    try std.testing.expect(page.file_search.focusedCandidate() == null);
+
+    var suffix: [512]u8 = undefined;
+    @memset(&suffix, 'x');
+    const remaining = page.file_search.input.buffer.len - page.file_search.input.len;
+    var filled = try controller.apply(allocator, .{ .file_search_paste = suffix[0..remaining] });
+    filled.deinit(allocator);
+    const basis_before_overflow = page.file_search.basis.?;
+    try std.testing.expectEqual(page.file_search.input.buffer.len, page.file_search.input.len);
+    try std.testing.expect(page.file_search.no_match);
+
+    // A rejected fixed-capacity edit is not a new query generation. It must
+    // not require an allocator or disturb the projection for the old input.
+    var overflow_insert = try controller.apply(null, .{ .file_search_insert = 'z' });
+    overflow_insert.deinit(null);
+    try std.testing.expectEqual(page.file_search.input.buffer.len, page.file_search.input.len);
+    try std.testing.expect(page.file_search.no_match);
+    try std.testing.expect(page.file_search.basis.?.eql(basis_before_overflow));
+    try std.testing.expectEqualStrings("file search query is too long", page.status.text());
+
+    page.status.clear();
+    var overflow_paste = try controller.apply(null, .{ .file_search_paste = "z" });
+    overflow_paste.deinit(null);
+    try std.testing.expectEqual(page.file_search.input.buffer.len, page.file_search.input.len);
+    try std.testing.expect(page.file_search.no_match);
+    try std.testing.expect(page.file_search.basis.?.eql(basis_before_overflow));
+    try std.testing.expectEqualStrings("file search query is too long", page.status.text());
+}
+
+test "review file search candidate failure retains edited input as unavailable" {
+    const allocator = std.testing.allocator;
+    var loaded = test_support.loadedDiffTwo();
+    loaded.tree.nodes = &file_search_input_nodes;
+    var page: @import("../review.zig").ReviewPageState = .{
+        .load = test_support.loadState(loaded),
+    };
+    defer page.deinit(allocator);
+    const controller: Controller = .{ .navigation = .{
+        .page = &page,
+        .repo_root = null,
+        .source = .unstaged,
+        .layout = .{ .width = 80, .height = 20 },
+        .diagnostics = .{ .target = &page.status },
+    } };
+
+    var entered = try controller.apply(allocator, .enter_file_search);
+    entered.deinit(allocator);
+    try std.testing.expect(page.file_search.projection_available);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var inserted = try controller.apply(failing.allocator(), .{ .file_search_insert = 'b' });
+    inserted.deinit(failing.allocator());
+
+    // Prompt editing is fixed-capacity and already committed before the
+    // separately-owned candidate projection is prepared. Allocation failure
+    // must not roll the text back or leave candidates from the old query live.
+    try std.testing.expectEqualStrings("b", page.file_search.input.slice());
+    try std.testing.expect(!page.file_search.projection_available);
+    try std.testing.expect(!page.file_search.no_match);
+    try std.testing.expectEqual(@as(usize, 0), page.file_search.candidates.len);
+    try std.testing.expect(page.file_search.basis == null);
+    try std.testing.expect(page.file_search.focusedCandidate() == null);
+}
+
+test "review file search missing allocator preserves the published query generation" {
+    const allocator = std.testing.allocator;
+    var loaded = test_support.loadedDiffTwo();
+    loaded.tree.nodes = &file_search_input_nodes;
+    var page: @import("../review.zig").ReviewPageState = .{
+        .load = test_support.loadState(loaded),
+        .source_session_revision = 5,
+        .accepted_sidebar_revision = 7,
+    };
+    defer page.deinit(allocator);
+    const controller: Controller = .{ .navigation = .{
+        .page = &page,
+        .repo_root = null,
+        .repo_epoch = 3,
+        .source = .unstaged,
+        .layout = .{ .width = 80, .height = 20 },
+        .diagnostics = .{ .target = &page.status },
+    } };
+
+    var entered = try controller.apply(allocator, .enter_file_search);
+    entered.deinit(allocator);
+    const empty_basis = page.file_search.basis.?;
+    for ([_]message.Msg{
+        .{ .file_search_insert = 'b' },
+        .{ .file_search_paste = "b" },
+    }) |edit| {
+        try std.testing.expectError(error.MissingAllocator, controller.apply(null, edit));
+        try std.testing.expectEqualStrings("", page.file_search.input.slice());
+        try std.testing.expect(page.file_search.projection_available);
+        try std.testing.expect(!page.file_search.no_match);
+        try std.testing.expectEqual(@as(usize, 2), page.file_search.candidates.len);
+        try std.testing.expectEqual(@as(usize, 0), page.file_search.filter.list.focusedIndex());
+        try std.testing.expectEqualStrings("a", page.file_search.focusedCandidate().?.path_key);
+        try std.testing.expect(page.file_search.basis.?.eql(empty_basis));
+    }
+
+    var inserted = try controller.apply(allocator, .{ .file_search_insert = 'a' });
+    inserted.deinit(allocator);
+    const a_basis = page.file_search.basis.?;
+    try std.testing.expectError(error.MissingAllocator, controller.apply(null, .file_search_backspace));
+    try std.testing.expectEqualStrings("a", page.file_search.input.slice());
+    try std.testing.expect(page.file_search.projection_available);
+    try std.testing.expect(!page.file_search.no_match);
+    try std.testing.expectEqual(@as(usize, 1), page.file_search.candidates.len);
+    try std.testing.expectEqual(@as(usize, 0), page.file_search.filter.list.focusedIndex());
+    try std.testing.expectEqualStrings("a", page.file_search.focusedCandidate().?.path_key);
+    try std.testing.expect(page.file_search.basis.?.eql(a_basis));
 }
 
 test "review mouse release returns one owned copy command" {
