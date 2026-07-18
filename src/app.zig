@@ -107,6 +107,7 @@ const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
 const GeneratedSyntaxTask = app_load.GeneratedSyntaxTask(App.Msg);
 const RepositoryManifestTask = repository_page.ManifestTask(App.Msg);
+const RepositoryBranchTask = repository_page.BranchTask(App.Msg);
 const RepositoryDocumentTask = repository_page.DocumentTask(App.Msg);
 const RepositorySyntaxTask = repository_page.SyntaxTask(App.Msg);
 const RepositoryChangeMapTask = repository_page.ChangeMapTask(App.Msg);
@@ -676,6 +677,7 @@ pub const App = struct {
         }
         try self.maybeStartQueuedReviewRevalidation(ctx);
         try self.maybeStartRepositoryManifest(ctx);
+        self.maybeStartRepositoryBranch(ctx);
         try self.maybeStartRepositoryDocument(ctx);
         try self.maybeStartRepositorySyntax(ctx);
         self.maybeStartRepositoryChangeMap(ctx);
@@ -733,6 +735,15 @@ pub const App = struct {
                 defer owned.deinit(ctx.allocator());
                 const outcome = self.pages.repository.applyFinished(ctx.allocator(), &owned);
                 if (self.active_page != .repository or outcome == .discarded or outcome == .unchanged) ctx.redraw().skip();
+            },
+            .branch_finished => |finished| {
+                var owned = finished;
+                defer owned.deinit();
+                const outcome = self.pages.repository.applyBranchFinished(&owned);
+                if (self.active_page != .repository or switch (outcome) {
+                    .changed, .failed => false,
+                    .discarded, .unchanged => true,
+                }) ctx.redraw().skip();
             },
             .document_finished => |finished| {
                 var owned = finished;
@@ -839,6 +850,48 @@ pub const App = struct {
             ctx.allocator().destroy(task);
             self.pages.repository.rejectDocumentSpawn(generation);
             return err;
+        };
+    }
+
+    /// Branch chrome is an auxiliary Repository member. Failure to prepare or
+    /// queue it must not fail the primary manifest/document update; the
+    /// branch-local freshness terminal carries that bounded failure instead.
+    fn maybeStartRepositoryBranch(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        if (self.active_page != .repository or !self.pages.repository.wantsBranchRequest()) return;
+        const repo_root = self.activeRepoRoot() orelse {
+            self.pages.repository.markBranchRequestPreparationFailed();
+            return;
+        };
+        const capability = self.repo_state.activeCapability() orelse {
+            self.pages.repository.markBranchRequestPreparationFailed();
+            return;
+        };
+
+        var request = self.pages.repository.prepareBranchRequest(
+            ctx.allocator(),
+            repo_root,
+            capability,
+        ) catch {
+            self.pages.repository.markBranchRequestPreparationFailed();
+            return;
+        };
+        var request_consumed = false;
+        defer if (!request_consumed) request.deinit(ctx.allocator());
+        const generation = request.generation;
+        const task = ctx.allocator().create(RepositoryBranchTask) catch {
+            self.pages.repository.rejectBranchSpawn(generation);
+            return;
+        };
+        task.* = .{ .request = request, .env_map = self.env_map };
+        request_consumed = true;
+        ctx.task().spawnWith(.{
+            .ctx = task,
+            .run = RepositoryBranchTask.run,
+            .failed = RepositoryBranchTask.failed,
+        }) catch {
+            task.request.deinit(ctx.allocator());
+            ctx.allocator().destroy(task);
+            self.pages.repository.rejectBranchSpawn(generation);
         };
     }
 
@@ -979,7 +1032,7 @@ pub const App = struct {
             .git_action_spinner_tick,
             => true,
             .repository => |repository_msg| switch (repository_msg) {
-                .manifest_finished => true,
+                .manifest_finished, .branch_finished => true,
                 else => false,
             },
             else => false,
@@ -7665,6 +7718,281 @@ fn branchStatusBundleForTest(allocator: std.mem.Allocator, spec: BranchStatusBun
     return builder.finish();
 }
 
+fn configureRepositoryBranchAppForTest(
+    app: *App,
+    allocator: std.mem.Allocator,
+    root_path: []const u8,
+) !void {
+    app.repo_state.discovery = try testSingleRepoDiscovery(allocator, root_path);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(root_path);
+    app.pages.repository.activate(app.repo_epoch, app.repo_state.activeIdentity());
+    // These integration tests isolate the auxiliary member. The manifest
+    // coordinator has its own start/apply suite and must not add an unrelated
+    // task to the branch assertions below.
+    app.pages.repository.needs_revalidation = false;
+}
+
+fn initializeRepositoryBranchAppRepoForTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+) !void {
+    try runAppTestGit(allocator, io, &.{ "git", "init", "--initial-branch=main" }, dir);
+    try dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "base\n" });
+    try runAppTestGit(allocator, io, &.{ "git", "add", "tracked.txt" }, dir);
+    try runAppTestGit(allocator, io, &.{
+        "git",
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "base",
+    }, dir);
+}
+
+test "Repository branch App route runs owned task and preserves primary status" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try initializeRepositoryBranchAppRepoForTest(allocator, io, tmp.dir);
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .repository,
+        .repo_epoch = 3,
+    };
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    try configureRepositoryBranchAppForTest(&app, allocator, root_path);
+    app.pages.repository.status.set("Selected source range", .{});
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+
+    app.maybeStartRepositoryBranch(&ctx);
+    const queued = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    const task: *RepositoryBranchTask = @ptrCast(@alignCast(queued[0].ctx));
+    try std.testing.expectEqual(page.RequestIdentity{
+        .origin = .repository,
+        .repo_epoch = 3,
+        .activation_id = app.pages.repository.activation_id,
+    }, task.request.identity);
+    try std.testing.expect(task.request.root.identity.eql(app.repo_state.activeIdentity().?));
+    try std.testing.expectEqualStrings(root_path, task.request.root_path);
+
+    const message = queued[0].run(queued[0].ctx, allocator, io);
+    try app.update(message, &ctx);
+
+    try std.testing.expectEqualStrings("main", app.pages.repository.branch.snapshot.status.branchName().?);
+    try std.testing.expect(app.pages.repository.branch.freshness == .fresh);
+    try std.testing.expect(app.pages.repository.branch.pending == null);
+    try std.testing.expectEqualStrings("Selected source range", app.pages.repository.status.text());
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+}
+
+test "Repository branch App start failures close request owners and stay branch local" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+
+    // The first request allocation fails before a generation is armed.
+    {
+        var app: App = .{ .allocator = allocator, .active_page = .repository, .repo_epoch = 1 };
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        try configureRepositoryBranchAppForTest(&app, allocator, root_path);
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = failing.allocator(), ._io = io };
+
+        app.maybeStartRepositoryBranch(&ctx);
+
+        try std.testing.expect(app.pages.repository.branch.pending == null);
+        try std.testing.expectEqual(@as(u64, 0), app.pages.repository.branch.generation);
+        try std.testing.expect(app.pages.repository.branch.freshness.failed == .preparation_failed);
+        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    }
+
+    // Request preparation succeeds, then task allocation fails. The exact
+    // armed generation is terminalized and the unconsumed request defer closes
+    // both path and duplicated descriptor.
+    {
+        var app: App = .{ .allocator = allocator, .active_page = .repository, .repo_epoch = 2 };
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        try configureRepositoryBranchAppForTest(&app, allocator, root_path);
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = failing.allocator(), ._io = io };
+
+        app.maybeStartRepositoryBranch(&ctx);
+
+        try std.testing.expect(app.pages.repository.branch.pending == null);
+        try std.testing.expectEqual(@as(u64, 1), app.pages.repository.branch.generation);
+        try std.testing.expect(app.pages.repository.branch.freshness.failed == .start_failed);
+        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    }
+
+    // A full Chasen task queue rejects synchronously after the task captured
+    // the request. The coordinator dismantles that concrete task and closes
+    // only its exact generation.
+    {
+        const DummyTask = struct {
+            fn run(_: std.mem.Allocator, _: std.Io) App.Msg {
+                return .quit;
+            }
+            fn failed(_: chasen.TaskFailure) App.Msg {
+                return .quit;
+            }
+        };
+        var app: App = .{ .allocator = allocator, .active_page = .repository, .repo_epoch = 3 };
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        try configureRepositoryBranchAppForTest(&app, allocator, root_path);
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+        for (0..16) |_| try ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+
+        app.maybeStartRepositoryBranch(&ctx);
+
+        try std.testing.expect(app.pages.repository.branch.pending == null);
+        try std.testing.expectEqual(@as(u64, 1), app.pages.repository.branch.generation);
+        try std.testing.expect(app.pages.repository.branch.freshness.failed == .start_failed);
+        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+        try std.testing.expectEqual(@as(usize, 16), ctx.takePendingTasks().len);
+    }
+}
+
+test "Repository branch App runtime terminals preserve diagnostic ownership" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+
+    // A runtime start failure is delivered through the normal App route.
+    {
+        var app: App = .{ .allocator = allocator, .active_page = .repository, .repo_epoch = 4 };
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        try configureRepositoryBranchAppForTest(&app, allocator, root_path);
+        app.pages.repository.status.set("Copy failed", .{});
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+        app.maybeStartRepositoryBranch(&ctx);
+        const queued = ctx.takePendingTasksWith();
+        try std.testing.expectEqual(@as(usize, 1), queued.len);
+
+        const message = queued[0].failed(queued[0].ctx, .{ .start_failed = "SystemResources" }, allocator);
+        try app.update(message, &ctx);
+
+        try std.testing.expect(app.pages.repository.branch.freshness.failed == .start_failed);
+        try std.testing.expectEqualStrings("Copy failed", app.pages.repository.status.text());
+        try std.testing.expect(!ctx.redrawWasSuppressed());
+    }
+
+    // Runtime unwind consumes the captured task request, then disposes the
+    // returned completion without delivering it. The pending scalar is inert
+    // because App teardown follows; no owned payload remains behind it.
+    {
+        var app: App = .{ .allocator = allocator, .active_page = .repository, .repo_epoch = 5 };
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        try configureRepositoryBranchAppForTest(&app, allocator, root_path);
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+        app.maybeStartRepositoryBranch(&ctx);
+        const queued = ctx.takePendingTasksWith();
+        try std.testing.expectEqual(@as(usize, 1), queued.len);
+
+        var message = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
+        message.deinitUndelivered(allocator);
+
+        try std.testing.expect(app.pages.repository.branch.pending != null);
+        try std.testing.expect(app.pages.repository.branch.freshness == .validating);
+    }
+
+    // App-level undelivered routing owns loaded arenas as well as failure-only
+    // messages; std.testing.allocator verifies the complete cleanup terminal.
+    var undelivered = App.Msg{ .repository = .{ .branch_finished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = 9, .activation_id = 1 },
+        .root_identity = .{ .device = 2, .inode = 3 },
+        .generation = 4,
+        .result = .{ .loaded = try branchStatusBundleForTest(allocator, .{ .branch = "undelivered" }) },
+    } } };
+    undelivered.deinitUndelivered(allocator);
+}
+
+test "Repository branch App completion suppresses stale unchanged and inactive redraws" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    var app: App = .{ .allocator = allocator, .active_page = .repository, .repo_epoch = 6 };
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    try configureRepositoryBranchAppForTest(&app, allocator, root_path);
+
+    var request = try app.pages.repository.prepareBranchRequest(allocator, root_path, &app.repo_state.root.?);
+    defer request.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+    try app.updateRepository(&ctx, .{ .branch_finished = .{
+        .identity = request.identity,
+        .root_identity = request.root.identity,
+        .generation = request.generation + 1,
+        .result = .{ .loaded = try branchStatusBundleForTest(allocator, .{ .branch = "stale" }) },
+    } });
+    try std.testing.expectEqual(request.generation, app.pages.repository.branch.pending.?.generation);
+    try std.testing.expect(app.pages.repository.branch.snapshot.identity == null);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+
+    ctx.resetRedrawSuppressed();
+    try app.updateRepository(&ctx, .{ .branch_finished = .{
+        .identity = request.identity,
+        .root_identity = request.root.identity,
+        .generation = request.generation,
+        .result = .{ .loaded = try branchStatusBundleForTest(allocator, .{ .branch = "main" }) },
+    } });
+    try std.testing.expectEqualStrings("main", app.pages.repository.branch.snapshot.status.branchName().?);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+
+    app.pages.repository.requestReload(true);
+    app.pages.repository.needs_revalidation = false;
+    var unchanged_request = try app.pages.repository.prepareBranchRequest(allocator, root_path, &app.repo_state.root.?);
+    defer unchanged_request.deinit(allocator);
+    ctx.resetRedrawSuppressed();
+    try app.updateRepository(&ctx, .{ .branch_finished = .{
+        .identity = unchanged_request.identity,
+        .root_identity = unchanged_request.root.identity,
+        .generation = unchanged_request.generation,
+        .result = .{ .loaded = try branchStatusBundleForTest(allocator, .{ .branch = "main" }) },
+    } });
+    try std.testing.expect(ctx.redrawWasSuppressed());
+
+    app.pages.repository.requestReload(true);
+    app.pages.repository.needs_revalidation = false;
+    var inactive_request = try app.pages.repository.prepareBranchRequest(allocator, root_path, &app.repo_state.root.?);
+    defer inactive_request.deinit(allocator);
+    app.pages.repository.deactivate();
+    app.active_page = .history;
+    ctx.resetRedrawSuppressed();
+    try app.updateRepository(&ctx, .{ .branch_finished = .{
+        .identity = inactive_request.identity,
+        .root_identity = inactive_request.root.identity,
+        .generation = inactive_request.generation,
+        .result = .{ .loaded = try branchStatusBundleForTest(allocator, .{ .branch = "inactive" }) },
+    } });
+    try std.testing.expectEqualStrings("inactive", app.pages.repository.branch.snapshot.status.branchName().?);
+    try std.testing.expect(app.pages.repository.branch.freshness == .validating);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+}
+
 fn setupPushRetryRepoForTest(allocator: std.mem.Allocator, io: std.Io, tmp: *std.testing.TmpDir) !struct { repo_root: []u8, oid: []u8 } {
     try tmp.dir.createDir(io, "work", .default_dir);
     var work = try tmp.dir.openDir(io, "work", .{});
@@ -8658,17 +8986,23 @@ test "repository activation and manual reload route to page-owned manifest tasks
     defer clearPendingRepositoryTasks(&ctx, std.testing.allocator);
 
     try app.update(.{ .switch_page = .repository }, &ctx);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
     const first: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
     try std.testing.expectEqual(page.Id.repository, first.identity.origin);
     try std.testing.expectEqual(app.repo_epoch, first.identity.repo_epoch);
     const first_generation = first.generation;
+    const first_branch: *RepositoryBranchTask = @ptrCast(@alignCast(ctx._pending_tasks_with[1].ctx));
+    const first_branch_generation = first_branch.request.generation;
+    try std.testing.expectEqual(first.identity, first_branch.request.identity);
 
     try app.update(.reload, &ctx);
-    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
-    const second: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[1].ctx));
+    try std.testing.expectEqual(@as(u8, 4), ctx._pending_tasks_with_len);
+    const second: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[2].ctx));
     try std.testing.expect(second.generation > first_generation);
     try std.testing.expectEqual(second.generation, app.pages.repository.pending_generation.?);
+    const second_branch: *RepositoryBranchTask = @ptrCast(@alignCast(ctx._pending_tasks_with[3].ctx));
+    try std.testing.expect(second_branch.request.generation > first_branch_generation);
+    try std.testing.expectEqual(second_branch.request.generation, app.pages.repository.branch.pending.?.generation);
 }
 
 test "repository transition B2b2a missing document capability closes incoming owner" {
@@ -9875,7 +10209,7 @@ test "review repository transition C2 keyboard opens exact retained path with li
         diff_view_model.BodyCoordinate{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } },
         app.pages.review.viewer.diff_cursor,
     ));
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
 }
 
 test "review repository transition C2 page bar exposes deleted target as unavailable" {
@@ -9920,7 +10254,7 @@ test "review repository transition C2 page bar exposes deleted target as unavail
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.no_current_path, unavailable.reason);
     try std.testing.expectEqualStrings("src/deleted.zig", unavailable.path);
     try std.testing.expect(app.pages.repository.selected_path == null);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
 }
 
 test "live review waiter blocks direct keyboard and mouse page switches with one reason" {
@@ -16155,10 +16489,8 @@ fn clearPendingStatusTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocat
 
 fn clearPendingRepositoryTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
     for (ctx.takePendingTasksWith()) |entry| {
-        const task: *RepositoryManifestTask = @ptrCast(@alignCast(entry.ctx));
-        allocator.free(task.root_path);
-        task.root.deinit();
-        allocator.destroy(task);
+        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
+        message.deinitUndelivered(allocator);
     }
 }
 
