@@ -124,6 +124,11 @@ const DisplayUnitResult = enum {
     window_complete,
 };
 
+const DisplayScan = struct {
+    output_len: usize,
+    columns: usize,
+};
+
 /// Produces only the requested terminal-cell window of a raw path identity.
 /// The allocation is bounded by `4 * width + 8`, independent of raw path
 /// length, control-byte expansion, horizontal skip, or combining characters.
@@ -139,7 +144,43 @@ pub fn displayWindowAlloc(
     const capacity = try std.math.add(usize, try std.math.mul(usize, width, 4), 8);
     const storage = try allocator.alloc(u8, capacity);
     errdefer allocator.free(storage);
-    if (width == 0) return .{ .storage = storage, .len = 0 };
+
+    const scan = scanDisplayWindow(raw, skip_columns, width, capacity, storage);
+    return .{ .storage = storage, .len = scan.output_len };
+}
+
+/// Measures the complete injective display projection of a raw path without
+/// allocating its escaped text. It deliberately uses the same scanner as
+/// `displayWindowAlloc`, so controls, invalid UTF-8, backslashes, grapheme
+/// clusters, and terminal-cell width cannot acquire a second interpretation.
+pub fn escapedDisplayWidth(raw: []const u8) usize {
+    return scanDisplayWindow(
+        raw,
+        0,
+        std.math.maxInt(usize),
+        std.math.maxInt(usize),
+        null,
+    ).columns;
+}
+
+/// Measures the cells that `displayWindowAlloc` would actually emit for one
+/// bounded viewport, including its complete-grapheme and bounded-storage
+/// rules. Header hit testing uses this rather than allocating display text or
+/// treating raw byte length as terminal width.
+pub fn displayWindowWidth(raw: []const u8, skip_columns: usize, width: usize) usize {
+    const scaled = std.math.mul(usize, width, 4) catch std.math.maxInt(usize);
+    const capacity = std.math.add(usize, scaled, 8) catch std.math.maxInt(usize);
+    return scanDisplayWindow(raw, skip_columns, width, capacity, null).columns;
+}
+
+fn scanDisplayWindow(
+    raw: []const u8,
+    skip_columns: usize,
+    width: usize,
+    output_capacity: usize,
+    output: ?[]u8,
+) DisplayScan {
+    if (width == 0) return .{ .output_len = 0, .columns = 0 };
 
     var raw_index: usize = 0;
     var skipped = skip_columns;
@@ -153,7 +194,8 @@ pub fn displayWindowAlloc(
             while (iter.next()) |grapheme| {
                 const bytes = grapheme.bytes(printable);
                 const result = appendDisplayUnit(
-                    storage,
+                    output,
+                    output_capacity,
                     bytes,
                     chasen.text.displayWidth(bytes),
                     &skipped,
@@ -162,7 +204,7 @@ pub fn displayWindowAlloc(
                     width,
                 );
                 if (result == .window_complete) {
-                    return .{ .storage = storage, .len = output_len };
+                    return .{ .output_len = output_len, .columns = columns };
                 }
             }
             raw_index += printable_len;
@@ -172,7 +214,8 @@ pub fn displayWindowAlloc(
         const token = escapedDisplayToken(raw[raw_index..]);
         raw_index += token.consumed;
         const result = appendDisplayUnit(
-            storage,
+            output,
+            output_capacity,
             token.bytes[0..token.len],
             token.columns,
             &skipped,
@@ -182,11 +225,12 @@ pub fn displayWindowAlloc(
         );
         if (result == .window_complete) break;
     }
-    return .{ .storage = storage, .len = output_len };
+    return .{ .output_len = output_len, .columns = columns };
 }
 
 fn appendDisplayUnit(
-    storage: []u8,
+    output: ?[]u8,
+    output_capacity: usize,
     bytes: []const u8,
     unit_columns: usize,
     skipped: *usize,
@@ -204,8 +248,10 @@ fn appendDisplayUnit(
         return .continue_scanning;
     }
     if (unit_columns > width - columns.*) return .window_complete;
-    if (bytes.len > storage.len - output_len.*) return .window_complete;
-    @memcpy(storage[output_len.* .. output_len.* + bytes.len], bytes);
+    if (bytes.len > output_capacity - output_len.*) return .window_complete;
+    if (output) |storage| {
+        @memcpy(storage[output_len.* .. output_len.* + bytes.len], bytes);
+    }
     output_len.* += bytes.len;
     columns.* += unit_columns;
     if (columns.* == width and unit_columns > 0) return .window_complete;
@@ -389,4 +435,45 @@ test "repository manifest display window stays viewport bounded for maximum path
     try std.testing.expect(window.storage.len <= 20 * 4 + 8);
     try std.testing.expect(window.text().len <= 20 * 4);
     try std.testing.expect(chasen.text.displayWidth(window.text()) <= 20);
+}
+
+test "repository manifest escaped width shares display escaping semantics" {
+    const cases = [_][]const u8{
+        "src/main.zig",
+        "literal\\path",
+        "日本語\xff",
+        "e\u{301}x",
+        "👩‍🚀x",
+        "前\x7f\u{0080}後",
+    };
+    for (cases) |raw| {
+        var window = try displayWindowAlloc(std.testing.allocator, raw, 0, 128);
+        defer window.deinit(std.testing.allocator);
+        try std.testing.expectEqual(
+            chasen.text.displayWidth(window.text()),
+            escapedDisplayWidth(raw),
+        );
+        try std.testing.expectEqual(
+            chasen.text.displayWidth(window.text()),
+            displayWindowWidth(raw, 0, 128),
+        );
+    }
+}
+
+test "repository manifest display window width follows atomic viewport units" {
+    try std.testing.expectEqual(@as(usize, 0), displayWindowWidth("👩‍🚀x", 0, 1));
+    try std.testing.expectEqual(@as(usize, 2), displayWindowWidth("👩‍🚀x", 0, 2));
+    try std.testing.expectEqual(@as(usize, 1), displayWindowWidth("e\u{301}x", 0, 1));
+    try std.testing.expectEqual(@as(usize, 1), displayWindowWidth("e\u{301}x", 1, 1));
+
+    const combining = "\u{301}";
+    const combining_count = 32;
+    var overlong: [1 + combining.len * combining_count]u8 = undefined;
+    overlong[0] = 'e';
+    for (0..combining_count) |index| {
+        const start = 1 + index * combining.len;
+        @memcpy(overlong[start .. start + combining.len], combining);
+    }
+    try std.testing.expectEqual(@as(usize, 1), escapedDisplayWidth(&overlong));
+    try std.testing.expectEqual(@as(usize, 0), displayWindowWidth(&overlong, 0, 1));
 }
