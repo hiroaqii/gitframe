@@ -7,12 +7,14 @@ const content_fingerprint = @import("../../content_fingerprint.zig");
 const page = @import("../page.zig");
 const page_link = @import("../page_link.zig");
 const git_backend = @import("../../git/backend.zig");
+const git_branch_status = @import("../../git/branch_status.zig");
 const process_runner = @import("../../process/runner.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 const selected_document = @import("../../repository/document.zig");
 const source_document = @import("../../repository/source.zig");
 const repository_change_map = @import("../../repository/change_map.zig");
 const repository_change_index = @import("../../repository/change_index.zig");
+const branch_chrome = @import("../branch_chrome.zig");
 const manifest = @import("../../repository/manifest.zig");
 const repository_tree = @import("../../repository/tree.zig");
 const source_syntax = @import("../../syntax/source.zig");
@@ -2999,6 +3001,7 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     const tree = &state.bundle.?.tree;
     if (layout.tree_visible) {
         var left = surface.child(.{ .col = 0, .row = 0, .width = layout.tree_width, .height = size.height });
+        try drawRepositoryBranchRow(state, &left, context.palette);
         const tree_header: []const u8 = if (state.file_visibility == .changed) " Files [changed]" else " Files";
         // Match Review's literal leading-cell clipping. The ellipsis-producing
         // text helper would turn a width-one title into `…` instead of blank.
@@ -3089,6 +3092,90 @@ fn drawIncomingUnavailable(
 
 fn treeStatusAvailable(state: *const RepositoryPageState) bool {
     return if (state.bundle) |bundle| bundle.status_available else false;
+}
+
+const RepositoryBranchRowTone = enum {
+    fact,
+    terminal,
+};
+
+const RepositoryBranchRowPresentation = struct {
+    text: []const u8,
+    tone: RepositoryBranchRowTone,
+    stale_col: ?u16 = null,
+};
+
+/// Project Repository's independent branch owner into its read-only row-0
+/// chrome. A snapshot must name the exact current physical root; otherwise a
+/// retained label from another repository can never cross into presentation.
+fn repositoryBranchRowPresentation(
+    state: *const RepositoryPageState,
+    allocator: std.mem.Allocator,
+    available_width: u16,
+) ?RepositoryBranchRowPresentation {
+    const root_identity = state.root_identity orelse return null;
+    const snapshot_identity = repository_branch.SnapshotIdentity{
+        .repo_epoch = state.repo_epoch,
+        .root_identity = root_identity,
+    };
+    if (state.branch.snapshot.matches(snapshot_identity)) {
+        const formatted = branch_chrome.formatBaseLabel(
+            allocator,
+            state.branch.snapshot.status,
+            available_width,
+        ) catch return .{ .text = "branch", .tone = .fact };
+        const failed = switch (state.branch.freshness) {
+            .failed => true,
+            else => false,
+        };
+        const stale_text = "  stale";
+        const stale_width = chasen.text.displayWidth(stale_text);
+        return .{
+            // The frame/testing allocator owns the formatted text for the
+            // same lifetime as this presentation value.
+            .text = formatted.text,
+            .tone = .fact,
+            // Auxiliary failure never makes the label itself less legible.
+            // Admit the subdued suffix only beside an unclipped complete base;
+            // otherwise the base receives the whole row width.
+            .stale_col = if (failed and
+                !formatted.was_clipped and
+                formatted.full_display_width +| stale_width <= available_width)
+                formatted.full_display_width
+            else
+                null,
+        };
+    }
+
+    return switch (state.branch.freshness) {
+        .validating => .{ .text = "loading branch", .tone = .terminal },
+        .failed => .{ .text = "branch unavailable", .tone = .terminal },
+        .unavailable, .fresh => null,
+    };
+}
+
+fn drawRepositoryBranchRow(
+    state: *const RepositoryPageState,
+    surface: *chasen.Surface,
+    palette: theme.Palette,
+) !void {
+    const size = surface.size();
+    if (size.width <= 1 or size.height == 0) return;
+    const presentation = repositoryBranchRowPresentation(
+        state,
+        surface.frameAllocator(),
+        size.width - 1,
+    ) orelse return;
+    const style = switch (presentation.tone) {
+        .fact => palette.style(.info),
+        .terminal => palette.style(.muted),
+    };
+    try draw.copyClippedTextAt(surface, 1, 0, presentation.text, style);
+    if (presentation.stale_col) |base_width| {
+        var stale_style = palette.style(.muted);
+        stale_style.dim = true;
+        try draw.copyClippedTextAt(surface, 1 +| base_width, 0, "  stale", stale_style);
+    }
 }
 
 fn drawTreeProjectionRow(
@@ -4096,6 +4183,33 @@ fn bundleForTest(bytes: []const u8) !Bundle {
     var document = try manifest.parseOwned(std.testing.allocator, try std.testing.allocator.dupe(u8, bytes));
     errdefer document.deinit(std.testing.allocator);
     return .{ .tree = try repository_tree.Tree.build(std.testing.allocator, &document), .document = document };
+}
+
+fn repositoryBranchViewStateForTest() !RepositoryPageState {
+    return .{
+        .active = true,
+        .repo_epoch = 3,
+        .root_identity = .{ .device = 5, .inode = 8 },
+        .bundle = try bundleForTest("README.md\x00src/main.zig\x00"),
+        .load_state = .loaded,
+    };
+}
+
+fn installRepositoryBranchSnapshotForTest(
+    state: *RepositoryPageState,
+    status: git_branch_status.BranchStatus,
+    freshness: repository_branch.Freshness,
+) void {
+    const root_identity = state.root_identity orelse unreachable;
+    state.branch.snapshot.deinit();
+    state.branch.snapshot.identity = .{
+        .repo_epoch = state.repo_epoch,
+        .root_identity = root_identity,
+    };
+    // Test status slices are static. The production path transfers the
+    // backend bundle arena into this same page-owned snapshot.
+    state.branch.snapshot.status = status;
+    state.branch.freshness = freshness;
 }
 
 fn selectionStateForTest(paths: []const u8, content: []const u8) !RepositoryPageState {
@@ -6427,6 +6541,245 @@ test "repository accepted empty manifest renders the typed root at its mouse tar
     try width_two.init(2, compact_size.height);
     defer width_two.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &width_two.surface);
+    try width_two.expectCellText(0, 2, " ");
+    try width_two.expectCellText(1, 2, "F");
+}
+
+test "Repository branch C2 renders read-only facts without moving tree geometry" {
+    const allocator = std.testing.allocator;
+    var state = try repositoryBranchViewStateForTest();
+    defer state.deinit(allocator);
+    installRepositoryBranchSnapshotForTest(&state, .{
+        .head = .{ .branch = "main" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{ .ahead = 0, .behind = 2 },
+    }, .fresh);
+
+    const size: chasen.Size = .{ .width = 72, .height = 8 };
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(size.width, size.height);
+    defer test_surface.deinit();
+    const palette: theme.Palette = .default();
+    try view(.{ .page_state = &state, .palette = palette, .repo_root = "/work/gitframe" }, &test_surface.surface);
+
+    const snapshot = try test_surface.snapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "main ↑0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "push") == null);
+    try test_surface.expectCellText(1, 0, "m");
+    try test_surface.expectCellText(0, 1, " ");
+    try test_surface.expectCellText(0, 2, " ");
+    try test_surface.expectCellText(1, 2, "F");
+    try test_surface.expectCellText(0, 3, "▾");
+    const branch_cell = test_surface.surface.readCell(1, 0) orelse return error.ExpectedRepositoryBranchCell;
+    try std.testing.expect(branch_cell.style.fg.eql(palette.color(.info)));
+    try std.testing.expect(!branch_cell.style.dim);
+
+    const layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    try std.testing.expectEqual(@as(u16, 3), layout.header_rows);
+    try std.testing.expectEqual(@as(u16, 5), layout.treeRows(size.height));
+    try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, size).?);
+    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'P' }) == null);
+
+    installRepositoryBranchSnapshotForTest(&state, .{ .head = .detached }, .fresh);
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = palette, .repo_root = "/work/gitframe" }, &test_surface.surface);
+    const detached = try test_surface.snapshot(allocator);
+    defer allocator.free(detached);
+    try std.testing.expect(std.mem.indexOf(u8, detached, "detached") != null);
+
+    installRepositoryBranchSnapshotForTest(&state, .{ .head = .{ .branch = "topic" } }, .fresh);
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = palette, .repo_root = "/work/gitframe" }, &test_surface.surface);
+    const no_upstream = try test_surface.snapshot(allocator);
+    defer allocator.free(no_upstream);
+    try std.testing.expect(std.mem.indexOf(u8, no_upstream, "topic no upstream") != null);
+}
+
+test "Repository branch C2 retains last good facts and bounds stale chrome" {
+    const allocator = std.testing.allocator;
+    var state = try repositoryBranchViewStateForTest();
+    defer state.deinit(allocator);
+    state.branch.freshness = .validating;
+
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(72, 8);
+    defer test_surface.deinit();
+    const palette: theme.Palette = .default();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const loading = try test_surface.snapshot(allocator);
+    defer allocator.free(loading);
+    try std.testing.expect(std.mem.indexOf(u8, loading, "loading branch") != null);
+    const loading_cell = test_surface.surface.readCell(1, 0) orelse return error.ExpectedLoadingBranchCell;
+    try std.testing.expect(loading_cell.style.fg.eql(palette.color(.muted)));
+
+    installRepositoryBranchSnapshotForTest(&state, .{
+        .head = .{ .branch = "main" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{ .ahead = 0, .behind = 0 },
+    }, .validating);
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const retained = try test_surface.snapshot(allocator);
+    defer allocator.free(retained);
+    try std.testing.expect(std.mem.indexOf(u8, retained, "main ↑0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retained, "loading branch") == null);
+
+    state.branch.freshness = .{ .failed = .load_failed };
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const stale = try test_surface.snapshot(allocator);
+    defer allocator.free(stale);
+    try std.testing.expect(std.mem.indexOf(u8, stale, "main ↑0  stale") != null);
+    const base_cell = test_surface.surface.readCell(1, 0) orelse return error.ExpectedRetainedBranchCell;
+    const stale_cell = test_surface.surface.readCell(10, 0) orelse return error.ExpectedStaleBranchCell;
+    try std.testing.expect(base_cell.style.fg.eql(palette.color(.info)));
+    try std.testing.expect(!base_cell.style.dim);
+    try std.testing.expect(stale_cell.style.fg.eql(palette.color(.muted)));
+    try std.testing.expect(stale_cell.style.dim);
+
+    installRepositoryBranchSnapshotForTest(&state, .{
+        .head = .{ .branch = "feature/very-long-ticket-name" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{ .ahead = 0, .behind = 0 },
+    }, .{ .failed = .load_failed });
+    const narrow = repositoryBranchRowPresentation(&state, allocator, 10) orelse return error.ExpectedNarrowBranchPresentation;
+    defer allocator.free(narrow.text);
+    try std.testing.expect(narrow.stale_col == null);
+    try std.testing.expect(chasen.text.displayWidth(narrow.text) <= 10);
+
+    state.branch.snapshot.deinit();
+    state.branch.freshness = .{ .failed = .load_failed };
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
+    const unavailable = try test_surface.snapshot(allocator);
+    defer allocator.free(unavailable);
+    try std.testing.expect(std.mem.indexOf(u8, unavailable, "branch unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unavailable, "main ↑0") == null);
+}
+
+test "Repository branch C2 yields row zero to full page owners" {
+    const allocator = std.testing.allocator;
+    const identity: root_capability.Identity = .{ .device = 5, .inode = 8 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .repo_epoch = 3,
+        .root_identity = identity,
+        .load_state = .loading,
+    };
+    defer state.deinit(allocator);
+    installRepositoryBranchSnapshotForTest(&state, .{ .head = .{ .branch = "branch-first" } }, .fresh);
+
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(72, 8);
+    defer test_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    const initial_loading = try test_surface.snapshot(allocator);
+    defer allocator.free(initial_loading);
+    try std.testing.expect(std.mem.indexOf(u8, initial_loading, "Loading repository files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, initial_loading, "branch-first") == null);
+
+    state.load_state = .failed;
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    const manifest_failure = try test_surface.snapshot(allocator);
+    defer allocator.free(manifest_failure);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_failure, "Repository manifest failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_failure, "branch-first") == null);
+
+    state.load_state = .loading;
+    state.file_search.mode = true;
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    const search_without_bundle = try test_surface.snapshot(allocator);
+    defer allocator.free(search_without_bundle);
+    try std.testing.expect(std.mem.indexOf(u8, search_without_bundle, "Find file:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_without_bundle, "branch-first") == null);
+
+    state.file_search.mode = false;
+    state.bundle = try bundleForTest("main.zig\x00");
+    state.load_state = .loaded;
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        state.repo_epoch,
+        identity,
+        .{ .unavailable = .{ .path = "removed.zig", .reason = .no_current_path } },
+    );
+    state.acceptIncoming(allocator, &incoming);
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    const incoming_unavailable = try test_surface.snapshot(allocator);
+    defer allocator.free(incoming_unavailable);
+    try std.testing.expect(std.mem.indexOf(u8, incoming_unavailable, "Repository target unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, incoming_unavailable, "branch-first") == null);
+}
+
+test "Repository branch C2 keeps bundle search chrome and hides with the tree" {
+    const allocator = std.testing.allocator;
+    var state = try repositoryBranchViewStateForTest();
+    defer state.deinit(allocator);
+    installRepositoryBranchSnapshotForTest(&state, .{
+        .head = .{ .branch = "main" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{},
+    }, .fresh);
+
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(72, 8);
+    defer test_surface.deinit();
+    state.file_search.mode = true;
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    const search_with_bundle = try test_surface.snapshot(allocator);
+    defer allocator.free(search_with_bundle);
+    try std.testing.expect(std.mem.indexOf(u8, search_with_bundle, "main ↑0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_with_bundle, "Find file:") != null);
+
+    state.file_search.mode = false;
+    state.viewer.tree_hidden = true;
+    state.viewer.focus = .source;
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    const hidden = try test_surface.snapshot(allocator);
+    defer allocator.free(hidden);
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "main ↑0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "Files") == null);
+
+    state.viewer.tree_hidden = false;
+    state.branch.snapshot.identity.?.repo_epoch = 99;
+    state.branch.freshness = .{ .failed = .root_changed };
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    const mismatched = try test_surface.snapshot(allocator);
+    defer allocator.free(mismatched);
+    try std.testing.expect(std.mem.indexOf(u8, mismatched, "main ↑0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, mismatched, "branch unavailable") != null);
+}
+
+test "Repository branch C2 clips width one and two without moving Files" {
+    const allocator = std.testing.allocator;
+    var state = try repositoryBranchViewStateForTest();
+    defer state.deinit(allocator);
+    installRepositoryBranchSnapshotForTest(&state, .{
+        .head = .{ .branch = "main" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{},
+    }, .fresh);
+
+    var width_one: chasen.testing.TestSurface = undefined;
+    try width_one.init(1, 3);
+    defer width_one.deinit();
+    try view(.{ .page_state = &state, .palette = .default() }, &width_one.surface);
+    try width_one.expectCellText(0, 0, " ");
+    try width_one.expectCellText(0, 1, " ");
+    try width_one.expectCellText(0, 2, " ");
+
+    var width_two: chasen.testing.TestSurface = undefined;
+    try width_two.init(2, 3);
+    defer width_two.deinit();
+    try view(.{ .page_state = &state, .palette = .default() }, &width_two.surface);
+    try width_two.expectCellText(0, 0, " ");
+    try width_two.expectCellText(1, 0, "…");
+    try width_two.expectCellText(0, 1, " ");
     try width_two.expectCellText(0, 2, " ");
     try width_two.expectCellText(1, 2, "F");
 }
