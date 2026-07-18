@@ -144,7 +144,7 @@ pub fn drawSource(
             // Promote only the active current line-number digits so retained
             // source position never looks focused while the tree is active.
             // The dedicated role keeps this focus cue distinct from syntax.
-            const number_role: theme.Role = if (source_active and current) .repository_active_line_number else .diff_line_number;
+            const number_role: theme.Role = if (source_active and current) .pane_active_line_number else .diff_line_number;
             draw.copyClippedTextAt(surface, number_col, row, number, sourceRowStyle(palette.style(number_role), source_active, current, palette)) catch {};
         }
         if (geometry.text_width == 0) {
@@ -904,7 +904,7 @@ test "repository source cursor row composes semantic overlays and active-only ba
     palette.colors[@intFromEnum(theme.Role.foreground)] = .{ .rgb = .{ 21, 22, 23 } };
     palette.colors[@intFromEnum(theme.Role.diff_line_number)] = .{ .rgb = .{ 31, 32, 33 } };
     palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 41, 42, 43 } };
-    palette.colors[@intFromEnum(theme.Role.repository_active_line_number)] = .{ .rgb = .{ 51, 52, 53 } };
+    palette.colors[@intFromEnum(theme.Role.pane_active_line_number)] = .{ .rgb = .{ 51, 52, 53 } };
     palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
     palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
 
@@ -933,7 +933,7 @@ test "repository source cursor row composes semantic overlays and active-only ba
     const non_current_line_number = active.surface.readCell(geometry.line_number_col, cursor_row + 1) orelse
         return error.ExpectedNonCurrentLineNumber;
     try std.testing.expect(gutter.style.fg.eql(palette.color(.diff_modified)));
-    try std.testing.expect(line_number.style.fg.eql(palette.color(.repository_active_line_number)));
+    try std.testing.expect(line_number.style.fg.eql(palette.color(.pane_active_line_number)));
     try std.testing.expect(!line_number.style.bold);
     try std.testing.expect(non_current_line_number.style.fg.eql(palette.color(.diff_line_number)));
     try std.testing.expect(!non_current_line_number.style.bg.eql(palette.color(.pane_cursor_bg)));
