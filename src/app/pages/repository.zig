@@ -17,6 +17,7 @@ const manifest = @import("../../repository/manifest.zig");
 const repository_tree = @import("../../repository/tree.zig");
 const source_syntax = @import("../../syntax/source.zig");
 const source_syntax_runtime = @import("../../syntax/source_runtime.zig");
+const repository_branch = @import("repository/branch.zig");
 const repository_input = @import("repository/input.zig");
 const repository_file_search_focus = @import("repository/file_search_focus.zig");
 const repository_incoming = @import("repository/incoming.zig");
@@ -32,6 +33,10 @@ const text_projection = @import("../../text/projection.zig");
 pub const InputContext = repository_input.Context;
 
 pub const LoadState = enum { idle, no_repository, loading, loaded, empty, failed };
+
+pub const BranchRequest = repository_branch.Request;
+pub const BranchFinished = repository_branch.Finished;
+pub const BranchApplyOutcome = repository_branch.ApplyOutcome;
 
 pub const Bundle = struct {
     document: manifest.Document,
@@ -855,6 +860,9 @@ pub const RepositoryPageState = struct {
     activation_id: u64 = 0,
     repo_epoch: u64 = 0,
     root_identity: ?root_capability.Identity = null,
+    /// Independent read-only branch owner. It shares neither Review's
+    /// freshness nor Repository's primary manifest/status diagnostic slot.
+    branch: repository_branch.State = .{},
     generation: u64 = 0,
     pending_generation: ?u64 = null,
     manifest_revision: u64 = 0,
@@ -939,6 +947,7 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn deinit(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
+        self.branch.deinit();
         self.clearFileSearchDocumentAuthority();
         self.incoming.deinit(allocator);
         self.cancelSourceSelection();
@@ -957,6 +966,7 @@ pub const RepositoryPageState = struct {
         if (self.activation_id == 0) self.activation_id = 1;
         if (self.repo_epoch != repo_epoch) self.repo_epoch = repo_epoch;
         self.root_identity = identity;
+        self.branch.activate(self.repo_epoch, identity);
         self.pending_generation = null;
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
@@ -1035,6 +1045,7 @@ pub const RepositoryPageState = struct {
         self.pending_change_map_generation = null;
         self.repo_epoch = repo_epoch;
         self.root_identity = identity;
+        self.branch.repositoryChanged(self.active, identity);
         self.status.clear();
         self.load_state = if (identity != null) .idle else .no_repository;
         self.freshness = if (identity != null) .validating else .unavailable;
@@ -1327,6 +1338,52 @@ pub const RepositoryPageState = struct {
         };
     }
 
+    pub fn wantsBranchRequest(self: *const RepositoryPageState) bool {
+        return self.branch.wantsRequest(self.active, self.root_identity);
+    }
+
+    pub fn prepareBranchRequest(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        capability: *const root_capability.RootCapability,
+    ) !BranchRequest {
+        return self.branch.prepareRequest(
+            allocator,
+            .{
+                .origin = .repository,
+                .repo_epoch = self.repo_epoch,
+                .activation_id = self.activation_id,
+            },
+            repo_root,
+            capability,
+        );
+    }
+
+    pub fn markBranchRequestPreparationFailed(self: *RepositoryPageState) void {
+        self.branch.markPreparationFailed();
+    }
+
+    pub fn rejectBranchSpawn(self: *RepositoryPageState, generation: u64) void {
+        self.branch.rejectSpawn(generation);
+    }
+
+    pub fn applyBranchFinished(
+        self: *RepositoryPageState,
+        finished: *BranchFinished,
+    ) BranchApplyOutcome {
+        return self.branch.applyFinished(
+            .{
+                .origin = .repository,
+                .repo_epoch = self.repo_epoch,
+                .activation_id = self.activation_id,
+            },
+            self.root_identity,
+            self.active,
+            finished,
+        );
+    }
+
     pub fn prepareDocumentRequest(
         self: *RepositoryPageState,
         allocator: std.mem.Allocator,
@@ -1481,6 +1538,11 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn requestReload(self: *RepositoryPageState, has_repository: bool) void {
+        self.branch.requestReload(
+            self.active,
+            self.repo_epoch,
+            if (has_repository) self.root_identity else null,
+        );
         self.clearFileSearchDocumentAuthority();
         self.invalidateDisplayedDocumentAuthority();
         self.pending_syntax_generation = null;
@@ -4782,6 +4844,32 @@ const TestRoot = struct {
 };
 
 const TaskIdentityTestMsg = union(enum) { repository: Msg };
+
+test "Repository branch terminal does not mutate the primary page status" {
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state: RepositoryPageState = .{};
+    defer state.deinit(std.testing.allocator);
+    state.activate(3, root.capability.identity);
+    state.status.set("Selected source copied", .{});
+
+    var request = try state.prepareBranchRequest(
+        std.testing.allocator,
+        root.path,
+        &root.capability,
+    );
+    defer request.deinit(std.testing.allocator);
+    var finished = BranchFinished{
+        .identity = request.identity,
+        .root_identity = request.root.identity,
+        .generation = request.generation,
+        .result = .{ .failed = .load_failed },
+    };
+    defer finished.deinit();
+
+    try std.testing.expectEqual(BranchApplyOutcome.failed, state.applyBranchFinished(&finished));
+    try std.testing.expectEqualStrings("Selected source copied", state.status.text());
+}
 
 test "repository tasks derive completion root identity from their descriptor" {
     var root_a = try TestRoot.init();
