@@ -112,6 +112,10 @@ pub const DisplayedDocument = struct {
     source_revision: u64 = 0,
     authority: Authority,
     value: DocumentValue,
+    /// Descriptor-proved metadata for the same regular/symlink snapshot as
+    /// `value`. Presentation may omit it while authority is retained, but it
+    /// is never refreshed independently from selected-document acceptance.
+    metadata: ?selected_document.StableMetadata = null,
     syntax_spans: source_syntax.SourceSpans = .empty(),
     change_decoration: ChangeDecoration = .terminal_plain,
 
@@ -248,6 +252,36 @@ pub const DocumentValue = union(enum) {
     }
 };
 
+/// A page-model allocation failure converts proved text to `unreadable`; that
+/// failed conversion must not retain the source snapshot's metadata. Every
+/// other metadata admission decision remains owned by the page-neutral loader
+/// instead of duplicating its stable-classification list here.
+fn metadataAfterDocumentConversion(
+    value: *const DocumentValue,
+    metadata: ?selected_document.StableMetadata,
+) ?selected_document.StableMetadata {
+    return switch (value.*) {
+        .source => metadata,
+        .inert => |inert| switch (inert) {
+            .unreadable => null,
+            else => metadata,
+        },
+    };
+}
+
+test "repository document conversion keeps proved metadata except on unreadable fallback" {
+    const metadata: selected_document.StableMetadata = .{
+        .modified_at = .{ .nanoseconds = 42 },
+    };
+    const binary: DocumentValue = .{ .inert = .binary };
+    try std.testing.expectEqual(
+        metadata.modified_at.nanoseconds,
+        metadataAfterDocumentConversion(&binary, metadata).?.modified_at.nanoseconds,
+    );
+    const unreadable: DocumentValue = .{ .inert = .unreadable };
+    try std.testing.expect(metadataAfterDocumentConversion(&unreadable, metadata) == null);
+}
+
 pub const DocumentFinished = struct {
     identity: page.RequestIdentity,
     root_identity: root_capability.Identity,
@@ -255,6 +289,7 @@ pub const DocumentFinished = struct {
     manifest_revision: u64,
     path: []u8,
     value: DocumentValue,
+    metadata: ?selected_document.StableMetadata = null,
 
     pub fn deinit(self: *DocumentFinished, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -560,16 +595,19 @@ pub fn DocumentTask(comptime AppMsg: type) type {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
             defer task.root.deinit();
-            var loaded = selected_document.load(task.root, task.path, allocator, io);
-            defer loaded.deinit(allocator);
+            var snapshot = selected_document.load(task.root, task.path, allocator, io);
+            defer snapshot.deinit(allocator);
+            const value = DocumentValue.fromLoaded(allocator, &snapshot.value);
             const finished = DocumentFinished{
                 .identity = task.identity,
                 .root_identity = task.root.identity,
                 .generation = task.generation,
                 .manifest_revision = task.manifest_revision,
                 .path = task.path,
-                .value = DocumentValue.fromLoaded(allocator, &loaded),
+                .value = value,
+                .metadata = metadataAfterDocumentConversion(&value, snapshot.metadata),
             };
+            snapshot.metadata = null;
             task.path = &.{};
             return .{ .repository = .{ .document_finished = finished } };
         }
@@ -610,15 +648,15 @@ pub fn SyntaxTask(comptime AppMsg: type) type {
             // borrowing DisplayedDocument across threads. The extra bounded
             // read keeps plain-source acceptance immediate and avoids shared or
             // refcounted mutable lifetime between page state and the worker.
-            var loaded = selected_document.load(task.root, task.path, allocator, io);
-            defer loaded.deinit(allocator);
+            var snapshot = selected_document.load(task.root, task.path, allocator, io);
+            defer snapshot.deinit(allocator);
             var fingerprint = task.expected_fingerprint;
             var result: SyntaxResult = .unavailable;
-            switch (loaded) {
+            switch (snapshot.value) {
                 .text => |text| {
                     var document: ?source_document.Document = source_document.Document.initOwned(allocator, text.bytes, text.fingerprint) catch null;
                     if (document) |*source| {
-                        loaded = .unreadable;
+                        snapshot.value = .unreadable;
                         defer source.deinit(allocator);
                         fingerprint = source.fingerprint;
                         const spans: ?source_syntax.SourceSpans = source_syntax_runtime.buildSourceSpans(allocator, io, source, task.path) catch null;
@@ -682,9 +720,9 @@ pub fn ChangeMapTask(comptime AppMsg: type) type {
             var fingerprint = task.expected_fingerprint;
             var content_line_count = task.expected_content_line_count;
             var result: ChangeMapResult = .unavailable;
-            var loaded = selected_document.load(task.root, task.path, allocator, io);
-            defer loaded.deinit(allocator);
-            var value = DocumentValue.fromLoaded(allocator, &loaded);
+            var snapshot = selected_document.load(task.root, task.path, allocator, io);
+            defer snapshot.deinit(allocator);
+            var value = DocumentValue.fromLoaded(allocator, &snapshot.value);
             defer value.deinit(allocator);
             switch (value) {
                 .source => |*source| {
@@ -1933,6 +1971,7 @@ pub const RepositoryPageState = struct {
             .source_revision = self.source_revision,
             .authority = .accepted,
             .value = finished.value,
+            .metadata = finished.metadata,
             .change_decoration = switch (finished.value) {
                 .source => .eligible,
                 .inert => .terminal_plain,
@@ -1940,6 +1979,7 @@ pub const RepositoryPageState = struct {
         };
         finished.path = &.{};
         finished.value = .{ .inert = .unreadable };
+        finished.metadata = null;
         self.viewer.resetSource();
         self.reconcileNoSourceFocus();
         self.source_search.clear();
@@ -4830,16 +4870,18 @@ test "repository real reload updates status color and selected source" {
 
     var initial_document_request = try state.prepareDocumentRequest(allocator, &capability);
     defer initial_document_request.deinit(allocator);
-    var initial_loaded = selected_document.load(initial_document_request.root, initial_document_request.path, allocator, io);
-    defer initial_loaded.deinit(allocator);
+    var initial_snapshot = selected_document.load(initial_document_request.root, initial_document_request.path, allocator, io);
+    defer initial_snapshot.deinit(allocator);
     var initial_document_finished = DocumentFinished{
         .identity = initial_document_request.identity,
         .root_identity = initial_document_request.root.identity,
         .generation = initial_document_request.generation,
         .manifest_revision = initial_document_request.manifest_revision,
         .path = try allocator.dupe(u8, initial_document_request.path),
-        .value = DocumentValue.fromLoaded(allocator, &initial_loaded),
+        .value = DocumentValue.fromLoaded(allocator, &initial_snapshot.value),
+        .metadata = initial_snapshot.metadata,
     };
+    initial_snapshot.metadata = null;
     defer initial_document_finished.deinit(allocator);
     try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &initial_document_finished));
     try std.testing.expectEqualStrings("const value = 1;\n", state.currentSource().?.bytes);
@@ -4870,16 +4912,18 @@ test "repository real reload updates status color and selected source" {
 
     var reload_document_request = try state.prepareDocumentRequest(allocator, &capability);
     defer reload_document_request.deinit(allocator);
-    var reload_loaded = selected_document.load(reload_document_request.root, reload_document_request.path, allocator, io);
-    defer reload_loaded.deinit(allocator);
+    var reload_snapshot = selected_document.load(reload_document_request.root, reload_document_request.path, allocator, io);
+    defer reload_snapshot.deinit(allocator);
     var reload_document_finished = DocumentFinished{
         .identity = reload_document_request.identity,
         .root_identity = reload_document_request.root.identity,
         .generation = reload_document_request.generation,
         .manifest_revision = reload_document_request.manifest_revision,
         .path = try allocator.dupe(u8, reload_document_request.path),
-        .value = DocumentValue.fromLoaded(allocator, &reload_loaded),
+        .value = DocumentValue.fromLoaded(allocator, &reload_snapshot.value),
+        .metadata = reload_snapshot.metadata,
     };
+    reload_snapshot.metadata = null;
     defer reload_document_finished.deinit(allocator);
     try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &reload_document_finished));
     try std.testing.expectEqualStrings("const value = 2;\n", state.currentSource().?.bytes);
@@ -5322,6 +5366,7 @@ test "repository document task builds the bounded source model before delivery" 
     var root = try TestRoot.init();
     defer root.deinit();
     try root.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source.zig", .data = "first\r\nsecond\n" });
+    const expected = try root.tmp.dir.statFile(std.testing.io, "source.zig", .{});
     const allocator = std.testing.allocator;
     const Document = DocumentTask(TaskIdentityTestMsg);
     const task = try allocator.create(Document);
@@ -5340,6 +5385,7 @@ test "repository document task builds the bounded source model before delivery" 
                 try std.testing.expectEqual(@as(usize, 2), source.rowCount());
                 try std.testing.expectEqualStrings("first", source.lineBody(0).?);
                 try std.testing.expectEqualStrings("second", source.lineBody(1).?);
+                try std.testing.expectEqual(expected.mtime.nanoseconds, finished.metadata.?.modified_at.nanoseconds);
             },
             .inert => return error.ExpectedSource,
         },
@@ -5787,6 +5833,7 @@ test "repository page accepts selected document and renders plain source" {
     var request = try state.prepareDocumentRequest(std.testing.allocator, &root.capability);
     defer request.deinit(std.testing.allocator);
     const bytes = try std.testing.allocator.dupe(u8, "const value = 1;\n");
+    const modified_at: std.Io.Timestamp = .{ .nanoseconds = 123_456_789 };
     var finished = DocumentFinished{
         .identity = request.identity,
         .root_identity = request.root.identity,
@@ -5798,6 +5845,7 @@ test "repository page accepts selected document and renders plain source" {
             bytes,
             content_fingerprint.Fingerprint.init(bytes),
         ) },
+        .metadata = .{ .modified_at = modified_at },
     };
     defer finished.deinit(std.testing.allocator);
     state.viewer.source_cursor = 20;
@@ -5807,6 +5855,11 @@ test "repository page accepts selected document and renders plain source" {
     state.source_search.mode = true;
     state.source_search.match = .{ .line = 1, .start = 0, .end = 1 };
     try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(std.testing.allocator, &finished));
+    try std.testing.expect(finished.metadata == null);
+    try std.testing.expectEqual(
+        modified_at.nanoseconds,
+        state.displayed_document.?.metadata.?.modified_at.nanoseconds,
+    );
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_horizontal_scroll);

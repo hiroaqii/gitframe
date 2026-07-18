@@ -624,7 +624,7 @@ pub fn GeneratedSyntaxTask(comptime Msg: type) type {
             } else {
                 var snapshot = selected_document.load(task.root, request.path_key, allocator, io);
                 defer snapshot.deinit(allocator);
-                switch (snapshot) {
+                switch (snapshot.value) {
                     .text => |text| {
                         snapshot_fingerprint = text.fingerprint;
                         if (!text.fingerprint.eql(request.expected_fingerprint)) {
@@ -632,7 +632,7 @@ pub fn GeneratedSyntaxTask(comptime Msg: type) type {
                         } else {
                             var source = repository_source.Document.initOwned(allocator, text.bytes, text.fingerprint) catch null;
                             if (source) |*document| {
-                                snapshot = .unreadable;
+                                snapshot.value = .unreadable;
                                 defer document.deinit(allocator);
                                 const spans: ?source_syntax.SourceSpans = source_syntax_runtime.buildSourceSpans(allocator, io, document, request.path_key) catch null;
                                 if (spans) |owned| result = .{ .loaded = owned };
@@ -1123,11 +1123,11 @@ fn loadGeneratedAddedFile(
 
     var snapshot = selected_document.load(capability, request.path_key, allocator, io);
     defer snapshot.deinit(allocator);
-    switch (snapshot) {
+    switch (snapshot.value) {
         .text => |text| {
             const bytes = text.bytes;
             const fingerprint = text.fingerprint;
-            snapshot = .unreadable;
+            snapshot.value = .unreadable;
             const bundle = review_projection.generatedFileFromOwnedContent(
                 allocator,
                 request.path_key,

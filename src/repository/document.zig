@@ -28,7 +28,14 @@ const MutationHook = struct {
 /// production entry point always supplies the zero value.
 const LoadHooks = struct {
     before_regular_open: ?MutationHook = null,
-    after_regular_read: ?MutationHook = null,
+    /// Runs after the loader has classified the descriptor contents but before
+    /// the final descriptor stat which proves that classification stable. The
+    /// same seam covers the bounded no-content oversized path.
+    before_regular_final_stat: ?MutationHook = null,
+};
+
+pub const StableMetadata = struct {
+    modified_at: std.Io.Timestamp,
 };
 
 pub const Value = union(enum) {
@@ -64,6 +71,22 @@ pub const Value = union(enum) {
     }
 };
 
+/// One descriptor-safe observation of a repository-relative object.
+///
+/// Metadata is optional because missing, unsupported, special, and read-error
+/// terminals do not describe an accepted regular file or symlink. A stable
+/// regular/symlink classification is never published without the metadata
+/// proved by its final stat; the two values are one acceptance unit.
+pub const Snapshot = struct {
+    value: Value,
+    metadata: ?StableMetadata = null,
+
+    pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
+        self.value.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 /// Load and classify one selected repository-relative object from a pinned
 /// root descriptor. Expected filesystem states are inert values, not errors.
 pub fn load(
@@ -71,7 +94,7 @@ pub fn load(
     raw_path: []const u8,
     allocator: std.mem.Allocator,
     io: std.Io,
-) Value {
+) Snapshot {
     return loadWithHooks(root, raw_path, allocator, io, .{});
 }
 
@@ -81,9 +104,9 @@ fn loadWithHooks(
     allocator: std.mem.Allocator,
     io: std.Io,
     hooks: LoadHooks,
-) Value {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return .unsupported_platform;
-    repository_path.validate(raw_path) catch return .missing_or_changed;
+) Snapshot {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return withoutMetadata(.unsupported_platform);
+    repository_path.validate(raw_path) catch return withoutMetadata(.missing_or_changed);
 
     const split = std.mem.lastIndexOfScalar(u8, raw_path, '/');
     const parent_path = if (split) |index| raw_path[0..index] else "";
@@ -95,7 +118,7 @@ fn loadWithHooks(
     if (parent_path.len > 0) {
         var components = std.mem.splitScalar(u8, parent_path, '/');
         while (components.next()) |component| {
-            const child = std.posix.openat(parent_handle, component, directoryFlags(), 0) catch return .missing_or_changed;
+            const child = std.posix.openat(parent_handle, component, directoryFlags(), 0) catch return withoutMetadata(.missing_or_changed);
             if (owns_parent) closeRaw(parent_handle);
             parent_handle = child;
             owns_parent = true;
@@ -104,20 +127,20 @@ fn loadWithHooks(
 
     const parent: std.Io.Dir = .{ .handle = parent_handle };
     const before = parent.statFile(io, final_name, .{ .follow_symlinks = false }) catch |err| {
-        return mapStatFailure(err);
+        return withoutMetadata(mapStatFailure(err));
     };
     return switch (before.kind) {
         .sym_link => loadSymlink(parent, final_name, before, allocator, io),
-        .directory => .directory_or_gitlink,
-        .named_pipe => .named_pipe,
-        .unix_domain_socket => .unix_socket,
-        .block_device => .block_device,
-        .character_device => .character_device,
+        .directory => withoutMetadata(.directory_or_gitlink),
+        .named_pipe => withoutMetadata(.named_pipe),
+        .unix_domain_socket => withoutMetadata(.unix_socket),
+        .block_device => withoutMetadata(.block_device),
+        .character_device => withoutMetadata(.character_device),
         .file => blk: {
             if (hooks.before_regular_open) |hook| hook.invoke(parent, final_name, io);
-            break :blk loadRegular(parent_handle, final_name, allocator, io, hooks.after_regular_read);
+            break :blk loadRegular(parent_handle, final_name, allocator, io, hooks.before_regular_final_stat);
         },
-        else => .unknown_special,
+        else => withoutMetadata(.unknown_special),
     };
 }
 
@@ -127,19 +150,19 @@ fn loadSymlink(
     before: std.Io.File.Stat,
     allocator: std.mem.Allocator,
     io: std.Io,
-) Value {
+) Snapshot {
     // The extra byte is a truncation sentinel: a full buffer is rejected
     // because readlink cannot otherwise distinguish exact fit from truncation.
     var target_buffer: [max_symlink_target_bytes + 1]u8 = undefined;
-    const len = parent.readLink(io, name, &target_buffer) catch return .missing_or_changed;
-    const target_len = acceptedSymlinkTargetLength(len) orelse return .missing_or_changed;
-    const after = parent.statFile(io, name, .{ .follow_symlinks = false }) catch return .missing_or_changed;
-    if (!stableStat(before, after)) return .missing_or_changed;
-    const target = allocator.dupe(u8, target_buffer[0..target_len]) catch return .unreadable;
-    return .{ .symlink = .{
+    const len = parent.readLink(io, name, &target_buffer) catch return withoutMetadata(.missing_or_changed);
+    const target_len = acceptedSymlinkTargetLength(len) orelse return withoutMetadata(.missing_or_changed);
+    const after = parent.statFile(io, name, .{ .follow_symlinks = false }) catch return withoutMetadata(.missing_or_changed);
+    if (!stableStat(before, after)) return withoutMetadata(.missing_or_changed);
+    const target = allocator.dupe(u8, target_buffer[0..target_len]) catch return withoutMetadata(.unreadable);
+    return withStableMetadata(.{ .symlink = .{
         .target = target,
         .fingerprint = content_fingerprint.Fingerprint.init(target),
-    } };
+    } }, after.mtime);
 }
 
 fn acceptedSymlinkTargetLength(read_len: usize) ?usize {
@@ -152,42 +175,58 @@ fn loadRegular(
     name: []const u8,
     allocator: std.mem.Allocator,
     io: std.Io,
-    after_read_hook: ?MutationHook,
-) Value {
-    const handle = std.posix.openat(parent_handle, name, regularFlags(), 0) catch |err| return mapOpenFailure(err);
+    before_final_stat_hook: ?MutationHook,
+) Snapshot {
+    const handle = std.posix.openat(parent_handle, name, regularFlags(), 0) catch |err| return withoutMetadata(mapOpenFailure(err));
     const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = true } };
     defer file.close(io);
 
-    const before = file.stat(io) catch return .unreadable;
-    if (before.kind != .file) return valueForKind(before.kind);
-    if (before.size > max_text_bytes) return .{ .oversized = before.size };
+    const before = file.stat(io) catch return withoutMetadata(.unreadable);
+    if (before.kind != .file) return withoutMetadata(valueForKind(before.kind));
+    if (before.size > max_text_bytes) {
+        if (before_final_stat_hook) |hook| hook.invoke(.{ .handle = parent_handle }, name, io);
+        const after = file.stat(io) catch return withoutMetadata(.missing_or_changed);
+        if (!stableStat(before, after)) return withoutMetadata(.missing_or_changed);
+        return withStableMetadata(.{ .oversized = before.size }, after.mtime);
+    }
 
     var reader_buffer: [4096]u8 = undefined;
     var reader = file.readerStreaming(io, &reader_buffer);
     const bytes = reader.interface.allocRemaining(allocator, .limited(max_text_bytes + 1)) catch |err| switch (err) {
-        error.StreamTooLong => return .{ .oversized = max_text_bytes + 1 },
-        else => return .unreadable,
+        error.StreamTooLong => return withoutMetadata(.missing_or_changed),
+        else => return withoutMetadata(.unreadable),
     };
     if (bytes.len > max_text_bytes) {
         allocator.free(bytes);
-        return .{ .oversized = bytes.len };
+        return withoutMetadata(.missing_or_changed);
     }
     if (before.size != bytes.len) {
         allocator.free(bytes);
-        return .missing_or_changed;
+        return withoutMetadata(.missing_or_changed);
     }
 
-    if (after_read_hook) |hook| hook.invoke(.{ .handle = parent_handle }, name, io);
+    if (before_final_stat_hook) |hook| hook.invoke(.{ .handle = parent_handle }, name, io);
 
     const after = file.stat(io) catch {
         allocator.free(bytes);
-        return .missing_or_changed;
+        return withoutMetadata(.missing_or_changed);
     };
     if (!stableStat(before, after)) {
         allocator.free(bytes);
-        return .missing_or_changed;
+        return withoutMetadata(.missing_or_changed);
     }
-    return classifyOwned(bytes, allocator);
+    return withStableMetadata(classifyOwned(bytes, allocator), after.mtime);
+}
+
+fn withoutMetadata(value: Value) Snapshot {
+    return .{ .value = value };
+}
+
+fn withStableMetadata(value: Value, modified_at: std.Io.Timestamp) Snapshot {
+    return .{
+        .value = value,
+        .metadata = .{ .modified_at = modified_at },
+    };
 }
 
 fn classifyOwned(bytes: []u8, allocator: std.mem.Allocator) Value {
@@ -335,20 +374,22 @@ test "repository document loads bounded text through pinned root" {
     defer repo.close(io);
     try repo.createDir(io, "src", .default_dir);
     try repo.writeFile(io, .{ .sub_path = "src/main.zig", .data = "const value = 1;\n" });
+    const expected = try repo.statFile(io, "src/main.zig", .{});
     const root_path = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
     defer allocator.free(root_path);
     var root = try root_capability.RootCapability.openCanonical(root_path);
     defer root.deinit();
 
-    var value = load(root, "src/main.zig", allocator, io);
-    defer value.deinit(allocator);
-    switch (value) {
+    var snapshot = load(root, "src/main.zig", allocator, io);
+    defer snapshot.deinit(allocator);
+    switch (snapshot.value) {
         .text => |text| {
             try std.testing.expectEqualStrings("const value = 1;\n", text.bytes);
             try std.testing.expect(text.fingerprint.eql(content_fingerprint.Fingerprint.init(text.bytes)));
         },
         else => return error.ExpectedTextDocument,
     }
+    try std.testing.expectEqual(expected.mtime.nanoseconds, snapshot.metadata.?.modified_at.nanoseconds);
 }
 
 test "repository document keeps symlink target inert" {
@@ -362,17 +403,19 @@ test "repository document keeps symlink target inert" {
     defer repo.close(io);
     try repo.writeFile(io, .{ .sub_path = "target", .data = "secret" });
     try repo.symLink(io, "target", "link", .{});
+    const expected = try repo.statFile(io, "link", .{ .follow_symlinks = false });
     const root_path = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
     defer allocator.free(root_path);
     var root = try root_capability.RootCapability.openCanonical(root_path);
     defer root.deinit();
 
-    var value = load(root, "link", allocator, io);
-    defer value.deinit(allocator);
-    switch (value) {
+    var snapshot = load(root, "link", allocator, io);
+    defer snapshot.deinit(allocator);
+    switch (snapshot.value) {
         .symlink => |link| try std.testing.expectEqualStrings("target", link.target),
         else => return error.ExpectedSymlinkDocument,
     }
+    try std.testing.expectEqual(expected.mtime.nanoseconds, snapshot.metadata.?.modified_at.nanoseconds);
 }
 
 test "repository document symlink sentinel accepts boundary and rejects full buffer" {
@@ -391,9 +434,10 @@ test "repository document rejects symlink replaced between stat and read" {
     try tmp.dir.deleteFile(io, "link");
     try tmp.dir.symLink(io, "replacement-target", "link", .{});
 
-    var value = loadSymlink(tmp.dir, "link", before, allocator, io);
-    defer value.deinit(allocator);
-    try std.testing.expect(value == .missing_or_changed);
+    var snapshot = loadSymlink(tmp.dir, "link", before, allocator, io);
+    defer snapshot.deinit(allocator);
+    try std.testing.expect(snapshot.value == .missing_or_changed);
+    try std.testing.expect(snapshot.metadata == null);
 }
 
 test "repository document retains invalid UTF-8 and control bytes in inert symlink target" {
@@ -409,9 +453,9 @@ test "repository document retains invalid UTF-8 and control bytes in inert symli
     var root = try root_capability.RootCapability.openCanonical(root_path);
     defer root.deinit();
 
-    var value = load(root, "link", allocator, io);
-    defer value.deinit(allocator);
-    switch (value) {
+    var snapshot = load(root, "link", allocator, io);
+    defer snapshot.deinit(allocator);
+    switch (snapshot.value) {
         .symlink => |link| {
             try std.testing.expectEqualSlices(u8, target, link.target);
             try std.testing.expect(link.fingerprint.eql(content_fingerprint.Fingerprint.init(target)));
@@ -447,9 +491,10 @@ test "repository document classifies a named pipe without blocking" {
     var root = try root_capability.RootCapability.openCanonical(root_path);
     defer root.deinit();
 
-    var value = load(root, "pipe", allocator, io);
-    defer value.deinit(allocator);
-    try std.testing.expect(value == .named_pipe);
+    var snapshot = load(root, "pipe", allocator, io);
+    defer snapshot.deinit(allocator);
+    try std.testing.expect(snapshot.value == .named_pipe);
+    try std.testing.expect(snapshot.metadata == null);
 }
 
 test "repository document final open reclassifies regular file replaced by named pipe" {
@@ -465,13 +510,14 @@ test "repository document final open reclassifies regular file replaced by named
     defer root.deinit();
     var mutation: ReplaceWithFifoContext = .{};
 
-    var value = loadWithHooks(root, "selected", allocator, io, .{ .before_regular_open = .{
+    var snapshot = loadWithHooks(root, "selected", allocator, io, .{ .before_regular_open = .{
         .context = &mutation,
         .run = ReplaceWithFifoContext.run,
     } });
-    defer value.deinit(allocator);
+    defer snapshot.deinit(allocator);
     try std.testing.expect(!mutation.failed);
-    try std.testing.expect(value == .named_pipe);
+    try std.testing.expect(snapshot.value == .named_pipe);
+    try std.testing.expect(snapshot.metadata == null);
 }
 
 test "repository document rejects a file changed after read" {
@@ -487,13 +533,14 @@ test "repository document rejects a file changed after read" {
     defer root.deinit();
     var mutation: RewriteAfterReadContext = .{};
 
-    var value = loadWithHooks(root, "selected", allocator, io, .{ .after_regular_read = .{
+    var snapshot = loadWithHooks(root, "selected", allocator, io, .{ .before_regular_final_stat = .{
         .context = &mutation,
         .run = RewriteAfterReadContext.run,
     } });
-    defer value.deinit(allocator);
+    defer snapshot.deinit(allocator);
     try std.testing.expect(!mutation.failed);
-    try std.testing.expect(value == .missing_or_changed);
+    try std.testing.expect(snapshot.value == .missing_or_changed);
+    try std.testing.expect(snapshot.metadata == null);
 }
 
 test "repository document classifies a unix domain socket" {
@@ -512,9 +559,10 @@ test "repository document classifies a unix domain socket" {
     var root = try root_capability.RootCapability.openCanonical(root_path);
     defer root.deinit();
 
-    var value = load(root, "socket", allocator, io);
-    defer value.deinit(allocator);
-    try std.testing.expect(value == .unix_socket);
+    var snapshot = load(root, "socket", allocator, io);
+    defer snapshot.deinit(allocator);
+    try std.testing.expect(snapshot.value == .unix_socket);
+    try std.testing.expect(snapshot.metadata == null);
 }
 
 test "repository document reads committed object after root path replacement" {
@@ -538,9 +586,9 @@ test "repository document reads committed object after root path replacement" {
 
     try tmp.dir.rename("repo", tmp.dir, "old-repo", io);
     try tmp.dir.symLink(io, "outside", "repo", .{ .is_directory = true });
-    var value = load(root, "selected.txt", allocator, io);
-    defer value.deinit(allocator);
-    switch (value) {
+    var snapshot = load(root, "selected.txt", allocator, io);
+    defer snapshot.deinit(allocator);
+    switch (snapshot.value) {
         .text => |text| try std.testing.expectEqualStrings("committed\n", text.bytes),
         else => return error.ExpectedCommittedText,
     }
@@ -579,6 +627,43 @@ test "repository document rejects unsafe content without retaining bytes" {
     try std.testing.expect(allowed_value == .text);
 }
 
+test "repository document stable inert regular classifications retain proved metadata" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cases = [_]struct {
+        name: []const u8,
+        bytes: []const u8,
+        tag: std.meta.Tag(Value),
+    }{
+        .{ .name = "binary", .bytes = "a\x00b", .tag = .binary },
+        .{ .name = "invalid", .bytes = "invalid-\xff", .tag = .invalid_utf8 },
+        .{ .name = "control", .bytes = "page\x0cnext", .tag = .unsafe_control_text },
+    };
+
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    var root = try root_capability.RootCapability.openCanonical(root_path);
+    defer root.deinit();
+
+    for (cases) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = case.name, .data = case.bytes });
+        const expected = try tmp.dir.statFile(io, case.name, .{});
+        var snapshot = load(root, case.name, allocator, io);
+        defer snapshot.deinit(allocator);
+        try std.testing.expectEqual(case.tag, std.meta.activeTag(snapshot.value));
+        try std.testing.expectEqual(expected.mtime.nanoseconds, snapshot.metadata.?.modified_at.nanoseconds);
+    }
+}
+
+test "repository document preserves negative proved timestamp as raw metadata" {
+    var snapshot = withStableMetadata(.binary, .{ .nanoseconds = -1 });
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i96, -1), snapshot.metadata.?.modified_at.nanoseconds);
+}
+
 test "repository document enforces exact one MiB boundary" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -598,15 +683,43 @@ test "repository document enforces exact one MiB boundary" {
     var root = try root_capability.RootCapability.openCanonical(root_path);
     defer root.deinit();
 
-    var exact_value = load(root, "exact.txt", allocator, io);
-    defer exact_value.deinit(allocator);
-    switch (exact_value) {
+    var exact_snapshot = load(root, "exact.txt", allocator, io);
+    defer exact_snapshot.deinit(allocator);
+    switch (exact_snapshot.value) {
         .text => |text| try std.testing.expectEqual(max_text_bytes, text.bytes.len),
         else => return error.ExpectedBoundaryText,
     }
-    var over_value = load(root, "over.txt", allocator, io);
-    defer over_value.deinit(allocator);
-    try std.testing.expect(over_value == .oversized);
+    var over_snapshot = load(root, "over.txt", allocator, io);
+    defer over_snapshot.deinit(allocator);
+    try std.testing.expect(over_snapshot.value == .oversized);
+    const expected_over = try tmp.dir.statFile(io, "over.txt", .{});
+    try std.testing.expectEqual(expected_over.mtime.nanoseconds, over_snapshot.metadata.?.modified_at.nanoseconds);
+}
+
+test "repository document oversized classification requires a stable second stat" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const over = try allocator.alloc(u8, max_text_bytes + 1);
+    defer allocator.free(over);
+    @memset(over, 'x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "over.txt", .data = over });
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    var root = try root_capability.RootCapability.openCanonical(root_path);
+    defer root.deinit();
+    var mutation: RewriteAfterReadContext = .{};
+
+    var snapshot = loadWithHooks(root, "over.txt", allocator, io, .{ .before_regular_final_stat = .{
+        .context = &mutation,
+        .run = RewriteAfterReadContext.run,
+    } });
+    defer snapshot.deinit(allocator);
+    try std.testing.expect(!mutation.failed);
+    try std.testing.expect(snapshot.value == .missing_or_changed);
+    try std.testing.expect(snapshot.metadata == null);
 }
 
 test "repository document rejects intermediate symlink" {
@@ -628,7 +741,8 @@ test "repository document rejects intermediate symlink" {
     var root = try root_capability.RootCapability.openCanonical(root_path);
     defer root.deinit();
 
-    var value = load(root, "linked/secret.txt", allocator, io);
-    defer value.deinit(allocator);
-    try std.testing.expect(value == .missing_or_changed);
+    var snapshot = load(root, "linked/secret.txt", allocator, io);
+    defer snapshot.deinit(allocator);
+    try std.testing.expect(snapshot.value == .missing_or_changed);
+    try std.testing.expect(snapshot.metadata == null);
 }
