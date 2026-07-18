@@ -5,6 +5,7 @@
 //! effects; it deliberately has no `App`, `Ctx`, overlay, or process access.
 
 const std = @import("std");
+const context = @import("../../../context.zig");
 const content_fingerprint = @import("../../../content_fingerprint.zig");
 const builtin = @import("builtin");
 const auto_reload = @import("../../auto_reload.zig");
@@ -82,6 +83,17 @@ const StatusProjectionOutcome = enum {
     /// An action refresh intentionally retains an older intermediate tree.
     deferred_sidebar,
 };
+
+fn cloneSidebarIdentity(
+    allocator: std.mem.Allocator,
+    identity: context.SidebarIdentity,
+) !context.SidebarIdentity {
+    return switch (identity) {
+        .repo_root => .repo_root,
+        .directory => |path| .{ .directory = try allocator.dupe(u8, path) },
+        .file => |path_key| .{ .file = try allocator.dupe(u8, path_key) },
+    };
+}
 
 pub const StatusProjectionTrigger = enum {
     /// A newly accepted source already materialized the empty-status tree; the
@@ -222,11 +234,17 @@ pub const View = struct {
     pub fn captureAnchor(self: View, allocator: std.mem.Allocator) !?review_page.ReloadAnchor {
         const loaded = self.navigation.activeLoadedDiffConst() orelse return null;
         const path_key = self.navigation.selectedStagePathKey() orelse return null;
+        const sidebar_identity = self.navigation.selectedSidebarIdentity() orelse return null;
         const selected_target = self.page.viewer.selected_target orelse return null;
         const visible_row = loaded.visibleRowOfNode(self.page.viewer.selected_node) orelse 0;
 
+        const owned_path_key = try allocator.dupe(u8, path_key);
+        errdefer allocator.free(owned_path_key);
+        const owned_sidebar_identity = try cloneSidebarIdentity(allocator, sidebar_identity);
+
         return .{
-            .path_key = try allocator.dupe(u8, path_key),
+            .path_key = owned_path_key,
+            .sidebar_identity = owned_sidebar_identity,
             .selected_target_tag = std.meta.activeTag(selected_target),
             .visible_sidebar_row = visible_row,
             .diff_cursor = self.page.viewer.diff_cursor,
@@ -1364,7 +1382,7 @@ pub const Controller = struct {
         switch (finished.result) {
             .empty => {
                 var acceptance_restore = if (pending_reload) |pending|
-                    if (pending.kind == .watch) try self.view().captureDisplayRestore(allocator) else null
+                    if (self.shouldCaptureAcceptanceRestore(pending.kind)) try self.view().captureDisplayRestore(allocator) else null
                 else
                     null;
                 errdefer if (acceptance_restore) |*restore| restore.deinit(allocator);
@@ -1405,8 +1423,11 @@ pub const Controller = struct {
                     .rebuild_not_watch, .rebuild_no_current_loaded, .rebuild_text_changed => {},
                 }
 
-                var acceptance_restore = if (consumed_pending_is_watch)
-                    try self.view().captureDisplayRestore(allocator)
+                var acceptance_restore = if (pending_reload) |pending|
+                    if (self.shouldCaptureAcceptanceRestore(pending.kind))
+                        try self.view().captureDisplayRestore(allocator)
+                    else
+                        null
                 else
                     null;
                 errdefer if (acceptance_restore) |*restore| restore.deinit(allocator);
@@ -1450,7 +1471,7 @@ pub const Controller = struct {
                 } else {
                     if (!had_loaded_before and !had_action_cursor) {
                         self.navigation.selectFirstVisibleFile(active_loaded);
-                    } else if (self.page.action_cursor.hasOwner()) {
+                    } else if (self.page.action_cursor.hasRestoreAuthority()) {
                         _ = self.navigation.remapActionCursor(active_loaded);
                     } else {
                         self.navigation.syncSidebarNodeToSelectedFile(active_loaded);
@@ -1503,6 +1524,16 @@ pub const Controller = struct {
         const recovered_failure = self.page.auto_reload.last_failure;
         self.page.auto_reload.acceptSource(fingerprint);
         return recovered_failure;
+    }
+
+    /// Watch reloads always preserve acceptance-time navigation. Action
+    /// reloads do so only after a later explicit sidebar selection has revoked
+    /// the original action target; this captures the current user path before
+    /// replacing the source arena.
+    fn shouldCaptureAcceptanceRestore(self: Controller, kind: review_page.ReloadKind) bool {
+        return kind == .watch or
+            (kind == .action_result and self.page.action_cursor.hasOwner() and
+                !self.page.action_cursor.hasRestoreAuthority());
     }
 
     fn acceptedSourceMember(self: Controller) authority.MemberFreshness {
@@ -1697,6 +1728,7 @@ pub const Controller = struct {
     ) !void {
         const allocator = self.navigation.loadArenaAllocator() orelse return;
         const previous_path_key = self.navigation.view().selectedStagePathKey();
+        const previous_sidebar_identity = self.navigation.view().selectedSidebarIdentity();
         try self.navigation.ensureTreeOrderScope(app_allocator);
         loaded.tree = try file_tree.buildWithOptions(allocator, loaded.document, self.page.git_status.document, .{
             .root = self.navigation.view().fileTreeRootOptions(),
@@ -1708,19 +1740,28 @@ pub const Controller = struct {
             self.page.review_display.hide_reviewed_files,
             self.page.review_display.changed_file_filter,
         );
-        if (self.page.action_cursor.hasOwner()) {
+        if (self.page.action_cursor.hasRestoreAuthority()) {
             _ = self.navigation.remapActionCursor(loaded);
             return;
+        }
+        // Source replacement can temporarily make the anchored path absent
+        // until the fresh status snapshot is projected back into the tree.
+        // Reapply that still-owned display anchor here, where a staged-only
+        // row can finally satisfy it, and retain the anchor until the matching
+        // projection result restores the body navigation.
+        if (self.page.pending_display_navigation_restore) |*restore| {
+            if (self.navigation.restoreReloadAnchor(loaded, restore.authoritative())) return;
         }
         if (prefer_first_visible_file) {
             self.navigation.selectFirstVisibleFile(loaded);
         } else {
             if (previous_path_key) |path_key| {
-                if (navigation.findNodeByPathKey(loaded, path_key)) |node_index| {
+                if (navigation.findFileNodeByPathKey(loaded, path_key)) |node_index| {
                     self.navigation.selectSidebarNode(loaded, node_index);
-                    self.navigation.reconcileSelectionAfterVisibleNodeChange(loaded);
-                    return;
                 }
+            }
+            if (previous_sidebar_identity) |identity| {
+                _ = self.navigation.restoreSidebarIdentity(loaded, identity);
             }
             self.navigation.reconcileSelectionAfterVisibleNodeChange(loaded);
         }
@@ -1776,7 +1817,7 @@ pub const Controller = struct {
             self.navigation.selectSidebarNode(active_loaded, node_index);
             break;
         }
-        if (self.page.action_cursor.hasOwner()) _ = self.navigation.remapActionCursor(active_loaded);
+        if (self.page.action_cursor.hasRestoreAuthority()) _ = self.navigation.remapActionCursor(active_loaded);
         if (self.page.pending_display_navigation_restore) |*restore| {
             _ = self.navigation.restoreReloadAnchor(active_loaded, restore.authoritative());
         }
@@ -2264,15 +2305,16 @@ test "full projection cache promotes LRU before old display admission" {
         0,
     );
 
-    // captureAnchor performs the one permitted allocation. If old-display
+    // captureAnchor separately owns the sticky path and sidebar identity, so
+    // it performs the two permitted allocations. If old-display
     // admission unexpectedly needs cache metadata after removing the hit, the
     // next allocation fails; the hit must still remain installable either way.
-    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
     var update = try controller.prepareProjection(failing.allocator());
     defer update.deinit(allocator);
 
     try std.testing.expect(update.command == null);
-    try std.testing.expectEqual(@as(usize, 1), failing.alloc_index);
+    try std.testing.expectEqual(@as(usize, 2), failing.alloc_index);
     try std.testing.expect(page.review_projection.pending == null);
     try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
     try std.testing.expectEqual(review_projection.max_cached_entries, page.review_projection.cacheLen());

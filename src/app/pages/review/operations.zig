@@ -178,7 +178,15 @@ pub const AcceptedActionOutcome = union(enum) {
 
 pub const OutcomeApply = struct {
     reload: ReloadIntent = .none,
-    reviewed_clear_failed: bool = false,
+    local_effect_failure: ?LocalEffectFailure = null,
+};
+
+/// A Git side effect has already succeeded when these local presentation
+/// mutations run. Their failure may affect a diagnostic or an ephemeral mark,
+/// but must never suppress the mandatory reload which reconciles Git state.
+pub const LocalEffectFailure = enum {
+    reviewed_mark_clear,
+    staged_hunk_mark_record,
 };
 
 pub const CommitSummary = union(enum) {
@@ -635,7 +643,7 @@ pub const Controller = struct {
         allocator: std.mem.Allocator,
         outcome: AcceptedActionOutcome,
         active_repo_matches: bool,
-    ) !OutcomeApply {
+    ) OutcomeApply {
         return switch (outcome) {
             .stage_file => blk: {
                 if (!active_repo_matches) break :blk .{};
@@ -649,15 +657,20 @@ pub const Controller = struct {
                 const clear_failed = if (self.page.reviewed_store.clearPathKey(allocator, value.repo_root, value.path)) |_| false else |_| true;
                 break :blk .{
                     .reload = if (active_repo_matches) .source_and_aux else .none,
-                    .reviewed_clear_failed = clear_failed,
+                    .local_effect_failure = if (clear_failed) .reviewed_mark_clear else null,
                 };
             },
             .stage_hunk => |value| blk: {
                 if (!active_repo_matches) break :blk .{};
-                if (value.mark_source == .session) {
-                    try self.page.staged_hunks.add(allocator, value.repo_root, value.path, value.hunk_index);
-                }
-                break :blk .{ .reload = .{ .status = value.repo_root } };
+                const mark_failed = value.mark_source == .session and
+                    if (self.page.staged_hunks.add(allocator, value.repo_root, value.path, value.hunk_index))
+                        false
+                    else |_|
+                        true;
+                break :blk .{
+                    .reload = .{ .status = value.repo_root },
+                    .local_effect_failure = if (mark_failed) .staged_hunk_mark_record else null,
+                };
             },
             .unstage_hunk => |value| blk: {
                 if (!active_repo_matches) break :blk .{};
@@ -673,7 +686,7 @@ pub const Controller = struct {
                 const clear_failed = if (self.page.reviewed_store.clearForRepo(allocator, value.repo_root)) |_| false else |_| true;
                 break :blk .{
                     .reload = if (active_repo_matches) .source_and_aux else .none,
-                    .reviewed_clear_failed = clear_failed,
+                    .local_effect_failure = if (clear_failed) .reviewed_mark_clear else null,
                 };
             },
         };
@@ -798,6 +811,33 @@ test "owned operation proposal construction frees partial clones" {
             .ahead_behind = .{ .ahead = 1, .behind = 0 },
         });
         try std.testing.expectError(error.OutOfMemory, result);
+    }
+}
+
+test "accepted hunk stage keeps mandatory reload when local mark allocation fails" {
+    const backing = std.testing.allocator;
+    var fail_index: usize = 0;
+    while (fail_index < 3) : (fail_index += 1) {
+        var page: review_page.ReviewPageState = .{};
+        defer page.deinit(backing);
+        const controller: Controller = .{
+            .page = &page,
+            .navigation = undefined,
+            .view_state = undefined,
+        };
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+
+        const applied = controller.applyAcceptedOutcome(failing.allocator(), .{ .stage_hunk = .{
+            .repo_root = "/repo",
+            .path = "src/main.zig",
+            .hunk_index = 2,
+            .mark_source = .session,
+        } }, true);
+
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(LocalEffectFailure.staged_hunk_mark_record, applied.local_effect_failure.?);
+        try std.testing.expectEqualStrings("/repo", applied.reload.status);
+        try std.testing.expectEqual(@as(usize, 0), page.staged_hunks.items.items.len);
     }
 }
 

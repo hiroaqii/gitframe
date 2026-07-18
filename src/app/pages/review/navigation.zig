@@ -633,6 +633,19 @@ pub const View = struct {
         };
     }
 
+    /// Stable identity of the sidebar cursor, independent from the sticky
+    /// file/status target displayed in the main pane.
+    pub fn selectedSidebarIdentity(self: View) ?context.SidebarIdentity {
+        const loaded = self.activeLoadedDiffConst() orelse return null;
+        if (self.page.viewer.selected_node >= loaded.tree.nodes.len) return null;
+        const node = loaded.tree.nodes[self.page.viewer.selected_node];
+        return switch (node.kind) {
+            .repo_root => .repo_root,
+            .directory => .{ .directory = node.path },
+            .file => .{ .file = if (node.path_key.len > 0) node.path_key else node.path },
+        };
+    }
+
     pub fn statusEntryForPathKey(self: View, path_key: []const u8) ?git_status.StatusEntry {
         for (self.page.git_status.document.entries) |entry| {
             const entry_key = entry.canonicalPathKey() orelse continue;
@@ -1769,7 +1782,7 @@ pub const Controller = struct {
     /// Rebind the tree cursor after one member replaces the tree, but retain
     /// the action owner until the exact source/status pair is terminal.
     pub fn remapActionCursor(self: Controller, loaded: *LoadedDiff) bool {
-        const target = self.page.action_cursor.target() orelse return false;
+        const target = self.page.action_cursor.restoreTarget() orelse return false;
         return self.restoreTypedActionTarget(loaded, target, false);
     }
 
@@ -1778,6 +1791,7 @@ pub const Controller = struct {
     pub fn finalizeActionCursor(self: Controller, allocator: std.mem.Allocator) bool {
         var owner = self.page.action_cursor.takeTerminal() orelse return false;
         defer owner.deinit(allocator);
+        if (!owner.mayRestore()) return true;
         const loaded = self.activeLoadedDiff() orelse return true;
         _ = self.restoreTypedActionTarget(loaded, &owner.target, true);
         self.clampSelection(loaded.document.files.len);
@@ -1863,7 +1877,7 @@ pub const Controller = struct {
     }
 
     pub fn restoreReloadAnchor(self: Controller, loaded: *LoadedDiff, anchor: *const review_page.ReloadAnchor) bool {
-        const selected_same_path = if (findNodeByPathKey(loaded, anchor.path_key)) |node_index| blk: {
+        const selected_same_path = if (findFileNodeByPathKey(loaded, anchor.path_key)) |node_index| blk: {
             self.selectSidebarNode(loaded, node_index);
             break :blk true;
         } else blk: {
@@ -1881,6 +1895,11 @@ pub const Controller = struct {
             }
             return false;
         };
+
+        // Directory/root selection is independent from the sticky diff body.
+        // Restore it only after rebinding the body file so selecting a
+        // directory cannot accidentally replace the displayed target.
+        _ = self.restoreSidebarIdentity(loaded, anchor.sidebar_identity);
 
         self.page.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
         self.page.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
@@ -1910,6 +1929,16 @@ pub const Controller = struct {
         // controls its materialized rows. Preserve the restored diff target,
         // but never leave the sidebar cursor on a hidden descendant.
         self.reconcileSelectionAfterVisibleNodeChange(loaded);
+        return true;
+    }
+
+    pub fn restoreSidebarIdentity(
+        self: Controller,
+        loaded: *LoadedDiff,
+        identity: context.SidebarIdentity,
+    ) bool {
+        const node_index = findNodeBySidebarIdentity(loaded, identity) orelse return false;
+        self.selectSidebarNode(loaded, node_index);
         return true;
     }
 
@@ -2278,6 +2307,26 @@ pub fn findNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize
     return null;
 }
 
+pub fn findNodeBySidebarIdentity(
+    loaded: *const LoadedDiff,
+    identity: context.SidebarIdentity,
+) ?usize {
+    for (loaded.tree.nodes, 0..) |node, index| {
+        switch (identity) {
+            .repo_root => if (node.kind == .repo_root) return index,
+            .directory => |path| {
+                if (node.kind == .directory and std.mem.eql(u8, node.path, path)) return index;
+            },
+            .file => |path_key| {
+                if (node.kind != .file) continue;
+                const node_key = if (node.path_key.len > 0) node.path_key else node.path;
+                if (std.mem.eql(u8, node_key, path_key)) return index;
+            },
+        }
+    }
+    return null;
+}
+
 fn typedActionNode(
     loaded: *const LoadedDiff,
     target: *const review_page.action_cursor.Target,
@@ -2320,7 +2369,7 @@ fn deepestVisibleTypedAncestor(loaded: *const LoadedDiff, path_key: []const u8) 
     return best_directory orelse root;
 }
 
-fn findFileNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
+pub fn findFileNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
     for (loaded.tree.nodes, 0..) |node, index| {
         if (node.kind != .file) continue;
         const node_key = if (node.path_key.len > 0) node.path_key else node.path;
@@ -3216,6 +3265,7 @@ test "Review navigation snapshot and reload restore share the page owner" {
 
     var anchor: review_page.ReloadAnchor = .{
         .path_key = try allocator.dupe(u8, "a"),
+        .sidebar_identity = .{ .file = try allocator.dupe(u8, "a") },
         .selected_target_tag = .diff_file,
         .visible_sidebar_row = 0,
         .diff_cursor = snapshot.diff_cursor,
@@ -5214,7 +5264,7 @@ test "terminal directory action cursor reveals exact target under collapsed repo
         0,
     );
     app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
-    try std.testing.expect(app.pages.review.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }));
+    try std.testing.expect(app.pages.review.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .source_and_status));
     try std.testing.expect(app.pages.review.action_cursor.startMember(7, .source, 11));
     try std.testing.expect(app.pages.review.action_cursor.startMember(7, .status, 12));
     try std.testing.expect(app.pages.review.action_cursor.finishMember(7, 3, .status, 12, true));
@@ -5262,7 +5312,7 @@ test "filtered directory action cursor falls back to repository root instead of 
         0,
     );
     app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
-    try std.testing.expect(app.pages.review.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }));
+    try std.testing.expect(app.pages.review.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .source_and_status));
     try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(7, .source));
     try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(7, .status));
 
@@ -5298,7 +5348,7 @@ test "disappeared file action cursor keeps the existing nearest-file fallback" {
         3,
     );
     app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
-    try std.testing.expect(app.pages.review.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }));
+    try std.testing.expect(app.pages.review.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .source_and_status));
     try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(7, .source));
     try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(7, .status));
 

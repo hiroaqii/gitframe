@@ -9,6 +9,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const message = @import("message.zig");
 const navigation = @import("navigation.zig");
+const context = @import("../../../context.zig");
+const review_page = @import("../review.zig");
 const review_selection = @import("selection.zig");
 const diff_selection = @import("../../../diff/selection.zig");
 const file_tree = if (builtin.is_test) @import("../../../file_tree.zig") else struct {};
@@ -73,6 +75,8 @@ pub const Controller = struct {
     pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: message.Msg) !ReviewUpdate {
         const tracks_navigation = tracksDisplayNavigation(msg);
         const before = if (tracks_navigation) self.navigation.view().displayNavigationSnapshot() else undefined;
+        const tracks_sidebar_selection = tracksExplicitSidebarSelection(msg);
+        const sidebar_before = if (tracks_sidebar_selection) sidebarSelectionSnapshot(self.navigation) else undefined;
 
         var result: ReviewUpdate = .{};
         switch (msg) {
@@ -221,6 +225,17 @@ pub const Controller = struct {
             .finish_review_canceled => result.command = .{ .finish_review = .canceled },
         }
 
+        // This boundary sees semantic Review input after it has either changed
+        // the sidebar/file intent or proved to be a no-op. Internal tree
+        // rebuild/remap helpers never pass through here, so they cannot revoke
+        // an action's restoration authority accidentally.
+        if (tracks_sidebar_selection) {
+            const sidebar_after = sidebarSelectionSnapshot(self.navigation);
+            if (!std.meta.eql(sidebar_before, sidebar_after)) {
+                _ = self.navigation.page.action_cursor.supersedeRestore();
+            }
+        }
+
         if (tracks_navigation) {
             const after = self.navigation.view().displayNavigationSnapshot();
             if (!std.meta.eql(before, after)) {
@@ -308,6 +323,36 @@ pub const Controller = struct {
     }
 };
 
+const SidebarSelectionSnapshot = struct {
+    selected_target: ?context.SelectedTarget,
+    selected_node: usize,
+};
+
+fn sidebarSelectionSnapshot(controller: navigation.Controller) SidebarSelectionSnapshot {
+    return .{
+        .selected_target = controller.page.viewer.selected_target,
+        .selected_node = controller.page.viewer.selected_node,
+    };
+}
+
+fn tracksExplicitSidebarSelection(msg: message.Msg) bool {
+    return switch (msg) {
+        .select_previous_file,
+        .select_next_file,
+        .select_first_file,
+        .select_last_file,
+        .toggle_directory,
+        .expand_directory,
+        .collapse_or_parent_directory,
+        .sidebar_click_node,
+        .mouse_sidebar_wheel_up,
+        .mouse_sidebar_wheel_down,
+        .submit_file_search,
+        => true,
+        else => false,
+    };
+}
+
 fn tracksDisplayNavigation(msg: message.Msg) bool {
     return switch (msg) {
         .select_previous_file,
@@ -370,6 +415,147 @@ test "review update owns state transition and shell intent" {
     var shell_update = try controller.apply(std.testing.allocator, .request_push);
     defer shell_update.deinit(std.testing.allocator);
     try std.testing.expectEqual(Command.request_push, shell_update.command.?);
+}
+
+fn installUpdateTestActionCursor(
+    page: *review_page.ReviewPageState,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !void {
+    var prepared = try review_page.action_cursor.Prepared.init(
+        allocator,
+        3,
+        .{ .device = 5, .inode = 8 },
+        .file,
+        path,
+        0,
+    );
+    page.action_cursor.install(allocator, &prepared, 7);
+}
+
+test "explicit sidebar update supersedes action restore while internal remap does not" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    var loaded = test_support.loadedDiffTwo();
+    loaded.tree.nodes = &file_search_input_nodes;
+    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadStateWithArena(arena, loaded),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 0 },
+    };
+    defer page.deinit(allocator);
+    try installUpdateTestActionCursor(&page, allocator, "a");
+
+    const controller: Controller = .{ .navigation = .{
+        .page = &page,
+        .repo_root = "/repo",
+        .source = .unstaged,
+        .layout = .{ .width = 80, .height = 20 },
+        .diagnostics = .{ .target = &page.status },
+    } };
+
+    controller.navigation.selectSidebarNode(controller.navigation.activeLoadedDiff().?, 1);
+    controller.navigation.selectSidebarNode(controller.navigation.activeLoadedDiff().?, 0);
+    try std.testing.expect(page.action_cursor.hasRestoreAuthority());
+
+    var explicit = try controller.apply(null, .select_next_file);
+    explicit.deinit(null);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, page.viewer.selected_target.?);
+    try std.testing.expect(!page.action_cursor.hasRestoreAuthority());
+    try std.testing.expect(page.action_cursor.hasOwner());
+
+    try std.testing.expect(page.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .status_only));
+    try std.testing.expect(page.action_cursor.startMember(7, .status, 11));
+    try std.testing.expect(page.action_cursor.finishMember(7, 3, .status, 11, true));
+    try std.testing.expect(controller.navigation.finalizeActionCursor(allocator));
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, page.viewer.selected_target.?);
+}
+
+test "file search supersedes action restore only when submit changes selection" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    var loaded = test_support.loadedDiffTwo();
+    loaded.tree.nodes = &file_search_input_nodes;
+    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadStateWithArena(arena, loaded),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 0 },
+        .source_session_revision = 5,
+        .accepted_sidebar_revision = 7,
+    };
+    defer page.deinit(allocator);
+    try installUpdateTestActionCursor(&page, allocator, "a");
+    const controller: Controller = .{
+        .navigation = .{
+            .page = &page,
+            .repo_root = "/repo",
+            .repo_epoch = 3,
+            .source = .unstaged,
+            .layout = .{ .width = 80, .height = 20 },
+            .diagnostics = .{ .target = &page.status },
+        },
+        .repo_epoch = 3,
+    };
+
+    var enter_same = try controller.apply(allocator, .enter_file_search);
+    enter_same.deinit(allocator);
+    var submit_same = try controller.apply(allocator, .submit_file_search);
+    submit_same.deinit(allocator);
+    try std.testing.expect(page.action_cursor.hasRestoreAuthority());
+
+    var enter_other = try controller.apply(allocator, .enter_file_search);
+    enter_other.deinit(allocator);
+    var move_candidate = try controller.apply(null, .file_search_next);
+    move_candidate.deinit(null);
+    try std.testing.expect(page.action_cursor.hasRestoreAuthority());
+    var submit_other = try controller.apply(allocator, .submit_file_search);
+    submit_other.deinit(allocator);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, page.viewer.selected_target.?);
+    try std.testing.expect(!page.action_cursor.hasRestoreAuthority());
+
+    // The superseded action still reaches its exact terminal and cleans up.
+    try std.testing.expect(page.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .status_only));
+    try std.testing.expect(page.action_cursor.startMember(7, .status, 11));
+    try std.testing.expect(page.action_cursor.finishMember(7, 3, .status, 11, true));
+    try std.testing.expect(controller.navigation.finalizeActionCursor(allocator));
+
+    // Wheel selection uses the same post-transition authority boundary while
+    // a later action is already waiting for its status refresh.
+    try installUpdateTestActionCursor(&page, allocator, "b");
+    try std.testing.expect(page.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .status_only));
+    try std.testing.expect(page.action_cursor.startMember(7, .status, 12));
+    var wheel = try controller.apply(null, .mouse_sidebar_wheel_up);
+    wheel.deinit(null);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, page.viewer.selected_target.?);
+    try std.testing.expect(!page.action_cursor.hasRestoreAuthority());
+    try std.testing.expect(page.action_cursor.finishMember(7, 3, .status, 12, true));
+    try std.testing.expect(controller.navigation.finalizeActionCursor(allocator));
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, page.viewer.selected_target.?);
+}
+
+test "explicit parent selection supersedes file action restore" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    var loaded = test_support.loadedDiffRootedNested();
+    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadStateWithArena(arena, loaded),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 2 },
+    };
+    defer page.deinit(allocator);
+    try installUpdateTestActionCursor(&page, allocator, "src/a");
+    const controller: Controller = .{ .navigation = .{
+        .page = &page,
+        .repo_root = "/repo",
+        .source = .unstaged,
+        .layout = .{ .width = 80, .height = 20 },
+        .diagnostics = .{ .target = &page.status },
+    } };
+
+    var parent = try controller.apply(allocator, .collapse_or_parent_directory);
+    parent.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), page.viewer.selected_node);
+    try std.testing.expect(!page.action_cursor.hasRestoreAuthority());
 }
 
 const file_search_input_nodes = [_]file_tree.Node{

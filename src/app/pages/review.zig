@@ -89,7 +89,11 @@ pub const ReloadKind = enum {
 };
 
 pub const ReloadAnchor = struct {
+    /// Sticky main-pane file identity. A directory/root sidebar cursor does not
+    /// replace this target.
     path_key: []u8,
+    /// Exact sidebar cursor identity, independently owned from `path_key`.
+    sidebar_identity: context.SidebarIdentity,
     selected_target_tag: std.meta.Tag(context.SelectedTarget),
     visible_sidebar_row: usize,
     diff_cursor: diff_view_model.BodyCoordinate,
@@ -101,6 +105,10 @@ pub const ReloadAnchor = struct {
 
     pub fn deinit(self: *ReloadAnchor, allocator: std.mem.Allocator) void {
         allocator.free(self.path_key);
+        switch (self.sidebar_identity) {
+            .repo_root => {},
+            inline .directory, .file => |path| allocator.free(path),
+        }
         self.* = undefined;
     }
 };
@@ -271,6 +279,7 @@ test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
         .kind = .manual,
         .anchor = .{
             .path_key = try allocator.dupe(u8, "src/main.zig"),
+            .sidebar_identity = .{ .file = try allocator.dupe(u8, "src/main.zig") },
             .selected_target_tag = .diff_file,
             .visible_sidebar_row = 3,
             .diff_cursor = .{ .metadata = 0 },
@@ -287,6 +296,7 @@ test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
         .source_session_revision = 11,
         .original = .{
             .path_key = try allocator.dupe(u8, "src/original.zig"),
+            .sidebar_identity = .{ .file = try allocator.dupe(u8, "src/original.zig") },
             .selected_target_tag = .diff_file,
             .visible_sidebar_row = 4,
             .diff_cursor = .{ .metadata = 0 },
@@ -298,6 +308,7 @@ test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
         },
         .override = .{
             .path_key = try allocator.dupe(u8, "src/override.zig"),
+            .sidebar_identity = .{ .file = try allocator.dupe(u8, "src/override.zig") },
             .selected_target_tag = .diff_file,
             .visible_sidebar_row = 5,
             .diff_cursor = .{ .metadata = 0 },

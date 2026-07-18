@@ -61,7 +61,7 @@ pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
     return pending;
 }
 
-pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: *git_ops.HunkStageTarget) !void {
+pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: *git_ops.HunkStageTarget) !actions.PendingAction {
     defer consumeHunkTarget(ctx.allocator(), target);
 
     const pending = action_state.begin(.stage_hunk);
@@ -85,9 +85,10 @@ pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *
     target.patch = &.{};
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    return pending;
 }
 
-pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: *git_ops.HunkUnstageTarget) !void {
+pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: *git_ops.HunkUnstageTarget) !actions.PendingAction {
     defer consumeHunkTarget(ctx.allocator(), target);
 
     const pending = action_state.begin(.unstage_hunk);
@@ -112,6 +113,7 @@ pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
     target.patch = &.{};
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    return pending;
 }
 
 pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, repo_root: []const u8, path: []const u8) !actions.PendingAction {

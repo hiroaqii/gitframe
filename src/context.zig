@@ -57,6 +57,17 @@ pub const SidebarTarget = union(enum) {
     }
 };
 
+/// Stable sidebar row identity across tree/status/source generations.
+///
+/// Unlike `SidebarTarget`, this never stores generation-local file or status
+/// indexes. The path slices are borrowed unless an enclosing owner explicitly
+/// duplicates them.
+pub const SidebarIdentity = union(enum) {
+    repo_root,
+    directory: PathKey,
+    file: PathKey,
+};
+
 /// Action target shown in the main pane.
 ///
 /// This is intentionally separate from the sidebar cursor: selecting a
