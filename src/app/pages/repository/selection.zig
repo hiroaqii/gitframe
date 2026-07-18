@@ -115,6 +115,43 @@ pub const DragSelection = struct {
     }
 };
 
+/// Exclusive owner of Repository pointer gestures.
+///
+/// SH4 contains only the source-range variant, so both predicates currently
+/// return the same value. They remain separate because pointer-stream capture
+/// and source-content borrowing have different policy consumers once a
+/// source-header path owner is introduced in SH5.
+pub const Owner = union(enum) {
+    none,
+    source: DragSelection,
+
+    pub fn activeSource(self: Owner) ?DragSelection {
+        return switch (self) {
+            .none => null,
+            .source => |selection| selection,
+        };
+    }
+
+    /// Whether any gesture owns pane-external drag/release routing and blocks
+    /// a second press or wheel event from replacing the pointer stream.
+    pub fn activeMouseOwner(self: Owner) bool {
+        return switch (self) {
+            .none => false,
+            .source => true,
+        };
+    }
+
+    /// Whether accepted source bytes are borrowed by a live range gesture.
+    /// Page-transition blocking and later deferred source apply use only this
+    /// narrower question, never the aggregate mouse-owner predicate.
+    pub fn activeSourceRange(self: Owner) bool {
+        return switch (self) {
+            .none => false,
+            .source => true,
+        };
+    }
+};
+
 pub const OwnedContentToken = struct {
     repo_epoch: u64,
     root_identity: root_capability.Identity,
@@ -303,6 +340,26 @@ fn testToken(path: []const u8, bytes: []const u8) RepositoryContentToken {
         .path = path,
         .source_fingerprint = Fingerprint.init(bytes),
     };
+}
+
+test "repository selection owner SH4 keeps pointer and source-range predicates explicit" {
+    var owner: Owner = .none;
+    try std.testing.expect(!owner.activeMouseOwner());
+    try std.testing.expect(!owner.activeSourceRange());
+    try std.testing.expect(owner.activeSource() == null);
+
+    owner = .{ .source = DragSelection.init(
+        testToken("main.zig", "source"),
+        .character,
+        pointFromBoundary(0, 0),
+    ) };
+    try std.testing.expect(owner.activeMouseOwner());
+    try std.testing.expect(owner.activeSourceRange());
+    try std.testing.expect(owner.activeSource() != null);
+
+    owner = .none;
+    try std.testing.expect(!owner.activeMouseOwner());
+    try std.testing.expect(!owner.activeSourceRange());
 }
 
 fn testDocument(bytes: []const u8) !source.Document {

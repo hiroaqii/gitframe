@@ -1057,9 +1057,10 @@ pub const RepositoryPageState = struct {
     /// Activation/deactivation and manual reload retain it; an explicit newer
     /// destination, repository replacement, or deinit releases it once.
     incoming: repository_incoming.State = .none,
-    /// Live coordinates borrow `displayed_document`; every owner-replacement
-    /// path must cancel this value before freeing source/path storage.
-    source_selection: ?repository_selection.DragSelection = null,
+    /// Live pointer owners may borrow accepted page storage. Every focus,
+    /// geometry, overlay, repository, manifest, and document replacement path
+    /// must cancel this tagged owner before releasing that storage.
+    selection_owner: repository_selection.Owner = .none,
     /// Release-frozen source identity, coordinates, and text. Unlike the live
     /// gesture, this owns all storage and never blocks reload or page switches.
     completed_selection: ?repository_selection.CompletedSelection = null,
@@ -1113,7 +1114,7 @@ pub const RepositoryPageState = struct {
         self.branch.deinit();
         self.clearFileSearchDocumentAuthority();
         self.incoming.deinit(allocator);
-        self.cancelSourceSelection();
+        self.cancelMouseOwner();
         self.clearCompletedSelection(allocator);
         if (self.bundle) |*bundle| bundle.deinit(allocator);
         if (self.displayed_document) |*document| document.deinit(allocator);
@@ -1171,7 +1172,7 @@ pub const RepositoryPageState = struct {
             const owner = allocator orelse @panic("Repository incoming replacement requires an allocator");
             self.incoming.dismiss(owner);
         }
-        self.cancelSourceSelection();
+        self.cancelMouseOwner();
         if (self.completed_selection != null) {
             const owner = allocator orelse @panic("Repository completed-selection replacement requires an allocator");
             self.clearCompletedSelection(owner);
@@ -1959,7 +1960,7 @@ pub const RepositoryPageState = struct {
         // owned state: retain it only when the incoming document proves the
         // same complete semantic content token. Delivery generations and the
         // replacement allocation itself are intentionally irrelevant.
-        self.cancelSourceSelection();
+        self.cancelMouseOwner();
         self.reconcileCompletedSelectionForDocument(allocator, finished);
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
@@ -2091,7 +2092,7 @@ pub const RepositoryPageState = struct {
 
     fn replaceBundle(self: *RepositoryPageState, allocator: std.mem.Allocator, incoming: *Bundle) !void {
         self.clearFileSearchDocumentAuthority();
-        self.cancelSourceSelection();
+        self.cancelMouseOwner();
         const previous_selected = self.selected_path;
         const previous_cursor_identity = if (self.bundle) |*previous|
             self.tree_projection.cursorIdentity(&previous.tree, self.viewer.tree_cursor)
@@ -2271,7 +2272,7 @@ pub const RepositoryPageState = struct {
         // keyboard navigation/search cannot silently retarget the gesture.
         switch (msg) {
             .mouse_source_drag, .mouse_source_release, .cancel_source_selection => {},
-            else => self.cancelSourceSelection(),
+            else => self.cancelMouseOwner(),
         }
         const previous = self.selected_path;
         const layout = bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
@@ -2330,7 +2331,7 @@ pub const RepositoryPageState = struct {
             .mouse_source_press => |point| self.pressSourceSelection(point, body_size),
             .mouse_source_drag => |point| self.dragSourceSelection(point, body_size),
             .mouse_source_release => |point| result.command = self.releaseSourceSelection(allocator, point, body_size),
-            .cancel_source_selection => self.cancelSourceSelection(),
+            .cancel_source_selection => self.cancelMouseOwner(),
             .mouse_source_wheel_up => if (source) |document| {
                 self.viewer.focus = .source;
                 repository_navigation.moveSource(&self.viewer, document, -1, source_geometry.?);
@@ -2428,7 +2429,7 @@ pub const RepositoryPageState = struct {
 
     fn invalidateSelectedDocument(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
         self.clearFileSearchDocumentAuthority();
-        self.cancelSourceSelection();
+        self.cancelMouseOwner();
         self.clearCompletedSelection(allocator);
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
@@ -2738,12 +2739,22 @@ pub const RepositoryPageState = struct {
         }
     }
 
-    pub fn activeSourceSelection(self: *const RepositoryPageState) bool {
-        return self.source_selection != null;
+    /// Any Repository gesture which owns pane-external drag/release routing
+    /// and excludes replacement press/wheel events.
+    pub fn activeMouseOwner(self: *const RepositoryPageState) bool {
+        return self.selection_owner.activeMouseOwner();
     }
 
-    pub fn cancelSourceSelection(self: *RepositoryPageState) void {
-        self.source_selection = null;
+    /// Only a live source-content range. This is intentionally narrower than
+    /// `activeMouseOwner` for page-transition and deferred-refresh policy.
+    pub fn activeSourceRange(self: *const RepositoryPageState) bool {
+        return self.selection_owner.activeSourceRange();
+    }
+
+    /// End any borrowed Repository pointer owner before its storage or screen
+    /// geometry can be replaced.
+    pub fn cancelMouseOwner(self: *RepositoryPageState) void {
+        self.selection_owner = .none;
     }
 
     fn clearCompletedSelection(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
@@ -2832,22 +2843,27 @@ pub const RepositoryPageState = struct {
         };
         self.viewer.focus = .source;
         self.viewer.source_cursor = line_index;
-        self.source_selection = repository_selection.DragSelection.initAtCell(token, mode, logical_point, .{ .col = point.col, .row = point.row });
+        self.selection_owner = .{ .source = repository_selection.DragSelection.initAtCell(
+            token,
+            mode,
+            logical_point,
+            .{ .col = point.col, .row = point.row },
+        ) };
     }
 
     fn dragSourceSelection(self: *RepositoryPageState, point: ?BodyPoint, body_size: chasen.Size) void {
-        const live = self.source_selection orelse return;
+        var live = self.selection_owner.activeSource() orelse return;
         const local = point orelse return;
         const document = self.currentSource() orelse {
-            self.cancelSourceSelection();
+            self.cancelMouseOwner();
             return;
         };
         const current_token = self.currentContentToken() orelse {
-            self.cancelSourceSelection();
+            self.cancelMouseOwner();
             return;
         };
         if (!live.token.eql(current_token)) {
-            self.cancelSourceSelection();
+            self.cancelMouseOwner();
             return;
         }
         const geometry = self.sourceGeometry(body_size, document);
@@ -2866,7 +2882,8 @@ pub const RepositoryPageState = struct {
             },
         };
         self.viewer.source_cursor = line_index;
-        self.source_selection.?.updateAtCell(logical_point, .{ .col = local.col, .row = local.row });
+        live.updateAtCell(logical_point, .{ .col = local.col, .row = local.row });
+        self.selection_owner = .{ .source = live };
     }
 
     fn releaseSourceSelection(
@@ -2875,9 +2892,9 @@ pub const RepositoryPageState = struct {
         point: ?BodyPoint,
         body_size: chasen.Size,
     ) ?Command {
-        if (self.source_selection == null) return null;
+        if (!self.activeSourceRange()) return null;
         self.dragSourceSelection(point, body_size);
-        const live = self.source_selection orelse {
+        const live = self.selection_owner.activeSource() orelse {
             // A defensive identity failure inside the final drag invalidates
             // the basis for both the gesture and any prior candidate.
             self.clearCompletedSelection(allocator);
@@ -2887,39 +2904,39 @@ pub const RepositoryPageState = struct {
         if (!live.moved) {
             // A click still updates focus/cursor at press time, but it is not a
             // replacement transaction for the prior release-frozen candidate.
-            self.cancelSourceSelection();
+            self.cancelMouseOwner();
             return null;
         }
 
         const document = self.currentSource() orelse {
             self.clearCompletedSelection(allocator);
-            self.cancelSourceSelection();
+            self.cancelMouseOwner();
             self.status.set("Source selection is no longer available", .{});
             return null;
         };
         const current_token = self.currentContentToken() orelse {
             self.clearCompletedSelection(allocator);
-            self.cancelSourceSelection();
+            self.cancelMouseOwner();
             self.status.set("Source selection has no current basis", .{});
             return null;
         };
         if (!live.token.eql(current_token)) {
             self.clearCompletedSelection(allocator);
-            self.cancelSourceSelection();
+            self.cancelMouseOwner();
             self.status.set("Source selection is no longer current", .{});
             return null;
         }
 
         var candidate = repository_selection.buildCompletedSelection(allocator, document, live) catch |err| {
             self.clearCompletedSelection(allocator);
-            self.cancelSourceSelection();
+            self.cancelMouseOwner();
             self.status.set("Could not complete source selection: {s}", .{@errorName(err)});
             return null;
         };
         self.clearCompletedSelection(allocator);
         self.completed_selection = candidate;
         candidate = undefined;
-        self.cancelSourceSelection();
+        self.cancelMouseOwner();
 
         // A real empty line is a useful line anchor but has no clipboard
         // payload. Keep the candidate and deliberately emit no shell command.
@@ -3370,7 +3387,7 @@ fn drawDocumentCheckpoint(
     }
     switch (displayed.value) {
         .source => |*source| {
-            const live_selection = if (state.source_selection) |selection|
+            const live_selection = if (state.selection_owner.activeSource()) |selection|
                 if (state.currentContentToken()) |token|
                     if (selection.token.eql(token)) selection else null
                 else
@@ -6182,53 +6199,53 @@ test "repository selection slice B live gesture fixes mode and resumes after lea
 
     state.source_search.mode = true;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = first_row } }, size);
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
     state.source_search.mode = false;
     state.file_search.mode = true;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = first_row } }, size);
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
     state.file_search.mode = false;
 
     // Separators are focus-only dead space and never create a selection.
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.separator_col.?, .row = first_row } }, size);
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col + 3, .row = first_row } }, size);
-    try std.testing.expect(state.activeSourceSelection());
-    try std.testing.expectEqual(repository_selection.Mode.character, state.source_selection.?.mode);
-    try std.testing.expectEqual(@as(usize, 3), state.source_selection.?.anchor.leading_byte);
-    try std.testing.expectEqual(@as(usize, 4), state.source_selection.?.anchor.trailing_byte);
+    try std.testing.expect(state.activeSourceRange());
+    try std.testing.expectEqual(repository_selection.Mode.character, state.selection_owner.activeSource().?.mode);
+    try std.testing.expectEqual(@as(usize, 3), state.selection_owner.activeSource().?.anchor.leading_byte);
+    try std.testing.expectEqual(@as(usize, 4), state.selection_owner.activeSource().?.anchor.trailing_byte);
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_drag = null }, size);
-    try std.testing.expect(!state.source_selection.?.moved);
+    try std.testing.expect(!state.selection_owner.activeSource().?.moved);
     _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{ .col = geometry.text_col + 4, .row = first_row + 1 } }, size);
-    try std.testing.expect(state.source_selection.?.moved);
-    try std.testing.expectEqual(@as(usize, 1), state.source_selection.?.focus.line_index);
-    try std.testing.expectEqual(@as(usize, 5), state.source_selection.?.focus.trailing_byte);
-    try std.testing.expectEqual(repository_selection.Mode.character, state.source_selection.?.mode);
+    try std.testing.expect(state.selection_owner.activeSource().?.moved);
+    try std.testing.expectEqual(@as(usize, 1), state.selection_owner.activeSource().?.focus.line_index);
+    try std.testing.expectEqual(@as(usize, 5), state.selection_owner.activeSource().?.focus.trailing_byte);
+    try std.testing.expectEqual(repository_selection.Mode.character, state.selection_owner.activeSource().?.mode);
 
     // A character drag entering its own gutter clamps to the leading logical
     // boundary; it does not switch to whole-line mode.
     _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{ .col = geometry.gutter_col, .row = first_row + 1 } }, size);
-    try std.testing.expectEqual(repository_selection.Mode.character, state.source_selection.?.mode);
-    try std.testing.expectEqual(@as(usize, 0), state.source_selection.?.focus.leading_byte);
-    try std.testing.expectEqual(@as(usize, 0), state.source_selection.?.focus.trailing_byte);
+    try std.testing.expectEqual(repository_selection.Mode.character, state.selection_owner.activeSource().?.mode);
+    try std.testing.expectEqual(@as(usize, 0), state.selection_owner.activeSource().?.focus.leading_byte);
+    try std.testing.expectEqual(@as(usize, 0), state.selection_owner.activeSource().?.focus.trailing_byte);
     var character_release = state.applyNavigation(allocator, .{ .mouse_source_release = null }, size);
     defer character_release.deinit(allocator);
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.gutter_col, .row = first_row } }, size);
-    try std.testing.expectEqual(repository_selection.Mode.line, state.source_selection.?.mode);
+    try std.testing.expectEqual(repository_selection.Mode.line, state.selection_owner.activeSource().?.mode);
     _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{ .col = geometry.text_col + 2, .row = first_row + 1 } }, size);
-    try std.testing.expectEqual(repository_selection.Mode.line, state.source_selection.?.mode);
-    try std.testing.expectEqual(@as(usize, 1), state.source_selection.?.focus.line_index);
+    try std.testing.expectEqual(repository_selection.Mode.line, state.selection_owner.activeSource().?.mode);
+    try std.testing.expectEqual(@as(usize, 1), state.selection_owner.activeSource().?.focus.line_index);
     var line_release = state.applyNavigation(allocator, .{ .mouse_source_release = .{ .col = geometry.text_col + 2, .row = first_row + 1 } }, size);
     defer line_release.deinit(allocator);
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.line_number_col, .row = first_row } }, size);
-    try std.testing.expectEqual(repository_selection.Mode.line, state.source_selection.?.mode);
-    state.cancelSourceSelection();
+    try std.testing.expectEqual(repository_selection.Mode.line, state.selection_owner.activeSource().?.mode);
+    state.cancelMouseOwner();
 }
 
 test "repository selection slice B hit testing applies scroll once and follows line number geometry" {
@@ -6242,19 +6259,19 @@ test "repository selection slice B hit testing applies scroll once and follows l
 
     state.viewer.source_horizontal_scroll = 2;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col + 1, .row = first_row } }, size);
-    try std.testing.expectEqual(@as(usize, 3), state.source_selection.?.anchor.leading_byte);
-    state.cancelSourceSelection();
+    try std.testing.expectEqual(@as(usize, 3), state.selection_owner.activeSource().?.anchor.leading_byte);
+    state.cancelMouseOwner();
 
     state.viewer.source_horizontal_scroll = 0;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col + 20, .row = first_row } }, size);
-    try std.testing.expectEqual(@as(usize, "ABCDEFG".len), state.source_selection.?.anchor.leading_byte);
-    try std.testing.expectEqual(@as(usize, "ABCDEFG".len), state.source_selection.?.anchor.trailing_byte);
-    state.cancelSourceSelection();
+    try std.testing.expectEqual(@as(usize, "ABCDEFG".len), state.selection_owner.activeSource().?.anchor.leading_byte);
+    try std.testing.expectEqual(@as(usize, "ABCDEFG".len), state.selection_owner.activeSource().?.anchor.trailing_byte);
+    state.cancelMouseOwner();
 
     state.viewer.source_vertical_scroll = 1;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = first_row } }, size);
-    try std.testing.expectEqual(@as(usize, 1), state.source_selection.?.anchor.line_index);
-    state.cancelSourceSelection();
+    try std.testing.expectEqual(@as(usize, 1), state.selection_owner.activeSource().?.anchor.line_index);
+    state.cancelMouseOwner();
 
     state.viewer.source_vertical_scroll = 0;
     state.viewer.source_horizontal_scroll = 0;
@@ -6262,8 +6279,8 @@ test "repository selection slice B hit testing applies scroll once and follows l
     geometry = state.sourceGeometry(size, document);
     try std.testing.expectEqual(@as(u16, 1), geometry.text_col);
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
-    try std.testing.expectEqual(repository_selection.Mode.character, state.source_selection.?.mode);
-    try std.testing.expectEqual(@as(usize, 0), state.source_selection.?.anchor.leading_byte);
+    try std.testing.expectEqual(repository_selection.Mode.character, state.selection_owner.activeSource().?.mode);
+    try std.testing.expectEqual(@as(usize, 0), state.selection_owner.activeSource().?.anchor.leading_byte);
 }
 
 test "repository selection slice B synthetic empty row rejects every gesture stage" {
@@ -6274,12 +6291,12 @@ test "repository selection slice B synthetic empty row rejects every gesture sta
     const geometry = state.sourceGeometry(size, state.currentSource().?);
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.gutter_col, .row = geometry.body_first_row } }, size);
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
     _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
     var release = state.applyNavigation(allocator, .{ .mouse_source_release = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
     defer release.deinit(allocator);
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
 }
 
 test "repository selection slice B owner replacement cancels live borrowed selection first" {
@@ -6290,14 +6307,14 @@ test "repository selection slice B owner replacement cancels live borrowed selec
     const geometry = state.sourceGeometry(size, state.currentSource().?);
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
-    try std.testing.expect(state.activeSourceSelection());
+    try std.testing.expect(state.activeSourceRange());
     state.viewer.focus = .tree;
     try std.testing.expect(state.applyNavigation(allocator, .move_down, size).selected_path_changed);
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
     try std.testing.expect(state.displayed_document == null);
 
     state.repositoryChanged(allocator, 9, .{ .device = 10, .inode = 11 });
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
     try std.testing.expect(state.bundle == null);
 }
 
@@ -6309,17 +6326,17 @@ test "repository selection slice B accepted manifest and document replacement ca
     var geometry = state.sourceGeometry(size, state.currentSource().?);
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
-    try std.testing.expect(state.activeSourceSelection());
+    try std.testing.expect(state.activeSourceRange());
     var incoming = try bundleForTest("main.zig\x00");
     var incoming_owned = true;
     defer if (incoming_owned) incoming.deinit(allocator);
     try state.replaceBundle(allocator, &incoming);
     incoming_owned = false;
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
 
     geometry = state.sourceGeometry(size, state.currentSource().?);
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
-    try std.testing.expect(state.activeSourceSelection());
+    try std.testing.expect(state.activeSourceRange());
     state.document_generation = 8;
     state.pending_document_generation = 8;
     // Byte-identical content still arrives in separately owned storage; Slice
@@ -6335,7 +6352,7 @@ test "repository selection slice B accepted manifest and document replacement ca
     };
     defer replacement.deinit(allocator);
     try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &replacement));
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
     try std.testing.expectEqualStrings("old source", state.currentSource().?.lineBody(0).?);
 }
 
@@ -6356,7 +6373,7 @@ test "repository selection slice C moved release installs candidate and independ
     } }, size);
     var update = state.applyNavigation(allocator, .{ .mouse_source_release = null }, size);
     defer update.deinit(allocator);
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
     try std.testing.expect(state.completed_selection != null);
     try std.testing.expectEqualStrings("DEFG\nHIJKL", state.completed_selection.?.text);
     var command = update.takeCommand() orelse return error.ExpectedSourceCopyCommand;
@@ -6423,14 +6440,14 @@ test "repository selection slice C candidate and clipboard allocation failures h
             repository_selection.pointFromBoundary(0, 0),
         );
         live.update(repository_selection.pointFromBoundary(0, line.len));
-        state.source_selection = live;
+        state.selection_owner = .{ .source = live };
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 0 });
         defer state.deinit(failing.allocator());
         var update = state.applyNavigation(failing.allocator(), .{ .mouse_source_release = null }, size);
         defer update.deinit(failing.allocator());
         try std.testing.expect(update.command == null);
         try std.testing.expect(state.completed_selection == null);
-        try std.testing.expect(!state.activeSourceSelection());
+        try std.testing.expect(!state.activeSourceRange());
     }
 
     var observed_clipboard_failure = false;
@@ -6447,13 +6464,13 @@ test "repository selection slice C candidate and clipboard allocation failures h
             repository_selection.pointFromBoundary(0, 0),
         );
         live.update(repository_selection.pointFromBoundary(0, line.len));
-        state.source_selection = live;
+        state.selection_owner = .{ .source = live };
         var update = state.applyNavigation(failing.allocator(), .{ .mouse_source_release = null }, size);
         defer update.deinit(failing.allocator());
         if (state.completed_selection != null and update.command == null) {
             observed_clipboard_failure = true;
             try std.testing.expectEqualStrings("ABC", state.completed_selection.?.text);
-            try std.testing.expect(!state.activeSourceSelection());
+            try std.testing.expect(!state.activeSourceRange());
         }
     }
     try std.testing.expect(observed_clipboard_failure);
@@ -6472,13 +6489,13 @@ test "repository selection slice C stale release clears prior candidate" {
         repository_selection.pointFromLine(0),
     );
     live.moved = true;
-    state.source_selection = live;
+    state.selection_owner = .{ .source = live };
 
     var update = state.applyNavigation(allocator, .{ .mouse_source_release = null }, .{ .width = 60, .height = 6 });
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
     try std.testing.expect(state.completed_selection == null);
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
 }
 
 test "repository selection slice C real empty line keeps candidate without copy command" {
@@ -6491,7 +6508,7 @@ test "repository selection slice C real empty line keeps candidate without copy 
         repository_selection.pointFromLine(0),
     );
     live.moved = true;
-    state.source_selection = live;
+    state.selection_owner = .{ .source = live };
 
     var update = state.applyNavigation(allocator, .{ .mouse_source_release = null }, .{ .width = 60, .height = 6 });
     defer update.deinit(allocator);
@@ -6601,18 +6618,18 @@ test "repository selection slice D retains candidate across inactive page and pr
         .col = geometry.text_col,
         .row = geometry.body_first_row,
     } }, size);
-    try std.testing.expect(state.activeSourceSelection());
+    try std.testing.expect(state.activeSourceRange());
     _ = state.applyNavigation(allocator, .cancel_source_selection, size);
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
     try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
         .col = geometry.text_col,
         .row = geometry.body_first_row,
     } }, size);
-    state.cancelSourceSelection();
+    state.cancelMouseOwner();
     state.clampForBodySize(.{ .width = 50, .height = 5 });
-    try std.testing.expect(!state.activeSourceSelection());
+    try std.testing.expect(!state.activeSourceRange());
     try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
 }
 

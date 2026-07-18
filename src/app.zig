@@ -542,7 +542,7 @@ pub const App = struct {
                 // borrow before changing layout, then drain deferred owners at
                 // the common post-update boundary below.
                 self.reviewNavigation().terminateDiffSelection();
-                self.pages.repository.cancelSourceSelection();
+                self.pages.repository.cancelMouseOwner();
                 const previous_width = self.reviewNavigationView().diffPaneWidth();
                 const previous_mode = self.reviewNavigationView().effectiveDisplayMode();
                 self.terminal_size = size;
@@ -577,7 +577,7 @@ pub const App = struct {
             .commit_panel_move_up => self.commit_panel.moveUp(),
             .commit_panel_move_down => self.commit_panel.moveDown(),
             .enter_repo_picker => {
-                if (self.active_page == .repository) self.pages.repository.cancelSourceSelection();
+                if (self.active_page == .repository) self.pages.repository.cancelMouseOwner();
                 try self.enterRepoPickerMode(ctx.allocator());
             },
             .cancel_repo_picker => try self.cancelRepoPickerMode(ctx.allocator()),
@@ -602,7 +602,7 @@ pub const App = struct {
             .repo_picker_move_right => self.moveRepoPickerCursorRight(),
             .open_help => {
                 if (self.active_page == .review) self.reviewNavigation().clearDiffSelection();
-                if (self.active_page == .repository) self.pages.repository.cancelSourceSelection();
+                if (self.active_page == .repository) self.pages.repository.cancelMouseOwner();
                 self.overlay.openHelpForPage(self.active_page);
             },
             .close_help => self.overlay.close(),
@@ -660,7 +660,7 @@ pub const App = struct {
             .auto_reload_tick => try self.autoReloadTick(ctx),
             .focus_lost => switch (self.active_page) {
                 .review => self.reviewNavigation().terminateDiffSelection(),
-                .repository => self.pages.repository.cancelSourceSelection(),
+                .repository => self.pages.repository.cancelMouseOwner(),
                 .history, .config => {},
             },
             .git_action_spinner_tick => self.gitActionSpinnerTick(ctx),
@@ -1150,7 +1150,7 @@ pub const App = struct {
                 else => {},
             }
         }
-        if (self.pages.repository.activeSourceSelection()) {
+        if (self.pages.repository.activeMouseOwner()) {
             const body_point: ?repository_page.BodyPoint = if (self.bodyMousePoint(mouse)) |point|
                 .{ .col = point.col, .row = point.row }
             else
@@ -1208,7 +1208,7 @@ pub const App = struct {
         // Page-bar presses above still reach the common blocker and explain
         // why the switch was rejected. Inside the Repository body, a second
         // press or wheel event cannot replace the active gesture implicitly.
-        if (self.pages.repository.activeSourceSelection()) return null;
+        if (self.pages.repository.activeMouseOwner()) return null;
         if (self.active_page == .repository) {
             const point = self.shellLayout().terminalToBody(mouse.col, mouse.row) orelse return null;
             const button: repository_page.MouseButton = switch (mouse.button) {
@@ -1351,7 +1351,7 @@ pub const App = struct {
     fn pageTransitionSnapshot(self: *const App) page_transition.Snapshot {
         return .{
             .review_mouse_selection = self.pages.review.selection_owner.activeMouseSelection(),
-            .repository_mouse_selection = self.pages.repository.activeSourceSelection(),
+            .repository_mouse_selection = self.pages.repository.activeSourceRange(),
             .review_deferred_apply = self.pages.review.deferred_source_apply != null,
             .review_search = self.pages.review.search.mode,
             .review_file_search = self.pages.review.file_search.mode,
@@ -8894,7 +8894,9 @@ test "repository selection slice B drag routes first and outside release termina
         .terminal_size = .{ .width = 100, .height = 20 },
     };
     app.pages.repository.viewer.tree_width = 42;
-    app.pages.repository.source_selection = repositoryLiveSelectionForTest();
+    app.pages.repository.selection_owner = .{ .source = repositoryLiveSelectionForTest() };
+    try std.testing.expect(app.pages.repository.activeMouseOwner());
+    try std.testing.expect(app.pages.repository.activeSourceRange());
     const shell = app.shellLayout();
     const body_size = shell.bodySize();
     const tree_width = repository_page.bodyLayout(
@@ -8919,6 +8921,19 @@ test "repository selection slice B drag routes first and outside release termina
         else => return error.ExpectedRepositoryDrag,
     }
 
+    // Pointer-stream ownership is broader than source-range policy: a second
+    // press or wheel cannot replace the gesture before its release terminal.
+    try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(
+        shell.body.col + tree_width + 2,
+        shell.body.row + 2,
+        .left,
+    )) == null);
+    try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(
+        shell.body.col + tree_width + 2,
+        shell.body.row + 2,
+        .wheel_down,
+    )) == null);
+
     const release = app.handleEvent(app_test_support.mouseEventTyped(0, 0, .left, .release)) orelse
         return error.ExpectedRepositoryRelease;
     switch (release) {
@@ -8930,7 +8945,8 @@ test "repository selection slice B drag routes first and outside release termina
     }
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.update(release, &ctx);
-    try std.testing.expect(!app.pages.repository.activeSourceSelection());
+    try std.testing.expect(!app.pages.repository.activeSourceRange());
+    try std.testing.expect(!app.pages.repository.activeMouseOwner());
 }
 
 test "repository selection slice B shell blocks transition and cancels on focus or resize" {
@@ -8938,12 +8954,15 @@ test "repository selection slice B shell blocks transition and cancels on focus 
         .active_page = .repository,
         .terminal_size = .{ .width = 100, .height = 20 },
     };
-    app.pages.repository.source_selection = repositoryLiveSelectionForTest();
+    app.pages.repository.selection_owner = .{ .source = repositoryLiveSelectionForTest() };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    try std.testing.expect(!@hasField(app_input.KeyContext, "repository_mouse_selection"));
+    try std.testing.expect(app.pages.repository.activeMouseOwner());
+    try std.testing.expect(app.pages.repository.activeSourceRange());
 
     try app.update(.{ .switch_page = .history }, &ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
-    try std.testing.expect(app.pages.repository.activeSourceSelection());
+    try std.testing.expect(app.pages.repository.activeSourceRange());
     try std.testing.expectEqualStrings("finish Repository mouse selection before switching pages", app.status.text());
 
     app.status.clear();
@@ -8954,15 +8973,17 @@ test "repository selection slice B shell blocks transition and cancels on focus 
         return error.ExpectedPageSwitch;
     try app.update(mouse_switch, &ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
-    try std.testing.expect(app.pages.repository.activeSourceSelection());
+    try std.testing.expect(app.pages.repository.activeSourceRange());
     try std.testing.expectEqualStrings("finish Repository mouse selection before switching pages", app.status.text());
 
     try app.update(.focus_lost, &ctx);
-    try std.testing.expect(!app.pages.repository.activeSourceSelection());
+    try std.testing.expect(!app.pages.repository.activeSourceRange());
+    try std.testing.expect(!app.pages.repository.activeMouseOwner());
 
-    app.pages.repository.source_selection = repositoryLiveSelectionForTest();
+    app.pages.repository.selection_owner = .{ .source = repositoryLiveSelectionForTest() };
     try app.update(.{ .terminal_resized = .{ .width = 70, .height = 12 } }, &ctx);
-    try std.testing.expect(!app.pages.repository.activeSourceSelection());
+    try std.testing.expect(!app.pages.repository.activeSourceRange());
+    try std.testing.expect(!app.pages.repository.activeMouseOwner());
     try std.testing.expectEqual(chasen.Size{ .width = 70, .height = 12 }, app.terminal_size);
 }
 
