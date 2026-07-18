@@ -263,6 +263,7 @@ pub const DocumentFinished = struct {
 
 pub const Msg = union(enum) {
     manifest_finished: ManifestFinished,
+    branch_finished: BranchFinished,
     document_finished: DocumentFinished,
     syntax_finished: SyntaxFinished,
     change_map_finished: ChangeMapFinished,
@@ -318,6 +319,7 @@ pub const Msg = union(enum) {
     pub fn deinitUndelivered(self: *Msg, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .manifest_finished => |*finished| finished.deinit(allocator),
+            .branch_finished => |*finished| finished.deinit(),
             .document_finished => |*finished| finished.deinit(allocator),
             .syntax_finished => |*finished| finished.deinit(allocator),
             .change_map_finished => |*finished| finished.deinit(allocator),
@@ -404,6 +406,126 @@ pub fn ManifestTask(comptime AppMsg: type) type {
             };
             return .{ .repository = .{ .manifest_finished = finished } };
         }
+    };
+}
+
+/// Repository branch task. The prepared request owns both forms of root
+/// evidence: `root_path` is checked immediately around the read, while the
+/// duplicated descriptor is the only cwd authority passed to Git.
+pub fn BranchTask(comptime AppMsg: type) type {
+    return struct {
+        request: BranchRequest,
+        /// Borrowed from process initialization. App and Chasen keep this map
+        /// alive until every started task reaches `run` or `failed` cleanup.
+        env_map: ?*const std.process.Environ.Map,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+            defer task.request.deinit(allocator);
+            const finished = BranchFinished{
+                .identity = task.request.identity,
+                .root_identity = task.request.root.identity,
+                .generation = task.request.generation,
+                .result = runRepositoryBranchLoadChecked(
+                    task.request.root_path,
+                    task.request.root,
+                    task.env_map,
+                    allocator,
+                    io,
+                ),
+            };
+            return .{ .repository = .{ .branch_finished = finished } };
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            defer allocator.destroy(task);
+            defer task.request.deinit(allocator);
+            const finished = BranchFinished{
+                .identity = task.request.identity,
+                .root_identity = task.request.root.identity,
+                .generation = task.request.generation,
+                .result = .{ .failed = switch (failure) {
+                    .start_failed => .start_failed,
+                    .runtime_abandoned => .runtime_abandoned,
+                } },
+            };
+            return .{ .repository = .{ .branch_finished = finished } };
+        }
+    };
+}
+
+const RepositoryBranchReadFn = *const fn (
+    context: ?*anyopaque,
+    cwd: std.Io.Dir,
+    env_map: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) repository_branch.Result;
+
+fn runRepositoryBranchLoadChecked(
+    root_path: []const u8,
+    root: root_capability.RootCapability,
+    env_map: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) repository_branch.Result {
+    return runRepositoryBranchLoadCheckedWithReader(
+        root_path,
+        root,
+        env_map,
+        allocator,
+        io,
+        null,
+        readRepositoryBranchStatus,
+    );
+}
+
+/// The private reader seam exists so replacement tests can deterministically
+/// move the canonical path after the descriptor read but before the post-check.
+/// Production always selects `readRepositoryBranchStatus`.
+fn runRepositoryBranchLoadCheckedWithReader(
+    root_path: []const u8,
+    root: root_capability.RootCapability,
+    env_map: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    reader_context: ?*anyopaque,
+    reader: RepositoryBranchReadFn,
+) repository_branch.Result {
+    if (!root_capability.pathMatches(root_path, root.identity)) {
+        return .{ .failed = .root_changed };
+    }
+    var result = reader(reader_context, root.dir(), env_map, allocator, io);
+    if (!root_capability.pathMatches(root_path, root.identity)) {
+        // A successful backend result may own a complete arena. Close it here
+        // before replacing the payload with the path-membership terminal.
+        result.deinit();
+        return .{ .failed = .root_changed };
+    }
+    return result;
+}
+
+fn readRepositoryBranchStatus(
+    _: ?*anyopaque,
+    cwd: std.Io.Dir,
+    env_map: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) repository_branch.Result {
+    var backend: git_backend.LocalCommandBackend = .{};
+    const raw = backend.backend().loadBranchStatus(allocator, io, .{
+        .cwd = .{ .dir = cwd },
+        .parent_env = env_map,
+    }) catch return .{ .failed = .load_failed };
+    return switch (raw) {
+        .ok => |bundle| .{ .loaded = bundle },
+        .failed => |message| blk: {
+            allocator.free(message);
+            break :blk .{ .failed = .load_failed };
+        },
+        .failed_static => .{ .failed = .load_failed },
     };
 }
 
@@ -2251,7 +2373,7 @@ pub const RepositoryPageState = struct {
                 };
                 self.refreshFileSearch();
             },
-            .manifest_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
+            .manifest_finished, .branch_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
         }
         if (!optionalPathEql(previous, self.selected_path)) {
             self.invalidateSelectedDocument(allocator);
@@ -2812,6 +2934,7 @@ fn navigationDismissesIncoming(msg: Msg) bool {
         .cancel_source_search,
         .cancel_file_search,
         .manifest_finished,
+        .branch_finished,
         .document_finished,
         .syntax_finished,
         .change_map_finished,
@@ -4844,6 +4967,171 @@ const TestRoot = struct {
 };
 
 const TaskIdentityTestMsg = union(enum) { repository: Msg };
+
+fn initializeBranchTaskRepository(root: *TestRoot) !void {
+    const io = std.testing.io;
+    try runRepositoryTestGit(io, root.tmp.dir, &.{ "git", "init", "--initial-branch=main" });
+    try root.tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "base\n" });
+    try runRepositoryTestGit(io, root.tmp.dir, &.{ "git", "add", "tracked.txt" });
+    try runRepositoryTestGit(io, root.tmp.dir, &.{
+        "git",
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "base",
+    });
+}
+
+test "Repository branch task reads through its descriptor and posts an owned completion" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    try initializeBranchTaskRepository(&root);
+    var state: RepositoryPageState = .{};
+    defer state.deinit(allocator);
+    state.activate(3, root.capability.identity);
+
+    var request = try state.prepareBranchRequest(allocator, root.path, &root.capability);
+    const Branch = BranchTask(TaskIdentityTestMsg);
+    const task = allocator.create(Branch) catch |err| {
+        request.deinit(allocator);
+        return err;
+    };
+    task.* = .{ .request = request, .env_map = null };
+    var message = Branch.run(task, allocator, std.testing.io);
+    defer message.repository.deinitUndelivered(allocator);
+    switch (message.repository) {
+        .branch_finished => |*finished| {
+            try std.testing.expect(root.capability.identity.eql(finished.root_identity));
+            try std.testing.expect(finished.result == .loaded);
+            try std.testing.expectEqualStrings("main", finished.result.loaded.status.branchName().?);
+            try std.testing.expectEqual(BranchApplyOutcome.changed, state.applyBranchFinished(finished));
+        },
+        else => return error.ExpectedBranchCompletion,
+    }
+}
+
+test "Repository branch task failure callback preserves typed runtime ownership" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state: RepositoryPageState = .{};
+    defer state.deinit(allocator);
+    state.activate(4, root.capability.identity);
+
+    var request = try state.prepareBranchRequest(allocator, root.path, &root.capability);
+    const Branch = BranchTask(TaskIdentityTestMsg);
+    const task = allocator.create(Branch) catch |err| {
+        request.deinit(allocator);
+        return err;
+    };
+    task.* = .{ .request = request, .env_map = null };
+    var message = Branch.failed(task, .runtime_abandoned, allocator);
+    defer message.repository.deinitUndelivered(allocator);
+    switch (message.repository) {
+        .branch_finished => |finished| {
+            try std.testing.expect(root.capability.identity.eql(finished.root_identity));
+            try std.testing.expectEqual(repository_branch.Failure.runtime_abandoned, finished.result.failed);
+        },
+        else => return error.ExpectedBranchCompletion,
+    }
+}
+
+const BranchReplacementReader = struct {
+    tmp: *std.testing.TmpDir,
+    original: []const u8,
+    parked: []const u8,
+    replacement: []const u8,
+
+    fn readThenReplace(
+        context: ?*anyopaque,
+        cwd: std.Io.Dir,
+        env_map: ?*const std.process.Environ.Map,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) repository_branch.Result {
+        var result = readRepositoryBranchStatus(null, cwd, env_map, allocator, io);
+        if (result != .loaded) return result;
+        const self: *BranchReplacementReader = @ptrCast(@alignCast(context.?));
+        self.tmp.dir.rename(self.original, self.tmp.dir, self.parked, io) catch {
+            result.deinit();
+            return .{ .failed = .load_failed };
+        };
+        self.tmp.dir.rename(self.replacement, self.tmp.dir, self.original, io) catch {
+            result.deinit();
+            return .{ .failed = .load_failed };
+        };
+        return result;
+    }
+};
+
+fn expectRepositoryBranchPostCheckRejectsReplacement(ancestor: bool) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const original = if (ancestor) "base" else "repo";
+    const parked = if (ancestor) "old-base" else "old-repo";
+    const replacement = "replacement";
+    const relative_root = if (ancestor) "base/repo" else "repo";
+    const replacement_root = if (ancestor) "replacement/repo" else replacement;
+    if (ancestor) {
+        try tmp.dir.createDirPath(io, relative_root);
+        try tmp.dir.createDirPath(io, replacement_root);
+    } else {
+        try tmp.dir.createDir(io, relative_root, .default_dir);
+        try tmp.dir.createDir(io, replacement_root, .default_dir);
+    }
+    {
+        var work = try tmp.dir.openDir(io, relative_root, .{});
+        defer work.close(io);
+        try runRepositoryTestGit(io, work, &.{ "git", "init", "--initial-branch=main" });
+        try work.writeFile(io, .{ .sub_path = "tracked.txt", .data = "base\n" });
+        try runRepositoryTestGit(io, work, &.{ "git", "add", "tracked.txt" });
+        try runRepositoryTestGit(io, work, &.{
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "base",
+        });
+    }
+    const root_path = try tmp.dir.realPathFileAlloc(io, relative_root, allocator);
+    defer allocator.free(root_path);
+    var root = try root_capability.RootCapability.openCanonical(root_path);
+    defer root.deinit();
+    var reader = BranchReplacementReader{
+        .tmp = &tmp,
+        .original = original,
+        .parked = parked,
+        .replacement = replacement,
+    };
+    var result = runRepositoryBranchLoadCheckedWithReader(
+        root_path,
+        root,
+        null,
+        allocator,
+        io,
+        &reader,
+        BranchReplacementReader.readThenReplace,
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(repository_branch.Failure.root_changed, result.failed);
+}
+
+test "Repository branch task post-check rejects final root replacement" {
+    try expectRepositoryBranchPostCheckRejectsReplacement(false);
+}
+
+test "Repository branch task post-check rejects ancestor replacement" {
+    try expectRepositoryBranchPostCheckRejectsReplacement(true);
+}
 
 test "Repository branch terminal does not mutate the primary page status" {
     var root = try TestRoot.init();

@@ -79,9 +79,9 @@ pub const Result = union(enum) {
     }
 };
 
-/// Owned completion payload. C1b will place this type on Repository's message
-/// route; defining cleanup beside the result makes normal and undelivered
-/// ownership use the same terminal operation.
+/// Owned completion payload carried by Repository's branch message route.
+/// Defining cleanup beside the result keeps normal and undelivered ownership
+/// on the same terminal operation.
 pub const Finished = struct {
     identity: app_page.RequestIdentity,
     root_identity: root_capability.Identity,
