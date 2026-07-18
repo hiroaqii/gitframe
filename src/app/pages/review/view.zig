@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const draw = @import("draw");
+const branch_chrome = @import("../../branch_chrome.zig");
 const app_load_state = @import("../../load_state.zig");
 const app_page = @import("../../page.zig");
 const review_projection = @import("../../review_projection.zig");
@@ -971,92 +972,8 @@ fn branchStatusSidebarText(page: *const review_page.ReviewPageState, repo_root: 
     const snapshot_root = page.branch_status.repo_root orelse return null;
     if (!std.mem.eql(u8, root, snapshot_root)) return null;
 
-    return formatSidebarBranchStatus(allocator, page.branch_status.status, available_width) catch "branch";
-}
-
-fn formatSidebarBranchStatus(allocator: std.mem.Allocator, status: git_branch_status.BranchStatus, available_width: u16) ![]const u8 {
-    const branch = switch (status.head) {
-        .branch => |name| name,
-        .detached => return "detached",
-        .unknown => return "unknown branch",
-    };
-    var allocated_suffix: ?[]const u8 = null;
-    defer if (allocated_suffix) |suffix| allocator.free(suffix);
-    const suffix = if (status.upstream == null)
-        " no upstream"
-    else blk: {
-        const ahead = if (status.ahead_behind) |ab| ab.ahead else 0;
-        allocated_suffix = try std.fmt.allocPrint(allocator, " ↑{d}", .{ahead});
-        break :blk allocated_suffix.?;
-    };
-    const reserved = chasen.text.displayWidth(suffix);
-    const branch_width = if (available_width > reserved) available_width - reserved else 0;
-    const display_branch = try branchPrefixTail(allocator, branch, branch_width);
-    defer allocator.free(display_branch);
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ display_branch, suffix });
-}
-
-fn branchPrefixTail(allocator: std.mem.Allocator, branch: []const u8, width: u16) ![]const u8 {
-    if (width == 0) return allocator.dupe(u8, "");
-    if (chasen.text.displayWidth(branch) <= width) return allocator.dupe(u8, branch);
-    const slash = std.mem.indexOfScalar(u8, branch, '/') orelse return markedClipToOwned(allocator, branch, width);
-    const prefix = branch[0 .. slash + 1];
-    const marker = "…";
-    const prefix_width = chasen.text.displayWidth(prefix);
-    const marker_width = chasen.text.displayWidth(marker);
-    if (width <= prefix_width + marker_width) return markedClipToOwned(allocator, branch, width);
-    // Keep branch class prefixes such as "feature/" while preserving the
-    // ticket/topic tail that usually disambiguates long branch names.
-    const tail_width = width - prefix_width - marker_width;
-    const tail_source = branch[slash + 1 ..];
-    const tail_source_width = chasen.text.displayWidth(tail_source);
-    const tail = chasen.text.dropToWidth(tail_source, tail_source_width - tail_width);
-    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, marker, tail });
-}
-
-fn markedClipToOwned(allocator: std.mem.Allocator, text: []const u8, width: u16) ![]const u8 {
-    const clipped = chasen.text.clipToWidthWithMarker(text, width, "…");
-    if (clipped.marker.len == 0) return allocator.dupe(u8, clipped.prefix);
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ clipped.prefix, clipped.marker });
-}
-
-test "formatSidebarBranchStatus distinguishes upstream state" {
-    const with_upstream = try formatSidebarBranchStatus(std.testing.allocator, .{
-        .head = .{ .branch = "feature/topic" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
-        .ahead_behind = .{ .ahead = 2, .behind = 1 },
-    }, 80);
-    defer std.testing.allocator.free(with_upstream);
-    try std.testing.expectEqualStrings("feature/topic ↑2", with_upstream);
-
-    const without_upstream = try formatSidebarBranchStatus(std.testing.allocator, .{
-        .head = .{ .branch = "feature/topic" },
-    }, 80);
-    defer std.testing.allocator.free(without_upstream);
-    try std.testing.expectEqualStrings("feature/topic no upstream", without_upstream);
-}
-
-test "formatSidebarBranchStatus keeps branch prefix and tail when clipped" {
-    const text = try formatSidebarBranchStatus(std.testing.allocator, .{
-        .head = .{ .branch = "feature/very-long-ticket-name" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
-        .ahead_behind = .{ .ahead = 0, .behind = 0 },
-    }, 22);
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.startsWith(u8, text, "feature/…"));
-    try std.testing.expect(std.mem.endsWith(u8, text, " ↑0"));
-}
-
-test "formatSidebarBranchStatus omits behind count" {
-    const text = try formatSidebarBranchStatus(std.testing.allocator, .{
-        .head = .{ .branch = "main" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
-        .ahead_behind = .{ .ahead = 0, .behind = 7 },
-    }, 80);
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expectEqualStrings("main ↑0", text);
+    const formatted = branch_chrome.formatBaseLabel(allocator, page.branch_status.status, available_width) catch return "branch";
+    return formatted.text;
 }
 
 test "branch sidebar retains background snapshot but shows foreground loading" {

@@ -28,6 +28,7 @@ test {
     _ = @import("app_test.zig");
     _ = @import("app/actions.zig");
     _ = @import("app/auto_reload.zig");
+    _ = @import("app/branch_chrome.zig");
     _ = @import("app/commit_panel.zig");
     _ = @import("app/git_requests.zig");
     _ = @import("app/git_ops.zig");
