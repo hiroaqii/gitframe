@@ -1829,6 +1829,8 @@ test "sidebar row stage matrix keeps semantic foreground independent of cursor c
 }
 
 test "diff renderer owns header search marker gutter and input presentation" {
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .focus = .diff, .diff_cursor = .{ .hunk_header = 0 } },
@@ -1837,34 +1839,42 @@ test "diff renderer owns header search marker gutter and input presentation" {
     try ts.init(90, 10);
     defer ts.deinit();
 
-    try viewDiffPane(testContext(&page, .default(), 90, 11), &ts.surface, page.load.state.loaded.loaded);
+    try viewDiffPane(testContext(&page, palette, 90, 11), &ts.surface, page.load.state.loaded.loaded);
     try ts.expectCellText(0, 1, "─");
     try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.default));
     try std.testing.expect(ts.surface.readCell(0, 1).?.style.dim);
 
     page.viewer.focus = .sidebar;
-    try viewDiffPane(testContext(&page, .default(), 90, 11), &ts.surface, page.load.state.loaded.loaded);
+    ts.surface.clear(.{ .col = 0, .row = 0, .width = 90, .height = 10 });
+    try viewDiffPane(testContext(&page, palette, 90, 11), &ts.surface, page.load.state.loaded.loaded);
     try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.gray));
+    try std.testing.expect(!ts.surface.readCell(1, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(!ts.surface.readCell(89, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     page.viewer.focus = .diff;
     page.search.match_offset = 0;
-    try viewDiffPane(testContext(&page, .default(), 90, 11), &ts.surface, page.load.state.loaded.loaded);
+    ts.surface.clear(.{ .col = 0, .row = 0, .width = 90, .height = 10 });
+    try viewDiffPane(testContext(&page, palette, 90, 11), &ts.surface, page.load.state.loaded.loaded);
     try ts.expectCellText(0, review_layout.diff_body_start_row, "»");
     try ts.expectCellText(1, review_layout.diff_body_start_row, "▌");
     try ts.expectCellText(2, review_layout.diff_body_start_row, "╭");
+    try std.testing.expect(!ts.surface.readCell(0, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(ts.surface.readCell(1, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(ts.surface.readCell(2, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(ts.surface.readCell(89, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     page.search.match_offset = null;
     page.viewer.display_mode = .side_by_side;
     var narrow: chasen.testing.TestSurface = undefined;
     try narrow.init(72, 8);
     defer narrow.deinit();
-    try viewDiffPane(testContext(&page, .default(), 72, 9), &narrow.surface, page.load.state.loaded.loaded);
+    try viewDiffPane(testContext(&page, palette, 72, 9), &narrow.surface, page.load.state.loaded.loaded);
     try narrow.expectCellText(57, 0, "u");
     try narrow.expectCellText(65, 0, "(");
 
     page.search.mode = true;
     try page.search.input.insertSlice("missing");
-    try viewDiffPane(testContext(&page, .default(), 90, 11), &ts.surface, page.load.state.loaded.loaded);
+    try viewDiffPane(testContext(&page, palette, 90, 11), &ts.surface, page.load.state.loaded.loaded);
     try ts.expectCellText(1, 1, "s");
     try ts.expectCellText(9, 1, "m");
     try ts.expectCellText(16, 1, " ");

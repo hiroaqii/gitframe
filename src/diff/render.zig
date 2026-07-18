@@ -254,30 +254,32 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
         }
         const body_offset = cursor.bodyOffset();
         const row = cursor.nextRow() orelse continue;
-        drawCursorMarker(surface, row, body_offset, options.cursor_offset, styles);
+        const presentation = RowPresentation.forBodyOffset(options, body_offset);
+        presentation.prefill(surface, row, styles);
+        drawCursorMarker(surface, row, body_offset, options.cursor_offset, presentation, styles);
         switch (body_row) {
-            .metadata => |line| try draw.copyClippedTextAt(&body_surface, 0, row, line, styles.metadata),
-            .binary_marker => _ = body_surface.borrowTextAt(0, row, "Binary file", styles.warning),
+            .metadata => |line| try draw.copyClippedTextAt(&body_surface, 0, row, line, presentation.compose(styles.metadata, styles)),
+            .binary_marker => _ = body_surface.borrowTextAt(0, row, "Binary file", presentation.compose(styles.warning, styles)),
             .hunk_header => |hunk| {
-                if (current_hunk_highlighted and !hunk.folded) drawHunkGuide(surface, row, guideGlyph(guide_index, hunk.hunk_index, body_offset), styles);
-                try drawHunkHeaderRow(&body_surface, row, hunk, options.highlighted_hunk, mode, current_hunk_staged, styles);
+                if (current_hunk_highlighted and !hunk.folded) drawHunkGuide(surface, row, guideGlyph(guide_index, hunk.hunk_index, body_offset), presentation, styles);
+                try drawHunkHeaderRow(&body_surface, row, hunk, options.highlighted_hunk, mode, current_hunk_staged, presentation, styles);
             },
             .unified_line => |line| {
                 if (current_hunk_highlighted) {
-                    if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), styles);
+                    if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), presentation, styles);
                 }
                 const syntax_ctx = unifiedSyntaxContext(options, rows, line);
-                try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles, syntax_ctx.line_spans, syntax_ctx.hunk_side_has_visible_syntax, unifiedSelectionForLine(options, rows, line));
+                try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, current_hunk_staged, presentation, styles, syntax_ctx.line_spans, syntax_ctx.hunk_side_has_visible_syntax, unifiedSelectionForLine(options, rows, line));
             },
             .side_by_side => |side_row| {
                 if (current_hunk_highlighted) {
-                    if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), styles);
+                    if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), presentation, styles);
                 }
                 const geometry = sideBySideGeometry(body_surface.size().width);
                 const indexed_row = rows.currentSideBySideRow();
                 switch (side_row) {
-                    .single => |line| try drawSideBySideSingle(&body_surface, row, line, geometry, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles, sideBySideSingleSyntaxSpans(options, rows, line), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
-                    .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, geometry, options.horizontal_scroll, options.line_numbers, current_hunk_staged, styles, sideBySidePairSyntaxSpans(options, rows), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
+                    .single => |line| try drawSideBySideSingle(&body_surface, row, line, geometry, options.horizontal_scroll, options.line_numbers, current_hunk_staged, presentation, styles, sideBySideSingleSyntaxSpans(options, rows, line), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
+                    .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, geometry, options.horizontal_scroll, options.line_numbers, current_hunk_staged, presentation, styles, sideBySidePairSyntaxSpans(options, rows), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
                 }
             },
         }
@@ -308,7 +310,9 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, sour
         if (cursor.done()) return;
         const body_offset = cursor.bodyOffset();
         const row = cursor.nextRow() orelse continue;
-        drawCursorMarker(surface, row, body_offset, options.cursor_offset, styles);
+        const presentation = RowPresentation.forBodyOffset(options, body_offset);
+        presentation.prefill(surface, row, styles);
+        drawCursorMarker(surface, row, body_offset, options.cursor_offset, presentation, styles);
         const line: diff_parser.DiffLine = .{
             .kind = .added,
             .text = source.lineBody(index).?,
@@ -317,12 +321,12 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, sour
         const line_spans = options.source_syntax_spans.lineSpans(index);
         if (mode == .side_by_side) {
             const geometry = sideBySideGeometry(body_surface.size().width);
-            try drawSideBySidePair(&body_surface, row, null, line, geometry, options.horizontal_scroll, options.line_numbers, false, styles, .{
+            try drawSideBySidePair(&body_surface, row, null, line, geometry, options.horizontal_scroll, options.line_numbers, false, presentation, styles, .{
                 .new = line_spans,
                 .new_hunk_side_has_visible_syntax = options.source_has_visible_syntax,
             }, generatedSideBySideSelection(options, index, line));
         } else {
-            try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, false, styles, line_spans, options.source_has_visible_syntax, generatedUnifiedSelection(options, index, line));
+            try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, false, presentation, styles, line_spans, options.source_has_visible_syntax, generatedUnifiedSelection(options, index, line));
         }
     }
 }
@@ -429,7 +433,8 @@ fn applyHeaderRegionStyle(surface: *chasen.Surface, region: HeaderRegion, style:
     }
 }
 
-fn drawHunkHeader(surface: *chasen.Surface, row: u16, header: []const u8, style: chasen.TextStyle, mode: DisplayMode, styles: RenderStyles) !void {
+fn drawHunkHeader(surface: *chasen.Surface, row: u16, header: []const u8, style: chasen.TextStyle, mode: DisplayMode, presentation: RowPresentation, styles: RenderStyles) !void {
+    const row_style = presentation.compose(style, styles);
     if (mode == .side_by_side and surface.size().width >= side_by_side_min_width) {
         const geometry = sideBySideGeometry(surface.size().width);
         var old_column = surface.child(.{
@@ -438,12 +443,12 @@ fn drawHunkHeader(surface: *chasen.Surface, row: u16, header: []const u8, style:
             .width = geometry.old.width,
             .height = 1,
         });
-        try draw.copyClippedTextAt(&old_column, 0, 0, header, style);
-        _ = surface.borrowTextAt(geometry.separator_col, row, "│", styles.metadata);
+        try draw.copyClippedTextAt(&old_column, 0, 0, header, row_style);
+        _ = surface.borrowTextAt(geometry.separator_col, row, "│", presentation.compose(styles.metadata, styles));
         return;
     }
 
-    try draw.copyClippedTextAt(surface, 0, row, header, style);
+    try draw.copyClippedTextAt(surface, 0, row, header, row_style);
 }
 
 fn drawHunkHeaderRow(
@@ -453,6 +458,7 @@ fn drawHunkHeaderRow(
     highlighted_hunk: ?usize,
     mode: DisplayMode,
     staged: bool,
+    presentation: RowPresentation,
     styles: RenderStyles,
 ) !void {
     const style = hunkHeaderStyle(highlighted_hunk != null and highlighted_hunk.? == hunk.hunk_index, staged, styles);
@@ -465,7 +471,7 @@ fn drawHunkHeaderRow(
         hunk.new_count,
         hunk.section,
     });
-    try drawHunkHeader(surface, row, header, style, mode, styles);
+    try drawHunkHeader(surface, row, header, style, mode, presentation, styles);
 }
 
 fn hunkHeaderStyle(highlighted: bool, staged: bool, styles: RenderStyles) chasen.TextStyle {
@@ -480,9 +486,45 @@ fn hunkHeaderStyle(highlighted: bool, staged: bool, styles: RenderStyles) chasen
 pub const body_start_row: u16 = 3;
 pub const cursor_gutter_width: u16 = 2;
 
-fn drawCursorMarker(surface: *chasen.Surface, row: u16, body_offset: usize, cursor_offset: ?usize, styles: RenderStyles) void {
+const RowPresentation = struct {
+    active_cursor: bool,
+
+    fn forBodyOffset(options: RenderOptions, body_offset: usize) RowPresentation {
+        return .{ .active_cursor = options.pane_active and options.cursor_offset != null and options.cursor_offset.? == body_offset };
+    }
+
+    fn prefill(self: RowPresentation, surface: *chasen.Surface, row: u16, styles: RenderStyles) void {
+        if (!self.active_cursor) return;
+        fillRowRegion(surface, row, .{ .col = 0, .width = surface.size().width }, .{ .bg = styles.palette.color(.pane_cursor_bg) });
+    }
+
+    fn compose(self: RowPresentation, base: chasen.TextStyle, styles: RenderStyles) chasen.TextStyle {
+        if (!self.active_cursor) return base;
+        var result = base;
+        result.bg = styles.palette.color(.pane_cursor_bg);
+        return result;
+    }
+
+    fn lineNumber(self: RowPresentation, base: chasen.TextStyle, present: bool, styles: RenderStyles) chasen.TextStyle {
+        var result = self.compose(base, styles);
+        if (self.active_cursor and present) result.fg = styles.palette.color(.pane_active_line_number);
+        return result;
+    }
+
+    fn prefix(self: RowPresentation, kind: diff_parser.DiffLine.Kind, hunk_side_has_visible_syntax: bool) []const u8 {
+        if (self.active_cursor and hunk_side_has_visible_syntax) return switch (kind) {
+            .added => "+",
+            .removed => "-",
+            .context => " ",
+            .metadata => "\\",
+        };
+        return prefixForLine(kind, hunk_side_has_visible_syntax);
+    }
+};
+
+fn drawCursorMarker(surface: *chasen.Surface, row: u16, body_offset: usize, cursor_offset: ?usize, presentation: RowPresentation, styles: RenderStyles) void {
     if (cursor_offset == null or cursor_offset.? != body_offset) return;
-    _ = surface.borrowTextAt(0, row, "▌", styles.cursor);
+    _ = surface.borrowTextAt(0, row, "▌", presentation.compose(styles.cursor, styles));
 }
 
 fn guideGlyph(index_opt: ?diff_view_model.RenderedLineIndex, hunk_index: usize, body_offset: usize) []const u8 {
@@ -494,9 +536,9 @@ fn guideGlyph(index_opt: ?diff_view_model.RenderedLineIndex, hunk_index: usize, 
     return "│";
 }
 
-fn drawHunkGuide(surface: *chasen.Surface, row: u16, glyph: []const u8, styles: RenderStyles) void {
+fn drawHunkGuide(surface: *chasen.Surface, row: u16, glyph: []const u8, presentation: RowPresentation, styles: RenderStyles) void {
     if (surface.size().width < 2) return;
-    _ = surface.borrowTextAt(1, row, glyph, styles.hunk_guide);
+    _ = surface.borrowTextAt(1, row, glyph, presentation.compose(styles.hunk_guide, styles));
 }
 
 const UnifiedSyntaxContext = struct {
@@ -606,18 +648,18 @@ const BodyCursor = struct {
     }
 };
 
-fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
+fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
     const whole_line = selection != null and selection.?.mode == .line;
     if (whole_line) fillRowRegion(surface, row, .{ .col = 0, .width = surface.size().width }, styles.selection);
-    const text_style = selectedStyle(bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), whole_line, styles);
-    const marker_style = selectedStyle(markerStyleForLine(line.kind, staged, styles), whole_line, styles);
-    const prefix = prefixForLine(line.kind, hunk_side_has_visible_syntax);
+    const text_style = selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), styles), whole_line, styles);
+    const marker_style = selectedStyle(presentation.compose(markerStyleForLine(line.kind, staged, styles), styles), whole_line, styles);
+    const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
     const layout = lineLayout(line_numbers, .unified);
-    drawGutterLeadInBackground(surface, row, layout, selectedStyle(gutterLeadInStyle(line.kind, staged, styles), whole_line, styles));
+    drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, staged, styles), styles), whole_line, styles));
 
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), selectedStyle(lineNumberStyle(line.kind, staged, styles), whole_line, styles));
-        _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), selectedStyle(lineNumberStyle(line.kind, staged, styles), whole_line, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, staged, styles), line.old_line != null, styles), whole_line, styles));
+        _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, staged, styles), line.new_line != null, styles), whole_line, styles));
     }
     _ = surface.borrowTextAt(layout.prefix_col, row, prefix, marker_style);
     try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, text_style, syntax_spans, styles);
@@ -654,35 +696,35 @@ fn generatedSideBySideSelection(options: RenderOptions, line_index: usize, line:
     return .{ .new = range };
 }
 
-fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
+fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, staged: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
     drawSideBySideSelection(surface, row, geometry, selection, styles);
     var columns = sideBySideRowColumns(surface, row, geometry);
     const selected = selection orelse SideBySideSelection{};
-    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
-    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
-    drawSideBySideGutter(surface, row, geometry, styles);
+    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+    drawSideBySideGutter(surface, row, geometry, presentation, styles);
 }
 
-fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
+fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, staged: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
     drawSideBySideSelection(surface, row, geometry, selection, styles);
     var columns = sideBySideRowColumns(surface, row, geometry);
     const selected = selection orelse SideBySideSelection{};
     switch (line.kind) {
         .removed => {
-            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
-            drawSideBySideGutter(surface, row, geometry, styles);
+            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+            drawSideBySideGutter(surface, row, geometry, presentation, styles);
         },
         .added => {
-            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
-            drawSideBySideGutter(surface, row, geometry, styles);
+            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+            drawSideBySideGutter(surface, row, geometry, presentation, styles);
         },
         .context => {
-            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
-            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
-            drawSideBySideGutter(surface, row, geometry, styles);
+            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+            drawSideBySideGutter(surface, row, geometry, presentation, styles);
         },
         .metadata => {
-            try draw.copyClippedTextAt(surface, 0, row, line.text, styles.metadata);
+            try draw.copyClippedTextAt(surface, 0, row, line.text, presentation.compose(styles.metadata, styles));
         },
     }
 }
@@ -701,8 +743,8 @@ fn fillRowRegion(surface: *chasen.Surface, row: u16, region: SideBySideRegion, s
     }
 }
 
-fn drawSideBySideGutter(surface: *chasen.Surface, row: u16, geometry: SideBySideGeometry, styles: RenderStyles) void {
-    _ = surface.borrowTextAt(geometry.separator_col, row, "│", styles.metadata);
+fn drawSideBySideGutter(surface: *chasen.Surface, row: u16, geometry: SideBySideGeometry, presentation: RowPresentation, styles: RenderStyles) void {
+    _ = surface.borrowTextAt(geometry.separator_col, row, "│", presentation.compose(styles.metadata, styles));
 }
 
 const SideBySideColumns = struct {
@@ -760,29 +802,29 @@ fn sideBySideSelectionForPair(options: RenderOptions, file: diff_parser.FileDiff
     return selected;
 }
 
-fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
+fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
     const selected = selection != null and selection.?.mode == .line;
     const layout = lineLayout(line_numbers, .side_by_side);
-    drawGutterLeadInBackground(surface, row, layout, selectedStyle(gutterLeadInStyle(line.kind, staged, styles), selected, styles));
+    drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, staged, styles), styles), selected, styles));
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), selectedStyle(lineNumberStyle(line.kind, staged, styles), selected, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, staged, styles), line.old_line != null, styles), selected, styles));
     }
-    const prefix = if (line.kind == .removed and !hunk_side_has_visible_syntax) "-" else " ";
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(markerStyleForLine(line.kind, staged, styles), selected, styles));
-    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), selected, styles), syntax_spans, styles);
+    const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(presentation.compose(markerStyleForLine(line.kind, staged, styles), styles), selected, styles));
+    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
     if (selection) |range| if (range.mode == .character) applyCharacterSelection(surface, layout.text_col, row, line.text, horizontal_scroll, range, styles.selection.bg);
 }
 
-fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
+fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
     const selected = selection != null and selection.?.mode == .line;
     const layout = lineLayout(line_numbers, .side_by_side);
-    drawGutterLeadInBackground(surface, row, layout, selectedStyle(gutterLeadInStyle(line.kind, staged, styles), selected, styles));
+    drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, staged, styles), styles), selected, styles));
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), selectedStyle(lineNumberStyle(line.kind, staged, styles), selected, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, staged, styles), line.new_line != null, styles), selected, styles));
     }
-    const prefix = if (line.kind == .added and !hunk_side_has_visible_syntax) "+" else " ";
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(markerStyleForLine(line.kind, staged, styles), selected, styles));
-    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), selected, styles), syntax_spans, styles);
+    const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(presentation.compose(markerStyleForLine(line.kind, staged, styles), styles), selected, styles));
+    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
     if (selection) |range| if (range.mode == .character) applyCharacterSelection(surface, layout.text_col, row, line.text, horizontal_scroll, range, styles.selection.bg);
 }
 
@@ -1644,12 +1686,12 @@ test "renderFile highlights only the selected side-by-side pane side" {
     try std.testing.expect(new_body.style.bg.eql(palette.color(.diff_added_bg)));
 }
 
-test "renderFile character selection colors only exact tokens and preserves syntax foreground" {
+test "review diff cursor character selection colors only exact tokens and preserves syntax and staged style" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 6);
     defer ts.deinit();
 
-    const palette = theme.Palette.default();
+    const palette = reviewCursorTestPalette();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
         .old_path = "a/a",
@@ -1673,8 +1715,10 @@ test "renderFile character selection colors only exact tokens and preserves synt
 
     try renderFile(&ts.surface, file, .{
         .requested_mode = .unified,
+        .cursor_offset = 1,
         .palette = palette,
         .syntax_spans = spans,
+        .staged_hunks = &.{true},
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
             .side = .new,
@@ -1689,20 +1733,29 @@ test "renderFile character selection colors only exact tokens and preserves synt
     const selected_b = ts.surface.readCell(text_col + 1, 4).?;
     const selected_c = ts.surface.readCell(text_col + 2, 4).?;
     const last = ts.surface.readCell(text_col + 3, 4).?;
-    try std.testing.expect(!first.style.bg.eql(palette.color(.diff_cursor)));
+    const pane_bg = palette.color(.pane_cursor_bg);
+    try std.testing.expect(ts.surface.readCell(0, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(1, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(5, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(10, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(12, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(first.style.bg.eql(pane_bg));
     try std.testing.expect(selected_b.style.bg.eql(palette.color(.diff_cursor)));
     try std.testing.expect(selected_c.style.bg.eql(palette.color(.diff_cursor)));
-    try std.testing.expect(!last.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(last.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(pane_bg));
     try std.testing.expect(selected_b.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(selected_c.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(selected_b.style.dim);
+    try std.testing.expect(selected_c.style.dim);
 }
 
-test "side-by-side character selection stays inside the locked pane text" {
+test "review diff cursor side-by-side character selection stays inside the locked pane text" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(100, 6);
     defer ts.deinit();
 
-    const palette = theme.Palette.default();
+    const palette = reviewCursorTestPalette();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
         .old_path = "a/a",
@@ -1722,6 +1775,7 @@ test "side-by-side character selection stays inside the locked pane text" {
     };
     try renderFile(&ts.surface, file, .{
         .requested_mode = .side_by_side,
+        .cursor_offset = 1,
         .palette = palette,
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
@@ -1735,18 +1789,25 @@ test "side-by-side character selection stays inside the locked pane text" {
     const geometry = sideBySideGeometry(bodyWidth(100));
     const old_text = cursor_gutter_width + geometry.old.col + lineTextStart(true, .side_by_side);
     const new_text = cursor_gutter_width + geometry.new.col + lineTextStart(true, .side_by_side);
-    try std.testing.expect(!ts.surface.readCell(old_text, 4).?.style.bg.eql(palette.color(.diff_cursor)));
+    const separator = cursor_gutter_width + geometry.separator_col;
+    const pane_bg = palette.color(.pane_cursor_bg);
+    try std.testing.expect(ts.surface.readCell(0, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(1, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(cursor_gutter_width + geometry.old.col, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(old_text, 4).?.style.bg.eql(pane_bg));
     try std.testing.expect(ts.surface.readCell(old_text + 1, 4).?.style.bg.eql(palette.color(.diff_cursor)));
-    try std.testing.expect(!ts.surface.readCell(old_text + 2, 4).?.style.bg.eql(palette.color(.diff_cursor)));
-    try std.testing.expect(!ts.surface.readCell(new_text + 1, 4).?.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(ts.surface.readCell(old_text + 2, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(separator, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(new_text + 1, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(99, 4).?.style.bg.eql(pane_bg));
 }
 
-test "renderFile TAB selection and syntax use the same four-cell projection" {
+test "review diff cursor TAB selection and syntax use the same multi-cell projection" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 6);
     defer ts.deinit();
 
-    const palette = theme.Palette.default();
+    const palette = reviewCursorTestPalette();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
         .old_path = "a/a",
@@ -1770,6 +1831,7 @@ test "renderFile TAB selection and syntax use the same four-cell projection" {
 
     try renderFile(&ts.surface, file, .{
         .requested_mode = .unified,
+        .cursor_offset = 1,
         .palette = palette,
         .syntax_spans = spans,
         .selection = .{
@@ -1782,11 +1844,75 @@ test "renderFile TAB selection and syntax use the same four-cell projection" {
     });
 
     const text_col = cursor_gutter_width + lineTextStart(true, .unified);
-    try std.testing.expect(!ts.surface.readCell(text_col, 4).?.style.bg.eql(palette.color(.diff_cursor)));
+    const pane_bg = palette.color(.pane_cursor_bg);
+    try std.testing.expect(ts.surface.readCell(text_col, 4).?.style.bg.eql(pane_bg));
     try expectBgRange(&ts.surface, 4, text_col + 1, text_col + 4, palette.color(.diff_cursor));
     const b = ts.surface.readCell(text_col + 4, 4).?;
-    try std.testing.expect(!b.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(b.style.bg.eql(pane_bg));
     try std.testing.expect(b.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(pane_bg));
+}
+
+test "review diff cursor keeps wide combining and emoji graphemes atomic under character selection" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 6);
+    defer ts.deinit();
+
+    const palette = reviewCursorTestPalette();
+    const text = "a界e\u{301}👩‍💻z";
+    const wide_start = 1;
+    const wide_end = wide_start + "界".len;
+    const emoji_start = wide_end + "e\u{301}".len;
+    const selected_end = text.len - 1;
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 0,
+            .old_count = 0,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{.{ .kind = .added, .text = text, .new_line = 1 }},
+        }},
+    };
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .cursor_offset = 1,
+        .palette = palette,
+        .selection = .{
+            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+            .side = .new,
+            .mode = .character,
+            .start = .{ .hunk_index = 0, .line_index = 0, .leading = wide_start, .trailing = wide_end },
+            .end = .{ .hunk_index = 0, .line_index = 0, .leading = emoji_start, .trailing = selected_end },
+        },
+    });
+
+    const text_col = cursor_gutter_width + lineTextStart(true, .unified);
+    const pane_bg = palette.color(.pane_cursor_bg);
+    const selection_bg = palette.color(.diff_cursor);
+    try std.testing.expect(ts.surface.readCell(text_col, 4).?.style.bg.eql(pane_bg));
+    // Vaxis stores a wide grapheme as one styled Cell with width 2, rather
+    // than exposing its second occupied terminal column as another token.
+    // Assert grapheme bytes and width together so a byte-interior or
+    // partial-cell selection cannot satisfy this regression.
+    const wide = ts.surface.readCell(text_col + 1, 4).?;
+    const combining = ts.surface.readCell(text_col + 3, 4).?;
+    const emoji = ts.surface.readCell(text_col + 4, 4).?;
+    try std.testing.expectEqualStrings("界", wide.char.grapheme);
+    try std.testing.expectEqual(@as(u8, 2), wide.char.width);
+    try std.testing.expect(wide.style.bg.eql(selection_bg));
+    try std.testing.expectEqualStrings("e\u{301}", combining.char.grapheme);
+    try std.testing.expect(combining.style.bg.eql(selection_bg));
+    try std.testing.expectEqualStrings("👩‍💻", emoji.char.grapheme);
+    try std.testing.expectEqual(@as(u8, 2), emoji.char.width);
+    try std.testing.expect(emoji.style.bg.eql(selection_bg));
+    try std.testing.expect(ts.surface.readCell(text_col + 6, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(pane_bg));
 }
 
 test "renderFile normalizes highlighted side-by-side body base foreground" {
@@ -2619,6 +2745,256 @@ test "renderFile cursor marker uses absolute body offset and dims when pane is i
     try ts.expectCellText(0, 3, " ");
     try ts.expectCellText(0, 4, "▌");
     try std.testing.expect(ts.surface.readCell(0, 4).?.style.dim);
+    try std.testing.expect(!ts.surface.readCell(79, 4).?.style.bg.eql(theme.Palette.default().color(.pane_cursor_bg)));
+}
+
+fn reviewCursorTestPalette() theme.Palette {
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.pane_active_line_number)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.diff_context_bg)] = .{ .rgb = .{ 10, 11, 12 } };
+    palette.colors[@intFromEnum(theme.Role.diff_added_bg)] = .{ .rgb = .{ 13, 14, 15 } };
+    palette.colors[@intFromEnum(theme.Role.diff_removed_bg)] = .{ .rgb = .{ 16, 17, 18 } };
+    return palette;
+}
+
+test "review diff cursor composes unified selection inside pane chrome" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 5);
+    defer ts.deinit();
+
+    const palette = reviewCursorTestPalette();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{.{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 }},
+        }},
+    };
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .cursor_offset = 1,
+        .staged_hunks = &.{true},
+        .palette = palette,
+        .selection = .{
+            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+            .side = .new,
+            .start = .{ .hunk_index = 0, .line_index = 0 },
+            .end = .{ .hunk_index = 0, .line_index = 0 },
+        },
+    });
+
+    const row: u16 = body_start_row + 1;
+    const pane_bg = palette.color(.pane_cursor_bg);
+    const selection_bg = palette.color(.diff_cursor);
+    try std.testing.expect(ts.surface.readCell(0, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(1, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(2, row).?.style.bg.eql(selection_bg));
+    const old_number = ts.surface.readCell(5, row).?;
+    const new_number = ts.surface.readCell(10, row).?;
+    try std.testing.expect(old_number.style.bg.eql(selection_bg));
+    try std.testing.expect(new_number.style.bg.eql(selection_bg));
+    try std.testing.expect(old_number.style.fg.eql(palette.color(.pane_active_line_number)));
+    try std.testing.expect(new_number.style.fg.eql(palette.color(.pane_active_line_number)));
+    const text = ts.surface.readCell(cursor_gutter_width + lineTextStart(true, .unified), row).?;
+    try std.testing.expect(text.style.bg.eql(selection_bg));
+    try std.testing.expect(text.style.dim);
+    try std.testing.expect(ts.surface.readCell(79, row).?.style.bg.eql(selection_bg));
+    try std.testing.expect(!ts.surface.readCell(79, body_start_row).?.style.bg.eql(pane_bg));
+}
+
+test "review diff cursor keeps side-by-side separator outside selected side" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 5);
+    defer ts.deinit();
+
+    const palette = reviewCursorTestPalette();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{
+                .{ .kind = .removed, .text = "old", .old_line = 1 },
+                .{ .kind = .added, .text = "new", .new_line = 1 },
+            },
+        }},
+    };
+    const geometry = sideBySideGeometry(bodyWidth(100));
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .side_by_side,
+        .cursor_offset = 1,
+        .palette = palette,
+        .selection = .{
+            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+            .side = .old,
+            .start = .{ .hunk_index = 0, .line_index = 0 },
+            .end = .{ .hunk_index = 0, .line_index = 0 },
+        },
+    });
+
+    const row: u16 = body_start_row + 1;
+    const pane_bg = palette.color(.pane_cursor_bg);
+    const selection_bg = palette.color(.diff_cursor);
+    const old_start = cursor_gutter_width + geometry.old.col;
+    const separator = cursor_gutter_width + geometry.separator_col;
+    const new_start = cursor_gutter_width + geometry.new.col;
+    try std.testing.expect(ts.surface.readCell(0, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(1, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(old_start, row).?.style.bg.eql(selection_bg));
+    try std.testing.expect(ts.surface.readCell(separator - 1, row).?.style.bg.eql(selection_bg));
+    try std.testing.expect(ts.surface.readCell(separator, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(new_start, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(99, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(old_start + 3, row).?.style.fg.eql(palette.color(.pane_active_line_number)));
+    try std.testing.expect(ts.surface.readCell(new_start + 3, row).?.style.fg.eql(palette.color(.pane_active_line_number)));
+}
+
+test "review diff cursor restores parsed signs from cross-row syntax authority" {
+    const allocator = std.testing.allocator;
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 2,
+            .new_start = 1,
+            .new_count = 2,
+            .section = "",
+            .lines = &.{
+                .{ .kind = .removed, .text = "", .old_line = 1 },
+                .{ .kind = .removed, .text = "old", .old_line = 2 },
+                .{ .kind = .added, .text = "", .new_line = 1 },
+                .{ .kind = .added, .text = "new", .new_line = 2 },
+            },
+        }},
+    };
+    const hunk_line_counts = [_]usize{4};
+    const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
+    var spans = try syntax_provider.allocateEmpty(allocator, .{ .files = &files });
+    defer spans.deinit(allocator);
+    const old_spans = try allocator.dupe(syntax_token.TokenSpan, &.{.{ .start = 0, .end = 3, .role = .keyword }});
+    const new_spans = try allocator.dupe(syntax_token.TokenSpan, &.{.{ .start = 0, .end = 3, .role = .string }});
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .old }, .{ .spans = old_spans });
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 3, .side = .new }, .{ .spans = new_spans });
+
+    var removed: chasen.testing.TestSurface = undefined;
+    try removed.init(80, 8);
+    defer removed.deinit();
+    try renderFile(&removed.surface, file, .{ .requested_mode = .unified, .cursor_offset = 1, .syntax_spans = spans });
+    try removed.expectCellText(12, 4, "-");
+    try removed.expectCellText(12, 5, " ");
+    try std.testing.expect(removed.surface.readCell(12, 4).?.style.bg.eql(theme.Palette.default().color(.pane_cursor_bg)));
+
+    var added: chasen.testing.TestSurface = undefined;
+    try added.init(80, 8);
+    defer added.deinit();
+    try renderFile(&added.surface, file, .{ .requested_mode = .unified, .cursor_offset = 3, .syntax_spans = spans });
+    try added.expectCellText(12, 6, "+");
+    try added.expectCellText(12, 7, " ");
+
+    var split: chasen.testing.TestSurface = undefined;
+    try split.init(100, 6);
+    defer split.deinit();
+    try renderFile(&split.surface, file, .{ .requested_mode = .side_by_side, .cursor_offset = 1, .syntax_spans = spans });
+    const geometry = sideBySideGeometry(bodyWidth(100));
+    try split.expectCellText(cursor_gutter_width + geometry.old.col + lineLayout(true, .side_by_side).prefix_col, 4, "-");
+    try split.expectCellText(cursor_gutter_width + geometry.new.col + lineLayout(true, .side_by_side).prefix_col, 4, "+");
+    try split.expectCellText(cursor_gutter_width + geometry.old.col + lineLayout(true, .side_by_side).prefix_col, 5, " ");
+    try split.expectCellText(cursor_gutter_width + geometry.new.col + lineLayout(true, .side_by_side).prefix_col, 5, " ");
+}
+
+test "review diff cursor restores generated sign from cross-row syntax authority" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "\nconst value = 1;");
+    var source = try repository_source.Document.initOwned(allocator, bytes, .init(bytes));
+    defer source.deinit(allocator);
+    var spans = source_syntax.SourceSpans{
+        .line_entries = try allocator.dupe(source_syntax.LineEntry, &.{.{ .line_index = 1, .span_start = 0, .span_count = 1 }}),
+        .spans = try allocator.dupe(syntax_token.TokenSpan, &.{.{ .start = 0, .end = 5, .role = .keyword }}),
+    };
+    defer spans.deinit(allocator);
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 5);
+    defer ts.deinit();
+    try renderGeneratedAddedFile(&ts.surface, "new.zig", &source, .{
+        .cursor_offset = 0,
+        .source_syntax_spans = spans,
+        .source_has_visible_syntax = true,
+    });
+
+    try ts.expectCellText(12, 3, "+");
+    try ts.expectCellText(12, 4, " ");
+    try std.testing.expect(ts.surface.readCell(12, 3).?.style.bg.eql(theme.Palette.default().color(.pane_cursor_bg)));
+    try std.testing.expect(ts.surface.readCell(14, 4).?.style.fg.eql(theme.Palette.default().color(.accent)));
+}
+
+test "review diff cursor covers metadata binary and hunk rows only while active" {
+    const palette = reviewCursorTestPalette();
+    const text_file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{"new file mode 100644"},
+        .hunks = &.{.{
+            .old_start = 0,
+            .old_count = 0,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{.{ .kind = .added, .text = "new", .new_line = 1 }},
+        }},
+    };
+    const binary_file: diff_parser.FileDiff = .{
+        .header = "diff --git a/image.bin b/image.bin",
+        .metadata = &.{"new file mode 100644"},
+        .hunks = &.{},
+        .is_binary = true,
+    };
+
+    var metadata: chasen.testing.TestSurface = undefined;
+    try metadata.init(80, 6);
+    defer metadata.deinit();
+    try renderFile(&metadata.surface, text_file, .{ .cursor_offset = 0, .palette = palette });
+    try expectBgRange(&metadata.surface, body_start_row, 0, 80, palette.color(.pane_cursor_bg));
+
+    var hunk: chasen.testing.TestSurface = undefined;
+    try hunk.init(80, 6);
+    defer hunk.deinit();
+    try renderFile(&hunk.surface, text_file, .{ .cursor_offset = 1, .palette = palette, .staged_hunks = &.{true} });
+    try expectBgRange(&hunk.surface, body_start_row + 1, 0, 80, palette.color(.pane_cursor_bg));
+    try std.testing.expect(hunk.surface.readCell(2, body_start_row + 1).?.style.dim);
+
+    var binary: chasen.testing.TestSurface = undefined;
+    try binary.init(80, 5);
+    defer binary.deinit();
+    try renderFile(&binary.surface, binary_file, .{ .cursor_offset = 1, .palette = palette });
+    try expectBgRange(&binary.surface, body_start_row + 1, 0, 80, palette.color(.pane_cursor_bg));
+
+    var inactive: chasen.testing.TestSurface = undefined;
+    try inactive.init(80, 6);
+    defer inactive.deinit();
+    try renderFile(&inactive.surface, text_file, .{ .cursor_offset = 2, .pane_active = false, .palette = palette });
+    try std.testing.expect(!inactive.surface.readCell(79, body_start_row + 2).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
 
 test "renderFile can start from cached side-by-side viewport offset" {
