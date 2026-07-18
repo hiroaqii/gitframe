@@ -9,6 +9,9 @@ pub const Error = error{
 pub const Options = struct {
     argv: []const []const u8,
     cwd: std.process.Child.Cwd = .inherit,
+    /// Complete child environment. Non-null replaces, rather than augments,
+    /// the inherited process environment.
+    environ_map: ?*const std.process.Environ.Map = null,
     stdin: []const u8 = &.{},
     stdout_limit: std.Io.Limit = .unlimited,
     stderr_limit: std.Io.Limit = .unlimited,
@@ -81,6 +84,7 @@ pub fn runWithStdinDetailed(allocator: std.mem.Allocator, io: std.Io, options: O
     var child = std.process.spawn(io, .{
         .argv = options.argv,
         .cwd = options.cwd,
+        .environ_map = options.environ_map,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -135,6 +139,25 @@ test "runCaptured captures stdout and stderr" {
 
     try std.testing.expectEqualStrings("out", result.stdout);
     try std.testing.expectEqualStrings("err", result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+}
+
+test "runCaptured forwards explicit environment map" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GITFRAME_RUNNER_SENTINEL", "explicit");
+
+    const argv = [_][]const u8{ "sh", "-c", "printf %s \"$GITFRAME_RUNNER_SENTINEL\"" };
+    const result = try runCaptured(std.testing.allocator, std.testing.io, .{
+        .argv = &argv,
+        .environ_map = &env,
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(64),
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("explicit", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 }
 

@@ -1752,6 +1752,7 @@ pub const App = struct {
         task.* = .{
             .identity = branch_read.identity,
             .repo_root = branch_read.repo_root,
+            .env_map = self.env_map,
             .generation = branch_read.generation,
             .background_cycle_id = branch_read.background_cycle_id,
         };
@@ -9990,9 +9991,14 @@ test "Review re-entry queues one revalidation behind an older read and leaving c
 }
 
 test "Review re-entry starts immediate fingerprint revalidation even when polling is disabled" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GIT_DIR", "/must-be-sanitized-before-branch-read");
+
     var app: App = .{
         .active_page = .repository,
         .allocator = std.testing.allocator,
+        .env_map = &env,
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
             .display_path = "/repo",
@@ -10015,6 +10021,7 @@ test "Review re-entry starts immediate fingerprint revalidation even when pollin
     try std.testing.expectEqual(active.activation_id, status_task.identity.activation_id);
     try std.testing.expectEqual(active.activation_id, branch_task.identity.activation_id);
     try std.testing.expectEqual(active.activation_id, diff_task.identity.activation_id);
+    try std.testing.expect(branch_task.env_map == &env);
     try std.testing.expect(diff_task.expected_fingerprint != null);
 }
 

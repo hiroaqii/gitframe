@@ -241,9 +241,24 @@ pub const RepositoryFileChangeRequest = struct {
     temp_base_path: []const u8 = "/tmp",
 };
 
+/// Concrete repository authority accepted by branch-status reads.
+///
+/// Unlike `std.process.Child.Cwd`, this deliberately has no ambient `.inherit`
+/// case. The caller must name a path or keep a directory descriptor alive for
+/// the complete synchronous backend call.
+pub const BranchStatusCwd = union(enum) {
+    path: []const u8,
+    dir: std.Io.Dir,
+};
+
 /// Request for branch/upstream/ahead-behind status in a concrete repository.
 pub const BranchStatusRequest = struct {
-    repo_root: []const u8,
+    /// Borrowed authority kept valid for the synchronous backend call. Every
+    /// command contributing to one status snapshot receives this exact cwd.
+    cwd: BranchStatusCwd,
+    /// Borrowed parent environment used only as input to the branch-status
+    /// sanitizer. Null means an empty controlled environment, never inheritance.
+    parent_env: ?*const std.process.Environ.Map,
 };
 
 pub const BranchListRequest = struct {
@@ -416,7 +431,7 @@ pub const LocalCommandBackend = struct {
     }
 
     pub fn loadBranchStatus(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
-        return loadGitBranchStatus(allocator, io, request.repo_root);
+        return loadGitBranchStatus(allocator, io, request);
     }
 
     pub fn loadBranchList(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
@@ -1863,12 +1878,19 @@ test "background status suppresses optional locks without changing foreground ar
     try std.testing.expectEqualStrings("status", statusArgvForOrigin(.background)[2]);
 }
 
-fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!BranchStatusLoadResult {
+fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
     var builder = git_branch_status.Builder.init(allocator);
     defer builder.deinit();
 
+    const cwd: std.process.Child.Cwd = switch (request.cwd) {
+        .path => |path| .{ .path = path },
+        .dir => |dir| .{ .dir = dir },
+    };
+    var env = try branchStatusEnvironment(allocator, request.parent_env);
+    defer env.deinit();
+
     const head_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
-    const head_result = try runGitBranchStatusCommand(allocator, io, repo_root, &head_argv);
+    const head_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &head_argv);
     defer head_result.deinit(allocator);
 
     switch (head_result.term) {
@@ -1881,7 +1903,7 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []co
     }
 
     const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
-    const oid_result = try runGitBranchStatusCommand(allocator, io, repo_root, &oid_argv);
+    const oid_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &oid_argv);
     defer oid_result.deinit(allocator);
     switch (oid_result.term) {
         .exited => |code| if (code == 0) {
@@ -1891,7 +1913,7 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []co
     }
 
     const upstream_argv = [_][]const u8{ "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}" };
-    const upstream_result = try runGitBranchStatusCommand(allocator, io, repo_root, &upstream_argv);
+    const upstream_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &upstream_argv);
     defer upstream_result.deinit(allocator);
     var has_upstream = false;
     switch (upstream_result.term) {
@@ -1907,7 +1929,7 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, repo_root: []co
 
     if (has_upstream) {
         const ab_argv = [_][]const u8{ "git", "rev-list", "--left-right", "--count", "HEAD...@{upstream}" };
-        const ab_result = try runGitBranchStatusCommand(allocator, io, repo_root, &ab_argv);
+        const ab_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &ab_argv);
         defer ab_result.deinit(allocator);
         switch (ab_result.term) {
             .exited => |code| if (code == 0) {
@@ -2008,12 +2030,52 @@ fn branchListCommandFailure(allocator: std.mem.Allocator, result: process_runner
 }
 
 fn runGitBranchStatusCommand(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!process_runner.Result {
+    return runGitBranchStatusCommandInCwd(allocator, io, .{ .path = repo_root }, null, argv);
+}
+
+fn runGitBranchStatusCommandInCwd(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.process.Child.Cwd,
+    environ_map: ?*const std.process.Environ.Map,
+    argv: []const []const u8,
+) LoadError!process_runner.Result {
     return process_runner.runCaptured(allocator, io, .{
         .argv = argv,
-        .cwd = .{ .path = repo_root },
+        .cwd = cwd,
+        .environ_map = environ_map,
         .stdout_limit = .limited(4 * 1024),
         .stderr_limit = .limited(16 * 1024),
     }) catch |err| return runnerErrorToLoadError(err);
+}
+
+/// Build the complete environment for one local branch-status snapshot.
+///
+/// Git gives `GIT_*` variables precedence over cwd and repository config. That
+/// family includes repository/worktree selectors (`GIT_DIR`, `GIT_WORK_TREE`,
+/// `GIT_COMMON_DIR`, `GIT_INDEX_FILE`), object/ref selectors
+/// (`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+/// `GIT_NAMESPACE`), and config/discovery injection (`GIT_CONFIG_*`,
+/// `GIT_CEILING_DIRECTORIES`). Removing the entire family is intentionally
+/// future-proof: a newly inherited Git knob cannot silently become a second
+/// repository authority for one of the four commands.
+fn branchStatusEnvironment(allocator: std.mem.Allocator, parent: ?*const std.process.Environ.Map) LoadError!std.process.Environ.Map {
+    var env = if (parent) |map|
+        map.clone(allocator) catch return error.OutOfMemory
+    else
+        std.process.Environ.Map.init(allocator);
+    errdefer env.deinit();
+
+    var index: usize = 0;
+    while (index < env.keys().len) {
+        const key = env.keys()[index];
+        if (key.len >= "GIT_".len and std.ascii.eqlIgnoreCase(key[0.."GIT_".len], "GIT_")) {
+            _ = env.swapRemove(key);
+        } else {
+            index += 1;
+        }
+    }
+    return env;
 }
 
 fn freeRunResult(allocator: std.mem.Allocator, result: std.process.RunResult) void {
@@ -3812,7 +3874,10 @@ test "LocalCommandBackend loads branch status without upstream" {
     defer std.testing.allocator.free(repo_root);
 
     var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.loadBranchStatus(std.testing.allocator, io, .{ .repo_root = repo_root });
+    const result = try local_backend.loadBranchStatus(std.testing.allocator, io, .{
+        .cwd = .{ .path = repo_root },
+        .parent_env = null,
+    });
     defer result.deinit(std.testing.allocator);
 
     const status = switch (result) {
@@ -3849,7 +3914,10 @@ test "LocalCommandBackend loads branch status with upstream" {
     try runTestGit(io, &.{ "git", "push", "-u", "origin", "main" }, work);
 
     var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.loadBranchStatus(std.testing.allocator, io, .{ .repo_root = repo_root });
+    const result = try local_backend.loadBranchStatus(std.testing.allocator, io, .{
+        .cwd = .{ .path = repo_root },
+        .parent_env = null,
+    });
     defer result.deinit(std.testing.allocator);
 
     const status = switch (result) {
@@ -3863,6 +3931,136 @@ test "LocalCommandBackend loads branch status with upstream" {
     try std.testing.expectEqualStrings("main", status.upstream.?.remote_branch);
     try std.testing.expectEqual(@as(u32, 0), status.ahead_behind.?.ahead);
     try std.testing.expectEqual(@as(u32, 0), status.ahead_behind.?.behind);
+}
+
+test "branch status environment removes Git repository authority" {
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("HOME", "/home/test");
+
+    const git_keys = [_][]const u8{
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_BARE",
+        "GIT_SHALLOW_FILE",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    };
+    for (git_keys) |key| try parent.put(key, "redirect");
+
+    var env = try branchStatusEnvironment(std.testing.allocator, &parent);
+    defer env.deinit();
+
+    try std.testing.expectEqualStrings("/home/test", env.get("HOME").?);
+    for (git_keys) |key| try std.testing.expect(env.get(key) == null);
+    try std.testing.expectEqualStrings("redirect", parent.get("GIT_DIR").?);
+}
+
+test "branch status descriptor cwd survives path replacement" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try runTestGit(io, &.{ "git", "init", "--bare", "remote-pinned.git" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "init", "--bare", "remote-replacement.git" }, tmp.dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    try tmp.dir.createDir(io, "replacement", .default_dir);
+
+    var pinned = try tmp.dir.openDir(io, "work", .{});
+    defer pinned.close(io);
+    var replacement = try tmp.dir.openDir(io, "replacement", .{});
+    defer replacement.close(io);
+
+    const pinned_remote = try tmp.dir.realPathFileAlloc(io, "remote-pinned.git", std.testing.allocator);
+    defer std.testing.allocator.free(pinned_remote);
+    const replacement_remote = try tmp.dir.realPathFileAlloc(io, "remote-replacement.git", std.testing.allocator);
+    defer std.testing.allocator.free(replacement_remote);
+
+    try runTestGit(io, &.{
+        "git",
+        "init",
+        "--initial-branch=pinned",
+    }, pinned);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", pinned_remote }, pinned);
+    try pinned.writeFile(io, .{ .sub_path = "PINNED.md", .data = "base\n" });
+    try runTestGit(io, &.{ "git", "add", "PINNED.md" }, pinned);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "pinned base" }, pinned);
+    try runTestGit(io, &.{ "git", "push", "-u", "origin", "pinned" }, pinned);
+    try pinned.writeFile(io, .{ .sub_path = "PINNED.md", .data = "base\nahead\n" });
+    try runTestGit(io, &.{ "git", "add", "PINNED.md" }, pinned);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "pinned ahead" }, pinned);
+    const pinned_oid = try gitOutputAlloc(io, pinned, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    defer std.testing.allocator.free(pinned_oid);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=replacement" }, replacement);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", replacement_remote }, replacement);
+    try replacement.writeFile(io, .{ .sub_path = "REPLACEMENT.md", .data = "replacement\n" });
+    try runTestGit(io, &.{ "git", "add", "REPLACEMENT.md" }, replacement);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "replacement base" }, replacement);
+    try runTestGit(io, &.{ "git", "push", "-u", "origin", "replacement" }, replacement);
+    const replacement_oid = try gitOutputAlloc(io, replacement, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    defer std.testing.allocator.free(replacement_oid);
+    try std.testing.expect(!std.mem.eql(u8, trimLineEnd(pinned_oid), trimLineEnd(replacement_oid)));
+
+    // Keep the descriptor to repository A open while its former canonical path
+    // is replaced by repository B. Reopening "work" would now observe B.
+    try tmp.dir.rename("work", tmp.dir, "pinned-work", io);
+    try tmp.dir.rename("replacement", tmp.dir, "work", io);
+    const replacement_path = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(replacement_path);
+    const replacement_git_dir = try std.fs.path.join(std.testing.allocator, &.{ replacement_path, ".git" });
+    defer std.testing.allocator.free(replacement_git_dir);
+
+    // The input environment deliberately tries to override descriptor A with
+    // repository B. Branch-status sanitization must remove this second Git
+    // authority before the shared environment reaches any subprocess.
+    var redirect_env = std.process.Environ.Map.init(std.testing.allocator);
+    defer redirect_env.deinit();
+    try redirect_env.put("GIT_DIR", replacement_git_dir);
+    try redirect_env.put("GIT_WORK_TREE", replacement_path);
+
+    var local_backend: LocalCommandBackend = .{};
+    const pinned_result = try local_backend.loadBranchStatus(std.testing.allocator, io, .{
+        .cwd = .{ .dir = pinned },
+        .parent_env = &redirect_env,
+    });
+    defer pinned_result.deinit(std.testing.allocator);
+    const replacement_result = try local_backend.loadBranchStatus(std.testing.allocator, io, .{
+        .cwd = .{ .path = replacement_path },
+        .parent_env = &redirect_env,
+    });
+    defer replacement_result.deinit(std.testing.allocator);
+
+    const pinned_status = switch (pinned_result) {
+        .ok => |bundle| bundle.status,
+        .failed, .failed_static => return error.UnexpectedBranchStatusFailure,
+    };
+    const replacement_status = switch (replacement_result) {
+        .ok => |bundle| bundle.status,
+        .failed, .failed_static => return error.UnexpectedBranchStatusFailure,
+    };
+
+    try std.testing.expectEqualStrings("pinned", pinned_status.branchName().?);
+    try std.testing.expectEqualStrings(trimLineEnd(pinned_oid), pinned_status.oid.?);
+    try std.testing.expectEqualStrings("origin/pinned", pinned_status.upstream.?.name);
+    try std.testing.expectEqual(@as(u32, 1), pinned_status.ahead_behind.?.ahead);
+    try std.testing.expectEqual(@as(u32, 0), pinned_status.ahead_behind.?.behind);
+
+    try std.testing.expectEqualStrings("replacement", replacement_status.branchName().?);
+    try std.testing.expectEqualStrings(trimLineEnd(replacement_oid), replacement_status.oid.?);
+    try std.testing.expectEqualStrings("origin/replacement", replacement_status.upstream.?.name);
+    try std.testing.expectEqual(@as(u32, 0), replacement_status.ahead_behind.?.ahead);
+    try std.testing.expectEqual(@as(u32, 0), replacement_status.ahead_behind.?.behind);
 }
 
 fn runTestGit(io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !void {

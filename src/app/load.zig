@@ -485,6 +485,9 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
         repo_root: []u8,
+        /// Borrowed from process initialization; App and the runtime keep it
+        /// alive until every spawned task has completed.
+        env_map: ?*const std.process.Environ.Map,
         generation: u64,
         background_cycle_id: ?u64 = null,
 
@@ -497,7 +500,7 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
-                .result = runBranchStatusLoad(task.repo_root, allocator, io),
+                .result = runBranchStatusLoad(task.repo_root, task.env_map, allocator, io),
             };
             task.repo_root = &.{};
 
@@ -707,9 +710,17 @@ pub fn runStatusLoadWithOrigin(
     }
 }
 
-pub fn runBranchStatusLoad(repo_root: []const u8, allocator: std.mem.Allocator, io: std.Io) BranchStatusLoadTaskResult {
+pub fn runBranchStatusLoad(
+    repo_root: []const u8,
+    env_map: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) BranchStatusLoadTaskResult {
     var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().loadBranchStatus(allocator, io, .{ .repo_root = repo_root }) catch |err| {
+    const raw_result = local_backend.backend().loadBranchStatus(allocator, io, .{
+        .cwd = .{ .path = repo_root },
+        .parent_env = env_map,
+    }) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, "Branch status load failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Branch status load failed: OutOfMemory" },
