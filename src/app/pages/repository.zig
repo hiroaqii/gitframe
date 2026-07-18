@@ -27,6 +27,7 @@ const repository_layout = @import("repository/layout.zig");
 const repository_model = @import("repository/model.zig");
 const repository_navigation = @import("repository/navigation.zig");
 const repository_selection = @import("repository/selection.zig");
+const repository_source_header = @import("repository/source_header.zig");
 const repository_source_geometry = @import("repository/source_geometry.zig");
 const repository_tree_projection = @import("repository/tree_projection.zig");
 const repository_view = @import("repository/view.zig");
@@ -3095,7 +3096,7 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     if (state.selected_path) |path| {
         try repository_view.drawSourceHeader(
             &right,
-            path,
+            sourceHeaderPresentation(state, path),
             state.source_search,
             state.viewer.focus == .source,
             context.palette,
@@ -3112,6 +3113,67 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             context.palette.style(.muted),
         ) catch {};
     }
+}
+
+/// Projects only facts proved for the currently selected Repository path.
+/// The path and current manifest Git fact remain useful while a document is
+/// loading or retained; line and mtime require the exact accepted document
+/// authority so header chrome never upgrades last-good bytes to fresh state.
+fn sourceHeaderPresentation(
+    state: *const RepositoryPageState,
+    selected_path: []const u8,
+) repository_source_header.Presentation {
+    const accepted = acceptedSourceHeaderDocument(state, selected_path);
+    const line_position: ?repository_source_header.LinePosition = if (accepted) |displayed|
+        switch (displayed.value) {
+            .source => |source| repository_source_header.LinePosition.fromCursor(
+                state.viewer.source_cursor,
+                source.contentLineCount(),
+            ),
+            .inert => null,
+        }
+    else
+        null;
+    const modified_at: ?std.Io.Timestamp = if (accepted) |displayed|
+        if (displayed.metadata) |metadata| metadata.modified_at else null
+    else
+        null;
+    return .init(
+        selected_path,
+        line_position,
+        sourceHeaderGitState(state, selected_path),
+        modified_at,
+    );
+}
+
+fn acceptedSourceHeaderDocument(
+    state: *const RepositoryPageState,
+    selected_path: []const u8,
+) ?*const DisplayedDocument {
+    const displayed = if (state.displayed_document) |*document| document else return null;
+    if (displayed.authority != .accepted or
+        displayed.manifest_revision != state.manifest_revision or
+        !std.mem.eql(u8, displayed.path, selected_path))
+    {
+        return null;
+    }
+    return displayed;
+}
+
+fn sourceHeaderGitState(
+    state: *const RepositoryPageState,
+    selected_path: []const u8,
+) repository_source_header.GitState {
+    const bundle = if (state.bundle) |*value| value else return .unavailable;
+    if (!bundle.status_available) return .unavailable;
+    const node_index = bundle.tree.nodeIndexForPath(selected_path, .all) orelse return .unavailable;
+    const node = bundle.tree.nodes[node_index];
+    if (node.kind != .file or !std.mem.eql(u8, node.path, selected_path)) return .unavailable;
+    const change = node.file_change orelse return .clean;
+    return switch (change) {
+        .added => .added,
+        .modified => .modified,
+    };
 }
 
 fn drawIncomingUnavailable(
@@ -4335,6 +4397,111 @@ fn applyBundleStatusForTest(bundle: *Bundle, bytes: []const u8) !void {
     _ = bundle.tree.applyChangeIndex(&index);
     bundle.status_fingerprint = index.fingerprint;
     bundle.status_available = true;
+}
+
+test "repository source header SH3 projects exact accepted source facts" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "first\nsecond\n");
+    defer state.deinit(allocator);
+    state.freshness = .fresh;
+    state.viewer.source_cursor = 99;
+    const modified_at: std.Io.Timestamp = .{
+        .nanoseconds = 951_827_640 * std.time.ns_per_s,
+    };
+    state.displayed_document.?.metadata = .{ .modified_at = modified_at };
+    try applyBundleStatusForTest(&state.bundle.?, " M main.zig\x00");
+
+    const presentation = sourceHeaderPresentation(&state, state.selected_path.?);
+    try std.testing.expectEqual(
+        repository_source_header.LinePosition{ .current = 2, .total = 2 },
+        presentation.line_position.?,
+    );
+    try std.testing.expectEqual(repository_source_header.GitState.modified, presentation.git_state);
+    try std.testing.expectEqual(modified_at.nanoseconds, presentation.modified_at.?.nanoseconds);
+    try std.testing.expectEqualStrings("main.zig", presentation.raw_path);
+}
+
+test "repository source header SH3 projects empty accepted source as zero of zero" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("empty.zig\x00", "");
+    defer state.deinit(allocator);
+    state.viewer.source_cursor = 99;
+    try applyBundleStatusForTest(&state.bundle.?, "");
+
+    const presentation = sourceHeaderPresentation(&state, state.selected_path.?);
+    try std.testing.expectEqual(
+        repository_source_header.LinePosition{ .current = 0, .total = 0 },
+        presentation.line_position.?,
+    );
+    try std.testing.expectEqual(repository_source_header.GitState.clean, presentation.git_state);
+}
+
+test "repository source header SH3 keeps inert mtime and omits its line" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("binary.dat\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 3,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    const modified_at: std.Io.Timestamp = .{ .nanoseconds = 123_456_789 };
+    state.displayed_document = .{
+        .path = try allocator.dupe(u8, state.selected_path.?),
+        .manifest_revision = state.manifest_revision,
+        .authority = .accepted,
+        .value = .{ .inert = .binary },
+        .metadata = .{ .modified_at = modified_at },
+    };
+    try applyBundleStatusForTest(&state.bundle.?, "?? binary.dat\x00");
+
+    const presentation = sourceHeaderPresentation(&state, state.selected_path.?);
+    try std.testing.expect(presentation.line_position == null);
+    try std.testing.expectEqual(repository_source_header.GitState.added, presentation.git_state);
+    try std.testing.expectEqual(modified_at.nanoseconds, presentation.modified_at.?.nanoseconds);
+}
+
+test "repository source header SH3 retained document cannot claim line or mtime" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "first\nsecond\n");
+    defer state.deinit(allocator);
+    state.displayed_document.?.metadata = .{ .modified_at = .{ .nanoseconds = 123 } };
+    state.displayed_document.?.authority = .revalidation_required;
+    try applyBundleStatusForTest(&state.bundle.?, "?? main.zig\x00");
+
+    var presentation = sourceHeaderPresentation(&state, state.selected_path.?);
+    try std.testing.expect(presentation.line_position == null);
+    try std.testing.expect(presentation.modified_at == null);
+    try std.testing.expectEqual(repository_source_header.GitState.added, presentation.git_state);
+
+    state.displayed_document.?.authority = .accepted;
+    state.displayed_document.?.manifest_revision +%= 1;
+    presentation = sourceHeaderPresentation(&state, state.selected_path.?);
+    try std.testing.expect(presentation.line_position == null);
+    try std.testing.expect(presentation.modified_at == null);
+    try std.testing.expectEqual(repository_source_header.GitState.added, presentation.git_state);
+}
+
+test "repository source header SH3 status requires an exact usable manifest node" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+
+    var presentation = sourceHeaderPresentation(&state, state.selected_path.?);
+    try std.testing.expectEqual(repository_source_header.GitState.unavailable, presentation.git_state);
+
+    try applyBundleStatusForTest(&state.bundle.?, "");
+    presentation = sourceHeaderPresentation(&state, state.selected_path.?);
+    try std.testing.expectEqual(repository_source_header.GitState.clean, presentation.git_state);
+
+    presentation = sourceHeaderPresentation(&state, "missing.zig");
+    try std.testing.expectEqual(repository_source_header.GitState.unavailable, presentation.git_state);
+    try std.testing.expect(presentation.line_position == null);
+    try std.testing.expect(presentation.modified_at == null);
 }
 
 test "repository changed filter retains changed selection without document reload" {
@@ -6888,6 +7055,57 @@ test "repository page renders tree and selected-document loading checkpoint" {
     try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "▸ gitframe") != null);
     try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "README.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "Loading selected file") != null);
+}
+
+test "repository source header SH3 page view renders and withdraws exact document facts" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "first\nsecond\n");
+    defer state.deinit(allocator);
+    state.freshness = .fresh;
+    state.viewer.focus = .source;
+    state.viewer.source_cursor = 1;
+    state.displayed_document.?.metadata = .{
+        .modified_at = .{ .nanoseconds = 951_827_640 * std.time.ns_per_s },
+    };
+    try applyBundleStatusForTest(&state.bundle.?, " M main.zig\x00");
+
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(120, 8);
+    defer test_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    {
+        const snapshot = try test_surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "main.zig") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ln 2/2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "2000-02-29 12:34Z") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "second") != null);
+    }
+
+    state.displayed_document.?.authority = .revalidation_required;
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    {
+        const snapshot = try test_surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ln 2/2") == null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "2000-02-29") == null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "second") != null);
+    }
+
+    state.displayed_document.?.authority = .accepted;
+    _ = state.applyNavigation(allocator, .enter_file_search, test_surface.surface.size());
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    {
+        const snapshot = try test_surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Find file:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ln 2/2") == null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "2000-02-29") == null);
+    }
 }
 
 test "repository page anchors inert checkpoint below source header rule" {
