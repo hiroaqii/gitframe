@@ -115,20 +115,49 @@ pub const DragSelection = struct {
     }
 };
 
+/// Borrowed identity of the selected path rendered in the Repository source
+/// header. Unlike `RepositoryContentToken`, this identity needs no accepted
+/// source bytes: loading, inert, and retained selected paths can all be copied.
+/// `path` borrows the accepted manifest and the owner must be canceled before
+/// that manifest is replaced or released.
+pub const SourceHeaderIdentity = struct {
+    repo_epoch: u64,
+    activation_id: u64,
+    root_identity: root_capability.Identity,
+    manifest_revision: u64,
+    path: []const u8,
+
+    pub fn eql(self: SourceHeaderIdentity, other: SourceHeaderIdentity) bool {
+        return self.repo_epoch == other.repo_epoch and
+            self.activation_id == other.activation_id and
+            self.root_identity.eql(other.root_identity) and
+            self.manifest_revision == other.manifest_revision and
+            std.mem.eql(u8, self.path, other.path);
+    }
+};
+
+pub const SourceHeaderPathSelection = struct {
+    identity: SourceHeaderIdentity,
+};
+
 /// Exclusive owner of Repository pointer gestures.
 ///
-/// SH4 contains only the source-range variant, so both predicates currently
-/// return the same value. They remain separate because pointer-stream capture
-/// and source-content borrowing have different policy consumers once a
-/// source-header path owner is introduced in SH5.
 pub const Owner = union(enum) {
     none,
     source: DragSelection,
+    source_header: SourceHeaderPathSelection,
 
     pub fn activeSource(self: Owner) ?DragSelection {
         return switch (self) {
-            .none => null,
+            .none, .source_header => null,
             .source => |selection| selection,
+        };
+    }
+
+    pub fn activeSourceHeader(self: Owner) ?SourceHeaderPathSelection {
+        return switch (self) {
+            .none, .source => null,
+            .source_header => |selection| selection,
         };
     }
 
@@ -137,7 +166,7 @@ pub const Owner = union(enum) {
     pub fn activeMouseOwner(self: Owner) bool {
         return switch (self) {
             .none => false,
-            .source => true,
+            .source, .source_header => true,
         };
     }
 
@@ -146,7 +175,7 @@ pub const Owner = union(enum) {
     /// narrower question, never the aggregate mouse-owner predicate.
     pub fn activeSourceRange(self: Owner) bool {
         return switch (self) {
-            .none => false,
+            .none, .source_header => false,
             .source => true,
         };
     }
@@ -644,4 +673,37 @@ test "repository selection releases every partial allocation" {
             defer completed.deinit(allocator);
         }
     }.build, .{ &document, selection });
+}
+
+test "repository source header identity and owner predicates stay policy-specific" {
+    const base: SourceHeaderIdentity = .{
+        .repo_epoch = 3,
+        .activation_id = 4,
+        .root_identity = .{ .device = 5, .inode = 6 },
+        .manifest_revision = 7,
+        .path = "src/main.zig",
+    };
+    try std.testing.expect(base.eql(base));
+    inline for (.{
+        SourceHeaderIdentity{ .repo_epoch = 30, .activation_id = 4, .root_identity = .{ .device = 5, .inode = 6 }, .manifest_revision = 7, .path = "src/main.zig" },
+        SourceHeaderIdentity{ .repo_epoch = 3, .activation_id = 40, .root_identity = .{ .device = 5, .inode = 6 }, .manifest_revision = 7, .path = "src/main.zig" },
+        SourceHeaderIdentity{ .repo_epoch = 3, .activation_id = 4, .root_identity = .{ .device = 50, .inode = 6 }, .manifest_revision = 7, .path = "src/main.zig" },
+        SourceHeaderIdentity{ .repo_epoch = 3, .activation_id = 4, .root_identity = .{ .device = 5, .inode = 6 }, .manifest_revision = 70, .path = "src/main.zig" },
+        SourceHeaderIdentity{ .repo_epoch = 3, .activation_id = 4, .root_identity = .{ .device = 5, .inode = 6 }, .manifest_revision = 7, .path = "src/other.zig" },
+    }) |different| try std.testing.expect(!base.eql(different));
+
+    const header_owner: Owner = .{ .source_header = .{ .identity = base } };
+    try std.testing.expect(header_owner.activeMouseOwner());
+    try std.testing.expect(!header_owner.activeSourceRange());
+    try std.testing.expect(header_owner.activeSource() == null);
+    try std.testing.expect(header_owner.activeSourceHeader().?.identity.eql(base));
+
+    const source_owner: Owner = .{ .source = DragSelection.init(
+        testToken("src/main.zig", "source"),
+        .character,
+        pointFromBoundary(0, 0),
+    ) };
+    try std.testing.expect(source_owner.activeMouseOwner());
+    try std.testing.expect(source_owner.activeSourceRange());
+    try std.testing.expect(source_owner.activeSourceHeader() == null);
 }

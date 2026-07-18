@@ -30,6 +30,7 @@ pub fn drawSourceHeader(
     presentation: source_header.Presentation,
     search: model.SourceSearchState,
     source_active: bool,
+    path_selected: bool,
     palette: theme.Palette,
 ) !void {
     const size = surface.size();
@@ -45,12 +46,14 @@ pub fn drawSourceHeader(
             0,
             header_layout.path_area.width,
         )) |path_window| {
+            var path_style = palette.boldStyle(.accent);
+            if (path_selected) path_style.bg = palette.color(.diff_cursor);
             draw.copyClippedTextAt(
                 surface,
                 header_layout.path_area.col,
                 source_geometry.source_path_row,
                 path_window.text(),
-                palette.boldStyle(.accent),
+                path_style,
             ) catch {};
         } else |_| {}
     }
@@ -471,7 +474,7 @@ test "repository source header renders path above a full fixed separator" {
     try test_surface.init(24, source_geometry.source_body_first_row);
     defer test_surface.deinit();
 
-    try drawSourceHeader(&test_surface.surface, sourceHeaderPresentationForTest("src/main.zig"), .{}, false, palette);
+    try drawSourceHeader(&test_surface.surface, sourceHeaderPresentationForTest("src/main.zig"), .{}, false, false, palette);
     const snapshot = try test_surface.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/main.zig") != null);
@@ -511,12 +514,12 @@ test "repository source header SH3 renders typed metadata focus-stably" {
     var active: chasen.testing.TestSurface = undefined;
     try active.init(96, source_geometry.source_body_first_row);
     defer active.deinit();
-    try drawSourceHeader(&active.surface, presentation, .{}, true, palette);
+    try drawSourceHeader(&active.surface, presentation, .{}, true, false, palette);
 
     var inactive: chasen.testing.TestSurface = undefined;
     try inactive.init(96, source_geometry.source_body_first_row);
     defer inactive.deinit();
-    try drawSourceHeader(&inactive.surface, presentation, .{}, false, palette);
+    try drawSourceHeader(&inactive.surface, presentation, .{}, false, false, palette);
 
     const snapshot = try active.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
@@ -545,6 +548,36 @@ test "repository source header SH3 renders typed metadata focus-stably" {
     }
 }
 
+test "repository source header SH5 highlights only the exact path target" {
+    const palette: theme.Palette = .default();
+    const presentation = source_header.Presentation.init(
+        "src/main.zig",
+        .{ .current = 2, .total = 20 },
+        .modified,
+        .{ .nanoseconds = 951_827_640 * std.time.ns_per_s },
+    );
+    const expected = source_header.layout(72, presentation);
+    const target = expected.path_target orelse return error.ExpectedPathTarget;
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(72, source_geometry.source_body_first_row);
+    defer test_surface.deinit();
+
+    try drawSourceHeader(&test_surface.surface, presentation, .{}, true, true, palette);
+
+    var offset: u16 = 0;
+    while (offset < target.width) : (offset += 1) {
+        const cell = test_surface.surface.readCell(target.col + offset, source_geometry.source_path_row) orelse
+            return error.ExpectedSelectedPathCell;
+        try std.testing.expect(cell.style.bg.eql(palette.color(.diff_cursor)));
+        try std.testing.expect(cell.style.fg.eql(palette.color(.accent)));
+        try std.testing.expect(cell.style.bold);
+    }
+    const line = expected.line orelse return error.ExpectedLineMetadata;
+    const metadata = test_surface.surface.readCell(line.region.col, source_geometry.source_path_row) orelse
+        return error.ExpectedLineMetadataCell;
+    try std.testing.expect(!metadata.style.bg.eql(palette.color(.diff_cursor)));
+}
+
 test "repository source header SH3 preserves semantic Git styles" {
     const palette: theme.Palette = .default();
     const cases = [_]struct { state: source_header.GitState, role: theme.Role }{
@@ -559,7 +592,7 @@ test "repository source header SH3 preserves semantic Git styles" {
         var test_surface: chasen.testing.TestSurface = undefined;
         try test_surface.init(40, 1);
         defer test_surface.deinit();
-        try drawSourceHeader(&test_surface.surface, presentation, .{}, false, palette);
+        try drawSourceHeader(&test_surface.surface, presentation, .{}, false, false, palette);
         const git_cell = test_surface.surface.readCell(expected_layout.git.?.region.col, 0) orelse
             return error.ExpectedGitHeaderCell;
         try std.testing.expect(git_cell.style.fg.eql(palette.color(case.role)));
@@ -578,7 +611,7 @@ test "repository source header SH3 renderer follows adaptive omission regions" {
     var medium: chasen.testing.TestSurface = undefined;
     try medium.init(50, 1);
     defer medium.deinit();
-    try drawSourceHeader(&medium.surface, presentation, .{}, false, .default());
+    try drawSourceHeader(&medium.surface, presentation, .{}, false, false, .default());
     const medium_snapshot = try medium.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(medium_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, "Ln 42/8713") != null);
@@ -588,7 +621,7 @@ test "repository source header SH3 renderer follows adaptive omission regions" {
     var narrow: chasen.testing.TestSurface = undefined;
     try narrow.init(29, 1);
     defer narrow.deinit();
-    try drawSourceHeader(&narrow.surface, presentation, .{}, false, .default());
+    try drawSourceHeader(&narrow.surface, presentation, .{}, false, false, .default());
     const narrow_snapshot = try narrow.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(narrow_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "Ln 42/8713") != null);
@@ -611,12 +644,12 @@ test "repository source normal header rule follows source focus" {
     var active: chasen.testing.TestSurface = undefined;
     try active.init(12, source_geometry.source_body_first_row);
     defer active.deinit();
-    try drawSourceHeader(&active.surface, sourceHeaderPresentationForTest("src/main.zig"), .{}, true, palette);
+    try drawSourceHeader(&active.surface, sourceHeaderPresentationForTest("src/main.zig"), .{}, true, false, palette);
 
     var inactive: chasen.testing.TestSurface = undefined;
     try inactive.init(12, source_geometry.source_body_first_row);
     defer inactive.deinit();
-    try drawSourceHeader(&inactive.surface, sourceHeaderPresentationForTest("src/main.zig"), .{}, false, palette);
+    try drawSourceHeader(&inactive.surface, sourceHeaderPresentationForTest("src/main.zig"), .{}, false, false, palette);
 
     for (0..active.surface.size().width) |col| {
         const active_rule = active.surface.readCell(@intCast(col), source_geometry.source_search_or_rule_row) orelse
@@ -638,7 +671,7 @@ test "repository source header truncates safely to the path row" {
     try test_surface.init(2, 1);
     defer test_surface.deinit();
 
-    try drawSourceHeader(&test_surface.surface, sourceHeaderPresentationForTest("a"), .{}, false, .default());
+    try drawSourceHeader(&test_surface.surface, sourceHeaderPresentationForTest("a"), .{}, false, false, .default());
     try test_surface.expectCellText(1, source_geometry.source_path_row, "a");
     try std.testing.expect(test_surface.surface.readCell(0, source_geometry.source_search_or_rule_row) == null);
 }
@@ -652,7 +685,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try test_surface.init(32, 6);
     defer test_surface.deinit();
 
-    try drawSourceHeader(&test_surface.surface, sourceHeaderPresentationForTest("src/main.zig"), .{}, true, .default());
+    try drawSourceHeader(&test_surface.surface, sourceHeaderPresentationForTest("src/main.zig"), .{}, true, false, .default());
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, null, .default());
     var snapshot = try test_surface.snapshot(allocator);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "/needle") == null);
@@ -665,7 +698,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try test_surface.init(32, 6);
     var search: model.SourceSearchState = .{ .mode = true };
     try search.input.insertSlice("needle");
-    try drawSourceHeader(&test_surface.surface, sourceHeaderPresentationForTest("src/main.zig"), search, true, .default());
+    try drawSourceHeader(&test_surface.surface, sourceHeaderPresentationForTest("src/main.zig"), search, true, false, .default());
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, search, null, .default());
     snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
@@ -684,7 +717,7 @@ test "repository source retained search result replaces the normal separator" {
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(28, source_geometry.source_body_first_row);
     defer test_surface.deinit();
-    try drawSourceHeader(&test_surface.surface, sourceHeaderPresentationForTest("src/main.zig"), search, false, palette);
+    try drawSourceHeader(&test_surface.surface, sourceHeaderPresentationForTest("src/main.zig"), search, false, false, palette);
 
     const snapshot = try test_surface.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
@@ -787,7 +820,7 @@ test "repository source focus does not dim semantic foregrounds" {
     var active: chasen.testing.TestSurface = undefined;
     try active.init(32, 4);
     defer active.deinit();
-    try drawSourceHeader(&active.surface, sourceHeaderPresentationForTest("src/main.zig"), search, true, palette);
+    try drawSourceHeader(&active.surface, sourceHeaderPresentationForTest("src/main.zig"), search, true, false, palette);
     try drawSource(
         &active.surface,
         &document,
@@ -802,7 +835,7 @@ test "repository source focus does not dim semantic foregrounds" {
     var inactive: chasen.testing.TestSurface = undefined;
     try inactive.init(32, 4);
     defer inactive.deinit();
-    try drawSourceHeader(&inactive.surface, sourceHeaderPresentationForTest("src/main.zig"), search, false, palette);
+    try drawSourceHeader(&inactive.surface, sourceHeaderPresentationForTest("src/main.zig"), search, false, false, palette);
     try drawSource(
         &inactive.surface,
         &document,

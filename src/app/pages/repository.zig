@@ -314,10 +314,11 @@ pub const Msg = union(enum) {
     scroll_right,
     mouse_row: usize,
     mouse_toggle_row: usize,
+    mouse_source_header_press: BodyPoint,
     mouse_source_press: BodyPoint,
-    mouse_source_drag: ?BodyPoint,
-    mouse_source_release: ?BodyPoint,
-    cancel_source_selection,
+    mouse_owner_drag: ?BodyPoint,
+    mouse_owner_release: ?BodyPoint,
+    cancel_mouse_owner,
     mouse_source_wheel_up,
     mouse_source_wheel_down,
     focus_tree,
@@ -367,15 +368,16 @@ pub const Msg = union(enum) {
     }
 };
 
-/// Repository remains the semantic owner of selected source bytes. Commands
-/// transfer only separately owned shell effects; App never reconstructs text
-/// from page state or source coordinates.
+/// Repository remains the semantic owner of selected source bytes and raw
+/// manifest paths. Commands transfer only separately owned shell effects; App
+/// never reconstructs payloads from page state, display text, or coordinates.
 pub const Command = union(enum) {
     copy_source_selection: []u8,
+    copy_source_header_path: []u8,
 
     pub fn deinit(self: *Command, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .copy_source_selection => |text| allocator.free(text),
+            .copy_source_selection, .copy_source_header_path => |text| allocator.free(text),
         }
         self.* = undefined;
     }
@@ -1124,6 +1126,7 @@ pub const RepositoryPageState = struct {
 
     pub fn activate(self: *RepositoryPageState, repo_epoch: u64, identity: ?root_capability.Identity) void {
         self.clearFileSearchDocumentAuthority();
+        self.cancelMouseOwner();
         self.initialized = true;
         self.active = true;
         self.activation_id +%= 1;
@@ -1157,6 +1160,7 @@ pub const RepositoryPageState = struct {
 
     pub fn deactivate(self: *RepositoryPageState) void {
         self.file_search_source_focus.clear();
+        self.cancelMouseOwner();
         self.active = false;
         if (self.bundle != null) self.freshness = .validating;
     }
@@ -1702,6 +1706,7 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn requestReload(self: *RepositoryPageState, has_repository: bool) void {
+        self.cancelMouseOwner();
         self.branch.requestReload(
             self.active,
             self.repo_epoch,
@@ -2271,7 +2276,7 @@ pub const RepositoryPageState = struct {
         // Any independent page command becomes an explicit cancel terminal so
         // keyboard navigation/search cannot silently retarget the gesture.
         switch (msg) {
-            .mouse_source_drag, .mouse_source_release, .cancel_source_selection => {},
+            .mouse_owner_drag, .mouse_owner_release, .cancel_mouse_owner => {},
             else => self.cancelMouseOwner(),
         }
         const previous = self.selected_path;
@@ -2328,10 +2333,11 @@ pub const RepositoryPageState = struct {
                 self.viewer.focus = .tree;
                 self.setCursor(row, body_height, true);
             },
+            .mouse_source_header_press => |point| self.pressSourceHeader(point, body_size),
             .mouse_source_press => |point| self.pressSourceSelection(point, body_size),
-            .mouse_source_drag => |point| self.dragSourceSelection(point, body_size),
-            .mouse_source_release => |point| result.command = self.releaseSourceSelection(allocator, point, body_size),
-            .cancel_source_selection => self.cancelMouseOwner(),
+            .mouse_owner_drag => |point| self.dragMouseOwner(point, body_size),
+            .mouse_owner_release => |point| result.command = self.releaseMouseOwner(allocator, point, body_size),
+            .cancel_mouse_owner => self.cancelMouseOwner(),
             .mouse_source_wheel_up => if (source) |document| {
                 self.viewer.focus = .source;
                 repository_navigation.moveSource(&self.viewer, document, -1, source_geometry.?);
@@ -2751,6 +2757,21 @@ pub const RepositoryPageState = struct {
         return self.selection_owner.activeSourceRange();
     }
 
+    /// Header-path gestures own pointer capture but never accepted source
+    /// bytes. A different-page request may therefore cancel this owner and
+    /// continue instead of using the source-range transition blocker.
+    pub fn cancelSourceHeaderOwner(self: *RepositoryPageState) bool {
+        if (self.selection_owner.activeSourceHeader() == null) return false;
+        self.cancelMouseOwner();
+        return true;
+    }
+
+    pub fn sourceHeaderSelected(self: *const RepositoryPageState) bool {
+        const selection = self.selection_owner.activeSourceHeader() orelse return false;
+        const current = self.currentSourceHeaderIdentity() orelse return false;
+        return selection.identity.eql(current);
+    }
+
     /// End any borrowed Repository pointer owner before its storage or screen
     /// geometry can be replaced.
     pub fn cancelMouseOwner(self: *RepositoryPageState) void {
@@ -2807,6 +2828,98 @@ pub const RepositoryPageState = struct {
             .path = displayed.path,
             .source_fingerprint = source.fingerprint,
         };
+    }
+
+    /// Resolves the manifest-owned path identity independently from selected
+    /// source content. This is what lets loading and inert files participate
+    /// in header-path copy without pretending that source bytes are accepted.
+    fn currentSourceHeaderIdentity(self: *const RepositoryPageState) ?repository_selection.SourceHeaderIdentity {
+        if (!self.active or self.activation_id == 0) return null;
+        const root_identity = self.root_identity orelse return null;
+        const bundle = if (self.bundle) |*value| value else return null;
+        const path = self.selected_path orelse return null;
+        _ = bundle.tree.nodeIndexForPath(path, .all) orelse return null;
+        return .{
+            .repo_epoch = self.repo_epoch,
+            .activation_id = self.activation_id,
+            .root_identity = root_identity,
+            .manifest_revision = self.manifest_revision,
+            .path = path,
+        };
+    }
+
+    fn sourceHeaderPathHit(
+        self: *const RepositoryPageState,
+        point: BodyPoint,
+        body_size: chasen.Size,
+    ) ?repository_selection.SourceHeaderIdentity {
+        if (self.incomingUnavailable() != null or
+            self.file_search.mode or
+            point.row != repository_source_geometry.source_path_row)
+        {
+            return null;
+        }
+        switch (self.load_state) {
+            .idle, .no_repository, .failed => return null,
+            .loading => if (self.file_visibility == .all) return null,
+            .empty, .loaded => {},
+        }
+        const page_layout = bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
+        if (page_layout.source_width == 0 or point.col >= page_layout.source_width) return null;
+        const identity = self.currentSourceHeaderIdentity() orelse return null;
+        const presentation = sourceHeaderPresentation(self, identity.path);
+        const target = repository_source_header.layout(page_layout.source_width, presentation).path_target orelse return null;
+        if (!target.contains(point.col)) return null;
+        return identity;
+    }
+
+    fn pressSourceHeader(self: *RepositoryPageState, point: BodyPoint, body_size: chasen.Size) void {
+        const identity = self.sourceHeaderPathHit(point, body_size) orelse return;
+        if (self.currentSource() != null) self.viewer.focus = .source;
+        self.selection_owner = .{ .source_header = .{ .identity = identity } };
+    }
+
+    fn dragMouseOwner(self: *RepositoryPageState, point: ?BodyPoint, body_size: chasen.Size) void {
+        switch (self.selection_owner) {
+            .none => {},
+            .source => self.dragSourceSelection(point, body_size),
+            // A header gesture owns the pointer stream but has no moving
+            // endpoint: both click and drag release copy the same whole path.
+            .source_header => {},
+        }
+    }
+
+    fn releaseMouseOwner(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        point: ?BodyPoint,
+        body_size: chasen.Size,
+    ) ?Command {
+        return switch (self.selection_owner) {
+            .none => null,
+            .source => self.releaseSourceSelection(allocator, point, body_size),
+            .source_header => self.releaseSourceHeaderPath(allocator),
+        };
+    }
+
+    fn releaseSourceHeaderPath(self: *RepositoryPageState, allocator: std.mem.Allocator) ?Command {
+        const selection = self.selection_owner.activeSourceHeader() orelse return null;
+        const current = self.currentSourceHeaderIdentity() orelse {
+            self.cancelMouseOwner();
+            return null;
+        };
+        if (!selection.identity.eql(current)) {
+            self.cancelMouseOwner();
+            return null;
+        }
+        const path = allocator.dupe(u8, current.path) catch {
+            self.cancelMouseOwner();
+            self.status.set("Could not prepare file path copy", .{});
+            return null;
+        };
+        self.cancelMouseOwner();
+        self.status.clear();
+        return .{ .copy_source_header_path = path };
     }
 
     fn pointAtTextCell(
@@ -2973,13 +3086,19 @@ pub const RepositoryPageState = struct {
             },
         };
         if (point.col < layout.source_col) return null;
-        const document = self.currentSource() orelse return null;
         const source_point = sourceGesturePoint(point, size, self.viewer.tree_width, self.viewer.tree_hidden) orelse return null;
-        const geometry = self.sourceGeometry(size, document);
         return switch (button) {
-            .wheel_up => .mouse_source_wheel_up,
-            .wheel_down => .mouse_source_wheel_down,
-            .left => if (source_point.row >= geometry.body_first_row) .{ .mouse_source_press = source_point } else .focus_source,
+            .wheel_up => if (self.currentSource() != null) .mouse_source_wheel_up else null,
+            .wheel_down => if (self.currentSource() != null) .mouse_source_wheel_down else null,
+            .left => if (self.sourceHeaderPathHit(source_point, size) != null)
+                .{ .mouse_source_header_press = source_point }
+            else if (self.currentSource()) |document|
+                if (source_point.row >= self.sourceGeometry(size, document).body_first_row)
+                    .{ .mouse_source_press = source_point }
+                else
+                    .focus_source
+            else
+                null,
         };
     }
 };
@@ -2990,7 +3109,7 @@ fn navigationDismissesIncoming(msg: Msg) bool {
         .toggle_tree_visibility,
         .decrease_tree_width,
         .increase_tree_width,
-        .cancel_source_selection,
+        .cancel_mouse_owner,
         .cancel_source_search,
         .cancel_file_search,
         .manifest_finished,
@@ -3116,6 +3235,7 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             sourceHeaderPresentation(state, path),
             state.source_search,
             state.viewer.focus == .source,
+            state.sourceHeaderSelected(),
             context.palette,
         );
         if (size.height > repository_source_geometry.source_body_first_row) {
@@ -4519,6 +4639,158 @@ test "repository source header SH3 status requires an exact usable manifest node
     try std.testing.expectEqual(repository_source_header.GitState.unavailable, presentation.git_state);
     try std.testing.expect(presentation.line_position == null);
     try std.testing.expect(presentation.modified_at == null);
+}
+
+test "repository source header SH5 copies a loading byte-exact path and excludes chrome" {
+    const allocator = std.testing.allocator;
+    const raw_path = "src/\xff-main.zig";
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 4,
+        .repo_epoch = 3,
+        .root_identity = .{ .device = 5, .inode = 6 },
+        .bundle = try bundleForTest(raw_path ++ "\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 7,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    const size: chasen.Size = .{ .width = 72, .height = 8 };
+    const page_layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const header_layout = repository_source_header.layout(
+        page_layout.source_width,
+        sourceHeaderPresentation(&state, state.selected_path.?),
+    );
+    const target = header_layout.path_target orelse return error.ExpectedPathTarget;
+    const local: BodyPoint = .{ .col = target.col, .row = repository_source_geometry.source_path_row };
+    const press = state.mouseToMsg(.{
+        .col = page_layout.source_col + local.col,
+        .row = local.row,
+    }, .left, size) orelse return error.ExpectedHeaderPress;
+    try std.testing.expectEqual(Msg{ .mouse_source_header_press = local }, press);
+
+    if (header_layout.git) |git| {
+        try std.testing.expect(state.mouseToMsg(.{
+            .col = page_layout.source_col + git.region.col,
+            .row = repository_source_geometry.source_path_row,
+        }, .left, size) == null);
+    }
+    try std.testing.expect(state.mouseToMsg(.{
+        .col = page_layout.source_col + target.col,
+        .row = repository_source_geometry.source_search_or_rule_row,
+    }, .left, size) == null);
+
+    var pressed = state.applyNavigation(allocator, press, size);
+    defer pressed.deinit(allocator);
+    try std.testing.expect(state.activeMouseOwner());
+    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(state.sourceHeaderSelected());
+    try std.testing.expect(state.completed_selection == null);
+
+    // A click release copies the complete model path even though its rendered
+    // form escapes the invalid byte and may be clipped by the terminal.
+    var released = state.applyNavigation(allocator, .{ .mouse_owner_release = null }, size);
+    defer released.deinit(allocator);
+    var command = released.takeCommand() orelse return error.ExpectedHeaderCopyCommand;
+    defer command.deinit(allocator);
+    switch (command) {
+        .copy_source_header_path => |path| try std.testing.expectEqualSlices(u8, raw_path, path),
+        else => return error.ExpectedHeaderCopyCommand,
+    }
+    try std.testing.expect(!state.activeMouseOwner());
+    try std.testing.expect(state.completed_selection == null);
+}
+
+test "repository source header SH5 locks gesture kind and revalidates release identity" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "first\nsecond\n");
+    defer state.deinit(allocator);
+    const size: chasen.Size = .{ .width = 72, .height = 8 };
+    const page_layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const header_layout = repository_source_header.layout(
+        page_layout.source_width,
+        sourceHeaderPresentation(&state, state.selected_path.?),
+    );
+    const target = header_layout.path_target orelse return error.ExpectedPathTarget;
+    const header_point: BodyPoint = .{ .col = target.col, .row = repository_source_geometry.source_path_row };
+    const source_geometry = state.sourceGeometry(size, state.currentSource().?);
+    const body_point: BodyPoint = .{ .col = source_geometry.text_col, .row = source_geometry.body_first_row };
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_header_press = header_point }, size);
+    _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = body_point }, size);
+    try std.testing.expect(state.selection_owner.activeSourceHeader() != null);
+    try std.testing.expect(!state.activeSourceRange());
+    var header_release = state.applyNavigation(allocator, .{ .mouse_owner_release = body_point }, size);
+    defer header_release.deinit(allocator);
+    try std.testing.expect(header_release.command != null);
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = body_point }, size);
+    _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = header_point }, size);
+    try std.testing.expect(state.selection_owner.activeSource() != null);
+    try std.testing.expect(state.activeSourceRange());
+    state.cancelMouseOwner();
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_header_press = header_point }, size);
+    state.manifest_revision +%= 1;
+    var stale = state.applyNavigation(allocator, .{ .mouse_owner_release = null }, size);
+    defer stale.deinit(allocator);
+    try std.testing.expect(stale.command == null);
+    try std.testing.expect(!state.activeMouseOwner());
+}
+
+test "repository source header SH5 bounds clone failure and retains exact unchanged manifest" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 4,
+        .repo_epoch = 3,
+        .root_identity = .{ .device = 5, .inode = 6 },
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 7,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    const size: chasen.Size = .{ .width = 72, .height = 8 };
+    const page_layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const target = repository_source_header.layout(
+        page_layout.source_width,
+        sourceHeaderPresentation(&state, state.selected_path.?),
+    ).path_target orelse return error.ExpectedPathTarget;
+    const header_point: BodyPoint = .{ .col = target.col, .row = repository_source_geometry.source_path_row };
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_header_press = header_point }, size);
+    state.generation = 9;
+    state.pending_generation = 9;
+    var unchanged: ManifestFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = state.root_identity.?,
+        .generation = 9,
+        .result = .{ .unchanged = state.bundle.?.document.fingerprint },
+    };
+    defer unchanged.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(allocator, &unchanged));
+    try std.testing.expect(state.activeMouseOwner());
+    try std.testing.expect(state.sourceHeaderSelected());
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var failed_release = state.applyNavigation(failing.allocator(), .{ .mouse_owner_release = null }, size);
+    defer failed_release.deinit(failing.allocator());
+    try std.testing.expect(failed_release.command == null);
+    try std.testing.expect(!state.activeMouseOwner());
+    try std.testing.expectEqualStrings("Could not prepare file path copy", state.status.text());
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_header_press = header_point }, size);
+    state.requestReload(true);
+    try std.testing.expect(!state.activeMouseOwner());
+
+    _ = state.applyNavigation(allocator, .{ .mouse_source_header_press = header_point }, size);
+    var replacement = try bundleForTest("main.zig\x00");
+    var replacement_owned = true;
+    defer if (replacement_owned) replacement.deinit(allocator);
+    try state.replaceBundle(allocator, &replacement);
+    replacement_owned = false;
+    try std.testing.expect(!state.activeMouseOwner());
 }
 
 test "repository changed filter retains changed selection without document reload" {
@@ -6216,9 +6488,9 @@ test "repository selection slice B live gesture fixes mode and resumes after lea
     try std.testing.expectEqual(@as(usize, 3), state.selection_owner.activeSource().?.anchor.leading_byte);
     try std.testing.expectEqual(@as(usize, 4), state.selection_owner.activeSource().?.anchor.trailing_byte);
 
-    _ = state.applyNavigation(allocator, .{ .mouse_source_drag = null }, size);
+    _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = null }, size);
     try std.testing.expect(!state.selection_owner.activeSource().?.moved);
-    _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{ .col = geometry.text_col + 4, .row = first_row + 1 } }, size);
+    _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = .{ .col = geometry.text_col + 4, .row = first_row + 1 } }, size);
     try std.testing.expect(state.selection_owner.activeSource().?.moved);
     try std.testing.expectEqual(@as(usize, 1), state.selection_owner.activeSource().?.focus.line_index);
     try std.testing.expectEqual(@as(usize, 5), state.selection_owner.activeSource().?.focus.trailing_byte);
@@ -6226,20 +6498,20 @@ test "repository selection slice B live gesture fixes mode and resumes after lea
 
     // A character drag entering its own gutter clamps to the leading logical
     // boundary; it does not switch to whole-line mode.
-    _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{ .col = geometry.gutter_col, .row = first_row + 1 } }, size);
+    _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = .{ .col = geometry.gutter_col, .row = first_row + 1 } }, size);
     try std.testing.expectEqual(repository_selection.Mode.character, state.selection_owner.activeSource().?.mode);
     try std.testing.expectEqual(@as(usize, 0), state.selection_owner.activeSource().?.focus.leading_byte);
     try std.testing.expectEqual(@as(usize, 0), state.selection_owner.activeSource().?.focus.trailing_byte);
-    var character_release = state.applyNavigation(allocator, .{ .mouse_source_release = null }, size);
+    var character_release = state.applyNavigation(allocator, .{ .mouse_owner_release = null }, size);
     defer character_release.deinit(allocator);
     try std.testing.expect(!state.activeSourceRange());
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.gutter_col, .row = first_row } }, size);
     try std.testing.expectEqual(repository_selection.Mode.line, state.selection_owner.activeSource().?.mode);
-    _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{ .col = geometry.text_col + 2, .row = first_row + 1 } }, size);
+    _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = .{ .col = geometry.text_col + 2, .row = first_row + 1 } }, size);
     try std.testing.expectEqual(repository_selection.Mode.line, state.selection_owner.activeSource().?.mode);
     try std.testing.expectEqual(@as(usize, 1), state.selection_owner.activeSource().?.focus.line_index);
-    var line_release = state.applyNavigation(allocator, .{ .mouse_source_release = .{ .col = geometry.text_col + 2, .row = first_row + 1 } }, size);
+    var line_release = state.applyNavigation(allocator, .{ .mouse_owner_release = .{ .col = geometry.text_col + 2, .row = first_row + 1 } }, size);
     defer line_release.deinit(allocator);
     try std.testing.expect(!state.activeSourceRange());
 
@@ -6292,9 +6564,9 @@ test "repository selection slice B synthetic empty row rejects every gesture sta
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.gutter_col, .row = geometry.body_first_row } }, size);
     try std.testing.expect(!state.activeSourceRange());
-    _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
+    _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
     try std.testing.expect(!state.activeSourceRange());
-    var release = state.applyNavigation(allocator, .{ .mouse_source_release = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
+    var release = state.applyNavigation(allocator, .{ .mouse_owner_release = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
     defer release.deinit(allocator);
     try std.testing.expect(!state.activeSourceRange());
 }
@@ -6367,11 +6639,11 @@ test "repository selection slice C moved release installs candidate and independ
         .col = geometry.text_col + 3,
         .row = geometry.body_first_row,
     } }, size);
-    _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{
+    _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = .{
         .col = geometry.text_col + 4,
         .row = geometry.body_first_row + 1,
     } }, size);
-    var update = state.applyNavigation(allocator, .{ .mouse_source_release = null }, size);
+    var update = state.applyNavigation(allocator, .{ .mouse_owner_release = null }, size);
     defer update.deinit(allocator);
     try std.testing.expect(!state.activeSourceRange());
     try std.testing.expect(state.completed_selection != null);
@@ -6384,6 +6656,7 @@ test "repository selection slice C moved release installs candidate and independ
             text[0] = 'X';
             try std.testing.expectEqualStrings("DEFG\nHIJKL", state.completed_selection.?.text);
         },
+        else => return error.ExpectedSourceCopyCommand,
     }
 
     // A later click changes cursor/focus only and retains the accepted owner.
@@ -6391,7 +6664,7 @@ test "repository selection slice C moved release installs candidate and independ
         .col = geometry.text_col,
         .row = geometry.body_first_row,
     } }, size);
-    var click = state.applyNavigation(allocator, .{ .mouse_source_release = .{
+    var click = state.applyNavigation(allocator, .{ .mouse_owner_release = .{
         .col = geometry.text_col,
         .row = geometry.body_first_row,
     } }, size);
@@ -6413,15 +6686,16 @@ test "repository selection slice C first token to gutter keeps the token" {
         .col = geometry.text_col,
         .row = geometry.body_first_row,
     } }, size);
-    _ = state.applyNavigation(allocator, .{ .mouse_source_drag = .{
+    _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = .{
         .col = geometry.gutter_col,
         .row = geometry.body_first_row,
     } }, size);
-    var update = state.applyNavigation(allocator, .{ .mouse_source_release = null }, size);
+    var update = state.applyNavigation(allocator, .{ .mouse_owner_release = null }, size);
     defer update.deinit(allocator);
     try std.testing.expectEqualStrings("A", state.completed_selection.?.text);
     switch (update.command.?) {
         .copy_source_selection => |text| try std.testing.expectEqualStrings("A", text),
+        else => return error.ExpectedSourceCopyCommand,
     }
 }
 
@@ -6443,7 +6717,7 @@ test "repository selection slice C candidate and clipboard allocation failures h
         state.selection_owner = .{ .source = live };
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 0 });
         defer state.deinit(failing.allocator());
-        var update = state.applyNavigation(failing.allocator(), .{ .mouse_source_release = null }, size);
+        var update = state.applyNavigation(failing.allocator(), .{ .mouse_owner_release = null }, size);
         defer update.deinit(failing.allocator());
         try std.testing.expect(update.command == null);
         try std.testing.expect(state.completed_selection == null);
@@ -6465,7 +6739,7 @@ test "repository selection slice C candidate and clipboard allocation failures h
         );
         live.update(repository_selection.pointFromBoundary(0, line.len));
         state.selection_owner = .{ .source = live };
-        var update = state.applyNavigation(failing.allocator(), .{ .mouse_source_release = null }, size);
+        var update = state.applyNavigation(failing.allocator(), .{ .mouse_owner_release = null }, size);
         defer update.deinit(failing.allocator());
         if (state.completed_selection != null and update.command == null) {
             observed_clipboard_failure = true;
@@ -6491,7 +6765,7 @@ test "repository selection slice C stale release clears prior candidate" {
     live.moved = true;
     state.selection_owner = .{ .source = live };
 
-    var update = state.applyNavigation(allocator, .{ .mouse_source_release = null }, .{ .width = 60, .height = 6 });
+    var update = state.applyNavigation(allocator, .{ .mouse_owner_release = null }, .{ .width = 60, .height = 6 });
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
     try std.testing.expect(state.completed_selection == null);
@@ -6510,7 +6784,7 @@ test "repository selection slice C real empty line keeps candidate without copy 
     live.moved = true;
     state.selection_owner = .{ .source = live };
 
-    var update = state.applyNavigation(allocator, .{ .mouse_source_release = null }, .{ .width = 60, .height = 6 });
+    var update = state.applyNavigation(allocator, .{ .mouse_owner_release = null }, .{ .width = 60, .height = 6 });
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
     try std.testing.expect(state.completed_selection != null);
@@ -6619,7 +6893,7 @@ test "repository selection slice D retains candidate across inactive page and pr
         .row = geometry.body_first_row,
     } }, size);
     try std.testing.expect(state.activeSourceRange());
-    _ = state.applyNavigation(allocator, .cancel_source_selection, size);
+    _ = state.applyNavigation(allocator, .cancel_mouse_owner, size);
     try std.testing.expect(!state.activeSourceRange());
     try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
 

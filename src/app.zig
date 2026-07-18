@@ -774,6 +774,7 @@ pub const App = struct {
                 defer command.deinit(ctx.allocator());
                 switch (command) {
                     .copy_source_selection => |text| self.copySourceSelection(ctx, text),
+                    .copy_source_header_path => |path| self.copySourceHeaderPath(ctx, path),
                 }
             },
         }
@@ -1162,8 +1163,8 @@ pub const App = struct {
                 self.pages.repository.viewer.tree_hidden,
             );
             switch (mouse.type) {
-                .drag => return .{ .repository = .{ .mouse_source_drag = source_point } },
-                .release => return .{ .repository = .{ .mouse_source_release = source_point } },
+                .drag => return .{ .repository = .{ .mouse_owner_drag = source_point } },
+                .release => return .{ .repository = .{ .mouse_owner_release = source_point } },
                 else => {},
             }
         }
@@ -1446,6 +1447,13 @@ pub const App = struct {
     /// Single page-transition entry point for keyboard, mouse, and future
     /// Session API requests. It applies the policy before mutating either page.
     fn requestPageSwitch(self: *App, ctx: *chasen.Ctx(Msg), target: page.Id) !void {
+        // A Repository header-path gesture borrows only manifest path identity,
+        // not source content. Leaving the page cancels that pointer owner and
+        // continues through ordinary blockers; a source-range owner remains in
+        // the snapshot below and still rejects the transition.
+        if (self.active_page == .repository and target != .repository) {
+            _ = self.pages.repository.cancelSourceHeaderOwner();
+        }
         switch (page_transition.disposition(self.active_page, target, self.pageTransitionSnapshot())) {
             .unchanged => {
                 self.status.clearIfEphemeral();
@@ -4175,6 +4183,14 @@ pub const App = struct {
         });
     }
 
+    fn copySourceHeaderPath(self: *App, ctx: *chasen.Ctx(Msg), path: []const u8) void {
+        self.queueClipboardCopy(ctx, .{
+            .origin = .{ .page = self.repositoryPageEffectOrigin() },
+            .label = "file path",
+            .text = path,
+        });
+    }
+
     fn copyDiffHeaderPath(self: *App, ctx: *chasen.Ctx(Msg), selection: diff_selection.HeaderPathSelection) void {
         const path = self.reviewContent().diffHeaderPath(selection) orelse return;
         self.queueClipboardCopy(ctx, .{
@@ -5780,6 +5796,34 @@ test "repository selection slice C copy uses Repository origin without opening A
     const entry = ctx._pending_clipboard_copies[0];
     try std.testing.expectEqualStrings("selected source", entry.text);
     const state = app.clipboard_copy_states.get(entry.request_id.id) orelse return error.ExpectedClipboardState;
+    try std.testing.expectEqual(page.Id.repository, state.origin.page.page_id);
+    try std.testing.expectEqual(@as(u64, 4), state.origin.page.repo_epoch);
+    try std.testing.expectEqual(@as(u64, 5), state.origin.page.activation_id);
+    try std.testing.expectEqual(app_state.OverlayKind.none, app.overlay.kind);
+}
+
+test "repository source header SH5 copy uses byte-exact Repository clipboard effect" {
+    var app: App = .{
+        .active_page = .repository,
+        .repo_epoch = 4,
+        .pages = .{ .repository = .{
+            .active = true,
+            .activation_id = 5,
+            .repo_epoch = 4,
+        } },
+    };
+    defer app.clipboard_copy_states.deinit(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+    const path = "src/\xff-main.zig";
+
+    app.copySourceHeaderPath(&ctx, path);
+
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    const entry = ctx._pending_clipboard_copies[0];
+    try std.testing.expectEqualSlices(u8, path, entry.text);
+    const state = app.clipboard_copy_states.get(entry.request_id.id) orelse return error.ExpectedClipboardState;
+    try std.testing.expectEqualStrings("file path", state.label);
     try std.testing.expectEqual(page.Id.repository, state.origin.page.page_id);
     try std.testing.expectEqual(@as(u64, 4), state.origin.page.repo_epoch);
     try std.testing.expectEqual(@as(u64, 5), state.origin.page.activation_id);
@@ -8888,6 +8932,16 @@ fn repositoryLiveSelectionForTest() repository_selection.DragSelection {
     );
 }
 
+fn repositoryHeaderSelectionForTest() repository_selection.SourceHeaderPathSelection {
+    return .{ .identity = .{
+        .repo_epoch = 1,
+        .activation_id = 4,
+        .root_identity = .{ .device = 2, .inode = 3 },
+        .manifest_revision = 5,
+        .path = "main.zig",
+    } };
+}
+
 test "repository selection slice B drag routes first and outside release terminates" {
     var app: App = .{
         .active_page = .repository,
@@ -8912,7 +8966,7 @@ test "repository selection slice B drag routes first and outside release termina
     )) orelse return error.ExpectedRepositoryDrag;
     switch (drag) {
         .repository => |message| switch (message) {
-            .mouse_source_drag => |point| try std.testing.expectEqual(
+            .mouse_owner_drag => |point| try std.testing.expectEqual(
                 repository_page.BodyPoint{ .col = 4, .row = 2 },
                 point.?,
             ),
@@ -8938,7 +8992,7 @@ test "repository selection slice B drag routes first and outside release termina
         return error.ExpectedRepositoryRelease;
     switch (release) {
         .repository => |message| switch (message) {
-            .mouse_source_release => |point| try std.testing.expect(point == null),
+            .mouse_owner_release => |point| try std.testing.expect(point == null),
             else => return error.ExpectedRepositoryRelease,
         },
         else => return error.ExpectedRepositoryRelease,
@@ -8985,6 +9039,40 @@ test "repository selection slice B shell blocks transition and cancels on focus 
     try std.testing.expect(!app.pages.repository.activeSourceRange());
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
     try std.testing.expectEqual(chasen.Size{ .width = 70, .height = 12 }, app.terminal_size);
+}
+
+test "repository source header SH5 page switch cancels header owner without weakening source blocker" {
+    var app: App = .{
+        .active_page = .repository,
+        .pages = .{ .repository = .{ .active = true } },
+    };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    app.pages.repository.selection_owner = .{ .source_header = repositoryHeaderSelectionForTest() };
+    try app.requestPageSwitch(&ctx, .repository);
+    try std.testing.expect(app.pages.repository.activeMouseOwner());
+    try std.testing.expect(!app.pages.repository.activeSourceRange());
+
+    app.overlay.openHelp();
+    try app.requestPageSwitch(&ctx, .history);
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+    try std.testing.expect(!app.pages.repository.activeMouseOwner());
+    try std.testing.expectEqualStrings("close help before switching pages", app.status.text());
+    app.overlay.close();
+
+    app.pages.repository.selection_owner = .{ .source_header = repositoryHeaderSelectionForTest() };
+    try app.requestPageSwitch(&ctx, .history);
+    try std.testing.expectEqual(page.Id.history, app.active_page);
+    try std.testing.expect(!app.pages.repository.activeMouseOwner());
+
+    app.active_page = .repository;
+    app.pages.repository.active = true;
+    app.pages.repository.selection_owner = .{ .source = repositoryLiveSelectionForTest() };
+    app.status.clear();
+    try app.requestPageSwitch(&ctx, .history);
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+    try std.testing.expect(app.pages.repository.activeSourceRange());
+    try std.testing.expectEqualStrings("finish Repository mouse selection before switching pages", app.status.text());
 }
 
 test "repository activation and manual reload route to page-owned manifest tasks" {
