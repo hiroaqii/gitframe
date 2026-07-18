@@ -443,8 +443,19 @@ fn drawSidebarDetailRow(app: Context, surface: *chasen.Surface, row: u16) !void 
         return;
     }
 
-    if (branchStatusSidebarText(app.page, app.repo_root, surface.frameAllocator(), size.width - 1)) |text| {
-        try draw.copyClippedTextAt(surface, 1, row, text, sidebarBranchStyle(app.theme));
+    const available_width = size.width - 1;
+    if (branchStatusSidebarPresentation(app.page, app.repo_root, surface.frameAllocator(), available_width)) |presentation| {
+        try draw.copyClippedTextAt(surface, 1, row, presentation.text, sidebarBranchStyle(app.theme));
+
+        if (reviewPushHintInputReachable(app.page)) {
+            var key_buffer: [16]u8 = undefined;
+            const push_key = app.keymap.display(.push, key_buffer[0..]);
+            var hint_buffer: [32]u8 = undefined;
+            if (reviewPushHintForKey(presentation, available_width, push_key, hint_buffer[0..])) |hint| {
+                const hint_col = 1 + hint.base_display_width;
+                try draw.copyClippedTextAt(surface, hint_col, row, hint.text, sidebarBranchHintStyle(app.theme));
+            }
+        }
     }
 }
 
@@ -959,21 +970,74 @@ fn firstLine(text: []const u8) []const u8 {
     return text;
 }
 
-fn branchStatusSidebarText(page: *const review_page.ReviewPageState, repo_root: ?[]const u8, allocator: std.mem.Allocator, available_width: u16) ?[]const u8 {
+const SidebarBranchPresentation = struct {
+    text: []const u8,
+    full_display_width: ?u16 = null,
+    was_clipped: bool = false,
+    push_hint_eligible: bool = false,
+};
+
+const ReviewPushHint = struct {
+    text: []const u8,
+    base_display_width: u16,
+};
+
+fn branchStatusSidebarPresentation(page: *const review_page.ReviewPageState, repo_root: ?[]const u8, allocator: std.mem.Allocator, available_width: u16) ?SidebarBranchPresentation {
     const root = repo_root orelse return null;
     if (page.branch_status_load.pending) |pending| {
         const has_retained_snapshot = if (page.branch_status.repo_root) |snapshot_root|
             std.mem.eql(u8, root, snapshot_root)
         else
             false;
-        if (pending.origin == .foreground or !has_retained_snapshot) return "loading branch";
+        if (pending.origin == .foreground or !has_retained_snapshot) return .{ .text = "loading branch" };
     }
 
     const snapshot_root = page.branch_status.repo_root orelse return null;
     if (!std.mem.eql(u8, root, snapshot_root)) return null;
 
-    const formatted = branch_chrome.formatBaseLabel(allocator, page.branch_status.status, available_width) catch return "branch";
-    return formatted.text;
+    const formatted = branch_chrome.formatBaseLabel(allocator, page.branch_status.status, available_width) catch return .{ .text = "branch" };
+    return .{
+        // The caller-provided frame/testing allocator owns this transferred
+        // text for the same lifetime as the returned presentation.
+        .text = formatted.text,
+        .full_display_width = formatted.full_display_width,
+        .was_clipped = formatted.was_clipped,
+        .push_hint_eligible = branchStatusAllowsPushHint(page.branch_status.status),
+    };
+}
+
+fn branchStatusAllowsPushHint(status: git_branch_status.BranchStatus) bool {
+    return switch (status.head) {
+        .branch => true,
+        .detached, .unknown => false,
+    };
+}
+
+/// Text-input modes consume keys before Review's normal action route. Keep the
+/// branch fact visible, but do not advertise a shortcut that cannot currently
+/// reach the existing push command.
+fn reviewPushHintInputReachable(page: *const review_page.ReviewPageState) bool {
+    return !page.search.mode and !page.file_search.mode;
+}
+
+/// Compose discoverability chrome only when it fits after an unclipped base.
+/// The existing key/input and Review operation paths remain the sole push
+/// authority; this helper never infers action availability from branch text.
+fn reviewPushHintForKey(
+    presentation: SidebarBranchPresentation,
+    available_width: u16,
+    push_key: ?[]const u8,
+    buffer: []u8,
+) ?ReviewPushHint {
+    if (!presentation.push_hint_eligible or presentation.was_clipped) return null;
+    const base_width = presentation.full_display_width orelse return null;
+    if (base_width > available_width) return null;
+    const key = push_key orelse return null;
+    if (key.len == 0) return null;
+
+    const hint = std.fmt.bufPrint(buffer, "  ({s}: push)", .{key}) catch return null;
+    if (chasen.text.displayWidth(hint) > available_width - base_width) return null;
+    return .{ .text = hint, .base_display_width = base_width };
 }
 
 test "branch sidebar retains background snapshot but shows foreground loading" {
@@ -994,12 +1058,183 @@ test "branch sidebar retains background snapshot but shows foreground loading" {
     };
     defer page_state.branch_status.deinit();
 
-    const retained = branchStatusSidebarText(&page_state, "/repo", std.testing.allocator, 80).?;
-    defer std.testing.allocator.free(retained);
-    try std.testing.expectEqualStrings("main no upstream", retained);
+    const retained = branchStatusSidebarPresentation(&page_state, "/repo", std.testing.allocator, 80).?;
+    defer std.testing.allocator.free(retained.text);
+    try std.testing.expectEqualStrings("main no upstream", retained.text);
+    try std.testing.expect(retained.push_hint_eligible);
 
     page_state.branch_status_load.pending.?.origin = .foreground;
-    try std.testing.expectEqualStrings("loading branch", branchStatusSidebarText(&page_state, "/repo", std.testing.allocator, 80).?);
+    const loading = branchStatusSidebarPresentation(&page_state, "/repo", std.testing.allocator, 80).?;
+    try std.testing.expectEqualStrings("loading branch", loading.text);
+    try std.testing.expect(!loading.push_hint_eligible);
+}
+
+test "review branch push hint renders effective key with secondary style" {
+    var builder = git_branch_status.Builder.init(std.testing.allocator);
+    errdefer builder.deinit();
+    try builder.setBranchHead("main");
+    try builder.setUpstream("origin/main");
+    builder.setAheadBehind(0, 0);
+    var bundle = builder.finish();
+    var branch_status: git_branch_status.State = .{};
+    try branch_status.replace("/repo", &bundle);
+
+    var page_state: review_page.ReviewPageState = .{ .branch_status = branch_status };
+    defer page_state.branch_status.deinit();
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.muted)] = .{ .rgb = .{ 4, 5, 6 } };
+
+    var context = testContext(&page_state, palette, 48, 4);
+    context.repo_root = "/repo";
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(48, 1);
+    defer ts.deinit();
+
+    try drawSidebarDetailRow(context, &ts.surface, 0);
+    const default_snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(default_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, default_snapshot, "main ↑0  (P: push)") != null);
+
+    const base_cell = ts.surface.readCell(1, 0) orelse return error.ExpectedBranchBaseCell;
+    const hint_cell = ts.surface.readCell(10, 0) orelse return error.ExpectedBranchHintCell;
+    try std.testing.expect(base_cell.style.fg.eql(palette.color(.info)));
+    try std.testing.expect(!base_cell.style.dim);
+    try std.testing.expect(hint_cell.style.fg.eql(palette.color(.muted)));
+    try std.testing.expect(hint_cell.style.dim);
+
+    var config: keymap.Config = .{};
+    config.set(.push, .{ .ctrl = .s });
+    context.keymap = keymap.Effective.fromConfig(config);
+    ts.surface.clearAll();
+    try drawSidebarDetailRow(context, &ts.surface, 0);
+    const configured_snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(configured_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, configured_snapshot, "main ↑0  (Ctrl+s: push)") != null);
+
+    var unbound: keymap.Effective = .{};
+    unbound.bindings[@intFromEnum(keymap.PublicAction.push)] = null;
+    context.keymap = unbound;
+    ts.surface.clearAll();
+    try drawSidebarDetailRow(context, &ts.surface, 0);
+    const unbound_snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(unbound_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, unbound_snapshot, ": push)") == null);
+}
+
+test "review branch push hint follows text input authority" {
+    var builder = git_branch_status.Builder.init(std.testing.allocator);
+    errdefer builder.deinit();
+    try builder.setBranchHead("main");
+    try builder.setUpstream("origin/main");
+    builder.setAheadBehind(0, 0);
+    var bundle = builder.finish();
+    var branch_status: git_branch_status.State = .{};
+    try branch_status.replace("/repo", &bundle);
+
+    var page_state: review_page.ReviewPageState = .{ .branch_status = branch_status };
+    defer page_state.branch_status.deinit();
+    var context = testContext(&page_state, .default(), 48, 4);
+    context.repo_root = "/repo";
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(48, 1);
+    defer ts.deinit();
+
+    try drawSidebarDetailRow(context, &ts.surface, 0);
+    const normal_before = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(normal_before);
+    try std.testing.expect(std.mem.indexOf(u8, normal_before, "main ↑0  (P: push)") != null);
+
+    page_state.file_search.mode = true;
+    ts.surface.clearAll();
+    try drawSidebarDetailRow(context, &ts.surface, 0);
+    const file_search = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(file_search);
+    try std.testing.expect(std.mem.indexOf(u8, file_search, "main ↑0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, file_search, ": push)") == null);
+
+    page_state.file_search.mode = false;
+    page_state.search.mode = true;
+    ts.surface.clearAll();
+    try drawSidebarDetailRow(context, &ts.surface, 0);
+    const diff_search = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(diff_search);
+    try std.testing.expect(std.mem.indexOf(u8, diff_search, "main ↑0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff_search, ": push)") == null);
+
+    page_state.search.mode = false;
+    ts.surface.clearAll();
+    try drawSidebarDetailRow(context, &ts.surface, 0);
+    const normal_after = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(normal_after);
+    try std.testing.expect(std.mem.indexOf(u8, normal_after, "main ↑0  (P: push)") != null);
+}
+
+test "review branch push hint drops before base clipping and omits non-branch terminals" {
+    const no_upstream_status: git_branch_status.BranchStatus = .{ .head = .{ .branch = "main" } };
+    var formatted = try branch_chrome.formatBaseLabel(std.testing.allocator, no_upstream_status, 80);
+    defer formatted.deinit(std.testing.allocator);
+    const presentation: SidebarBranchPresentation = .{
+        .text = formatted.text,
+        .full_display_width = formatted.full_display_width,
+        .was_clipped = formatted.was_clipped,
+        .push_hint_eligible = branchStatusAllowsPushHint(no_upstream_status),
+    };
+    const hint_width = chasen.text.displayWidth("  (P: push)");
+    const exact_width = presentation.full_display_width.? + hint_width;
+    var hint_buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("  (P: push)", reviewPushHintForKey(presentation, exact_width, "P", hint_buffer[0..]).?.text);
+    try std.testing.expect(reviewPushHintForKey(presentation, exact_width - 1, "P", hint_buffer[0..]) == null);
+    try std.testing.expect(reviewPushHintForKey(presentation, exact_width, null, hint_buffer[0..]) == null);
+
+    var clipped = try branch_chrome.formatBaseLabel(std.testing.allocator, no_upstream_status, presentation.full_display_width.? - 1);
+    defer clipped.deinit(std.testing.allocator);
+    const clipped_presentation: SidebarBranchPresentation = .{
+        .text = clipped.text,
+        .full_display_width = clipped.full_display_width,
+        .was_clipped = clipped.was_clipped,
+        .push_hint_eligible = true,
+    };
+    try std.testing.expect(clipped_presentation.was_clipped);
+    try std.testing.expect(reviewPushHintForKey(clipped_presentation, presentation.full_display_width.? - 1, "P", hint_buffer[0..]) == null);
+
+    const loading: SidebarBranchPresentation = .{ .text = "loading branch" };
+    const detached: SidebarBranchPresentation = .{ .text = "detached", .full_display_width = 8 };
+    const unknown: SidebarBranchPresentation = .{ .text = "unknown branch", .full_display_width = 14 };
+    try std.testing.expect(!branchStatusAllowsPushHint(.{ .head = .detached }));
+    try std.testing.expect(!branchStatusAllowsPushHint(.{ .head = .unknown }));
+    try std.testing.expect(reviewPushHintForKey(loading, 80, "P", hint_buffer[0..]) == null);
+    try std.testing.expect(reviewPushHintForKey(detached, 80, "P", hint_buffer[0..]) == null);
+    try std.testing.expect(reviewPushHintForKey(unknown, 80, "P", hint_buffer[0..]) == null);
+}
+
+test "review filter summary owns sidebar detail row over push hint" {
+    var builder = git_branch_status.Builder.init(std.testing.allocator);
+    errdefer builder.deinit();
+    try builder.setBranchHead("main");
+    try builder.setUpstream("origin/main");
+    builder.setAheadBehind(0, 0);
+    var bundle = builder.finish();
+    var branch_status: git_branch_status.State = .{};
+    try branch_status.replace("/repo", &bundle);
+
+    var page_state: review_page.ReviewPageState = .{
+        .branch_status = branch_status,
+        .review_display = .{ .changed_file_filter = .modified },
+    };
+    defer page_state.branch_status.deinit();
+    var context = testContext(&page_state, .default(), 48, 4);
+    context.repo_root = "/repo";
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(48, 1);
+    defer ts.deinit();
+
+    try drawSidebarDetailRow(context, &ts.surface, 0);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "main ↑0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, ": push)") == null);
 }
 
 pub fn drawSearchMatchMarker(app: Context, surface: *chasen.Surface) void {
@@ -1063,6 +1298,10 @@ fn sidebarTitleStyle(palette: theme.Palette) chasen.TextStyle {
 
 fn sidebarBranchStyle(palette: theme.Palette) chasen.TextStyle {
     return palette.style(.info);
+}
+
+fn sidebarBranchHintStyle(palette: theme.Palette) chasen.TextStyle {
+    return .{ .fg = palette.color(.muted), .dim = true };
 }
 
 /// Selected-file identity is stable chrome rather than a pane-focus signal.
