@@ -81,6 +81,7 @@ test {
     _ = @import("diff/patch.zig");
     _ = @import("diff/render.zig");
     _ = @import("diff/selection.zig");
+    _ = @import("diff/syntax_view.zig");
     _ = @import("editor.zig");
     _ = @import("external/action.zig");
     _ = @import("git/backend.zig");
