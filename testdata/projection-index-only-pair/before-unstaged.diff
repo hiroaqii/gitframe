@@ -1,0 +1,10 @@
+diff --git a/src/pair_fixture.zig b/src/pair_fixture.zig
+index 2222222..4444444 100644
+--- a/src/pair_fixture.zig
++++ b/src/pair_fixture.zig
+@@ -8,1 +8,1 @@
+-const beta: usize = 2;
++const beta: usize = 20;
+@@ -13,1 +13,1 @@
+-const gamma: usize = 3;
++const gamma: usize = 30;

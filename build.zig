@@ -277,7 +277,7 @@ pub fn build(b: *std.Build) void {
 
     const projection_perf_step = b.step(
         "projection-perf",
-        "Profile staged projection construction from a recorded patch",
+        "Profile staged projection construction from a patch or component pair",
     );
     const source_syntax_perf_step = b.step(
         "source-syntax-perf",
@@ -348,7 +348,7 @@ pub fn build(b: *std.Build) void {
         source_syntax_capacity_step.dependOn(&run_source_syntax_capacity.step);
     } else {
         projection_perf_step.dependOn(&b.addFail(
-            "run `zig build projection-perf -Dsyntax-provider=flow_syntax -- <patch-file> [iterations]` on macOS or Linux",
+            "run `zig build projection-perf -Dsyntax-provider=flow_syntax -- <patch-file> [iterations]` or its `--component-pair` mode on macOS or Linux",
         ).step);
         source_syntax_perf_step.dependOn(&b.addFail(
             "run `zig build source-syntax-perf -Dsyntax-provider=flow_syntax -- <file-a> <file-b> [iterations]` on macOS or Linux",

@@ -1,14 +1,18 @@
 //! Stage-level performance profiler for GitFrame's staged Review projection.
 //!
 //! This developer-only tool measures parse, flow-syntax, tree/cache construction,
-//! and first-redraw costs from a recorded unified-diff patch. Use it to compare
-//! Debug and ReleaseFast builds and to evaluate future provider optimizations. It is
-//! not a correctness test or a wall-clock acceptance gate, and normal `zig build`
-//! and `zig build test` paths do not execute it.
+//! and first-redraw costs from a recorded unified-diff patch. Its component-pair
+//! mode compares the same normalized HEAD-to-working-tree presentation before and
+//! after an index-only hunk move, including parse/projection/equality versus eager
+//! decoration. Use it to compare Debug and ReleaseFast builds and to evaluate future
+//! projection/provider changes. It is not a correctness test or a wall-clock
+//! acceptance gate, and normal `zig build` and `zig build test` paths do not execute
+//! it.
 //!
 //! Usage:
 //!   zig build projection-perf -- <patch-file> [iterations]
 //!   zig build projection-perf -Doptimize=ReleaseFast -- <patch-file> [iterations]
+//!   zig build projection-perf -- --component-pair <before-cached> <before-unstaged> <after-cached> <after-unstaged> [iterations]
 //!
 //! Results report median and observed range for each stage. A checksum consumes the
 //! generated model so optimized builds cannot discard the measured work. The
@@ -18,6 +22,7 @@
 const std = @import("std");
 
 const chasen = @import("chasen");
+const diff_hunk_projection = @import("../diff/hunk_projection.zig");
 const diff_parser = @import("../diff/parser.zig");
 const diff_render = @import("../diff/render.zig");
 const diff_view_model = @import("../diff/view_model.zig");
@@ -65,8 +70,11 @@ const Stopwatch = struct {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--component-pair")) {
+        return profileComponentPairCommand(init, args);
+    }
     if (args.len < 2 or args.len > 3) {
-        std.debug.print("usage: zig build projection-perf -- <patch-file> [iterations]\n", .{});
+        printUsage();
         return error.InvalidArguments;
     }
 
@@ -121,11 +129,382 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+fn printUsage() void {
+    std.debug.print(
+        \\usage:
+        \\  zig build projection-perf -- <patch-file> [iterations]
+        \\  zig build projection-perf -- --component-pair <before-cached> <before-unstaged> <after-cached> <after-unstaged> [iterations]
+        \\
+    , .{});
+}
+
 const Shape = struct {
     files: usize = 0,
     hunks: usize = 0,
     highlighted_sides: usize = 0,
 };
+
+const PairPhase = enum {
+    component_parse,
+    normalized_projection,
+    presentation_fingerprint,
+    presentation_equality,
+    exact_reuse_construction,
+    eager_decoration,
+    eager_refresh_total,
+};
+
+const pair_phase_count = @typeInfo(PairPhase).@"enum".fields.len;
+const PairSample = [pair_phase_count]u64;
+
+const ComponentPairInput = struct {
+    before_cached: []const u8,
+    before_unstaged: []const u8,
+    after_cached: []const u8,
+    after_unstaged: []const u8,
+};
+
+const ComponentPairShape = struct {
+    before_cached_hunks: usize = 0,
+    before_unstaged_hunks: usize = 0,
+    after_cached_hunks: usize = 0,
+    after_unstaged_hunks: usize = 0,
+    projected_hunks: usize = 0,
+};
+
+fn profileComponentPairCommand(init: std.process.Init, args: []const []const u8) !void {
+    if (args.len < 6 or args.len > 7) {
+        printUsage();
+        return error.InvalidArguments;
+    }
+
+    const iterations = if (args.len == 7)
+        try std.fmt.parseUnsigned(usize, args[6], 10)
+    else
+        default_iterations;
+    if (iterations == 0 or iterations > max_iterations) return error.InvalidIterationCount;
+
+    const before_cached = try readPatch(init, args[2]);
+    defer init.gpa.free(before_cached);
+    const before_unstaged = try readPatch(init, args[3]);
+    defer init.gpa.free(before_unstaged);
+    const after_cached = try readPatch(init, args[4]);
+    defer init.gpa.free(after_cached);
+    const after_unstaged = try readPatch(init, args[5]);
+    defer init.gpa.free(after_unstaged);
+    const input: ComponentPairInput = .{
+        .before_cached = before_cached,
+        .before_unstaged = before_unstaged,
+        .after_cached = after_cached,
+        .after_unstaged = after_unstaged,
+    };
+
+    var samples: [max_iterations]PairSample = undefined;
+    var shape: ComponentPairShape = .{};
+    var checksum: usize = 0;
+    for (samples[0..iterations]) |*sample| {
+        sample.* = try profileComponentPairOnce(init.gpa, init.io, input, &shape, &checksum);
+    }
+
+    std.debug.print(
+        \\GitFrame index-only component-pair profile
+        \\  before cached: {s} ({d} bytes, {d} hunks)
+        \\  before unstaged: {s} ({d} bytes, {d} hunks)
+        \\  after cached: {s} ({d} bytes, {d} hunks)
+        \\  after unstaged: {s} ({d} bytes, {d} hunks)
+        \\  normalized presentation hunks: {d}
+        \\  raw component metadata differs: yes
+        \\  canonical presentation equality: yes
+        \\  iterations: {d}
+        \\  checksum: {d}
+        \\
+    , .{
+        args[2],
+        before_cached.len,
+        shape.before_cached_hunks,
+        args[3],
+        before_unstaged.len,
+        shape.before_unstaged_hunks,
+        args[4],
+        after_cached.len,
+        shape.after_cached_hunks,
+        args[5],
+        after_unstaged.len,
+        shape.after_unstaged_hunks,
+        shape.projected_hunks,
+        iterations,
+        checksum,
+    });
+
+    inline for (@typeInfo(PairPhase).@"enum".fields, 0..) |field, phase_index| {
+        printPairSummary(field.name, samples[0..iterations], phase_index);
+    }
+}
+
+fn readPatch(init: std.process.Init, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(max_patch_bytes));
+}
+
+fn profileComponentPairOnce(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    input: ComponentPairInput,
+    shape: *ComponentPairShape,
+    checksum: *usize,
+) !PairSample {
+    var sample: PairSample = @splat(0);
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    // The retained presentation is setup rather than part of refresh timing.
+    // P0 measures the work performed after an index-only action against it.
+    const before_cached = try parseComponent(arena_allocator, input.before_cached);
+    const before_unstaged = try parseComponent(arena_allocator, input.before_unstaged);
+    const before_projection = try diff_hunk_projection.build(
+        arena_allocator,
+        try singleFile(before_cached),
+        try singleFile(before_unstaged),
+    );
+    const before_fingerprint = prototypePresentationFingerprint(before_projection.file);
+
+    var reuse_timer = Stopwatch.start(io);
+    var timer = Stopwatch.start(io);
+    const after_cached = try parseComponent(arena_allocator, input.after_cached);
+    const after_unstaged = try parseComponent(arena_allocator, input.after_unstaged);
+    sample[@intFromEnum(PairPhase.component_parse)] = timer.read();
+
+    timer = Stopwatch.start(io);
+    const after_projection = try diff_hunk_projection.build(
+        arena_allocator,
+        try singleFile(after_cached),
+        try singleFile(after_unstaged),
+    );
+    sample[@intFromEnum(PairPhase.normalized_projection)] = timer.read();
+
+    if (metadataEqual(before_projection.file.metadata, after_projection.file.metadata)) {
+        return error.ComponentPairMetadataDidNotChange;
+    }
+    if (projectedStatesEqual(before_projection.hunk_states, after_projection.hunk_states)) {
+        return error.ComponentPairAuthorityDidNotChange;
+    }
+
+    timer = Stopwatch.start(io);
+    const after_fingerprint = prototypePresentationFingerprint(after_projection.file);
+    sample[@intFromEnum(PairPhase.presentation_fingerprint)] = timer.read();
+    if (!std.mem.eql(u8, &before_fingerprint, &after_fingerprint)) {
+        return error.ComponentPairFingerprintMismatch;
+    }
+
+    timer = Stopwatch.start(io);
+    const equal = prototypePresentationEqual(before_projection.file, after_projection.file);
+    sample[@intFromEnum(PairPhase.presentation_equality)] = timer.read();
+    if (!equal) return error.ComponentPairPresentationMismatch;
+    sample[@intFromEnum(PairPhase.exact_reuse_construction)] = reuse_timer.read();
+
+    timer = Stopwatch.start(io);
+    try profileEagerComponentDecoration(arena_allocator, io, after_cached, checksum);
+    try profileEagerComponentDecoration(arena_allocator, io, after_unstaged, checksum);
+    sample[@intFromEnum(PairPhase.eager_decoration)] = timer.read();
+    sample[@intFromEnum(PairPhase.eager_refresh_total)] = reuse_timer.read();
+
+    shape.* = .{
+        .before_cached_hunks = before_cached.totalHunks(),
+        .before_unstaged_hunks = before_unstaged.totalHunks(),
+        .after_cached_hunks = after_cached.totalHunks(),
+        .after_unstaged_hunks = after_unstaged.totalHunks(),
+        .projected_hunks = after_projection.file.hunks.len,
+    };
+    for (after_fingerprint) |byte| checksum.* +%= byte;
+    checksum.* +%= after_projection.file.hunks.len;
+    return sample;
+}
+
+fn parseComponent(allocator: std.mem.Allocator, bytes: []const u8) !diff_parser.DiffDocument {
+    return diff_parser.parse(allocator, try allocator.dupe(u8, bytes));
+}
+
+fn singleFile(document: diff_parser.DiffDocument) !diff_parser.FileDiff {
+    if (document.files.len != 1) return error.ExpectedSingleFileComponent;
+    return document.files[0];
+}
+
+fn profileEagerComponentDecoration(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    document: diff_parser.DiffDocument,
+    checksum: *usize,
+) !void {
+    var spans = try provider.allocateEmptyForDocument(allocator, document);
+    const query_cache = try flow_syntax.QueryCache.create(io, allocator, .{});
+    defer query_cache.deinit();
+
+    var ignored_sample: Sample = @splat(0);
+    var ignored_shape: Shape = .{ .files = document.files.len };
+    for (document.files, 0..) |file, file_index| {
+        ignored_shape.hunks += file.hunks.len;
+        if (file.is_binary) continue;
+        for (file.hunks, 0..) |hunk, hunk_index| {
+            try profileHunkSide(allocator, io, &ignored_sample, &spans, query_cache, file, hunk, .{
+                .file_index = file_index,
+                .hunk_index = hunk_index,
+                .side = .old,
+            }, &ignored_shape, checksum);
+            try profileHunkSide(allocator, io, &ignored_sample, &spans, query_cache, file, hunk, .{
+                .file_index = file_index,
+                .hunk_index = hunk_index,
+                .side = .new,
+            }, &ignored_shape, checksum);
+        }
+    }
+
+    const tree = try file_tree.build(allocator, document);
+    const rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, document);
+    checksum.* +%= tree.nodes.len;
+    if (document.files.len != 0) {
+        checksum.* +%= rendered_line_cache.indexFor(0, .side_by_side).?.lineCount();
+    }
+}
+
+/// P0-only model of the visible projected file shape. Raw component metadata and
+/// hunk stage/action origins are deliberately absent. P1 replaces this profiler
+/// prototype with the reviewed production canonical identity and comparator.
+fn prototypePresentationFingerprint(file: diff_parser.FileDiff) [32]u8 {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hashOptionalBytes(&hasher, file.old_path);
+    hashOptionalBytes(&hasher, file.new_path);
+    hashBool(&hasher, file.is_binary);
+    hashU64(&hasher, file.hunks.len);
+    for (file.hunks) |hunk| {
+        hashU32(&hasher, hunk.old_start);
+        hashU32(&hasher, hunk.old_count);
+        hashU32(&hasher, hunk.new_start);
+        hashU32(&hasher, hunk.new_count);
+        hashBytes(&hasher, hunk.section);
+        hashU64(&hasher, hunk.lines.len);
+        for (hunk.lines) |line| {
+            hashByte(&hasher, @intFromEnum(line.kind));
+            hashBytes(&hasher, line.text);
+            hashOptionalU32(&hasher, line.old_line);
+            hashOptionalU32(&hasher, line.new_line);
+        }
+    }
+
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn prototypePresentationEqual(lhs: diff_parser.FileDiff, rhs: diff_parser.FileDiff) bool {
+    if (!optionalBytesEqual(lhs.old_path, rhs.old_path)) return false;
+    if (!optionalBytesEqual(lhs.new_path, rhs.new_path)) return false;
+    if (lhs.is_binary != rhs.is_binary or lhs.hunks.len != rhs.hunks.len) return false;
+
+    for (lhs.hunks, rhs.hunks) |left_hunk, right_hunk| {
+        if (left_hunk.old_start != right_hunk.old_start or
+            left_hunk.old_count != right_hunk.old_count or
+            left_hunk.new_start != right_hunk.new_start or
+            left_hunk.new_count != right_hunk.new_count or
+            !std.mem.eql(u8, left_hunk.section, right_hunk.section) or
+            left_hunk.lines.len != right_hunk.lines.len)
+        {
+            return false;
+        }
+        for (left_hunk.lines, right_hunk.lines) |left_line, right_line| {
+            if (left_line.kind != right_line.kind or
+                !std.mem.eql(u8, left_line.text, right_line.text) or
+                left_line.old_line != right_line.old_line or
+                left_line.new_line != right_line.new_line)
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn metadataEqual(lhs: []const []const u8, rhs: []const []const u8) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+fn projectedStatesEqual(
+    lhs: []const diff_hunk_projection.ProjectedHunkState,
+    rhs: []const diff_hunk_projection.ProjectedHunkState,
+) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (left.state != right.state or !hunkOriginEqual(left.origin, right.origin)) return false;
+    }
+    return true;
+}
+
+fn hunkOriginEqual(lhs: diff_hunk_projection.HunkOrigin, rhs: diff_hunk_projection.HunkOrigin) bool {
+    return switch (lhs) {
+        .cached => |index| switch (rhs) {
+            .cached => |other| index == other,
+            .unstaged => false,
+        },
+        .unstaged => |index| switch (rhs) {
+            .cached => false,
+            .unstaged => |other| index == other,
+        },
+    };
+}
+
+fn optionalBytesEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs) |left| {
+        const right = rhs orelse return false;
+        return std.mem.eql(u8, left, right);
+    }
+    return rhs == null;
+}
+
+fn hashOptionalBytes(hasher: *std.crypto.hash.Blake3, value: ?[]const u8) void {
+    if (value) |bytes| {
+        hashByte(hasher, 1);
+        hashBytes(hasher, bytes);
+    } else {
+        hashByte(hasher, 0);
+    }
+}
+
+fn hashOptionalU32(hasher: *std.crypto.hash.Blake3, value: ?u32) void {
+    if (value) |number| {
+        hashByte(hasher, 1);
+        hashU32(hasher, number);
+    } else {
+        hashByte(hasher, 0);
+    }
+}
+
+fn hashBytes(hasher: *std.crypto.hash.Blake3, bytes: []const u8) void {
+    hashU64(hasher, bytes.len);
+    hasher.update(bytes);
+}
+
+fn hashBool(hasher: *std.crypto.hash.Blake3, value: bool) void {
+    hashByte(hasher, @intFromBool(value));
+}
+
+fn hashByte(hasher: *std.crypto.hash.Blake3, value: u8) void {
+    hasher.update(&.{value});
+}
+
+fn hashU32(hasher: *std.crypto.hash.Blake3, value: u32) void {
+    var bytes: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
+fn hashU64(hasher: *std.crypto.hash.Blake3, value: usize) void {
+    var bytes: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, @intCast(value), .little);
+    hasher.update(&bytes);
+}
 
 fn profileOnce(
     allocator: std.mem.Allocator,
@@ -319,6 +698,29 @@ const RenderContext = struct {
 };
 
 fn printSummary(label: []const u8, samples: []const Sample, phase_index: usize) void {
+    var values: [max_iterations]u64 = undefined;
+    for (samples, 0..) |sample, index| values[index] = sample[phase_index];
+    const sorted = values[0..samples.len];
+    insertionSort(sorted);
+    const median = sorted[sorted.len / 2];
+    if (median < std.time.ns_per_us) {
+        std.debug.print("  {s}: median {d} ns, range {d}..{d} ns\n", .{
+            label,
+            median,
+            sorted[0],
+            sorted[sorted.len - 1],
+        });
+        return;
+    }
+    std.debug.print("  {s}: median {d} us, range {d}..{d} us\n", .{
+        label,
+        median / std.time.ns_per_us,
+        sorted[0] / std.time.ns_per_us,
+        sorted[sorted.len - 1] / std.time.ns_per_us,
+    });
+}
+
+fn printPairSummary(label: []const u8, samples: []const PairSample, phase_index: usize) void {
     var values: [max_iterations]u64 = undefined;
     for (samples, 0..) |sample, index| values[index] = sample[phase_index];
     const sorted = values[0..samples.len];
