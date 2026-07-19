@@ -18,6 +18,30 @@ const text_projection = @import("../text/projection.zig");
 
 pub const DisplayMode = diff_view_model.DisplayMode;
 
+pub const HunkStageState = enum {
+    unstaged,
+    staged,
+};
+
+/// Explicit index-membership authority for every hunk rendered in a pane.
+///
+/// The former empty boolean slice conflated an unstaged document with a
+/// staged-only document whose session marks had been normalized away. Keeping
+/// the uniform cases as tags also avoids allocating a repeated state slice.
+pub const HunkStagePresentation = union(enum) {
+    all_unstaged,
+    all_staged,
+    per_hunk: []const HunkStageState,
+
+    pub fn stateForHunk(self: HunkStagePresentation, hunk_index: usize) HunkStageState {
+        return switch (self) {
+            .all_unstaged => .unstaged,
+            .all_staged => .staged,
+            .per_hunk => |states| if (hunk_index < states.len) states[hunk_index] else .unstaged,
+        };
+    }
+};
+
 pub const RenderOptions = struct {
     requested_mode: DisplayMode = .unified,
     scroll: usize = 0,
@@ -26,7 +50,7 @@ pub const RenderOptions = struct {
     line_numbers: bool = true,
     highlighted_hunk: ?usize = null,
     cursor_offset: ?usize = null,
-    staged_hunks: []const bool = &.{},
+    hunk_stages: HunkStagePresentation = .all_unstaged,
     line_index: ?diff_view_model.RenderedLineIndex = null,
     folded_hunks: []const bool = &.{},
     palette: theme.Palette = .default(),
@@ -36,6 +60,19 @@ pub const RenderOptions = struct {
     selection: ?diff_selection.View = null,
     header_selection: bool = false,
 };
+
+test "hunk stage presentation resolves uniform and exact per-hunk states" {
+    const all_unstaged: HunkStagePresentation = .all_unstaged;
+    const all_staged: HunkStagePresentation = .all_staged;
+    try std.testing.expectEqual(HunkStageState.unstaged, all_unstaged.stateForHunk(0));
+    try std.testing.expectEqual(HunkStageState.staged, all_staged.stateForHunk(99));
+
+    const states = [_]HunkStageState{ .staged, .unstaged };
+    const per_hunk: HunkStagePresentation = .{ .per_hunk = &states };
+    try std.testing.expectEqual(HunkStageState.staged, per_hunk.stateForHunk(0));
+    try std.testing.expectEqual(HunkStageState.unstaged, per_hunk.stateForHunk(1));
+    try std.testing.expectEqual(HunkStageState.unstaged, per_hunk.stateForHunk(2));
+}
 
 pub const SideBySideRegion = struct {
     col: u16,
@@ -247,7 +284,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     while (rows.next()) |body_row| {
         if (cursor.done()) return;
         if (rows.currentHunkIndex()) |hunk_index| {
-            current_hunk_staged = hunk_index < options.staged_hunks.len and options.staged_hunks[hunk_index];
+            current_hunk_staged = options.hunk_stages.stateForHunk(hunk_index) == .staged;
             current_hunk_highlighted = options.highlighted_hunk != null and options.highlighted_hunk.? == hunk_index;
         } else {
             current_hunk_staged = false;
@@ -1341,7 +1378,7 @@ test "renderFile dims staged hunk body without removing it" {
 
     try renderFile(&ts.surface, file, .{
         .requested_mode = .unified,
-        .staged_hunks = &.{true},
+        .hunk_stages = .all_staged,
     });
 
     const header_cell = ts.surface.readCell(2, 3).?;
@@ -1355,6 +1392,47 @@ test "renderFile dims staged hunk body without removing it" {
     try ts.expectCellText(14, 5, "n");
     const new_cell = ts.surface.readCell(14, 5).?;
     try std.testing.expect(new_cell.style.dim);
+}
+
+test "renderFile consumes exact per-hunk stage presentation" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 7);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 0,
+                .old_count = 0,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "staged",
+                .lines = &.{.{ .kind = .added, .text = "first", .new_line = 1 }},
+            },
+            .{
+                .old_start = 1,
+                .old_count = 0,
+                .new_start = 3,
+                .new_count = 1,
+                .section = "unstaged",
+                .lines = &.{.{ .kind = .added, .text = "second", .new_line = 3 }},
+            },
+        },
+    };
+    const states = [_]HunkStageState{ .staged, .unstaged };
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .hunk_stages = .{ .per_hunk = &states },
+    });
+
+    const text_col = cursor_gutter_width + lineTextStart(true, .unified);
+    try std.testing.expect(ts.surface.readCell(text_col, body_start_row + 1).?.style.dim);
+    try std.testing.expect(!ts.surface.readCell(text_col, body_start_row + 3).?.style.dim);
 }
 
 test "renderFile applies unified syntax spans without removing diff background" {
@@ -1480,7 +1558,7 @@ test "renderFile normalizes highlighted unified body base foreground" {
         .requested_mode = .unified,
         .palette = palette,
         .syntax = .initDirect(&spans, 0),
-        .staged_hunks = &.{true},
+        .hunk_stages = .all_staged,
     });
 
     const context_cell = ts.surface.readCell(14, 4).?;
@@ -1814,7 +1892,7 @@ test "review diff cursor character selection colors only exact tokens and preser
         .cursor_offset = 1,
         .palette = palette,
         .syntax = .initDirect(&spans, 0),
-        .staged_hunks = &.{true},
+        .hunk_stages = .all_staged,
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
             .side = .new,
@@ -2879,7 +2957,7 @@ test "review diff cursor composes unified selection inside pane chrome" {
     try renderFile(&ts.surface, file, .{
         .requested_mode = .unified,
         .cursor_offset = 1,
-        .staged_hunks = &.{true},
+        .hunk_stages = .all_staged,
         .palette = palette,
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
@@ -3076,7 +3154,7 @@ test "review diff cursor covers metadata binary and hunk rows only while active"
     var hunk: chasen.testing.TestSurface = undefined;
     try hunk.init(80, 6);
     defer hunk.deinit();
-    try renderFile(&hunk.surface, text_file, .{ .cursor_offset = 1, .palette = palette, .staged_hunks = &.{true} });
+    try renderFile(&hunk.surface, text_file, .{ .cursor_offset = 1, .palette = palette, .hunk_stages = .all_staged });
     try expectBgRange(&hunk.surface, body_start_row + 1, 0, 80, palette.color(.pane_cursor_bg));
     try std.testing.expect(hunk.surface.readCell(2, body_start_row + 1).?.style.dim);
 

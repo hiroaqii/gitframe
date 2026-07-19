@@ -88,13 +88,13 @@ pub const ActiveDiffDisplay = union(enum) {
         file: diff_parser.FileDiff,
         line_index: ?diff_view_model.RenderedLineIndex,
         folded_hunks: []const bool,
-        staged_flags: []const bool,
+        hunk_stages: diff_render.HunkStagePresentation,
         syntax: diff_syntax_view.View,
     },
     combined_projection: struct {
         file: diff_parser.FileDiff,
         line_index: diff_view_model.RenderedLineIndex,
-        staged_flags: []const bool,
+        hunk_stages: diff_render.HunkStagePresentation,
         syntax: diff_syntax_view.View,
     },
 
@@ -119,10 +119,10 @@ pub const ActiveDiffDisplay = union(enum) {
         };
     }
 
-    pub fn stagedFlags(self: ActiveDiffDisplay) []const bool {
+    pub fn hunkStagePresentation(self: ActiveDiffDisplay) diff_render.HunkStagePresentation {
         return switch (self) {
-            .loaded => |loaded| loaded.staged_flags,
-            .combined_projection => |projection| projection.staged_flags,
+            .loaded => |loaded| loaded.hunk_stages,
+            .combined_projection => |projection| projection.hunk_stages,
         };
     }
 
@@ -133,6 +133,21 @@ pub const ActiveDiffDisplay = union(enum) {
         };
     }
 };
+
+/// Converts projection-owned index membership into the renderer's explicit
+/// per-hunk contract. Both normal and status-only Review routes use this one
+/// conversion so they cannot disagree about a combined hunk's stage state.
+pub fn projectedHunkStagePresentation(
+    allocator: std.mem.Allocator,
+    states: []const diff_hunk_projection.ProjectedHunkState,
+) !diff_render.HunkStagePresentation {
+    if (states.len == 0) return .{ .per_hunk = &.{} };
+    const presentation = try allocator.alloc(diff_render.HunkStageState, states.len);
+    for (states, presentation) |state, *item| {
+        item.* = if (state.state == .staged) .staged else .unstaged;
+    }
+    return .{ .per_hunk = presentation };
+}
 
 pub const invalid_utf8_body_message = "Text preview unavailable: diff content is not valid UTF-8";
 
@@ -774,17 +789,24 @@ pub const View = struct {
     pub fn activeDiffDisplay(self: View, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?ActiveDiffDisplay {
         const selected: struct { loaded: *const LoadedDiff, file_index: usize } = switch (self.displayedReviewBody()) {
             .combined => |bundle| {
-                const states = bundle.projection.hunk_states;
-                const flags = try allocator.alloc(bool, states.len);
-                for (states, flags) |state, *flag| flag.* = state.state == .staged;
                 return .{ .combined_projection = .{
                     .file = bundle.projection.file,
                     .line_index = bundle.projection.lineIndex(mode),
-                    .staged_flags = flags,
+                    .hunk_stages = try projectedHunkStagePresentation(allocator, bundle.projection.hunk_states),
                     .syntax = bundle.syntaxView(),
                 } };
             },
-            .cached => |bundle| .{ .loaded = &bundle.loaded, .file_index = 0 },
+            .cached => |bundle| {
+                const loaded = &bundle.loaded;
+                if (loaded.document.files.len == 0) return null;
+                return .{ .loaded = .{
+                    .file = loaded.document.files[0],
+                    .line_index = loaded.cachedRenderedLineIndex(0, mode),
+                    .folded_hunks = loaded.foldedHunksForFile(0),
+                    .hunk_stages = .all_staged,
+                    .syntax = .initDirect(&loaded.syntax_spans, 0),
+                } };
+            },
             .primary => |primary| .{ .loaded = primary.loaded, .file_index = primary.file_index },
             .none, .generated, .inert_invalid_utf8, .status, .pending => return null,
         };
@@ -795,7 +817,7 @@ pub const View = struct {
             .file = file,
             .line_index = loaded.cachedRenderedLineIndex(file_index, mode),
             .folded_hunks = loaded.foldedHunksForFile(file_index),
-            .staged_flags = try self.stagedHunkFlagsForFile(allocator, file),
+            .hunk_stages = try self.hunkStagePresentationForFile(allocator, file),
             .syntax = .initDirect(&loaded.syntax_spans, file_index),
         } };
     }
@@ -892,25 +914,30 @@ pub const View = struct {
         };
     }
 
-    pub fn stagedHunkFlagsForFile(self: View, allocator: std.mem.Allocator, file: diff_parser.FileDiff) ![]const bool {
-        if (self.page.staged_hunks.items.items.len == 0 or file.hunks.len == 0) return &.{};
-        const repo_root = self.repo_root orelse return &.{};
-        const path = diff_file.canonicalPathKey(file) orelse return &.{};
+    pub fn hunkStagePresentationForFile(self: View, allocator: std.mem.Allocator, file: diff_parser.FileDiff) !diff_render.HunkStagePresentation {
+        switch (self.source) {
+            .cached => return .all_staged,
+            .unstaged => {},
+            .stdin, .pager, .patch_file, .range, .no_index => return .all_unstaged,
+        }
+        if (file.hunks.len == 0) return .all_unstaged;
+        const repo_root = self.repo_root orelse return .all_unstaged;
+        const path = diff_file.canonicalPathKey(file) orelse return .all_unstaged;
+        if (self.isFreshStagedOnlyPath(repo_root, path)) return .all_staged;
+        if (self.page.staged_hunks.items.items.len == 0) return .all_unstaged;
 
         var marked_count: usize = 0;
         for (0..file.hunks.len) |hunk_index| {
             if (self.page.staged_hunks.contains(repo_root, path, hunk_index)) marked_count += 1;
         }
 
-        if (marked_count == 0) return &.{};
-        if (marked_count == file.hunks.len and self.isFreshStagedOnlyPath(repo_root, path)) return &.{};
+        if (marked_count == 0) return .all_unstaged;
 
-        const flags = try allocator.alloc(bool, file.hunks.len);
-        @memset(flags, false);
-        for (flags, 0..) |*flag, hunk_index| {
-            flag.* = self.page.staged_hunks.contains(repo_root, path, hunk_index);
+        const states = try allocator.alloc(diff_render.HunkStageState, file.hunks.len);
+        for (states, 0..) |*state, hunk_index| {
+            state.* = if (self.page.staged_hunks.contains(repo_root, path, hunk_index)) .staged else .unstaged;
         }
-        return flags;
+        return .{ .per_hunk = states };
     }
 
     pub fn selectedDiffCursorOffset(self: View) ?usize {
@@ -4931,6 +4958,48 @@ test "cached preview supports diff search" {
     try std.testing.expectEqual(app.pages.review.search.match.?.coordinate, app.pages.review.viewer.diff_cursor);
 }
 
+test "retained cached projection keeps all-staged authority on diff-file route" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .status_load = .{ .generation = 3, .pending = .{ .generation = 3 } },
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+        } },
+        .terminal_size = .{ .width = 100, .height = 40 },
+        .source = .unstaged,
+        .repo_root = "/repo",
+    };
+    defer app.pages.review.review_projection.deinit(std.testing.allocator);
+    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
+
+    const request = try app_review_projection.cloneRequest(
+        std.testing.allocator,
+        app_page.RequestIdentity.review(0, 1),
+        1,
+        "/repo",
+        "a",
+        .cached_diff,
+        .unstaged,
+        app.pages.review.source_session_revision,
+        app.pages.review.status_snapshot_revision,
+    );
+    app.pages.review.review_projection.displayed = .{ .ready = .{
+        .request = request,
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
+    } };
+
+    try std.testing.expect(app.reviewNavigationView().displayedReviewBody() == .cached);
+    const without_marks = (try app.reviewNavigationView().activeDiffDisplay(arena.allocator(), .unified)) orelse return error.ExpectedCachedDisplay;
+    try std.testing.expect(without_marks.hunkStagePresentation() == .all_staged);
+
+    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    const with_marks = (try app.reviewNavigationView().activeDiffDisplay(arena.allocator(), .unified)) orelse return error.ExpectedCachedDisplay;
+    try std.testing.expect(with_marks.hunkStagePresentation() == .all_staged);
+}
+
 test "generated preview uses metadata cursor rows and ignores hunk movement" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
@@ -5100,7 +5169,28 @@ test "staged new file preview does not refresh existing search query" {
     try std.testing.expect(app.pages.review.search.match_offset == null);
 }
 
-test "stagedHunkFlagsForFile keeps partial staged display flags" {
+test "hunk stage presentation classifies direct source authority" {
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
+        .allocator = std.testing.allocator,
+        .repo_root = "/repo",
+    };
+
+    const unstaged = try app.reviewNavigationView().hunkStagePresentationForFile(std.testing.allocator, app_test_support.file_with_hunks);
+    try std.testing.expect(unstaged == .all_unstaged);
+
+    app.source = .cached;
+    const cached = try app.reviewNavigationView().hunkStagePresentationForFile(std.testing.allocator, app_test_support.file_with_hunks);
+    try std.testing.expect(cached == .all_staged);
+
+    app.source = .{ .range = "HEAD~1..HEAD" };
+    const historical = try app.reviewNavigationView().hunkStagePresentationForFile(std.testing.allocator, app_test_support.file_with_hunks);
+    try std.testing.expect(historical == .all_unstaged);
+}
+
+test "hunk stage presentation keeps partial session marks" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -5118,13 +5208,13 @@ test "stagedHunkFlagsForFile keeps partial staged display flags" {
     try app.pages.review.git_status.replace("/repo", &status_bundle);
     try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
 
-    const flags = try app.reviewNavigationView().stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
-    try std.testing.expectEqual(@as(usize, 2), flags.len);
-    try std.testing.expect(flags[0]);
-    try std.testing.expect(!flags[1]);
+    const presentation = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    try std.testing.expect(presentation == .per_hunk);
+    try std.testing.expectEqual(diff_render.HunkStageState.staged, presentation.stateForHunk(0));
+    try std.testing.expectEqual(diff_render.HunkStageState.unstaged, presentation.stateForHunk(1));
 }
 
-test "stagedHunkFlagsForFile normalizes all staged hunks only when status is staged-only" {
+test "hunk stage presentation uses all-staged only for fresh staged-only status" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -5138,33 +5228,36 @@ test "stagedHunkFlagsForFile normalizes all staged hunks only when status is sta
     defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
     defer app.pages.review.git_status.deinit();
 
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 1);
-
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.pages.review.git_status.replace("/repo", &staged_bundle);
-    try std.testing.expectEqual(@as(usize, 0), (try app.reviewNavigationView().stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks)).len);
+    const staged = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    try std.testing.expect(staged == .all_staged);
+
+    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 1);
+    const hunk_by_hunk = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    try std.testing.expect(hunk_by_hunk == .all_staged);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
     try app.pages.review.git_status.replace("/repo", &mixed_bundle);
-    const mixed_flags = try app.reviewNavigationView().stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
-    try std.testing.expectEqual(@as(usize, 2), mixed_flags.len);
-    try std.testing.expect(mixed_flags[0]);
-    try std.testing.expect(mixed_flags[1]);
+    const mixed = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    try std.testing.expect(mixed == .per_hunk);
+    try std.testing.expectEqual(diff_render.HunkStageState.staged, mixed.stateForHunk(0));
+    try std.testing.expectEqual(diff_render.HunkStageState.staged, mixed.stateForHunk(1));
 
     app.pages.review.status_load.pending = .{ .generation = 1 };
-    const stale_flags = try app.reviewNavigationView().stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
-    try std.testing.expectEqual(@as(usize, 2), stale_flags.len);
-    try std.testing.expect(stale_flags[0]);
-    try std.testing.expect(stale_flags[1]);
+    const stale = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    try std.testing.expect(stale == .per_hunk);
+    try std.testing.expectEqual(diff_render.HunkStageState.staged, stale.stateForHunk(0));
+    try std.testing.expectEqual(diff_render.HunkStageState.staged, stale.stateForHunk(1));
 
     app.pages.review.status_load.pending = null;
     var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.pages.review.git_status.replace("/other", &other_repo_bundle);
-    const missing_flags = try app.reviewNavigationView().stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks);
-    try std.testing.expectEqual(@as(usize, 2), missing_flags.len);
-    try std.testing.expect(missing_flags[0]);
-    try std.testing.expect(missing_flags[1]);
+    const other_repo = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    try std.testing.expect(other_repo == .per_hunk);
+    try std.testing.expectEqual(diff_render.HunkStageState.staged, other_repo.stateForHunk(0));
+    try std.testing.expectEqual(diff_render.HunkStageState.staged, other_repo.stateForHunk(1));
 }
 
 test "typed action cursor remaps a directory without changing the sticky diff target" {

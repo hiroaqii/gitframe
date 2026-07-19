@@ -13403,9 +13403,10 @@ test "active diff display uses ready combined projection by identity" {
     const display = (try app.reviewNavigationView().activeDiffDisplay(frame_arena.allocator(), .unified)) orelse return error.ExpectedActiveDisplay;
     try std.testing.expect(display == .combined_projection);
     try std.testing.expectEqual(@as(usize, 2), display.combined_projection.file.hunks.len);
-    try std.testing.expectEqual(@as(usize, 2), display.combined_projection.staged_flags.len);
-    try std.testing.expect(display.combined_projection.staged_flags[0]);
-    try std.testing.expect(!display.combined_projection.staged_flags[1]);
+    const stages = display.hunkStagePresentation();
+    try std.testing.expect(stages == .per_hunk);
+    try std.testing.expectEqual(diff_render.HunkStageState.staged, stages.stateForHunk(0));
+    try std.testing.expectEqual(diff_render.HunkStageState.unstaged, stages.stateForHunk(1));
     const bundle = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
     switch (display.syntaxView()) {
         .combined => |syntax| {
@@ -14295,7 +14296,7 @@ test "projected hunk actions route through original cached and unstaged origins"
     }
 }
 
-test "stagedHunkFlagsForFile display normalization does not clear hunk action marks" {
+test "hunk stage presentation keeps fresh staged authority without clearing action marks" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -14322,7 +14323,8 @@ test "stagedHunkFlagsForFile display normalization does not clear hunk action ma
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.pages.review.git_status.replace("/repo", &staged_bundle);
-    try std.testing.expectEqual(@as(usize, 0), (try app.reviewNavigationView().stagedHunkFlagsForFile(arena.allocator(), app_test_support.file_with_hunks)).len);
+    const presentation = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    try std.testing.expect(presentation == .all_staged);
 
     switch (app.reviewOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
         .ready => |target| {

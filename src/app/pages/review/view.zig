@@ -605,7 +605,7 @@ pub fn viewDiffPane(app: Context, surface: *chasen.Surface, loaded: loaded_diff.
         .line_numbers = app.page.viewer.view_options.line_numbers,
         .highlighted_hunk = app.selectedHunkIndex(),
         .cursor_offset = app.visibleDiffCursorOffset(),
-        .staged_hunks = display.stagedFlags(),
+        .hunk_stages = display.hunkStagePresentation(),
         .line_index = display.lineIndex(),
         .folded_hunks = display.foldedHunks(),
         .palette = app.theme,
@@ -671,6 +671,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .line_numbers = app.page.viewer.view_options.line_numbers,
                 .highlighted_hunk = app.selectedHunkIndex(),
                 .cursor_offset = app.visibleDiffCursorOffset(),
+                .hunk_stages = .all_staged,
                 .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
                 .palette = app.theme,
                 .syntax = .initDirect(&bundle.loaded.syntax_spans, 0),
@@ -681,8 +682,6 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
             return;
         },
         .combined => |bundle| {
-            const flags = try surface.frameAllocator().alloc(bool, bundle.projection.hunk_states.len);
-            for (bundle.projection.hunk_states, flags) |state, *flag| flag.* = state.state == .staged;
             try diff_render.renderFile(&content, bundle.projection.file, .{
                 .requested_mode = app.page.viewer.display_mode,
                 .scroll = app.page.viewer.diff_scroll,
@@ -692,7 +691,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .highlighted_hunk = app.selectedHunkIndex(),
                 .cursor_offset = app.visibleDiffCursorOffset(),
                 .line_index = bundle.projection.lineIndex(diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
-                .staged_hunks = flags,
+                .hunk_stages = try review_navigation.projectedHunkStagePresentation(surface.frameAllocator(), bundle.projection.hunk_states),
                 .palette = app.theme,
                 .syntax = bundle.syntaxView(),
                 .selection = app.diffSelectionView(),
@@ -709,6 +708,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .pane_active = active,
                 .line_numbers = app.page.viewer.view_options.line_numbers,
                 .cursor_offset = app.visibleDiffCursorOffset(),
+                .hunk_stages = .all_unstaged,
                 .palette = app.theme,
                 .header_selection = app.diffHeaderSelectionActive(),
                 .source_syntax_spans = switch (bundle.decoration) {
