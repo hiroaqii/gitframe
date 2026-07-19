@@ -35,6 +35,7 @@ pub const Projection = struct {
 pub const BuildError = error{
     UnsupportedFile,
     AmbiguousProjection,
+    UnmappableCoordinate,
     OutOfMemory,
 };
 
@@ -43,10 +44,11 @@ const Source = enum {
     unstaged,
 };
 
-/// One hunk candidate projected into index-side coordinates.
+/// One component hunk candidate ordered by its index-side changed range.
 ///
-/// Cached diff is HEAD->index, unstaged diff is index->worktree, so this
-/// module never compares HEAD-side and worktree-side line numbers directly.
+/// Cached diff is HEAD->index and unstaged diff is index->worktree. The index
+/// range is used only for ordering and ambiguity checks; `build()` later clones
+/// and normalizes the hunk value into HEAD->worktree display coordinates.
 const Candidate = struct {
     source: Source,
     hunk_index: usize,
@@ -71,6 +73,11 @@ pub fn build(
     try validateFile(cached_file);
     try validateFile(unstaged_file);
 
+    const cached_transform = buildCoordinateTransform(allocator, cached_file.hunks) catch |err| return coordinateBuildError(err);
+    defer cached_transform.deinit(allocator);
+    const unstaged_transform = buildCoordinateTransform(allocator, unstaged_file.hunks) catch |err| return coordinateBuildError(err);
+    defer unstaged_transform.deinit(allocator);
+
     var candidates: std.ArrayList(Candidate) = .empty;
     defer candidates.deinit(allocator);
 
@@ -90,11 +97,21 @@ pub fn build(
     const states = try allocator.alloc(ProjectedHunkState, candidates.items.len);
     errdefer allocator.free(states);
 
-    // Hunk structs are copied into the projection, but their line slices still
-    // borrow from the original cached/unstaged loaded bundles. The caller must
-    // keep those bundles alive as long as this Projection is displayed.
+    var initialized_hunks: usize = 0;
+    errdefer for (hunks[0..initialized_hunks]) |hunk| allocator.free(hunk.lines);
+
+    // Projected hunk and line values belong to the projection allocator because
+    // their coordinates are normalized from HEAD directly to the working tree.
+    // Text and section slices remain borrowed from the retained component
+    // bundles; HunkOrigin remains the authority for later stage operations.
     for (candidates.items, 0..) |candidate, index| {
-        hunks[index] = candidate.hunk;
+        hunks[index] = try normalizeCandidateHunk(
+            allocator,
+            candidate,
+            cached_transform,
+            unstaged_transform,
+        );
+        initialized_hunks += 1;
         states[index] = switch (candidate.source) {
             .cached => .{ .state = .staged, .origin = .{ .cached = candidate.hunk_index } },
             .unstaged => .{ .state = .unstaged, .origin = .{ .unstaged = candidate.hunk_index } },
@@ -110,11 +127,15 @@ pub fn build(
         .is_binary = false,
     };
 
+    var unified_line_index = try diff_view_model.RenderedLineIndex.build(allocator, file, .unified);
+    errdefer unified_line_index.deinit(allocator);
+    const side_by_side_line_index = try diff_view_model.RenderedLineIndex.build(allocator, file, .side_by_side);
+
     return .{
         .file = file,
         .hunk_states = states,
-        .unified_line_index = try diff_view_model.RenderedLineIndex.build(allocator, file, .unified),
-        .side_by_side_line_index = try diff_view_model.RenderedLineIndex.build(allocator, file, .side_by_side),
+        .unified_line_index = unified_line_index,
+        .side_by_side_line_index = side_by_side_line_index,
     };
 }
 
@@ -131,7 +152,7 @@ fn appendCandidates(
     source: Source,
 ) BuildError!void {
     for (file.hunks, 0..) |hunk, hunk_index| {
-        const range = changedIndexRange(hunk, source) orelse return error.AmbiguousProjection;
+        const range = try changedIndexRange(hunk, source);
         try candidates.append(allocator, .{
             .source = source,
             .hunk_index = hunk_index,
@@ -141,7 +162,7 @@ fn appendCandidates(
     }
 }
 
-fn changedIndexRange(hunk: diff_parser.Hunk, source: Source) ?ChangedRange {
+fn changedIndexRange(hunk: diff_parser.Hunk, source: Source) BuildError!ChangedRange {
     var start: ?u32 = null;
     var end: u32 = 0;
 
@@ -165,13 +186,13 @@ fn changedIndexRange(hunk: diff_parser.Hunk, source: Source) ?ChangedRange {
             },
         } orelse continue;
 
-        const one_past = index_line + 1;
+        const one_past = std.math.add(u32, index_line, 1) catch return error.UnmappableCoordinate;
         if (start == null or index_line < start.?) start = index_line;
         if (one_past > end) end = one_past;
     }
 
-    const first = start orelse return null;
-    if (first >= end) return null;
+    const first = start orelse return error.AmbiguousProjection;
+    if (first >= end) return error.AmbiguousProjection;
     return .{ .start = first, .end = end };
 }
 
@@ -190,6 +211,132 @@ const CoordinateTransformError = error{
     UnmappableCoordinate,
     OutOfMemory,
 };
+
+fn coordinateBuildError(err: CoordinateTransformError) BuildError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidCoordinate, error.UnmappableCoordinate => error.UnmappableCoordinate,
+    };
+}
+
+fn normalizeCandidateHunk(
+    allocator: std.mem.Allocator,
+    candidate: Candidate,
+    cached_transform: CoordinateTransform,
+    unstaged_transform: CoordinateTransform,
+) BuildError!diff_parser.Hunk {
+    const lines = try allocator.alloc(diff_parser.DiffLine, candidate.hunk.lines.len);
+    errdefer allocator.free(lines);
+    @memcpy(lines, candidate.hunk.lines);
+
+    var normalized = candidate.hunk;
+    normalized.lines = lines;
+    switch (candidate.source) {
+        .cached => {
+            // Git's zero-count header convention makes a new-side anchor
+            // after-biased. Preserve that convention while mapping B -> C.
+            normalized.new_start = try normalizeProjectedStart(
+                unstaged_transform,
+                candidate.hunk.new_start,
+                candidate.hunk.new_count,
+                .forward,
+                .after,
+            );
+            for (lines) |*line| {
+                if (line.new_line) |coordinate| {
+                    line.new_line = try normalizeProjectedLine(unstaged_transform, coordinate, .forward);
+                }
+            }
+        },
+        .unstaged => {
+            // Git's zero-count header convention makes an old-side anchor
+            // before-biased. Preserve that convention while mapping B -> A.
+            normalized.old_start = try normalizeProjectedStart(
+                cached_transform,
+                candidate.hunk.old_start,
+                candidate.hunk.old_count,
+                .inverse,
+                .before,
+            );
+            for (lines) |*line| {
+                if (line.old_line) |coordinate| {
+                    line.old_line = try normalizeProjectedLine(cached_transform, coordinate, .inverse);
+                }
+            }
+        },
+    }
+
+    try validateProjectedHunk(normalized);
+    return normalized;
+}
+
+fn normalizeProjectedStart(
+    transform: CoordinateTransform,
+    start: u32,
+    count: u32,
+    direction: TransformDirection,
+    gap_bias: GapBias,
+) BuildError!u32 {
+    if (count != 0) return normalizeProjectedLine(transform, start, direction);
+    const mapped = switch (direction) {
+        .forward => transform.mapGapForward(.{ .position = start, .bias = gap_bias }),
+        .inverse => transform.mapGapInverse(.{ .position = start, .bias = gap_bias }),
+    } catch |err| return coordinateBuildError(err);
+    return mapped;
+}
+
+fn normalizeProjectedLine(
+    transform: CoordinateTransform,
+    coordinate: u32,
+    direction: TransformDirection,
+) BuildError!u32 {
+    const mapped = switch (direction) {
+        .forward => transform.mapLineForward(coordinate),
+        .inverse => transform.mapLineInverse(coordinate),
+    } catch |err| return coordinateBuildError(err);
+    return mapped;
+}
+
+fn validateProjectedHunk(hunk: diff_parser.Hunk) BuildError!void {
+    try validateProjectedSide(hunk, .old);
+    try validateProjectedSide(hunk, .new);
+}
+
+const ProjectedSide = enum {
+    old,
+    new,
+};
+
+fn validateProjectedSide(hunk: diff_parser.Hunk, side: ProjectedSide) BuildError!void {
+    const start = switch (side) {
+        .old => hunk.old_start,
+        .new => hunk.new_start,
+    };
+    const count = switch (side) {
+        .old => hunk.old_count,
+        .new => hunk.new_count,
+    };
+
+    var consumed: u32 = 0;
+    var previous: ?u32 = null;
+    for (hunk.lines) |line| {
+        const coordinate = switch (side) {
+            .old => line.old_line,
+            .new => line.new_line,
+        } orelse continue;
+
+        if (count == 0) return error.UnmappableCoordinate;
+        if (previous) |last| {
+            const expected = std.math.add(u32, last, 1) catch return error.UnmappableCoordinate;
+            if (coordinate != expected) return error.UnmappableCoordinate;
+        } else if (coordinate != start) {
+            return error.UnmappableCoordinate;
+        }
+        previous = coordinate;
+        consumed = std.math.add(u32, consumed, 1) catch return error.UnmappableCoordinate;
+    }
+    if (consumed != count) return error.UnmappableCoordinate;
+}
 
 /// A maximal non-context edit expressed as boundaries between existing lines.
 ///
@@ -829,6 +976,31 @@ test "coordinate transform checks numeric bounds without claiming an EOF bound" 
     try std.testing.expectError(error.InvalidCoordinate, translateCoordinate(std.math.maxInt(u32), 1));
 }
 
+fn expectRenderedHunkHeader(
+    projection: Projection,
+    mode: diff_view_model.DisplayMode,
+    hunk_index: usize,
+    old_start: u32,
+    new_start: u32,
+) !void {
+    const line_index = projection.lineIndex(mode);
+    var rows = diff_view_model.BodyRowIterator.initAt(
+        projection.file,
+        mode,
+        line_index,
+        line_index.hunkOffset(hunk_index),
+    );
+    const row = rows.next() orelse return error.ExpectedProjectedHunkHeader;
+    switch (row) {
+        .hunk_header => |header| {
+            try std.testing.expectEqual(hunk_index, header.hunk_index);
+            try std.testing.expectEqual(old_start, header.old_start);
+            try std.testing.expectEqual(new_start, header.new_start);
+        },
+        else => return error.ExpectedProjectedHunkHeader,
+    }
+}
+
 test "hunk projection orders cached new-side and unstaged old-side coordinates" {
     var cached_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer cached_arena.deinit();
@@ -841,22 +1013,18 @@ test "hunk projection orders cached new-side and unstaged old-side coordinates" 
         \\diff --git a/src/app.zig b/src/app.zig
         \\--- a/src/app.zig
         \\+++ b/src/app.zig
-        \\@@ -30,3 +10,3 @@
-        \\ context
+        \\@@ -30,1 +30,1 @@
         \\-old staged
         \\+new staged
-        \\ context
         \\
     );
     const unstaged = try parseOneFile(&unstaged_arena,
         \\diff --git a/src/app.zig b/src/app.zig
         \\--- a/src/app.zig
         \\+++ b/src/app.zig
-        \\@@ -40,3 +80,3 @@
-        \\ context
+        \\@@ -40,1 +40,1 @@
         \\-old unstaged
         \\+new unstaged
-        \\ context
         \\
     );
 
@@ -864,6 +1032,231 @@ test "hunk projection orders cached new-side and unstaged old-side coordinates" 
     try std.testing.expectEqual(@as(usize, 2), projection.file.hunks.len);
     try std.testing.expectEqual(HunkStageState.staged, projection.hunk_states[0].state);
     try std.testing.expectEqual(HunkStageState.unstaged, projection.hunk_states[1].state);
+}
+
+test "hunk projection keeps later HEAD and worktree coordinates stable across staged partition" {
+    var first_cached_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer first_cached_arena.deinit();
+    var first_unstaged_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer first_unstaged_arena.deinit();
+    var first_projection_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer first_projection_arena.deinit();
+
+    const first_cached = try parseOneFile(&first_cached_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -10,0 +11,1 @@
+        \\+inserted before later change
+        \\
+    );
+    const first_unstaged = try parseOneFile(&first_unstaged_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -21,1 +21,1 @@
+        \\-old later
+        \\+new later
+        \\
+    );
+    const first = try build(first_projection_arena.allocator(), first_cached, first_unstaged);
+
+    var second_cached_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer second_cached_arena.deinit();
+    var second_unstaged_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer second_unstaged_arena.deinit();
+    var second_projection_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer second_projection_arena.deinit();
+
+    const second_cached = try parseOneFile(&second_cached_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -20,1 +20,1 @@
+        \\-old later
+        \\+new later
+        \\
+    );
+    const second_unstaged = try parseOneFile(&second_unstaged_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -10,0 +11,1 @@
+        \\+inserted before later change
+        \\
+    );
+    const second = try build(second_projection_arena.allocator(), second_cached, second_unstaged);
+
+    for ([_]Projection{ first, second }) |projection| {
+        const later = projection.file.hunks[1];
+        try std.testing.expectEqual(@as(u32, 20), later.old_start);
+        try std.testing.expectEqual(@as(u32, 21), later.new_start);
+        try std.testing.expectEqual(@as(?u32, 20), later.lines[0].old_line);
+        try std.testing.expectEqual(@as(?u32, 21), later.lines[1].new_line);
+        try expectRenderedHunkHeader(projection, .unified, 1, 20, 21);
+        try expectRenderedHunkHeader(projection, .side_by_side, 1, 20, 21);
+    }
+
+    try std.testing.expectEqualDeep(HunkOrigin{ .unstaged = 0 }, first.hunk_states[1].origin);
+    try std.testing.expectEqualDeep(HunkOrigin{ .cached = 0 }, second.hunk_states[1].origin);
+    try std.testing.expect(first.file.hunks[1].lines.ptr != first_unstaged.hunks[0].lines.ptr);
+    try std.testing.expect(first.file.hunks[1].lines[0].text.ptr == first_unstaged.hunks[0].lines[0].text.ptr);
+}
+
+test "hunk projection keeps later coordinates stable across cached and unstaged deletion" {
+    var first_cached_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer first_cached_arena.deinit();
+    var first_unstaged_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer first_unstaged_arena.deinit();
+    var first_projection_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer first_projection_arena.deinit();
+
+    const first_cached = try parseOneFile(&first_cached_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -10,1 +9,0 @@
+        \\-deleted before later change
+        \\
+    );
+    const first_unstaged = try parseOneFile(&first_unstaged_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -19,1 +19,1 @@
+        \\-old later
+        \\+new later
+        \\
+    );
+    const first = try build(first_projection_arena.allocator(), first_cached, first_unstaged);
+
+    var second_cached_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer second_cached_arena.deinit();
+    var second_unstaged_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer second_unstaged_arena.deinit();
+    var second_projection_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer second_projection_arena.deinit();
+
+    const second_cached = try parseOneFile(&second_cached_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -20,1 +20,1 @@
+        \\-old later
+        \\+new later
+        \\
+    );
+    const second_unstaged = try parseOneFile(&second_unstaged_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -10,1 +9,0 @@
+        \\-deleted before later change
+        \\
+    );
+    const second = try build(second_projection_arena.allocator(), second_cached, second_unstaged);
+
+    for ([_]Projection{ first, second }) |projection| {
+        const later = projection.file.hunks[1];
+        try std.testing.expectEqual(@as(u32, 20), later.old_start);
+        try std.testing.expectEqual(@as(u32, 19), later.new_start);
+        try std.testing.expectEqual(@as(?u32, 20), later.lines[0].old_line);
+        try std.testing.expectEqual(@as(?u32, 19), later.lines[1].new_line);
+        try expectRenderedHunkHeader(projection, .unified, 1, 20, 19);
+        try expectRenderedHunkHeader(projection, .side_by_side, 1, 20, 19);
+    }
+
+    try std.testing.expectEqualDeep(HunkOrigin{ .unstaged = 0 }, first.hunk_states[1].origin);
+    try std.testing.expectEqualDeep(HunkOrigin{ .cached = 0 }, second.hunk_states[1].origin);
+}
+
+test "hunk projection normalizes zero-count headers after non-zero prior deltas" {
+    var first_cached_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer first_cached_arena.deinit();
+    var first_unstaged_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer first_unstaged_arena.deinit();
+    var first_projection_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer first_projection_arena.deinit();
+
+    const first_cached = try parseOneFile(&first_cached_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -20,1 +19,0 @@
+        \\-cached deletion
+        \\
+    );
+    const first_unstaged = try parseOneFile(&first_unstaged_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -10,0 +11,1 @@
+        \\+unstaged insertion
+        \\
+    );
+    const first = try build(first_projection_arena.allocator(), first_cached, first_unstaged);
+    const cached_deletion = first.file.hunks[1];
+    try std.testing.expectEqual(@as(u32, 0), cached_deletion.new_count);
+    try std.testing.expectEqual(@as(u32, 20), cached_deletion.new_start);
+
+    var second_cached_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer second_cached_arena.deinit();
+    var second_unstaged_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer second_unstaged_arena.deinit();
+    var second_projection_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer second_projection_arena.deinit();
+
+    const second_cached = try parseOneFile(&second_cached_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -10,0 +11,1 @@
+        \\+cached insertion
+        \\
+    );
+    const second_unstaged = try parseOneFile(&second_unstaged_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -20,0 +21,1 @@
+        \\+unstaged insertion
+        \\
+    );
+    const second = try build(second_projection_arena.allocator(), second_cached, second_unstaged);
+    const unstaged_insertion = second.file.hunks[1];
+    try std.testing.expectEqual(@as(u32, 0), unstaged_insertion.old_count);
+    try std.testing.expectEqual(@as(u32, 19), unstaged_insertion.old_start);
+}
+
+test "hunk projection zero-count header mapping preserves Git side bias" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const insertion = try parseOneFile(&arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -5,0 +6,1 @@
+        \\+inserted
+        \\
+    );
+    const insertion_transform = try buildCoordinateTransform(std.testing.allocator, insertion.hunks);
+    defer insertion_transform.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 5), try normalizeProjectedStart(insertion_transform, 5, 0, .forward, .before));
+    try std.testing.expectEqual(@as(u32, 6), try normalizeProjectedStart(insertion_transform, 5, 0, .forward, .after));
+
+    const deletion = try parseOneFile(&arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -6,1 +5,0 @@
+        \\-deleted
+        \\
+    );
+    const deletion_transform = try buildCoordinateTransform(std.testing.allocator, deletion.hunks);
+    defer deletion_transform.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 5), try normalizeProjectedStart(deletion_transform, 5, 0, .inverse, .before));
+    try std.testing.expectEqual(@as(u32, 6), try normalizeProjectedStart(deletion_transform, 5, 0, .inverse, .after));
 }
 
 test "hunk projection rejects equal index-side starts" {
@@ -878,22 +1271,18 @@ test "hunk projection rejects equal index-side starts" {
         \\diff --git a/src/app.zig b/src/app.zig
         \\--- a/src/app.zig
         \\+++ b/src/app.zig
-        \\@@ -1,3 +10,3 @@
-        \\ context
+        \\@@ -10,1 +10,1 @@
         \\-old staged
         \\+new staged
-        \\ context
         \\
     );
     const unstaged = try parseOneFile(&unstaged_arena,
         \\diff --git a/src/app.zig b/src/app.zig
         \\--- a/src/app.zig
         \\+++ b/src/app.zig
-        \\@@ -10,3 +20,3 @@
-        \\ context
+        \\@@ -10,1 +10,1 @@
         \\-old unstaged
         \\+new unstaged
-        \\ context
         \\
     );
 
@@ -946,25 +1335,20 @@ test "hunk projection rejects overlapping changed ranges with different starts" 
         \\diff --git a/src/app.zig b/src/app.zig
         \\--- a/src/app.zig
         \\+++ b/src/app.zig
-        \\@@ -10,5 +10,5 @@
-        \\ context
+        \\@@ -10,2 +10,2 @@
         \\-old staged 1
         \\-old staged 2
         \\+new staged 1
         \\+new staged 2
-        \\ context
         \\
     );
     const unstaged = try parseOneFile(&unstaged_arena,
         \\diff --git a/src/app.zig b/src/app.zig
         \\--- a/src/app.zig
         \\+++ b/src/app.zig
-        \\@@ -11,5 +20,5 @@
-        \\ context
+        \\@@ -11,1 +11,1 @@
         \\-old unstaged
         \\+new unstaged
-        \\ context
-        \\ context
         \\
     );
 
@@ -983,28 +1367,24 @@ test "hunk projection combines context-overlapping changed-range-disjoint hunks"
         \\diff --git a/src/app.zig b/src/app.zig
         \\--- a/src/app.zig
         \\+++ b/src/app.zig
-        \\@@ -10,7 +10,7 @@
-        \\ context
+        \\@@ -10,3 +10,3 @@
+        \\ context 10
         \\-old staged
         \\+new staged
-        \\ context
-        \\ context
-        \\ context
-        \\ context
+        \\ context 12
         \\
     );
     const unstaged = try parseOneFile(&unstaged_arena,
         \\diff --git a/src/app.zig b/src/app.zig
         \\--- a/src/app.zig
         \\+++ b/src/app.zig
-        \\@@ -12,7 +20,7 @@
-        \\ context
-        \\ context
-        \\ context
+        \\@@ -12,5 +12,5 @@
+        \\ context 12
+        \\ context 13
+        \\ context 14
         \\-old unstaged
         \\+new unstaged
-        \\ context
-        \\ context
+        \\ context 16
         \\
     );
 
@@ -1012,6 +1392,56 @@ test "hunk projection combines context-overlapping changed-range-disjoint hunks"
     try std.testing.expectEqual(@as(usize, 2), projection.file.hunks.len);
     try std.testing.expectEqual(HunkStageState.staged, projection.hunk_states[0].state);
     try std.testing.expectEqual(HunkStageState.unstaged, projection.hunk_states[1].state);
+}
+
+test "hunk projection rejects copied context that crosses another component edit" {
+    var cached_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer cached_arena.deinit();
+    var unstaged_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer unstaged_arena.deinit();
+    var projection_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer projection_arena.deinit();
+
+    const cached = try parseOneFile(&cached_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -13,1 +13,1 @@
+        \\-old staged
+        \\+new staged
+        \\
+    );
+    const unstaged = try parseOneFile(&unstaged_arena,
+        \\diff --git a/src/app.zig b/src/app.zig
+        \\--- a/src/app.zig
+        \\+++ b/src/app.zig
+        \\@@ -13,5 +13,4 @@
+        \\ context 13
+        \\ context 14
+        \\ context 15
+        \\-old unstaged
+        \\ context 17
+        \\
+    );
+
+    try std.testing.expectError(error.UnmappableCoordinate, build(projection_arena.allocator(), cached, unstaged));
+}
+
+test "hunk projection validation rejects non-contiguous normalized coordinates" {
+    const lines = [_]diff_parser.DiffLine{
+        .{ .kind = .context, .text = "first", .old_line = 10, .new_line = 10 },
+        .{ .kind = .context, .text = "gap", .old_line = 12, .new_line = 11 },
+    };
+    const hunk: diff_parser.Hunk = .{
+        .old_start = 10,
+        .old_count = 2,
+        .new_start = 10,
+        .new_count = 2,
+        .section = "",
+        .lines = &lines,
+    };
+
+    try std.testing.expectError(error.UnmappableCoordinate, validateProjectedHunk(hunk));
 }
 
 test "hunk projection rejects pure context hunks defensively" {

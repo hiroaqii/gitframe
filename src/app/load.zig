@@ -1097,8 +1097,24 @@ fn buildCombinedHunkResult(
         unstaged_bundle.loaded.document.files[0],
     ) catch |err| {
         arena.deinit();
-        return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, path_key, "Cannot combine staged and unstaged hunks: {s}", .{@errorName(err)}) catch
-            return .{ .failed_static = "Projection allocation failed" } } };
+        // Unlike invalid text, unsafe coordinates cannot retain an inert hunk
+        // projection: doing so would expose actions against fabricated display
+        // positions. A status body is non-cacheable and has no hunk authority.
+        const body = switch (err) {
+            error.UnmappableCoordinate => review_projection.statusBodyAlloc(
+                allocator,
+                path_key,
+                "Cannot combine staged and unstaged hunks: line coordinates cannot be normalized safely.",
+                .{},
+            ),
+            else => review_projection.statusBodyAlloc(
+                allocator,
+                path_key,
+                "Cannot combine staged and unstaged hunks: {s}",
+                .{@errorName(err)},
+            ),
+        } catch return .{ .failed_static = "Projection allocation failed" };
+        return .{ .ready = .{ .status_body = body } };
     };
 
     const bundle = review_projection.CombinedHunkBundle{
@@ -1306,6 +1322,44 @@ test "combined projection transfers both bundles when either component is inert"
         try std.testing.expectEqual(cached_is_invalid, !result.ready.inert_combined.cached_bundle.loaded.fileTextSelectable(0));
         try std.testing.expectEqual(!cached_is_invalid, !result.ready.inert_combined.unstaged_bundle.loaded.fileTextSelectable(0));
     }
+}
+
+test "combined projection reports unmappable coordinates without transferring bundles" {
+    const allocator = std.testing.allocator;
+    const cached_patch =
+        "diff --git a/a b/a\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -13,1 +13,1 @@\n" ++
+        "-old staged\n" ++
+        "+new staged\n";
+    const unstaged_patch =
+        "diff --git a/a b/a\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -13,5 +13,4 @@\n" ++
+        " context 13\n" ++
+        " context 14\n" ++
+        " context 15\n" ++
+        "-old unstaged\n" ++
+        " context 17\n";
+
+    var cached = try buildLoadedBundle(allocator, cached_patch);
+    defer cached.deinit();
+    var unstaged = try buildLoadedBundle(allocator, unstaged_patch);
+    defer unstaged.deinit();
+
+    var result = buildCombinedHunkResult("a", allocator, &cached, &unstaged);
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .ready);
+    try std.testing.expect(result.ready == .status_body);
+    try std.testing.expectEqualStrings(
+        "Cannot combine staged and unstaged hunks: line coordinates cannot be normalized safely.",
+        result.ready.status_body.message,
+    );
+    try std.testing.expect(!result.ready.cacheable());
+    try std.testing.expect(cached.arena != null);
+    try std.testing.expect(unstaged.arena != null);
 }
 
 test "every invalid file remains admitted as an inert tree entry" {
