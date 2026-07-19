@@ -744,10 +744,21 @@ pub fn generatedSyntaxRequestForProjection(
 }
 
 pub fn statusBodyAlloc(allocator: std.mem.Allocator, path: []const u8, comptime fmt: []const u8, args: anytype) !StatusBody {
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
     return .{
-        .path = try allocator.dupe(u8, path),
+        .path = owned_path,
         .message = try std.fmt.allocPrint(allocator, fmt, args),
     };
+}
+
+test "status body allocation rolls back path when message allocation fails" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn allocate(allocator: std.mem.Allocator) !void {
+            var body = try statusBodyAlloc(allocator, "src/a.zig", "load failed: {s}", .{"OutOfMemory"});
+            defer body.deinit(allocator);
+        }
+    }.allocate, .{});
 }
 
 pub fn generatedFileFromOwnedContent(

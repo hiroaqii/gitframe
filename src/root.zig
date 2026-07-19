@@ -39,6 +39,7 @@ test {
     _ = @import("app/page.zig");
     _ = @import("app/page_link.zig");
     _ = @import("app/page_transition.zig");
+    _ = @import("app/projection_component.zig");
     _ = @import("app/shell_layout.zig");
     _ = @import("app/pages/review.zig");
     _ = @import("app/pages/review/content.zig");

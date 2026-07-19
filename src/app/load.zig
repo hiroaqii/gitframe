@@ -1,12 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const chasen = @import("chasen");
 const auto_reload = @import("auto_reload.zig");
 const page = @import("page.zig");
 const diff_parser = @import("../diff/parser.zig");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
+const diff_render = @import("../diff/render.zig");
 const diff_source = @import("../diff/source.zig");
+const diff_syntax_view = @import("../diff/syntax_view.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
 const git_backend = @import("../git/backend.zig");
@@ -15,6 +18,7 @@ const git_status = @import("../git/status.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const path_key_mod = @import("../path_key.zig");
 const process_runner = @import("../process/runner.zig");
+const projection_component = @import("projection_component.zig");
 const review_projection = @import("review_projection.zig");
 const repo_discovery = @import("../repo/discovery.zig");
 const root_capability = @import("../repo/root_capability.zig");
@@ -1025,6 +1029,28 @@ fn loadFileDiffBundle(
     io: std.Io,
     base: git_backend.FileDiffBase,
 ) !?LoadedDiffBundle {
+    const bytes = try loadFileDiffBytes(request, allocator, io, base) orelse return null;
+    defer allocator.free(bytes);
+    return try buildLoadedBundleWithIo(allocator, io, bytes);
+}
+
+fn loadFileProjectionComponent(
+    request: review_projection.Request,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    base: git_backend.FileDiffBase,
+) !?projection_component.ParsedComponent {
+    const bytes = try loadFileDiffBytes(request, allocator, io, base) orelse return null;
+    defer allocator.free(bytes);
+    return try projection_component.ParsedComponent.parse(allocator, bytes);
+}
+
+fn loadFileDiffBytes(
+    request: review_projection.Request,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    base: git_backend.FileDiffBase,
+) !?[]u8 {
     var local_backend: git_backend.LocalCommandBackend = .{};
     const raw_result = try local_backend.backend().loadDiff(allocator, io, .{
         .repo_root = request.repo_root,
@@ -1033,9 +1059,11 @@ fn loadFileDiffBundle(
 
     switch (raw_result) {
         .ok => |bytes| {
-            defer allocator.free(bytes);
-            if (bytes.len == 0) return null;
-            return try buildLoadedBundleWithIo(allocator, io, bytes);
+            if (bytes.len == 0) {
+                allocator.free(bytes);
+                return null;
+            }
+            return bytes;
         },
         .failed => |message| {
             defer allocator.free(message);
@@ -1046,60 +1074,63 @@ fn loadFileDiffBundle(
 }
 
 fn loadCombinedHunks(request: review_projection.Request, allocator: std.mem.Allocator, io: std.Io) review_projection.TaskResult {
-    var cached_bundle = loadFileDiffBundle(request, allocator, io, .cached) catch |err| {
+    var cached_component = loadFileProjectionComponent(request, allocator, io, .cached) catch |err| {
         return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Staged hunk projection load failed: {s}", .{@errorName(err)}) catch
             return .{ .failed_static = "Projection load failed: OutOfMemory" } };
     } orelse return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No staged hunks for this file.", .{}) catch
         return .{ .failed_static = "Projection allocation failed" } } };
-    defer cached_bundle.deinit();
+    defer cached_component.deinit();
 
-    var unstaged_bundle = loadFileDiffBundle(request, allocator, io, .unstaged) catch |err| {
+    var unstaged_component = loadFileProjectionComponent(request, allocator, io, .unstaged) catch |err| {
         return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Unstaged hunk projection load failed: {s}", .{@errorName(err)}) catch
             return .{ .failed_static = "Projection load failed: OutOfMemory" } };
     } orelse return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No unstaged hunks for this file.", .{}) catch
         return .{ .failed_static = "Projection allocation failed" } } };
-    defer unstaged_bundle.deinit();
+    defer unstaged_component.deinit();
 
-    return buildCombinedHunkResult(request.path_key, allocator, &cached_bundle, &unstaged_bundle);
+    return buildCombinedHunkResult(request.path_key, allocator, io, &cached_component, &unstaged_component);
 }
 
-/// Combines two already-loaded per-file bundles and transfers them only for a
-/// ready combined terminal. Keeping this ownership boundary independent from
-/// Git process I/O makes both invalid-component directions directly testable.
+/// Normalize two parse-only components, eagerly decorate them, and transfer
+/// both owners only for a ready combined terminal. P2 intentionally has no
+/// reuse branch: the explicit parse/decorate boundary is behavior-preserving
+/// preparation for a later exact-presentation admission policy.
 fn buildCombinedHunkResult(
     path_key: []const u8,
     allocator: std.mem.Allocator,
-    cached_bundle: *LoadedDiffBundle,
-    unstaged_bundle: *LoadedDiffBundle,
+    io: std.Io,
+    cached_component: *projection_component.ParsedComponent,
+    unstaged_component: *projection_component.ParsedComponent,
 ) review_projection.TaskResult {
-    if (cached_bundle.loaded.document.files.len != 1 or unstaged_bundle.loaded.document.files.len != 1) {
+    if (cached_component.document.files.len != 1 or unstaged_component.document.files.len != 1) {
         return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, path_key, "Cannot combine staged and unstaged hunks for this file.", .{}) catch
             return .{ .failed_static = "Projection allocation failed" } } };
     }
 
-    if (!cached_bundle.loaded.fileTextSelectable(0) or !unstaged_bundle.loaded.fileTextSelectable(0)) {
-        const bundle = review_projection.InertCombinedBundle{
-            .cached_bundle = cached_bundle.*,
-            .unstaged_bundle = unstaged_bundle.*,
+    const text_selectable = cached_component.fileTextSelectable(0) and unstaged_component.fileTextSelectable(0);
+    if (!text_selectable) {
+        var decorated = decorateProjectionComponents(cached_component, unstaged_component, io) catch |err| {
+            return projectionDecorationFailureResult(allocator, path_key, err);
         };
-        cached_bundle.arena = null;
-        unstaged_bundle.arena = null;
+        defer decorated.deinit();
+        const bundle = review_projection.InertCombinedBundle{
+            .cached_bundle = decorated.cached,
+            .unstaged_bundle = decorated.unstaged,
+        };
+        decorated.cached.arena = null;
+        decorated.unstaged.arena = null;
         return .{ .ready = .{ .inert_combined = bundle } };
     }
 
-    // The local cached/unstaged bundles are cleaned up on every early return.
-    // On success, CombinedHunkBundle takes their arenas and nulls the locals so
-    // the defers below become no-ops instead of double-freeing moved ownership.
     var arena: std.heap.ArenaAllocator = .init(allocator);
     const projection = diff_hunk_projection.build(
         arena.allocator(),
-        cached_bundle.loaded.document.files[0],
-        unstaged_bundle.loaded.document.files[0],
+        cached_component.document.files[0],
+        unstaged_component.document.files[0],
     ) catch |err| {
         arena.deinit();
-        // Unlike invalid text, unsafe coordinates cannot retain an inert hunk
-        // projection: doing so would expose actions against fabricated display
-        // positions. A status body is non-cacheable and has no hunk authority.
+        // Unlike invalid text, unsafe coordinates cannot retain an inert
+        // projection because that would expose fabricated action targets.
         const body = switch (err) {
             error.UnmappableCoordinate => review_projection.statusBodyAlloc(
                 allocator,
@@ -1117,15 +1148,79 @@ fn buildCombinedHunkResult(
         return .{ .ready = .{ .status_body = body } };
     };
 
+    const bundle = decorateCombinedProjection(
+        arena,
+        projection,
+        cached_component,
+        unstaged_component,
+        io,
+    ) catch |err| {
+        return projectionDecorationFailureResult(allocator, path_key, err);
+    };
+    return .{ .ready = .{ .combined_hunks = bundle } };
+}
+
+fn projectionDecorationFailureResult(
+    allocator: std.mem.Allocator,
+    path_key: []const u8,
+    err: anyerror,
+) review_projection.TaskResult {
+    const body = review_projection.statusBodyAlloc(
+        allocator,
+        path_key,
+        "Projection decoration failed: {s}",
+        .{@errorName(err)},
+    ) catch return .{ .failed_static = "Projection decoration failed: OutOfMemory" };
+    return .{ .failed = body };
+}
+
+const DecoratedProjectionComponents = struct {
+    cached: LoadedDiffBundle,
+    unstaged: LoadedDiffBundle,
+
+    fn deinit(self: *DecoratedProjectionComponents) void {
+        self.cached.deinit();
+        self.unstaged.deinit();
+    }
+};
+
+fn decorateProjectionComponents(
+    cached_component: *projection_component.ParsedComponent,
+    unstaged_component: *projection_component.ParsedComponent,
+    io: std.Io,
+) !DecoratedProjectionComponents {
+    var cached = try decorateProjectionComponent(cached_component, io);
+    errdefer cached.deinit();
+    return .{
+        .cached = cached,
+        .unstaged = try decorateProjectionComponent(unstaged_component, io),
+    };
+}
+
+/// Consume a normalized projection arena and promote both parse-only
+/// components into the exact combined presentation shape used today. The
+/// projection arena is released here on failure and transferred on success.
+fn decorateCombinedProjection(
+    projection_arena: std.heap.ArenaAllocator,
+    projection: diff_hunk_projection.Projection,
+    cached_component: *projection_component.ParsedComponent,
+    unstaged_component: *projection_component.ParsedComponent,
+    io: std.Io,
+) !review_projection.CombinedHunkBundle {
+    var arena = projection_arena;
+    errdefer arena.deinit();
+    var decorated = try decorateProjectionComponents(cached_component, unstaged_component, io);
+    errdefer decorated.deinit();
+
     const bundle = review_projection.CombinedHunkBundle{
         .arena = arena,
         .projection = projection,
-        .cached_bundle = cached_bundle.*,
-        .unstaged_bundle = unstaged_bundle.*,
+        .cached_bundle = decorated.cached,
+        .unstaged_bundle = decorated.unstaged,
     };
-    cached_bundle.arena = null;
-    unstaged_bundle.arena = null;
-    return .{ .ready = .{ .combined_hunks = bundle } };
+    decorated.cached.arena = null;
+    decorated.unstaged.arena = null;
+    return bundle;
 }
 
 fn loadGeneratedAddedFile(
@@ -1243,6 +1338,61 @@ fn buildLoadedBundleWithOptions(
     const copied = try arena_allocator.dupe(u8, bytes);
     const document = try diff_parser.parse(arena_allocator, copied);
     const file_text_eligibility = try @import("../diff/text_eligibility.zig").classifyDocument(arena_allocator, document);
+    const loaded = try decorateLoadedDiff(
+        arena_allocator,
+        io,
+        copied,
+        document,
+        file_text_eligibility,
+        tree_options,
+    );
+
+    // Do not store `arena_allocator` in the result: its interface points at
+    // this local arena value, while the arena itself is moved by value across
+    // the task-result boundary.
+    return .{
+        .arena = arena,
+        .loaded = loaded,
+        .fingerprint = fingerprint,
+    };
+}
+
+/// Promote one parse-only projection component into the ordinary, fully
+/// decorated bundle used by the current Review renderer. Failure leaves the
+/// component owner intact; success transfers its arena exactly once.
+fn decorateProjectionComponent(
+    component: *projection_component.ParsedComponent,
+    io: std.Io,
+) !LoadedDiffBundle {
+    const arena_allocator = component.arena.?.allocator();
+    const loaded = try decorateLoadedDiff(
+        arena_allocator,
+        io,
+        component.text,
+        component.document,
+        component.file_text_eligibility,
+        .{},
+    );
+    const fingerprint = component.fingerprint;
+    const arena = component.takeArena();
+    return .{
+        .arena = arena,
+        .loaded = loaded,
+        .fingerprint = fingerprint,
+    };
+}
+
+/// Build every presentation derivative from an already-owned parsed model.
+/// Both the ordinary load path and projection promotion use this one work
+/// order so P2 cannot silently diverge in syntax, tree, or rendered-row state.
+fn decorateLoadedDiff(
+    arena_allocator: std.mem.Allocator,
+    io: std.Io,
+    copied: []const u8,
+    document: diff_parser.DiffDocument,
+    file_text_eligibility: []const loaded_diff.FileTextEligibility,
+    tree_options: file_tree.BuildOptions,
+) !LoadedDiff {
     const syntax_spans = try syntax_provider.buildDocumentSpans(arena_allocator, io, document, file_text_eligibility);
     const tree = try file_tree.buildWithOptions(arena_allocator, document, null, tree_options);
     const rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document);
@@ -1261,15 +1411,7 @@ fn buildLoadedBundleWithOptions(
         .collapsed_dirs = .empty,
     };
     try loaded.rebuildVisibleNodes(arena_allocator, .expanded, false, .all);
-
-    // Do not store `arena_allocator` in the result: its interface points at
-    // this local arena value, while the arena itself is moved by value across
-    // the task-result boundary.
-    return .{
-        .arena = arena,
-        .loaded = loaded,
-        .fingerprint = fingerprint,
-    };
+    return loaded;
 }
 
 fn repoRootName(root: []const u8) []const u8 {
@@ -1286,6 +1428,41 @@ pub fn countLines(bytes: []const u8) usize {
         if (byte == '\n') count += 1;
     }
     return count;
+}
+
+const p2_cached_patch =
+    "diff --git a/a.zig b/a.zig\n" ++
+    "--- a/a.zig\n" ++
+    "+++ b/a.zig\n" ++
+    "@@ -1 +1 @@\n" ++
+    "-const old = 1;\n" ++
+    "+const staged = 2;\n";
+const p2_unstaged_patch =
+    "diff --git a/a.zig b/a.zig\n" ++
+    "--- a/a.zig\n" ++
+    "+++ b/a.zig\n" ++
+    "@@ -3 +3 @@\n" ++
+    "-const before = 3;\n" ++
+    "+const current = 4;\n";
+
+test "combined projection eagerly decorates parse-only components" {
+    const allocator = std.testing.allocator;
+    var cached = try projection_component.ParsedComponent.parse(allocator, p2_cached_patch);
+    defer cached.deinit();
+    var unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
+    defer unstaged.deinit();
+
+    var result = buildCombinedHunkResult("a.zig", allocator, std.testing.io, &cached, &unstaged);
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .ready);
+    try std.testing.expect(result.ready == .combined_hunks);
+    try std.testing.expect(cached.arena == null);
+    try std.testing.expect(unstaged.arena == null);
+    try std.testing.expectEqual(@as(usize, 2), result.ready.combined_hunks.projection.file.hunks.len);
+    try std.testing.expectEqualStrings(p2_cached_patch, result.ready.combined_hunks.cached_bundle.loaded.text);
+    try std.testing.expectEqualStrings(p2_unstaged_patch, result.ready.combined_hunks.unstaged_bundle.loaded.text);
+    try std.testing.expectEqual(@as(usize, 1), result.ready.combined_hunks.cached_bundle.loaded.tree.nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), result.ready.combined_hunks.unstaged_bundle.loaded.tree.nodes.len);
 }
 
 test "combined projection transfers both bundles when either component is inert" {
@@ -1308,12 +1485,12 @@ test "combined projection transfers both bundles when either component is inert"
         "+bad\xff\n";
 
     for ([_]bool{ true, false }) |cached_is_invalid| {
-        var cached = try buildLoadedBundle(allocator, if (cached_is_invalid) invalid_patch else valid_patch);
+        var cached = try projection_component.ParsedComponent.parse(allocator, if (cached_is_invalid) invalid_patch else valid_patch);
         defer cached.deinit();
-        var unstaged = try buildLoadedBundle(allocator, if (cached_is_invalid) valid_patch else invalid_patch);
+        var unstaged = try projection_component.ParsedComponent.parse(allocator, if (cached_is_invalid) valid_patch else invalid_patch);
         defer unstaged.deinit();
 
-        var result = buildCombinedHunkResult("a", allocator, &cached, &unstaged);
+        var result = buildCombinedHunkResult("a", allocator, std.testing.io, &cached, &unstaged);
         defer result.deinit(allocator);
         try std.testing.expect(result == .ready);
         try std.testing.expect(result.ready == .inert_combined);
@@ -1344,12 +1521,12 @@ test "combined projection reports unmappable coordinates without transferring bu
         "-old unstaged\n" ++
         " context 17\n";
 
-    var cached = try buildLoadedBundle(allocator, cached_patch);
+    var cached = try projection_component.ParsedComponent.parse(allocator, cached_patch);
     defer cached.deinit();
-    var unstaged = try buildLoadedBundle(allocator, unstaged_patch);
+    var unstaged = try projection_component.ParsedComponent.parse(allocator, unstaged_patch);
     defer unstaged.deinit();
 
-    var result = buildCombinedHunkResult("a", allocator, &cached, &unstaged);
+    var result = buildCombinedHunkResult("a", allocator, std.testing.io, &cached, &unstaged);
     defer result.deinit(allocator);
     try std.testing.expect(result == .ready);
     try std.testing.expect(result.ready == .status_body);
@@ -1360,6 +1537,104 @@ test "combined projection reports unmappable coordinates without transferring bu
     try std.testing.expect(!result.ready.cacheable());
     try std.testing.expect(cached.arena != null);
     try std.testing.expect(unstaged.arena != null);
+}
+
+test "projection component decoration preserves loaded model and rendered cells" {
+    const allocator = std.testing.allocator;
+    const patch =
+        "diff --git a/src/a.zig b/src/a.zig\n" ++
+        "index 1111111..2222222 100644\n" ++
+        "--- a/src/a.zig\n" ++
+        "+++ b/src/a.zig\n" ++
+        "@@ -1,2 +1,2 @@ fn main\n" ++
+        "-const old: usize = 1;\n" ++
+        "+const new: usize = 2;\n" ++
+        " return;\n";
+
+    var direct = try buildLoadedBundle(allocator, patch);
+    defer direct.deinit();
+    var component = try projection_component.ParsedComponent.parse(allocator, patch);
+    defer component.deinit();
+    var promoted = try decorateProjectionComponent(&component, std.testing.io);
+    defer promoted.deinit();
+
+    try std.testing.expectEqualStrings(direct.loaded.text, promoted.loaded.text);
+    try std.testing.expect(direct.fingerprint.eql(promoted.fingerprint));
+    try std.testing.expectEqualDeep(direct.loaded.document, promoted.loaded.document);
+    try std.testing.expectEqualSlices(
+        loaded_diff.FileTextEligibility,
+        direct.loaded.file_text_eligibility,
+        promoted.loaded.file_text_eligibility,
+    );
+    try std.testing.expectEqualDeep(direct.loaded.syntax_spans, promoted.loaded.syntax_spans);
+    try std.testing.expectEqualDeep(direct.loaded.tree.nodes, promoted.loaded.tree.nodes);
+    try std.testing.expectEqualDeep(direct.loaded.rendered_line_cache, promoted.loaded.rendered_line_cache);
+    try std.testing.expectEqualSlices(bool, direct.loaded.collapsed_hunks, promoted.loaded.collapsed_hunks);
+    try std.testing.expectEqualSlices(usize, direct.loaded.visible_nodes, promoted.loaded.visible_nodes);
+    try std.testing.expectEqual(direct.loaded.visible_node_count, promoted.loaded.visible_node_count);
+    try std.testing.expectEqual(direct.loaded.bytes, promoted.loaded.bytes);
+    try std.testing.expectEqual(direct.loaded.lines, promoted.loaded.lines);
+
+    var direct_surface: chasen.testing.TestSurface = undefined;
+    try direct_surface.init(80, 8);
+    defer direct_surface.deinit();
+    var promoted_surface: chasen.testing.TestSurface = undefined;
+    try promoted_surface.init(80, 8);
+    defer promoted_surface.deinit();
+
+    try renderLoadedFileForParity(&direct_surface.surface, &direct.loaded);
+    try renderLoadedFileForParity(&promoted_surface.surface, &promoted.loaded);
+    var row: u16 = 0;
+    while (row < 8) : (row += 1) {
+        var col: u16 = 0;
+        while (col < 80) : (col += 1) {
+            const expected = direct_surface.surface.readCell(col, row) orelse chasen.Cell.blank;
+            const actual = promoted_surface.surface.readCell(col, row) orelse chasen.Cell.blank;
+            try std.testing.expect(expected.eql(actual));
+        }
+    }
+}
+
+fn renderLoadedFileForParity(surface: *chasen.Surface, loaded: *const LoadedDiff) !void {
+    try diff_render.renderFile(surface, loaded.document.files[0], .{
+        .requested_mode = .unified,
+        .line_index = loaded.renderedLineIndex(0, .unified),
+        .folded_hunks = loaded.foldedHunksForFile(0),
+        .syntax = diff_syntax_view.View.initDirect(&loaded.syntax_spans, 0),
+    });
+}
+
+test "projection pair promotion releases partial ownership on every allocation failure" {
+    if (build_options.syntax_provider_flow_syntax) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn promote(allocator: std.mem.Allocator, cached_bytes: []const u8, unstaged_bytes: []const u8) !void {
+            var cached = try projection_component.ParsedComponent.parse(allocator, cached_bytes);
+            defer cached.deinit();
+            var unstaged = try projection_component.ParsedComponent.parse(allocator, unstaged_bytes);
+            defer unstaged.deinit();
+            var decorated = try decorateProjectionComponents(&cached, &unstaged, std.testing.io);
+            defer decorated.deinit();
+        }
+    }.promote, .{ p2_cached_patch, p2_unstaged_patch });
+}
+
+test "projection decoration failure terminal owns path and message transactionally" {
+    for (0..2) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var result = projectionDecorationFailureResult(failing.allocator(), "src/a.zig", error.OutOfMemory);
+        try std.testing.expect(result == .failed_static);
+        result.deinit(failing.allocator());
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+
+    var successful = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var result = projectionDecorationFailureResult(successful.allocator(), "src/a.zig", error.OutOfMemory);
+    try std.testing.expect(result == .failed);
+    try std.testing.expectEqualStrings("src/a.zig", result.failed.path);
+    try std.testing.expectEqualStrings("Projection decoration failed: OutOfMemory", result.failed.message);
+    result.deinit(successful.allocator());
+    try std.testing.expectEqual(successful.allocated_bytes, successful.freed_bytes);
 }
 
 test "every invalid file remains admitted as an inert tree entry" {
