@@ -1088,15 +1088,17 @@ fn loadCombinedHunks(request: review_projection.Request, allocator: std.mem.Allo
         return .{ .failed_static = "Projection allocation failed" } } };
     defer unstaged_component.deinit();
 
-    return buildCombinedHunkResult(request.path_key, allocator, io, &cached_component, &unstaged_component);
+    return buildCombinedHunkResult(request.path_key, request.status_snapshot_revision, allocator, io, &cached_component, &unstaged_component);
 }
 
-/// Normalize two parse-only components, eagerly decorate them, and transfer
-/// both owners only for a ready combined terminal. P2 intentionally has no
-/// reuse branch: the explicit parse/decorate boundary is behavior-preserving
-/// preparation for a later exact-presentation admission policy.
+/// Normalize two parse-only components, eagerly decorate an independent
+/// presentation generation, and transfer both owner domains only for a ready
+/// combined terminal. P3 still has no reuse branch: presentation and fresh
+/// authority are built from the same Git output while remaining independently
+/// replaceable for the later exact-reuse policy.
 fn buildCombinedHunkResult(
     path_key: []const u8,
+    status_snapshot_revision: u64,
     allocator: std.mem.Allocator,
     io: std.Io,
     cached_component: *projection_component.ParsedComponent,
@@ -1122,13 +1124,29 @@ fn buildCombinedHunkResult(
         return .{ .ready = .{ .inert_combined = bundle } };
     }
 
-    var arena: std.heap.ArenaAllocator = .init(allocator);
-    const projection = diff_hunk_projection.build(
-        arena.allocator(),
-        cached_component.document.files[0],
-        unstaged_component.document.files[0],
+    // The parsed inputs become fresh patch authority. Reparse their already
+    // owned bytes for the eager presentation so its decorated component
+    // storage can outlive replacement of that authority in P4. Parsing is
+    // deliberately still same-generation and unconditional in P3.
+    var cached_presentation_component = projection_component.ParsedComponent.parse(allocator, cached_component.text) catch |err| {
+        return projectionDecorationFailureResult(allocator, path_key, err);
+    };
+    defer cached_presentation_component.deinit();
+    var unstaged_presentation_component = projection_component.ParsedComponent.parse(allocator, unstaged_component.text) catch |err| {
+        return projectionDecorationFailureResult(allocator, path_key, err);
+    };
+    defer unstaged_presentation_component.deinit();
+
+    var presentation_arena: std.heap.ArenaAllocator = .init(allocator);
+    var authority_arena: std.heap.ArenaAllocator = .init(allocator);
+    const projection = diff_hunk_projection.buildWithAllocators(
+        presentation_arena.allocator(),
+        authority_arena.allocator(),
+        cached_presentation_component.document.files[0],
+        unstaged_presentation_component.document.files[0],
     ) catch |err| {
-        arena.deinit();
+        presentation_arena.deinit();
+        authority_arena.deinit();
         // Unlike invalid text, unsafe coordinates cannot retain an inert
         // projection because that would expose fabricated action targets.
         const body = switch (err) {
@@ -1149,8 +1167,12 @@ fn buildCombinedHunkResult(
     };
 
     const bundle = decorateCombinedProjection(
-        arena,
+        presentation_arena,
+        authority_arena,
         projection,
+        status_snapshot_revision,
+        &cached_presentation_component,
+        &unstaged_presentation_component,
         cached_component,
         unstaged_component,
         io,
@@ -1197,29 +1219,47 @@ fn decorateProjectionComponents(
     };
 }
 
-/// Consume a normalized projection arena and promote both parse-only
-/// components into the exact combined presentation shape used today. The
-/// projection arena is released here on failure and transferred on success.
+/// Consume normalized presentation/authority arenas, promote only the
+/// presentation components, and retain the original parse-only components as
+/// patch authority. Every owner is released here on failure and transferred
+/// exactly once on success.
 fn decorateCombinedProjection(
-    projection_arena: std.heap.ArenaAllocator,
+    presentation_arena_owner: std.heap.ArenaAllocator,
+    authority_arena_owner: std.heap.ArenaAllocator,
     projection: diff_hunk_projection.Projection,
-    cached_component: *projection_component.ParsedComponent,
-    unstaged_component: *projection_component.ParsedComponent,
+    status_snapshot_revision: u64,
+    cached_presentation_component: *projection_component.ParsedComponent,
+    unstaged_presentation_component: *projection_component.ParsedComponent,
+    cached_authority_component: *projection_component.ParsedComponent,
+    unstaged_authority_component: *projection_component.ParsedComponent,
     io: std.Io,
 ) !review_projection.CombinedHunkBundle {
-    var arena = projection_arena;
-    errdefer arena.deinit();
-    var decorated = try decorateProjectionComponents(cached_component, unstaged_component, io);
+    var presentation_arena = presentation_arena_owner;
+    errdefer presentation_arena.deinit();
+    var authority_arena = authority_arena_owner;
+    errdefer authority_arena.deinit();
+    var decorated = try decorateProjectionComponents(cached_presentation_component, unstaged_presentation_component, io);
     errdefer decorated.deinit();
 
     const bundle = review_projection.CombinedHunkBundle{
-        .arena = arena,
-        .projection = projection,
-        .cached_bundle = decorated.cached,
-        .unstaged_bundle = decorated.unstaged,
+        .presentation = .{
+            .arena = presentation_arena,
+            .projection = projection.presentation,
+            .cached_bundle = decorated.cached,
+            .unstaged_bundle = decorated.unstaged,
+        },
+        .authority = .{
+            .arena = authority_arena,
+            .projection = projection.authority,
+            .cached_component = cached_authority_component.*,
+            .unstaged_component = unstaged_authority_component.*,
+            .status_snapshot_revision = status_snapshot_revision,
+        },
     };
     decorated.cached.arena = null;
     decorated.unstaged.arena = null;
+    cached_authority_component.arena = null;
+    unstaged_authority_component.arena = null;
     return bundle;
 }
 
@@ -1452,17 +1492,58 @@ test "combined projection eagerly decorates parse-only components" {
     var unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
     defer unstaged.deinit();
 
-    var result = buildCombinedHunkResult("a.zig", allocator, std.testing.io, &cached, &unstaged);
+    var result = buildCombinedHunkResult("a.zig", 7, allocator, std.testing.io, &cached, &unstaged);
     defer result.deinit(allocator);
     try std.testing.expect(result == .ready);
     try std.testing.expect(result.ready == .combined_hunks);
     try std.testing.expect(cached.arena == null);
     try std.testing.expect(unstaged.arena == null);
-    try std.testing.expectEqual(@as(usize, 2), result.ready.combined_hunks.projection.file.hunks.len);
-    try std.testing.expectEqualStrings(p2_cached_patch, result.ready.combined_hunks.cached_bundle.loaded.text);
-    try std.testing.expectEqualStrings(p2_unstaged_patch, result.ready.combined_hunks.unstaged_bundle.loaded.text);
-    try std.testing.expectEqual(@as(usize, 1), result.ready.combined_hunks.cached_bundle.loaded.tree.nodes.len);
-    try std.testing.expectEqual(@as(usize, 1), result.ready.combined_hunks.unstaged_bundle.loaded.tree.nodes.len);
+    const bundle = &result.ready.combined_hunks;
+    try std.testing.expectEqual(@as(usize, 2), bundle.displayFile().hunks.len);
+    try std.testing.expectEqualStrings(p2_cached_patch, bundle.presentation.cached_bundle.loaded.text);
+    try std.testing.expectEqualStrings(p2_unstaged_patch, bundle.presentation.unstaged_bundle.loaded.text);
+    try std.testing.expectEqualStrings(p2_cached_patch, bundle.authority.cached_component.text);
+    try std.testing.expectEqualStrings(p2_unstaged_patch, bundle.authority.unstaged_component.text);
+    try std.testing.expect(bundle.presentation.cached_bundle.loaded.text.ptr != bundle.authority.cached_component.text.ptr);
+    try std.testing.expect(bundle.presentation.unstaged_bundle.loaded.text.ptr != bundle.authority.unstaged_component.text.ptr);
+    try std.testing.expectEqual(@as(usize, 1), bundle.presentation.cached_bundle.loaded.tree.nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), bundle.presentation.unstaged_bundle.loaded.tree.nodes.len);
+    try std.testing.expect(bundle.presentation.cached_bundle.fingerprint.eql(bundle.authority.cached_component.fingerprint));
+    try std.testing.expect(bundle.presentation.unstaged_bundle.fingerprint.eql(bundle.authority.unstaged_component.fingerprint));
+    const cached_action_file = bundle.actionSourceFile(.{ .cached = 0 }) orelse return error.ExpectedCachedAuthorityFile;
+    const unstaged_action_file = bundle.actionSourceFile(.{ .unstaged = 0 }) orelse return error.ExpectedUnstagedAuthorityFile;
+    try std.testing.expect(cached_action_file.hunks[0].lines[0].text.ptr == bundle.authority.cached_component.document.files[0].hunks[0].lines[0].text.ptr);
+    try std.testing.expect(unstaged_action_file.hunks[0].lines[0].text.ptr == bundle.authority.unstaged_component.document.files[0].hunks[0].lines[0].text.ptr);
+    try std.testing.expect(cached_action_file.hunks[0].lines[0].text.ptr != bundle.presentation.cached_bundle.loaded.document.files[0].hunks[0].lines[0].text.ptr);
+    try std.testing.expect(unstaged_action_file.hunks[0].lines[0].text.ptr != bundle.presentation.unstaged_bundle.loaded.document.files[0].hunks[0].lines[0].text.ptr);
+    try std.testing.expectEqual(@as(u64, 7), bundle.authority.status_snapshot_revision);
+}
+
+test "combined presentation and authority owners release every allocation failure" {
+    if (build_options.syntax_provider_flow_syntax) return error.SkipZigTest;
+
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var cached = try projection_component.ParsedComponent.parse(allocator, p2_cached_patch);
+            defer cached.deinit();
+            var unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
+            defer unstaged.deinit();
+            var result = buildCombinedHunkResult("a.zig", 7, allocator, std.testing.io, &cached, &unstaged);
+            defer result.deinit(allocator);
+        }
+    };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        try std.testing.expect(fail_index < 4096);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        Harness.run(failing.allocator()) catch |err| switch (err) {
+            error.OutOfMemory => {},
+            else => return err,
+        };
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (!failing.has_induced_failure) break;
+    }
 }
 
 test "combined projection transfers both bundles when either component is inert" {
@@ -1490,7 +1571,7 @@ test "combined projection transfers both bundles when either component is inert"
         var unstaged = try projection_component.ParsedComponent.parse(allocator, if (cached_is_invalid) valid_patch else invalid_patch);
         defer unstaged.deinit();
 
-        var result = buildCombinedHunkResult("a", allocator, std.testing.io, &cached, &unstaged);
+        var result = buildCombinedHunkResult("a", 7, allocator, std.testing.io, &cached, &unstaged);
         defer result.deinit(allocator);
         try std.testing.expect(result == .ready);
         try std.testing.expect(result.ready == .inert_combined);
@@ -1526,7 +1607,7 @@ test "combined projection reports unmappable coordinates without transferring bu
     var unstaged = try projection_component.ParsedComponent.parse(allocator, unstaged_patch);
     defer unstaged.deinit();
 
-    var result = buildCombinedHunkResult("a", allocator, std.testing.io, &cached, &unstaged);
+    var result = buildCombinedHunkResult("a", 7, allocator, std.testing.io, &cached, &unstaged);
     defer result.deinit(allocator);
     try std.testing.expect(result == .ready);
     try std.testing.expect(result.ready == .status_body);

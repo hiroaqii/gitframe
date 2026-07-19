@@ -303,8 +303,8 @@ pub const Controller = struct {
             } },
             .combined => |bundle| .{ .combined_projection = .{
                 .status_snapshot_revision = page.status_snapshot_revision,
-                .cached = bundle.cached_bundle.fingerprint,
-                .unstaged = bundle.unstaged_bundle.fingerprint,
+                .cached = bundle.authority.cached_component.fingerprint,
+                .unstaged = bundle.authority.unstaged_component.fingerprint,
             } },
             .generated => |bundle| .{ .generated_untracked = .{
                 .status_snapshot_revision = page.status_snapshot_revision,

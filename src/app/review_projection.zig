@@ -1,6 +1,8 @@
 const std = @import("std");
+const diff_parser = @import("../diff/parser.zig");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
 const diff_syntax_view = @import("../diff/syntax_view.zig");
+const diff_view_model = @import("../diff/view_model.zig");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const repository_source = @import("../repository/source.zig");
 const root_capability = @import("../repo/root_capability.zig");
@@ -9,6 +11,7 @@ const source_syntax_runtime = @import("../syntax/source_runtime.zig");
 const syntax_style = @import("../syntax/style.zig");
 const app_load = @import("load.zig");
 const page = @import("page.zig");
+const projection_component = @import("projection_component.zig");
 
 pub const max_generated_file_bytes = 1024 * 1024;
 pub const max_cached_entries = 4;
@@ -147,15 +150,19 @@ pub const GeneratedFileBundle = struct {
     }
 };
 
-pub const CombinedHunkBundle = struct {
+/// Stable rendered A-to-C content. Its normalized file, rendered indexes,
+/// syntax-origin map, and decorated component backing are one lifetime and may
+/// later be retained while index authority is replaced.
+pub const CombinedPresentation = struct {
     arena: ?std.heap.ArenaAllocator,
-    projection: diff_hunk_projection.Projection,
+    projection: diff_hunk_projection.Presentation,
     cached_bundle: app_load.LoadedDiffBundle,
     unstaged_bundle: app_load.LoadedDiffBundle,
 
-    /// Borrows origin and token storage owned by this bundle for one render
-    /// call. The returned view has no cleanup and must not outlive `self`.
-    pub fn syntaxView(self: *const CombinedHunkBundle) diff_syntax_view.View {
+    /// Borrows origin and token storage owned by this presentation generation
+    /// for one render call. The returned view has no cleanup and must not
+    /// outlive `self`.
+    fn syntaxView(self: *const CombinedPresentation) diff_syntax_view.View {
         return .initCombined(
             self.projection.presentation_syntax_origins,
             &self.cached_bundle.loaded.syntax_spans,
@@ -163,12 +170,98 @@ pub const CombinedHunkBundle = struct {
         );
     }
 
-    pub fn deinit(self: *CombinedHunkBundle) void {
+    fn retainedBytes(self: *const CombinedPresentation) usize {
+        return saturatedSum(&.{
+            arenaCapacity(self.arena),
+            arenaCapacity(self.cached_bundle.arena),
+            arenaCapacity(self.unstaged_bundle.arena),
+        });
+    }
+
+    fn deinit(self: *CombinedPresentation) void {
         if (self.arena) |*arena| arena.deinit();
         self.arena = null;
         self.cached_bundle.deinit();
         self.unstaged_bundle.deinit();
         self.projection = undefined;
+    }
+};
+
+/// Fresh index-derived facts which alone authorize the next stage/unstage
+/// patch. Parse-only component owners intentionally do not borrow storage from
+/// `CombinedPresentation`.
+pub const CombinedAuthority = struct {
+    arena: ?std.heap.ArenaAllocator,
+    projection: diff_hunk_projection.Authority,
+    cached_component: projection_component.ParsedComponent,
+    unstaged_component: projection_component.ParsedComponent,
+    status_snapshot_revision: u64,
+
+    fn actionSourceFile(self: *const CombinedAuthority, origin: diff_hunk_projection.HunkActionOrigin) ?diff_parser.FileDiff {
+        const document = switch (origin) {
+            .cached => self.cached_component.document,
+            .unstaged => self.unstaged_component.document,
+        };
+        if (document.files.len != 1) return null;
+        return document.files[0];
+    }
+
+    fn retainedBytes(self: *const CombinedAuthority) usize {
+        return saturatedSum(&.{
+            arenaCapacity(self.arena),
+            arenaCapacity(self.cached_component.arena),
+            arenaCapacity(self.unstaged_component.arena),
+        });
+    }
+
+    fn deinit(self: *CombinedAuthority) void {
+        if (self.arena) |*arena| arena.deinit();
+        self.arena = null;
+        self.cached_component.deinit();
+        self.unstaged_component.deinit();
+        self.projection = undefined;
+    }
+};
+
+pub const CombinedHunkBundle = struct {
+    presentation: CombinedPresentation,
+    authority: CombinedAuthority,
+
+    pub fn displayFile(self: *const CombinedHunkBundle) diff_parser.FileDiff {
+        return self.presentation.projection.file;
+    }
+
+    pub fn displayLineIndex(self: *const CombinedHunkBundle, mode: diff_view_model.DisplayMode) diff_view_model.RenderedLineIndex {
+        return self.presentation.projection.lineIndex(mode);
+    }
+
+    pub fn hunkStageStates(self: *const CombinedHunkBundle) []const diff_hunk_projection.HunkStageState {
+        return self.authority.projection.hunk_stage_states;
+    }
+
+    pub fn hunkActionOrigins(self: *const CombinedHunkBundle) []const diff_hunk_projection.HunkActionOrigin {
+        return self.authority.projection.hunk_action_origins;
+    }
+
+    pub fn actionSourceFile(self: *const CombinedHunkBundle, origin: diff_hunk_projection.HunkActionOrigin) ?diff_parser.FileDiff {
+        return self.authority.actionSourceFile(origin);
+    }
+
+    pub fn syntaxView(self: *const CombinedHunkBundle) diff_syntax_view.View {
+        return self.presentation.syntaxView();
+    }
+
+    pub fn retainedBytes(self: *const CombinedHunkBundle) usize {
+        return saturatedSum(&.{
+            self.presentation.retainedBytes(),
+            self.authority.retainedBytes(),
+        });
+    }
+
+    pub fn deinit(self: *CombinedHunkBundle) void {
+        self.presentation.deinit();
+        self.authority.deinit();
+        self.* = undefined;
     }
 };
 
@@ -227,11 +320,7 @@ pub const Ready = union(enum) {
         return switch (self) {
             .cached_diff => |bundle| arenaCapacity(bundle.arena),
             .generated_added_file => |bundle| bundle.retainedBytes(),
-            .combined_hunks => |bundle| saturatedSum(&.{
-                arenaCapacity(bundle.arena),
-                arenaCapacity(bundle.cached_bundle.arena),
-                arenaCapacity(bundle.unstaged_bundle.arena),
-            }),
+            .combined_hunks => |bundle| bundle.retainedBytes(),
             .inert_combined => |bundle| saturatedSum(&.{
                 arenaCapacity(bundle.cached_bundle.arena),
                 arenaCapacity(bundle.unstaged_bundle.arena),
@@ -1014,29 +1103,50 @@ test "projection cache retained bytes include every cacheable arena" {
     try std.testing.expect(cached.retainedBytes() >= cached_capacity);
     cached.deinit(allocator);
 
-    var projection_arena: std.heap.ArenaAllocator = .init(allocator);
-    var staged_arena: std.heap.ArenaAllocator = .init(allocator);
-    var unstaged_arena: std.heap.ArenaAllocator = .init(allocator);
-    _ = try projection_arena.allocator().alloc(u8, 512);
-    _ = try staged_arena.allocator().alloc(u8, 1024);
-    _ = try unstaged_arena.allocator().alloc(u8, 2048);
+    var presentation_arena: std.heap.ArenaAllocator = .init(allocator);
+    var authority_arena: std.heap.ArenaAllocator = .init(allocator);
+    var presentation_cached_arena: std.heap.ArenaAllocator = .init(allocator);
+    var presentation_unstaged_arena: std.heap.ArenaAllocator = .init(allocator);
+    var authority_cached_arena: std.heap.ArenaAllocator = .init(allocator);
+    var authority_unstaged_arena: std.heap.ArenaAllocator = .init(allocator);
+    _ = try presentation_arena.allocator().alloc(u8, 512);
+    _ = try authority_arena.allocator().alloc(u8, 256);
+    _ = try presentation_cached_arena.allocator().alloc(u8, 1024);
+    _ = try presentation_unstaged_arena.allocator().alloc(u8, 2048);
+    _ = try authority_cached_arena.allocator().alloc(u8, 4096);
+    _ = try authority_unstaged_arena.allocator().alloc(u8, 8192);
     const combined_capacity = saturatedSum(&.{
-        projection_arena.queryCapacity(),
-        staged_arena.queryCapacity(),
-        unstaged_arena.queryCapacity(),
+        presentation_arena.queryCapacity(),
+        authority_arena.queryCapacity(),
+        presentation_cached_arena.queryCapacity(),
+        presentation_unstaged_arena.queryCapacity(),
+        authority_cached_arena.queryCapacity(),
+        authority_unstaged_arena.queryCapacity(),
     });
     var combined = ReadyDisplay{
         .request = try cloneRequest(allocator, page.RequestIdentity.review(0, 1), 2, "/repo", "combined", .combined_hunks, .unstaged, 1, 2),
         .value = .{ .combined_hunks = .{
-            .arena = projection_arena,
-            .projection = undefined,
-            .cached_bundle = .{ .arena = staged_arena, .loaded = undefined },
-            .unstaged_bundle = .{ .arena = unstaged_arena, .loaded = undefined },
+            .presentation = .{
+                .arena = presentation_arena,
+                .projection = undefined,
+                .cached_bundle = .{ .arena = presentation_cached_arena, .loaded = undefined },
+                .unstaged_bundle = .{ .arena = presentation_unstaged_arena, .loaded = undefined },
+            },
+            .authority = .{
+                .arena = authority_arena,
+                .projection = undefined,
+                .cached_component = .{ .arena = authority_cached_arena, .text = undefined, .document = undefined, .file_text_eligibility = undefined, .fingerprint = .init("") },
+                .unstaged_component = .{ .arena = authority_unstaged_arena, .text = undefined, .document = undefined, .file_text_eligibility = undefined, .fingerprint = .init("") },
+                .status_snapshot_revision = 2,
+            },
         } },
     };
-    projection_arena = undefined;
-    staged_arena = undefined;
-    unstaged_arena = undefined;
+    presentation_arena = undefined;
+    authority_arena = undefined;
+    presentation_cached_arena = undefined;
+    presentation_unstaged_arena = undefined;
+    authority_cached_arena = undefined;
+    authority_unstaged_arena = undefined;
     try std.testing.expect(combined.retainedBytes() >= combined_capacity);
     combined.deinit(allocator);
 }

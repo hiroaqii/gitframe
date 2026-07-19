@@ -11,6 +11,7 @@ const chasen = @import("chasen");
 const app_direction = @import("../../direction.zig");
 const app_load = @import("../../load.zig");
 const app_page = @import("../../page.zig");
+const projection_component = @import("../../projection_component.zig");
 const page_link = @import("../../page_link.zig");
 const app_state = @import("../../state.zig");
 const shell_layout = if (builtin.is_test) @import("../../shell_layout.zig") else struct {};
@@ -341,10 +342,10 @@ pub const View = struct {
                 };
             },
             .combined => |bundle| blk: {
-                const path_key = diff_file.canonicalPathKey(bundle.projection.file) orelse return null;
+                const path_key = diff_file.canonicalPathKey(bundle.displayFile()) orelse return null;
                 break :blk .{
-                    .file = bundle.projection.file,
-                    .line_index = bundle.projection.lineIndex(self.effectiveDisplayMode()),
+                    .file = bundle.displayFile(),
+                    .line_index = bundle.displayLineIndex(self.effectiveDisplayMode()),
                     .folded_hunks = &.{},
                     .identity = .{ .projection_file = .{ .kind = .combined, .path_key = path_key } },
                 };
@@ -364,10 +365,10 @@ pub const View = struct {
                 };
             }
             if (self.activeCombinedProjection()) |bundle| {
-                const path_key = diff_file.canonicalPathKey(bundle.projection.file) orelse return null;
+                const path_key = diff_file.canonicalPathKey(bundle.displayFile()) orelse return null;
                 break :blk .{
                     .identity = .{ .kind = .projection_file, .path_key = path_key },
-                    .display_path = diff_file.displayPath(bundle.projection.file),
+                    .display_path = diff_file.displayPath(bundle.displayFile()),
                 };
             }
             if (self.activeCachedDiffProjection()) |bundle| {
@@ -563,7 +564,7 @@ pub const View = struct {
                 else
                     0,
                 .generated_added_file => |bundle| bundle.source.rowCount(),
-                .combined_hunks => |bundle| bundle.projection.lineIndex(self.effectiveDisplayMode()).lineCount(),
+                .combined_hunks => |bundle| bundle.displayLineIndex(self.effectiveDisplayMode()).lineCount(),
                 .inert_combined => 1,
                 .status_body => 1,
             },
@@ -751,7 +752,7 @@ pub const View = struct {
         return switch (self.displayedReviewBody()) {
             .primary => |primary| primary.loaded.document.files[primary.file_index],
             .cached => |bundle| bundle.loaded.document.files[0],
-            .combined => |bundle| bundle.projection.file,
+            .combined => |bundle| bundle.displayFile(),
             .none, .generated, .inert_invalid_utf8, .status, .pending => null,
         };
     }
@@ -778,7 +779,7 @@ pub const View = struct {
     }
 
     pub fn displayedDiffLineIndex(self: View, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
-        if (self.activeCombinedProjection()) |bundle| return bundle.projection.lineIndex(mode);
+        if (self.activeCombinedProjection()) |bundle| return bundle.displayLineIndex(mode);
         if (self.activeCachedDiffProjection()) |bundle| {
             if (bundle.loaded.document.files.len == 0) return null;
             return bundle.loaded.cachedRenderedLineIndex(0, mode);
@@ -790,9 +791,9 @@ pub const View = struct {
         const selected: struct { loaded: *const LoadedDiff, file_index: usize } = switch (self.displayedReviewBody()) {
             .combined => |bundle| {
                 return .{ .combined_projection = .{
-                    .file = bundle.projection.file,
-                    .line_index = bundle.projection.lineIndex(mode),
-                    .hunk_stages = try projectedHunkStagePresentation(allocator, bundle.projection.hunk_stage_states),
+                    .file = bundle.displayFile(),
+                    .line_index = bundle.displayLineIndex(mode),
+                    .hunk_stages = try projectedHunkStagePresentation(allocator, bundle.hunkStageStates()),
                     .syntax = bundle.syntaxView(),
                 } };
             },
@@ -894,7 +895,7 @@ pub const View = struct {
 
     pub fn selectedHunkOffset(self: View, mode: diff_render.DisplayMode, hunk_index: usize) usize {
         if (!self.bodyAllowsHunkInteraction()) return 0;
-        if (self.activeCombinedProjection()) |bundle| return bundle.projection.lineIndex(mode).hunkOffset(hunk_index);
+        if (self.activeCombinedProjection()) |bundle| return bundle.displayLineIndex(mode).hunkOffset(hunk_index);
         const loaded = self.activeLoadedDiffConst() orelse return 0;
         const file_index = self.selectedFileIndex(loaded) orelse return 0;
         if (loaded.rendered_line_cache.indexFor(file_index, mode)) |index| return index.hunkOffset(hunk_index);
@@ -3215,26 +3216,48 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
     var unstaged_bundle = try app_load.buildLoadedBundle(allocator, test_support.diff_unstaged_projection);
     var unstaged_owned = true;
     defer if (unstaged_owned) unstaged_bundle.deinit();
-    var projection_arena = std.heap.ArenaAllocator.init(allocator);
-    var projection_owned = true;
-    defer if (projection_owned) projection_arena.deinit();
-    const projection = try diff_hunk_projection.build(
-        projection_arena.allocator(),
+    var cached_authority = try projection_component.ParsedComponent.parse(allocator, test_support.diff_cached_projection);
+    var cached_authority_owned = true;
+    defer if (cached_authority_owned) cached_authority.deinit();
+    var unstaged_authority = try projection_component.ParsedComponent.parse(allocator, test_support.diff_unstaged_projection);
+    var unstaged_authority_owned = true;
+    defer if (unstaged_authority_owned) unstaged_authority.deinit();
+    var presentation_arena = std.heap.ArenaAllocator.init(allocator);
+    var presentation_owned = true;
+    defer if (presentation_owned) presentation_arena.deinit();
+    var authority_arena = std.heap.ArenaAllocator.init(allocator);
+    var authority_owned = true;
+    defer if (authority_owned) authority_arena.deinit();
+    const projection = try diff_hunk_projection.buildWithAllocators(
+        presentation_arena.allocator(),
+        authority_arena.allocator(),
         cached_bundle.loaded.document.files[0],
         unstaged_bundle.loaded.document.files[0],
     );
     combined_harness.pages.review.review_projection.installReady(.{
         .request = try review_projection.cloneRequest(allocator, combined_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .combined_hunks, .unstaged, 0, 0),
         .value = .{ .combined_hunks = .{
-            .arena = projection_arena,
-            .projection = projection,
-            .cached_bundle = cached_bundle,
-            .unstaged_bundle = unstaged_bundle,
+            .presentation = .{
+                .arena = presentation_arena,
+                .projection = projection.presentation,
+                .cached_bundle = cached_bundle,
+                .unstaged_bundle = unstaged_bundle,
+            },
+            .authority = .{
+                .arena = authority_arena,
+                .projection = projection.authority,
+                .cached_component = cached_authority,
+                .unstaged_component = unstaged_authority,
+                .status_snapshot_revision = 0,
+            },
         } },
     });
-    projection_owned = false;
+    presentation_owned = false;
+    authority_owned = false;
     cached_owned = false;
     unstaged_owned = false;
+    cached_authority_owned = false;
+    unstaged_authority_owned = false;
     defer combined_harness.pages.review.deinit(allocator);
     const combined_raw = combined_harness.view().rawDiffPaneGeometry().?;
     const combined_content_width = contentWidth(combined_raw.width);

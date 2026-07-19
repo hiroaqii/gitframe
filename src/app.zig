@@ -26,6 +26,7 @@ const review_view = @import("app/pages/review/view.zig");
 const repository_page = @import("app/pages/repository.zig");
 const repository_selection = @import("app/pages/repository/selection.zig");
 const app_prompt = @import("app/prompt.zig");
+const app_projection_component = @import("app/projection_component.zig");
 const app_push_retry = @import("app/push_retry.zig");
 const app_repo_picker = @import("app/repo_picker.zig");
 const app_review_projection = @import("app/review_projection.zig");
@@ -13410,9 +13411,9 @@ test "active diff display uses ready combined projection by identity" {
     const bundle = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
     switch (display.syntaxView()) {
         .combined => |syntax| {
-            try std.testing.expect(syntax.origins.ptr == bundle.projection.presentation_syntax_origins.ptr);
-            try std.testing.expect(syntax.cached == &bundle.cached_bundle.loaded.syntax_spans);
-            try std.testing.expect(syntax.unstaged == &bundle.unstaged_bundle.loaded.syntax_spans);
+            try std.testing.expect(syntax.origins.ptr == bundle.presentation.projection.presentation_syntax_origins.ptr);
+            try std.testing.expect(syntax.cached == &bundle.presentation.cached_bundle.loaded.syntax_spans);
+            try std.testing.expect(syntax.unstaged == &bundle.presentation.unstaged_bundle.loaded.syntax_spans);
         },
         .direct => return error.ExpectedCombinedSyntaxView,
     }
@@ -13458,7 +13459,7 @@ test "background status refresh retains combined projection while cursor moves" 
     acceptTestSource(&app);
 
     const projection_before = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
-    const hunks_before = projection_before.projection.file.hunks.ptr;
+    const hunks_before = projection_before.displayFile().hunks.ptr;
     const cursor_before = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
     try std.testing.expect(cursor_before > 0);
 
@@ -13469,7 +13470,7 @@ test "background status refresh retains combined projection while cursor moves" 
     try app.ensureReviewProjection(&ctx);
 
     const retained = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedRetainedProjection;
-    try std.testing.expectEqual(hunks_before, retained.projection.file.hunks.ptr);
+    try std.testing.expectEqual(hunks_before, retained.displayFile().hunks.ptr);
     app.reviewNavigation().moveDiffCursorRows(.down);
     const cursor_after = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedProjectionCursor;
     try std.testing.expect(cursor_after > cursor_before);
@@ -13519,7 +13520,7 @@ test "unchanged full cycle preserves projection semantic identity" {
     } };
 
     const projection_before = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
-    const hunks_before = projection_before.projection.file.hunks.ptr;
+    const hunks_before = projection_before.displayFile().hunks.ptr;
     const cursor_before = app.pages.review.viewer.diff_cursor;
     const scroll_before = app.pages.review.viewer.diff_scroll;
 
@@ -13533,7 +13534,7 @@ test "unchanged full cycle preserves projection semantic identity" {
     try app.ensureReviewProjection(&ctx);
 
     const projection_after = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
-    try std.testing.expectEqual(hunks_before, projection_after.projection.file.hunks.ptr);
+    try std.testing.expectEqual(hunks_before, projection_after.displayFile().hunks.ptr);
     try std.testing.expect(!app.pages.review.review_projection.hasPending());
     try std.testing.expectEqual(@as(u64, 17), app.pages.review.source_session_revision);
     try std.testing.expectEqual(@as(u64, 19), app.pages.review.status_snapshot_revision);
@@ -14299,7 +14300,7 @@ test "projected hunk actions route through original cached and unstaged origins"
     // cross-generation-mismatched action origin must fail closed without
     // changing the fresh stage-state decision shown by the toggle UI.
     const live = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
-    @constCast(live.projection.hunk_action_origins)[1] = .{ .cached = 0 };
+    @constCast(live.hunkActionOrigins())[1] = .{ .cached = 0 };
     switch (app.reviewOperations().selectedHunkToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
         else => return error.ExpectedProjectedToggleStage,
@@ -14308,6 +14309,9 @@ test "projected hunk actions route through original cached and unstaged origins"
         .no_hunk => {},
         else => return error.ExpectedMismatchedActionOriginToFailClosed,
     }
+
+    @constCast(&live.authority.status_snapshot_revision).* +%= 1;
+    try std.testing.expect(app.reviewOperations().selectedHunkToggleOperation() == .stale_status);
 }
 
 test "hunk stage presentation keeps fresh staged authority without clearing action marks" {
@@ -17618,18 +17622,35 @@ fn testCombinedHunkBundle(allocator: std.mem.Allocator) !app_review_projection.C
     var unstaged_bundle = try app_load.buildLoadedBundle(allocator, app_test_support.diff_unstaged_projection);
     errdefer unstaged_bundle.deinit();
 
-    var projection_arena: std.heap.ArenaAllocator = .init(allocator);
-    errdefer projection_arena.deinit();
-    const projection = try diff_hunk_projection.build(
-        projection_arena.allocator(),
+    var cached_authority = try app_projection_component.ParsedComponent.parse(allocator, app_test_support.diff_cached_projection);
+    errdefer cached_authority.deinit();
+    var unstaged_authority = try app_projection_component.ParsedComponent.parse(allocator, app_test_support.diff_unstaged_projection);
+    errdefer unstaged_authority.deinit();
+
+    var presentation_arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer presentation_arena.deinit();
+    var authority_arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer authority_arena.deinit();
+    const projection = try diff_hunk_projection.buildWithAllocators(
+        presentation_arena.allocator(),
+        authority_arena.allocator(),
         cached_bundle.loaded.document.files[0],
         unstaged_bundle.loaded.document.files[0],
     );
 
     return .{
-        .arena = projection_arena,
-        .projection = projection,
-        .cached_bundle = cached_bundle,
-        .unstaged_bundle = unstaged_bundle,
+        .presentation = .{
+            .arena = presentation_arena,
+            .projection = projection.presentation,
+            .cached_bundle = cached_bundle,
+            .unstaged_bundle = unstaged_bundle,
+        },
+        .authority = .{
+            .arena = authority_arena,
+            .projection = projection.authority,
+            .cached_component = cached_authority,
+            .unstaged_component = unstaged_authority,
+            .status_snapshot_revision = 0,
+        },
     };
 }

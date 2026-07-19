@@ -12,6 +12,7 @@ const auto_reload = @import("../../auto_reload.zig");
 const app_load = @import("../../load.zig");
 const app_page = @import("../../page.zig");
 const load_state = @import("../../load_state.zig");
+const projection_component = @import("../../projection_component.zig");
 const review_projection = @import("../../review_projection.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
@@ -376,8 +377,8 @@ pub const Controller = struct {
             } },
             .combined_hunks => |bundle| .{ .combined_projection = .{
                 .status_snapshot_revision = self.page.status_snapshot_revision,
-                .cached = bundle.cached_bundle.fingerprint,
-                .unstaged = bundle.unstaged_bundle.fingerprint,
+                .cached = bundle.authority.cached_component.fingerprint,
+                .unstaged = bundle.authority.unstaged_component.fingerprint,
             } },
             .generated_added_file => |bundle| .{ .generated_untracked = .{
                 .status_snapshot_revision = self.page.status_snapshot_revision,
@@ -3116,11 +3117,21 @@ test "cached and combined ready completions use the live drag deferral slot" {
     var unstaged_bundle = try app_load.buildLoadedBundle(allocator, test_support.diff_unstaged_projection);
     var unstaged_owned = true;
     defer if (unstaged_owned) unstaged_bundle.deinit();
-    var projection_arena = std.heap.ArenaAllocator.init(allocator);
-    var projection_owned = true;
-    defer if (projection_owned) projection_arena.deinit();
-    const projection = try diff_hunk_projection.build(
-        projection_arena.allocator(),
+    var cached_authority = try projection_component.ParsedComponent.parse(allocator, test_support.diff_cached_projection);
+    var cached_authority_owned = true;
+    defer if (cached_authority_owned) cached_authority.deinit();
+    var unstaged_authority = try projection_component.ParsedComponent.parse(allocator, test_support.diff_unstaged_projection);
+    var unstaged_authority_owned = true;
+    defer if (unstaged_authority_owned) unstaged_authority.deinit();
+    var presentation_arena = std.heap.ArenaAllocator.init(allocator);
+    var presentation_owned = true;
+    defer if (presentation_owned) presentation_arena.deinit();
+    var authority_arena = std.heap.ArenaAllocator.init(allocator);
+    var authority_owned = true;
+    defer if (authority_owned) authority_arena.deinit();
+    const projection = try diff_hunk_projection.buildWithAllocators(
+        presentation_arena.allocator(),
+        authority_arena.allocator(),
         cached_bundle.loaded.document.files[0],
         unstaged_bundle.loaded.document.files[0],
     );
@@ -3132,17 +3143,29 @@ test "cached and combined ready completions use the live drag deferral slot" {
     var combined_finished: app_load.ReviewProjectionFinished = .{
         .request = combined_request,
         .result = .{ .ready = .{ .combined_hunks = .{
-            .arena = projection_arena,
-            .projection = projection,
-            .cached_bundle = cached_bundle,
-            .unstaged_bundle = unstaged_bundle,
+            .presentation = .{
+                .arena = presentation_arena,
+                .projection = projection.presentation,
+                .cached_bundle = cached_bundle,
+                .unstaged_bundle = unstaged_bundle,
+            },
+            .authority = .{
+                .arena = authority_arena,
+                .projection = projection.authority,
+                .cached_component = cached_authority,
+                .unstaged_component = unstaged_authority,
+                .status_snapshot_revision = 0,
+            },
         } } },
     };
     const combined_apply = try combined_controller.applyProjectionFinished(allocator, &combined_finished);
     try std.testing.expect(combined_apply.result_transferred);
-    projection_owned = false;
+    presentation_owned = false;
+    authority_owned = false;
     cached_owned = false;
     unstaged_owned = false;
+    cached_authority_owned = false;
+    unstaged_authority_owned = false;
     try std.testing.expect(combined_page.deferred_projection_apply != null);
     combined_page.selection_owner = .none;
     try combined_controller.applyDeferredProjection(allocator);

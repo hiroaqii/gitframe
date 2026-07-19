@@ -22,19 +22,31 @@ pub const HunkActionOrigin = union(enum) {
     unstaged: usize,
 };
 
-pub const Projection = struct {
+pub const Presentation = struct {
     file: diff_parser.FileDiff,
-    hunk_stage_states: []const HunkStageState,
     presentation_syntax_origins: []const PresentationSyntaxOrigin,
-    hunk_action_origins: []const HunkActionOrigin,
     unified_line_index: diff_view_model.RenderedLineIndex,
     side_by_side_line_index: diff_view_model.RenderedLineIndex,
 
-    pub fn lineIndex(self: Projection, mode: diff_view_model.DisplayMode) diff_view_model.RenderedLineIndex {
+    pub fn lineIndex(self: Presentation, mode: diff_view_model.DisplayMode) diff_view_model.RenderedLineIndex {
         return switch (mode) {
             .unified => self.unified_line_index,
             .side_by_side => self.side_by_side_line_index,
         };
+    }
+};
+
+pub const Authority = struct {
+    hunk_stage_states: []const HunkStageState,
+    hunk_action_origins: []const HunkActionOrigin,
+};
+
+pub const Projection = struct {
+    presentation: Presentation,
+    authority: Authority,
+
+    pub fn lineIndex(self: Projection, mode: diff_view_model.DisplayMode) diff_view_model.RenderedLineIndex {
+        return self.presentation.lineIndex(mode);
     }
 };
 
@@ -76,19 +88,32 @@ pub fn build(
     cached_file: diff_parser.FileDiff,
     unstaged_file: diff_parser.FileDiff,
 ) BuildError!Projection {
+    return buildWithAllocators(allocator, allocator, cached_file, unstaged_file);
+}
+
+/// Build one normalized display while placing retained presentation facts and
+/// replaceable index authority in independent allocation domains. Passing the
+/// same allocator preserves the convenient single-owner form used by leaf
+/// tests and the developer profiler; Review uses distinct arenas.
+pub fn buildWithAllocators(
+    presentation_allocator: std.mem.Allocator,
+    authority_allocator: std.mem.Allocator,
+    cached_file: diff_parser.FileDiff,
+    unstaged_file: diff_parser.FileDiff,
+) BuildError!Projection {
     try validateFile(cached_file);
     try validateFile(unstaged_file);
 
-    const cached_transform = buildCoordinateTransform(allocator, cached_file.hunks) catch |err| return coordinateBuildError(err);
-    defer cached_transform.deinit(allocator);
-    const unstaged_transform = buildCoordinateTransform(allocator, unstaged_file.hunks) catch |err| return coordinateBuildError(err);
-    defer unstaged_transform.deinit(allocator);
+    const cached_transform = buildCoordinateTransform(presentation_allocator, cached_file.hunks) catch |err| return coordinateBuildError(err);
+    defer cached_transform.deinit(presentation_allocator);
+    const unstaged_transform = buildCoordinateTransform(presentation_allocator, unstaged_file.hunks) catch |err| return coordinateBuildError(err);
+    defer unstaged_transform.deinit(presentation_allocator);
 
     var candidates: std.ArrayList(Candidate) = .empty;
-    defer candidates.deinit(allocator);
+    defer candidates.deinit(presentation_allocator);
 
-    try appendCandidates(allocator, &candidates, cached_file, .cached);
-    try appendCandidates(allocator, &candidates, unstaged_file, .unstaged);
+    try appendCandidates(presentation_allocator, &candidates, cached_file, .cached);
+    try appendCandidates(presentation_allocator, &candidates, unstaged_file, .unstaged);
     if (candidates.items.len == 0) return error.AmbiguousProjection;
 
     std.mem.sort(Candidate, candidates.items, {}, lessThanCandidate);
@@ -98,27 +123,28 @@ pub fn build(
         if (candidate.range.overlaps(previous.range)) return error.AmbiguousProjection;
     }
 
-    const hunks = try allocator.alloc(diff_parser.Hunk, candidates.items.len);
-    errdefer allocator.free(hunks);
-    const stage_states = try allocator.alloc(HunkStageState, candidates.items.len);
-    errdefer allocator.free(stage_states);
-    const syntax_origins = try allocator.alloc(PresentationSyntaxOrigin, candidates.items.len);
-    errdefer allocator.free(syntax_origins);
-    const action_origins = try allocator.alloc(HunkActionOrigin, candidates.items.len);
-    errdefer allocator.free(action_origins);
+    const hunks = try presentation_allocator.alloc(diff_parser.Hunk, candidates.items.len);
+    errdefer presentation_allocator.free(hunks);
+    const syntax_origins = try presentation_allocator.alloc(PresentationSyntaxOrigin, candidates.items.len);
+    errdefer presentation_allocator.free(syntax_origins);
+    const stage_states = try authority_allocator.alloc(HunkStageState, candidates.items.len);
+    errdefer authority_allocator.free(stage_states);
+    const action_origins = try authority_allocator.alloc(HunkActionOrigin, candidates.items.len);
+    errdefer authority_allocator.free(action_origins);
 
     var initialized_hunks: usize = 0;
-    errdefer for (hunks[0..initialized_hunks]) |hunk| allocator.free(hunk.lines);
+    errdefer for (hunks[0..initialized_hunks]) |hunk| presentation_allocator.free(hunk.lines);
 
-    // Projected hunk and line values belong to the projection allocator because
-    // their coordinates are normalized from HEAD directly to the working tree.
+    // Projected hunk and line values belong to the presentation allocator
+    // because their coordinates are normalized from HEAD directly to the
+    // working tree.
     // Text and section slices remain borrowed from the retained component
     // bundles. Syntax and action origins are deliberately separate arrays even
     // in this same-generation eager result, so future presentation retention
     // cannot accidentally use fresh patch authority for syntax lookup.
     for (candidates.items, 0..) |candidate, index| {
         hunks[index] = try normalizeCandidateHunk(
-            allocator,
+            presentation_allocator,
             candidate,
             cached_transform,
             unstaged_transform,
@@ -147,17 +173,21 @@ pub fn build(
         .is_binary = false,
     };
 
-    var unified_line_index = try diff_view_model.RenderedLineIndex.build(allocator, file, .unified);
-    errdefer unified_line_index.deinit(allocator);
-    const side_by_side_line_index = try diff_view_model.RenderedLineIndex.build(allocator, file, .side_by_side);
+    var unified_line_index = try diff_view_model.RenderedLineIndex.build(presentation_allocator, file, .unified);
+    errdefer unified_line_index.deinit(presentation_allocator);
+    const side_by_side_line_index = try diff_view_model.RenderedLineIndex.build(presentation_allocator, file, .side_by_side);
 
     return .{
-        .file = file,
-        .hunk_stage_states = stage_states,
-        .presentation_syntax_origins = syntax_origins,
-        .hunk_action_origins = action_origins,
-        .unified_line_index = unified_line_index,
-        .side_by_side_line_index = side_by_side_line_index,
+        .presentation = .{
+            .file = file,
+            .presentation_syntax_origins = syntax_origins,
+            .unified_line_index = unified_line_index,
+            .side_by_side_line_index = side_by_side_line_index,
+        },
+        .authority = .{
+            .hunk_stage_states = stage_states,
+            .hunk_action_origins = action_origins,
+        },
     };
 }
 
@@ -1007,7 +1037,7 @@ fn expectRenderedHunkHeader(
 ) !void {
     const line_index = projection.lineIndex(mode);
     var rows = diff_view_model.BodyRowIterator.initAt(
-        projection.file,
+        projection.presentation.file,
         mode,
         line_index,
         line_index.hunkOffset(hunk_index),
@@ -1051,13 +1081,63 @@ test "hunk projection orders cached new-side and unstaged old-side coordinates" 
     );
 
     const projection = try build(projection_arena.allocator(), cached, unstaged);
-    try std.testing.expectEqual(@as(usize, 2), projection.file.hunks.len);
-    try std.testing.expectEqual(HunkStageState.staged, projection.hunk_stage_states[0]);
-    try std.testing.expectEqual(HunkStageState.unstaged, projection.hunk_stage_states[1]);
-    try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .cached = 0 }, projection.presentation_syntax_origins[0]);
-    try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .unstaged = 0 }, projection.presentation_syntax_origins[1]);
-    try std.testing.expectEqualDeep(HunkActionOrigin{ .cached = 0 }, projection.hunk_action_origins[0]);
-    try std.testing.expectEqualDeep(HunkActionOrigin{ .unstaged = 0 }, projection.hunk_action_origins[1]);
+    try std.testing.expectEqual(@as(usize, 2), projection.presentation.file.hunks.len);
+    try std.testing.expectEqual(HunkStageState.staged, projection.authority.hunk_stage_states[0]);
+    try std.testing.expectEqual(HunkStageState.unstaged, projection.authority.hunk_stage_states[1]);
+    try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .cached = 0 }, projection.presentation.presentation_syntax_origins[0]);
+    try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .unstaged = 0 }, projection.presentation.presentation_syntax_origins[1]);
+    try std.testing.expectEqualDeep(HunkActionOrigin{ .cached = 0 }, projection.authority.hunk_action_origins[0]);
+    try std.testing.expectEqualDeep(HunkActionOrigin{ .unstaged = 0 }, projection.authority.hunk_action_origins[1]);
+}
+
+test "hunk projection keeps presentation and authority in separate allocation domains" {
+    var cached_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer cached_arena.deinit();
+    var unstaged_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer unstaged_arena.deinit();
+
+    const cached = try parseOneFile(&cached_arena,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-const old = 1;
+        \\+const staged = 2;
+        \\
+    );
+    const unstaged = try parseOneFile(&unstaged_arena,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -3 +3 @@
+        \\-const before = 3;
+        \\+const current = 4;
+        \\
+    );
+
+    var presentation_storage: [64 * 1024]u8 = undefined;
+    var authority_storage: [64 * 1024]u8 = undefined;
+    var presentation_fba = std.heap.FixedBufferAllocator.init(&presentation_storage);
+    var authority_fba = std.heap.FixedBufferAllocator.init(&authority_storage);
+    const projection = try buildWithAllocators(
+        presentation_fba.allocator(),
+        authority_fba.allocator(),
+        cached,
+        unstaged,
+    );
+
+    try std.testing.expect(pointerInBuffer(projection.presentation.file.hunks.ptr, &presentation_storage));
+    try std.testing.expect(pointerInBuffer(projection.presentation.presentation_syntax_origins.ptr, &presentation_storage));
+    try std.testing.expect(!pointerInBuffer(projection.presentation.file.hunks.ptr, &authority_storage));
+    try std.testing.expect(pointerInBuffer(projection.authority.hunk_stage_states.ptr, &authority_storage));
+    try std.testing.expect(pointerInBuffer(projection.authority.hunk_action_origins.ptr, &authority_storage));
+    try std.testing.expect(!pointerInBuffer(projection.authority.hunk_stage_states.ptr, &presentation_storage));
+}
+
+fn pointerInBuffer(pointer: anytype, buffer: []const u8) bool {
+    const address = @intFromPtr(pointer);
+    const start = @intFromPtr(buffer.ptr);
+    return address >= start and address < start + buffer.len;
 }
 
 test "hunk projection keeps later HEAD and worktree coordinates stable across staged partition" {
@@ -1114,7 +1194,7 @@ test "hunk projection keeps later HEAD and worktree coordinates stable across st
     const second = try build(second_projection_arena.allocator(), second_cached, second_unstaged);
 
     for ([_]Projection{ first, second }) |projection| {
-        const later = projection.file.hunks[1];
+        const later = projection.presentation.file.hunks[1];
         try std.testing.expectEqual(@as(u32, 20), later.old_start);
         try std.testing.expectEqual(@as(u32, 21), later.new_start);
         try std.testing.expectEqual(@as(?u32, 20), later.lines[0].old_line);
@@ -1123,12 +1203,12 @@ test "hunk projection keeps later HEAD and worktree coordinates stable across st
         try expectRenderedHunkHeader(projection, .side_by_side, 1, 20, 21);
     }
 
-    try std.testing.expectEqualDeep(HunkActionOrigin{ .unstaged = 0 }, first.hunk_action_origins[1]);
-    try std.testing.expectEqualDeep(HunkActionOrigin{ .cached = 0 }, second.hunk_action_origins[1]);
-    try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .unstaged = 0 }, first.presentation_syntax_origins[1]);
-    try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .cached = 0 }, second.presentation_syntax_origins[1]);
-    try std.testing.expect(first.file.hunks[1].lines.ptr != first_unstaged.hunks[0].lines.ptr);
-    try std.testing.expect(first.file.hunks[1].lines[0].text.ptr == first_unstaged.hunks[0].lines[0].text.ptr);
+    try std.testing.expectEqualDeep(HunkActionOrigin{ .unstaged = 0 }, first.authority.hunk_action_origins[1]);
+    try std.testing.expectEqualDeep(HunkActionOrigin{ .cached = 0 }, second.authority.hunk_action_origins[1]);
+    try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .unstaged = 0 }, first.presentation.presentation_syntax_origins[1]);
+    try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .cached = 0 }, second.presentation.presentation_syntax_origins[1]);
+    try std.testing.expect(first.presentation.file.hunks[1].lines.ptr != first_unstaged.hunks[0].lines.ptr);
+    try std.testing.expect(first.presentation.file.hunks[1].lines[0].text.ptr == first_unstaged.hunks[0].lines[0].text.ptr);
 }
 
 test "hunk projection keeps later coordinates stable across cached and unstaged deletion" {
@@ -1185,7 +1265,7 @@ test "hunk projection keeps later coordinates stable across cached and unstaged 
     const second = try build(second_projection_arena.allocator(), second_cached, second_unstaged);
 
     for ([_]Projection{ first, second }) |projection| {
-        const later = projection.file.hunks[1];
+        const later = projection.presentation.file.hunks[1];
         try std.testing.expectEqual(@as(u32, 20), later.old_start);
         try std.testing.expectEqual(@as(u32, 19), later.new_start);
         try std.testing.expectEqual(@as(?u32, 20), later.lines[0].old_line);
@@ -1194,8 +1274,8 @@ test "hunk projection keeps later coordinates stable across cached and unstaged 
         try expectRenderedHunkHeader(projection, .side_by_side, 1, 20, 19);
     }
 
-    try std.testing.expectEqualDeep(HunkActionOrigin{ .unstaged = 0 }, first.hunk_action_origins[1]);
-    try std.testing.expectEqualDeep(HunkActionOrigin{ .cached = 0 }, second.hunk_action_origins[1]);
+    try std.testing.expectEqualDeep(HunkActionOrigin{ .unstaged = 0 }, first.authority.hunk_action_origins[1]);
+    try std.testing.expectEqualDeep(HunkActionOrigin{ .cached = 0 }, second.authority.hunk_action_origins[1]);
 }
 
 test "hunk projection normalizes zero-count headers after non-zero prior deltas" {
@@ -1223,7 +1303,7 @@ test "hunk projection normalizes zero-count headers after non-zero prior deltas"
         \\
     );
     const first = try build(first_projection_arena.allocator(), first_cached, first_unstaged);
-    const cached_deletion = first.file.hunks[1];
+    const cached_deletion = first.presentation.file.hunks[1];
     try std.testing.expectEqual(@as(u32, 0), cached_deletion.new_count);
     try std.testing.expectEqual(@as(u32, 20), cached_deletion.new_start);
 
@@ -1251,7 +1331,7 @@ test "hunk projection normalizes zero-count headers after non-zero prior deltas"
         \\
     );
     const second = try build(second_projection_arena.allocator(), second_cached, second_unstaged);
-    const unstaged_insertion = second.file.hunks[1];
+    const unstaged_insertion = second.presentation.file.hunks[1];
     try std.testing.expectEqual(@as(u32, 0), unstaged_insertion.old_count);
     try std.testing.expectEqual(@as(u32, 19), unstaged_insertion.old_start);
 }
@@ -1417,9 +1497,9 @@ test "hunk projection combines context-overlapping changed-range-disjoint hunks"
     );
 
     const projection = try build(projection_arena.allocator(), cached, unstaged);
-    try std.testing.expectEqual(@as(usize, 2), projection.file.hunks.len);
-    try std.testing.expectEqual(HunkStageState.staged, projection.hunk_stage_states[0]);
-    try std.testing.expectEqual(HunkStageState.unstaged, projection.hunk_stage_states[1]);
+    try std.testing.expectEqual(@as(usize, 2), projection.presentation.file.hunks.len);
+    try std.testing.expectEqual(HunkStageState.staged, projection.authority.hunk_stage_states[0]);
+    try std.testing.expectEqual(HunkStageState.unstaged, projection.authority.hunk_stage_states[1]);
 }
 
 test "hunk projection rejects copied context that crosses another component edit" {

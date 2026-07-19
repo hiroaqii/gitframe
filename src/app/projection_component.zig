@@ -6,9 +6,11 @@
 //! without weakening the ordinary `LoadedDiffBundle`: it owns only the raw
 //! bytes, parsed document, text-safety classification, and raw fingerprint.
 //!
-//! P2 still promotes every successful combined projection eagerly. Keeping
-//! the parse-only lifetime separate now lets a later slice make an explicit
-//! reuse decision without representing a partially initialized loaded diff.
+//! P3 still builds every successful combined presentation eagerly, but keeps
+//! a same-generation parse-only copy as independently replaceable action
+//! authority. A later slice can therefore retain an old decorated presentation
+//! while installing fresh authority without representing a partially
+//! initialized loaded diff.
 
 const std = @import("std");
 const content_fingerprint = @import("../content_fingerprint.zig");

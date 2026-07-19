@@ -100,7 +100,7 @@ pub const View = struct {
             ),
             .cached => |bundle| self.parsedRepositoryTarget(bundle.loaded.document.files[0], .cached, repo_root),
             .combined => |bundle| repositoryTargetForParsedFile(
-                bundle.projection.file,
+                bundle.displayFile(),
                 self.page.viewer.diff_cursor,
                 self.navigation.effectiveDisplayMode(),
                 .synthetic,

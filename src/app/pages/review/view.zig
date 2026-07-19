@@ -682,7 +682,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
             return;
         },
         .combined => |bundle| {
-            try diff_render.renderFile(&content, bundle.projection.file, .{
+            try diff_render.renderFile(&content, bundle.displayFile(), .{
                 .requested_mode = app.page.viewer.display_mode,
                 .scroll = app.page.viewer.diff_scroll,
                 .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
@@ -690,8 +690,8 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .line_numbers = app.page.viewer.view_options.line_numbers,
                 .highlighted_hunk = app.selectedHunkIndex(),
                 .cursor_offset = app.visibleDiffCursorOffset(),
-                .line_index = bundle.projection.lineIndex(diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
-                .hunk_stages = try review_navigation.projectedHunkStagePresentation(surface.frameAllocator(), bundle.projection.hunk_stage_states),
+                .line_index = bundle.displayLineIndex(diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
+                .hunk_stages = try review_navigation.projectedHunkStagePresentation(surface.frameAllocator(), bundle.hunkStageStates()),
                 .palette = app.theme,
                 .syntax = bundle.syntaxView(),
                 .selection = app.diffSelectionView(),

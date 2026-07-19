@@ -632,23 +632,23 @@ test "same A C component pair stays equal when B partition and origins change" {
     const before = try hunk_projection.build(allocator, before_cached.files[0], before_unstaged.files[0]);
     const after = try hunk_projection.build(allocator, after_cached.files[0], after_unstaged.files[0]);
 
-    try std.testing.expect(!std.mem.eql(u8, before.file.metadata[0], after.file.metadata[0]));
-    try std.testing.expect(before.hunk_stage_states[1] != after.hunk_stage_states[1]);
-    try std.testing.expect(exactEqual(before.file, after.file));
-    try std.testing.expect(fingerprint(before.file).eql(fingerprint(after.file)));
+    try std.testing.expect(!std.mem.eql(u8, before.presentation.file.metadata[0], after.presentation.file.metadata[0]));
+    try std.testing.expect(before.authority.hunk_stage_states[1] != after.authority.hunk_stage_states[1]);
+    try std.testing.expect(exactEqual(before.presentation.file, after.presentation.file));
+    try std.testing.expect(fingerprint(before.presentation.file).eql(fingerprint(after.presentation.file)));
 
-    var changed = after.file;
+    var changed = after.presentation.file;
     changed.metadata = &.{ "old mode 100644", "new mode 100755" };
-    try expectMutationUnequal(before.file, changed);
-    changed = after.file;
+    try expectMutationUnequal(before.presentation.file, changed);
+    changed = after.presentation.file;
     changed.new_path = "b/src/other.zig";
-    try expectMutationUnequal(before.file, changed);
+    try expectMutationUnequal(before.presentation.file, changed);
 
-    var changed_hunks = try allocator.dupe(diff_parser.Hunk, after.file.hunks);
+    var changed_hunks = try allocator.dupe(diff_parser.Hunk, after.presentation.file.hunks);
     var changed_lines = try allocator.dupe(diff_parser.DiffLine, changed_hunks[0].lines);
     changed_lines[0].text = "changed rendered text";
     changed_hunks[0].lines = changed_lines;
-    changed = after.file;
+    changed = after.presentation.file;
     changed.hunks = changed_hunks;
-    try expectMutationUnequal(before.file, changed);
+    try expectMutationUnequal(before.presentation.file, changed);
 }

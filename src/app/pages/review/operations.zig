@@ -418,8 +418,9 @@ pub const View = struct {
         if (self.currentCombinedProjection()) |bundle| {
             if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
             const projected_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
-            if (projected_index >= bundle.projection.hunk_stage_states.len) return .no_hunk;
-            return switch (bundle.projection.hunk_stage_states[projected_index]) {
+            const stage_states = bundle.hunkStageStates();
+            if (projected_index >= stage_states.len) return .no_hunk;
+            return switch (stage_states[projected_index]) {
                 .unstaged => if (can_stage) .{ .operation = .stage } else .unavailable_source,
                 .staged => if (can_unstage) .{ .operation = .unstage } else .unavailable_source,
             };
@@ -536,20 +537,19 @@ pub const View = struct {
         repo_root: []const u8,
         bundle: *const review_projection.CombinedHunkBundle,
     ) HunkStageTargetResult {
-        const path = diff_file.canonicalPathKey(bundle.projection.file) orelse return .no_path;
+        const path = diff_file.canonicalPathKey(bundle.displayFile()) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
         const projected_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
-        if (projected_index >= bundle.projection.hunk_stage_states.len or
-            projected_index >= bundle.projection.hunk_action_origins.len) return .no_hunk;
-        if (bundle.projection.hunk_stage_states[projected_index] == .staged) return .already_staged_hunk;
-        const origin_index = switch (bundle.projection.hunk_action_origins[projected_index]) {
+        const stage_states = bundle.hunkStageStates();
+        const action_origins = bundle.hunkActionOrigins();
+        if (projected_index >= stage_states.len or projected_index >= action_origins.len) return .no_hunk;
+        if (stage_states[projected_index] == .staged) return .already_staged_hunk;
+        const origin = action_origins[projected_index];
+        const origin_index = switch (origin) {
             .unstaged => |index| index,
             .cached => return .no_hunk,
         };
-        const file = if (bundle.unstaged_bundle.loaded.document.files.len > 0)
-            bundle.unstaged_bundle.loaded.document.files[0]
-        else
-            return .no_file;
+        const file = bundle.actionSourceFile(origin) orelse return .no_file;
         if (origin_index >= file.hunks.len) return .no_hunk;
         const patch = diff_patch.formatSingleHunkPatch(allocator, file, origin_index) catch |err| switch (err) {
             error.BinaryFile => return .binary_unsupported,
@@ -573,20 +573,19 @@ pub const View = struct {
         repo_root: []const u8,
         bundle: *const review_projection.CombinedHunkBundle,
     ) HunkUnstageTargetResult {
-        const path = diff_file.canonicalPathKey(bundle.projection.file) orelse return .no_path;
+        const path = diff_file.canonicalPathKey(bundle.displayFile()) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
         const projected_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
-        if (projected_index >= bundle.projection.hunk_stage_states.len or
-            projected_index >= bundle.projection.hunk_action_origins.len) return .no_hunk;
-        if (bundle.projection.hunk_stage_states[projected_index] == .unstaged) return .not_staged_hunk;
-        const origin_index = switch (bundle.projection.hunk_action_origins[projected_index]) {
+        const stage_states = bundle.hunkStageStates();
+        const action_origins = bundle.hunkActionOrigins();
+        if (projected_index >= stage_states.len or projected_index >= action_origins.len) return .no_hunk;
+        if (stage_states[projected_index] == .unstaged) return .not_staged_hunk;
+        const origin = action_origins[projected_index];
+        const origin_index = switch (origin) {
             .cached => |index| index,
             .unstaged => return .no_hunk,
         };
-        const file = if (bundle.cached_bundle.loaded.document.files.len > 0)
-            bundle.cached_bundle.loaded.document.files[0]
-        else
-            return .no_file;
+        const file = bundle.actionSourceFile(origin) orelse return .no_file;
         if (origin_index >= file.hunks.len) return .no_hunk;
         const patch = diff_patch.formatSingleHunkPatch(allocator, file, origin_index) catch |err| switch (err) {
             error.BinaryFile => return .binary_unsupported,
@@ -609,6 +608,7 @@ pub const View = struct {
         const bundle = self.navigation.activeCombinedProjection() orelse return null;
         const request = self.page.review_projection.displayed.request() orelse return null;
         if (request.kind != .combined_hunks or request.status_snapshot_revision != self.page.status_snapshot_revision) return null;
+        if (bundle.authority.status_snapshot_revision != self.page.status_snapshot_revision) return null;
         return bundle;
     }
 

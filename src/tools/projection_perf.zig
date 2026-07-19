@@ -267,7 +267,7 @@ fn profileComponentPairOnce(
         try singleFile(before_cached),
         try singleFile(before_unstaged),
     );
-    const before_fingerprint = presentation_identity.fingerprint(before_projection.file);
+    const before_fingerprint = presentation_identity.fingerprint(before_projection.presentation.file);
 
     var reuse_timer = Stopwatch.start(io);
     var timer = Stopwatch.start(io);
@@ -283,27 +283,27 @@ fn profileComponentPairOnce(
     );
     sample[@intFromEnum(PairPhase.normalized_projection)] = timer.read();
 
-    if (metadataEqual(before_projection.file.metadata, after_projection.file.metadata)) {
+    if (metadataEqual(before_projection.presentation.file.metadata, after_projection.presentation.file.metadata)) {
         return error.ComponentPairMetadataDidNotChange;
     }
     if (hunkAuthorityEqual(
-        before_projection.hunk_stage_states,
-        before_projection.hunk_action_origins,
-        after_projection.hunk_stage_states,
-        after_projection.hunk_action_origins,
+        before_projection.authority.hunk_stage_states,
+        before_projection.authority.hunk_action_origins,
+        after_projection.authority.hunk_stage_states,
+        after_projection.authority.hunk_action_origins,
     )) {
         return error.ComponentPairAuthorityDidNotChange;
     }
 
     timer = Stopwatch.start(io);
-    const after_fingerprint = presentation_identity.fingerprint(after_projection.file);
+    const after_fingerprint = presentation_identity.fingerprint(after_projection.presentation.file);
     sample[@intFromEnum(PairPhase.presentation_fingerprint)] = timer.read();
     if (!before_fingerprint.eql(after_fingerprint)) {
         return error.ComponentPairFingerprintMismatch;
     }
 
     timer = Stopwatch.start(io);
-    const equal = presentation_identity.exactEqual(before_projection.file, after_projection.file);
+    const equal = presentation_identity.exactEqual(before_projection.presentation.file, after_projection.presentation.file);
     sample[@intFromEnum(PairPhase.presentation_equality)] = timer.read();
     if (!equal) return error.ComponentPairPresentationMismatch;
     sample[@intFromEnum(PairPhase.exact_reuse_construction)] = reuse_timer.read();
@@ -319,10 +319,10 @@ fn profileComponentPairOnce(
         .before_unstaged_hunks = before_unstaged.totalHunks(),
         .after_cached_hunks = after_cached.totalHunks(),
         .after_unstaged_hunks = after_unstaged.totalHunks(),
-        .projected_hunks = after_projection.file.hunks.len,
+        .projected_hunks = after_projection.presentation.file.hunks.len,
     };
     for (after_fingerprint.digest) |byte| checksum.* +%= byte;
-    checksum.* +%= after_projection.file.hunks.len;
+    checksum.* +%= after_projection.presentation.file.hunks.len;
     return sample;
 }
 
