@@ -13410,7 +13410,7 @@ test "active diff display uses ready combined projection by identity" {
     const bundle = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
     switch (display.syntaxView()) {
         .combined => |syntax| {
-            try std.testing.expect(syntax.hunk_states.ptr == bundle.projection.hunk_states.ptr);
+            try std.testing.expect(syntax.origins.ptr == bundle.projection.presentation_syntax_origins.ptr);
             try std.testing.expect(syntax.cached == &bundle.cached_bundle.loaded.syntax_spans);
             try std.testing.expect(syntax.unstaged == &bundle.unstaged_bundle.loaded.syntax_spans);
         },
@@ -14293,6 +14293,20 @@ test "projected hunk actions route through original cached and unstaged origins"
     switch (app.reviewOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
         .not_staged_hunk => {},
         else => return error.ExpectedNotStagedProjectedHunk,
+    }
+
+    // Stage chrome and patch authority are separate contracts. A corrupt or
+    // cross-generation-mismatched action origin must fail closed without
+    // changing the fresh stage-state decision shown by the toggle UI.
+    const live = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
+    @constCast(live.projection.hunk_action_origins)[1] = .{ .cached = 0 };
+    switch (app.reviewOperations().selectedHunkToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
+        else => return error.ExpectedProjectedToggleStage,
+    }
+    switch (app.reviewOperations().selectedHunkStageTarget(std.testing.allocator)) {
+        .no_hunk => {},
+        else => return error.ExpectedMismatchedActionOriginToFailClosed,
     }
 }
 

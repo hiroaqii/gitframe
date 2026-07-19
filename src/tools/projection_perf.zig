@@ -286,7 +286,12 @@ fn profileComponentPairOnce(
     if (metadataEqual(before_projection.file.metadata, after_projection.file.metadata)) {
         return error.ComponentPairMetadataDidNotChange;
     }
-    if (projectedStatesEqual(before_projection.hunk_states, after_projection.hunk_states)) {
+    if (hunkAuthorityEqual(
+        before_projection.hunk_stage_states,
+        before_projection.hunk_action_origins,
+        after_projection.hunk_stage_states,
+        after_projection.hunk_action_origins,
+    )) {
         return error.ComponentPairAuthorityDidNotChange;
     }
 
@@ -375,18 +380,20 @@ fn metadataEqual(lhs: []const []const u8, rhs: []const []const u8) bool {
     return true;
 }
 
-fn projectedStatesEqual(
-    lhs: []const diff_hunk_projection.ProjectedHunkState,
-    rhs: []const diff_hunk_projection.ProjectedHunkState,
+fn hunkAuthorityEqual(
+    lhs_states: []const diff_hunk_projection.HunkStageState,
+    lhs_origins: []const diff_hunk_projection.HunkActionOrigin,
+    rhs_states: []const diff_hunk_projection.HunkStageState,
+    rhs_origins: []const diff_hunk_projection.HunkActionOrigin,
 ) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |left, right| {
-        if (left.state != right.state or !hunkOriginEqual(left.origin, right.origin)) return false;
+    if (lhs_states.len != rhs_states.len or lhs_origins.len != rhs_origins.len or lhs_states.len != lhs_origins.len) return false;
+    for (lhs_states, lhs_origins, rhs_states, rhs_origins) |left_state, left_origin, right_state, right_origin| {
+        if (left_state != right_state or !hunkActionOriginEqual(left_origin, right_origin)) return false;
     }
     return true;
 }
 
-fn hunkOriginEqual(lhs: diff_hunk_projection.HunkOrigin, rhs: diff_hunk_projection.HunkOrigin) bool {
+fn hunkActionOriginEqual(lhs: diff_hunk_projection.HunkActionOrigin, rhs: diff_hunk_projection.HunkActionOrigin) bool {
     return switch (lhs) {
         .cached => |index| switch (rhs) {
             .cached => |other| index == other,

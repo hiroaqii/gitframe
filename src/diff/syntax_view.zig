@@ -28,7 +28,7 @@ pub const View = union(enum) {
     };
 
     pub const Combined = struct {
-        hunk_states: []const hunk_projection.ProjectedHunkState,
+        origins: []const hunk_projection.PresentationSyntaxOrigin,
         cached: *const syntax_provider.DocumentSpans,
         unstaged: *const syntax_provider.DocumentSpans,
     };
@@ -41,12 +41,12 @@ pub const View = union(enum) {
     }
 
     pub fn initCombined(
-        hunk_states: []const hunk_projection.ProjectedHunkState,
+        origins: []const hunk_projection.PresentationSyntaxOrigin,
         cached: *const syntax_provider.DocumentSpans,
         unstaged: *const syntax_provider.DocumentSpans,
     ) View {
         return .{ .combined = .{
-            .hunk_states = hunk_states,
+            .origins = origins,
             .cached = cached,
             .unstaged = unstaged,
         } };
@@ -85,9 +85,9 @@ pub const View = union(enum) {
     fn resolveHunk(self: View, projected_hunk_index: usize) ?ResolvedHunk {
         return switch (self) {
             .direct => |direct| resolveDocumentHunk(direct.document, direct.file_index, projected_hunk_index),
-            .combined => |combined| if (projected_hunk_index >= combined.hunk_states.len)
+            .combined => |combined| if (projected_hunk_index >= combined.origins.len)
                 null
-            else switch (combined.hunk_states[projected_hunk_index].origin) {
+            else switch (combined.origins[projected_hunk_index]) {
                 .cached => |original_hunk_index| resolveDocumentHunk(combined.cached, 0, original_hunk_index),
                 .unstaged => |original_hunk_index| resolveDocumentHunk(combined.unstaged, 0, original_hunk_index),
             },
@@ -140,11 +140,26 @@ test "combined syntax view resolves reordered hunks by component origin" {
     var unstaged_files = [_]syntax_provider.FileSpans{.{ .hunks = &unstaged_hunks }};
     const unstaged: syntax_provider.DocumentSpans = .{ .files = &unstaged_files };
 
-    const states = [_]hunk_projection.ProjectedHunkState{
-        .{ .state = .unstaged, .origin = .{ .unstaged = 1 } },
-        .{ .state = .staged, .origin = .{ .cached = 0 } },
+    const origins = [_]hunk_projection.PresentationSyntaxOrigin{
+        .{ .unstaged = 1 },
+        .{ .cached = 0 },
     };
-    const view = View.initCombined(&states, &cached, &unstaged);
+    // Fresh action authority is intentionally different. If syntax lookup is
+    // ever rewired to that map, the role assertions below resolve the wrong
+    // component and ordinal instead of merely producing an equivalent span.
+    const action_origins = [_]hunk_projection.HunkActionOrigin{
+        .{ .cached = 0 },
+        .{ .unstaged = 0 },
+    };
+    try std.testing.expect(switch (origins[0]) {
+        .unstaged => true,
+        .cached => false,
+    });
+    try std.testing.expect(switch (action_origins[0]) {
+        .cached => true,
+        .unstaged => false,
+    });
+    const view = View.initCombined(&origins, &cached, &unstaged);
 
     try expectOnlyRole(.string, view.lineSpans(.{ .hunk_index = 0, .line_index = 0, .side = .new }));
     try expectOnlyRole(.property, view.lineSpans(.{ .hunk_index = 0, .line_index = 1, .side = .new }));
@@ -165,11 +180,8 @@ test "combined syntax view fails closed without component or ordinal fallback" {
     var unstaged_files = [_]syntax_provider.FileSpans{.{ .hunks = &unstaged_hunks }};
     const unstaged: syntax_provider.DocumentSpans = .{ .files = &unstaged_files };
     const cached = syntax_provider.DocumentSpans.empty();
-    const states = [_]hunk_projection.ProjectedHunkState{.{
-        .state = .staged,
-        .origin = .{ .cached = 0 },
-    }};
-    const view = View.initCombined(&states, &cached, &unstaged);
+    const origins = [_]hunk_projection.PresentationSyntaxOrigin{.{ .cached = 0 }};
+    const view = View.initCombined(&origins, &cached, &unstaged);
 
     try expectEmpty(view.lineSpans(.{ .hunk_index = 0, .line_index = 0, .side = .new }));
     try expectEmpty(view.lineSpans(.{ .hunk_index = 1, .line_index = 0, .side = .new }));
@@ -182,11 +194,11 @@ test "combined syntax view returns empty spans for invalid original line and hun
     var hunks = [_]syntax_provider.HunkSpans{.{ .lines = &lines }};
     var files = [_]syntax_provider.FileSpans{.{ .hunks = &hunks }};
     const document: syntax_provider.DocumentSpans = .{ .files = &files };
-    const states = [_]hunk_projection.ProjectedHunkState{
-        .{ .state = .unstaged, .origin = .{ .unstaged = 0 } },
-        .{ .state = .staged, .origin = .{ .cached = 9 } },
+    const origins = [_]hunk_projection.PresentationSyntaxOrigin{
+        .{ .unstaged = 0 },
+        .{ .cached = 9 },
     };
-    const view = View.initCombined(&states, &document, &document);
+    const view = View.initCombined(&origins, &document, &document);
 
     try expectEmpty(view.lineSpans(.{ .hunk_index = 0, .line_index = 8, .side = .new }));
     try expectEmpty(view.lineSpans(.{ .hunk_index = 1, .line_index = 0, .side = .new }));
@@ -227,11 +239,8 @@ test "direct and combined syntax views keep provider-empty documents plain" {
     try expectEmpty(direct.lineSpans(.{ .hunk_index = 0, .line_index = 0, .side = .new }));
     try std.testing.expect(!direct.hunkSideHasVisibleSyntax(0, .new));
 
-    const states = [_]hunk_projection.ProjectedHunkState{.{
-        .state = .unstaged,
-        .origin = .{ .unstaged = 0 },
-    }};
-    const combined = View.initCombined(&states, &empty, &empty);
+    const origins = [_]hunk_projection.PresentationSyntaxOrigin{.{ .unstaged = 0 }};
+    const combined = View.initCombined(&origins, &empty, &empty);
     try expectEmpty(combined.lineSpans(.{ .hunk_index = 0, .line_index = 0, .side = .new }));
     try std.testing.expect(!combined.hunkSideHasVisibleSyntax(0, .new));
 }

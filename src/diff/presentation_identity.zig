@@ -633,7 +633,7 @@ test "same A C component pair stays equal when B partition and origins change" {
     const after = try hunk_projection.build(allocator, after_cached.files[0], after_unstaged.files[0]);
 
     try std.testing.expect(!std.mem.eql(u8, before.file.metadata[0], after.file.metadata[0]));
-    try std.testing.expect(before.hunk_states[1].state != after.hunk_states[1].state);
+    try std.testing.expect(before.hunk_stage_states[1] != after.hunk_stage_states[1]);
     try std.testing.expect(exactEqual(before.file, after.file));
     try std.testing.expect(fingerprint(before.file).eql(fingerprint(after.file)));
 

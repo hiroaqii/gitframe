@@ -157,7 +157,7 @@ pub const CombinedHunkBundle = struct {
     /// call. The returned view has no cleanup and must not outlive `self`.
     pub fn syntaxView(self: *const CombinedHunkBundle) diff_syntax_view.View {
         return .initCombined(
-            self.projection.hunk_states,
+            self.projection.presentation_syntax_origins,
             &self.cached_bundle.loaded.syntax_spans,
             &self.unstaged_bundle.loaded.syntax_spans,
         );

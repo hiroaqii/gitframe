@@ -1840,11 +1840,11 @@ test "renderFile resolves reordered combined syntax in unified and side-by-side 
     try putOwnedTestSpan(allocator, &unstaged, .{ .file_index = 0, .hunk_index = 1, .line_index = 0, .side = .old }, .type);
     try putOwnedTestSpan(allocator, &unstaged, .{ .file_index = 0, .hunk_index = 1, .line_index = 1, .side = .new }, .number);
 
-    const hunk_states = [_]diff_hunk_projection.ProjectedHunkState{
-        .{ .state = .unstaged, .origin = .{ .unstaged = 1 } },
-        .{ .state = .staged, .origin = .{ .cached = 0 } },
+    const syntax_origins = [_]diff_hunk_projection.PresentationSyntaxOrigin{
+        .{ .unstaged = 1 },
+        .{ .cached = 0 },
     };
-    const syntax = diff_syntax_view.View.initCombined(&hunk_states, &cached, &unstaged);
+    const syntax = diff_syntax_view.View.initCombined(&syntax_origins, &cached, &unstaged);
     var palette: theme.Palette = .default();
     palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
     palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 4, 5, 6 } };

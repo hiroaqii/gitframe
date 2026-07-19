@@ -139,12 +139,12 @@ pub const ActiveDiffDisplay = union(enum) {
 /// conversion so they cannot disagree about a combined hunk's stage state.
 pub fn projectedHunkStagePresentation(
     allocator: std.mem.Allocator,
-    states: []const diff_hunk_projection.ProjectedHunkState,
+    states: []const diff_hunk_projection.HunkStageState,
 ) !diff_render.HunkStagePresentation {
     if (states.len == 0) return .{ .per_hunk = &.{} };
     const presentation = try allocator.alloc(diff_render.HunkStageState, states.len);
     for (states, presentation) |state, *item| {
-        item.* = if (state.state == .staged) .staged else .unstaged;
+        item.* = if (state == .staged) .staged else .unstaged;
     }
     return .{ .per_hunk = presentation };
 }
@@ -792,7 +792,7 @@ pub const View = struct {
                 return .{ .combined_projection = .{
                     .file = bundle.projection.file,
                     .line_index = bundle.projection.lineIndex(mode),
-                    .hunk_stages = try projectedHunkStagePresentation(allocator, bundle.projection.hunk_states),
+                    .hunk_stages = try projectedHunkStagePresentation(allocator, bundle.projection.hunk_stage_states),
                     .syntax = bundle.syntaxView(),
                 } };
             },

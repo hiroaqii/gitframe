@@ -691,7 +691,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .highlighted_hunk = app.selectedHunkIndex(),
                 .cursor_offset = app.visibleDiffCursorOffset(),
                 .line_index = bundle.projection.lineIndex(diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
-                .hunk_stages = try review_navigation.projectedHunkStagePresentation(surface.frameAllocator(), bundle.projection.hunk_states),
+                .hunk_stages = try review_navigation.projectedHunkStagePresentation(surface.frameAllocator(), bundle.projection.hunk_stage_states),
                 .palette = app.theme,
                 .syntax = bundle.syntaxView(),
                 .selection = app.diffSelectionView(),

@@ -8,19 +8,25 @@ pub const HunkStageState = enum {
     unstaged,
 };
 
-pub const HunkOrigin = union(enum) {
+/// Maps a displayed hunk to syntax spans owned by the presentation generation.
+/// This type must never be used to construct the next Git patch.
+pub const PresentationSyntaxOrigin = union(enum) {
     cached: usize,
     unstaged: usize,
 };
 
-pub const ProjectedHunkState = struct {
-    state: HunkStageState,
-    origin: HunkOrigin,
+/// Maps a displayed hunk to the fresh component hunk which authorizes the next
+/// stage/unstage patch. This type must never index retained syntax owners.
+pub const HunkActionOrigin = union(enum) {
+    cached: usize,
+    unstaged: usize,
 };
 
 pub const Projection = struct {
     file: diff_parser.FileDiff,
-    hunk_states: []const ProjectedHunkState,
+    hunk_stage_states: []const HunkStageState,
+    presentation_syntax_origins: []const PresentationSyntaxOrigin,
+    hunk_action_origins: []const HunkActionOrigin,
     unified_line_index: diff_view_model.RenderedLineIndex,
     side_by_side_line_index: diff_view_model.RenderedLineIndex,
 
@@ -94,8 +100,12 @@ pub fn build(
 
     const hunks = try allocator.alloc(diff_parser.Hunk, candidates.items.len);
     errdefer allocator.free(hunks);
-    const states = try allocator.alloc(ProjectedHunkState, candidates.items.len);
-    errdefer allocator.free(states);
+    const stage_states = try allocator.alloc(HunkStageState, candidates.items.len);
+    errdefer allocator.free(stage_states);
+    const syntax_origins = try allocator.alloc(PresentationSyntaxOrigin, candidates.items.len);
+    errdefer allocator.free(syntax_origins);
+    const action_origins = try allocator.alloc(HunkActionOrigin, candidates.items.len);
+    errdefer allocator.free(action_origins);
 
     var initialized_hunks: usize = 0;
     errdefer for (hunks[0..initialized_hunks]) |hunk| allocator.free(hunk.lines);
@@ -103,7 +113,9 @@ pub fn build(
     // Projected hunk and line values belong to the projection allocator because
     // their coordinates are normalized from HEAD directly to the working tree.
     // Text and section slices remain borrowed from the retained component
-    // bundles; HunkOrigin remains the authority for later stage operations.
+    // bundles. Syntax and action origins are deliberately separate arrays even
+    // in this same-generation eager result, so future presentation retention
+    // cannot accidentally use fresh patch authority for syntax lookup.
     for (candidates.items, 0..) |candidate, index| {
         hunks[index] = try normalizeCandidateHunk(
             allocator,
@@ -112,10 +124,18 @@ pub fn build(
             unstaged_transform,
         );
         initialized_hunks += 1;
-        states[index] = switch (candidate.source) {
-            .cached => .{ .state = .staged, .origin = .{ .cached = candidate.hunk_index } },
-            .unstaged => .{ .state = .unstaged, .origin = .{ .unstaged = candidate.hunk_index } },
-        };
+        switch (candidate.source) {
+            .cached => {
+                stage_states[index] = .staged;
+                syntax_origins[index] = .{ .cached = candidate.hunk_index };
+                action_origins[index] = .{ .cached = candidate.hunk_index };
+            },
+            .unstaged => {
+                stage_states[index] = .unstaged;
+                syntax_origins[index] = .{ .unstaged = candidate.hunk_index };
+                action_origins[index] = .{ .unstaged = candidate.hunk_index };
+            },
+        }
     }
 
     const file: diff_parser.FileDiff = .{
@@ -133,7 +153,9 @@ pub fn build(
 
     return .{
         .file = file,
-        .hunk_states = states,
+        .hunk_stage_states = stage_states,
+        .presentation_syntax_origins = syntax_origins,
+        .hunk_action_origins = action_origins,
         .unified_line_index = unified_line_index,
         .side_by_side_line_index = side_by_side_line_index,
     };
@@ -1030,8 +1052,12 @@ test "hunk projection orders cached new-side and unstaged old-side coordinates" 
 
     const projection = try build(projection_arena.allocator(), cached, unstaged);
     try std.testing.expectEqual(@as(usize, 2), projection.file.hunks.len);
-    try std.testing.expectEqual(HunkStageState.staged, projection.hunk_states[0].state);
-    try std.testing.expectEqual(HunkStageState.unstaged, projection.hunk_states[1].state);
+    try std.testing.expectEqual(HunkStageState.staged, projection.hunk_stage_states[0]);
+    try std.testing.expectEqual(HunkStageState.unstaged, projection.hunk_stage_states[1]);
+    try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .cached = 0 }, projection.presentation_syntax_origins[0]);
+    try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .unstaged = 0 }, projection.presentation_syntax_origins[1]);
+    try std.testing.expectEqualDeep(HunkActionOrigin{ .cached = 0 }, projection.hunk_action_origins[0]);
+    try std.testing.expectEqualDeep(HunkActionOrigin{ .unstaged = 0 }, projection.hunk_action_origins[1]);
 }
 
 test "hunk projection keeps later HEAD and worktree coordinates stable across staged partition" {
@@ -1097,8 +1123,10 @@ test "hunk projection keeps later HEAD and worktree coordinates stable across st
         try expectRenderedHunkHeader(projection, .side_by_side, 1, 20, 21);
     }
 
-    try std.testing.expectEqualDeep(HunkOrigin{ .unstaged = 0 }, first.hunk_states[1].origin);
-    try std.testing.expectEqualDeep(HunkOrigin{ .cached = 0 }, second.hunk_states[1].origin);
+    try std.testing.expectEqualDeep(HunkActionOrigin{ .unstaged = 0 }, first.hunk_action_origins[1]);
+    try std.testing.expectEqualDeep(HunkActionOrigin{ .cached = 0 }, second.hunk_action_origins[1]);
+    try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .unstaged = 0 }, first.presentation_syntax_origins[1]);
+    try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .cached = 0 }, second.presentation_syntax_origins[1]);
     try std.testing.expect(first.file.hunks[1].lines.ptr != first_unstaged.hunks[0].lines.ptr);
     try std.testing.expect(first.file.hunks[1].lines[0].text.ptr == first_unstaged.hunks[0].lines[0].text.ptr);
 }
@@ -1166,8 +1194,8 @@ test "hunk projection keeps later coordinates stable across cached and unstaged 
         try expectRenderedHunkHeader(projection, .side_by_side, 1, 20, 19);
     }
 
-    try std.testing.expectEqualDeep(HunkOrigin{ .unstaged = 0 }, first.hunk_states[1].origin);
-    try std.testing.expectEqualDeep(HunkOrigin{ .cached = 0 }, second.hunk_states[1].origin);
+    try std.testing.expectEqualDeep(HunkActionOrigin{ .unstaged = 0 }, first.hunk_action_origins[1]);
+    try std.testing.expectEqualDeep(HunkActionOrigin{ .cached = 0 }, second.hunk_action_origins[1]);
 }
 
 test "hunk projection normalizes zero-count headers after non-zero prior deltas" {
@@ -1390,8 +1418,8 @@ test "hunk projection combines context-overlapping changed-range-disjoint hunks"
 
     const projection = try build(projection_arena.allocator(), cached, unstaged);
     try std.testing.expectEqual(@as(usize, 2), projection.file.hunks.len);
-    try std.testing.expectEqual(HunkStageState.staged, projection.hunk_states[0].state);
-    try std.testing.expectEqual(HunkStageState.unstaged, projection.hunk_states[1].state);
+    try std.testing.expectEqual(HunkStageState.staged, projection.hunk_stage_states[0]);
+    try std.testing.expectEqual(HunkStageState.unstaged, projection.hunk_stage_states[1]);
 }
 
 test "hunk projection rejects copied context that crosses another component edit" {

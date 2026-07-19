@@ -418,10 +418,10 @@ pub const View = struct {
         if (self.currentCombinedProjection()) |bundle| {
             if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
             const projected_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
-            if (projected_index >= bundle.projection.hunk_states.len) return .no_hunk;
-            return switch (bundle.projection.hunk_states[projected_index].origin) {
+            if (projected_index >= bundle.projection.hunk_stage_states.len) return .no_hunk;
+            return switch (bundle.projection.hunk_stage_states[projected_index]) {
                 .unstaged => if (can_stage) .{ .operation = .stage } else .unavailable_source,
-                .cached => if (can_unstage) .{ .operation = .unstage } else .unavailable_source,
+                .staged => if (can_unstage) .{ .operation = .unstage } else .unavailable_source,
             };
         }
         if (self.navigation.activeCombinedProjection() != null) return .stale_status;
@@ -539,11 +539,12 @@ pub const View = struct {
         const path = diff_file.canonicalPathKey(bundle.projection.file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
         const projected_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
-        if (projected_index >= bundle.projection.hunk_states.len) return .no_hunk;
-        const state = bundle.projection.hunk_states[projected_index];
-        const origin_index = switch (state.origin) {
+        if (projected_index >= bundle.projection.hunk_stage_states.len or
+            projected_index >= bundle.projection.hunk_action_origins.len) return .no_hunk;
+        if (bundle.projection.hunk_stage_states[projected_index] == .staged) return .already_staged_hunk;
+        const origin_index = switch (bundle.projection.hunk_action_origins[projected_index]) {
             .unstaged => |index| index,
-            .cached => return .already_staged_hunk,
+            .cached => return .no_hunk,
         };
         const file = if (bundle.unstaged_bundle.loaded.document.files.len > 0)
             bundle.unstaged_bundle.loaded.document.files[0]
@@ -575,11 +576,12 @@ pub const View = struct {
         const path = diff_file.canonicalPathKey(bundle.projection.file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
         const projected_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
-        if (projected_index >= bundle.projection.hunk_states.len) return .no_hunk;
-        const state = bundle.projection.hunk_states[projected_index];
-        const origin_index = switch (state.origin) {
+        if (projected_index >= bundle.projection.hunk_stage_states.len or
+            projected_index >= bundle.projection.hunk_action_origins.len) return .no_hunk;
+        if (bundle.projection.hunk_stage_states[projected_index] == .unstaged) return .not_staged_hunk;
+        const origin_index = switch (bundle.projection.hunk_action_origins[projected_index]) {
             .cached => |index| index,
-            .unstaged => return .not_staged_hunk,
+            .unstaged => return .no_hunk,
         };
         const file = if (bundle.cached_bundle.loaded.document.files.len > 0)
             bundle.cached_bundle.loaded.document.files[0]
