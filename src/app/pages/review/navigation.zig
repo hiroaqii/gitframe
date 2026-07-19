@@ -28,6 +28,7 @@ const diff_render = @import("../../../diff/render.zig");
 const diff_search = @import("../../../diff/search.zig");
 const diff_selection = @import("../../../diff/selection.zig");
 const diff_source = @import("../../../diff/source.zig");
+const diff_syntax_view = @import("../../../diff/syntax_view.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
 const file_tree = @import("../../../file_tree.zig");
 const git_status = @import("../../../git/status.zig");
@@ -84,17 +85,17 @@ pub const DisplayNavigationSnapshot = struct {
 
 pub const ActiveDiffDisplay = union(enum) {
     loaded: struct {
-        file_index: usize,
         file: diff_parser.FileDiff,
         line_index: ?diff_view_model.RenderedLineIndex,
         folded_hunks: []const bool,
         staged_flags: []const bool,
+        syntax: diff_syntax_view.View,
     },
     combined_projection: struct {
         file: diff_parser.FileDiff,
         line_index: diff_view_model.RenderedLineIndex,
         staged_flags: []const bool,
-        hunk_states: []const diff_hunk_projection.ProjectedHunkState,
+        syntax: diff_syntax_view.View,
     },
 
     pub fn file(self: ActiveDiffDisplay) diff_parser.FileDiff {
@@ -125,10 +126,10 @@ pub const ActiveDiffDisplay = union(enum) {
         };
     }
 
-    pub fn loadedFileIndex(self: ActiveDiffDisplay) ?usize {
+    pub fn syntaxView(self: ActiveDiffDisplay) diff_syntax_view.View {
         return switch (self) {
-            .loaded => |loaded| loaded.file_index,
-            .combined_projection => null,
+            .loaded => |loaded| loaded.syntax,
+            .combined_projection => |projection| projection.syntax,
         };
     }
 };
@@ -780,7 +781,7 @@ pub const View = struct {
                     .file = bundle.projection.file,
                     .line_index = bundle.projection.lineIndex(mode),
                     .staged_flags = flags,
-                    .hunk_states = states,
+                    .syntax = bundle.syntaxView(),
                 } };
             },
             .cached => |bundle| .{ .loaded = &bundle.loaded, .file_index = 0 },
@@ -791,11 +792,11 @@ pub const View = struct {
         const file_index = selected.file_index;
         const file = loaded.document.files[file_index];
         return .{ .loaded = .{
-            .file_index = file_index,
             .file = file,
             .line_index = loaded.cachedRenderedLineIndex(file_index, mode),
             .folded_hunks = loaded.foldedHunksForFile(file_index),
             .staged_flags = try self.stagedHunkFlagsForFile(allocator, file),
+            .syntax = .initDirect(&loaded.syntax_spans, file_index),
         } };
     }
 

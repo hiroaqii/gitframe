@@ -609,8 +609,7 @@ pub fn viewDiffPane(app: Context, surface: *chasen.Surface, loaded: loaded_diff.
         .line_index = display.lineIndex(),
         .folded_hunks = display.foldedHunks(),
         .palette = app.theme,
-        .file_index = display.loadedFileIndex() orelse 0,
-        .syntax_spans = if (display.loadedFileIndex() != null) loaded.syntax_spans else .empty(),
+        .syntax = display.syntaxView(),
         .selection = app.diffSelectionView(),
         .header_selection = app.diffHeaderSelectionActive(),
     });
@@ -674,8 +673,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .cursor_offset = app.visibleDiffCursorOffset(),
                 .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
                 .palette = app.theme,
-                .file_index = 0,
-                .syntax_spans = bundle.loaded.syntax_spans,
+                .syntax = .initDirect(&bundle.loaded.syntax_spans, 0),
                 .selection = app.diffSelectionView(),
                 .header_selection = app.diffHeaderSelectionActive(),
             });
@@ -696,6 +694,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .line_index = bundle.projection.lineIndex(diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
                 .staged_hunks = flags,
                 .palette = app.theme,
+                .syntax = bundle.syntaxView(),
                 .selection = app.diffSelectionView(),
                 .header_selection = app.diffHeaderSelectionActive(),
             });

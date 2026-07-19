@@ -13406,6 +13406,15 @@ test "active diff display uses ready combined projection by identity" {
     try std.testing.expectEqual(@as(usize, 2), display.combined_projection.staged_flags.len);
     try std.testing.expect(display.combined_projection.staged_flags[0]);
     try std.testing.expect(!display.combined_projection.staged_flags[1]);
+    const bundle = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
+    switch (display.syntaxView()) {
+        .combined => |syntax| {
+            try std.testing.expect(syntax.hunk_states.ptr == bundle.projection.hunk_states.ptr);
+            try std.testing.expect(syntax.cached == &bundle.cached_bundle.loaded.syntax_spans);
+            try std.testing.expect(syntax.unstaged == &bundle.unstaged_bundle.loaded.syntax_spans);
+        },
+        .direct => return error.ExpectedCombinedSyntaxView,
+    }
 }
 
 test "background status refresh retains combined projection while cursor moves" {

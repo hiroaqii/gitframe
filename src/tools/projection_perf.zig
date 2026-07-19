@@ -189,7 +189,7 @@ fn profileOnce(
         try diff_render.renderFile(&test_surface.surface, document.files[0], .{
             .requested_mode = .side_by_side,
             .line_index = rendered_line_cache.indexFor(0, .side_by_side),
-            .syntax_spans = spans,
+            .syntax = .initDirect(&spans, 0),
         });
     }
     sample[@intFromEnum(Phase.first_redraw)] = timer.read();

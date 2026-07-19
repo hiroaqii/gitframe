@@ -3,8 +3,10 @@ const chasen = @import("chasen");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const draw = @import("draw");
 const diff_file = @import("file.zig");
+const diff_hunk_projection = @import("hunk_projection.zig");
 const diff_parser = @import("parser.zig");
 const diff_selection = @import("selection.zig");
+const diff_syntax_view = @import("syntax_view.zig");
 const diff_view_model = @import("view_model.zig");
 const syntax_provider = @import("../syntax/provider.zig");
 const source_syntax = @import("../syntax/source.zig");
@@ -28,8 +30,7 @@ pub const RenderOptions = struct {
     line_index: ?diff_view_model.RenderedLineIndex = null,
     folded_hunks: []const bool = &.{},
     palette: theme.Palette = .default(),
-    file_index: usize = 0,
-    syntax_spans: syntax_provider.DocumentSpans = .empty(),
+    syntax: ?diff_syntax_view.View = null,
     source_syntax_spans: source_syntax.SourceSpans = .empty(),
     source_has_visible_syntax: bool = false,
     selection: ?diff_selection.View = null,
@@ -555,8 +556,8 @@ fn unifiedSyntaxContext(options: RenderOptions, rows: diff_view_model.BodyRowIte
         .metadata => return .{},
     };
     return .{
-        .line_spans = options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line_index, side)),
-        .hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, side),
+        .line_spans = syntaxLineSpans(options.syntax, hunk_index, line_index, side),
+        .hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax, hunk_index, side),
     };
 }
 
@@ -569,18 +570,18 @@ fn sideBySideSingleSyntaxSpans(options: RenderOptions, rows: diff_view_model.Bod
     };
     return switch (line.kind) {
         .removed => .{
-            .old = options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line_index, .old)),
-            .old_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, .old),
+            .old = syntaxLineSpans(options.syntax, hunk_index, line_index, .old),
+            .old_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax, hunk_index, .old),
         },
         .added => .{
-            .new = options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line_index, .new)),
-            .new_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, .new),
+            .new = syntaxLineSpans(options.syntax, hunk_index, line_index, .new),
+            .new_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax, hunk_index, .new),
         },
         .context => .{
-            .old = options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line_index, .old)),
-            .new = options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line_index, .new)),
-            .old_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, .old),
-            .new_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, .new),
+            .old = syntaxLineSpans(options.syntax, hunk_index, line_index, .old),
+            .new = syntaxLineSpans(options.syntax, hunk_index, line_index, .new),
+            .old_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax, hunk_index, .old),
+            .new_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax, hunk_index, .new),
         },
         .metadata => .{},
     };
@@ -592,35 +593,24 @@ fn sideBySidePairSyntaxSpans(options: RenderOptions, rows: diff_view_model.BodyR
     return switch (indexed) {
         .single => .{},
         .paired => |pair| .{
-            .old = if (pair.removed) |line| options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line.line_index, .old)) else .empty(),
-            .new = if (pair.added) |line| options.syntax_spans.lineSpans(lineKey(options.file_index, hunk_index, line.line_index, .new)) else .empty(),
-            .old_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, .old),
-            .new_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax_spans, options.file_index, hunk_index, .new),
+            .old = if (pair.removed) |line| syntaxLineSpans(options.syntax, hunk_index, line.line_index, .old) else .empty(),
+            .new = if (pair.added) |line| syntaxLineSpans(options.syntax, hunk_index, line.line_index, .new) else .empty(),
+            .old_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax, hunk_index, .old),
+            .new_hunk_side_has_visible_syntax = hunkSideHasVisibleSyntaxSignal(options.syntax, hunk_index, .new),
         },
     };
 }
 
-fn hunkSideHasVisibleSyntaxSignal(document_spans: syntax_provider.DocumentSpans, file_index: usize, hunk_index: usize, side: syntax_provider.Side) bool {
-    if (file_index >= document_spans.files.len) return false;
-    const file = document_spans.files[file_index];
-    if (hunk_index >= file.hunks.len) return false;
-    const hunk = file.hunks[hunk_index];
-    for (hunk.lines) |line| {
-        const spans = line.forSide(side);
-        for (spans.spans) |span| {
-            if (roleChangesForeground(span.role)) return true;
-        }
-    }
-    return false;
-}
-
-fn lineKey(file_index: usize, hunk_index: usize, line_index: usize, side: syntax_provider.Side) syntax_provider.LineKey {
-    return .{
-        .file_index = file_index,
+fn syntaxLineSpans(view: ?diff_syntax_view.View, hunk_index: usize, line_index: usize, side: syntax_provider.Side) syntax_token.LineSpans {
+    return (view orelse return .empty()).lineSpans(.{
         .hunk_index = hunk_index,
         .line_index = line_index,
         .side = side,
-    };
+    });
+}
+
+fn hunkSideHasVisibleSyntaxSignal(view: ?diff_syntax_view.View, hunk_index: usize, side: syntax_provider.Side) bool {
+    return (view orelse return false).hunkSideHasVisibleSyntax(hunk_index, side);
 }
 
 const BodyCursor = struct {
@@ -957,10 +947,6 @@ fn setCellBackground(surface: *chasen.Surface, col: u16, row: u16, background: c
 
 fn syntaxStyle(base: chasen.TextStyle, role: syntax_token.TokenRole, styles: RenderStyles) chasen.TextStyle {
     return syntax_style.apply(base, role, styles.palette);
-}
-
-fn roleChangesForeground(role: syntax_token.TokenRole) bool {
-    return syntax_style.changesForeground(role);
 }
 
 // Scrollable diff body text should not draw an artificial ellipsis; users can
@@ -1406,7 +1392,7 @@ test "renderFile applies unified syntax spans without removing diff background" 
     try renderFile(&ts.surface, file, .{
         .requested_mode = .unified,
         .palette = palette,
-        .syntax_spans = spans,
+        .syntax = .initDirect(&spans, 0),
     });
 
     const removed_cell = ts.surface.readCell(14, 4).?;
@@ -1448,7 +1434,7 @@ test "renderFile hides unified diff prefix for highlighted hunk side and keeps f
     const new_spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &[_]syntax_token.TokenSpan{.{ .start = 0, .end = 3, .role = .string }});
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 2, .side = .new }, .{ .spans = new_spans });
 
-    try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .syntax_spans = spans });
+    try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .syntax = .initDirect(&spans, 0) });
 
     try ts.expectCellText(12, 4, "-");
     try ts.expectCellText(12, 5, " ");
@@ -1493,7 +1479,7 @@ test "renderFile normalizes highlighted unified body base foreground" {
     try renderFile(&ts.surface, file, .{
         .requested_mode = .unified,
         .palette = palette,
-        .syntax_spans = spans,
+        .syntax = .initDirect(&spans, 0),
         .staged_hunks = &.{true},
     });
 
@@ -1557,7 +1543,7 @@ test "renderFile keeps unified diff prefix when spans do not change foreground" 
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .new }, .{ .spans = plain_spans });
     syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .new }, .{ .spans = fallback_spans });
 
-    try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .syntax_spans = spans });
+    try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .syntax = .initDirect(&spans, 0) });
 
     try ts.expectCellText(12, 4, "+");
     try ts.expectCellText(12, 5, "+");
@@ -1597,7 +1583,7 @@ test "renderFile applies side-by-side context syntax spans per side" {
     try renderFile(&ts.surface, file, .{
         .requested_mode = .side_by_side,
         .palette = palette,
-        .syntax_spans = spans,
+        .syntax = .initDirect(&spans, 0),
     });
 
     const old_cell = ts.surface.readCell(9, 4).?;
@@ -1632,7 +1618,7 @@ test "renderFile hides side-by-side diff prefixes by highlighted hunk side" {
 
     try renderFile(&ts.surface, file, .{
         .requested_mode = .side_by_side,
-        .syntax_spans = spans,
+        .syntax = .initDirect(&spans, 0),
     });
 
     const geometry = sideBySideGeometry(bodyWidth(100));
@@ -1644,6 +1630,116 @@ test "renderFile hides side-by-side diff prefixes by highlighted hunk side" {
     try ts.expectCellText(57, 4, " ");
     try ts.expectCellText(9, 4, "o");
     try ts.expectCellText(59, 4, "n");
+}
+
+test "renderFile resolves reordered combined syntax in unified and side-by-side modes" {
+    const allocator = std.testing.allocator;
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 10,
+                .old_count = 1,
+                .new_start = 10,
+                .new_count = 1,
+                .section = "unstaged origin",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old unstaged", .old_line = 10 },
+                    .{ .kind = .added, .text = "new unstaged", .new_line = 10 },
+                },
+            },
+            .{
+                .old_start = 20,
+                .old_count = 1,
+                .new_start = 20,
+                .new_count = 1,
+                .section = "cached origin",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old cached", .old_line = 20 },
+                    .{ .kind = .added, .text = "new cached", .new_line = 20 },
+                },
+            },
+        },
+    };
+    const component_hunk_lines = [_]usize{ 2, 2 };
+    const component_files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &component_hunk_lines }};
+    var cached = try syntax_provider.allocateEmpty(allocator, .{ .files = &component_files });
+    defer cached.deinit(allocator);
+    var unstaged = try syntax_provider.allocateEmpty(allocator, .{ .files = &component_files });
+    defer unstaged.deinit(allocator);
+
+    // Correct origins use cached(0) and unstaged(1). The other component
+    // ordinals deliberately contain non-visible roles so projected-ordinal or
+    // opposite-component fallback changes both token color and prefix output.
+    try putOwnedTestSpan(allocator, &cached, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }, .keyword);
+    try putOwnedTestSpan(allocator, &cached, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .new }, .string);
+    try putOwnedTestSpan(allocator, &cached, .{ .file_index = 0, .hunk_index = 1, .line_index = 0, .side = .old }, .variable);
+    try putOwnedTestSpan(allocator, &cached, .{ .file_index = 0, .hunk_index = 1, .line_index = 1, .side = .new }, .plain);
+    try putOwnedTestSpan(allocator, &unstaged, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }, .variable);
+    try putOwnedTestSpan(allocator, &unstaged, .{ .file_index = 0, .hunk_index = 0, .line_index = 1, .side = .new }, .plain);
+    try putOwnedTestSpan(allocator, &unstaged, .{ .file_index = 0, .hunk_index = 1, .line_index = 0, .side = .old }, .type);
+    try putOwnedTestSpan(allocator, &unstaged, .{ .file_index = 0, .hunk_index = 1, .line_index = 1, .side = .new }, .number);
+
+    const hunk_states = [_]diff_hunk_projection.ProjectedHunkState{
+        .{ .state = .unstaged, .origin = .{ .unstaged = 1 } },
+        .{ .state = .staged, .origin = .{ .cached = 0 } },
+    };
+    const syntax = diff_syntax_view.View.initCombined(&hunk_states, &cached, &unstaged);
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.warning)] = .{ .rgb = .{ 10, 11, 12 } };
+
+    var unified: chasen.testing.TestSurface = undefined;
+    try unified.init(80, 9);
+    defer unified.deinit();
+    try renderFile(&unified.surface, file, .{
+        .requested_mode = .unified,
+        .palette = palette,
+        .syntax = syntax,
+    });
+    const unified_text_col = cursor_gutter_width + lineTextStart(true, .unified);
+    const unified_prefix_col = cursor_gutter_width + lineLayout(true, .unified).prefix_col;
+    try std.testing.expect(unified.surface.readCell(unified_text_col, body_start_row + 1).?.style.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(unified.surface.readCell(unified_text_col, body_start_row + 2).?.style.fg.eql(palette.color(.warning)));
+    try std.testing.expect(unified.surface.readCell(unified_text_col, body_start_row + 4).?.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(unified.surface.readCell(unified_text_col, body_start_row + 5).?.style.fg.eql(palette.color(.success)));
+    try unified.expectCellText(unified_prefix_col, body_start_row + 1, " ");
+    try unified.expectCellText(unified_prefix_col, body_start_row + 5, " ");
+
+    var side_by_side: chasen.testing.TestSurface = undefined;
+    try side_by_side.init(100, 7);
+    defer side_by_side.deinit();
+    try renderFile(&side_by_side.surface, file, .{
+        .requested_mode = .side_by_side,
+        .palette = palette,
+        .syntax = syntax,
+    });
+    const geometry = sideBySideGeometry(bodyWidth(100));
+    const old_text_col = cursor_gutter_width + geometry.old.col + lineTextStart(true, .side_by_side);
+    const new_text_col = cursor_gutter_width + geometry.new.col + lineTextStart(true, .side_by_side);
+    const old_prefix_col = cursor_gutter_width + geometry.old.col + lineLayout(true, .side_by_side).prefix_col;
+    const new_prefix_col = cursor_gutter_width + geometry.new.col + lineLayout(true, .side_by_side).prefix_col;
+    try std.testing.expect(side_by_side.surface.readCell(old_text_col, body_start_row + 1).?.style.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(side_by_side.surface.readCell(new_text_col, body_start_row + 1).?.style.fg.eql(palette.color(.warning)));
+    try std.testing.expect(side_by_side.surface.readCell(old_text_col, body_start_row + 3).?.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(side_by_side.surface.readCell(new_text_col, body_start_row + 3).?.style.fg.eql(palette.color(.success)));
+    try side_by_side.expectCellText(old_prefix_col, body_start_row + 1, " ");
+    try side_by_side.expectCellText(new_prefix_col, body_start_row + 3, " ");
+}
+
+fn putOwnedTestSpan(
+    allocator: std.mem.Allocator,
+    document: *syntax_provider.DocumentSpans,
+    key: syntax_provider.LineKey,
+    role: syntax_token.TokenRole,
+) !void {
+    const spans = try allocator.dupe(syntax_token.TokenSpan, &.{.{ .start = 0, .end = 3, .role = role }});
+    syntax_provider.putLineSpans(document, key, .{ .spans = spans });
 }
 
 test "renderFile highlights only the selected side-by-side pane side" {
@@ -1717,7 +1813,7 @@ test "review diff cursor character selection colors only exact tokens and preser
         .requested_mode = .unified,
         .cursor_offset = 1,
         .palette = palette,
-        .syntax_spans = spans,
+        .syntax = .initDirect(&spans, 0),
         .staged_hunks = &.{true},
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
@@ -1833,7 +1929,7 @@ test "review diff cursor TAB selection and syntax use the same multi-cell projec
         .requested_mode = .unified,
         .cursor_offset = 1,
         .palette = palette,
-        .syntax_spans = spans,
+        .syntax = .initDirect(&spans, 0),
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
             .side = .new,
@@ -1943,7 +2039,7 @@ test "renderFile normalizes highlighted side-by-side body base foreground" {
     try renderFile(&ts.surface, file, .{
         .requested_mode = .side_by_side,
         .palette = palette,
-        .syntax_spans = spans,
+        .syntax = .initDirect(&spans, 0),
     });
 
     const old_identifier = ts.surface.readCell(13, 4).?;
@@ -1980,7 +2076,7 @@ test "renderFile clips syntax spans through horizontal scroll without splitting 
         .requested_mode = .unified,
         .horizontal_scroll = 1,
         .palette = palette,
-        .syntax_spans = spans,
+        .syntax = .initDirect(&spans, 0),
     });
 
     try ts.expectCellText(14, 4, "あ");
@@ -2899,7 +2995,7 @@ test "review diff cursor restores parsed signs from cross-row syntax authority" 
     var removed: chasen.testing.TestSurface = undefined;
     try removed.init(80, 8);
     defer removed.deinit();
-    try renderFile(&removed.surface, file, .{ .requested_mode = .unified, .cursor_offset = 1, .syntax_spans = spans });
+    try renderFile(&removed.surface, file, .{ .requested_mode = .unified, .cursor_offset = 1, .syntax = .initDirect(&spans, 0) });
     try removed.expectCellText(12, 4, "-");
     try removed.expectCellText(12, 5, " ");
     try std.testing.expect(removed.surface.readCell(12, 4).?.style.bg.eql(theme.Palette.default().color(.pane_cursor_bg)));
@@ -2907,14 +3003,14 @@ test "review diff cursor restores parsed signs from cross-row syntax authority" 
     var added: chasen.testing.TestSurface = undefined;
     try added.init(80, 8);
     defer added.deinit();
-    try renderFile(&added.surface, file, .{ .requested_mode = .unified, .cursor_offset = 3, .syntax_spans = spans });
+    try renderFile(&added.surface, file, .{ .requested_mode = .unified, .cursor_offset = 3, .syntax = .initDirect(&spans, 0) });
     try added.expectCellText(12, 6, "+");
     try added.expectCellText(12, 7, " ");
 
     var split: chasen.testing.TestSurface = undefined;
     try split.init(100, 6);
     defer split.deinit();
-    try renderFile(&split.surface, file, .{ .requested_mode = .side_by_side, .cursor_offset = 1, .syntax_spans = spans });
+    try renderFile(&split.surface, file, .{ .requested_mode = .side_by_side, .cursor_offset = 1, .syntax = .initDirect(&spans, 0) });
     const geometry = sideBySideGeometry(bodyWidth(100));
     try split.expectCellText(cursor_gutter_width + geometry.old.col + lineLayout(true, .side_by_side).prefix_col, 4, "-");
     try split.expectCellText(cursor_gutter_width + geometry.new.col + lineLayout(true, .side_by_side).prefix_col, 4, "+");

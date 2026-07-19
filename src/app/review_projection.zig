@@ -1,5 +1,6 @@
 const std = @import("std");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
+const diff_syntax_view = @import("../diff/syntax_view.zig");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const repository_source = @import("../repository/source.zig");
 const root_capability = @import("../repo/root_capability.zig");
@@ -151,6 +152,16 @@ pub const CombinedHunkBundle = struct {
     projection: diff_hunk_projection.Projection,
     cached_bundle: app_load.LoadedDiffBundle,
     unstaged_bundle: app_load.LoadedDiffBundle,
+
+    /// Borrows origin and token storage owned by this bundle for one render
+    /// call. The returned view has no cleanup and must not outlive `self`.
+    pub fn syntaxView(self: *const CombinedHunkBundle) diff_syntax_view.View {
+        return .initCombined(
+            self.projection.hunk_states,
+            &self.cached_bundle.loaded.syntax_spans,
+            &self.unstaged_bundle.loaded.syntax_spans,
+        );
+    }
 
     pub fn deinit(self: *CombinedHunkBundle) void {
         if (self.arena) |*arena| arena.deinit();
