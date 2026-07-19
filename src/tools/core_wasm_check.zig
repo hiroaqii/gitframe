@@ -14,6 +14,7 @@ const std = @import("std");
 
 const diff_file = @import("../diff/file.zig");
 const diff_parser = @import("../diff/parser.zig");
+const diff_presentation_identity = @import("../diff/presentation_identity.zig");
 const diff_search = @import("../diff/search.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
@@ -25,6 +26,7 @@ const sidebar_view_model = @import("../sidebar/view_model.zig");
 comptime {
     refAllDecls(diff_file);
     refAllDecls(diff_parser);
+    refAllDecls(diff_presentation_identity);
     refAllDecls(diff_search);
     refAllDecls(diff_view_model);
     refAllDecls(file_tree);
@@ -52,6 +54,7 @@ pub fn gitframeCoreWasmCompileCheck() usize {
     const cache = diff_view_model.RenderedLineCache.build(allocator, document) catch unreachable;
 
     const file = document.files[0];
+    const presentation_fingerprint = diff_presentation_identity.fingerprint(file);
     const index = cache.indexFor(0, .side_by_side) orelse unreachable;
     const match = diff_search.findMatch(file, .side_by_side, "new", null, .forward) orelse unreachable;
 
@@ -69,6 +72,8 @@ pub fn gitframeCoreWasmCompileCheck() usize {
     return document.files.len +
         tree.nodes.len +
         index.lineCount() +
+        presentation_fingerprint.digest[0] +
+        @intFromBool(diff_presentation_identity.exactEqual(file, file)) +
         @intFromBool(std.meta.eql(match.coordinate, diff_view_model.BodyCoordinate{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } })) +
         row.stats.added;
 }

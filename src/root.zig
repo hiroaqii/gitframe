@@ -79,6 +79,7 @@ test {
     _ = @import("diff/file.zig");
     _ = @import("diff/hunk_projection.zig");
     _ = @import("diff/patch.zig");
+    _ = @import("diff/presentation_identity.zig");
     _ = @import("diff/render.zig");
     _ = @import("diff/selection.zig");
     _ = @import("diff/syntax_view.zig");

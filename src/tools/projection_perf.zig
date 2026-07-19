@@ -24,6 +24,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
 const diff_parser = @import("../diff/parser.zig");
+const presentation_identity = @import("../diff/presentation_identity.zig");
 const diff_render = @import("../diff/render.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
@@ -266,7 +267,7 @@ fn profileComponentPairOnce(
         try singleFile(before_cached),
         try singleFile(before_unstaged),
     );
-    const before_fingerprint = prototypePresentationFingerprint(before_projection.file);
+    const before_fingerprint = presentation_identity.fingerprint(before_projection.file);
 
     var reuse_timer = Stopwatch.start(io);
     var timer = Stopwatch.start(io);
@@ -290,14 +291,14 @@ fn profileComponentPairOnce(
     }
 
     timer = Stopwatch.start(io);
-    const after_fingerprint = prototypePresentationFingerprint(after_projection.file);
+    const after_fingerprint = presentation_identity.fingerprint(after_projection.file);
     sample[@intFromEnum(PairPhase.presentation_fingerprint)] = timer.read();
-    if (!std.mem.eql(u8, &before_fingerprint, &after_fingerprint)) {
+    if (!before_fingerprint.eql(after_fingerprint)) {
         return error.ComponentPairFingerprintMismatch;
     }
 
     timer = Stopwatch.start(io);
-    const equal = prototypePresentationEqual(before_projection.file, after_projection.file);
+    const equal = presentation_identity.exactEqual(before_projection.file, after_projection.file);
     sample[@intFromEnum(PairPhase.presentation_equality)] = timer.read();
     if (!equal) return error.ComponentPairPresentationMismatch;
     sample[@intFromEnum(PairPhase.exact_reuse_construction)] = reuse_timer.read();
@@ -315,7 +316,7 @@ fn profileComponentPairOnce(
         .after_unstaged_hunks = after_unstaged.totalHunks(),
         .projected_hunks = after_projection.file.hunks.len,
     };
-    for (after_fingerprint) |byte| checksum.* +%= byte;
+    for (after_fingerprint.digest) |byte| checksum.* +%= byte;
     checksum.* +%= after_projection.file.hunks.len;
     return sample;
 }
@@ -366,63 +367,6 @@ fn profileEagerComponentDecoration(
     }
 }
 
-/// P0-only model of the visible projected file shape. Raw component metadata and
-/// hunk stage/action origins are deliberately absent. P1 replaces this profiler
-/// prototype with the reviewed production canonical identity and comparator.
-fn prototypePresentationFingerprint(file: diff_parser.FileDiff) [32]u8 {
-    var hasher = std.crypto.hash.Blake3.init(.{});
-    hashOptionalBytes(&hasher, file.old_path);
-    hashOptionalBytes(&hasher, file.new_path);
-    hashBool(&hasher, file.is_binary);
-    hashU64(&hasher, file.hunks.len);
-    for (file.hunks) |hunk| {
-        hashU32(&hasher, hunk.old_start);
-        hashU32(&hasher, hunk.old_count);
-        hashU32(&hasher, hunk.new_start);
-        hashU32(&hasher, hunk.new_count);
-        hashBytes(&hasher, hunk.section);
-        hashU64(&hasher, hunk.lines.len);
-        for (hunk.lines) |line| {
-            hashByte(&hasher, @intFromEnum(line.kind));
-            hashBytes(&hasher, line.text);
-            hashOptionalU32(&hasher, line.old_line);
-            hashOptionalU32(&hasher, line.new_line);
-        }
-    }
-
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
-    return digest;
-}
-
-fn prototypePresentationEqual(lhs: diff_parser.FileDiff, rhs: diff_parser.FileDiff) bool {
-    if (!optionalBytesEqual(lhs.old_path, rhs.old_path)) return false;
-    if (!optionalBytesEqual(lhs.new_path, rhs.new_path)) return false;
-    if (lhs.is_binary != rhs.is_binary or lhs.hunks.len != rhs.hunks.len) return false;
-
-    for (lhs.hunks, rhs.hunks) |left_hunk, right_hunk| {
-        if (left_hunk.old_start != right_hunk.old_start or
-            left_hunk.old_count != right_hunk.old_count or
-            left_hunk.new_start != right_hunk.new_start or
-            left_hunk.new_count != right_hunk.new_count or
-            !std.mem.eql(u8, left_hunk.section, right_hunk.section) or
-            left_hunk.lines.len != right_hunk.lines.len)
-        {
-            return false;
-        }
-        for (left_hunk.lines, right_hunk.lines) |left_line, right_line| {
-            if (left_line.kind != right_line.kind or
-                !std.mem.eql(u8, left_line.text, right_line.text) or
-                left_line.old_line != right_line.old_line or
-                left_line.new_line != right_line.new_line)
-            {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
 fn metadataEqual(lhs: []const []const u8, rhs: []const []const u8) bool {
     if (lhs.len != rhs.len) return false;
     for (lhs, rhs) |left, right| {
@@ -453,57 +397,6 @@ fn hunkOriginEqual(lhs: diff_hunk_projection.HunkOrigin, rhs: diff_hunk_projecti
             .unstaged => |other| index == other,
         },
     };
-}
-
-fn optionalBytesEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
-    if (lhs) |left| {
-        const right = rhs orelse return false;
-        return std.mem.eql(u8, left, right);
-    }
-    return rhs == null;
-}
-
-fn hashOptionalBytes(hasher: *std.crypto.hash.Blake3, value: ?[]const u8) void {
-    if (value) |bytes| {
-        hashByte(hasher, 1);
-        hashBytes(hasher, bytes);
-    } else {
-        hashByte(hasher, 0);
-    }
-}
-
-fn hashOptionalU32(hasher: *std.crypto.hash.Blake3, value: ?u32) void {
-    if (value) |number| {
-        hashByte(hasher, 1);
-        hashU32(hasher, number);
-    } else {
-        hashByte(hasher, 0);
-    }
-}
-
-fn hashBytes(hasher: *std.crypto.hash.Blake3, bytes: []const u8) void {
-    hashU64(hasher, bytes.len);
-    hasher.update(bytes);
-}
-
-fn hashBool(hasher: *std.crypto.hash.Blake3, value: bool) void {
-    hashByte(hasher, @intFromBool(value));
-}
-
-fn hashByte(hasher: *std.crypto.hash.Blake3, value: u8) void {
-    hasher.update(&.{value});
-}
-
-fn hashU32(hasher: *std.crypto.hash.Blake3, value: u32) void {
-    var bytes: [@sizeOf(u32)]u8 = undefined;
-    std.mem.writeInt(u32, &bytes, value, .little);
-    hasher.update(&bytes);
-}
-
-fn hashU64(hasher: *std.crypto.hash.Blake3, value: usize) void {
-    var bytes: [@sizeOf(u64)]u8 = undefined;
-    std.mem.writeInt(u64, &bytes, @intCast(value), .little);
-    hasher.update(&bytes);
 }
 
 fn profileOnce(
