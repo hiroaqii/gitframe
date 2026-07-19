@@ -279,15 +279,12 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
         diff_view_model.BodyRowIterator.initAtWithFolded(file, mode, index, options.scroll, options.folded_hunks)
     else
         diff_view_model.BodyRowIterator.initWithFolded(file, mode, options.folded_hunks);
-    var current_hunk_staged = false;
     var current_hunk_highlighted = false;
     while (rows.next()) |body_row| {
         if (cursor.done()) return;
         if (rows.currentHunkIndex()) |hunk_index| {
-            current_hunk_staged = options.hunk_stages.stateForHunk(hunk_index) == .staged;
             current_hunk_highlighted = options.highlighted_hunk != null and options.highlighted_hunk.? == hunk_index;
         } else {
-            current_hunk_staged = false;
             current_hunk_highlighted = false;
         }
         const body_offset = cursor.bodyOffset();
@@ -299,25 +296,26 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
             .metadata => |line| try draw.copyClippedTextAt(&body_surface, 0, row, line, presentation.compose(styles.metadata, styles)),
             .binary_marker => _ = body_surface.borrowTextAt(0, row, "Binary file", presentation.compose(styles.warning, styles)),
             .hunk_header => |hunk| {
-                if (current_hunk_highlighted and !hunk.folded) drawHunkGuide(surface, row, guideGlyph(guide_index, hunk.hunk_index, body_offset), presentation, styles);
-                try drawHunkHeaderRow(&body_surface, row, hunk, options.highlighted_hunk, mode, current_hunk_staged, presentation, styles);
+                const current_stage = if (current_hunk_highlighted) options.hunk_stages.stateForHunk(hunk.hunk_index) else null;
+                if (current_stage != null and !hunk.folded) drawHunkGuide(surface, row, guideGlyph(guide_index, hunk.hunk_index, body_offset), current_stage.?, presentation, styles);
+                try drawHunkHeaderRow(&body_surface, row, hunk, current_stage, mode, presentation, styles);
             },
             .unified_line => |line| {
                 if (current_hunk_highlighted) {
-                    if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), presentation, styles);
+                    if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), options.hunk_stages.stateForHunk(hunk_index), presentation, styles);
                 }
                 const syntax_ctx = unifiedSyntaxContext(options, rows, line);
-                try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, current_hunk_staged, presentation, styles, syntax_ctx.line_spans, syntax_ctx.hunk_side_has_visible_syntax, unifiedSelectionForLine(options, rows, line));
+                try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, presentation, styles, syntax_ctx.line_spans, syntax_ctx.hunk_side_has_visible_syntax, unifiedSelectionForLine(options, rows, line));
             },
             .side_by_side => |side_row| {
                 if (current_hunk_highlighted) {
-                    if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), presentation, styles);
+                    if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), options.hunk_stages.stateForHunk(hunk_index), presentation, styles);
                 }
                 const geometry = sideBySideGeometry(body_surface.size().width);
                 const indexed_row = rows.currentSideBySideRow();
                 switch (side_row) {
-                    .single => |line| try drawSideBySideSingle(&body_surface, row, line, geometry, options.horizontal_scroll, options.line_numbers, current_hunk_staged, presentation, styles, sideBySideSingleSyntaxSpans(options, rows, line), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
-                    .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, geometry, options.horizontal_scroll, options.line_numbers, current_hunk_staged, presentation, styles, sideBySidePairSyntaxSpans(options, rows), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
+                    .single => |line| try drawSideBySideSingle(&body_surface, row, line, geometry, options.horizontal_scroll, options.line_numbers, presentation, styles, sideBySideSingleSyntaxSpans(options, rows, line), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
+                    .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, geometry, options.horizontal_scroll, options.line_numbers, presentation, styles, sideBySidePairSyntaxSpans(options, rows), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
                 }
             },
         }
@@ -359,12 +357,12 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, sour
         const line_spans = options.source_syntax_spans.lineSpans(index);
         if (mode == .side_by_side) {
             const geometry = sideBySideGeometry(body_surface.size().width);
-            try drawSideBySidePair(&body_surface, row, null, line, geometry, options.horizontal_scroll, options.line_numbers, false, presentation, styles, .{
+            try drawSideBySidePair(&body_surface, row, null, line, geometry, options.horizontal_scroll, options.line_numbers, presentation, styles, .{
                 .new = line_spans,
                 .new_hunk_side_has_visible_syntax = options.source_has_visible_syntax,
             }, generatedSideBySideSelection(options, index, line));
         } else {
-            try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, false, presentation, styles, line_spans, options.source_has_visible_syntax, generatedUnifiedSelection(options, index, line));
+            try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, presentation, styles, line_spans, options.source_has_visible_syntax, generatedUnifiedSelection(options, index, line));
         }
     }
 }
@@ -493,13 +491,12 @@ fn drawHunkHeaderRow(
     surface: *chasen.Surface,
     row: u16,
     hunk: diff_view_model.HunkHeader,
-    highlighted_hunk: ?usize,
+    current_stage: ?HunkStageState,
     mode: DisplayMode,
-    staged: bool,
     presentation: RowPresentation,
     styles: RenderStyles,
 ) !void {
-    const style = hunkHeaderStyle(highlighted_hunk != null and highlighted_hunk.? == hunk.hunk_index, staged, styles);
+    const style = hunkHeaderStyle(current_stage, styles);
     const marker = if (hunk.folded) "▸" else "▾";
     const header = try std.fmt.allocPrint(surface.frameAllocator(), "{s} @@ -{d},{d} +{d},{d} @@ {s}", .{
         marker,
@@ -512,13 +509,12 @@ fn drawHunkHeaderRow(
     try drawHunkHeader(surface, row, header, style, mode, presentation, styles);
 }
 
-fn hunkHeaderStyle(highlighted: bool, staged: bool, styles: RenderStyles) chasen.TextStyle {
-    var style = if (highlighted) styles.selected_hunk else styles.hunk;
-    if (staged) {
-        style.dim = true;
-        style.bg = .{ .index = 8 };
-    }
-    return style;
+fn hunkHeaderStyle(current_stage: ?HunkStageState, styles: RenderStyles) chasen.TextStyle {
+    const stage = current_stage orelse return styles.hunk;
+    return switch (stage) {
+        .unstaged => styles.selected_hunk,
+        .staged => styles.staged_hunk_header,
+    };
 }
 
 pub const body_start_row: u16 = 3;
@@ -574,9 +570,13 @@ fn guideGlyph(index_opt: ?diff_view_model.RenderedLineIndex, hunk_index: usize, 
     return "│";
 }
 
-fn drawHunkGuide(surface: *chasen.Surface, row: u16, glyph: []const u8, presentation: RowPresentation, styles: RenderStyles) void {
+fn drawHunkGuide(surface: *chasen.Surface, row: u16, glyph: []const u8, stage: HunkStageState, presentation: RowPresentation, styles: RenderStyles) void {
     if (surface.size().width < 2) return;
-    _ = surface.borrowTextAt(1, row, glyph, presentation.compose(styles.hunk_guide, styles));
+    const style = switch (stage) {
+        .unstaged => styles.hunk_guide,
+        .staged => styles.staged_hunk_guide,
+    };
+    _ = surface.borrowTextAt(1, row, glyph, presentation.compose(style, styles));
 }
 
 const UnifiedSyntaxContext = struct {
@@ -675,18 +675,18 @@ const BodyCursor = struct {
     }
 };
 
-fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
+fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
     const whole_line = selection != null and selection.?.mode == .line;
     if (whole_line) fillRowRegion(surface, row, .{ .col = 0, .width = surface.size().width }, styles.selection);
-    const text_style = selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), styles), whole_line, styles);
-    const marker_style = selectedStyle(presentation.compose(markerStyleForLine(line.kind, staged, styles), styles), whole_line, styles);
+    const text_style = selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, styles, hunk_side_has_visible_syntax), styles), whole_line, styles);
+    const marker_style = selectedStyle(presentation.compose(markerStyleForLine(line.kind, styles), styles), whole_line, styles);
     const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
     const layout = lineLayout(line_numbers, .unified);
-    drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, staged, styles), styles), whole_line, styles));
+    drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, styles), styles), whole_line, styles));
 
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, staged, styles), line.old_line != null, styles), whole_line, styles));
-        _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, staged, styles), line.new_line != null, styles), whole_line, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, styles), line.old_line != null, styles), whole_line, styles));
+        _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, styles), line.new_line != null, styles), whole_line, styles));
     }
     _ = surface.borrowTextAt(layout.prefix_col, row, prefix, marker_style);
     try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, text_style, syntax_spans, styles);
@@ -723,31 +723,31 @@ fn generatedSideBySideSelection(options: RenderOptions, line_index: usize, line:
     return .{ .new = range };
 }
 
-fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, staged: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
+fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
     drawSideBySideSelection(surface, row, geometry, selection, styles);
     var columns = sideBySideRowColumns(surface, row, geometry);
     const selected = selection orelse SideBySideSelection{};
-    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
-    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
     drawSideBySideGutter(surface, row, geometry, presentation, styles);
 }
 
-fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, staged: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
+fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
     drawSideBySideSelection(surface, row, geometry, selection, styles);
     var columns = sideBySideRowColumns(surface, row, geometry);
     const selected = selection orelse SideBySideSelection{};
     switch (line.kind) {
         .removed => {
-            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
             drawSideBySideGutter(surface, row, geometry, presentation, styles);
         },
         .added => {
-            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
             drawSideBySideGutter(surface, row, geometry, presentation, styles);
         },
         .context => {
-            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, staged, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
-            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, staged, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
             drawSideBySideGutter(surface, row, geometry, presentation, styles);
         },
         .metadata => {
@@ -829,29 +829,29 @@ fn sideBySideSelectionForPair(options: RenderOptions, file: diff_parser.FileDiff
     return selected;
 }
 
-fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
+fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
     const selected = selection != null and selection.?.mode == .line;
     const layout = lineLayout(line_numbers, .side_by_side);
-    drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, staged, styles), styles), selected, styles));
+    drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, styles), styles), selected, styles));
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, staged, styles), line.old_line != null, styles), selected, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, styles), line.old_line != null, styles), selected, styles));
     }
     const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(presentation.compose(markerStyleForLine(line.kind, staged, styles), styles), selected, styles));
-    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(presentation.compose(markerStyleForLine(line.kind, styles), styles), selected, styles));
+    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
     if (selection) |range| if (range.mode == .character) applyCharacterSelection(surface, layout.text_col, row, line.text, horizontal_scroll, range, styles.selection.bg);
 }
 
-fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, staged: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
+fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
     const selected = selection != null and selection.?.mode == .line;
     const layout = lineLayout(line_numbers, .side_by_side);
-    drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, staged, styles), styles), selected, styles));
+    drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, styles), styles), selected, styles));
     if (line_numbers) {
-        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, staged, styles), line.new_line != null, styles), selected, styles));
+        _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, styles), line.new_line != null, styles), selected, styles));
     }
     const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
-    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(presentation.compose(markerStyleForLine(line.kind, staged, styles), styles), selected, styles));
-    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, staged, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
+    _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(presentation.compose(markerStyleForLine(line.kind, styles), styles), selected, styles));
+    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
     if (selection) |range| if (range.mode == .character) applyCharacterSelection(surface, layout.text_col, row, line.text, horizontal_scroll, range, styles.selection.bg);
 }
 
@@ -1004,19 +1004,17 @@ fn lineNumberText(surface: *chasen.Surface, line: ?u32) ![]const u8 {
         surface.copyText("    ");
 }
 
-fn textStyleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
-    var style = switch (kind) {
+fn textStyleForLine(kind: diff_parser.DiffLine.Kind, styles: RenderStyles) chasen.TextStyle {
+    return switch (kind) {
         .added => styles.added_text,
         .removed => styles.removed_text,
         .context => styles.context,
         .metadata => styles.metadata,
     };
-    if (staged) style.dim = true;
-    return style;
 }
 
-fn bodyTextStyleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles, hunk_side_has_visible_syntax: bool) chasen.TextStyle {
-    var style = textStyleForLine(kind, staged, styles);
+fn bodyTextStyleForLine(kind: diff_parser.DiffLine.Kind, styles: RenderStyles, hunk_side_has_visible_syntax: bool) chasen.TextStyle {
+    var style = textStyleForLine(kind, styles);
     if (hunk_side_has_visible_syntax) switch (kind) {
         .added, .removed => style.fg = styles.context.fg,
         .context, .metadata => {},
@@ -1024,29 +1022,25 @@ fn bodyTextStyleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: R
     return style;
 }
 
-fn markerStyleForLine(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
-    var style = switch (kind) {
+fn markerStyleForLine(kind: diff_parser.DiffLine.Kind, styles: RenderStyles) chasen.TextStyle {
+    return switch (kind) {
         .added => styles.added_marker,
         .removed => styles.removed_marker,
         .context => styles.context_marker,
         .metadata => styles.metadata,
     };
-    if (staged) style.dim = true;
-    return style;
 }
 
-fn gutterLeadInStyle(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
-    var style: chasen.TextStyle = switch (kind) {
+fn gutterLeadInStyle(kind: diff_parser.DiffLine.Kind, styles: RenderStyles) chasen.TextStyle {
+    return switch (kind) {
         .added => .{ .bg = styles.added_text.bg },
         .removed => .{ .bg = styles.removed_text.bg },
         .context => .{ .bg = styles.context.bg },
         .metadata => .{},
     };
-    if (staged) style.dim = true;
-    return style;
 }
 
-fn lineNumberStyle(kind: diff_parser.DiffLine.Kind, staged: bool, styles: RenderStyles) chasen.TextStyle {
+fn lineNumberStyle(kind: diff_parser.DiffLine.Kind, styles: RenderStyles) chasen.TextStyle {
     var style = switch (kind) {
         .added => styles.added_line_number,
         .removed => styles.removed_line_number,
@@ -1054,7 +1048,6 @@ fn lineNumberStyle(kind: diff_parser.DiffLine.Kind, staged: bool, styles: Render
         .metadata => styles.metadata,
     };
     if (kind == .context) style.bg = styles.context.bg;
-    if (staged) style.dim = true;
     return style;
 }
 
@@ -1092,7 +1085,9 @@ const RenderStyles = struct {
     file_header: chasen.TextStyle,
     hunk: chasen.TextStyle,
     selected_hunk: chasen.TextStyle,
+    staged_hunk_header: chasen.TextStyle,
     hunk_guide: chasen.TextStyle,
+    staged_hunk_guide: chasen.TextStyle,
     cursor: chasen.TextStyle,
     added_text: chasen.TextStyle,
     removed_text: chasen.TextStyle,
@@ -1113,7 +1108,11 @@ const RenderStyles = struct {
             .file_header = .{ .bold = true, .fg = palette.color(.accent) },
             .hunk = .{ .dim = true, .fg = palette.color(.diff_metadata) },
             .selected_hunk = .{ .bold = true, .fg = palette.color(.diff_hunk) },
+            .staged_hunk_header = .{ .bold = true, .fg = palette.color(.staged) },
             .hunk_guide = .{ .bold = true, .fg = palette.color(.diff_hunk) },
+            // Index membership colors current-hunk chrome only. Keeping it
+            // out of body styles preserves syntax and diff-kind readability.
+            .staged_hunk_guide = .{ .bold = true, .fg = palette.color(.staged) },
             .cursor = .{ .bold = true, .fg = palette.color(.diff_cursor) },
             // Keep diff state on backgrounds so body foreground is available
             // for syntax token colors once a provider is enabled.
@@ -1137,6 +1136,7 @@ fn stylesForOptions(options: RenderOptions) RenderStyles {
     var styles = RenderStyles.fromPalette(options.palette);
     if (!options.pane_active) {
         styles.hunk_guide.dim = true;
+        styles.staged_hunk_guide.dim = true;
         styles.cursor.dim = true;
     }
     return styles;
@@ -1351,10 +1351,13 @@ test "renderFile fills context gutter lead-in and line numbers with context back
     try std.testing.expect(new_line_number.style.bg.eql(palette.color(.diff_context_bg)));
 }
 
-test "renderFile dims staged hunk body without removing it" {
+test "renderFile colors staged current hunk header without dimming body" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 6);
     defer ts.deinit();
+    var palette = theme.Palette.default();
+    palette.colors[@intFromEnum(theme.Role.staged)] = .{ .rgb = .{ 61, 62, 63 } };
+    palette.colors[@intFromEnum(theme.Role.diff_hunk)] = .{ .rgb = .{ 71, 72, 73 } };
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
@@ -1378,27 +1381,29 @@ test "renderFile dims staged hunk body without removing it" {
 
     try renderFile(&ts.surface, file, .{
         .requested_mode = .unified,
+        .highlighted_hunk = 0,
         .hunk_stages = .all_staged,
+        .palette = palette,
     });
 
     const header_cell = ts.surface.readCell(2, 3).?;
-    try std.testing.expect(header_cell.style.bg.eql(.{ .index = 8 }));
+    try std.testing.expect(header_cell.style.fg.eql(palette.color(.staged)));
+    try std.testing.expect(!header_cell.style.dim);
+    try std.testing.expect(header_cell.style.bg.eql(.default));
     const gutter_cell = ts.surface.readCell(3, 4).?;
     try std.testing.expect(gutter_cell.style.bg.eql(theme.Palette.default().color(.diff_removed_bg)));
-    try std.testing.expect(gutter_cell.style.dim);
+    try std.testing.expect(!gutter_cell.style.dim);
+    try std.testing.expect(!ts.surface.readCell(5, 4).?.style.dim);
+    try std.testing.expect(!ts.surface.readCell(12, 4).?.style.dim);
     try ts.expectCellText(14, 4, "o");
     const old_cell = ts.surface.readCell(14, 4).?;
-    try std.testing.expect(old_cell.style.dim);
+    try std.testing.expect(!old_cell.style.dim);
     try ts.expectCellText(14, 5, "n");
     const new_cell = ts.surface.readCell(14, 5).?;
-    try std.testing.expect(new_cell.style.dim);
+    try std.testing.expect(!new_cell.style.dim);
 }
 
-test "renderFile consumes exact per-hunk stage presentation" {
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(80, 7);
-    defer ts.deinit();
-
+test "renderFile colors current header and guide from exact per-hunk stage state" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
         .old_path = "a/src/main.zig",
@@ -1424,15 +1429,89 @@ test "renderFile consumes exact per-hunk stage presentation" {
         },
     };
     const states = [_]HunkStageState{ .staged, .unstaged };
+    var palette = theme.Palette.default();
+    palette.colors[@intFromEnum(theme.Role.staged)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.diff_hunk)] = .{ .rgb = .{ 4, 5, 6 } };
 
-    try renderFile(&ts.surface, file, .{
+    var staged: chasen.testing.TestSurface = undefined;
+    try staged.init(80, 7);
+    defer staged.deinit();
+    try renderFile(&staged.surface, file, .{
         .requested_mode = .unified,
+        .highlighted_hunk = 0,
         .hunk_stages = .{ .per_hunk = &states },
+        .palette = palette,
+    });
+    try staged.expectCellText(1, body_start_row, "╭");
+    try staged.expectCellText(1, body_start_row + 1, "╰");
+    try staged.expectCellText(1, body_start_row + 2, " ");
+    try std.testing.expect(staged.surface.readCell(1, body_start_row).?.style.fg.eql(palette.color(.staged)));
+    try std.testing.expect(staged.surface.readCell(2, body_start_row).?.style.fg.eql(palette.color(.staged)));
+    try std.testing.expect(!staged.surface.readCell(cursor_gutter_width + lineTextStart(true, .unified), body_start_row + 1).?.style.dim);
+
+    var unstaged: chasen.testing.TestSurface = undefined;
+    try unstaged.init(80, 7);
+    defer unstaged.deinit();
+    try renderFile(&unstaged.surface, file, .{
+        .requested_mode = .unified,
+        .highlighted_hunk = 1,
+        .hunk_stages = .{ .per_hunk = &states },
+        .palette = palette,
+    });
+    try unstaged.expectCellText(1, body_start_row, " ");
+    try unstaged.expectCellText(1, body_start_row + 2, "╭");
+    try unstaged.expectCellText(1, body_start_row + 3, "╰");
+    try std.testing.expect(unstaged.surface.readCell(1, body_start_row + 2).?.style.fg.eql(palette.color(.diff_hunk)));
+    try std.testing.expect(unstaged.surface.readCell(2, body_start_row + 2).?.style.fg.eql(palette.color(.diff_hunk)));
+    try std.testing.expect(!unstaged.surface.readCell(cursor_gutter_width + lineTextStart(true, .unified), body_start_row + 3).?.style.dim);
+}
+
+test "whole-file and per-hunk staged authority converge on current hunk presentation" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 0,
+            .old_count = 0,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{.{ .kind = .added, .text = "new", .new_line = 1 }},
+        }},
+    };
+    const staged_state = [_]HunkStageState{.staged};
+    var palette = theme.Palette.default();
+    palette.colors[@intFromEnum(theme.Role.staged)] = .{ .rgb = .{ 21, 22, 23 } };
+    palette.colors[@intFromEnum(theme.Role.diff_hunk)] = .{ .rgb = .{ 31, 32, 33 } };
+
+    var whole_file: chasen.testing.TestSurface = undefined;
+    try whole_file.init(80, 5);
+    defer whole_file.deinit();
+    try renderFile(&whole_file.surface, file, .{
+        .highlighted_hunk = 0,
+        .hunk_stages = .all_staged,
+        .palette = palette,
     });
 
-    const text_col = cursor_gutter_width + lineTextStart(true, .unified);
-    try std.testing.expect(ts.surface.readCell(text_col, body_start_row + 1).?.style.dim);
-    try std.testing.expect(!ts.surface.readCell(text_col, body_start_row + 3).?.style.dim);
+    var individual_hunk: chasen.testing.TestSurface = undefined;
+    try individual_hunk.init(80, 5);
+    defer individual_hunk.deinit();
+    try renderFile(&individual_hunk.surface, file, .{
+        .highlighted_hunk = 0,
+        .hunk_stages = .{ .per_hunk = &staged_state },
+        .palette = palette,
+    });
+
+    const whole_file_guide = whole_file.surface.readCell(1, body_start_row).?;
+    const individual_hunk_guide = individual_hunk.surface.readCell(1, body_start_row).?;
+    const whole_file_header = whole_file.surface.readCell(2, body_start_row).?;
+    const individual_hunk_header = individual_hunk.surface.readCell(2, body_start_row).?;
+    try std.testing.expect(whole_file_guide.style.fg.eql(palette.color(.staged)));
+    try std.testing.expect(individual_hunk_guide.style.fg.eql(whole_file_guide.style.fg));
+    try std.testing.expect(whole_file_header.style.fg.eql(palette.color(.staged)));
+    try std.testing.expect(individual_hunk_header.style.fg.eql(whole_file_header.style.fg));
 }
 
 test "renderFile applies unified syntax spans without removing diff background" {
@@ -1564,27 +1643,27 @@ test "renderFile normalizes highlighted unified body base foreground" {
     const context_cell = ts.surface.readCell(14, 4).?;
     try std.testing.expect(context_cell.style.fg.eql(.default));
     try std.testing.expect(context_cell.style.bg.eql(palette.color(.diff_context_bg)));
-    try std.testing.expect(context_cell.style.dim);
+    try std.testing.expect(!context_cell.style.dim);
 
     const removed_keyword = ts.surface.readCell(14, 5).?;
     try std.testing.expect(removed_keyword.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(removed_keyword.style.bg.eql(palette.color(.diff_removed_bg)));
-    try std.testing.expect(removed_keyword.style.dim);
+    try std.testing.expect(!removed_keyword.style.dim);
 
     const removed_identifier = ts.surface.readCell(18, 5).?;
     try std.testing.expect(removed_identifier.style.fg.eql(.default));
     try std.testing.expect(removed_identifier.style.bg.eql(palette.color(.diff_removed_bg)));
-    try std.testing.expect(removed_identifier.style.dim);
+    try std.testing.expect(!removed_identifier.style.dim);
 
     const added_identifier = ts.surface.readCell(18, 6).?;
     try std.testing.expect(added_identifier.style.fg.eql(.default));
     try std.testing.expect(added_identifier.style.bg.eql(palette.color(.diff_added_bg)));
-    try std.testing.expect(added_identifier.style.dim);
+    try std.testing.expect(!added_identifier.style.dim);
 
     const unspanned_added = ts.surface.readCell(14, 7).?;
     try std.testing.expect(unspanned_added.style.fg.eql(.default));
     try std.testing.expect(unspanned_added.style.bg.eql(palette.color(.diff_added_bg)));
-    try std.testing.expect(unspanned_added.style.dim);
+    try std.testing.expect(!unspanned_added.style.dim);
 }
 
 test "renderFile keeps unified diff prefix when spans do not change foreground" {
@@ -1860,7 +1939,7 @@ test "renderFile highlights only the selected side-by-side pane side" {
     try std.testing.expect(new_body.style.bg.eql(palette.color(.diff_added_bg)));
 }
 
-test "review diff cursor character selection colors only exact tokens and preserves syntax and staged style" {
+test "review diff cursor character selection preserves syntax without stage dim" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 6);
     defer ts.deinit();
@@ -1920,8 +1999,8 @@ test "review diff cursor character selection colors only exact tokens and preser
     try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(pane_bg));
     try std.testing.expect(selected_b.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(selected_c.style.fg.eql(palette.color(.accent)));
-    try std.testing.expect(selected_b.style.dim);
-    try std.testing.expect(selected_c.style.dim);
+    try std.testing.expect(!selected_b.style.dim);
+    try std.testing.expect(!selected_c.style.dim);
 }
 
 test "review diff cursor side-by-side character selection stays inside the locked pane text" {
@@ -2163,19 +2242,24 @@ test "renderFile clips syntax spans through horizontal scroll without splitting 
     try std.testing.expect(cell.style.bg.eql(palette.color(.diff_added_bg)));
 }
 
-test "hunkHeaderStyle composes highlighted and staged state" {
+test "hunkHeaderStyle colors current hunk from exact stage state" {
     const styles = RenderStyles.fromPalette(.default());
-    const style = hunkHeaderStyle(true, true, styles);
+    const unstaged = hunkHeaderStyle(.unstaged, styles);
+    const staged = hunkHeaderStyle(.staged, styles);
 
-    try std.testing.expect(style.fg.eql(styles.selected_hunk.fg));
-    try std.testing.expect(!style.reverse);
-    try std.testing.expect(style.dim);
-    try std.testing.expect(style.bg.eql(.{ .index = 8 }));
+    try std.testing.expect(unstaged.fg.eql(styles.selected_hunk.fg));
+    try std.testing.expect(staged.fg.eql(styles.staged_hunk_header.fg));
+    try std.testing.expect(!unstaged.reverse);
+    try std.testing.expect(!staged.reverse);
+    try std.testing.expect(!unstaged.dim);
+    try std.testing.expect(!staged.dim);
+    try std.testing.expect(unstaged.bg.eql(.default));
+    try std.testing.expect(staged.bg.eql(.default));
 }
 
 test "hunkHeaderStyle dims unselected hunk header" {
     const styles = RenderStyles.fromPalette(.default());
-    const style = hunkHeaderStyle(false, false, styles);
+    const style = hunkHeaderStyle(null, styles);
 
     try std.testing.expect(style.dim);
     try std.testing.expect(style.fg.eql(styles.hunk.fg));
@@ -2225,6 +2309,50 @@ test "selected hunk guide is drawn only for highlighted hunk" {
     try std.testing.expect(guide_cell.style.fg.eql(RenderStyles.fromPalette(.default()).hunk_guide.fg));
 }
 
+test "side-by-side staged hunk colors current chrome without dimming body" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 5);
+    defer ts.deinit();
+
+    var palette = theme.Palette.default();
+    palette.colors[@intFromEnum(theme.Role.staged)] = .{ .rgb = .{ 41, 42, 43 } };
+    palette.colors[@intFromEnum(theme.Role.diff_hunk)] = .{ .rgb = .{ 51, 52, 53 } };
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{
+                .{ .kind = .removed, .text = "old", .old_line = 1 },
+                .{ .kind = .added, .text = "new", .new_line = 1 },
+            },
+        }},
+    };
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .side_by_side,
+        .highlighted_hunk = 0,
+        .hunk_stages = .all_staged,
+        .palette = palette,
+    });
+
+    try ts.expectCellText(1, body_start_row, "╭");
+    try ts.expectCellText(1, body_start_row + 1, "╰");
+    try std.testing.expect(ts.surface.readCell(1, body_start_row).?.style.fg.eql(palette.color(.staged)));
+    try std.testing.expect(ts.surface.readCell(2, body_start_row).?.style.fg.eql(palette.color(.staged)));
+    const geometry = sideBySideGeometry(bodyWidth(100));
+    const old_text_col = cursor_gutter_width + geometry.old.col + lineTextStart(true, .side_by_side);
+    const new_text_col = cursor_gutter_width + geometry.new.col + lineTextStart(true, .side_by_side);
+    try std.testing.expect(!ts.surface.readCell(old_text_col, body_start_row + 1).?.style.dim);
+    try std.testing.expect(!ts.surface.readCell(new_text_col, body_start_row + 1).?.style.dim);
+}
+
 test "selected hunk guide is dim when pane is inactive" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 7);
@@ -2259,12 +2387,15 @@ test "selected hunk guide is dim when pane is inactive" {
         .requested_mode = .unified,
         .highlighted_hunk = 1,
         .pane_active = false,
+        .hunk_stages = .all_staged,
     });
 
     const guide_cell = ts.surface.readCell(1, 5).?;
+    const header_cell = ts.surface.readCell(2, 5).?;
     try ts.expectCellText(1, 5, "╭");
     try std.testing.expect(guide_cell.style.dim);
-    try std.testing.expect(guide_cell.style.fg.eql(RenderStyles.fromPalette(.default()).hunk_guide.fg));
+    try std.testing.expect(guide_cell.style.fg.eql(RenderStyles.fromPalette(.default()).staged_hunk_guide.fg));
+    try std.testing.expect(header_cell.style.fg.eql(RenderStyles.fromPalette(.default()).staged_hunk_header.fg));
 }
 
 test "selected hunk guide continues when hunk header is scrolled above viewport" {
@@ -2335,11 +2466,13 @@ test "selected hunk guide is suppressed for folded highlighted hunk" {
     try renderFile(&ts.surface, file, .{
         .requested_mode = .unified,
         .highlighted_hunk = 0,
+        .hunk_stages = .all_staged,
         .folded_hunks = &.{true},
     });
 
     try ts.expectCellText(1, 3, " ");
     try ts.expectCellText(2, 3, "▸");
+    try std.testing.expect(ts.surface.readCell(2, 3).?.style.fg.eql(theme.Palette.default().color(.staged)));
 }
 
 test "displayPath prefers new path and strips git prefixes" {
@@ -2981,7 +3114,7 @@ test "review diff cursor composes unified selection inside pane chrome" {
     try std.testing.expect(new_number.style.fg.eql(palette.color(.pane_active_line_number)));
     const text = ts.surface.readCell(cursor_gutter_width + lineTextStart(true, .unified), row).?;
     try std.testing.expect(text.style.bg.eql(selection_bg));
-    try std.testing.expect(text.style.dim);
+    try std.testing.expect(!text.style.dim);
     try std.testing.expect(ts.surface.readCell(79, row).?.style.bg.eql(selection_bg));
     try std.testing.expect(!ts.surface.readCell(79, body_start_row).?.style.bg.eql(pane_bg));
 }
@@ -3156,6 +3289,8 @@ test "review diff cursor covers metadata binary and hunk rows only while active"
     defer hunk.deinit();
     try renderFile(&hunk.surface, text_file, .{ .cursor_offset = 1, .palette = palette, .hunk_stages = .all_staged });
     try expectBgRange(&hunk.surface, body_start_row + 1, 0, 80, palette.color(.pane_cursor_bg));
+    // A hunk header without highlighted_hunk remains metadata-dim; this is
+    // cursor ownership, not stage-owned body dimming.
     try std.testing.expect(hunk.surface.readCell(2, body_start_row + 1).?.style.dim);
 
     var binary: chasen.testing.TestSurface = undefined;
