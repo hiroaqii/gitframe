@@ -21,6 +21,7 @@ const path_key_mod = @import("../path_key.zig");
 const process_runner = @import("../process/runner.zig");
 const projection_component = @import("projection_component.zig");
 const review_projection = @import("review_projection.zig");
+const review_read_epoch = @import("review_read_epoch.zig");
 const repo_discovery = @import("../repo/discovery.zig");
 const root_capability = @import("../repo/root_capability.zig");
 const selected_document = @import("../repository/document.zig");
@@ -41,6 +42,7 @@ const untracked_stats_total_bytes = 4 * 1024 * 1024;
 /// Result payload sent from the asynchronous diff load task back to App.
 pub const DiffLoadFinished = struct {
     identity: page.RequestIdentity,
+    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch = .{},
     generation: u64,
     background_cycle_id: ?u64 = null,
     result: DiffLoadTaskResult,
@@ -80,6 +82,7 @@ pub const RepoPathDiscoveryFinished = struct {
 /// Result payload sent from the asynchronous status load task.
 pub const StatusLoadFinished = struct {
     identity: page.RequestIdentity,
+    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch = .{},
     generation: u64,
     background_cycle_id: ?u64 = null,
     repo_root: []u8,
@@ -94,6 +97,7 @@ pub const StatusLoadFinished = struct {
 /// Result payload sent from the asynchronous branch status load task.
 pub const BranchStatusLoadFinished = struct {
     identity: page.RequestIdentity,
+    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch = .{},
     generation: u64,
     background_cycle_id: ?u64 = null,
     repo_root: []u8,
@@ -407,6 +411,7 @@ pub fn runPathDiscovery(path: []const u8, allocator: std.mem.Allocator, io: std.
 pub fn DiffLoadTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
+        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
         request: LoadRequest,
         generation: u64,
         expected_fingerprint: ?content_fingerprint.Fingerprint = null,
@@ -421,6 +426,7 @@ pub fn DiffLoadTask(comptime Msg: type) type {
 
             return Msg.loadFinished(.{ .review = .{ .source = DiffLoadFinished{
                 .identity = task.identity,
+                .read_epoch = task.read_epoch,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .result = runLoadExpected(task.request, task.expected_fingerprint, allocator, io),
@@ -436,6 +442,7 @@ pub fn DiffLoadTask(comptime Msg: type) type {
 
             return Msg.loadFinished(.{ .review = .{ .source = DiffLoadFinished{
                 .identity = task.identity,
+                .read_epoch = task.read_epoch,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
@@ -447,6 +454,7 @@ pub fn DiffLoadTask(comptime Msg: type) type {
 pub fn StatusLoadTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
+        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
         repo_root: []u8,
         generation: u64,
         origin: git_backend.ReadOrigin = .foreground,
@@ -458,6 +466,7 @@ pub fn StatusLoadTask(comptime Msg: type) type {
 
             const result = StatusLoadFinished{
                 .identity = task.identity,
+                .read_epoch = task.read_epoch,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
@@ -474,6 +483,7 @@ pub fn StatusLoadTask(comptime Msg: type) type {
 
             const result = StatusLoadFinished{
                 .identity = task.identity,
+                .read_epoch = task.read_epoch,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
@@ -489,6 +499,7 @@ pub fn StatusLoadTask(comptime Msg: type) type {
 pub fn BranchStatusLoadTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
+        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
         repo_root: []u8,
         /// Borrowed from process initialization; App and the runtime keep it
         /// alive until every spawned task has completed.
@@ -502,6 +513,7 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
 
             const result = BranchStatusLoadFinished{
                 .identity = task.identity,
+                .read_epoch = task.read_epoch,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
@@ -518,6 +530,7 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
 
             const result = BranchStatusLoadFinished{
                 .identity = task.identity,
+                .read_epoch = task.read_epoch,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
@@ -2556,7 +2569,7 @@ fn runTestGit(io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !void {
     return error.GitCommandFailed;
 }
 
-test "StatusLoadTask failed preserves generation and moves repo root" {
+test "StatusLoadTask failed preserves read epoch generation and moves repo root" {
     const TestLoadMsg = ReadFinished;
     const TestMsg = union(enum) {
         load: TestLoadMsg,
@@ -2571,6 +2584,7 @@ test "StatusLoadTask failed preserves generation and moves repo root" {
     const task = try allocator.create(Task);
     task.* = .{
         .identity = page.RequestIdentity.review(7, 11),
+        .read_epoch = .{ .value = 19 },
         .repo_root = try allocator.dupe(u8, "/repo"),
         .generation = 42,
     };
@@ -2589,6 +2603,7 @@ test "StatusLoadTask failed preserves generation and moves repo root" {
 
     try std.testing.expectEqual(@as(u64, 42), finished.generation);
     try std.testing.expectEqual(page.RequestIdentity.review(7, 11), finished.identity);
+    try std.testing.expect(finished.read_epoch.eql(.{ .value = 19 }));
     try std.testing.expectEqualStrings("/repo", finished.repo_root);
     try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
         .failed_static => |message| message,
@@ -2596,7 +2611,7 @@ test "StatusLoadTask failed preserves generation and moves repo root" {
     });
 }
 
-test "DiffLoadTask failed frees request and preserves generation" {
+test "DiffLoadTask failed frees request and preserves read epoch generation" {
     const TestLoadMsg = ReadFinished;
     const TestMsg = union(enum) {
         load: TestLoadMsg,
@@ -2611,6 +2626,7 @@ test "DiffLoadTask failed frees request and preserves generation" {
     const task = try allocator.create(Task);
     task.* = .{
         .identity = page.RequestIdentity.review(3, 5),
+        .read_epoch = .{ .value = 23 },
         .request = .{
             .source = .{ .range = try allocator.dupe(u8, "HEAD~1..HEAD") },
             .repo_root = try allocator.dupe(u8, "/repo"),
@@ -2632,7 +2648,51 @@ test "DiffLoadTask failed frees request and preserves generation" {
 
     try std.testing.expectEqual(@as(u64, 9), finished.generation);
     try std.testing.expectEqual(page.RequestIdentity.review(3, 5), finished.identity);
+    try std.testing.expect(finished.read_epoch.eql(.{ .value = 23 }));
     try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
+        .failed_static => |message| message,
+        else => return error.UnexpectedResult,
+    });
+}
+
+test "BranchStatusLoadTask failed preserves read epoch generation and moves repo root" {
+    const TestLoadMsg = ReadFinished;
+    const TestMsg = union(enum) {
+        load: TestLoadMsg,
+
+        pub fn loadFinished(msg: TestLoadMsg) @This() {
+            return .{ .load = msg };
+        }
+    };
+    const Task = BranchStatusLoadTask(TestMsg);
+    const allocator = std.testing.allocator;
+
+    const task = try allocator.create(Task);
+    task.* = .{
+        .identity = page.RequestIdentity.review(5, 13),
+        .read_epoch = .{ .value = 29 },
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .env_map = null,
+        .generation = 47,
+    };
+
+    const msg = Task.failed(task, .{ .start_failed = "SystemResources" }, allocator);
+    var finished = switch (msg) {
+        .load => |load| switch (load) {
+            .review => |review| switch (review) {
+                .branch_status => |payload| payload,
+                else => return error.UnexpectedReadRoute,
+            },
+            else => return error.UnexpectedReadRoute,
+        },
+    };
+    defer finished.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 47), finished.generation);
+    try std.testing.expectEqual(page.RequestIdentity.review(5, 13), finished.identity);
+    try std.testing.expect(finished.read_epoch.eql(.{ .value = 29 }));
+    try std.testing.expectEqualStrings("/repo", finished.repo_root);
+    try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
         .failed_static => |message| message,
         else => return error.UnexpectedResult,
     });

@@ -116,6 +116,7 @@ pub const ReloadAnchor = struct {
 
 pub const PendingReload = struct {
     generation: u64,
+    read_epoch: repository_read_authority.ReviewRepositoryReadEpoch = .{},
     kind: ReloadKind,
     anchor: ?ReloadAnchor = null,
 

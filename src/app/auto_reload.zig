@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("../config.zig");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const diff_source = @import("../diff/source.zig");
+const review_read_epoch = @import("review_read_epoch.zig");
 
 pub const Activation = enum {
     disabled,
@@ -96,6 +97,7 @@ pub const LoadOrigin = enum {
 
 pub const AuxiliaryPending = struct {
     generation: u64,
+    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch = .{},
     origin: LoadOrigin = .foreground,
     background_cycle_id: ?u64 = null,
 };
@@ -112,9 +114,14 @@ pub const AuxiliaryTracker = struct {
         return self.generation;
     }
 
-    pub fn begin(self: *AuxiliaryTracker, background_cycle_id: ?u64) void {
+    pub fn begin(
+        self: *AuxiliaryTracker,
+        background_cycle_id: ?u64,
+        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+    ) void {
         self.pending = .{
             .generation = self.generation,
+            .read_epoch = read_epoch,
             .origin = if (background_cycle_id == null) .foreground else .background,
             .background_cycle_id = background_cycle_id,
         };
@@ -438,24 +445,27 @@ test "replacement invalidation preserves failure identity but fails closed" {
     try std.testing.expect(state.last_failure.?.eql(failure));
 }
 
-test "auxiliary tracker keeps retained display separate from action freshness" {
+test "auxiliary tracker keeps read epoch and retained display separate from action freshness" {
     var tracker: AuxiliaryTracker = .{};
     const initial = tracker.prepare(false);
-    tracker.begin(null);
+    tracker.begin(null, .{ .value = 17 });
     try std.testing.expect(tracker.isPending());
+    try std.testing.expect(tracker.pending.?.read_epoch.eql(.{ .value = 17 }));
     try std.testing.expect(tracker.accept(initial));
     tracker.markSuccess();
     try std.testing.expect(tracker.isFresh());
 
     const background = tracker.prepare(true);
-    tracker.begin(7);
+    tracker.begin(7, .{ .value = 19 });
     try std.testing.expect(!tracker.isFresh());
+    try std.testing.expect(tracker.pending.?.read_epoch.eql(.{ .value = 19 }));
     try std.testing.expect(tracker.accept(background));
     tracker.markFailure(true);
     try std.testing.expect(!tracker.isFresh());
 
     const recovery = tracker.prepare(true);
-    tracker.begin(8);
+    tracker.begin(8, .{ .value = 23 });
+    try std.testing.expect(tracker.pending.?.read_epoch.eql(.{ .value = 23 }));
     try std.testing.expect(tracker.accept(recovery));
     tracker.markSuccess();
     try std.testing.expect(tracker.isFresh());

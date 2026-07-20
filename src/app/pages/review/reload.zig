@@ -17,6 +17,7 @@ const review_projection = @import("../../review_projection.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
 const review_page = @import("../review.zig");
+const ReviewRepositoryReadEpoch = review_page.repository_read_authority.ReviewRepositoryReadEpoch;
 const review_selection = @import("selection.zig");
 const session_hunk_mark = @import("session_hunk_mark.zig");
 const review_operations = if (builtin.is_test) @import("operations.zig") else struct {};
@@ -211,6 +212,7 @@ pub const OwnedRepoDiscoveryRead = struct {
 
 pub const OwnedSourceRead = struct {
     identity: app_page.RequestIdentity,
+    read_epoch: ReviewRepositoryReadEpoch,
     request: diff_source.LoadRequest,
     generation: u64,
     expected_fingerprint: ?content_fingerprint.Fingerprint,
@@ -224,6 +226,7 @@ pub const OwnedSourceRead = struct {
 
 pub const OwnedStatusRead = struct {
     identity: app_page.RequestIdentity,
+    read_epoch: ReviewRepositoryReadEpoch,
     repo_root: []u8,
     generation: u64,
     origin: git_backend.ReadOrigin,
@@ -237,6 +240,7 @@ pub const OwnedStatusRead = struct {
 
 pub const OwnedBranchStatusRead = struct {
     identity: app_page.RequestIdentity,
+    read_epoch: ReviewRepositoryReadEpoch,
     repo_root: []u8,
     generation: u64,
     background_cycle_id: ?u64,
@@ -1066,7 +1070,12 @@ pub const Controller = struct {
             .initial, .action_result, .repo_switch => null,
         };
         errdefer if (anchor) |*captured| captured.deinit(allocator);
-        self.page.pending_reload = .{ .generation = generation, .kind = kind, .anchor = anchor };
+        self.page.pending_reload = .{
+            .generation = generation,
+            .read_epoch = self.page.repository_read_authority.epoch,
+            .kind = kind,
+            .anchor = anchor,
+        };
     }
 
     pub fn takePendingReloadIfGeneration(self: Controller, generation: u64) ?review_page.PendingReload {
@@ -1213,6 +1222,7 @@ pub const Controller = struct {
 
         return .{ .command = .{ .source_load = .{
             .identity = identity,
+            .read_epoch = self.page.repository_read_authority.epoch,
             .request = request,
             .generation = generation,
             .expected_fingerprint = expected_fingerprint,
@@ -1269,10 +1279,11 @@ pub const Controller = struct {
             self.dropStatusSnapshot(allocator);
         }
         const owned_root = try allocator.dupe(u8, repo_root);
-        self.page.status_load.begin(background_cycle_id);
+        self.page.status_load.begin(background_cycle_id, self.page.repository_read_authority.epoch);
         self.page.activation.markPending(.status);
         return .{ .command = .{ .status_load = .{
             .identity = identity,
+            .read_epoch = self.page.repository_read_authority.epoch,
             .repo_root = owned_root,
             .generation = self.page.status_load.generation,
             .origin = origin,
@@ -1307,10 +1318,11 @@ pub const Controller = struct {
             self.invalidateBranchStatusSnapshot();
         }
         const owned_root = try allocator.dupe(u8, repo_root);
-        self.page.branch_status_load.begin(background_cycle_id);
+        self.page.branch_status_load.begin(background_cycle_id, self.page.repository_read_authority.epoch);
         self.page.activation.markPending(.branch);
         return .{ .command = .{ .branch_status_load = .{
             .identity = identity,
+            .read_epoch = self.page.repository_read_authority.epoch,
             .repo_root = owned_root,
             .generation = self.page.branch_status_load.generation,
             .background_cycle_id = background_cycle_id,
@@ -3366,6 +3378,7 @@ test "owned read command variants release every payload" {
 
     var source_update: ReviewUpdate = .{ .command = .{ .source_load = .{
         .identity = app_page.RequestIdentity.review(0, 1),
+        .read_epoch = .{},
         .request = try diff_source.cloneLoadRequest(allocator, .{ .source = .{ .range = "main...HEAD" }, .repo_root = "/repo" }),
         .generation = 1,
         .expected_fingerprint = null,
@@ -3375,6 +3388,7 @@ test "owned read command variants release every payload" {
 
     var status_update: ReviewUpdate = .{ .command = .{ .status_load = .{
         .identity = app_page.RequestIdentity.review(0, 1),
+        .read_epoch = .{},
         .repo_root = try allocator.dupe(u8, "/repo"),
         .generation = 2,
         .origin = .foreground,
@@ -3384,6 +3398,7 @@ test "owned read command variants release every payload" {
 
     var branch_update: ReviewUpdate = .{ .command = .{ .branch_status_load = .{
         .identity = app_page.RequestIdentity.review(0, 1),
+        .read_epoch = .{},
         .repo_root = try allocator.dupe(u8, "/repo"),
         .generation = 3,
         .background_cycle_id = null,
@@ -3402,6 +3417,46 @@ test "owned read command variants release every payload" {
         6,
     ) } };
     projection_update.deinit(allocator);
+}
+
+test "review read epoch is captured by source status and branch commands" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{};
+    defer page.deinit(allocator);
+    page.repository_read_authority.epoch = .{ .value = 41 };
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    {
+        var update = try controller.prepareSourceLoad(
+            allocator,
+            "/repo",
+            .{ .clear_visible_state = false, .kind = .manual },
+        );
+        defer update.deinit(allocator);
+        var command = update.takeCommand() orelse return error.ExpectedSourceCommand;
+        defer command.deinit(allocator);
+        try std.testing.expect(command.source_load.read_epoch.eql(.{ .value = 41 }));
+        try std.testing.expect(page.pending_reload.?.read_epoch.eql(.{ .value = 41 }));
+    }
+
+    {
+        var update = try controller.prepareStatusLoad(allocator, "/repo", .foreground, null);
+        defer update.deinit(allocator);
+        var command = update.takeCommand() orelse return error.ExpectedStatusCommand;
+        defer command.deinit(allocator);
+        try std.testing.expect(command.status_load.read_epoch.eql(.{ .value = 41 }));
+        try std.testing.expect(page.status_load.pending.?.read_epoch.eql(.{ .value = 41 }));
+    }
+
+    {
+        var update = try controller.prepareBranchStatusLoad(allocator, "/repo", null);
+        defer update.deinit(allocator);
+        var command = update.takeCommand() orelse return error.ExpectedBranchCommand;
+        defer command.deinit(allocator);
+        try std.testing.expect(command.branch_status_load.read_epoch.eql(.{ .value = 41 }));
+        try std.testing.expect(page.branch_status_load.pending.?.read_epoch.eql(.{ .value = 41 }));
+    }
 }
 
 test "repository discovery transfers ownership only after Review acceptance" {
@@ -3566,12 +3621,12 @@ test "read command reject terminals clear only matching page state" {
     try std.testing.expect(page.load.pending == null);
 
     _ = page.status_load.prepare(false);
-    page.status_load.begin(null);
+    page.status_load.begin(null, .{});
     controller.rejectStatusSpawn(null);
     try std.testing.expect(page.status_load.pending == null);
 
     _ = page.branch_status_load.prepare(false);
-    page.branch_status_load.begin(null);
+    page.branch_status_load.begin(null, .{});
     controller.rejectBranchStatusSpawn(null);
     try std.testing.expect(page.branch_status_load.pending == null);
 
@@ -3900,7 +3955,7 @@ test "status line stats change invalidates retained projection cache" {
     try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
 
     _ = page.status_load.prepare(false);
-    page.status_load.begin(null);
+    page.status_load.begin(null, .{});
     var identical = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
     try identical.attachLineStats(&.{.{ .path_key = "a", .stats = .{ .added = 1, .removed = 1 } }});
     var identical_finished: app_load.StatusLoadFinished = .{
@@ -3916,7 +3971,7 @@ test "status line stats change invalidates retained projection cache" {
     try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
 
     _ = page.status_load.prepare(false);
-    page.status_load.begin(null);
+    page.status_load.begin(null, .{});
     var changed = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
     try changed.attachLineStats(&.{.{ .path_key = "a", .stats = .{ .added = 2, .removed = 1 } }});
     var finished: app_load.StatusLoadFinished = .{
@@ -4065,7 +4120,7 @@ fn acceptEmptyStatus(
     page: *review_page.ReviewPageState,
 ) !CompletionApply {
     _ = page.status_load.prepare(false);
-    page.status_load.begin(null);
+    page.status_load.begin(null, .{});
     var finished: app_load.StatusLoadFinished = .{
         .identity = page.activation.currentIdentity().?,
         .generation = page.status_load.generation,
@@ -4132,7 +4187,7 @@ test "accepted status replacement clears then republishes the retained file sear
     const controller = testController(&page, &status_message, .unstaged);
 
     _ = page.status_load.prepare(false);
-    page.status_load.begin(null);
+    page.status_load.begin(null, .{});
     var incoming = try git_status.StatusBundle.parseOwned(allocator, "?? src/owned.zig\x00");
     var finished: app_load.StatusLoadFinished = .{
         .identity = page.activation.currentIdentity().?,

@@ -8,28 +8,7 @@
 
 const std = @import("std");
 const actions = @import("../../actions.zig");
-
-/// Scalar namespace captured by every repository-derived Review read.
-///
-/// Zero is reserved as invalid so default construction and wraparound never
-/// manufacture an epoch which can be confused with absent request plumbing.
-pub const ReviewRepositoryReadEpoch = struct {
-    value: u64 = 1,
-
-    pub fn eql(self: ReviewRepositoryReadEpoch, other: ReviewRepositoryReadEpoch) bool {
-        return self.value == other.value;
-    }
-
-    pub fn next(self: ReviewRepositoryReadEpoch) ReviewRepositoryReadEpoch {
-        var value = self.value +% 1;
-        if (value == 0) value = 1;
-        return .{ .value = value };
-    }
-
-    pub fn isValid(self: ReviewRepositoryReadEpoch) bool {
-        return self.value != 0;
-    }
-};
+pub const ReviewRepositoryReadEpoch = @import("../../review_read_epoch.zig").ReviewRepositoryReadEpoch;
 
 pub const Phase = union(enum) {
     open,

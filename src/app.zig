@@ -1699,6 +1699,7 @@ pub const App = struct {
         };
         task.* = .{
             .identity = source.identity,
+            .read_epoch = source.read_epoch,
             .request = source.request,
             .generation = source.generation,
             .expected_fingerprint = source.expected_fingerprint,
@@ -1770,6 +1771,7 @@ pub const App = struct {
         };
         task.* = .{
             .identity = status_read.identity,
+            .read_epoch = status_read.read_epoch,
             .repo_root = status_read.repo_root,
             .generation = status_read.generation,
             .origin = status_read.origin,
@@ -1815,6 +1817,7 @@ pub const App = struct {
         };
         task.* = .{
             .identity = branch_read.identity,
+            .read_epoch = branch_read.read_epoch,
             .repo_root = branch_read.repo_root,
             .env_map = self.env_map,
             .generation = branch_read.generation,
@@ -8968,7 +8971,7 @@ test "background branch failure retains display and identical recovery restores 
     const cycle_id = app.pages.review.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .branch));
     const generation = app.pages.review.branch_status_load.prepare(true);
-    app.pages.review.branch_status_load.begin(cycle_id);
+    app.pages.review.branch_status_load.begin(cycle_id, .{});
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     app.finishBranchStatusLoad(&ctx, .{
         .identity = page.RequestIdentity.review(0, 1),
@@ -8983,7 +8986,7 @@ test "background branch failure retains display and identical recovery restores 
     try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 
     const recovery_generation = app.pages.review.branch_status_load.prepare(true);
-    app.pages.review.branch_status_load.begin(null);
+    app.pages.review.branch_status_load.begin(null, .{});
     const same = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc",
         .branch = "main",
@@ -9014,7 +9017,7 @@ test "background branch completion during repository action is discarded and rel
     const cycle_id = app.pages.review.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .branch));
     const generation = app.pages.review.branch_status_load.prepare(true);
-    app.pages.review.branch_status_load.begin(cycle_id);
+    app.pages.review.branch_status_load.begin(cycle_id, .{});
     _ = app.actions.begin(.stage_file);
     const changed = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "new-oid",
@@ -10179,6 +10182,7 @@ test "review repository transition E2b common switch commits exact path before r
         .config = .{ .source = .unstaged },
         .pages = .{
             .review = .{
+                .repository_read_authority = .{ .epoch = .{ .value = 31 } },
                 .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
                 .viewer = .{
                     .selected_target = .{ .diff_file = 0 },
@@ -10219,6 +10223,9 @@ test "review repository transition E2b common switch commits exact path before r
     try std.testing.expectEqual(active.activation_id, status_task.identity.activation_id);
     try std.testing.expectEqual(active.activation_id, branch_task.identity.activation_id);
     try std.testing.expectEqual(active.activation_id, diff_task.identity.activation_id);
+    try std.testing.expect(status_task.read_epoch.eql(.{ .value = 31 }));
+    try std.testing.expect(branch_task.read_epoch.eql(.{ .value = 31 }));
+    try std.testing.expect(diff_task.read_epoch.eql(.{ .value = 31 }));
 }
 
 test "review repository transition E2b blocker retains page owner and Review state" {
@@ -13532,7 +13539,7 @@ test "unchanged full cycle preserves projection semantic identity" {
     const scroll_before = app.pages.review.viewer.diff_scroll;
 
     const status_generation = app.pages.review.status_load.prepare(true);
-    app.pages.review.status_load.begin(1);
+    app.pages.review.status_load.begin(1, .{});
     app.pages.review.load.generation +%= 1;
     try std.testing.expect(app.pages.review.status_load.accept(status_generation));
     app.pages.review.status_load.markSuccess();
@@ -15966,7 +15973,7 @@ test "background status failure retains display snapshot and marks action freshn
     const cycle_id = app.pages.review.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .status));
     const generation = app.pages.review.status_load.prepare(true);
-    app.pages.review.status_load.begin(cycle_id);
+    app.pages.review.status_load.begin(cycle_id, .{});
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishStatusLoad(&ctx, .{
@@ -15983,7 +15990,7 @@ test "background status failure retains display snapshot and marks action freshn
     try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 
     const recovery_generation = app.pages.review.status_load.prepare(true);
-    app.pages.review.status_load.begin(null);
+    app.pages.review.status_load.begin(null, .{});
     const same = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a.zig\x00");
     try app.finishStatusLoad(&ctx, .{
         .identity = page.RequestIdentity.review(0, 1),
@@ -16004,7 +16011,7 @@ test "background status completion during repository action is discarded and rel
     const cycle_id = app.pages.review.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .status));
     const generation = app.pages.review.status_load.prepare(true);
-    app.pages.review.status_load.begin(cycle_id);
+    app.pages.review.status_load.begin(cycle_id, .{});
     _ = app.actions.begin(.stage_file);
     const changed = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M new.zig\x00");
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
