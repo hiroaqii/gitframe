@@ -120,11 +120,31 @@ pub const PendingReload = struct {
     kind: ReloadKind,
     anchor: ?ReloadAnchor = null,
 
+    pub fn matchesTerminal(
+        self: PendingReload,
+        generation: u64,
+        read_epoch: repository_read_authority.ReviewRepositoryReadEpoch,
+    ) bool {
+        return self.generation == generation and self.read_epoch.eql(read_epoch);
+    }
+
     pub fn deinit(self: *PendingReload, allocator: std.mem.Allocator) void {
         if (self.anchor) |*anchor| anchor.deinit(allocator);
         self.* = undefined;
     }
 };
+
+test "pending reload matches only its exact read terminal" {
+    const pending: PendingReload = .{
+        .generation = 7,
+        .read_epoch = .{ .value = 13 },
+        .kind = .watch,
+    };
+
+    try std.testing.expect(pending.matchesTerminal(7, .{ .value = 13 }));
+    try std.testing.expect(!pending.matchesTerminal(8, .{ .value = 13 }));
+    try std.testing.expect(!pending.matchesTerminal(7, .{ .value = 14 }));
+}
 
 pub const PendingDisplayNavigationRestore = struct {
     repo_root: []u8,

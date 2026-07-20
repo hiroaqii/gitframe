@@ -100,6 +100,21 @@ pub const AuxiliaryPending = struct {
     read_epoch: review_read_epoch.ReviewRepositoryReadEpoch = .{},
     origin: LoadOrigin = .foreground,
     background_cycle_id: ?u64 = null,
+
+    pub fn matchesTerminal(self: AuxiliaryPending, terminal: AuxiliaryTerminal) bool {
+        return self.generation == terminal.generation and
+            self.read_epoch.eql(terminal.read_epoch) and
+            self.background_cycle_id == terminal.background_cycle_id;
+    }
+};
+
+/// Exact provenance returned by one auxiliary status or branch task.
+/// Publication admission is a separate page-authority decision; this value
+/// only proves which pending owner a completion is allowed to retire.
+pub const AuxiliaryTerminal = struct {
+    generation: u64,
+    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+    background_cycle_id: ?u64,
 };
 
 pub const AuxiliaryTracker = struct {
@@ -127,11 +142,11 @@ pub const AuxiliaryTracker = struct {
         };
     }
 
-    pub fn accept(self: *AuxiliaryTracker, result_generation: u64) bool {
-        if (result_generation != self.generation) return false;
-        if (self.pending) |pending| {
-            if (pending.generation == result_generation) self.pending = null;
-        }
+    pub fn finishTerminal(self: *AuxiliaryTracker, terminal: AuxiliaryTerminal) bool {
+        if (terminal.generation != self.generation) return false;
+        const pending = self.pending orelse return false;
+        if (!pending.matchesTerminal(terminal)) return false;
+        self.pending = null;
         return true;
     }
 
@@ -451,7 +466,11 @@ test "auxiliary tracker keeps read epoch and retained display separate from acti
     tracker.begin(null, .{ .value = 17 });
     try std.testing.expect(tracker.isPending());
     try std.testing.expect(tracker.pending.?.read_epoch.eql(.{ .value = 17 }));
-    try std.testing.expect(tracker.accept(initial));
+    try std.testing.expect(tracker.finishTerminal(.{
+        .generation = initial,
+        .read_epoch = .{ .value = 17 },
+        .background_cycle_id = null,
+    }));
     tracker.markSuccess();
     try std.testing.expect(tracker.isFresh());
 
@@ -459,14 +478,54 @@ test "auxiliary tracker keeps read epoch and retained display separate from acti
     tracker.begin(7, .{ .value = 19 });
     try std.testing.expect(!tracker.isFresh());
     try std.testing.expect(tracker.pending.?.read_epoch.eql(.{ .value = 19 }));
-    try std.testing.expect(tracker.accept(background));
+    try std.testing.expect(tracker.finishTerminal(.{
+        .generation = background,
+        .read_epoch = .{ .value = 19 },
+        .background_cycle_id = 7,
+    }));
     tracker.markFailure(true);
     try std.testing.expect(!tracker.isFresh());
 
     const recovery = tracker.prepare(true);
     tracker.begin(8, .{ .value = 23 });
     try std.testing.expect(tracker.pending.?.read_epoch.eql(.{ .value = 23 }));
-    try std.testing.expect(tracker.accept(recovery));
+    try std.testing.expect(tracker.finishTerminal(.{
+        .generation = recovery,
+        .read_epoch = .{ .value = 23 },
+        .background_cycle_id = 8,
+    }));
     tracker.markSuccess();
     try std.testing.expect(tracker.isFresh());
+}
+
+test "auxiliary tracker retires only its exact read terminal" {
+    var tracker: AuxiliaryTracker = .{};
+    const generation = tracker.prepare(true);
+    tracker.begin(11, .{ .value = 29 });
+
+    try std.testing.expect(!tracker.finishTerminal(.{
+        .generation = generation + 1,
+        .read_epoch = .{ .value = 29 },
+        .background_cycle_id = 11,
+    }));
+    try std.testing.expect(!tracker.finishTerminal(.{
+        .generation = generation,
+        .read_epoch = .{ .value = 30 },
+        .background_cycle_id = 11,
+    }));
+    try std.testing.expect(!tracker.finishTerminal(.{
+        .generation = generation,
+        .read_epoch = .{ .value = 29 },
+        .background_cycle_id = 12,
+    }));
+    try std.testing.expect(tracker.isPending());
+
+    const exact: AuxiliaryTerminal = .{
+        .generation = generation,
+        .read_epoch = .{ .value = 29 },
+        .background_cycle_id = 11,
+    };
+    try std.testing.expect(tracker.finishTerminal(exact));
+    try std.testing.expect(!tracker.isPending());
+    try std.testing.expect(!tracker.finishTerminal(exact));
 }

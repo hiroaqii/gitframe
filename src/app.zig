@@ -13543,7 +13543,11 @@ test "unchanged full cycle preserves projection semantic identity" {
     const status_generation = app.pages.review.status_load.prepare(true);
     app.pages.review.status_load.begin(1, .{});
     app.pages.review.load.generation +%= 1;
-    try std.testing.expect(app.pages.review.status_load.accept(status_generation));
+    try std.testing.expect(app.pages.review.status_load.finishTerminal(.{
+        .generation = status_generation,
+        .read_epoch = .{},
+        .background_cycle_id = 1,
+    }));
     app.pages.review.status_load.markSuccess();
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };

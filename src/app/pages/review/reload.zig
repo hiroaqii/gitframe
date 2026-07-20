@@ -1824,16 +1824,21 @@ pub const Controller = struct {
         result: *app_load.StatusLoadFinished,
         background_blocked: bool,
     ) !CompletionApply {
+        const terminal: auto_reload.AuxiliaryTerminal = .{
+            .generation = result.generation,
+            .read_epoch = result.read_epoch,
+            .background_cycle_id = result.background_cycle_id,
+        };
         self.page.auto_reload.finishMember(result.background_cycle_id, .status);
         if (!self.acceptsIdentity(result.identity)) {
-            _ = self.page.status_load.accept(result.generation);
+            _ = self.page.status_load.finishTerminal(terminal);
             return .{};
         }
         if (background_blocked) {
-            _ = self.page.status_load.accept(result.generation);
+            _ = self.page.status_load.finishTerminal(terminal);
             return .{};
         }
-        if (!self.page.status_load.accept(result.generation)) return .{};
+        if (!self.page.status_load.finishTerminal(terminal)) return .{};
 
         switch (result.result) {
             .empty => {
@@ -1902,16 +1907,21 @@ pub const Controller = struct {
         result: *app_load.BranchStatusLoadFinished,
         background_blocked: bool,
     ) CompletionApply {
+        const terminal: auto_reload.AuxiliaryTerminal = .{
+            .generation = result.generation,
+            .read_epoch = result.read_epoch,
+            .background_cycle_id = result.background_cycle_id,
+        };
         self.page.auto_reload.finishMember(result.background_cycle_id, .branch);
         if (!self.acceptsIdentity(result.identity)) {
-            _ = self.page.branch_status_load.accept(result.generation);
+            _ = self.page.branch_status_load.finishTerminal(terminal);
             return .{};
         }
         if (background_blocked) {
-            _ = self.page.branch_status_load.accept(result.generation);
+            _ = self.page.branch_status_load.finishTerminal(terminal);
             return .{};
         }
-        if (!self.page.branch_status_load.accept(result.generation)) return .{};
+        if (!self.page.branch_status_load.finishTerminal(terminal)) return .{};
 
         switch (result.result) {
             .empty => {
