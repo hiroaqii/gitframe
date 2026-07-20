@@ -940,6 +940,38 @@ pub const State = struct {
         ready.request = request;
     }
 
+    /// Move a self-owned presentation back from staged-only to combined after
+    /// one hunk is unstaged. Only the cached-only authority is destroyed; the
+    /// normalized file, syntax backing, rendered indexes, and content token
+    /// remain the exact presentation admitted by App.
+    pub fn installCombinedFromRetainedStagedOnlyReuse(
+        self: *State,
+        allocator: std.mem.Allocator,
+        request: Request,
+        candidate: *CombinedReuseCandidate,
+    ) void {
+        std.debug.assert(request.kind == .combined_hunks);
+        self.clearSyntaxPending(allocator);
+        const ready = switch (self.displayed) {
+            .ready => |*ready| ready,
+            else => unreachable,
+        };
+        const bundle = switch (ready.value) {
+            .retained_staged_only => |*bundle| bundle,
+            else => unreachable,
+        };
+
+        const presentation = bundle.presentation;
+        bundle.authority.deinit();
+        bundle.* = undefined;
+        ready.value = .{ .combined_hunks = .{
+            .presentation = presentation,
+            .authority = candidate.discardCandidateAndTakeAuthority(),
+        } };
+        ready.request.deinit(allocator);
+        ready.request = request;
+    }
+
     /// Keep the independently owned primary load session as presentation and
     /// install only the exactly matched candidate's fresh index authority.
     /// A prior authority overlay is consumed here; it is deliberately never

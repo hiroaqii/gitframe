@@ -985,6 +985,42 @@ test "retained staged-only authority builds unstage patch from fresh cached comp
     try std.testing.expect(std.mem.indexOf(u8, target.patch, "+new") != null);
 }
 
+test "ordinary cached source hunk unstage keeps source and status reload membership" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer page.deinit(allocator);
+    acceptTestSource(&page);
+    var status = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &status);
+    page.status_load.markSuccess();
+
+    const view = testView(&page, .cached);
+    const target = switch (view.selectedHunkUnstageTarget(allocator)) {
+        .ready => |target| target,
+        else => return error.ExpectedCachedPrimaryUnstageTarget,
+    };
+    defer allocator.free(target.patch);
+    try std.testing.expectEqual(git_ops.HunkMarkSource.projection, target.mark_source);
+    try std.testing.expect(target.reload_after_success);
+
+    const controller: Controller = .{
+        .page = &page,
+        .navigation = undefined,
+        .view_state = undefined,
+    };
+    const applied = controller.applyAcceptedOutcome(allocator, .{ .unstage_hunk = .{
+        .repo_root = target.repo_root,
+        .path = target.path,
+        .hunk_index = target.hunk_index,
+        .mark_source = target.mark_source,
+        .reload_after_success = target.reload_after_success,
+    } }, true);
+    try std.testing.expect(applied.reload == .source_and_aux);
+}
+
 test "stage toggle resolves file operation from fresh status" {
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwoWithStatuses()),
