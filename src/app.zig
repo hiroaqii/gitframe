@@ -4951,8 +4951,9 @@ pub const App = struct {
         var result = finished;
         var result_transferred = false;
         defer if (!result_transferred) result.deinit(ctx.allocator());
-        result_transferred = (try self.reviewReload().applyProjectionFinished(ctx.allocator(), &result)).result_transferred;
-        if (self.active_page != .review) ctx.redraw().skip();
+        const applied = try self.reviewReload().applyProjectionFinished(ctx.allocator(), &result);
+        result_transferred = applied.result_transferred;
+        if (applied.skip_redraw or self.active_page != .review) ctx.redraw().skip();
     }
 
     fn finishGeneratedProjectionSyntax(
@@ -4962,8 +4963,8 @@ pub const App = struct {
     ) void {
         var result = finished;
         defer result.deinit(ctx.allocator());
-        self.reviewReload().applyGeneratedSyntaxFinished(ctx.allocator(), &result);
-        if (self.active_page != .review) ctx.redraw().skip();
+        const applied = self.reviewReload().applyGeneratedSyntaxFinished(ctx.allocator(), &result);
+        if (applied.skip_redraw or self.active_page != .review) ctx.redraw().skip();
     }
 
     fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
@@ -14203,9 +14204,69 @@ test "superseded projection completion cannot replace display" {
         .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) } },
     });
 
-    try std.testing.expect(app.pages.review.review_projection.pending != null);
+    try std.testing.expect(app.pages.review.review_projection.pending == null);
     try std.testing.expect(!app.pages.review.review_projection.hasDisplayed());
-    try std.testing.expectEqual(stale_status_revision, app.pages.review.review_projection.pending.?.status_snapshot_revision);
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "old generated syntax completion drains pending and suppresses redraw" {
+    const allocator = std.testing.allocator;
+    const root_identity: repo_root_capability.Identity = .{ .device = 29, .inode = 31 };
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .review,
+        .config = .{ .source = .unstaged },
+    };
+    defer app.pages.review.deinit(allocator);
+    _ = app.pages.review.activation.activate(0, .pending, .pending, .pending);
+    app.pages.review.repository_read_authority.epoch = .{ .value = 41 };
+    app.pages.review.review_projection.installReady(.{
+        .request = try app_review_projection.cloneRequestWithOptions(
+            allocator,
+            app.pages.review.activation.currentIdentity().?,
+            11,
+            "/repo",
+            "new.zig",
+            .generated_added_file,
+            .unstaged,
+            0,
+            0,
+            .{
+                .read_epoch = app.pages.review.repository_read_authority.epoch,
+                .root_identity = root_identity,
+            },
+        ),
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(
+            allocator,
+            "new.zig",
+            "const retained = true;\n",
+        ) },
+    });
+    const bundle = &app.pages.review.review_projection.displayed.ready.value.generated_added_file;
+    bundle.decoration = .eligible;
+    app.pages.review.review_projection.syntax_pending = try app_review_projection.generatedSyntaxRequestForProjection(
+        allocator,
+        17,
+        app.pages.review.activation.currentIdentity().?,
+        app.pages.review.review_projection.displayed.ready.request,
+        bundle.fingerprint(),
+    );
+    const old_epoch = app.pages.review.repository_read_authority.epoch;
+    app.pages.review.repository_read_authority.epoch = old_epoch.next();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    app.finishGeneratedProjectionSyntax(&ctx, .{
+        .request = try app_review_projection.cloneGeneratedSyntaxRequest(
+            allocator,
+            app.pages.review.review_projection.syntax_pending.?,
+        ),
+        .snapshot_fingerprint = bundle.fingerprint(),
+        .result = .{ .terminal_plain = .provider_unavailable },
+    });
+
+    try std.testing.expect(app.pages.review.review_projection.syntax_pending == null);
+    try std.testing.expect(bundle.decoration == .eligible);
+    try std.testing.expect(ctx._redraw_suppressed);
 }
 
 test "cached preview keeps search input while projection is pending" {

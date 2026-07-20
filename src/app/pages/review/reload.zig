@@ -77,7 +77,14 @@ pub const DiscoveryCommitOutcome = enum {
 };
 
 pub const ProjectionApply = struct {
+    /// The task result moved into retained or deferred page ownership.
     result_transferred: bool = false,
+    /// No visible, diagnostic, or navigation state changed.
+    skip_redraw: bool = false,
+};
+
+pub const GeneratedSyntaxApply = struct {
+    skip_redraw: bool = false,
 };
 
 pub const RedrawDisposition = enum {
@@ -1655,6 +1662,18 @@ pub const Controller = struct {
         self.page.review_projection.clearPending(allocator);
     }
 
+    /// Retire an already-proved exact async terminal without publishing it.
+    /// Selection, hunk marks, displayed/cache owners, navigation restore, and
+    /// eager-retry state belong to the retained presentation or a successor
+    /// request; an old completion has authority over none of them.
+    fn retireProjectionTerminalWithoutPublication(
+        self: Controller,
+        allocator: std.mem.Allocator,
+    ) ProjectionApply {
+        self.page.review_projection.clearPending(allocator);
+        return .{ .skip_redraw = true };
+    }
+
     /// Prepares optional syntax only for the current plain generated preview.
     /// The bundle remains `eligible` while the page-owned pending request is
     /// in flight, so immutable cache admission never needs to mutate an entry.
@@ -1722,33 +1741,32 @@ pub const Controller = struct {
         self: Controller,
         allocator: std.mem.Allocator,
         finished: *review_projection.GeneratedSyntaxFinished,
-    ) void {
-        const current_identity = self.page.activation.currentIdentity() orelse {
-            if (self.page.review_projection.syntax_pending) |pending| {
-                if (pending.matches(finished.request)) self.page.review_projection.clearSyntaxPending(allocator);
-            }
-            return;
-        };
+    ) GeneratedSyntaxApply {
+        // Pending equality proves cleanup ownership independently of current
+        // publication authority. Drain the exact page clone first; every
+        // rejection below leaves the retained generated body unchanged.
+        const pending = self.page.review_projection.syntax_pending orelse return .{ .skip_redraw = true };
+        if (!pending.matches(finished.request)) return .{ .skip_redraw = true };
+        self.page.review_projection.clearSyntaxPending(allocator);
+
+        const current_identity = self.page.activation.currentIdentity() orelse return .{ .skip_redraw = true };
         if (current_identity.origin != finished.request.identity.origin or
             current_identity.repo_epoch != finished.request.identity.repo_epoch or
             current_identity.activation_id != finished.request.identity.activation_id)
         {
-            if (self.page.review_projection.syntax_pending) |pending| {
-                if (pending.matches(finished.request)) self.page.review_projection.clearSyntaxPending(allocator);
-            }
-            return;
+            return .{ .skip_redraw = true };
         }
-        const pending = self.page.review_projection.syntax_pending orelse return;
-        if (!pending.matches(finished.request)) return;
-        self.page.review_projection.clearSyntaxPending(allocator);
-        const active_root = self.root_identity orelse return;
-        if (!active_root.eql(finished.request.root_identity)) return;
+        if (!self.page.repository_read_authority.acceptsRead(finished.request.read_epoch)) {
+            return .{ .skip_redraw = true };
+        }
+        const active_root = self.root_identity orelse return .{ .skip_redraw = true };
+        if (!active_root.eql(finished.request.root_identity)) return .{ .skip_redraw = true };
 
-        const target = self.view().projectionTarget() orelse return;
-        if (target.kind != .generated_added_file) return;
+        const target = self.view().projectionTarget() orelse return .{ .skip_redraw = true };
+        if (target.kind != .generated_added_file) return .{ .skip_redraw = true };
         const ready = switch (self.page.review_projection.displayed) {
             .ready => |*ready| ready,
-            .idle, .failed => return,
+            .idle, .failed => return .{ .skip_redraw = true },
         };
         if (ready.request.id != finished.request.projection_id or
             !ready.request.read_epoch.eql(finished.request.read_epoch) or
@@ -1761,24 +1779,26 @@ pub const Controller = struct {
                 target.source_kind,
                 self.page.source_session_revision,
                 self.page.status_snapshot_revision,
-            )) return;
+            )) return .{ .skip_redraw = true };
         const bundle = switch (ready.value) {
             .generated_added_file => |*bundle| bundle,
-            else => return,
+            else => return .{ .skip_redraw = true },
         };
-        if (!bundle.fingerprint().eql(finished.request.expected_fingerprint)) return;
+        if (!bundle.fingerprint().eql(finished.request.expected_fingerprint)) {
+            return .{ .skip_redraw = true };
+        }
 
         switch (finished.result) {
             .loaded => |spans| {
                 const snapshot = finished.snapshot_fingerprint orelse {
                     bundle.decoration = .{ .terminal_plain = .snapshot_changed };
-                    return;
+                    return .{};
                 };
                 if (!snapshot.eql(finished.request.expected_fingerprint) or
                     !snapshot.eql(bundle.fingerprint()))
                 {
                     bundle.decoration = .{ .terminal_plain = .snapshot_changed };
-                    return;
+                    return .{};
                 }
                 bundle.decoration = .{ .decorated = .{
                     .spans = spans,
@@ -1789,6 +1809,7 @@ pub const Controller = struct {
             .terminal_plain => |reason| bundle.decoration = .{ .terminal_plain = reason },
             .stale => bundle.decoration = .{ .terminal_plain = .snapshot_changed },
         }
+        return .{};
     }
 
     fn reconcileInstalledProjectionNavigation(
@@ -2017,13 +2038,37 @@ pub const Controller = struct {
         allocator: std.mem.Allocator,
         result: *app_load.ReviewProjectionFinished,
     ) !ProjectionApply {
-        if (!self.acceptsIdentity(result.request.identity)) return .{};
-        const pending = if (self.page.review_projection.pending) |*request| request else return .{};
-        if (pending.id != result.request.id or !pending.sameSemanticKey(result.request)) return .{};
+        const pending = if (self.page.review_projection.pending) |*request| request else return .{ .skip_redraw = true };
+        if (pending.id != result.request.id or !pending.sameSemanticKey(result.request)) {
+            return .{ .skip_redraw = true };
+        }
 
-        const current = self.view().projectionTarget() orelse return .{};
+        // Once a live-drag completion moves into the deferred slot, another
+        // result with the same request identity is a duplicate, not the owner
+        // of the still-retained page pending clone. The deferred apply removes
+        // its slot before re-entering this function.
+        if (self.page.deferred_projection_apply) |deferred| {
+            if (deferred.finished.request.id == result.request.id and
+                deferred.finished.request.sameSemanticKey(result.request))
+            {
+                return .{ .skip_redraw = true };
+            }
+        }
+
+        const publication_admitted = self.acceptsIdentity(result.request.identity) and
+            self.page.repository_read_authority.acceptsRead(result.request.read_epoch);
+        if (!publication_admitted) {
+            return self.retireProjectionTerminalWithoutPublication(allocator);
+        }
+
+        const current = self.view().projectionTarget() orelse {
+            return self.retireProjectionTerminalWithoutPublication(allocator);
+        };
         if (result.request.kind == .generated_added_file and
-            !result.request.matchesRootIdentity(self.root_identity)) return .{};
+            !result.request.matchesRootIdentity(self.root_identity))
+        {
+            return self.retireProjectionTerminalWithoutPublication(allocator);
+        }
         if (!result.request.matchesBorrowed(
             self.page.repository_read_authority.epoch,
             current.repo_root,
@@ -2032,16 +2077,18 @@ pub const Controller = struct {
             current.source_kind,
             self.page.source_session_revision,
             self.page.status_snapshot_revision,
-        )) return .{};
+        )) {
+            return self.retireProjectionTerminalWithoutPublication(allocator);
+        }
 
         // Keep the pending request and displayed owner intact until the drag
         // transaction has copied its selection into owned memory. Only one
         // completion can match the single pending request; a duplicate is
         // rejected and remains the caller's cleanup responsibility.
         if (self.displayMutationBlockedByDrag()) {
-            if (self.page.deferred_projection_apply != null) return .{};
+            if (self.page.deferred_projection_apply != null) return .{ .skip_redraw = true };
             self.page.deferred_projection_apply = .{ .finished = result.* };
-            return .{ .result_transferred = true };
+            return .{ .result_transferred = true, .skip_redraw = true };
         }
 
         if (result.result == .reuse_candidate) {
@@ -2157,7 +2204,10 @@ pub const Controller = struct {
 
     /// Applies an owned projection completion after the live drag borrow has
     /// ended. The normal acceptance checks run again because a deferred source
-    /// completion may already have advanced the session revision.
+    /// completion may already have advanced the session revision. The async
+    /// delivery which filled this slot already skipped its redraw; this later
+    /// call runs inside the input event which ended the borrow, whose redraw is
+    /// still needed to remove or finalize the selection presentation.
     pub fn applyDeferredProjection(
         self: Controller,
         allocator: std.mem.Allocator,
@@ -3848,6 +3898,111 @@ test "projection read epoch is captured by page pending and task command" {
     try std.testing.expect(command.review_projection.sameSemanticKey(page.review_projection.pending.?));
 }
 
+test "repository read projection terminals require current open epoch and exact pending owner" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    // An exact terminal from a superseded epoch retires its page clone, but
+    // cannot publish the task payload or schedule an eager presentation retry.
+    {
+        var update = try controller.prepareProjection(allocator);
+        defer update.deinit(allocator);
+        var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+        const request = switch (command) {
+            .review_projection => |request| request,
+            else => return error.ExpectedProjectionCommand,
+        };
+        command = undefined;
+        page.repository_read_authority.epoch = request.read_epoch.next();
+
+        var finished: app_load.ReviewProjectionFinished = .{
+            .request = request,
+            .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(
+                allocator,
+                "a",
+                "must not publish\n",
+            ) } },
+        };
+        defer finished.deinit(allocator);
+        const applied = try controller.applyProjectionFinished(allocator, &finished);
+
+        try std.testing.expect(!applied.result_transferred);
+        try std.testing.expect(applied.skip_redraw);
+        try std.testing.expect(page.review_projection.pending == null);
+        try std.testing.expect(!page.review_projection.hasDisplayed());
+        try std.testing.expect(page.review_projection.eager_retry_basis == null);
+    }
+
+    // Equality of the scalar epoch is insufficient while the page-owned read
+    // phase is closed by a mutation. Cleanup remains exact and infallible.
+    {
+        var update = try controller.prepareProjection(allocator);
+        defer update.deinit(allocator);
+        var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+        const request = switch (command) {
+            .review_projection => |request| request,
+            else => return error.ExpectedProjectionCommand,
+        };
+        command = undefined;
+        page.repository_read_authority.phase = .{ .mutation_in_flight = .{
+            .generation = 7,
+            .kind = .stage_hunk,
+        } };
+
+        var finished: app_load.ReviewProjectionFinished = .{
+            .request = request,
+            .result = .{ .failed_static = "must not publish" },
+        };
+        defer finished.deinit(allocator);
+        const applied = try controller.applyProjectionFinished(allocator, &finished);
+
+        try std.testing.expect(!applied.result_transferred);
+        try std.testing.expect(applied.skip_redraw);
+        try std.testing.expect(page.review_projection.pending == null);
+        try std.testing.expect(!page.review_projection.hasDisplayed());
+    }
+
+    // A wrong/duplicate terminal never consumes the page clone belonging to
+    // the current request.
+    page.repository_read_authority.phase = .open;
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    defer command.deinit(allocator);
+    const pending = page.review_projection.pending.?;
+    var wrong: app_load.ReviewProjectionFinished = .{
+        .request = try review_projection.cloneRequestWithOptions(
+            allocator,
+            pending.identity,
+            pending.id + 1,
+            pending.repo_root,
+            pending.path_key,
+            pending.kind,
+            pending.source_kind,
+            pending.source_session_revision,
+            pending.status_snapshot_revision,
+            .{
+                .read_epoch = pending.read_epoch,
+                .root_identity = pending.root_identity,
+                .expected_presentation = pending.expected_presentation,
+            },
+        ),
+        .result = .{ .failed_static = "duplicate" },
+    };
+    defer wrong.deinit(allocator);
+    const wrong_apply = try controller.applyProjectionFinished(allocator, &wrong);
+    try std.testing.expect(wrong_apply.skip_redraw);
+    try std.testing.expectEqual(pending.id, page.review_projection.pending.?.id);
+}
+
 test "read command reject terminals clear only matching page state" {
     const allocator = std.testing.allocator;
     var page: review_page.ReviewPageState = .{};
@@ -4116,7 +4271,8 @@ test "generated syntax lifecycle separates pending decorated terminal and cache 
         .result = .{ .loaded = .{ .line_entries = entries, .spans = spans } },
     };
     defer finished.deinit(allocator);
-    controller.applyGeneratedSyntaxFinished(allocator, &finished);
+    const applied = controller.applyGeneratedSyntaxFinished(allocator, &finished);
+    try std.testing.expect(!applied.skip_redraw);
     try std.testing.expect(!page.review_projection.hasSyntaxPending());
     const decorated_bundle = &page.review_projection.displayed.ready.value.generated_added_file;
     try std.testing.expect(decorated_bundle.decoration == .decorated);
@@ -4175,7 +4331,8 @@ test "generated syntax completion after cache admission cannot mutate immutable 
         .result = .{ .loaded = .empty() },
     };
     defer late.deinit(allocator);
-    controller.applyGeneratedSyntaxFinished(allocator, &late);
+    const late_apply = controller.applyGeneratedSyntaxFinished(allocator, &late);
+    try std.testing.expect(late_apply.skip_redraw);
     try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
 
     var promoted = try controller.prepareProjection(allocator);
@@ -4184,6 +4341,71 @@ test "generated syntax completion after cache admission cannot mutate immutable 
     try std.testing.expect(page.review_projection.displayed.ready.value.generated_added_file.decoration == .eligible);
     var retried = (try controller.prepareGeneratedSyntax(allocator)) orelse return error.ExpectedSyntaxRetry;
     defer retried.deinit(allocator);
+}
+
+test "old repository read generated syntax terminal drains without decorating retained projection" {
+    const allocator = std.testing.allocator;
+    const root = root_capability.Identity{ .device = 19, .inode = 23 };
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    page.repository_read_authority.epoch = .{ .value = 31 };
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    var controller = testController(&page, &status_message, .unstaged);
+    controller.root_identity = root;
+
+    page.review_projection.installReady(.{
+        .request = try review_projection.cloneRequestWithOptions(
+            allocator,
+            page.activation.currentIdentity().?,
+            11,
+            "/repo",
+            "a",
+            .generated_added_file,
+            .unstaged,
+            0,
+            0,
+            .{
+                .read_epoch = page.repository_read_authority.epoch,
+                .root_identity = root,
+            },
+        ),
+        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(
+            allocator,
+            "a",
+            "const retained = true;\n",
+        ) },
+    });
+    const bundle = &page.review_projection.displayed.ready.value.generated_added_file;
+    // Model an in-flight optional provider even in provider-none test builds.
+    bundle.decoration = .eligible;
+    page.review_projection.syntax_pending = try review_projection.generatedSyntaxRequestForProjection(
+        allocator,
+        17,
+        page.activation.currentIdentity().?,
+        page.review_projection.displayed.ready.request,
+        bundle.fingerprint(),
+    );
+    var finished: review_projection.GeneratedSyntaxFinished = .{
+        .request = try review_projection.cloneGeneratedSyntaxRequest(
+            allocator,
+            page.review_projection.syntax_pending.?,
+        ),
+        .snapshot_fingerprint = bundle.fingerprint(),
+        .result = .{ .terminal_plain = .provider_unavailable },
+    };
+    defer finished.deinit(allocator);
+    page.repository_read_authority.epoch = finished.request.read_epoch.next();
+
+    const applied = controller.applyGeneratedSyntaxFinished(allocator, &finished);
+
+    try std.testing.expect(applied.skip_redraw);
+    try std.testing.expect(page.review_projection.syntax_pending == null);
+    try std.testing.expect(bundle.decoration == .eligible);
 }
 
 test "status line stats change invalidates retained projection cache" {
@@ -5082,6 +5304,58 @@ test "source replacement before deferred projection rejects and frees the stale 
     try std.testing.expectEqual(@as(u64, 1), page.source_session_revision);
     try controller.applyDeferredProjection(allocator);
     try std.testing.expect(page.deferred_projection_apply == null);
+    try std.testing.expect(!page.review_projection.hasDisplayed());
+}
+
+test "old repository read deferred projection retires pending without publication" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const request = switch (command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    command = undefined;
+    page.selection_owner = .{ .diff = .init(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = request,
+        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(
+            allocator,
+            "a",
+            "must not publish\n",
+        ) } },
+    };
+    var finished_owned = true;
+    defer if (finished_owned) finished.deinit(allocator);
+    const old_epoch = request.read_epoch;
+    const deferred = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(deferred.result_transferred);
+    finished_owned = false;
+    try std.testing.expect(deferred.skip_redraw);
+    try std.testing.expect(page.deferred_projection_apply != null);
+    try std.testing.expect(page.review_projection.pending != null);
+
+    page.repository_read_authority.epoch = old_epoch.next();
+    page.selection_owner = .none;
+    try controller.applyDeferredProjection(allocator);
+
+    try std.testing.expect(page.deferred_projection_apply == null);
+    try std.testing.expect(page.review_projection.pending == null);
     try std.testing.expect(!page.review_projection.hasDisplayed());
 }
 
