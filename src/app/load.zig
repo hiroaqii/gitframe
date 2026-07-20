@@ -1193,6 +1193,57 @@ fn buildCombinedHunkResult(
     return .{ .ready = .{ .combined_hunks = bundle } };
 }
 
+/// Build the provider-independent half of a possible combined-presentation
+/// reuse. This function deliberately has no task I/O and cannot decorate
+/// syntax. The returned candidate owns normalized comparison storage
+/// separately from fresh patch authority so acceptance can discard the former
+/// and transfer the latter without retaining a redundant projection arena.
+///
+/// P4b introduces and tests this ownership boundary without selecting it from
+/// `loadCombinedHunks`; the production worker remains eagerly decorated until
+/// candidate publication and exact App acceptance land together.
+fn buildCombinedReuseCandidate(
+    status_snapshot_revision: u64,
+    allocator: std.mem.Allocator,
+    cached_component: *projection_component.ParsedComponent,
+    unstaged_component: *projection_component.ParsedComponent,
+) diff_hunk_projection.BuildError!review_projection.CombinedReuseCandidate {
+    if (cached_component.document.files.len != 1 or unstaged_component.document.files.len != 1) {
+        return error.UnsupportedFile;
+    }
+    if (!cached_component.fileTextSelectable(0) or !unstaged_component.fileTextSelectable(0)) {
+        return error.UnsupportedFile;
+    }
+
+    var candidate_arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer candidate_arena.deinit();
+    var authority_arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer authority_arena.deinit();
+
+    const projection = try diff_hunk_projection.buildWithAllocators(
+        candidate_arena.allocator(),
+        authority_arena.allocator(),
+        cached_component.document.files[0],
+        unstaged_component.document.files[0],
+    );
+
+    const candidate: review_projection.CombinedReuseCandidate = .{
+        .candidate_arena = candidate_arena,
+        .projection = projection.presentation,
+        .fingerprint = diff_presentation_identity.fingerprint(projection.presentation.file),
+        .fresh_authority = .{
+            .arena = authority_arena,
+            .projection = projection.authority,
+            .cached_component = cached_component.*,
+            .unstaged_component = unstaged_component.*,
+            .status_snapshot_revision = status_snapshot_revision,
+        },
+    };
+    cached_component.arena = null;
+    unstaged_component.arena = null;
+    return candidate;
+}
+
 fn projectionDecorationFailureResult(
     allocator: std.mem.Allocator,
     path_key: []const u8,
@@ -1533,6 +1584,73 @@ test "combined projection eagerly decorates parse-only components" {
     try std.testing.expect(cached_action_file.hunks[0].lines[0].text.ptr != bundle.presentation.cached_bundle.loaded.document.files[0].hunks[0].lines[0].text.ptr);
     try std.testing.expect(unstaged_action_file.hunks[0].lines[0].text.ptr != bundle.presentation.unstaged_bundle.loaded.document.files[0].hunks[0].lines[0].text.ptr);
     try std.testing.expectEqual(@as(u64, 7), bundle.authority.status_snapshot_revision);
+}
+
+test "combined reuse candidate separates comparison storage from fresh authority" {
+    const allocator = std.testing.allocator;
+    var cached = try projection_component.ParsedComponent.parse(allocator, p2_cached_patch);
+    defer cached.deinit();
+    var unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
+    defer unstaged.deinit();
+
+    var candidate = try buildCombinedReuseCandidate(8, allocator, &cached, &unstaged);
+    defer candidate.deinit();
+
+    try std.testing.expect(cached.arena == null);
+    try std.testing.expect(unstaged.arena == null);
+    try std.testing.expect(candidate.candidate_arena != null);
+    try std.testing.expect(candidate.fresh_authority != null);
+    try std.testing.expectEqual(@as(usize, 2), candidate.displayFile().hunks.len);
+    try std.testing.expect(candidate.fingerprint.eql(diff_presentation_identity.fingerprint(candidate.displayFile())));
+    try std.testing.expect(candidate.retainedBytes() > 0);
+    try std.testing.expect(!@hasField(review_projection.CombinedReuseCandidate, "cached_bundle"));
+    try std.testing.expect(!@hasField(review_projection.CombinedReuseCandidate, "unstaged_bundle"));
+    try std.testing.expect(!@hasField(review_projection.CombinedReuseCandidate, "syntax_spans"));
+
+    const authority = &candidate.fresh_authority.?;
+    try std.testing.expectEqual(@as(u64, 8), authority.status_snapshot_revision);
+    try std.testing.expectEqualStrings(p2_cached_patch, authority.cached_component.text);
+    try std.testing.expectEqualStrings(p2_unstaged_patch, authority.unstaged_component.text);
+    try std.testing.expect(candidate.displayFile().hunks[0].lines[0].text.ptr == authority.cached_component.document.files[0].hunks[0].lines[0].text.ptr);
+    try std.testing.expect(candidate.displayFile().hunks[1].lines[0].text.ptr == authority.unstaged_component.document.files[0].hunks[0].lines[0].text.ptr);
+    try std.testing.expectEqual(diff_hunk_projection.HunkStageState.staged, authority.projection.hunk_stage_states[0]);
+    try std.testing.expectEqual(diff_hunk_projection.HunkStageState.unstaged, authority.projection.hunk_stage_states[1]);
+    try std.testing.expect(authority.projection.hunk_action_origins[0] == .cached);
+    try std.testing.expect(authority.projection.hunk_action_origins[1] == .unstaged);
+}
+
+test "combined reuse candidate discards comparison owner before authority transfer" {
+    const allocator = std.testing.allocator;
+    var cached = try projection_component.ParsedComponent.parse(allocator, p2_cached_patch);
+    defer cached.deinit();
+    var unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
+    defer unstaged.deinit();
+
+    var candidate = try buildCombinedReuseCandidate(9, allocator, &cached, &unstaged);
+    defer candidate.deinit();
+    var authority = candidate.discardCandidateAndTakeAuthority();
+    defer authority.deinit();
+
+    try std.testing.expect(candidate.candidate_arena == null);
+    try std.testing.expect(candidate.fresh_authority == null);
+    try std.testing.expectEqual(@as(u64, 9), authority.status_snapshot_revision);
+    try std.testing.expectEqualStrings(p2_cached_patch, authority.cached_component.text);
+    try std.testing.expectEqualStrings(p2_unstaged_patch, authority.unstaged_component.text);
+}
+
+test "combined reuse candidate releases every allocation failure" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var cached = try projection_component.ParsedComponent.parse(allocator, p2_cached_patch);
+            defer cached.deinit();
+            var unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
+            defer unstaged.deinit();
+            var candidate = try buildCombinedReuseCandidate(10, allocator, &cached, &unstaged);
+            defer candidate.deinit();
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "combined presentation and authority owners release every allocation failure" {

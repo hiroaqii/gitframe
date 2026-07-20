@@ -234,11 +234,56 @@ pub const CombinedAuthority = struct {
         });
     }
 
-    fn deinit(self: *CombinedAuthority) void {
+    pub fn deinit(self: *CombinedAuthority) void {
         if (self.arena) |*arena| arena.deinit();
         self.arena = null;
         self.cached_component.deinit();
         self.unstaged_component.deinit();
+        self.projection = undefined;
+    }
+};
+
+/// Provider-independent normalized candidate plus the fresh index authority
+/// built from the same cached/unstaged component generation.
+///
+/// Candidate hunk text borrows from `fresh_authority`'s parsed components, so
+/// both owners travel together until App has performed its exact comparison.
+/// The candidate arena remains separate because a successful reuse discards
+/// the candidate while transferring only fresh authority into the retained
+/// presentation. No decorated bundle or syntax-provider storage belongs here.
+pub const CombinedReuseCandidate = struct {
+    candidate_arena: ?std.heap.ArenaAllocator,
+    projection: diff_hunk_projection.Presentation,
+    fingerprint: diff_presentation_identity.Fingerprint,
+    fresh_authority: ?CombinedAuthority,
+
+    pub fn displayFile(self: *const CombinedReuseCandidate) diff_parser.FileDiff {
+        return self.projection.file;
+    }
+
+    pub fn retainedBytes(self: *const CombinedReuseCandidate) usize {
+        return saturatedSum(&.{
+            arenaCapacity(self.candidate_arena),
+            if (self.fresh_authority) |authority| authority.retainedBytes() else 0,
+        });
+    }
+
+    /// Consume the candidate presentation after exact acceptance and transfer
+    /// the only remaining owner. Calling `deinit` afterwards is safe.
+    pub fn discardCandidateAndTakeAuthority(self: *CombinedReuseCandidate) CombinedAuthority {
+        if (self.candidate_arena) |*arena| arena.deinit();
+        self.candidate_arena = null;
+        self.projection = undefined;
+        const authority = self.fresh_authority.?;
+        self.fresh_authority = null;
+        return authority;
+    }
+
+    pub fn deinit(self: *CombinedReuseCandidate) void {
+        if (self.candidate_arena) |*arena| arena.deinit();
+        self.candidate_arena = null;
+        if (self.fresh_authority) |*authority| authority.deinit();
+        self.fresh_authority = null;
         self.projection = undefined;
     }
 };
