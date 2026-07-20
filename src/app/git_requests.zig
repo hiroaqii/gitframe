@@ -3,6 +3,11 @@
 //! Borrowed targets are duplicated into task-owned payloads. Owned request
 //! payloads are consumed on every return path: success transfers ownership to
 //! the task, and failure frees the payload before returning.
+//!
+//! A successful launcher returns its exact `PendingAction` only after
+//! `spawnWith` accepts the task. This receipt lets the App distinguish
+//! preparation from a concrete launch without inferring success from mutable
+//! `ActionState` after the fact.
 
 const std = @import("std");
 const chasen = @import("chasen");
@@ -149,7 +154,7 @@ pub const CommitRequest = struct {
     }
 };
 
-pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, request: *CommitRequest) !void {
+pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, request: *CommitRequest) !actions.PendingAction {
     defer request.deinit(ctx.allocator());
 
     const pending = action_state.begin(.commit);
@@ -167,6 +172,7 @@ pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *act
     errdefer destroyCommitTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    return pending;
 }
 
 pub const CommitMessageAssistRequest = struct {
@@ -186,7 +192,7 @@ pub const CommitMessageAssistRequest = struct {
     }
 };
 
-pub fn startCommitMessageAssist(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, request: *CommitMessageAssistRequest) !void {
+pub fn startCommitMessageAssist(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, request: *CommitMessageAssistRequest) !actions.PendingAction {
     defer request.deinit(ctx.allocator());
 
     const pending = action_state.begin(.assist_commit_message);
@@ -206,9 +212,10 @@ pub fn startCommitMessageAssist(comptime Msg: type, ctx: *chasen.Ctx(Msg), actio
     errdefer destroyCommitMessageAssistTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    return pending;
 }
 
-pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, confirmation: *app_state.AmendConfirmation) !void {
+pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, confirmation: *app_state.AmendConfirmation) !actions.PendingAction {
     defer consumeAmendConfirmation(ctx.allocator(), confirmation);
 
     const pending = action_state.begin(.amend);
@@ -226,6 +233,7 @@ pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *acti
     errdefer destroyCommitTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    return pending;
 }
 
 pub fn startPush(
@@ -234,7 +242,7 @@ pub fn startPush(
     action_state: *actions.ActionState,
     env_map: ?*const std.process.Environ.Map,
     confirmation: *app_state.PushConfirmation,
-) !void {
+) !actions.PendingAction {
     defer consumePushConfirmation(ctx.allocator(), confirmation);
 
     const pending = action_state.begin(.push);
@@ -264,6 +272,7 @@ pub fn startPush(
     errdefer destroyPushTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    return pending;
 }
 
 pub fn startPull(
@@ -272,7 +281,7 @@ pub fn startPull(
     action_state: *actions.ActionState,
     env_map: ?*const std.process.Environ.Map,
     confirmation: *app_state.PullConfirmation,
-) !void {
+) !actions.PendingAction {
     defer consumePullConfirmation(ctx.allocator(), confirmation);
 
     const pending = action_state.begin(.pull);
@@ -301,6 +310,7 @@ pub fn startPull(
     errdefer destroyPullTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    return pending;
 }
 
 pub const FetchRequest = struct {
@@ -314,7 +324,7 @@ pub fn startFetch(
     action_state: *actions.ActionState,
     env_map: ?*const std.process.Environ.Map,
     request: *FetchRequest,
-) !void {
+) !actions.PendingAction {
     defer consumeFetchRequest(ctx.allocator(), request);
 
     const pending = action_state.begin(.fetch);
@@ -332,6 +342,7 @@ pub fn startFetch(
     errdefer destroyFetchTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    return pending;
 }
 
 pub const SwitchBranchRequest = struct {
@@ -351,7 +362,7 @@ pub fn startSwitchBranch(
     ctx: *chasen.Ctx(Msg),
     action_state: *actions.ActionState,
     request: *SwitchBranchRequest,
-) !void {
+) !actions.PendingAction {
     defer consumeSwitchBranchRequest(ctx.allocator(), request);
 
     const pending = action_state.begin(.switch_branch);
@@ -377,6 +388,7 @@ pub fn startSwitchBranch(
     errdefer destroySwitchBranchTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    return pending;
 }
 
 pub fn startCredentialedPush(
@@ -386,7 +398,7 @@ pub fn startCredentialedPush(
     env_map: ?*const std.process.Environ.Map,
     target: *app_state.PushRetryTarget,
     credentials: *actions.PushCredentials,
-) !void {
+) !actions.PendingAction {
     // This function consumes credentials on every return path. Keeping cleanup
     // here prevents caller/task rollback paths from both freeing the same
     // secret buffers if spawning fails after task construction.
@@ -434,6 +446,7 @@ pub fn startCredentialedPush(
         .mode = .upstream,
         .remote_url = null,
     };
+    return pending;
 }
 
 fn destroyFileTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {

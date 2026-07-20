@@ -2519,7 +2519,7 @@ pub const App = struct {
             return err;
         };
 
-        app_git_requests.startCommitMessageAssist(Msg, ctx, &self.actions, &request) catch |err| {
+        _ = app_git_requests.startCommitMessageAssist(Msg, ctx, &self.actions, &request) catch |err| {
             self.commit_panel.commit_error = .assist_failed;
             self.setReviewStatus("could not start commit message action", .{});
             return err;
@@ -2654,7 +2654,7 @@ pub const App = struct {
         };
         parts = .{ .subject = &.{}, .body = null };
 
-        app_git_requests.startCommit(Msg, ctx, &self.actions, &request) catch |err| {
+        _ = app_git_requests.startCommit(Msg, ctx, &self.actions, &request) catch |err| {
             self.commit_panel.commit_error = .commit_failed;
             self.setReviewStatus("could not start commit task", .{});
             return err;
@@ -2695,7 +2695,7 @@ pub const App = struct {
         var confirmation = self.amend_confirmation orelse return;
         self.amend_confirmation = null;
 
-        app_git_requests.startAmend(Msg, ctx, &self.actions, &confirmation) catch |err| {
+        _ = app_git_requests.startAmend(Msg, ctx, &self.actions, &confirmation) catch |err| {
             if (self.overlay.isAmendCommit()) self.overlay.close();
             self.commit_panel.commit_error = .amend_failed;
             self.setReviewStatus("could not start amend task", .{});
@@ -2797,7 +2797,7 @@ pub const App = struct {
 
         self.setReviewStatus("pushing: {s} -> {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
 
-        app_git_requests.startPush(Msg, ctx, &self.actions, self.env_map, &confirmation) catch |err| {
+        _ = app_git_requests.startPush(Msg, ctx, &self.actions, self.env_map, &confirmation) catch |err| {
             self.setReviewStatus("could not start push task", .{});
             if (self.overlay.isPushBranch()) self.overlay.close();
             return err;
@@ -2905,7 +2905,7 @@ pub const App = struct {
 
         self.setReviewStatus("pulling: {s} <- {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
 
-        app_git_requests.startPull(Msg, ctx, &self.actions, self.env_map, &confirmation) catch |err| {
+        _ = app_git_requests.startPull(Msg, ctx, &self.actions, self.env_map, &confirmation) catch |err| {
             self.setReviewStatus("could not start pull task", .{});
             if (self.overlay.isPullBranch()) self.overlay.close();
             return err;
@@ -2969,7 +2969,7 @@ pub const App = struct {
         proposal_consumed = true;
 
         self.setReviewStatus("fetching: {s}", .{target.remote});
-        app_git_requests.startFetch(Msg, ctx, &self.actions, self.env_map, &request) catch |err| {
+        _ = app_git_requests.startFetch(Msg, ctx, &self.actions, self.env_map, &request) catch |err| {
             self.setReviewStatus("could not start fetch task", .{});
             return err;
         };
@@ -3108,7 +3108,7 @@ pub const App = struct {
         request.target_oid = try ctx.allocator().dupe(u8, selected.oid);
 
         self.setReviewStatus("switching branch: {s} -> {s}", .{ self.branch_switch.current_branch, selected.name });
-        app_git_requests.startSwitchBranch(Msg, ctx, &self.actions, &request) catch |err| {
+        _ = app_git_requests.startSwitchBranch(Msg, ctx, &self.actions, &request) catch |err| {
             self.setReviewStatus("could not start branch switch task", .{});
             return err;
         };
@@ -3422,7 +3422,7 @@ pub const App = struct {
         self.setReviewStatus("retrying push with credentials: {s} -> {s}/{s}", .{ target.branch, target.remote, target.remote_branch });
         self.cancelPushCredentialPrompt(ctx.allocator());
 
-        app_git_requests.startCredentialedPush(Msg, ctx, &self.actions, self.env_map, &target, &credentials) catch |err| {
+        _ = app_git_requests.startCredentialedPush(Msg, ctx, &self.actions, self.env_map, &target, &credentials) catch |err| {
             target.deinit(ctx.allocator());
             return err;
         };
