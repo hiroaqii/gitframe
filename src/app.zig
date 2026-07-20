@@ -4857,13 +4857,15 @@ pub const App = struct {
         );
         result_transferred = applied.result_transferred;
 
-        if (action_completion) |completion| {
-            const source_succeeded = switch (result.result) {
-                .empty, .unchanged, .loaded => true,
-                .failed, .failed_static => false,
-            };
-            if (try self.finishActionCursorCompletion(ctx.allocator(), completion, source_succeeded)) {
-                applied.redraw = .normal;
+        if (applied.terminal_admitted) {
+            if (action_completion) |completion| {
+                const source_succeeded = switch (result.result) {
+                    .empty, .unchanged, .loaded => true,
+                    .failed, .failed_static => false,
+                };
+                if (try self.finishActionCursorCompletion(ctx.allocator(), completion, source_succeeded)) {
+                    applied.redraw = .normal;
+                }
             }
         }
 
@@ -4914,7 +4916,9 @@ pub const App = struct {
         if (applied.project_status) |prefer_first| {
             try self.reviewReload().applyStatusProjection(ctx.allocator(), prefer_first, .accepted_status);
         }
-        const finalized_action_cursor = if (action_completion) |completion| blk: {
+        const finalized_action_cursor = if (!applied.terminal_admitted)
+            false
+        else if (action_completion) |completion| blk: {
             const status_succeeded = switch (result.result) {
                 .empty, .loaded => true,
                 .failed, .failed_static => false,
@@ -5495,6 +5499,24 @@ fn reviewActionCursorKind(kind: git_ops.TargetKind) review_page.action_cursor.Ta
 }
 
 const test_action_root_identity: repo_root_capability.Identity = .{ .device = 41, .inode = 73 };
+
+/// Test-only shorthand for the owner pair created by `prepareSourceLoad`.
+/// Direct completion fixtures must model both identities now that Review
+/// retires and admits source terminals independently.
+fn ownTestSourceRead(app: *App, generation: u64, kind: review_page.ReloadKind) void {
+    app.pages.review.load.generation = generation;
+    app.pages.review.load.pending = .{ .diff_load = generation };
+    if (app.pages.review.pending_reload) |*pending| {
+        std.debug.assert(pending.generation == generation);
+        pending.read_epoch = app.pages.review.repository_read_authority.epoch;
+    } else {
+        app.pages.review.pending_reload = .{
+            .generation = generation,
+            .read_epoch = app.pages.review.repository_read_authority.epoch,
+            .kind = kind,
+        };
+    }
+}
 
 fn installTestActionCursor(
     app: *App,
@@ -7708,6 +7730,7 @@ test "source apply allocation failure closes exact action cursor member for pend
         if (peer_state == .terminal) {
             try std.testing.expect(app.pages.review.action_cursor.finishMember(9, app.repo_epoch, .status, 2, false));
         }
+        ownTestSourceRead(&app, 1, .action_result);
         app.pages.review.activation.queueRevalidation();
 
         // applySourceFailure has already consumed the task generation before
@@ -7769,6 +7792,8 @@ test "status apply allocation failure closes exact action cursor member for pend
         try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 2));
         if (peer_state == .terminal) {
             try std.testing.expect(app.pages.review.action_cursor.finishMember(9, app.repo_epoch, .source, 1, false));
+        } else {
+            ownTestSourceRead(&app, 1, .action_result);
         }
         app.pages.review.activation.queueRevalidation();
 
@@ -13890,6 +13915,10 @@ test "fresh empty status consumes pending display restore at raw terminal" {
         .request = displayed_request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
+    app.pages.review.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = app.pages.review.auto_reload.beginCycle().?;
+    try std.testing.expectEqual(@as(u64, 1), cycle_id);
+    try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .status));
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.finishDiffLoad(&ctx, .{ .identity = page.RequestIdentity.review(0, 1), .generation = 2, .result = .empty });
@@ -14811,6 +14840,7 @@ test "finishDiffLoad applies active changed file filter" {
     defer app.reviewReload().clearLoadedDiff(app.allocator);
     defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    ownTestSourceRead(&app, 1, .initial);
 
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_added_deleted);
     try app.finishDiffLoad(&ctx, .{
@@ -15614,6 +15644,7 @@ test "finishDiffLoad takes current loaded bundle ownership" {
     };
     defer app.reviewReload().clearLoadedDiff(app.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    ownTestSourceRead(&app, 1, .initial);
 
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
@@ -15633,6 +15664,7 @@ test "finishDiffLoad initially selects first visible file node" {
     };
     defer app.reviewReload().clearLoadedDiff(app.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    ownTestSourceRead(&app, 1, .initial);
 
     const bundle = app_load.LoadedDiffBundle{
         .arena = .init(std.testing.allocator),
@@ -15657,6 +15689,7 @@ test "finishDiffLoad initially selects first visible file after status projectio
     defer app.pages.review.tree_order.deinit(std.testing.allocator);
     defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    ownTestSourceRead(&app, 1, .initial);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
@@ -15697,6 +15730,7 @@ test "finishDiffLoad keeps initial visible selection intent for later status pro
     defer app.pages.review.tree_order.deinit(std.testing.allocator);
     defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    ownTestSourceRead(&app, 1, .initial);
 
     const bundle = app_load.LoadedDiffBundle{
         .arena = .init(std.testing.allocator),
@@ -16171,7 +16205,7 @@ test "watch no-op diff load preserves session view state and staged hunk marks" 
 
     const mark_key = try currentTestSessionHunkMarkKey(&app, 0);
     try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", mark_key);
-    app.pages.review.load.generation = 2;
+    ownTestSourceRead(&app, 2, .watch);
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
 
     try app.finishDiffLoad(&ctx, .{
@@ -16898,6 +16932,7 @@ test "anchored reload keeps cursor when search query is present" {
     app.pages.review.search.match_offset = 4;
     app.pages.review.load.generation = 2;
     try app.reviewReload().beginPendingReload(std.testing.allocator, 2, .manual);
+    ownTestSourceRead(&app, 2, .manual);
 
     var changed = app_test_support.loadedDiffOne();
     changed.text = "changed";
@@ -16939,6 +16974,7 @@ test "manual reload restores anchor after visible state is cleared" {
 
     app.pages.review.load.generation = 2;
     try app.reviewReload().beginPendingReload(std.testing.allocator, 2, .manual);
+    ownTestSourceRead(&app, 2, .manual);
     app.reviewReload().clearLoadedDiff(app.allocator);
     app.pages.review.load.state = .loading;
 
@@ -16983,6 +17019,7 @@ test "manual reload retains collapsed Review repository root" {
 
     app.pages.review.load.generation = 2;
     try app.reviewReload().beginPendingReload(std.testing.allocator, 2, .manual);
+    ownTestSourceRead(&app, 2, .manual);
     app.reviewReload().clearLoadedDiff(app.allocator);
     app.pages.review.load.state = .loading;
 
@@ -17126,6 +17163,7 @@ test "finishDiffLoad records empty diff as no changes" {
         .pages = .{ .review = .{ .load = .{ .generation = 1 } } },
     };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    ownTestSourceRead(&app, 1, .initial);
 
     try app.finishDiffLoad(&ctx, .{
         .identity = page.RequestIdentity.review(0, 1),
@@ -17147,6 +17185,7 @@ test "finishDiffLoad projects earlier status snapshot into empty diff" {
     defer app.pages.review.tree_order.deinit(std.testing.allocator);
     defer if (app.pages.review.tree_order_scope) |scope| std.testing.allocator.free(scope);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    ownTestSourceRead(&app, 1, .initial);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
     try app.pages.review.git_status.replace("/tmp/repo", &status_bundle);
@@ -17184,6 +17223,7 @@ test "clean loaded status tears down status-only session after empty diff" {
     var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
     try app.pages.review.git_status.replace("/repo", &current);
     try app.reviewReload().createStatusOnlyLoadedSession(allocator, app.pages.review.git_status.document);
+    ownTestSourceRead(&app, 2, .initial);
 
     try app.finishDiffLoad(&ctx, .{
         .identity = page.RequestIdentity.review(0, 1),
@@ -17250,6 +17290,7 @@ test "source failure before clean status-only teardown remains stale" {
 
     var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
     try app.pages.review.git_status.replace("/repo", &current);
+    ownTestSourceRead(&app, 2, .initial);
     try app.finishDiffLoad(&ctx, .{ .identity = page.RequestIdentity.review(0, 1), .generation = 2, .result = .empty });
     try std.testing.expect(app.reviewNavigation().loadedDiff() != null);
 
@@ -17295,6 +17336,7 @@ test "source failure after clean status-only teardown remains stale" {
 
     var current = try git_status.StatusBundle.parseOwned(allocator, "M  src/main.zig\x00");
     try app.pages.review.git_status.replace("/repo", &current);
+    ownTestSourceRead(&app, 2, .initial);
     try app.finishDiffLoad(&ctx, .{ .identity = page.RequestIdentity.review(0, 1), .generation = 2, .result = .empty });
     const clean = try git_status.StatusBundle.parseOwned(allocator, "");
     try app.finishStatusLoad(&ctx, .{
@@ -17452,6 +17494,7 @@ test "finishDiffLoad copies and frees current failed message" {
     };
     defer app.reviewReload().clearLoadedDiff(app.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    ownTestSourceRead(&app, 1, .initial);
 
     const message = try std.testing.allocator.dupe(u8, " failed \n");
     try app.finishDiffLoad(&ctx, .{
@@ -17480,6 +17523,7 @@ test "action cursor waits for status terminal after matching source failure" {
     try promoteTestActionCursor(&app, 9);
     try std.testing.expect(app.pages.review.action_cursor.startMember(9, .source, 1));
     try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 2));
+    ownTestSourceRead(&app, 1, .action_result);
 
     try app.finishDiffLoad(&ctx, .{
         .identity = page.RequestIdentity.review(0, 1),
@@ -17496,6 +17540,69 @@ test "action cursor waits for status terminal after matching source failure" {
     });
 
     try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+}
+
+test "rejected old read terminals cannot consume action cursor members" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
+        .allocator = allocator,
+    };
+    defer app.reviewReload().clearLoadedDiff(app.allocator);
+    defer app.reviewNavigation().clearActionCursor(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    const old_epoch = app.pages.review.repository_read_authority.epoch;
+    app.pages.review.load.generation = 1;
+    app.pages.review.load.pending = .{ .diff_load = 1 };
+    app.pages.review.pending_reload = .{
+        .generation = 1,
+        .read_epoch = old_epoch,
+        .kind = .action_result,
+    };
+    app.pages.review.status_load.generation = 2;
+    app.pages.review.status_load.pending = .{
+        .generation = 2,
+        .read_epoch = old_epoch,
+    };
+
+    try installTestActionCursor(&app, allocator, .file, "a", 9);
+    try promoteTestActionCursor(&app, 9);
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .source, 1));
+    try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 2));
+    app.pages.review.repository_read_authority.epoch = old_epoch.next();
+
+    try app.finishDiffLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(app.repo_epoch, 1),
+        .read_epoch = old_epoch,
+        .generation = 1,
+        .result = .{ .failed_static = "old source" },
+    });
+    try std.testing.expect(app.pages.review.action_cursor.captureCompletion(
+        app.repo_epoch,
+        .source,
+        1,
+    ) != null);
+
+    try app.finishStatusLoad(&ctx, .{
+        .identity = page.RequestIdentity.review(app.repo_epoch, 1),
+        .read_epoch = old_epoch,
+        .generation = 2,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .failed_static = "old status" },
+    });
+    try std.testing.expect(app.pages.review.action_cursor.captureCompletion(
+        app.repo_epoch,
+        .status,
+        2,
+    ) != null);
+    try std.testing.expect(app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(app.pages.review.load.pending == null);
+    try std.testing.expect(app.pages.review.pending_reload == null);
+    try std.testing.expect(app.pages.review.status_load.pending == null);
+    try std.testing.expect(app.reviewNavigationView().activeLoadedDiffConst() != null);
 }
 
 test "saveRecentRepositoriesState writes reloadable state atomically" {

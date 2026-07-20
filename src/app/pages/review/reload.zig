@@ -47,6 +47,10 @@ pub const CompletionApply = struct {
     project_status: ?bool = null,
     diagnostic: ?Diagnostic = null,
     skip_redraw: bool = false,
+    /// True only when the delivered terminal owned the exact pending read and
+    /// passed the current repository epoch/phase and background-cycle fence.
+    /// App uses this to keep rejected reads from consuming action authority.
+    terminal_admitted: bool = false,
 };
 
 /// Owned cross-boundary command produced only after Review has accepted the
@@ -120,6 +124,8 @@ pub const SourceApply = struct {
         message: []const u8,
     } = null,
     redraw: RedrawDisposition = .normal,
+    /// See `CompletionApply.terminal_admitted`.
+    terminal_admitted: bool = false,
 };
 
 pub const DeferredSourceApplyOutcome = struct {
@@ -449,6 +455,18 @@ pub const Controller = struct {
 
     fn acceptsIdentity(self: Controller, identity: app_page.RequestIdentity) bool {
         return self.page.activation.acceptsRepoEpoch(identity, self.repo_epoch);
+    }
+
+    /// Snapshot publication authority before draining a background member.
+    /// The final member removes its cycle, so checking after `finishMember`
+    /// would incorrectly reject a valid exact terminal.
+    fn acceptsRepositoryReadCompletion(
+        self: Controller,
+        read_epoch: ReviewRepositoryReadEpoch,
+        background_cycle_id: ?u64,
+    ) bool {
+        return self.page.repository_read_authority.acceptsRead(read_epoch) and
+            self.page.auto_reload.acceptsCycle(background_cycle_id);
     }
 
     /// The live drag is the only state which borrows displayed source or
@@ -1090,6 +1108,38 @@ pub const Controller = struct {
         };
     }
 
+    fn sourceTerminalOwnsPending(self: Controller, finished: *const app_load.DiffLoadFinished) bool {
+        if (!self.page.load.isCurrent(finished.generation)) return false;
+        const pending_load = self.page.load.pending orelse return false;
+        if (!std.meta.eql(pending_load, load_state.PendingLoad{ .diff_load = finished.generation })) return false;
+        const pending_reload = self.page.pending_reload orelse return false;
+        return pending_reload.matchesTerminal(finished.generation, finished.read_epoch);
+    }
+
+    /// Retire source ownership only for the exact generation/epoch terminal.
+    /// Admission is intentionally separate: an old epoch still owns cleanup,
+    /// but can no longer publish any Review state or shell consequence.
+    fn takeOwnedSourceTerminal(
+        self: Controller,
+        finished: *const app_load.DiffLoadFinished,
+    ) ?review_page.PendingReload {
+        if (!self.sourceTerminalOwnsPending(finished)) return null;
+        std.debug.assert(self.page.load.finishPending(.{ .diff_load = finished.generation }));
+        const pending = self.page.pending_reload.?;
+        self.page.pending_reload = null;
+        return pending;
+    }
+
+    fn retireOwnedSourceTerminal(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        finished: *const app_load.DiffLoadFinished,
+    ) bool {
+        var pending = self.takeOwnedSourceTerminal(finished) orelse return false;
+        pending.deinit(allocator);
+        return true;
+    }
+
     pub fn clearPendingReloadIfGeneration(self: Controller, allocator: std.mem.Allocator, generation: u64) void {
         var pending = self.takePendingReloadIfGeneration(generation) orelse return;
         pending.deinit(allocator);
@@ -1147,8 +1197,7 @@ pub const Controller = struct {
     pub fn clearDeferredSourceApply(self: Controller, allocator: std.mem.Allocator) void {
         var deferred = self.page.deferred_source_apply orelse return;
         self.page.deferred_source_apply = null;
-        _ = self.page.load.clearPendingIfCurrent(.{ .diff_load = deferred.finished.generation });
-        self.clearPendingReloadIfGeneration(allocator, deferred.finished.generation);
+        _ = self.retireOwnedSourceTerminal(allocator, &deferred.finished);
         self.page.auto_reload.finishMember(deferred.cycle_id, .deferred_source_apply);
         deferred.deinit(allocator);
     }
@@ -1163,16 +1212,19 @@ pub const Controller = struct {
     ) !?DeferredSourceApplyOutcome {
         const deferred = self.page.deferred_source_apply orelse return null;
         self.page.deferred_source_apply = null;
+        const publication_admitted = deferred.finished.background_cycle_id == deferred.cycle_id and
+            !background_blocked and
+            self.acceptsIdentity(deferred.finished.identity) and
+            self.acceptsRepositoryReadCompletion(deferred.finished.read_epoch, deferred.cycle_id);
         defer self.page.auto_reload.finishMember(deferred.cycle_id, .deferred_source_apply);
 
         var finished = deferred.finished;
         var result_transferred = false;
         defer if (!result_transferred) finished.deinit(allocator);
 
-        if (background_blocked) {
-            _ = self.page.load.finishPending(.{ .diff_load = finished.generation });
-            self.clearPendingReloadIfGeneration(allocator, finished.generation);
-            return .{ .source = .{} };
+        if (!publication_admitted) {
+            _ = self.retireOwnedSourceTerminal(allocator, &finished);
+            return .{ .source = .{ .redraw = .skip } };
         }
 
         finished.background_cycle_id = null;
@@ -1829,16 +1881,12 @@ pub const Controller = struct {
             .read_epoch = result.read_epoch,
             .background_cycle_id = result.background_cycle_id,
         };
+        const publication_admitted = !background_blocked and
+            self.acceptsIdentity(result.identity) and
+            self.acceptsRepositoryReadCompletion(result.read_epoch, result.background_cycle_id);
         self.page.auto_reload.finishMember(result.background_cycle_id, .status);
-        if (!self.acceptsIdentity(result.identity)) {
-            _ = self.page.status_load.finishTerminal(terminal);
-            return .{};
-        }
-        if (background_blocked) {
-            _ = self.page.status_load.finishTerminal(terminal);
-            return .{};
-        }
-        if (!self.page.status_load.finishTerminal(terminal)) return .{};
+        const owns_terminal = self.page.status_load.finishTerminal(terminal);
+        if (!owns_terminal or !publication_admitted) return .{ .skip_redraw = true };
 
         switch (result.result) {
             .empty => {
@@ -1852,7 +1900,7 @@ pub const Controller = struct {
                 self.page.git_status.clear();
                 const prefer_first = self.page.pending_initial_first_visible_selection;
                 self.page.pending_initial_first_visible_selection = false;
-                return .{ .project_status = prefer_first };
+                return .{ .project_status = prefer_first, .terminal_admitted = true };
             },
             .loaded => |*bundle| {
                 switch (load_state.statusSnapshotReplaceDecision(
@@ -1865,7 +1913,7 @@ pub const Controller = struct {
                     .skip_identical => {
                         self.page.status_load.markSuccess();
                         _ = self.page.activation.finishMember(result.identity, .status, .fresh);
-                        return .{ .skip_redraw = true };
+                        return .{ .skip_redraw = true, .terminal_admitted = true };
                     },
                     .replace_action_cursor,
                     .replace_pending_initial_selection,
@@ -1881,7 +1929,7 @@ pub const Controller = struct {
                 result.result = .empty;
                 const prefer_first = self.page.pending_initial_first_visible_selection;
                 self.page.pending_initial_first_visible_selection = false;
-                return .{ .project_status = prefer_first };
+                return .{ .project_status = prefer_first, .terminal_admitted = true };
             },
             .failed => |message| return self.applyStatusFailure(allocator, result.identity, result.background_cycle_id, std.mem.trim(u8, message, " \t\r\n")),
             .failed_static => |message| return self.applyStatusFailure(allocator, result.identity, result.background_cycle_id, message),
@@ -1899,7 +1947,7 @@ pub const Controller = struct {
             self.page.git_status.clear();
         }
         self.page.pending_initial_first_visible_selection = false;
-        return .{ .diagnostic = .{ .status_load_failed = message } };
+        return .{ .diagnostic = .{ .status_load_failed = message }, .terminal_admitted = true };
     }
 
     pub fn applyBranchStatusFinished(
@@ -1912,16 +1960,12 @@ pub const Controller = struct {
             .read_epoch = result.read_epoch,
             .background_cycle_id = result.background_cycle_id,
         };
+        const publication_admitted = !background_blocked and
+            self.acceptsIdentity(result.identity) and
+            self.acceptsRepositoryReadCompletion(result.read_epoch, result.background_cycle_id);
         self.page.auto_reload.finishMember(result.background_cycle_id, .branch);
-        if (!self.acceptsIdentity(result.identity)) {
-            _ = self.page.branch_status_load.finishTerminal(terminal);
-            return .{};
-        }
-        if (background_blocked) {
-            _ = self.page.branch_status_load.finishTerminal(terminal);
-            return .{};
-        }
-        if (!self.page.branch_status_load.finishTerminal(terminal)) return .{};
+        const owns_terminal = self.page.branch_status_load.finishTerminal(terminal);
+        if (!owns_terminal or !publication_admitted) return .{ .skip_redraw = true };
 
         switch (result.result) {
             .empty => {
@@ -1937,13 +1981,13 @@ pub const Controller = struct {
                 if (same_root) {
                     self.page.branch_status_load.markSuccess();
                     _ = self.page.activation.finishMember(result.identity, .branch, .fresh);
-                    return .{ .skip_redraw = true };
+                    return .{ .skip_redraw = true, .terminal_admitted = true };
                 }
                 self.page.branch_status.replace(result.repo_root, bundle) catch {
                     self.page.branch_status.clear();
                     self.page.branch_status_load.markFailure(false);
                     _ = self.page.activation.finishMember(result.identity, .branch, .failed);
-                    return .{ .diagnostic = .branch_status_parse_failed };
+                    return .{ .diagnostic = .branch_status_parse_failed, .terminal_admitted = true };
                 };
                 self.page.branch_status_load.markSuccess();
                 _ = self.page.activation.finishMember(result.identity, .branch, .fresh);
@@ -1952,7 +1996,7 @@ pub const Controller = struct {
             .failed => |message| return self.applyBranchFailure(result.identity, result.background_cycle_id, std.mem.trim(u8, message, " \t\r\n")),
             .failed_static => |message| return self.applyBranchFailure(result.identity, result.background_cycle_id, message),
         }
-        return .{};
+        return .{ .terminal_admitted = true };
     }
 
     fn applyBranchFailure(self: Controller, identity: app_page.RequestIdentity, background_cycle_id: ?u64, message: []const u8) CompletionApply {
@@ -1960,7 +2004,7 @@ pub const Controller = struct {
         self.page.branch_status_load.markFailure(retain);
         _ = self.page.activation.finishMember(identity, .branch, .failed);
         if (!retain) self.page.branch_status.clear();
-        return .{ .diagnostic = .{ .branch_status_load_failed = message } };
+        return .{ .diagnostic = .{ .branch_status_load_failed = message }, .terminal_admitted = true };
     }
 
     /// Consumes a matching projection result into retained Review state. A
@@ -2132,14 +2176,12 @@ pub const Controller = struct {
         finished: *app_load.DiffLoadFinished,
         background_blocked: bool,
     ) !SourceApply {
-        if (background_blocked) {
-            self.page.auto_reload.finishMember(finished.background_cycle_id, .source);
-            _ = self.page.load.finishPending(.{ .diff_load = finished.generation });
-            self.clearPendingReloadIfGeneration(allocator, finished.generation);
-            return .{};
-        }
+        const publication_admitted = !background_blocked and
+            self.acceptsIdentity(finished.identity) and
+            self.acceptsRepositoryReadCompletion(finished.read_epoch, finished.background_cycle_id);
+        const owns_terminal = self.sourceTerminalOwnsPending(finished);
         if ((finished.result == .loaded or finished.result == .empty) and self.displayMutationBlockedByDrag() and
-            self.page.load.isCurrent(finished.generation) and self.page.deferred_source_apply == null)
+            owns_terminal and publication_admitted and self.page.deferred_source_apply == null)
         {
             if (finished.background_cycle_id) |cycle_id| {
                 if (self.page.auto_reload.moveMember(cycle_id, .source, .deferred_source_apply)) {
@@ -2149,19 +2191,14 @@ pub const Controller = struct {
             }
         }
         self.page.auto_reload.finishMember(finished.background_cycle_id, .source);
-        _ = self.page.load.finishPending(.{ .diff_load = finished.generation });
-        if (!self.acceptsIdentity(finished.identity)) {
-            self.clearPendingReloadIfGeneration(allocator, finished.generation);
-            return .{};
-        }
-        if (!self.page.load.isCurrent(finished.generation)) return .{};
-        var pending_reload = self.takePendingReloadIfGeneration(finished.generation);
+        var pending_reload = self.takeOwnedSourceTerminal(finished);
         defer if (pending_reload) |*pending| pending.deinit(allocator);
+        if (pending_reload == null or !publication_admitted) return .{ .redraw = .skip };
 
         const had_loaded_before = self.navigation.view().activeLoadedDiffConst() != null;
         const had_action_cursor = self.page.action_cursor.hasOwner();
         var can_project_status = false;
-        var outcome: SourceApply = .{};
+        var outcome: SourceApply = .{ .terminal_admitted = true };
 
         switch (finished.result) {
             .empty => {
@@ -2271,11 +2308,15 @@ pub const Controller = struct {
             },
             .failed => |message| {
                 _ = self.page.activation.finishMember(finished.identity, .source, .failed);
-                return try self.applySourceFailure(allocator, pending_reload, std.mem.trim(u8, message, " \t\r\n"));
+                var failure = try self.applySourceFailure(allocator, pending_reload, std.mem.trim(u8, message, " \t\r\n"));
+                failure.terminal_admitted = true;
+                return failure;
             },
             .failed_static => |message| {
                 _ = self.page.activation.finishMember(finished.identity, .source, .failed);
-                return try self.applySourceFailure(allocator, pending_reload, message);
+                var failure = try self.applySourceFailure(allocator, pending_reload, message);
+                failure.terminal_admitted = true;
+                return failure;
             },
         }
 
@@ -3486,6 +3527,153 @@ test "review read epoch is captured by source status and branch commands" {
         try std.testing.expect(command.branch_status_load.read_epoch.eql(.{ .value = 41 }));
         try std.testing.expect(page.branch_status_load.pending.?.read_epoch.eql(.{ .value = 41 }));
     }
+}
+
+test "repository read completion admission requires current open epoch and cycle" {
+    var page: review_page.ReviewPageState = .{};
+    defer page.deinit(std.testing.allocator);
+    page.repository_read_authority.epoch = .{ .value = 11 };
+    page.auto_reload = .init(.inherit, .{}, .unstaged);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    try std.testing.expect(controller.acceptsRepositoryReadCompletion(.{ .value = 11 }, null));
+    try std.testing.expect(!controller.acceptsRepositoryReadCompletion(.{ .value = 10 }, null));
+
+    const cycle_id = page.auto_reload.beginCycle().?;
+    try std.testing.expect(page.auto_reload.markMemberStarted(cycle_id, .source));
+    try std.testing.expect(controller.acceptsRepositoryReadCompletion(.{ .value = 11 }, cycle_id));
+    page.auto_reload.supersedeActiveCycleByMutation();
+    try std.testing.expect(!controller.acceptsRepositoryReadCompletion(.{ .value = 11 }, cycle_id));
+    page.auto_reload.finishMember(cycle_id, .source);
+
+    page.repository_read_authority.phase = .{ .mutation_in_flight = .{
+        .generation = 7,
+        .kind = .stage_hunk,
+    } };
+    try std.testing.expect(!controller.acceptsRepositoryReadCompletion(.{ .value = 11 }, null));
+}
+
+test "old repository read source terminal retires ownership without publication" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    const retained_text = controller.navigation.view().activeLoadedDiffConst().?.text.ptr;
+
+    var update = try controller.prepareSourceLoad(
+        allocator,
+        "/repo",
+        .{ .clear_visible_state = false, .kind = .manual },
+    );
+    defer update.deinit(allocator);
+    var command = update.takeCommand() orelse return error.ExpectedSourceCommand;
+    defer command.deinit(allocator);
+    const source_command = switch (command) {
+        .source_load => |source| source,
+        else => return error.ExpectedSourceCommand,
+    };
+    page.repository_read_authority.epoch = source_command.read_epoch.next();
+
+    var finished: app_load.DiffLoadFinished = .{
+        .identity = source_command.identity,
+        .read_epoch = source_command.read_epoch,
+        .generation = source_command.generation,
+        .result = .{ .failed_static = "must not publish" },
+    };
+    defer finished.deinit(allocator);
+    const applied = try controller.applySourceFinished(allocator, &finished, false);
+
+    try std.testing.expect(!applied.terminal_admitted);
+    try std.testing.expectEqual(RedrawDisposition.skip, applied.redraw);
+    try std.testing.expect(applied.auto_reload_failure == null);
+    try std.testing.expect(applied.recovered_failure == null);
+    try std.testing.expect(page.load.pending == null);
+    try std.testing.expect(page.pending_reload == null);
+    try std.testing.expectEqual(retained_text, controller.navigation.view().activeLoadedDiffConst().?.text.ptr);
+    try std.testing.expectEqual(authority.MemberFreshness.pending, page.activation.state.members().?.source);
+}
+
+test "superseded repository read status terminal drains without publication" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{};
+    defer page.deinit(allocator);
+    var initial = try git_status.StatusBundle.parseOwned(allocator, "M  retained.zig\x00");
+    try page.git_status.replace("/repo", &initial);
+    page.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = page.auto_reload.beginCycle().?;
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    var update = try controller.prepareStatusLoad(allocator, "/repo", .background, cycle_id);
+    defer update.deinit(allocator);
+    var command = update.takeCommand() orelse return error.ExpectedStatusCommand;
+    defer command.deinit(allocator);
+    const status_command = switch (command) {
+        .status_load => |status| status,
+        else => return error.ExpectedStatusCommand,
+    };
+    controller.acceptStatusSpawn(cycle_id);
+    page.auto_reload.supersedeActiveCycleByMutation();
+
+    var finished: app_load.StatusLoadFinished = .{
+        .identity = status_command.identity,
+        .read_epoch = status_command.read_epoch,
+        .generation = status_command.generation,
+        .background_cycle_id = cycle_id,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .failed_static = "must not publish" },
+    };
+    defer finished.deinit(allocator);
+    const applied = try controller.applyStatusFinished(allocator, &finished, false);
+
+    try std.testing.expect(!applied.terminal_admitted);
+    try std.testing.expect(applied.skip_redraw);
+    try std.testing.expect(applied.diagnostic == null);
+    try std.testing.expect(page.status_load.pending == null);
+    try std.testing.expectEqual(auto_reload.AuxiliaryFreshness.stale_refresh, page.status_load.freshness);
+    try std.testing.expectEqual(authority.MemberFreshness.pending, page.activation.state.members().?.status);
+    try std.testing.expectEqual(@as(usize, 1), page.git_status.document.entries.len);
+    try std.testing.expect(page.auto_reload.background_cycle == null);
+}
+
+test "old repository read branch terminal retires ownership without publication" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{};
+    defer page.deinit(allocator);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    var update = try controller.prepareBranchStatusLoad(allocator, "/repo", null);
+    defer update.deinit(allocator);
+    var command = update.takeCommand() orelse return error.ExpectedBranchCommand;
+    defer command.deinit(allocator);
+    const branch_command = switch (command) {
+        .branch_status_load => |branch| branch,
+        else => return error.ExpectedBranchCommand,
+    };
+    page.repository_read_authority.epoch = branch_command.read_epoch.next();
+
+    var finished: app_load.BranchStatusLoadFinished = .{
+        .identity = branch_command.identity,
+        .read_epoch = branch_command.read_epoch,
+        .generation = branch_command.generation,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .failed_static = "must not publish" },
+    };
+    defer finished.deinit(allocator);
+    const applied = controller.applyBranchStatusFinished(&finished, false);
+
+    try std.testing.expect(!applied.terminal_admitted);
+    try std.testing.expect(applied.skip_redraw);
+    try std.testing.expect(applied.diagnostic == null);
+    try std.testing.expect(page.branch_status_load.pending == null);
+    try std.testing.expectEqual(auto_reload.AuxiliaryFreshness.missing, page.branch_status_load.freshness);
+    try std.testing.expectEqual(authority.MemberFreshness.pending, page.activation.state.members().?.branch);
 }
 
 test "repository discovery transfers ownership only after Review acceptance" {
@@ -6881,7 +7069,12 @@ test "deferred source terminals consume blocked and accepted ownership" {
     blocked_page.pending_reload = .{ .generation = 1, .kind = .watch };
     blocked_page.deferred_source_apply = .{
         .cycle_id = blocked_cycle,
-        .finished = .{ .identity = app_page.RequestIdentity.review(0, 1), .generation = 1, .result = .{ .failed_static = "blocked" } },
+        .finished = .{
+            .identity = app_page.RequestIdentity.review(0, 1),
+            .generation = 1,
+            .background_cycle_id = blocked_cycle,
+            .result = .{ .failed_static = "blocked" },
+        },
     };
     const blocked_controller = testController(&blocked_page, &status_message, .unstaged);
     var blocked_applied = (try blocked_controller.applyDeferredSource(allocator, true)) orelse return error.ExpectedDeferredApply;
@@ -6905,6 +7098,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
         .finished = .{
             .identity = app_page.RequestIdentity.review(0, 1),
             .generation = 2,
+            .background_cycle_id = accepted_cycle,
             .result = .{ .unchanged = content_fingerprint.Fingerprint.init("same") },
         },
     };
@@ -6928,6 +7122,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
         .finished = .{
             .identity = app_page.RequestIdentity.review(0, 1),
             .generation = 3,
+            .background_cycle_id = failure_cycle,
             .result = .{ .failed = try allocator.dupe(u8, "owned deferred failure") },
         },
     };
@@ -6935,4 +7130,51 @@ test "deferred source terminals consume blocked and accepted ownership" {
     defer failure_applied.deinit(allocator);
     try std.testing.expect(failure_applied.owned_failure_message != null);
     try std.testing.expectEqualStrings("owned deferred failure", failure_applied.source.auto_reload_failure.?.message);
+}
+
+test "superseded deferred source retires exact ownership without publication" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    const retained_text = switch (page.load.state) {
+        .loaded => |*session| session.loaded.text.ptr,
+        else => unreachable,
+    };
+    page.auto_reload = .init(.inherit, .{}, .unstaged);
+    const cycle_id = page.auto_reload.beginCycle().?;
+    try std.testing.expect(page.auto_reload.markMemberStarted(cycle_id, .source));
+    try std.testing.expect(page.auto_reload.moveMember(cycle_id, .source, .deferred_source_apply));
+    page.load.generation = 7;
+    page.load.pending = .{ .diff_load = 7 };
+    const old_epoch = page.repository_read_authority.epoch;
+    page.pending_reload = .{ .generation = 7, .read_epoch = old_epoch, .kind = .watch };
+    page.deferred_source_apply = .{
+        .cycle_id = cycle_id,
+        .finished = .{
+            .identity = app_page.RequestIdentity.review(0, 1),
+            .read_epoch = old_epoch,
+            .generation = 7,
+            .background_cycle_id = cycle_id,
+            .result = .{ .failed_static = "must not publish" },
+        },
+    };
+    page.repository_read_authority.epoch = old_epoch.next();
+    page.auto_reload.supersedeActiveCycleByMutation();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    var applied = (try controller.applyDeferredSource(allocator, false)) orelse return error.ExpectedDeferredApply;
+    defer applied.deinit(allocator);
+
+    try std.testing.expect(!applied.source.terminal_admitted);
+    try std.testing.expectEqual(RedrawDisposition.skip, applied.source.redraw);
+    try std.testing.expect(applied.source.auto_reload_failure == null);
+    try std.testing.expect(page.deferred_source_apply == null);
+    try std.testing.expect(page.load.pending == null);
+    try std.testing.expect(page.pending_reload == null);
+    try std.testing.expect(page.auto_reload.background_cycle == null);
+    try std.testing.expectEqual(retained_text, controller.navigation.view().activeLoadedDiffConst().?.text.ptr);
 }
