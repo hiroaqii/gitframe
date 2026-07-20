@@ -151,6 +151,20 @@ const OwnedCombinedPresentation = struct {
     display_file: diff_parser.FileDiff,
 };
 
+/// Exact P5d handoff between the disappearing combined projection and the
+/// already-owned ordinary primary presentation. Both tokens are scalar: no
+/// pointer into either display owner survives projection teardown.
+const CombinedToOrdinaryOwner = enum {
+    self_owned,
+    primary_backed,
+};
+
+const CombinedToOrdinaryBoundary = struct {
+    owner: CombinedToOrdinaryOwner,
+    displayed_content: review_selection.ReviewContentToken,
+    ordinary_content: review_selection.ReviewContentToken,
+};
+
 pub const SourceLoadOptions = struct {
     clear_visible_state: bool,
     kind: review_page.ReloadKind,
@@ -481,6 +495,76 @@ pub const Controller = struct {
             .source_session_revision = self.page.source_session_revision,
             .display = display,
         };
+    }
+
+    /// Resolve the final-staged-hunk unstage boundary without manufacturing a
+    /// new projection. The primary load is an independent owner which predates
+    /// the combined overlay; exact presentation equality is nevertheless
+    /// required before a completed selection may cross from the projection
+    /// token namespace into the loaded token namespace.
+    fn combinedToOrdinaryBoundary(self: Controller) ?CombinedToOrdinaryBoundary {
+        if (!sourceIsUnstaged(self.source)) return null;
+        const repo_root = self.repo_root orelse return null;
+        const loaded = self.navigation.view().activeLoadedDiffConst() orelse return null;
+        const file_index = self.navigation.view().selectedFileIndex(loaded) orelse return null;
+        if (file_index >= loaded.document.files.len) return null;
+        const primary_file = loaded.document.files[file_index];
+        const path_key = diff_file.canonicalPathKey(primary_file) orelse return null;
+        const entry = self.navigation.view().freshStatusEntryForPathKey(repo_root, path_key) orelse return null;
+        if (file_tree.stagePresenceFromEntry(entry) != .unstaged_only) return null;
+
+        const ready = switch (self.page.review_projection.displayed) {
+            .ready => |*ready| ready,
+            .idle, .failed => return null,
+        };
+        if (!ready.request.matchesDisplayIdentity(
+            repo_root,
+            path_key,
+            sourceKind(self.source),
+            self.page.source_session_revision,
+        )) return null;
+
+        var owner: CombinedToOrdinaryOwner = undefined;
+        const combined_file = switch (ready.value) {
+            .combined_hunks => |*bundle| blk: {
+                owner = .self_owned;
+                break :blk bundle.displayFile();
+            },
+            // This overlay owns only fresh index authority. Its visible file
+            // is already the independently owned primary file.
+            .primary_combined_authority => blk: {
+                owner = .primary_backed;
+                break :blk primary_file;
+            },
+            else => return null,
+        };
+        if (!diff_presentation_identity.exactEqual(combined_file, primary_file)) return null;
+
+        const displayed_content = self.contentTokenForReady(&ready.value) orelse return null;
+        return .{
+            .owner = owner,
+            .displayed_content = displayed_content,
+            .ordinary_content = .{
+                .repo_epoch = self.repo_epoch,
+                .root_identity = self.root_identity,
+                .source = review_selection.SourceBasis.init(self.source),
+                .source_session_revision = self.page.source_session_revision,
+                .display = .{ .loaded = .init(loaded.text) },
+            },
+        };
+    }
+
+    fn rebindCompletedSelectionToOrdinary(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        boundary: CombinedToOrdinaryBoundary,
+    ) void {
+        const completed = if (self.page.completed_selection) |*completed| completed else return;
+        if (completed.token.eql(boundary.displayed_content)) {
+            completed.token = boundary.ordinary_content;
+        } else if (!completed.token.eql(boundary.ordinary_content)) {
+            self.clearCompletedSelection(allocator);
+        }
     }
 
     /// Preserve semantic selection identity across an eager combined rebuild
@@ -1097,9 +1181,39 @@ pub const Controller = struct {
                     self.page.pending_display_navigation_restore == null) return .{};
                 return error.MissingAllocator;
             };
+            self.page.review_projection.clearPending(allocator);
+            if (self.combinedToOrdinaryBoundary()) |boundary| {
+                // A self-owned combined body is always unfolded, while the
+                // underlying primary may retain folds from before projection
+                // activation. Capture semantic/offset fallback before owner
+                // teardown and restore it against the primary rendered model.
+                // Primary-backed authority already displays that exact model
+                // and therefore needs no cross-model anchor allocation.
+                var local_navigation = if (boundary.owner == .self_owned and
+                    self.page.pending_display_navigation_restore == null)
+                    try self.view().captureAnchor(allocator)
+                else
+                    null;
+                defer if (local_navigation) |*anchor| anchor.deinit(allocator);
+
+                const has_navigation_authority = boundary.owner == .primary_backed or
+                    self.page.pending_display_navigation_restore != null or
+                    local_navigation != null;
+                if (has_navigation_authority) {
+                    self.rebindCompletedSelectionToOrdinary(allocator, boundary);
+                    self.page.review_projection.finishCombinedToOrdinaryPrimary(allocator);
+                    switch (boundary.owner) {
+                        .self_owned => self.reconcileInstalledProjectionNavigation(
+                            allocator,
+                            if (local_navigation) |*anchor| anchor else null,
+                        ),
+                        .primary_backed => self.reconcileRetainedPresentationNavigation(allocator),
+                    }
+                    return .{};
+                }
+            }
             self.reconcileCompletedSelectionForNoProjectionTarget(allocator);
             if (self.page.pending_display_navigation_restore != null) self.clearDisplayRestore(allocator);
-            self.page.review_projection.clearPending(allocator);
             if (self.repo_root) |repo_root| {
                 self.page.review_projection.cacheOrClearDisplayed(
                     allocator,
@@ -4973,6 +5087,259 @@ test "one hunk unstage restores combined authority over retained primary present
     const accepted_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(accepted_clipboard);
     try std.testing.expectEqualStrings(original_clipboard, accepted_clipboard);
+}
+
+test "final staged hunk unstage returns owned combined display to exact ordinary primary" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = try testPrimaryCombinedLoadState(allocator),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .display_mode = .unified,
+            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 2, .line_index = 1 } },
+            .diff_scroll = 5,
+            .diff_horizontal_scroll = 3,
+        },
+    };
+    defer page.deinit(allocator);
+    var mixed_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &mixed_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    const primary = controller.navigation.activeLoadedDiff().?;
+    for (0..primary.document.files[0].hunks.len) |hunk_index| {
+        primary.setHunkFolded(0, hunk_index, false);
+    }
+    const primary_text_ptr = primary.text.ptr;
+    const primary_syntax_ptr = primary.syntax_spans.files.ptr;
+    try installTestCombinedCandidate(controller, allocator, 1, 121, page.status_snapshot_revision);
+    const combined_token = page.completed_selection.?.token;
+    const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(original_clipboard);
+    try page.search.query.insertSlice("gamma");
+    _ = controller.navigation.view().selectedDiffCursorOffset() orelse
+        return error.ExpectedCombinedCursorOffset;
+    const horizontal_before = page.viewer.diff_horizontal_scroll;
+
+    controller.advanceStatusSnapshotRevision(allocator);
+    var unstaged_status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try page.git_status.replace("/repo", &unstaged_status);
+    try std.testing.expect(controller.view().projectionTarget() == null);
+
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    try std.testing.expect(update.command == null);
+    try std.testing.expect(!page.review_projection.hasDisplayed());
+    const ordinary = switch (controller.navigation.view().displayedReviewBody()) {
+        .primary => |body| body,
+        else => return error.ExpectedOrdinaryPrimaryDisplay,
+    };
+    try std.testing.expect(ordinary.loaded == primary);
+    try std.testing.expect(ordinary.loaded.text.ptr == primary_text_ptr);
+    try std.testing.expect(ordinary.loaded.syntax_spans.files.ptr == primary_syntax_ptr);
+    try std.testing.expect(ordinary.hunk_authority == null);
+    const ordinary_line_count = controller.navigation.view().displayedDiffLineCount();
+    const cursor_offset_after = controller.navigation.view().selectedDiffCursorOffset() orelse
+        return error.ExpectedRestoredPrimaryCursorOffset;
+    try std.testing.expect(cursor_offset_after < ordinary_line_count);
+    try std.testing.expect(page.viewer.diff_scroll < ordinary_line_count);
+    try std.testing.expect(page.viewer.diff_horizontal_scroll <= horizontal_before);
+    try std.testing.expect(page.search.match != null);
+    try std.testing.expect(page.search.match_offset != null);
+    try std.testing.expect(page.search.match_offset.? < ordinary_line_count);
+    try std.testing.expect(page.completed_selection != null);
+    try std.testing.expect(!page.completed_selection.?.token.eql(combined_token));
+    try std.testing.expect(page.completed_selection.?.token.display == .loaded);
+    try std.testing.expect(page.completed_selection.?.token.display.loaded.eql(.init(primary.text)));
+    const accepted_clipboard = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(accepted_clipboard);
+    try std.testing.expectEqualStrings(original_clipboard, accepted_clipboard);
+}
+
+test "owned combined to folded primary remaps hidden cursor and clamps scroll" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = try testPrimaryCombinedLoadState(allocator),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .display_mode = .unified,
+            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 2, .line_index = 1 } },
+        },
+    };
+    defer page.deinit(allocator);
+    var mixed_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &mixed_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    const primary = controller.navigation.activeLoadedDiff().?;
+    primary.setHunkFolded(0, 2, true);
+    try std.testing.expect(primary.isHunkFolded(0, 2));
+    const folded_line_count = primary.renderedLineIndex(0, .unified).lineCount();
+
+    try installTestCombinedCandidate(controller, allocator, 1, 122, page.status_snapshot_revision);
+    const unfolded_line_count = controller.navigation.view().displayedDiffLineCount();
+    try std.testing.expect(unfolded_line_count > folded_line_count);
+    const unfolded_cursor_offset = controller.navigation.view().selectedDiffCursorOffset() orelse
+        return error.ExpectedCombinedCursorOffset;
+    page.viewer.diff_scroll = unfolded_line_count;
+
+    controller.advanceStatusSnapshotRevision(allocator);
+    var unstaged_status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try page.git_status.replace("/repo", &unstaged_status);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    try std.testing.expect(update.command == null);
+    try std.testing.expect(!page.review_projection.hasDisplayed());
+    try std.testing.expect(primary.isHunkFolded(0, 2));
+
+    const ordinary_line_count = controller.navigation.view().displayedDiffLineCount();
+    try std.testing.expectEqual(folded_line_count, ordinary_line_count);
+    const ordinary_cursor_offset = controller.navigation.view().selectedDiffCursorOffset() orelse
+        return error.ExpectedRestoredPrimaryCursorOffset;
+    try std.testing.expectEqual(
+        @min(unfolded_cursor_offset, ordinary_line_count - 1),
+        ordinary_cursor_offset,
+    );
+    switch (page.viewer.diff_cursor) {
+        .hunk_line => |line| try std.testing.expect(line.hunk_index != 2),
+        else => {},
+    }
+    try std.testing.expect(page.viewer.diff_scroll < ordinary_line_count);
+}
+
+test "final staged hunk unstage removes primary combined authority without replacing primary" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = try testPrimaryCombinedLoadState(allocator),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .display_mode = .unified,
+            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 1, .line_index = 1 } },
+            .diff_scroll = 4,
+            .diff_horizontal_scroll = 2,
+        },
+    };
+    defer page.deinit(allocator);
+    var mixed_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &mixed_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    const primary_before = switch (controller.navigation.view().displayedReviewBody()) {
+        .primary => |primary| primary,
+        else => return error.ExpectedPrimaryDisplay,
+    };
+    const primary_owner = primary_before.loaded;
+    const primary_text_ptr = primary_owner.text.ptr;
+    const primary_syntax_ptr = primary_owner.syntax_spans.files.ptr;
+    page.completed_selection = try testPrimaryCandidate(
+        controller,
+        allocator,
+        primary_owner.document.files[primary_before.file_index],
+    );
+    const loaded_token = page.completed_selection.?.token;
+    const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(original_clipboard);
+    try page.search.query.insertSlice("beta");
+    controller.navigation.refreshSearchForSelectedFile();
+    controller.navigation.selectSearchMatch(.forward);
+    page.viewer.diff_scroll = 4;
+    page.viewer.diff_horizontal_scroll = 2;
+    const search_before = page.search.match.?;
+    const search_offset_before = page.search.match_offset;
+    const cursor_before = page.viewer.diff_cursor;
+    const scroll_before = page.viewer.diff_scroll;
+    const horizontal_before = page.viewer.diff_horizontal_scroll;
+
+    var candidate = try testCombinedReuseCandidate(
+        allocator,
+        page.status_snapshot_revision,
+        test_combined_before_cached,
+        test_combined_before_unstaged,
+    );
+    defer candidate.deinit();
+    page.review_projection.installReady(.{
+        .request = try review_projection.cloneRequest(
+            allocator,
+            page.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .combined_hunks,
+            .unstaged,
+            page.source_session_revision,
+            page.status_snapshot_revision,
+        ),
+        .value = .{ .primary_combined_authority = candidate.discardCandidateAndTakeAuthority() },
+    });
+
+    controller.advanceStatusSnapshotRevision(allocator);
+    var unstaged_status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try page.git_status.replace("/repo", &unstaged_status);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    try std.testing.expect(update.command == null);
+    try std.testing.expect(!page.review_projection.hasDisplayed());
+
+    const primary_after = switch (controller.navigation.view().displayedReviewBody()) {
+        .primary => |primary| primary,
+        else => return error.ExpectedOrdinaryPrimaryDisplay,
+    };
+    try std.testing.expect(primary_after.loaded == primary_owner);
+    try std.testing.expect(primary_after.loaded.text.ptr == primary_text_ptr);
+    try std.testing.expect(primary_after.loaded.syntax_spans.files.ptr == primary_syntax_ptr);
+    try std.testing.expect(primary_after.hunk_authority == null);
+    try std.testing.expect(page.completed_selection != null);
+    try std.testing.expect(page.completed_selection.?.token.eql(loaded_token));
+    try std.testing.expect(std.meta.eql(search_before, page.search.match.?));
+    try std.testing.expectEqual(search_offset_before, page.search.match_offset);
+    try std.testing.expect(std.meta.eql(cursor_before, page.viewer.diff_cursor));
+    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll);
+    try std.testing.expectEqual(horizontal_before, page.viewer.diff_horizontal_scroll);
+    const accepted_clipboard = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(accepted_clipboard);
+    try std.testing.expectEqualStrings(original_clipboard, accepted_clipboard);
+}
+
+test "combined to ordinary mismatch clears projection selection before revealing primary" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = try testPrimaryLoadState(allocator, test_combined_primary_changed),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var mixed_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &mixed_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    try installTestCombinedCandidate(controller, allocator, 1, 131, page.status_snapshot_revision);
+    try std.testing.expect(!diff_presentation_identity.exactEqual(
+        page.review_projection.displayed.ready.value.combined_hunks.displayFile(),
+        controller.navigation.view().selectedFile().?,
+    ));
+
+    controller.advanceStatusSnapshotRevision(allocator);
+    var unstaged_status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try page.git_status.replace("/repo", &unstaged_status);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    try std.testing.expect(update.command == null);
+    try std.testing.expect(!page.review_projection.hasDisplayed());
+    try std.testing.expect(page.completed_selection == null);
+    const ordinary = switch (controller.navigation.view().displayedReviewBody()) {
+        .primary => |primary| primary,
+        else => return error.ExpectedOrdinaryPrimaryDisplay,
+    };
+    try std.testing.expect(diff_presentation_identity.exactEqual(
+        ordinary.loaded.document.files[ordinary.file_index],
+        controller.navigation.view().selectedFile().?,
+    ));
 }
 
 test "staged-only to combined exact mismatch keeps retained owner for bounded eager retry" {

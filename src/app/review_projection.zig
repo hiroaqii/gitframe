@@ -827,6 +827,23 @@ pub const State = struct {
         self.displayed.deinit(allocator);
     }
 
+    /// P5d terminal boundary: the accepted all-unstaged status makes the
+    /// independently owned primary load authoritative again. A self-owned
+    /// combined value releases presentation plus authority; a primary-backed
+    /// value releases only its authority overlay. The primary load itself is
+    /// deliberately outside this state and is never moved or deinitialized.
+    pub fn finishCombinedToOrdinaryPrimary(self: *State, allocator: std.mem.Allocator) void {
+        const ready = switch (self.displayed) {
+            .ready => |*ready| ready,
+            .idle, .failed => unreachable,
+        };
+        switch (ready.value) {
+            .combined_hunks, .primary_combined_authority => {},
+            else => unreachable,
+        }
+        self.clearDisplayed(allocator);
+    }
+
     pub fn clearSyntaxPending(self: *State, allocator: std.mem.Allocator) void {
         if (self.syntax_pending) |*request| request.deinit(allocator);
         self.syntax_pending = null;
