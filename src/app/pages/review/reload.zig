@@ -416,6 +416,21 @@ pub const Controller = struct {
         incoming.presentation.content_token = live.presentation.content_token;
     }
 
+    /// Snapshot only scalar presentation identity into a same-kind refresh.
+    /// Request/status authority remains independently fresh; no page-owned
+    /// pointer or slice crosses into the worker task.
+    fn expectedPresentationForTarget(
+        self: Controller,
+        target: ProjectionTarget,
+    ) ?review_projection.ExpectedPresentation {
+        if (target.kind != .combined_hunks) return null;
+        const live = self.navigation.view().activeCombinedProjection() orelse return null;
+        return .{
+            .fingerprint = live.presentation.fingerprint,
+            .content_token = live.presentation.content_token,
+        };
+    }
+
     /// A candidate is meaningful only for the exact semantic display basis it
     /// captured. Delivery IDs, status revisions, component fingerprints, and
     /// cache slots are intentionally absent from combined display identity.
@@ -898,7 +913,8 @@ pub const Controller = struct {
         errdefer self.clearCompletedSelection(allocator);
 
         const request_root_identity = if (target.kind == .generated_added_file) self.root_identity else null;
-        var state_request = try review_projection.cloneRequestWithRootIdentity(
+        const expected_presentation = self.expectedPresentationForTarget(target);
+        var state_request = try review_projection.cloneRequestWithOptions(
             allocator,
             identity,
             request_id,
@@ -908,11 +924,14 @@ pub const Controller = struct {
             target.source_kind,
             self.page.source_session_revision,
             self.page.status_snapshot_revision,
-            request_root_identity,
+            .{
+                .root_identity = request_root_identity,
+                .expected_presentation = expected_presentation,
+            },
         );
         errdefer state_request.deinit(allocator);
 
-        var task_request = try review_projection.cloneRequestWithRootIdentity(
+        var task_request = try review_projection.cloneRequestWithOptions(
             allocator,
             identity,
             request_id,
@@ -922,7 +941,10 @@ pub const Controller = struct {
             target.source_kind,
             self.page.source_session_revision,
             self.page.status_snapshot_revision,
-            request_root_identity,
+            .{
+                .root_identity = request_root_identity,
+                .expected_presentation = expected_presentation,
+            },
         );
         errdefer task_request.deinit(allocator);
 
@@ -1345,7 +1367,7 @@ pub const Controller = struct {
                 return .{ .result_transferred = true };
             },
             .failed_static => |message| {
-                var request = try review_projection.cloneRequestWithRootIdentity(
+                var request = try review_projection.cloneRequestWithOptions(
                     allocator,
                     result.request.identity,
                     result.request.id,
@@ -1355,7 +1377,10 @@ pub const Controller = struct {
                     result.request.source_kind,
                     result.request.source_session_revision,
                     result.request.status_snapshot_revision,
-                    result.request.root_identity,
+                    .{
+                        .root_identity = result.request.root_identity,
+                        .expected_presentation = result.request.expected_presentation,
+                    },
                 );
                 errdefer request.deinit(allocator);
                 var body = try review_projection.statusBodyAlloc(allocator, result.request.path_key, "{s}", .{message});
@@ -3675,6 +3700,44 @@ test "combined content token survives exact index partition and rejects changed 
     const forced_accepted = &page.review_projection.displayed.ready.value.combined_hunks;
     try std.testing.expect(forced_accepted.presentation.content_token.eql(.init(4)));
     try std.testing.expectEqual(@as(u64, 3), forced_accepted.authority.status_snapshot_revision);
+}
+
+test "combined replacement snapshots live presentation hint into page and task requests" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    try installTestCombinedCandidate(controller, allocator, 1, 41, 0);
+    const live = &page.review_projection.displayed.ready.value.combined_hunks.presentation;
+    const expected = review_projection.ExpectedPresentation{
+        .fingerprint = live.fingerprint,
+        .content_token = live.content_token,
+    };
+    controller.advanceStatusSnapshotRevision(allocator);
+
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    defer command.deinit(allocator);
+    const task_request = switch (command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+
+    const page_request = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    try std.testing.expectEqual(@as(u64, 1), page_request.status_snapshot_revision);
+    try std.testing.expectEqual(@as(u64, 1), task_request.status_snapshot_revision);
+    try std.testing.expect(page_request.expected_presentation.?.eql(expected));
+    try std.testing.expect(task_request.expected_presentation.?.eql(expected));
+    try std.testing.expect(page_request.expected_presentation.?.eql(task_request.expected_presentation.?));
 }
 
 test "combined candidate closes when replacement request allocation fails" {

@@ -30,6 +30,19 @@ pub const SourceKind = enum {
     other,
 };
 
+/// Scalar-only hint naming the combined presentation visible when a refresh
+/// request was prepared. The fingerprint may select the worker reuse path but
+/// is never acceptance proof; the opaque token lets acceptance verify that the
+/// same live presentation still exists before performing an exact comparison.
+pub const ExpectedPresentation = struct {
+    fingerprint: diff_presentation_identity.Fingerprint,
+    content_token: diff_presentation_identity.ContentToken,
+
+    pub fn eql(self: ExpectedPresentation, other: ExpectedPresentation) bool {
+        return self.fingerprint.eql(other.fingerprint) and self.content_token.eql(other.content_token);
+    }
+};
+
 pub const Request = struct {
     identity: page.RequestIdentity,
     id: u64,
@@ -40,6 +53,7 @@ pub const Request = struct {
     source_session_revision: u64,
     status_snapshot_revision: u64,
     root_identity: ?root_capability.Identity = null,
+    expected_presentation: ?ExpectedPresentation = null,
 
     pub fn deinit(self: *Request, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_root);
@@ -64,6 +78,9 @@ pub const Request = struct {
     }
 
     pub fn sameSemanticKey(self: Request, other: Request) bool {
+        // The expected presentation only chooses how a fresh generation is
+        // constructed. It is not part of cache/action validity; the status
+        // revision and the accepted Ready value remain authoritative.
         return optionalRootIdentityEql(self.root_identity, other.root_identity) and self.matchesBorrowed(
             other.repo_root,
             other.path_key,
@@ -773,6 +790,37 @@ pub fn cloneRequestWithRootIdentity(
     status_snapshot_revision: u64,
     root_identity: ?root_capability.Identity,
 ) !Request {
+    return cloneRequestWithOptions(
+        allocator,
+        identity,
+        id,
+        repo_root,
+        path_key,
+        kind,
+        source_kind,
+        source_session_revision,
+        status_snapshot_revision,
+        .{ .root_identity = root_identity },
+    );
+}
+
+pub const RequestCloneOptions = struct {
+    root_identity: ?root_capability.Identity = null,
+    expected_presentation: ?ExpectedPresentation = null,
+};
+
+pub fn cloneRequestWithOptions(
+    allocator: std.mem.Allocator,
+    identity: page.RequestIdentity,
+    id: u64,
+    repo_root: []const u8,
+    path_key: []const u8,
+    kind: Kind,
+    source_kind: SourceKind,
+    source_session_revision: u64,
+    status_snapshot_revision: u64,
+    options: RequestCloneOptions,
+) !Request {
     const owned_root = try allocator.dupe(u8, repo_root);
     errdefer allocator.free(owned_root);
     const owned_path = try allocator.dupe(u8, path_key);
@@ -785,7 +833,8 @@ pub fn cloneRequestWithRootIdentity(
         .source_kind = source_kind,
         .source_session_revision = source_session_revision,
         .status_snapshot_revision = status_snapshot_revision,
-        .root_identity = root_identity,
+        .root_identity = options.root_identity,
+        .expected_presentation = options.expected_presentation,
     };
 }
 
@@ -947,6 +996,50 @@ test "request matches semantic projection identity" {
     try std.testing.expect(!request.matchesBorrowed("/repo", "src/main.zig", .cached_diff, .cached, 10, 20));
     try std.testing.expect(!request.matchesBorrowed("/repo", "src/main.zig", .cached_diff, .unstaged, 11, 20));
     try std.testing.expect(!request.matchesBorrowed("/other", "src/main.zig", .cached_diff, .unstaged, 10, 20));
+}
+
+test "request clone owns paths and snapshots scalar presentation hint" {
+    const allocator = std.testing.allocator;
+    const root = root_capability.Identity{ .device = 7, .inode = 11 };
+    const expected = ExpectedPresentation{
+        .fingerprint = .{ .digest = [_]u8{0x5a} ** 32 },
+        .content_token = .init(41),
+    };
+    var request = try cloneRequestWithOptions(
+        allocator,
+        page.RequestIdentity.review(3, 5),
+        9,
+        "/repo",
+        "src/a.zig",
+        .combined_hunks,
+        .unstaged,
+        13,
+        17,
+        .{
+            .root_identity = root,
+            .expected_presentation = expected,
+        },
+    );
+    defer request.deinit(allocator);
+
+    try std.testing.expect(request.matchesRootIdentity(root));
+    try std.testing.expect(request.expected_presentation.?.eql(expected));
+
+    var ordinary = try cloneRequestWithRootIdentity(
+        allocator,
+        request.identity,
+        10,
+        request.repo_root,
+        request.path_key,
+        request.kind,
+        request.source_kind,
+        request.source_session_revision,
+        request.status_snapshot_revision,
+        root,
+    );
+    defer ordinary.deinit(allocator);
+    try std.testing.expect(ordinary.expected_presentation == null);
+    try std.testing.expect(request.sameSemanticKey(ordinary));
 }
 
 test "generated request and syntax clone retain pinned root identity" {
