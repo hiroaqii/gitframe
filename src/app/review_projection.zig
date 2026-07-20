@@ -397,12 +397,14 @@ pub const Ready = union(enum) {
 
 pub const TaskResult = union(enum) {
     ready: Ready,
+    reuse_candidate: CombinedReuseCandidate,
     failed: StatusBody,
     failed_static: []const u8,
 
     pub fn deinit(self: *TaskResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .ready => |*ready| ready.deinit(allocator),
+            .reuse_candidate => |*candidate| candidate.deinit(),
             .failed => |*body| body.deinit(allocator),
             .failed_static => {},
         }
@@ -758,6 +760,33 @@ pub const State = struct {
             else => false,
         });
         self.displayed = .{ .ready = ready };
+    }
+
+    /// Retain the currently displayed combined presentation while replacing
+    /// its request and index authority with an exactly accepted candidate.
+    /// All fallible admission work must finish before this no-fail move.
+    pub fn installCombinedReuse(
+        self: *State,
+        allocator: std.mem.Allocator,
+        request: Request,
+        candidate: *CombinedReuseCandidate,
+    ) void {
+        std.debug.assert(request.kind == .combined_hunks);
+        self.clearSyntaxPending(allocator);
+        const ready = switch (self.displayed) {
+            .ready => |*ready| ready,
+            else => unreachable,
+        };
+        const bundle = switch (ready.value) {
+            .combined_hunks => |*bundle| bundle,
+            else => unreachable,
+        };
+
+        var old_authority = bundle.authority;
+        bundle.authority = candidate.discardCandidateAndTakeAuthority();
+        old_authority.deinit();
+        ready.request.deinit(allocator);
+        ready.request = request;
     }
 
     pub fn hasPending(self: State) bool {

@@ -71,6 +71,11 @@ pub const DiscoveryCommitOutcome = enum {
 
 pub const ProjectionApply = struct {
     result_transferred: bool = false,
+    /// A candidate completion passed request freshness but failed the live
+    /// token/exact-presentation gate. P4c exposes this inert signal for the
+    /// later bounded eager retry; the production worker does not emit the
+    /// candidate terminal yet.
+    reuse_rejected: bool = false,
 };
 
 pub const RedrawDisposition = enum {
@@ -429,6 +434,55 @@ pub const Controller = struct {
             .fingerprint = live.presentation.fingerprint,
             .content_token = live.presentation.content_token,
         };
+    }
+
+    /// Candidate fingerprints are only a worker hint. Fresh authority may be
+    /// installed only while the request's expected token still names the live
+    /// presentation and the allocation-free canonical comparator proves the
+    /// normalized candidate exactly equal.
+    fn acceptsCombinedReuseCandidate(
+        self: Controller,
+        request: review_projection.Request,
+        candidate: *const review_projection.CombinedReuseCandidate,
+    ) bool {
+        const expected = request.expected_presentation orelse return false;
+        const live = self.navigation.view().activeCombinedProjection() orelse return false;
+        if (!live.presentation.content_token.eql(expected.content_token)) return false;
+        if (!live.presentation.fingerprint.eql(expected.fingerprint)) return false;
+        if (!candidate.fingerprint.eql(expected.fingerprint)) return false;
+
+        const fresh_authority = if (candidate.fresh_authority) |*fresh| fresh else return false;
+        if (fresh_authority.status_snapshot_revision != request.status_snapshot_revision) return false;
+        const candidate_hunks = candidate.displayFile().hunks.len;
+        if (fresh_authority.projection.hunk_stage_states.len != candidate_hunks or
+            fresh_authority.projection.hunk_action_origins.len != candidate_hunks) return false;
+
+        return diff_presentation_identity.exactEqual(live.displayFile(), candidate.displayFile());
+    }
+
+    fn applyCombinedReuseCandidate(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        result: *app_load.ReviewProjectionFinished,
+    ) ProjectionApply {
+        const candidate = &result.result.reuse_candidate;
+        if (!self.acceptsCombinedReuseCandidate(result.request, candidate)) {
+            // Old presentation and stale authority remain visible but cannot
+            // authorize another write under the fresh page status revision.
+            // The later enabling slice consumes this signal to issue one
+            // hint-free eager retry.
+            self.page.review_projection.clearPending(allocator);
+            return .{ .reuse_rejected = true };
+        }
+
+        self.page.review_projection.clearPending(allocator);
+        const request = result.request;
+        result.request = undefined;
+        self.page.review_projection.installCombinedReuse(allocator, request, candidate);
+        candidate.deinit();
+        result.result = undefined;
+        self.reconcileInstalledProjectionNavigation(allocator, null);
+        return .{ .result_transferred = true };
     }
 
     /// A candidate is meaningful only for the exact semantic display basis it
@@ -1293,9 +1347,11 @@ pub const Controller = struct {
         return .{ .diagnostic = .{ .branch_status_load_failed = message } };
     }
 
-    /// Transfers a matching projection result into retained Review state. A
+    /// Consumes a matching projection result into retained Review state. A
     /// true `result_transferred` means the caller must not deinitialize the
-    /// task result because its request/value now belong to the page.
+    /// task result: ordinary ready values move into the page, while an exact
+    /// reuse candidate is split into retained authority and locally released
+    /// comparison storage before the result is invalidated.
     pub fn applyProjectionFinished(
         self: Controller,
         allocator: std.mem.Allocator,
@@ -1327,6 +1383,10 @@ pub const Controller = struct {
             return .{ .result_transferred = true };
         }
 
+        if (result.result == .reuse_candidate) {
+            return self.applyCombinedReuseCandidate(allocator, result);
+        }
+
         var local_navigation = if (self.page.pending_display_navigation_restore == null)
             try self.view().captureAnchor(allocator)
         else
@@ -1338,6 +1398,7 @@ pub const Controller = struct {
                 self.retainCombinedPresentationTokenIfExact(ready);
                 self.reconcileCompletedSelectionForReady(allocator, ready);
             },
+            .reuse_candidate => unreachable,
             .failed, .failed_static => self.clearCompletedSelection(allocator),
         }
 
@@ -1366,6 +1427,7 @@ pub const Controller = struct {
                 self.clearDisplayRestore(allocator);
                 return .{ .result_transferred = true };
             },
+            .reuse_candidate => unreachable,
             .failed_static => |message| {
                 var request = try review_projection.cloneRequestWithOptions(
                     allocator,
@@ -2032,6 +2094,64 @@ fn testCombinedBundle(
             .status_snapshot_revision = status_snapshot_revision,
         },
     };
+}
+
+fn testCombinedReuseCandidate(
+    allocator: std.mem.Allocator,
+    status_snapshot_revision: u64,
+    cached_patch: []const u8,
+    unstaged_patch: []const u8,
+) !review_projection.CombinedReuseCandidate {
+    var cached = try projection_component.ParsedComponent.parse(allocator, cached_patch);
+    errdefer cached.deinit();
+    var unstaged = try projection_component.ParsedComponent.parse(allocator, unstaged_patch);
+    errdefer unstaged.deinit();
+    var candidate_arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer candidate_arena.deinit();
+    var authority_arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer authority_arena.deinit();
+    const projection = try diff_hunk_projection.buildWithAllocators(
+        candidate_arena.allocator(),
+        authority_arena.allocator(),
+        cached.document.files[0],
+        unstaged.document.files[0],
+    );
+    const candidate: review_projection.CombinedReuseCandidate = .{
+        .candidate_arena = candidate_arena,
+        .projection = projection.presentation,
+        .fingerprint = diff_presentation_identity.fingerprint(projection.presentation.file),
+        .fresh_authority = .{
+            .arena = authority_arena,
+            .projection = projection.authority,
+            .cached_component = cached,
+            .unstaged_component = unstaged,
+            .status_snapshot_revision = status_snapshot_revision,
+        },
+    };
+    cached.arena = null;
+    unstaged.arena = null;
+    return candidate;
+}
+
+fn cloneTestProjectionRequest(
+    allocator: std.mem.Allocator,
+    request: review_projection.Request,
+) !review_projection.Request {
+    return review_projection.cloneRequestWithOptions(
+        allocator,
+        request.identity,
+        request.id,
+        request.repo_root,
+        request.path_key,
+        request.kind,
+        request.source_kind,
+        request.source_session_revision,
+        request.status_snapshot_revision,
+        .{
+            .root_identity = request.root_identity,
+            .expected_presentation = request.expected_presentation,
+        },
+    );
 }
 
 fn testCombinedCandidate(
@@ -3738,6 +3858,199 @@ test "combined replacement snapshots live presentation hint into page and task r
     try std.testing.expect(page_request.expected_presentation.?.eql(expected));
     try std.testing.expect(task_request.expected_presentation.?.eql(expected));
     try std.testing.expect(page_request.expected_presentation.?.eql(task_request.expected_presentation.?));
+}
+
+test "combined reuse acceptance retains presentation and installs fresh authority" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    try installTestCombinedCandidate(controller, allocator, 1, 51, 0);
+    const live_before = &page.review_projection.displayed.ready.value.combined_hunks;
+    const presentation_text_ptr = live_before.presentation.cached_bundle.loaded.text.ptr;
+    const presentation_syntax_ptr = live_before.presentation.cached_bundle.loaded.syntax_spans.files.ptr;
+    const presentation_token = live_before.presentation.content_token;
+    const old_authority_text_ptr = live_before.authority.cached_component.text.ptr;
+    try std.testing.expect(live_before.authority.projection.hunk_action_origins[1] == .unstaged);
+    const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(original_clipboard);
+
+    controller.advanceStatusSnapshotRevision(allocator);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    var candidate = try testCombinedReuseCandidate(
+        allocator,
+        1,
+        test_combined_after_cached,
+        test_combined_after_unstaged,
+    );
+    try std.testing.expect(candidate.fingerprint.eql(pending.expected_presentation.?.fingerprint));
+    try std.testing.expect(diff_presentation_identity.exactEqual(live_before.displayFile(), candidate.displayFile()));
+    try std.testing.expect(candidate.fresh_authority.?.cached_component.text.ptr != old_authority_text_ptr);
+    try std.testing.expect(candidate.fresh_authority.?.projection.hunk_action_origins[1] == .cached);
+
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = try cloneTestProjectionRequest(allocator, pending),
+        .result = .{ .reuse_candidate = candidate },
+    };
+    candidate = undefined;
+    var finished_owned = true;
+    defer if (finished_owned) finished.deinit(allocator);
+    const applied = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(applied.result_transferred);
+    try std.testing.expect(!applied.reuse_rejected);
+    finished_owned = false;
+
+    try std.testing.expect(page.review_projection.pending == null);
+    const accepted = &page.review_projection.displayed.ready;
+    try std.testing.expectEqual(@as(u64, 1), accepted.request.status_snapshot_revision);
+    const bundle = &accepted.value.combined_hunks;
+    try std.testing.expect(bundle.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
+    try std.testing.expect(bundle.presentation.cached_bundle.loaded.syntax_spans.files.ptr == presentation_syntax_ptr);
+    try std.testing.expect(bundle.presentation.content_token.eql(presentation_token));
+    try std.testing.expectEqual(@as(u64, 1), bundle.authority.status_snapshot_revision);
+    try std.testing.expect(bundle.authority.cached_component.fingerprint.eql(content_fingerprint.Fingerprint.init(test_combined_after_cached)));
+    try std.testing.expect(bundle.authority.projection.hunk_action_origins[1] == .cached);
+    try std.testing.expectEqual(diff_hunk_projection.HunkStageState.staged, bundle.authority.projection.hunk_stage_states[1]);
+    try std.testing.expect(page.completed_selection != null);
+    const accepted_clipboard = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(accepted_clipboard);
+    try std.testing.expectEqualStrings(original_clipboard, accepted_clipboard);
+}
+
+const CombinedReuseRejection = enum {
+    expected_token_changed,
+    forced_fingerprint_collision,
+    stale_authority_revision,
+};
+
+fn testCombinedReuseRejection(
+    allocator: std.mem.Allocator,
+    rejection: CombinedReuseRejection,
+) !void {
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    try installTestCombinedCandidate(controller, allocator, 1, 61, 0);
+    const live_before = &page.review_projection.displayed.ready.value.combined_hunks;
+    const presentation_text_ptr = live_before.presentation.cached_bundle.loaded.text.ptr;
+    const authority_text_ptr = live_before.authority.cached_component.text.ptr;
+    const presentation_token = live_before.presentation.content_token;
+    controller.advanceStatusSnapshotRevision(allocator);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+
+    const candidate_unstaged = if (rejection == .forced_fingerprint_collision)
+        test_combined_changed_unstaged
+    else
+        test_combined_after_unstaged;
+    var candidate = try testCombinedReuseCandidate(
+        allocator,
+        1,
+        test_combined_after_cached,
+        candidate_unstaged,
+    );
+    var request = try cloneTestProjectionRequest(allocator, pending);
+    switch (rejection) {
+        .expected_token_changed => request.expected_presentation.?.content_token = .init(999),
+        .forced_fingerprint_collision => {
+            try std.testing.expect(!diff_presentation_identity.exactEqual(live_before.displayFile(), candidate.displayFile()));
+            candidate.fingerprint = request.expected_presentation.?.fingerprint;
+        },
+        .stale_authority_revision => candidate.fresh_authority.?.status_snapshot_revision = 0,
+    }
+
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = request,
+        .result = .{ .reuse_candidate = candidate },
+    };
+    request = undefined;
+    candidate = undefined;
+    defer finished.deinit(allocator);
+    const applied = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(!applied.result_transferred);
+    try std.testing.expect(applied.reuse_rejected);
+    try std.testing.expect(page.review_projection.pending == null);
+
+    const retained = &page.review_projection.displayed.ready.value.combined_hunks;
+    try std.testing.expect(retained.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
+    try std.testing.expect(retained.authority.cached_component.text.ptr == authority_text_ptr);
+    try std.testing.expect(retained.presentation.content_token.eql(presentation_token));
+    try std.testing.expectEqual(@as(u64, 0), retained.authority.status_snapshot_revision);
+    try std.testing.expect(page.completed_selection != null);
+}
+
+test "combined reuse rejection keeps old display inert for eager fallback" {
+    const allocator = std.testing.allocator;
+    try testCombinedReuseRejection(allocator, .expected_token_changed);
+    try testCombinedReuseRejection(allocator, .forced_fingerprint_collision);
+    try testCombinedReuseRejection(allocator, .stale_authority_revision);
+}
+
+test "combined reuse candidate crosses live drag deferral with one owner" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    try installTestCombinedCandidate(controller, allocator, 1, 71, 0);
+    controller.advanceStatusSnapshotRevision(allocator);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    var candidate = try testCombinedReuseCandidate(
+        allocator,
+        1,
+        test_combined_after_cached,
+        test_combined_after_unstaged,
+    );
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = try cloneTestProjectionRequest(allocator, pending),
+        .result = .{ .reuse_candidate = candidate },
+    };
+    candidate = undefined;
+
+    page.selection_owner = .{ .diff = .init(
+        .{ .projection_file = .{ .kind = .combined, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    const deferred = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(deferred.result_transferred);
+    try std.testing.expect(page.deferred_projection_apply != null);
+    try std.testing.expect(page.review_projection.pending != null);
+    try std.testing.expectEqual(@as(u64, 0), page.review_projection.displayed.ready.value.combined_hunks.authority.status_snapshot_revision);
+
+    page.selection_owner = .none;
+    try controller.applyDeferredProjection(allocator);
+    try std.testing.expect(page.deferred_projection_apply == null);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expectEqual(@as(u64, 1), page.review_projection.displayed.ready.value.combined_hunks.authority.status_snapshot_revision);
 }
 
 test "combined candidate closes when replacement request allocation fails" {
