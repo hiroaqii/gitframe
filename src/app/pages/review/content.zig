@@ -106,6 +106,7 @@ pub const View = struct {
                 .synthetic,
                 false,
             ),
+            .retained_staged_only => |bundle| self.parsedRepositoryTarget(bundle.displayFile(), .cached, repo_root),
             .generated => |bundle| generatedRepositoryTarget(
                 bundle.path,
                 bundle.source.contentLineCount(),

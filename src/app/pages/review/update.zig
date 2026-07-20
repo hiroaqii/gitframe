@@ -302,6 +302,7 @@ pub const Controller = struct {
                 .cached = bundle.fingerprint,
             } },
             .combined => |bundle| .{ .combined_projection = bundle.presentation.content_token },
+            .retained_staged_only => |bundle| .{ .combined_projection = bundle.presentation.content_token },
             .generated => |bundle| .{ .generated_untracked = .{
                 .status_snapshot_revision = page.status_snapshot_revision,
                 .source = bundle.fingerprint(),

@@ -1013,26 +1013,73 @@ pub fn runReviewProjectionLoad(
 }
 
 fn loadCachedFileDiff(request: review_projection.Request, allocator: std.mem.Allocator, io: std.Io) review_projection.TaskResult {
-    const bundle = loadFileDiffBundle(request, allocator, io, .cached) catch |err| {
+    var component = loadFileProjectionComponent(request, allocator, io, .cached) catch |err| {
         return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Cached diff load failed: {s}", .{@errorName(err)}) catch
             return .{ .failed_static = "Cached diff load failed: OutOfMemory" } };
-    };
-    if (bundle == null) {
+    } orelse {
         return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No staged diff for this file.", .{}) catch
             return .{ .failed_static = "Projection allocation failed" } } };
-    }
-    return .{ .ready = .{ .cached_diff = bundle.? } };
+    };
+    defer component.deinit();
+    return buildCachedFileTaskResult(request, allocator, io, &component);
 }
 
-fn loadFileDiffBundle(
+/// Select a parse-only staged-only candidate only when the request names the
+/// same canonical presentation. A miss promotes the already parsed component
+/// into the established eager cached projection in this same completion.
+fn buildCachedFileTaskResult(
     request: review_projection.Request,
     allocator: std.mem.Allocator,
     io: std.Io,
-    base: git_backend.FileDiffBase,
-) !?LoadedDiffBundle {
-    const bytes = try loadFileDiffBytes(request, allocator, io, base) orelse return null;
-    defer allocator.free(bytes);
-    return try buildLoadedBundleWithIo(allocator, io, bytes);
+    component: *projection_component.ParsedComponent,
+) review_projection.TaskResult {
+    if (request.expected_presentation) |expected| {
+        if (component.document.files.len == 1 and component.fileTextSelectable(0)) {
+            const fingerprint = diff_presentation_identity.fingerprint(component.document.files[0]);
+            if (fingerprint.eql(expected.fingerprint)) {
+                const authority_allocator = component.arena.?.allocator();
+                const hunk_count = component.document.files[0].hunks.len;
+                const stage_states = authority_allocator.alloc(diff_hunk_projection.HunkStageState, hunk_count) catch
+                    return buildCachedFileEagerResult(request.path_key, allocator, io, component);
+                @memset(stage_states, .staged);
+                const action_origins = authority_allocator.alloc(diff_hunk_projection.HunkActionOrigin, hunk_count) catch
+                    return buildCachedFileEagerResult(request.path_key, allocator, io, component);
+                for (action_origins, 0..) |*origin, hunk_index| origin.* = .{ .cached = hunk_index };
+
+                const candidate: review_projection.StagedOnlyReuseCandidate = .{
+                    .fingerprint = fingerprint,
+                    .fresh_authority = .{
+                        .projection = .{
+                            .hunk_stage_states = stage_states,
+                            .hunk_action_origins = action_origins,
+                        },
+                        .cached_component = component.*,
+                        .status_snapshot_revision = request.status_snapshot_revision,
+                    },
+                };
+                component.arena = null;
+                return .{ .staged_only_reuse_candidate = candidate };
+            }
+        }
+    }
+    return buildCachedFileEagerResult(request.path_key, allocator, io, component);
+}
+
+fn buildCachedFileEagerResult(
+    path_key: []const u8,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    component: *projection_component.ParsedComponent,
+) review_projection.TaskResult {
+    const bundle = decorateProjectionComponent(component, io) catch |err| {
+        return .{ .failed = review_projection.statusBodyAlloc(
+            allocator,
+            path_key,
+            "Cached diff load failed: {s}",
+            .{@errorName(err)},
+        ) catch return .{ .failed_static = "Cached diff load failed: OutOfMemory" } };
+    };
+    return .{ .ready = .{ .cached_diff = bundle } };
 }
 
 fn loadFileProjectionComponent(
@@ -1650,6 +1697,66 @@ fn testCombinedProjectionRequest(
         status_snapshot_revision,
         .{ .expected_presentation = expected_presentation },
     );
+}
+
+fn testCachedProjectionRequest(
+    allocator: std.mem.Allocator,
+    id: u64,
+    status_snapshot_revision: u64,
+    expected_presentation: ?review_projection.ExpectedPresentation,
+) !review_projection.Request {
+    return review_projection.cloneRequestWithOptions(
+        allocator,
+        page.RequestIdentity.review(0, 1),
+        id,
+        "/repo",
+        "a.zig",
+        .cached_diff,
+        .unstaged,
+        0,
+        status_snapshot_revision,
+        .{ .expected_presentation = expected_presentation },
+    );
+}
+
+test "cached worker publishes staged-only candidate only for matching presentation hint" {
+    const allocator = std.testing.allocator;
+    var component = try projection_component.ParsedComponent.parse(allocator, p2_cached_patch);
+    defer component.deinit();
+    const expected_fingerprint = diff_presentation_identity.fingerprint(component.document.files[0]);
+    var request = try testCachedProjectionRequest(allocator, 20, 7, .{
+        .fingerprint = expected_fingerprint,
+        .content_token = .init(19),
+    });
+    defer request.deinit(allocator);
+
+    var result = buildCachedFileTaskResult(request, allocator, std.testing.io, &component);
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .staged_only_reuse_candidate);
+    try std.testing.expect(component.arena == null);
+    const candidate = &result.staged_only_reuse_candidate;
+    try std.testing.expect(candidate.fingerprint.eql(expected_fingerprint));
+    try std.testing.expectEqual(@as(u64, 7), candidate.fresh_authority.?.status_snapshot_revision);
+    try std.testing.expectEqual(candidate.displayFile().hunks.len, candidate.fresh_authority.?.projection.hunk_stage_states.len);
+    for (candidate.fresh_authority.?.projection.hunk_stage_states, candidate.fresh_authority.?.projection.hunk_action_origins, 0..) |state, origin, hunk_index| {
+        try std.testing.expectEqual(diff_hunk_projection.HunkStageState.staged, state);
+        try std.testing.expectEqual(hunk_index, origin.cached);
+    }
+
+    var eager_component = try projection_component.ParsedComponent.parse(allocator, p2_cached_patch);
+    defer eager_component.deinit();
+    var mismatch = expected_fingerprint;
+    mismatch.digest[0] ^= 0xff;
+    var eager_request = try testCachedProjectionRequest(allocator, 21, 8, .{
+        .fingerprint = mismatch,
+        .content_token = .init(20),
+    });
+    defer eager_request.deinit(allocator);
+    var eager = buildCachedFileTaskResult(eager_request, allocator, std.testing.io, &eager_component);
+    defer eager.deinit(allocator);
+    try std.testing.expect(eager == .ready);
+    try std.testing.expect(eager.ready == .cached_diff);
+    try std.testing.expect(eager_component.arena == null);
 }
 
 test "combined worker publishes provider-independent candidate only for matching hint" {

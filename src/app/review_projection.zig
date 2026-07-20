@@ -253,6 +253,37 @@ pub const CombinedAuthority = struct {
     }
 };
 
+/// Fresh authority for a file whose index now contains every displayed hunk.
+///
+/// This is deliberately not represented as a `CombinedAuthority` with an
+/// empty unstaged component. A staged-only generation has one real patch
+/// source and every displayed hunk maps directly to that cached component;
+/// keeping the shape explicit prevents a later action from treating a
+/// fabricated component as Git authority.
+pub const StagedOnlyAuthority = struct {
+    projection: diff_hunk_projection.Authority,
+    cached_component: projection_component.ParsedComponent,
+    status_snapshot_revision: u64,
+
+    pub fn actionSourceFile(self: *const StagedOnlyAuthority, origin: diff_hunk_projection.HunkActionOrigin) ?diff_parser.FileDiff {
+        switch (origin) {
+            .cached => {},
+            .unstaged => return null,
+        }
+        if (self.cached_component.document.files.len != 1) return null;
+        return self.cached_component.document.files[0];
+    }
+
+    fn retainedBytes(self: *const StagedOnlyAuthority) usize {
+        return arenaCapacity(self.cached_component.arena);
+    }
+
+    pub fn deinit(self: *StagedOnlyAuthority) void {
+        self.cached_component.deinit();
+        self.projection = undefined;
+    }
+};
+
 /// Provider-independent normalized candidate plus the fresh index authority
 /// built from the same cached/unstaged component generation.
 ///
@@ -298,6 +329,34 @@ pub const CombinedReuseCandidate = struct {
     }
 };
 
+/// Provider-independent cached-only candidate used at the
+/// combined-to-staged-only boundary. Its parsed component is both the exact
+/// comparison basis and the fresh source for a subsequent unstage action.
+/// No decorated syntax storage is created unless reuse is rejected.
+pub const StagedOnlyReuseCandidate = struct {
+    fingerprint: diff_presentation_identity.Fingerprint,
+    fresh_authority: ?StagedOnlyAuthority,
+
+    pub fn displayFile(self: *const StagedOnlyReuseCandidate) diff_parser.FileDiff {
+        return self.fresh_authority.?.cached_component.document.files[0];
+    }
+
+    pub fn retainedBytes(self: *const StagedOnlyReuseCandidate) usize {
+        return if (self.fresh_authority) |authority| authority.retainedBytes() else 0;
+    }
+
+    pub fn takeAuthority(self: *StagedOnlyReuseCandidate) StagedOnlyAuthority {
+        const authority = self.fresh_authority.?;
+        self.fresh_authority = null;
+        return authority;
+    }
+
+    pub fn deinit(self: *StagedOnlyReuseCandidate) void {
+        if (self.fresh_authority) |*authority| authority.deinit();
+        self.fresh_authority = null;
+    }
+};
+
 pub const CombinedHunkBundle = struct {
     presentation: CombinedPresentation,
     authority: CombinedAuthority,
@@ -340,6 +399,39 @@ pub const CombinedHunkBundle = struct {
     }
 };
 
+/// An exactly retained combined presentation paired with fresh staged-only
+/// action authority. The request kind is `cached_diff`, but presentation
+/// syntax and line indexes remain owned by the earlier combined generation.
+pub const RetainedStagedOnlyBundle = struct {
+    presentation: CombinedPresentation,
+    authority: StagedOnlyAuthority,
+
+    pub fn displayFile(self: *const RetainedStagedOnlyBundle) diff_parser.FileDiff {
+        return self.presentation.projection.file;
+    }
+
+    pub fn displayLineIndex(self: *const RetainedStagedOnlyBundle, mode: diff_view_model.DisplayMode) diff_view_model.RenderedLineIndex {
+        return self.presentation.projection.lineIndex(mode);
+    }
+
+    pub fn syntaxView(self: *const RetainedStagedOnlyBundle) diff_syntax_view.View {
+        return self.presentation.syntaxView();
+    }
+
+    pub fn retainedBytes(self: *const RetainedStagedOnlyBundle) usize {
+        return saturatedSum(&.{
+            self.presentation.retainedBytes(),
+            self.authority.retainedBytes(),
+        });
+    }
+
+    pub fn deinit(self: *RetainedStagedOnlyBundle) void {
+        self.presentation.deinit();
+        self.authority.deinit();
+        self.* = undefined;
+    }
+};
+
 /// Owns both component snapshots when a mixed projection is intentionally
 /// admitted as an inert body. Keeping this as a typed projection terminal
 /// prevents navigation from falling through to an unrelated primary diff and
@@ -374,6 +466,11 @@ pub const Ready = union(enum) {
     /// the immutable primary loaded file. The primary load session remains
     /// the presentation owner; this value owns no pointer into that session.
     primary_combined_authority: CombinedAuthority,
+    /// Self-owned presentation retained across combined -> staged-only.
+    retained_staged_only: RetainedStagedOnlyBundle,
+    /// Fresh staged-only authority over an immutable primary presentation.
+    /// Like the combined primary overlay, this never enters projection cache.
+    primary_staged_only_authority: StagedOnlyAuthority,
     inert_combined: InertCombinedBundle,
     status_body: StatusBody,
 
@@ -383,6 +480,8 @@ pub const Ready = union(enum) {
             .generated_added_file => |*bundle| bundle.deinit(allocator),
             .combined_hunks => |*bundle| bundle.deinit(),
             .primary_combined_authority => |*authority| authority.deinit(),
+            .retained_staged_only => |*bundle| bundle.deinit(),
+            .primary_staged_only_authority => |*authority| authority.deinit(),
             .inert_combined => |*bundle| bundle.deinit(),
             .status_body => |*body| body.deinit(allocator),
         }
@@ -391,8 +490,8 @@ pub const Ready = union(enum) {
 
     pub fn cacheable(self: Ready) bool {
         return switch (self) {
-            .cached_diff, .generated_added_file, .combined_hunks, .inert_combined => true,
-            .primary_combined_authority, .status_body => false,
+            .cached_diff, .generated_added_file, .combined_hunks, .retained_staged_only, .inert_combined => true,
+            .primary_combined_authority, .primary_staged_only_authority, .status_body => false,
         };
     }
 
@@ -402,6 +501,8 @@ pub const Ready = union(enum) {
             .generated_added_file => |bundle| bundle.retainedBytes(),
             .combined_hunks => |bundle| bundle.retainedBytes(),
             .primary_combined_authority => |authority| authority.retainedBytes(),
+            .retained_staged_only => |bundle| bundle.retainedBytes(),
+            .primary_staged_only_authority => |authority| authority.retainedBytes(),
             .inert_combined => |bundle| saturatedSum(&.{
                 arenaCapacity(bundle.cached_bundle.arena),
                 arenaCapacity(bundle.unstaged_bundle.arena),
@@ -414,6 +515,7 @@ pub const Ready = union(enum) {
 pub const TaskResult = union(enum) {
     ready: Ready,
     reuse_candidate: CombinedReuseCandidate,
+    staged_only_reuse_candidate: StagedOnlyReuseCandidate,
     failed: StatusBody,
     failed_static: []const u8,
 
@@ -421,6 +523,7 @@ pub const TaskResult = union(enum) {
         switch (self.*) {
             .ready => |*ready| ready.deinit(allocator),
             .reuse_candidate => |*candidate| candidate.deinit(),
+            .staged_only_reuse_candidate => |*candidate| candidate.deinit(),
             .failed => |*body| body.deinit(allocator),
             .failed_static => {},
         }
@@ -857,6 +960,58 @@ pub const State = struct {
         self.displayed = .{ .ready = .{
             .request = request,
             .value = .{ .primary_combined_authority = candidate.discardCandidateAndTakeAuthority() },
+        } };
+    }
+
+    /// Move an exactly equal, self-owned combined presentation into its
+    /// staged-only generation while replacing the obsolete split authority
+    /// with the candidate's cached-only authority. This is an infallible move
+    /// performed only after App-side exact admission has succeeded.
+    pub fn installRetainedStagedOnlyReuse(
+        self: *State,
+        allocator: std.mem.Allocator,
+        request: Request,
+        candidate: *StagedOnlyReuseCandidate,
+    ) void {
+        std.debug.assert(request.kind == .cached_diff);
+        self.clearSyntaxPending(allocator);
+        const ready = switch (self.displayed) {
+            .ready => |*ready| ready,
+            else => unreachable,
+        };
+        const bundle = switch (ready.value) {
+            .combined_hunks => |*bundle| bundle,
+            else => unreachable,
+        };
+
+        const presentation = bundle.presentation;
+        bundle.authority.deinit();
+        bundle.* = undefined;
+        ready.value = .{ .retained_staged_only = .{
+            .presentation = presentation,
+            .authority = candidate.takeAuthority(),
+        } };
+        ready.request.deinit(allocator);
+        ready.request = request;
+    }
+
+    /// Keep the immutable primary load as presentation owner while replacing
+    /// its mixed authority overlay with fresh staged-only authority.
+    pub fn installPrimaryStagedOnlyReuse(
+        self: *State,
+        allocator: std.mem.Allocator,
+        request: Request,
+        candidate: *StagedOnlyReuseCandidate,
+    ) void {
+        std.debug.assert(request.kind == .cached_diff);
+        self.clearSyntaxPending(allocator);
+
+        var previous = self.displayed;
+        self.displayed = .idle;
+        previous.deinit(allocator);
+        self.displayed = .{ .ready = .{
+            .request = request,
+            .value = .{ .primary_staged_only_authority = candidate.takeAuthority() },
         } };
     }
 

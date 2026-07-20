@@ -13,6 +13,8 @@ const navigation = @import("navigation.zig");
 const review_page = @import("../review.zig");
 const git_ops = @import("../../git_ops.zig");
 const review_projection = @import("../../review_projection.zig");
+const projection_component = @import("../../projection_component.zig");
+const diff_hunk_projection = @import("../../../diff/hunk_projection.zig");
 const diff_file = @import("../../../diff/file.zig");
 const diff_patch = @import("../../../diff/patch.zig");
 const diff_source = @import("../../../diff/source.zig");
@@ -415,7 +417,7 @@ pub const View = struct {
         if (!self.activation().satisfiesAction(.stage_hunk)) return self.hunkAuthorityFailure(.stage_hunk);
 
         const repo_root = self.repo_root orelse return .no_repo;
-        if (self.currentCombinedAuthority()) |bundle| {
+        if (self.currentHunkAuthority()) |bundle| {
             if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
             const projected_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
             const stage_states = bundle.hunkStageStates();
@@ -425,7 +427,7 @@ pub const View = struct {
                 .staged => if (can_unstage) .{ .operation = .unstage } else .unavailable_source,
             };
         }
-        if (self.navigation.activeCombinedAuthority() != null) return .stale_status;
+        if (self.navigation.activeHunkAuthority() != null) return .stale_status;
 
         const file = self.navigation.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
@@ -455,10 +457,10 @@ pub const View = struct {
             else => .stale_source,
         };
         const repo_root = self.repo_root orelse return .no_repo;
-        if (self.currentCombinedAuthority()) |bundle| {
+        if (self.currentHunkAuthority()) |bundle| {
             return self.selectedProjectedHunkStageTarget(allocator, repo_root, bundle);
         }
-        if (self.navigation.activeCombinedAuthority() != null) return .stale_status;
+        if (self.navigation.activeHunkAuthority() != null) return .stale_status;
         const file = self.navigation.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
@@ -497,10 +499,10 @@ pub const View = struct {
             else => .stale_source,
         };
         const repo_root = self.repo_root orelse return .no_repo;
-        if (self.currentCombinedAuthority()) |bundle| {
+        if (self.currentHunkAuthority()) |bundle| {
             return self.selectedProjectedHunkUnstageTarget(allocator, repo_root, bundle);
         }
-        if (self.navigation.activeCombinedAuthority() != null) return .stale_status;
+        if (self.navigation.activeHunkAuthority() != null) return .stale_status;
         const file = self.navigation.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
@@ -535,7 +537,7 @@ pub const View = struct {
         self: View,
         allocator: std.mem.Allocator,
         repo_root: []const u8,
-        bundle: navigation.ActiveCombinedAuthority,
+        bundle: navigation.ActiveHunkAuthority,
     ) HunkStageTargetResult {
         const path = diff_file.canonicalPathKey(bundle.display_file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
@@ -571,7 +573,7 @@ pub const View = struct {
         self: View,
         allocator: std.mem.Allocator,
         repo_root: []const u8,
-        bundle: navigation.ActiveCombinedAuthority,
+        bundle: navigation.ActiveHunkAuthority,
     ) HunkUnstageTargetResult {
         const path = diff_file.canonicalPathKey(bundle.display_file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
@@ -603,12 +605,13 @@ pub const View = struct {
         } };
     }
 
-    fn currentCombinedAuthority(self: View) ?navigation.ActiveCombinedAuthority {
+    fn currentHunkAuthority(self: View) ?navigation.ActiveHunkAuthority {
         if (!self.activation().satisfiesAction(.stage_hunk)) return null;
-        const bundle = self.navigation.activeCombinedAuthority() orelse return null;
+        const bundle = self.navigation.activeHunkAuthority() orelse return null;
         const request = self.page.review_projection.displayed.request() orelse return null;
-        if (request.kind != .combined_hunks or request.status_snapshot_revision != self.page.status_snapshot_revision) return null;
-        if (bundle.authority.status_snapshot_revision != self.page.status_snapshot_revision) return null;
+        if (request.kind != bundle.authority.requestKind() or
+            request.status_snapshot_revision != self.page.status_snapshot_revision) return null;
+        if (bundle.authority.statusSnapshotRevision() != self.page.status_snapshot_revision) return null;
         return bundle;
     }
 
@@ -907,6 +910,79 @@ test "stage target skips only fresh staged-only files" {
     try page.git_status.replace("/other", &other);
     try std.testing.expect(testView(&page, .unstaged).stageTarget() == .ready);
     try std.testing.expect(testView(&page, .cached).stageTarget() == .unavailable_source);
+}
+
+test "retained staged-only authority builds unstage patch from fresh cached component" {
+    const allocator = std.testing.allocator;
+    const cached_patch =
+        \\diff --git a/a b/a
+        \\index 1111111..2222222 100644
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1,4 +1,4 @@ first
+        \\ one
+        \\ two
+        \\-old
+        \\+new
+        \\ four
+        \\@@ -20,2 +20,2 @@ second
+        \\ late one
+        \\-late old
+        \\+late new
+        \\
+    ;
+    var component = try projection_component.ParsedComponent.parse(allocator, cached_patch);
+    const owner = component.arena.?.allocator();
+    const stage_states = try owner.alloc(diff_hunk_projection.HunkStageState, 2);
+    @memset(stage_states, .staged);
+    const action_origins = try owner.alloc(diff_hunk_projection.HunkActionOrigin, 2);
+    action_origins[0] = .{ .cached = 0 };
+    action_origins[1] = .{ .cached = 1 };
+
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer page.deinit(allocator);
+    _ = page.activation.activate(0, .pending, .pending, .pending);
+    acceptTestSource(&page);
+    var status = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &status);
+    page.review_projection.installReady(.{
+        .request = try review_projection.cloneRequest(
+            allocator,
+            page.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            page.source_session_revision,
+            page.status_snapshot_revision,
+        ),
+        .value = .{ .primary_staged_only_authority = .{
+            .projection = .{
+                .hunk_stage_states = stage_states,
+                .hunk_action_origins = action_origins,
+            },
+            .cached_component = component,
+            .status_snapshot_revision = page.status_snapshot_revision,
+        } },
+    });
+    component.arena = null;
+
+    const view = testView(&page, .unstaged);
+    try std.testing.expect(view.selectedHunkStageTarget(allocator) == .already_staged_hunk);
+    const target = switch (view.selectedHunkUnstageTarget(allocator)) {
+        .ready => |target| target,
+        else => return error.ExpectedStagedOnlyUnstageTarget,
+    };
+    defer allocator.free(target.patch);
+    try std.testing.expectEqualStrings("a", target.path);
+    try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
+    try std.testing.expectEqual(git_ops.HunkMarkSource.projection, target.mark_source);
+    try std.testing.expect(std.mem.indexOf(u8, target.patch, "@@ -1,4 +1,4 @@ first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target.patch, "+new") != null);
 }
 
 test "stage toggle resolves file operation from fresh status" {

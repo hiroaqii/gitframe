@@ -700,6 +700,25 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
+        .retained_staged_only => |bundle| {
+            try diff_render.renderFile(&content, bundle.displayFile(), .{
+                .requested_mode = app.page.viewer.display_mode,
+                .scroll = app.page.viewer.diff_scroll,
+                .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
+                .pane_active = active,
+                .line_numbers = app.page.viewer.view_options.line_numbers,
+                .highlighted_hunk = app.selectedHunkIndex(),
+                .cursor_offset = app.visibleDiffCursorOffset(),
+                .line_index = bundle.displayLineIndex(diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
+                .hunk_stages = .all_staged,
+                .palette = app.theme,
+                .syntax = bundle.syntaxView(),
+                .selection = app.diffSelectionView(),
+                .header_selection = app.diffHeaderSelectionActive(),
+            });
+            drawPaneHeaderRule(surface, active, app.theme);
+            return;
+        },
         .generated => |bundle| {
             try diff_render.renderGeneratedAddedFile(&content, bundle.path, &bundle.source, .{
                 .requested_mode = app.page.viewer.display_mode,

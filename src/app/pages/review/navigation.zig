@@ -159,23 +159,65 @@ pub const HunkInteractionAvailability = enum {
     inert_invalid_utf8,
 };
 
-/// Borrowed action facade for a normalized combined presentation. The display
-/// file may be owned either by a combined projection or by the immutable
-/// primary load session; index-derived action storage always belongs to the
-/// separately retained authority.
-pub const ActiveCombinedAuthority = struct {
+/// Borrowed reference to the fresh index authority paired with the current
+/// presentation. The explicit union keeps a real two-component mixed
+/// generation distinct from a one-component staged-only generation.
+pub const HunkAuthorityRef = union(enum) {
+    combined: *const review_projection.CombinedAuthority,
+    staged_only: *const review_projection.StagedOnlyAuthority,
+
+    pub fn hunkStageStates(self: HunkAuthorityRef) []const diff_hunk_projection.HunkStageState {
+        return switch (self) {
+            .combined => |authority| authority.projection.hunk_stage_states,
+            .staged_only => |authority| authority.projection.hunk_stage_states,
+        };
+    }
+
+    pub fn hunkActionOrigins(self: HunkAuthorityRef) []const diff_hunk_projection.HunkActionOrigin {
+        return switch (self) {
+            .combined => |authority| authority.projection.hunk_action_origins,
+            .staged_only => |authority| authority.projection.hunk_action_origins,
+        };
+    }
+
+    pub fn actionSourceFile(self: HunkAuthorityRef, origin: diff_hunk_projection.HunkActionOrigin) ?diff_parser.FileDiff {
+        return switch (self) {
+            .combined => |authority| authority.actionSourceFile(origin),
+            .staged_only => |authority| authority.actionSourceFile(origin),
+        };
+    }
+
+    pub fn statusSnapshotRevision(self: HunkAuthorityRef) u64 {
+        return switch (self) {
+            .combined => |authority| authority.status_snapshot_revision,
+            .staged_only => |authority| authority.status_snapshot_revision,
+        };
+    }
+
+    pub fn requestKind(self: HunkAuthorityRef) review_projection.Kind {
+        return switch (self) {
+            .combined => .combined_hunks,
+            .staged_only => .cached_diff,
+        };
+    }
+};
+
+/// Borrowed action facade for a retained presentation. The display file and
+/// its fresh index authority may have different owners, but both are resolved
+/// for only the duration of the current update.
+pub const ActiveHunkAuthority = struct {
     display_file: diff_parser.FileDiff,
-    authority: *const review_projection.CombinedAuthority,
+    authority: HunkAuthorityRef,
 
-    pub fn hunkStageStates(self: ActiveCombinedAuthority) []const diff_hunk_projection.HunkStageState {
-        return self.authority.projection.hunk_stage_states;
+    pub fn hunkStageStates(self: ActiveHunkAuthority) []const diff_hunk_projection.HunkStageState {
+        return self.authority.hunkStageStates();
     }
 
-    pub fn hunkActionOrigins(self: ActiveCombinedAuthority) []const diff_hunk_projection.HunkActionOrigin {
-        return self.authority.projection.hunk_action_origins;
+    pub fn hunkActionOrigins(self: ActiveHunkAuthority) []const diff_hunk_projection.HunkActionOrigin {
+        return self.authority.hunkActionOrigins();
     }
 
-    pub fn actionSourceFile(self: ActiveCombinedAuthority, origin: diff_hunk_projection.HunkActionOrigin) ?diff_parser.FileDiff {
+    pub fn actionSourceFile(self: ActiveHunkAuthority, origin: diff_hunk_projection.HunkActionOrigin) ?diff_parser.FileDiff {
         return self.authority.actionSourceFile(origin);
     }
 };
@@ -183,7 +225,7 @@ pub const ActiveCombinedAuthority = struct {
 pub const PrimaryReviewBody = struct {
     loaded: *const LoadedDiff,
     file_index: usize,
-    combined_authority: ?*const review_projection.CombinedAuthority = null,
+    hunk_authority: ?HunkAuthorityRef = null,
 };
 
 /// Single authority facade for the body currently promised by Review.
@@ -196,6 +238,7 @@ pub const DisplayedReviewBody = union(enum) {
     primary: PrimaryReviewBody,
     cached: *const app_load.LoadedDiffBundle,
     combined: *const review_projection.CombinedHunkBundle,
+    retained_staged_only: *const review_projection.RetainedStagedOnlyBundle,
     generated: *const review_projection.GeneratedFileBundle,
     inert_invalid_utf8: struct {
         path_key: []const u8,
@@ -253,7 +296,9 @@ pub const View = struct {
                         },
                         .generated_added_file => |*bundle| .{ .generated = bundle },
                         .combined_hunks => |*bundle| .{ .combined = bundle },
-                        .primary_combined_authority => |*authority| self.primaryReviewBody(authority),
+                        .primary_combined_authority => |*authority| self.primaryReviewBody(.{ .combined = authority }),
+                        .retained_staged_only => |*bundle| .{ .retained_staged_only = bundle },
+                        .primary_staged_only_authority => |*authority| self.primaryReviewBody(.{ .staged_only = authority }),
                         .inert_combined => .{ .inert_invalid_utf8 = .{
                             .path_key = ready.request.path_key,
                             .display_path = ready.request.path_key,
@@ -277,7 +322,7 @@ pub const View = struct {
 
     fn primaryReviewBody(
         self: View,
-        combined_authority: ?*const review_projection.CombinedAuthority,
+        hunk_authority: ?HunkAuthorityRef,
     ) DisplayedReviewBody {
         const loaded = self.activeLoadedDiffConst() orelse return .none;
         const file_index = self.selectedFileIndex(loaded) orelse return .none;
@@ -290,7 +335,7 @@ pub const View = struct {
         return .{ .primary = .{
             .loaded = loaded,
             .file_index = file_index,
-            .combined_authority = combined_authority,
+            .hunk_authority = hunk_authority,
         } };
     }
 
@@ -387,6 +432,15 @@ pub const View = struct {
                     .identity = .{ .projection_file = .{ .kind = .combined, .path_key = path_key } },
                 };
             },
+            .retained_staged_only => |bundle| blk: {
+                const path_key = diff_file.canonicalPathKey(bundle.displayFile()) orelse return null;
+                break :blk .{
+                    .file = bundle.displayFile(),
+                    .line_index = bundle.displayLineIndex(self.effectiveDisplayMode()),
+                    .folded_hunks = &.{},
+                    .identity = .{ .projection_file = .{ .kind = .cached, .path_key = path_key } },
+                };
+            },
             .none, .generated, .inert_invalid_utf8, .status, .pending => return null,
         };
         if (expected) |identity| if (!identity.eql(target.identity)) return null;
@@ -402,6 +456,13 @@ pub const View = struct {
                 };
             }
             if (self.activeCombinedProjection()) |bundle| {
+                const path_key = diff_file.canonicalPathKey(bundle.displayFile()) orelse return null;
+                break :blk .{
+                    .identity = .{ .kind = .projection_file, .path_key = path_key },
+                    .display_path = diff_file.displayPath(bundle.displayFile()),
+                };
+            }
+            if (self.activeRetainedStagedOnlyProjection()) |bundle| {
                 const path_key = diff_file.canonicalPathKey(bundle.displayFile()) orelse return null;
                 break :blk .{
                     .identity = .{ .kind = .projection_file, .path_key = path_key },
@@ -603,6 +664,8 @@ pub const View = struct {
                 .generated_added_file => |bundle| bundle.source.rowCount(),
                 .combined_hunks => |bundle| bundle.displayLineIndex(self.effectiveDisplayMode()).lineCount(),
                 .primary_combined_authority => 0,
+                .retained_staged_only => |bundle| bundle.displayLineIndex(self.effectiveDisplayMode()).lineCount(),
+                .primary_staged_only_authority => 0,
                 .inert_combined => 1,
                 .status_body => 1,
             },
@@ -791,6 +854,7 @@ pub const View = struct {
             .primary => |primary| primary.loaded.document.files[primary.file_index],
             .cached => |bundle| bundle.loaded.document.files[0],
             .combined => |bundle| bundle.displayFile(),
+            .retained_staged_only => |bundle| bundle.displayFile(),
             .none, .generated, .inert_invalid_utf8, .status, .pending => null,
         };
     }
@@ -807,6 +871,11 @@ pub const View = struct {
                 .line_index = primary.loaded.renderedLineIndex(primary.file_index, mode),
                 .folded_hunks = primary.loaded.foldedHunksForFile(primary.file_index),
             },
+            .retained_staged_only => |bundle| .{
+                .file = bundle.displayFile(),
+                .line_index = bundle.displayLineIndex(mode),
+                .folded_hunks = &.{},
+            },
             .none, .combined, .generated, .inert_invalid_utf8, .status, .pending => null,
         };
     }
@@ -818,6 +887,7 @@ pub const View = struct {
 
     pub fn displayedDiffLineIndex(self: View, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
         if (self.activeCombinedProjection()) |bundle| return bundle.displayLineIndex(mode);
+        if (self.activeRetainedStagedOnlyProjection()) |bundle| return bundle.displayLineIndex(mode);
         if (self.activeCachedDiffProjection()) |bundle| {
             if (bundle.loaded.document.files.len == 0) return null;
             return bundle.loaded.cachedRenderedLineIndex(0, mode);
@@ -832,6 +902,14 @@ pub const View = struct {
                     .file = bundle.displayFile(),
                     .line_index = bundle.displayLineIndex(mode),
                     .hunk_stages = try projectedHunkStagePresentation(allocator, bundle.hunkStageStates()),
+                    .syntax = bundle.syntaxView(),
+                } };
+            },
+            .retained_staged_only => |bundle| {
+                return .{ .combined_projection = .{
+                    .file = bundle.displayFile(),
+                    .line_index = bundle.displayLineIndex(mode),
+                    .hunk_stages = .all_staged,
                     .syntax = bundle.syntaxView(),
                 } };
             },
@@ -856,8 +934,8 @@ pub const View = struct {
             .file = file,
             .line_index = loaded.cachedRenderedLineIndex(file_index, mode),
             .folded_hunks = loaded.foldedHunksForFile(file_index),
-            .hunk_stages = if (selected.combined_authority) |authority|
-                try projectedHunkStagePresentation(allocator, authority.projection.hunk_stage_states)
+            .hunk_stages = if (selected.hunk_authority) |authority|
+                try projectedHunkStagePresentation(allocator, authority.hunkStageStates())
             else
                 try self.hunkStagePresentationForFile(allocator, file),
             .syntax = .initDirect(&loaded.syntax_spans, file_index),
@@ -885,13 +963,24 @@ pub const View = struct {
         };
     }
 
-    pub fn activeCombinedAuthority(self: View) ?ActiveCombinedAuthority {
+    pub fn activeRetainedStagedOnlyProjection(self: View) ?*const review_projection.RetainedStagedOnlyBundle {
+        return switch (self.displayedReviewBody()) {
+            .retained_staged_only => |bundle| bundle,
+            else => null,
+        };
+    }
+
+    pub fn activeHunkAuthority(self: View) ?ActiveHunkAuthority {
         return switch (self.displayedReviewBody()) {
             .combined => |bundle| .{
                 .display_file = bundle.displayFile(),
-                .authority = &bundle.authority,
+                .authority = .{ .combined = &bundle.authority },
             },
-            .primary => |primary| if (primary.combined_authority) |authority| .{
+            .retained_staged_only => |bundle| .{
+                .display_file = bundle.displayFile(),
+                .authority = .{ .staged_only = &bundle.authority },
+            },
+            .primary => |primary| if (primary.hunk_authority) |authority| .{
                 .display_file = primary.loaded.document.files[primary.file_index],
                 .authority = authority,
             } else null,
@@ -905,7 +994,7 @@ pub const View = struct {
 
     pub fn hunkInteractionAvailability(self: View) HunkInteractionAvailability {
         return switch (self.displayedReviewBody()) {
-            .primary, .cached, .combined => .available,
+            .primary, .cached, .combined, .retained_staged_only => .available,
             .inert_invalid_utf8 => .inert_invalid_utf8,
             .none, .generated, .status, .pending => .unavailable,
         };
@@ -942,7 +1031,9 @@ pub const View = struct {
     }
 
     pub fn selectedFoldedHunks(self: View) []const bool {
-        if (self.activeCombinedProjection() != null or self.activeCachedDiffProjection() != null) return &.{};
+        if (self.activeCombinedProjection() != null or
+            self.activeRetainedStagedOnlyProjection() != null or
+            self.activeCachedDiffProjection() != null) return &.{};
         const loaded = self.activeLoadedDiffConst() orelse return &.{};
         const file_index = self.selectedFileIndex(loaded) orelse return &.{};
         return loaded.foldedHunksForFile(file_index);
