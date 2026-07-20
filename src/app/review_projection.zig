@@ -30,16 +30,26 @@ pub const SourceKind = enum {
     other,
 };
 
-/// Scalar-only hint naming the combined presentation visible when a refresh
-/// request was prepared. The fingerprint may select the worker reuse path but
-/// is never acceptance proof; the opaque token lets acceptance verify that the
-/// same live presentation still exists before performing an exact comparison.
+pub const ExpectedPresentationOwner = enum {
+    combined_projection,
+    primary_loaded,
+};
+
+/// Scalar-only hint naming the normalized presentation visible when a combined
+/// refresh request was prepared. `owner` distinguishes an owned combined
+/// projection from the independently owned primary load session. The
+/// fingerprint may select the worker reuse path but is never acceptance proof;
+/// the opaque token lets App verify that the same live owner still exists
+/// before performing an exact comparison.
 pub const ExpectedPresentation = struct {
+    owner: ExpectedPresentationOwner = .combined_projection,
     fingerprint: diff_presentation_identity.Fingerprint,
     content_token: diff_presentation_identity.ContentToken,
 
     pub fn eql(self: ExpectedPresentation, other: ExpectedPresentation) bool {
-        return self.fingerprint.eql(other.fingerprint) and self.content_token.eql(other.content_token);
+        return self.owner == other.owner and
+            self.fingerprint.eql(other.fingerprint) and
+            self.content_token.eql(other.content_token);
     }
 };
 
@@ -217,7 +227,7 @@ pub const CombinedAuthority = struct {
     unstaged_component: projection_component.ParsedComponent,
     status_snapshot_revision: u64,
 
-    fn actionSourceFile(self: *const CombinedAuthority, origin: diff_hunk_projection.HunkActionOrigin) ?diff_parser.FileDiff {
+    pub fn actionSourceFile(self: *const CombinedAuthority, origin: diff_hunk_projection.HunkActionOrigin) ?diff_parser.FileDiff {
         const document = switch (origin) {
             .cached => self.cached_component.document,
             .unstaged => self.unstaged_component.document,
@@ -360,6 +370,10 @@ pub const Ready = union(enum) {
     cached_diff: app_load.LoadedDiffBundle,
     generated_added_file: GeneratedFileBundle,
     combined_hunks: CombinedHunkBundle,
+    /// Fresh mixed-index authority whose normalized presentation is exactly
+    /// the immutable primary loaded file. The primary load session remains
+    /// the presentation owner; this value owns no pointer into that session.
+    primary_combined_authority: CombinedAuthority,
     inert_combined: InertCombinedBundle,
     status_body: StatusBody,
 
@@ -368,6 +382,7 @@ pub const Ready = union(enum) {
             .cached_diff => |*bundle| bundle.deinit(),
             .generated_added_file => |*bundle| bundle.deinit(allocator),
             .combined_hunks => |*bundle| bundle.deinit(),
+            .primary_combined_authority => |*authority| authority.deinit(),
             .inert_combined => |*bundle| bundle.deinit(),
             .status_body => |*body| body.deinit(allocator),
         }
@@ -377,7 +392,7 @@ pub const Ready = union(enum) {
     pub fn cacheable(self: Ready) bool {
         return switch (self) {
             .cached_diff, .generated_added_file, .combined_hunks, .inert_combined => true,
-            .status_body => false,
+            .primary_combined_authority, .status_body => false,
         };
     }
 
@@ -386,6 +401,7 @@ pub const Ready = union(enum) {
             .cached_diff => |bundle| arenaCapacity(bundle.arena),
             .generated_added_file => |bundle| bundle.retainedBytes(),
             .combined_hunks => |bundle| bundle.retainedBytes(),
+            .primary_combined_authority => |authority| authority.retainedBytes(),
             .inert_combined => |bundle| saturatedSum(&.{
                 arenaCapacity(bundle.cached_bundle.arena),
                 arenaCapacity(bundle.unstaged_bundle.arena),
@@ -821,6 +837,29 @@ pub const State = struct {
         ready.request = request;
     }
 
+    /// Keep the independently owned primary load session as presentation and
+    /// install only the exactly matched candidate's fresh index authority.
+    /// A prior authority overlay is consumed here; it is deliberately never
+    /// admitted to the projection cache because it cannot outlive its primary
+    /// source-session owner.
+    pub fn installPrimaryCombinedReuse(
+        self: *State,
+        allocator: std.mem.Allocator,
+        request: Request,
+        candidate: *CombinedReuseCandidate,
+    ) void {
+        std.debug.assert(request.kind == .combined_hunks);
+        self.clearSyntaxPending(allocator);
+
+        var previous = self.displayed;
+        self.displayed = .idle;
+        previous.deinit(allocator);
+        self.displayed = .{ .ready = .{
+            .request = request,
+            .value = .{ .primary_combined_authority = candidate.discardCandidateAndTakeAuthority() },
+        } };
+    }
+
     pub fn hasPending(self: State) bool {
         return self.pending != null;
     }
@@ -1157,7 +1196,14 @@ test "eager retry basis is bounded to one live presentation identity" {
         .fingerprint = .{ .digest = [_]u8{0x22} ** 32 },
         .content_token = .init(8),
     };
+    const primary = ExpectedPresentation{
+        .owner = .primary_loaded,
+        .fingerprint = first.fingerprint,
+        .content_token = first.content_token,
+    };
     var state: State = .{};
+
+    try std.testing.expect(!first.eql(primary));
 
     state.scheduleEagerRetry(first);
     try std.testing.expect(state.shouldForceEagerRetry(first));
@@ -1167,6 +1213,10 @@ test "eager retry basis is bounded to one live presentation identity" {
 
     state.scheduleEagerRetry(first);
     try std.testing.expect(!state.shouldForceEagerRetry(second));
+    try std.testing.expect(state.eager_retry_basis == null);
+
+    state.scheduleEagerRetry(first);
+    try std.testing.expect(!state.shouldForceEagerRetry(primary));
     try std.testing.expect(state.eager_retry_basis == null);
 
     state.scheduleEagerRetry(first);

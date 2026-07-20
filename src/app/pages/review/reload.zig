@@ -382,6 +382,13 @@ pub const Controller = struct {
                 .cached = bundle.fingerprint,
             } },
             .combined_hunks => |bundle| .{ .combined_projection = bundle.presentation.content_token },
+            .primary_combined_authority => blk: {
+                const primary = switch (self.navigation.view().displayedReviewBody()) {
+                    .primary => |primary| primary,
+                    else => return null,
+                };
+                break :blk .{ .loaded = .init(primary.loaded.text) };
+            },
             .generated_added_file => |bundle| .{ .generated_untracked = .{
                 .status_snapshot_revision = self.page.status_snapshot_revision,
                 .source = bundle.fingerprint(),
@@ -424,10 +431,23 @@ pub const Controller = struct {
         target: ProjectionTarget,
     ) ?review_projection.ExpectedPresentation {
         if (target.kind != .combined_hunks) return null;
-        const live = self.navigation.view().activeCombinedProjection() orelse return null;
-        return .{
+        if (self.navigation.view().activeCombinedProjection()) |live| return .{
+            .owner = .combined_projection,
             .fingerprint = live.presentation.fingerprint,
             .content_token = live.presentation.content_token,
+        };
+
+        const primary = switch (self.navigation.view().displayedReviewBody()) {
+            .primary => |primary| primary,
+            else => return null,
+        };
+        const file = primary.loaded.document.files[primary.file_index];
+        const path_key = diff_file.canonicalPathKey(file) orelse return null;
+        if (!std.mem.eql(u8, path_key, target.path_key)) return null;
+        return .{
+            .owner = .primary_loaded,
+            .fingerprint = diff_presentation_identity.fingerprint(file),
+            .content_token = .init(self.page.source_session_revision),
         };
     }
 
@@ -441,9 +461,6 @@ pub const Controller = struct {
         candidate: *const review_projection.CombinedReuseCandidate,
     ) bool {
         const expected = request.expected_presentation orelse return false;
-        const live = self.navigation.view().activeCombinedProjection() orelse return false;
-        if (!live.presentation.content_token.eql(expected.content_token)) return false;
-        if (!live.presentation.fingerprint.eql(expected.fingerprint)) return false;
         if (!candidate.fingerprint.eql(expected.fingerprint)) return false;
 
         const fresh_authority = if (candidate.fresh_authority) |*fresh| fresh else return false;
@@ -452,7 +469,27 @@ pub const Controller = struct {
         if (fresh_authority.projection.hunk_stage_states.len != candidate_hunks or
             fresh_authority.projection.hunk_action_origins.len != candidate_hunks) return false;
 
-        return diff_presentation_identity.exactEqual(live.displayFile(), candidate.displayFile());
+        return switch (expected.owner) {
+            .combined_projection => blk: {
+                const live = self.navigation.view().activeCombinedProjection() orelse break :blk false;
+                if (!live.presentation.content_token.eql(expected.content_token)) break :blk false;
+                if (!live.presentation.fingerprint.eql(expected.fingerprint)) break :blk false;
+                break :blk diff_presentation_identity.exactEqual(live.displayFile(), candidate.displayFile());
+            },
+            .primary_loaded => blk: {
+                const target = self.view().projectionTarget() orelse break :blk false;
+                const live = self.expectedPresentationForTarget(target) orelse break :blk false;
+                if (!live.eql(expected) or live.owner != .primary_loaded) break :blk false;
+                const primary = switch (self.navigation.view().displayedReviewBody()) {
+                    .primary => |primary| primary,
+                    else => break :blk false,
+                };
+                break :blk diff_presentation_identity.exactEqual(
+                    primary.loaded.document.files[primary.file_index],
+                    candidate.displayFile(),
+                );
+            },
+        };
     }
 
     fn applyCombinedReuseCandidate(
@@ -466,11 +503,12 @@ pub const Controller = struct {
             // authorize another write under the fresh page status revision.
             // Preserve only its scalar display identity so prepareProjection
             // emits one hint-free eager request for this exact live body.
-            if (self.navigation.view().activeCombinedProjection()) |live| {
-                self.page.review_projection.scheduleEagerRetry(.{
-                    .fingerprint = live.presentation.fingerprint,
-                    .content_token = live.presentation.content_token,
-                });
+            if (self.view().projectionTarget()) |target| {
+                if (self.expectedPresentationForTarget(target)) |live| {
+                    self.page.review_projection.scheduleEagerRetry(live);
+                } else {
+                    self.page.review_projection.finishEagerRetry();
+                }
             } else {
                 self.page.review_projection.finishEagerRetry();
             }
@@ -482,7 +520,10 @@ pub const Controller = struct {
         self.page.review_projection.clearPending(allocator);
         const request = result.request;
         result.request = undefined;
-        self.page.review_projection.installCombinedReuse(allocator, request, candidate);
+        switch (request.expected_presentation.?.owner) {
+            .combined_projection => self.page.review_projection.installCombinedReuse(allocator, request, candidate),
+            .primary_loaded => self.page.review_projection.installPrimaryCombinedReuse(allocator, request, candidate),
+        }
         candidate.deinit();
         result.result = undefined;
         self.reconcileInstalledProjectionNavigation(allocator, null);
@@ -948,15 +989,26 @@ pub const Controller = struct {
         )) return .{};
 
         self.page.review_projection.clearPending(allocator);
+        const live_expected_presentation = self.expectedPresentationForTarget(target);
+        const primary_reuse_candidate = if (live_expected_presentation) |expected|
+            expected.owner == .primary_loaded
+        else
+            false;
         if (!self.view().displayedMatchesStableIdentity(target)) {
-            self.clearCompletedSelection(allocator);
-            self.page.review_projection.cacheOrClearDisplayed(
-                allocator,
-                target.repo_root,
-                target.source_kind,
-                self.page.source_session_revision,
-                self.page.status_snapshot_revision,
-            );
+            if (!primary_reuse_candidate) self.clearCompletedSelection(allocator);
+            // The first all-unstaged -> combined request has no projection
+            // owner to cache or clear. Avoid consuming its eager-retry marker
+            // and keep the owned primary selection until exact acceptance or
+            // the terminal eager replacement decides its content basis.
+            if (!primary_reuse_candidate or self.page.review_projection.hasDisplayed()) {
+                self.page.review_projection.cacheOrClearDisplayed(
+                    allocator,
+                    target.repo_root,
+                    target.source_kind,
+                    self.page.source_session_revision,
+                    self.page.status_snapshot_revision,
+                );
+            }
         }
         self.page.review_projection_next_id +%= 1;
         const request_id = self.page.review_projection_next_id;
@@ -972,7 +1024,6 @@ pub const Controller = struct {
         errdefer self.clearCompletedSelection(allocator);
 
         const request_root_identity = if (target.kind == .generated_added_file) self.root_identity else null;
-        const live_expected_presentation = self.expectedPresentationForTarget(target);
         const force_eager_retry = self.page.review_projection.shouldForceEagerRetry(live_expected_presentation);
         const expected_presentation = if (force_eager_retry) null else live_expected_presentation;
         var state_request = try review_projection.cloneRequestWithOptions(
@@ -2038,6 +2089,22 @@ const test_combined_before_unstaged =
     \\+const gamma: usize = 30;
     \\
 ;
+const test_combined_primary =
+    \\diff --git a/a b/a
+    \\index 1111111..4444444 100644
+    \\--- a/a
+    \\+++ b/a
+    \\@@ -3,1 +3,1 @@
+    \\-const alpha: usize = 1;
+    \\+const alpha: usize = 10;
+    \\@@ -8,1 +8,1 @@
+    \\-const beta: usize = 2;
+    \\+const beta: usize = 20;
+    \\@@ -13,1 +13,1 @@
+    \\-const gamma: usize = 3;
+    \\+const gamma: usize = 30;
+    \\
+;
 const test_combined_after_cached =
     \\diff --git a/a b/a
     \\index 1111111..3333333 100644
@@ -2151,6 +2218,35 @@ fn testCombinedReuseCandidate(
     cached.arena = null;
     unstaged.arena = null;
     return candidate;
+}
+
+fn testPrimaryCombinedLoadState(allocator: std.mem.Allocator) !load_state.LoadRuntimeState {
+    var bundle = try app_load.buildLoadedBundle(allocator, test_combined_primary);
+    return .{ .state = .{ .loaded = .{
+        .arena = bundle.takeArena(),
+        .loaded = bundle.loaded,
+    } } };
+}
+
+fn testPrimaryCandidate(
+    controller: Controller,
+    allocator: std.mem.Allocator,
+    file: diff_parser.FileDiff,
+) !review_selection.CompletedSelection {
+    const token: review_selection.ReviewContentToken = .{
+        .repo_epoch = controller.repo_epoch,
+        .root_identity = controller.root_identity,
+        .source = review_selection.SourceBasis.init(controller.source),
+        .source_session_revision = controller.page.source_session_revision,
+        .display = .{ .loaded = .init(controller.navigation.view().activeLoadedDiffConst().?.text) },
+    };
+    var drag = @import("../../../diff/selection.zig").DragSelection.init(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 1 },
+    );
+    drag.moved = true;
+    return review_selection.buildParsed(allocator, token, file, drag);
 }
 
 fn cloneTestProjectionRequest(
@@ -3945,6 +4041,165 @@ test "combined reuse acceptance retains presentation and installs fresh authorit
     const accepted_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(accepted_clipboard);
     try std.testing.expectEqualStrings(original_clipboard, accepted_clipboard);
+}
+
+test "ordinary primary exact combined candidate retains primary presentation and installs authority" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = try testPrimaryCombinedLoadState(allocator),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    const primary_before = switch (controller.navigation.view().displayedReviewBody()) {
+        .primary => |primary| primary,
+        else => return error.ExpectedPrimaryDisplay,
+    };
+    const primary_owner = primary_before.loaded;
+    const primary_text_ptr = primary_before.loaded.text.ptr;
+    const primary_file = primary_before.loaded.document.files[primary_before.file_index];
+    page.completed_selection = try testPrimaryCandidate(controller, allocator, primary_file);
+    const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(original_clipboard);
+
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const expected = pending.expected_presentation orelse return error.ExpectedPrimaryPresentationHint;
+    try std.testing.expectEqual(review_projection.ExpectedPresentationOwner.primary_loaded, expected.owner);
+    try std.testing.expect(expected.fingerprint.eql(diff_presentation_identity.fingerprint(primary_file)));
+    try std.testing.expect(expected.content_token.eql(.init(page.source_session_revision)));
+
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const request = switch (command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    command = undefined;
+    try std.testing.expect(request.expected_presentation.?.eql(expected));
+    var candidate = try testCombinedReuseCandidate(
+        allocator,
+        page.status_snapshot_revision,
+        test_combined_before_cached,
+        test_combined_before_unstaged,
+    );
+    try std.testing.expect(candidate.fingerprint.eql(expected.fingerprint));
+    try std.testing.expect(diff_presentation_identity.exactEqual(primary_file, candidate.displayFile()));
+
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = request,
+        .result = .{ .reuse_candidate = candidate },
+    };
+    candidate = undefined;
+    const applied = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(applied.result_transferred);
+
+    const ready = &page.review_projection.displayed.ready;
+    try std.testing.expect(ready.value == .primary_combined_authority);
+    try std.testing.expect(!ready.value.cacheable());
+    try std.testing.expectEqual(page.status_snapshot_revision, ready.value.primary_combined_authority.status_snapshot_revision);
+    try std.testing.expect(controller.navigation.view().activeCombinedProjection() == null);
+    const authority_view = controller.navigation.view().activeCombinedAuthority() orelse return error.ExpectedCombinedAuthority;
+    try std.testing.expectEqual(diff_hunk_projection.HunkStageState.staged, authority_view.hunkStageStates()[0]);
+    try std.testing.expectEqual(diff_hunk_projection.HunkStageState.unstaged, authority_view.hunkStageStates()[1]);
+    try std.testing.expect(authority_view.hunkActionOrigins()[0] == .cached);
+    try std.testing.expect(authority_view.hunkActionOrigins()[1] == .unstaged);
+
+    const primary_after = switch (controller.navigation.view().displayedReviewBody()) {
+        .primary => |primary| primary,
+        else => return error.ExpectedRetainedPrimaryDisplay,
+    };
+    try std.testing.expect(primary_after.loaded == primary_owner);
+    try std.testing.expect(primary_after.loaded.text.ptr == primary_text_ptr);
+    try std.testing.expect(primary_after.combined_authority == authority_view.authority);
+
+    const active = try controller.navigation.view().activeDiffDisplay(allocator, .unified) orelse return error.ExpectedActiveDisplay;
+    defer switch (active.hunkStagePresentation()) {
+        .per_hunk => |states| allocator.free(states),
+        .all_staged, .all_unstaged => {},
+    };
+    try std.testing.expect(active == .loaded);
+    try std.testing.expect(active.syntaxView() == .direct);
+    try std.testing.expect(active.syntaxView().direct.document == &primary_owner.syntax_spans);
+    try std.testing.expect(active.foldedHunks().ptr == primary_owner.foldedHunksForFile(0).ptr);
+    try std.testing.expect(controller.navigation.view().displayedSearchTarget(.unified) != null);
+    try std.testing.expect(active.hunkStagePresentation().stateForHunk(0) == .staged);
+    try std.testing.expect(active.hunkStagePresentation().stateForHunk(1) == .unstaged);
+
+    try std.testing.expect(page.completed_selection != null);
+    const accepted_clipboard = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(accepted_clipboard);
+    try std.testing.expectEqualStrings(original_clipboard, accepted_clipboard);
+}
+
+test "ordinary primary combined candidate exact mismatch schedules one eager boundary" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = try testPrimaryCombinedLoadState(allocator),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const expected = pending.expected_presentation orelse return error.ExpectedPrimaryPresentationHint;
+    try std.testing.expectEqual(review_projection.ExpectedPresentationOwner.primary_loaded, expected.owner);
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const request = switch (command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    command = undefined;
+
+    var candidate = try testCombinedReuseCandidate(
+        allocator,
+        page.status_snapshot_revision,
+        test_combined_before_cached,
+        test_combined_changed_unstaged,
+    );
+    try std.testing.expect(!diff_presentation_identity.exactEqual(
+        controller.navigation.view().selectedFile().?,
+        candidate.displayFile(),
+    ));
+    candidate.fingerprint = expected.fingerprint;
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = request,
+        .result = .{ .reuse_candidate = candidate },
+    };
+    candidate = undefined;
+    defer finished.deinit(allocator);
+    const applied = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(!applied.result_transferred);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.review_projection.eager_retry_basis != null);
+    try std.testing.expectEqual(
+        review_projection.ExpectedPresentationOwner.primary_loaded,
+        page.review_projection.eager_retry_basis.?.owner,
+    );
+    try std.testing.expect(controller.navigation.view().displayedReviewBody() == .primary);
+    try std.testing.expect(controller.navigation.view().activeCombinedAuthority() == null);
+
+    var retry = try controller.prepareProjection(allocator);
+    defer retry.deinit(allocator);
+    const retry_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    try std.testing.expect(retry_pending.expected_presentation == null);
+    var retry_command = retry.takeCommand() orelse return error.ExpectedProjectionCommand;
+    defer retry_command.deinit(allocator);
+    switch (retry_command) {
+        .review_projection => |retry_request| try std.testing.expect(retry_request.expected_presentation == null),
+        else => return error.ExpectedProjectionCommand,
+    }
 }
 
 const CombinedReuseRejection = enum {

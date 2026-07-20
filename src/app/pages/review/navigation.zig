@@ -159,6 +159,33 @@ pub const HunkInteractionAvailability = enum {
     inert_invalid_utf8,
 };
 
+/// Borrowed action facade for a normalized combined presentation. The display
+/// file may be owned either by a combined projection or by the immutable
+/// primary load session; index-derived action storage always belongs to the
+/// separately retained authority.
+pub const ActiveCombinedAuthority = struct {
+    display_file: diff_parser.FileDiff,
+    authority: *const review_projection.CombinedAuthority,
+
+    pub fn hunkStageStates(self: ActiveCombinedAuthority) []const diff_hunk_projection.HunkStageState {
+        return self.authority.projection.hunk_stage_states;
+    }
+
+    pub fn hunkActionOrigins(self: ActiveCombinedAuthority) []const diff_hunk_projection.HunkActionOrigin {
+        return self.authority.projection.hunk_action_origins;
+    }
+
+    pub fn actionSourceFile(self: ActiveCombinedAuthority, origin: diff_hunk_projection.HunkActionOrigin) ?diff_parser.FileDiff {
+        return self.authority.actionSourceFile(origin);
+    }
+};
+
+pub const PrimaryReviewBody = struct {
+    loaded: *const LoadedDiff,
+    file_index: usize,
+    combined_authority: ?*const review_projection.CombinedAuthority = null,
+};
+
 /// Single authority facade for the body currently promised by Review.
 ///
 /// In particular, an accepted inert projection is still a displayed body; it
@@ -166,10 +193,7 @@ pub const HunkInteractionAvailability = enum {
 /// underneath it.
 pub const DisplayedReviewBody = union(enum) {
     none,
-    primary: struct {
-        loaded: *const LoadedDiff,
-        file_index: usize,
-    },
+    primary: PrimaryReviewBody,
     cached: *const app_load.LoadedDiffBundle,
     combined: *const review_projection.CombinedHunkBundle,
     generated: *const review_projection.GeneratedFileBundle,
@@ -229,6 +253,7 @@ pub const View = struct {
                         },
                         .generated_added_file => |*bundle| .{ .generated = bundle },
                         .combined_hunks => |*bundle| .{ .combined = bundle },
+                        .primary_combined_authority => |*authority| self.primaryReviewBody(authority),
                         .inert_combined => .{ .inert_invalid_utf8 = .{
                             .path_key = ready.request.path_key,
                             .display_path = ready.request.path_key,
@@ -247,6 +272,13 @@ pub const View = struct {
 
         if (self.selectedStatusEntry() != null) return if (self.page.review_projection.hasPending()) .pending else .none;
 
+        return self.primaryReviewBody(null);
+    }
+
+    fn primaryReviewBody(
+        self: View,
+        combined_authority: ?*const review_projection.CombinedAuthority,
+    ) DisplayedReviewBody {
         const loaded = self.activeLoadedDiffConst() orelse return .none;
         const file_index = self.selectedFileIndex(loaded) orelse return .none;
         if (file_index >= loaded.document.files.len) return .none;
@@ -255,7 +287,11 @@ pub const View = struct {
             const path_key = diff_file.canonicalPathKey(file) orelse diff_file.displayPath(file);
             return .{ .inert_invalid_utf8 = .{ .path_key = path_key, .display_path = diff_file.displayPath(file) } };
         }
-        return .{ .primary = .{ .loaded = loaded, .file_index = file_index } };
+        return .{ .primary = .{
+            .loaded = loaded,
+            .file_index = file_index,
+            .combined_authority = combined_authority,
+        } };
     }
 
     pub fn diffSelectionView(self: View) ?diff_selection.View {
@@ -566,6 +602,7 @@ pub const View = struct {
                     0,
                 .generated_added_file => |bundle| bundle.source.rowCount(),
                 .combined_hunks => |bundle| bundle.displayLineIndex(self.effectiveDisplayMode()).lineCount(),
+                .primary_combined_authority => 0,
                 .inert_combined => 1,
                 .status_body => 1,
             },
@@ -789,7 +826,7 @@ pub const View = struct {
     }
 
     pub fn activeDiffDisplay(self: View, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?ActiveDiffDisplay {
-        const selected: struct { loaded: *const LoadedDiff, file_index: usize } = switch (self.displayedReviewBody()) {
+        const selected: PrimaryReviewBody = switch (self.displayedReviewBody()) {
             .combined => |bundle| {
                 return .{ .combined_projection = .{
                     .file = bundle.displayFile(),
@@ -809,7 +846,7 @@ pub const View = struct {
                     .syntax = .initDirect(&loaded.syntax_spans, 0),
                 } };
             },
-            .primary => |primary| .{ .loaded = primary.loaded, .file_index = primary.file_index },
+            .primary => |primary| primary,
             .none, .generated, .inert_invalid_utf8, .status, .pending => return null,
         };
         const loaded = selected.loaded;
@@ -819,7 +856,10 @@ pub const View = struct {
             .file = file,
             .line_index = loaded.cachedRenderedLineIndex(file_index, mode),
             .folded_hunks = loaded.foldedHunksForFile(file_index),
-            .hunk_stages = try self.hunkStagePresentationForFile(allocator, file),
+            .hunk_stages = if (selected.combined_authority) |authority|
+                try projectedHunkStagePresentation(allocator, authority.projection.hunk_stage_states)
+            else
+                try self.hunkStagePresentationForFile(allocator, file),
             .syntax = .initDirect(&loaded.syntax_spans, file_index),
         } };
     }
@@ -841,6 +881,20 @@ pub const View = struct {
     pub fn activeCombinedProjection(self: View) ?*const review_projection.CombinedHunkBundle {
         return switch (self.displayedReviewBody()) {
             .combined => |bundle| bundle,
+            else => null,
+        };
+    }
+
+    pub fn activeCombinedAuthority(self: View) ?ActiveCombinedAuthority {
+        return switch (self.displayedReviewBody()) {
+            .combined => |bundle| .{
+                .display_file = bundle.displayFile(),
+                .authority = &bundle.authority,
+            },
+            .primary => |primary| if (primary.combined_authority) |authority| .{
+                .display_file = primary.loaded.document.files[primary.file_index],
+                .authority = authority,
+            } else null,
             else => null,
         };
     }

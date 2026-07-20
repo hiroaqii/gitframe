@@ -415,7 +415,7 @@ pub const View = struct {
         if (!self.activation().satisfiesAction(.stage_hunk)) return self.hunkAuthorityFailure(.stage_hunk);
 
         const repo_root = self.repo_root orelse return .no_repo;
-        if (self.currentCombinedProjection()) |bundle| {
+        if (self.currentCombinedAuthority()) |bundle| {
             if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
             const projected_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
             const stage_states = bundle.hunkStageStates();
@@ -425,7 +425,7 @@ pub const View = struct {
                 .staged => if (can_unstage) .{ .operation = .unstage } else .unavailable_source,
             };
         }
-        if (self.navigation.activeCombinedProjection() != null) return .stale_status;
+        if (self.navigation.activeCombinedAuthority() != null) return .stale_status;
 
         const file = self.navigation.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
@@ -455,10 +455,10 @@ pub const View = struct {
             else => .stale_source,
         };
         const repo_root = self.repo_root orelse return .no_repo;
-        if (self.currentCombinedProjection()) |bundle| {
+        if (self.currentCombinedAuthority()) |bundle| {
             return self.selectedProjectedHunkStageTarget(allocator, repo_root, bundle);
         }
-        if (self.navigation.activeCombinedProjection() != null) return .stale_status;
+        if (self.navigation.activeCombinedAuthority() != null) return .stale_status;
         const file = self.navigation.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
@@ -497,10 +497,10 @@ pub const View = struct {
             else => .stale_source,
         };
         const repo_root = self.repo_root orelse return .no_repo;
-        if (self.currentCombinedProjection()) |bundle| {
+        if (self.currentCombinedAuthority()) |bundle| {
             return self.selectedProjectedHunkUnstageTarget(allocator, repo_root, bundle);
         }
-        if (self.navigation.activeCombinedProjection() != null) return .stale_status;
+        if (self.navigation.activeCombinedAuthority() != null) return .stale_status;
         const file = self.navigation.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
@@ -535,9 +535,9 @@ pub const View = struct {
         self: View,
         allocator: std.mem.Allocator,
         repo_root: []const u8,
-        bundle: *const review_projection.CombinedHunkBundle,
+        bundle: navigation.ActiveCombinedAuthority,
     ) HunkStageTargetResult {
-        const path = diff_file.canonicalPathKey(bundle.displayFile()) orelse return .no_path;
+        const path = diff_file.canonicalPathKey(bundle.display_file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
         const projected_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
         const stage_states = bundle.hunkStageStates();
@@ -571,9 +571,9 @@ pub const View = struct {
         self: View,
         allocator: std.mem.Allocator,
         repo_root: []const u8,
-        bundle: *const review_projection.CombinedHunkBundle,
+        bundle: navigation.ActiveCombinedAuthority,
     ) HunkUnstageTargetResult {
-        const path = diff_file.canonicalPathKey(bundle.displayFile()) orelse return .no_path;
+        const path = diff_file.canonicalPathKey(bundle.display_file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
         const projected_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
         const stage_states = bundle.hunkStageStates();
@@ -603,9 +603,9 @@ pub const View = struct {
         } };
     }
 
-    fn currentCombinedProjection(self: View) ?*const review_projection.CombinedHunkBundle {
+    fn currentCombinedAuthority(self: View) ?navigation.ActiveCombinedAuthority {
         if (!self.activation().satisfiesAction(.stage_hunk)) return null;
-        const bundle = self.navigation.activeCombinedProjection() orelse return null;
+        const bundle = self.navigation.activeCombinedAuthority() orelse return null;
         const request = self.page.review_projection.displayed.request() orelse return null;
         if (request.kind != .combined_hunks or request.status_snapshot_revision != self.page.status_snapshot_revision) return null;
         if (bundle.authority.status_snapshot_revision != self.page.status_snapshot_revision) return null;

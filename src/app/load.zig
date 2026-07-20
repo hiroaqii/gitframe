@@ -1682,6 +1682,30 @@ test "combined worker publishes provider-independent candidate only for matching
     try std.testing.expect(!@hasField(review_projection.CombinedReuseCandidate, "cached_bundle"));
 }
 
+test "combined worker publishes provider-independent candidate for exact primary hint" {
+    const allocator = std.testing.allocator;
+    var cached = try projection_component.ParsedComponent.parse(allocator, p2_cached_patch);
+    defer cached.deinit();
+    var unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
+    defer unstaged.deinit();
+
+    var probe = try prepareCombinedReuse(allocator, &cached, &unstaged);
+    const expected_fingerprint = probe.fingerprint;
+    probe.deinit();
+    var request = try testCombinedProjectionRequest(allocator, 25, 12, .{
+        .owner = .primary_loaded,
+        .fingerprint = expected_fingerprint,
+        .content_token = .init(4),
+    });
+    defer request.deinit(allocator);
+
+    var result = buildCombinedHunkTaskResult(request, allocator, std.testing.io, &cached, &unstaged);
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .reuse_candidate);
+    try std.testing.expect(result.reuse_candidate.fingerprint.eql(expected_fingerprint));
+    try std.testing.expectEqual(@as(u64, 12), result.reuse_candidate.fresh_authority.?.status_snapshot_revision);
+}
+
 test "combined worker uses one eager completion for fingerprint miss and hint-free retry" {
     const allocator = std.testing.allocator;
 
