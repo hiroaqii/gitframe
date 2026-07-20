@@ -145,6 +145,13 @@ pub const CompletedSelection = struct {
         self.* = undefined;
     }
 
+    pub fn pathKey(self: CompletedSelection) []const u8 {
+        return switch (self.value) {
+            .parsed_diff => |parsed| parsed.canonical_path,
+            .generated_untracked => |generated| generated.path,
+        };
+    }
+
     pub fn clipboardText(self: CompletedSelection, allocator: std.mem.Allocator) ![]u8 {
         return switch (self.value) {
             .parsed_diff => |parsed| parsed.fragments.clipboardText(allocator),
