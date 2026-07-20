@@ -17,6 +17,8 @@ const app_state = @import("../../state.zig");
 const shell_layout = if (builtin.is_test) @import("../../shell_layout.zig") else struct {};
 const review_layout = @import("layout.zig");
 const review_message = @import("message.zig");
+const review_selection = @import("selection.zig");
+const session_hunk_mark = @import("session_hunk_mark.zig");
 const review_projection = @import("../../review_projection.zig");
 const app_review_projection = review_projection;
 const review_page = @import("../review.zig");
@@ -277,6 +279,8 @@ pub const SearchTarget = struct {
 pub const View = struct {
     page: *const review_page.ReviewPageState,
     repo_root: ?[]const u8,
+    repo_epoch: u64 = 0,
+    root_identity: ?root_capability.Identity = null,
     source: diff_source.SourceMode,
     layout: Layout,
 
@@ -318,6 +322,34 @@ pub const View = struct {
         if (self.selectedStatusEntry() != null) return if (self.page.review_projection.hasPending()) .pending else .none;
 
         return self.primaryReviewBody(null);
+    }
+
+    /// Exact scalar identity of the body currently promised by Review.
+    ///
+    /// Selection release, hunk action resolution, and session-mark rendering
+    /// share this builder so they cannot disagree about presentation lineage.
+    pub fn currentContentToken(self: View) ?review_selection.ReviewContentToken {
+        const display: review_selection.DisplayBasis = switch (self.displayedReviewBody()) {
+            .primary => |primary| .{ .loaded = .init(primary.loaded.text) },
+            .cached => |bundle| .{ .cached_projection = .{
+                .status_snapshot_revision = self.page.status_snapshot_revision,
+                .cached = bundle.fingerprint,
+            } },
+            .combined => |bundle| .{ .combined_projection = bundle.presentation.content_token },
+            .retained_staged_only => |bundle| .{ .combined_projection = bundle.presentation.content_token },
+            .generated => |bundle| .{ .generated_untracked = .{
+                .status_snapshot_revision = self.page.status_snapshot_revision,
+                .source = bundle.fingerprint(),
+            } },
+            .none, .inert_invalid_utf8, .status, .pending => return null,
+        };
+        return .{
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.root_identity,
+            .source = review_selection.SourceBasis.init(self.source),
+            .source_session_revision = self.page.source_session_revision,
+            .display = display,
+        };
     }
 
     fn primaryReviewBody(
@@ -1072,17 +1104,24 @@ pub const View = struct {
         const path = diff_file.canonicalPathKey(file) orelse return .all_unstaged;
         if (self.isFreshStagedOnlyPath(repo_root, path)) return .all_staged;
         if (self.page.staged_hunks.items.items.len == 0) return .all_unstaged;
+        const content = self.currentContentToken() orelse return .all_unstaged;
 
         var marked_count: usize = 0;
         for (0..file.hunks.len) |hunk_index| {
-            if (self.page.staged_hunks.contains(repo_root, path, hunk_index)) marked_count += 1;
+            if (self.page.staged_hunks.containsExact(repo_root, path, .{
+                .content = content,
+                .display_hunk_index = hunk_index,
+            })) marked_count += 1;
         }
 
         if (marked_count == 0) return .all_unstaged;
 
         const states = try allocator.alloc(diff_render.HunkStageState, file.hunks.len);
         for (states, 0..) |*state, hunk_index| {
-            state.* = if (self.page.staged_hunks.contains(repo_root, path, hunk_index)) .staged else .unstaged;
+            state.* = if (self.page.staged_hunks.containsExact(repo_root, path, .{
+                .content = content,
+                .display_hunk_index = hunk_index,
+            })) .staged else .unstaged;
         }
         return .{ .per_hunk = states };
     }
@@ -1175,7 +1214,14 @@ pub const Controller = struct {
     diagnostics: DiagnosticSink,
 
     pub fn view(self: Controller) View {
-        return .{ .page = self.page, .repo_root = self.repo_root, .source = self.source, .layout = self.layout };
+        return .{
+            .page = self.page,
+            .repo_root = self.repo_root,
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.root_identity,
+            .source = self.source,
+            .layout = self.layout,
+        };
     }
 
     fn setStatus(self: Controller, comptime fmt: []const u8, args: anytype) void {
@@ -2797,6 +2843,8 @@ const TestHarness = struct {
         return .{
             .page = &self.pages.review,
             .repo_root = self.repo_root,
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.root_identity,
             .source = self.source,
             .layout = .{ .width = body_size.width, .height = body_size.height },
         };
@@ -5166,7 +5214,11 @@ test "retained cached projection keeps all-staged authority on diff-file route" 
     const without_marks = (try app.reviewNavigationView().activeDiffDisplay(arena.allocator(), .unified)) orelse return error.ExpectedCachedDisplay;
     try std.testing.expect(without_marks.hunkStagePresentation() == .all_staged);
 
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    const cached_mark_key: session_hunk_mark.Key = .{
+        .content = app.reviewNavigationView().currentContentToken() orelse return error.ExpectedReviewContentToken,
+        .display_hunk_index = 0,
+    };
+    try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", cached_mark_key);
     const with_marks = (try app.reviewNavigationView().activeDiffDisplay(arena.allocator(), .unified)) orelse return error.ExpectedCachedDisplay;
     try std.testing.expect(with_marks.hunkStagePresentation() == .all_staged);
 }
@@ -5377,7 +5429,11 @@ test "hunk stage presentation keeps partial session marks" {
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    const mark_key: session_hunk_mark.Key = .{
+        .content = app.reviewNavigationView().currentContentToken() orelse return error.ExpectedReviewContentToken,
+        .display_hunk_index = 0,
+    };
+    try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", mark_key);
 
     const presentation = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
     try std.testing.expect(presentation == .per_hunk);
@@ -5404,8 +5460,15 @@ test "hunk stage presentation uses all-staged only for fresh staged-only status"
     const staged = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
     try std.testing.expect(staged == .all_staged);
 
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 1);
+    const content = app.reviewNavigationView().currentContentToken() orelse return error.ExpectedReviewContentToken;
+    try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", .{
+        .content = content,
+        .display_hunk_index = 0,
+    });
+    try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", .{
+        .content = content,
+        .display_hunk_index = 1,
+    });
     const hunk_by_hunk = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
     try std.testing.expect(hunk_by_hunk == .all_staged);
 

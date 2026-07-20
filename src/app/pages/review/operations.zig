@@ -10,6 +10,7 @@ const content_fingerprint = @import("../../../content_fingerprint.zig");
 const builtin = @import("builtin");
 const authority = @import("authority.zig");
 const navigation = @import("navigation.zig");
+const review_selection = @import("selection.zig");
 const review_page = @import("../review.zig");
 const git_ops = @import("../../git_ops.zig");
 const review_projection = @import("../../review_projection.zig");
@@ -57,7 +58,7 @@ pub const OwnedHunkProposal = struct {
     path: []u8,
     hunk_index: usize,
     patch: []u8,
-    mark_source: git_ops.HunkMarkSource,
+    session_mark_mutation: git_ops.SessionHunkMarkMutation,
     reload_after_success: bool,
 
     fn deinit(self: *OwnedHunkProposal, allocator: std.mem.Allocator) void {
@@ -166,13 +167,13 @@ pub const AcceptedActionOutcome = union(enum) {
         repo_root: []const u8,
         path: []const u8,
         hunk_index: usize,
-        mark_source: git_ops.HunkMarkSource,
+        session_mark_mutation: git_ops.SessionHunkMarkMutation,
     },
     unstage_hunk: struct {
         repo_root: []const u8,
         path: []const u8,
         hunk_index: usize,
-        mark_source: git_ops.HunkMarkSource,
+        session_mark_mutation: git_ops.SessionHunkMarkMutation,
         reload_after_success: bool,
     },
     commit: struct { repo_root: []const u8 },
@@ -206,6 +207,17 @@ pub const View = struct {
 
     pub fn activation(self: View) authority.ActivationState {
         return self.activation_state;
+    }
+
+    fn currentContentToken(self: View) ?review_selection.ReviewContentToken {
+        return self.navigation.currentContentToken();
+    }
+
+    fn sessionHunkMarkKey(self: View, display_hunk_index: usize) ?git_ops.SessionHunkMarkKey {
+        return .{
+            .content = self.currentContentToken() orelse return null,
+            .display_hunk_index = display_hunk_index,
+        };
     }
 
     pub fn selectedSidebarActionTarget(self: View) ?git_ops.PathTarget {
@@ -439,7 +451,8 @@ pub const View = struct {
             return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
         }
 
-        if (self.page.staged_hunks.contains(repo_root, path, hunk_index)) {
+        const mark_key = self.sessionHunkMarkKey(hunk_index) orelse return .stale_source;
+        if (self.page.staged_hunks.containsExact(repo_root, path, mark_key)) {
             return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
         }
         return if (can_stage) .{ .operation = .stage } else .unavailable_source;
@@ -470,7 +483,8 @@ pub const View = struct {
         if (entry.isConflict()) return .conflict_unsupported;
         if (file.is_binary) return .binary_unsupported;
         if (diff_file.status(file) != .modified or diff_file.hasModeChange(file)) return .unsupported_file_state;
-        if (self.page.staged_hunks.contains(repo_root, path, hunk_index)) return .already_staged_hunk;
+        const mark_key = self.sessionHunkMarkKey(hunk_index) orelse return .stale_source;
+        if (self.page.staged_hunks.containsExact(repo_root, path, mark_key)) return .already_staged_hunk;
 
         const patch = diff_patch.formatSingleHunkPatch(allocator, file, hunk_index) catch |err| switch (err) {
             error.BinaryFile => return .binary_unsupported,
@@ -484,6 +498,7 @@ pub const View = struct {
             .path = path,
             .hunk_index = hunk_index,
             .patch = patch,
+            .session_mark_mutation = .{ .add = mark_key },
         } };
     }
 
@@ -510,12 +525,18 @@ pub const View = struct {
         if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
         if (file.is_binary) return .binary_unsupported;
         if (diff_file.status(file) != .modified or diff_file.hasModeChange(file)) return .unsupported_file_state;
-        if (!sourceIsCached(self.source) and !self.page.staged_hunks.contains(repo_root, path, hunk_index)) return .not_staged_hunk;
+        const mark_key = if (sourceIsCached(self.source))
+            null
+        else
+            self.sessionHunkMarkKey(hunk_index) orelse return .stale_source;
+        if (mark_key) |key| {
+            if (!self.page.staged_hunks.containsExact(repo_root, path, key)) return .not_staged_hunk;
+        }
 
-        // This reverses a session-staged hunk from the same loaded FileDiff.
-        // finishStageHunk intentionally avoids a full diff reload, and
-        // clearLoadedDiff clears staged_hunks before a new document can reuse
-        // the same ordinal for a different hunk.
+        // Ordinary unstaged content may reverse only the exact local mark
+        // captured from this presentation. Cached content has no such mark;
+        // its accepted result instead requests the existing source-and-aux
+        // reload. Completion never re-resolves the then-current cursor.
         const patch = diff_patch.formatSingleHunkPatch(allocator, file, hunk_index) catch |err| switch (err) {
             error.BinaryFile => return .binary_unsupported,
             error.UnsupportedFileState => return .unsupported_file_state,
@@ -528,7 +549,7 @@ pub const View = struct {
             .path = path,
             .hunk_index = hunk_index,
             .patch = patch,
-            .mark_source = if (sourceIsCached(self.source)) .projection else .session,
+            .session_mark_mutation = if (mark_key) |key| .{ .remove = key } else .none,
             .reload_after_success = sourceIsCached(self.source),
         } };
     }
@@ -565,7 +586,7 @@ pub const View = struct {
             .path = path,
             .hunk_index = projected_index,
             .patch = patch,
-            .mark_source = .projection,
+            .session_mark_mutation = .none,
         } };
     }
 
@@ -601,7 +622,7 @@ pub const View = struct {
             .path = path,
             .hunk_index = projected_index,
             .patch = patch,
-            .mark_source = .projection,
+            .session_mark_mutation = .none,
         } };
     }
 
@@ -640,6 +661,28 @@ pub const Controller = struct {
         return self.view_state;
     }
 
+    fn applySessionHunkMarkMutation(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        path: []const u8,
+        mutation: git_ops.SessionHunkMarkMutation,
+    ) bool {
+        return switch (mutation) {
+            .none => false,
+            .add => |key| blk: {
+                const current = self.view_state.currentContentToken() orelse break :blk false;
+                if (!current.eql(key.content)) break :blk false;
+                self.page.staged_hunks.addExact(allocator, repo_root, path, key) catch break :blk true;
+                break :blk false;
+            },
+            .remove => |key| blk: {
+                _ = self.page.staged_hunks.removeExact(allocator, repo_root, path, key);
+                break :blk false;
+            },
+        };
+    }
+
     /// Applies only Review-local consequences of an already accepted shell
     /// action result. Process pending state, diagnostics, and task spawning stay
     /// with the shell; the returned reload intent is executed after this call.
@@ -667,11 +710,12 @@ pub const Controller = struct {
             },
             .stage_hunk => |value| blk: {
                 if (!active_repo_matches) break :blk .{};
-                const mark_failed = value.mark_source == .session and
-                    if (self.page.staged_hunks.add(allocator, value.repo_root, value.path, value.hunk_index))
-                        false
-                    else |_|
-                        true;
+                const mark_failed = self.applySessionHunkMarkMutation(
+                    allocator,
+                    value.repo_root,
+                    value.path,
+                    value.session_mark_mutation,
+                );
                 break :blk .{
                     .reload = .{ .status = value.repo_root },
                     .local_effect_failure = if (mark_failed) .staged_hunk_mark_record else null,
@@ -679,11 +723,14 @@ pub const Controller = struct {
             },
             .unstage_hunk => |value| blk: {
                 if (!active_repo_matches) break :blk .{};
+                _ = self.applySessionHunkMarkMutation(
+                    allocator,
+                    value.repo_root,
+                    value.path,
+                    value.session_mark_mutation,
+                );
                 if (value.reload_after_success) {
                     break :blk .{ .reload = .source_and_aux };
-                }
-                if (value.mark_source == .session) {
-                    _ = self.page.staged_hunks.remove(allocator, value.repo_root, value.path, value.hunk_index);
                 }
                 break :blk .{ .reload = .{ .status = value.repo_root } };
             },
@@ -760,7 +807,7 @@ fn consumeHunkProposal(allocator: std.mem.Allocator, target: *git_ops.HunkStageT
         .path = path,
         .hunk_index = target.hunk_index,
         .patch = patch,
-        .mark_source = target.mark_source,
+        .session_mark_mutation = target.session_mark_mutation,
         .reload_after_success = target.reload_after_success,
     };
 }
@@ -823,12 +870,18 @@ test "accepted hunk stage keeps mandatory reload when local mark allocation fail
     const backing = std.testing.allocator;
     var fail_index: usize = 0;
     while (fail_index < 3) : (fail_index += 1) {
-        var page: review_page.ReviewPageState = .{};
+        var page: review_page.ReviewPageState = .{
+            .load = test_support.loadState(test_support.loadedDiffOne()),
+            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+        };
         defer page.deinit(backing);
+        acceptTestSource(&page);
+        const view = testView(&page, .unstaged);
+        const key = view.sessionHunkMarkKey(2) orelse return error.ExpectedSessionHunkMarkKey;
         const controller: Controller = .{
             .page = &page,
             .navigation = undefined,
-            .view_state = undefined,
+            .view_state = view,
         };
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
 
@@ -836,7 +889,7 @@ test "accepted hunk stage keeps mandatory reload when local mark allocation fail
             .repo_root = "/repo",
             .path = "src/main.zig",
             .hunk_index = 2,
-            .mark_source = .session,
+            .session_mark_mutation = .{ .add = key },
         } }, true);
 
         try std.testing.expect(failing.has_induced_failure);
@@ -844,6 +897,65 @@ test "accepted hunk stage keeps mandatory reload when local mark allocation fail
         try std.testing.expectEqualStrings("/repo", applied.reload.status);
         try std.testing.expectEqual(@as(usize, 0), page.staged_hunks.items.items.len);
     }
+}
+
+test "accepted hunk add is ignored after its captured content lineage is invalidated" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer page.deinit(allocator);
+    acceptTestSource(&page);
+    const view = testView(&page, .unstaged);
+    const key = view.sessionHunkMarkKey(0) orelse return error.ExpectedSessionHunkMarkKey;
+    const controller: Controller = .{
+        .page = &page,
+        .navigation = undefined,
+        .view_state = view,
+    };
+
+    page.source_session_revision +%= 1;
+    const applied = controller.applyAcceptedOutcome(allocator, .{ .stage_hunk = .{
+        .repo_root = "/repo",
+        .path = "a",
+        .hunk_index = 0,
+        .session_mark_mutation = .{ .add = key },
+    } }, true);
+
+    try std.testing.expect(applied.local_effect_failure == null);
+    try std.testing.expectEqualStrings("/repo", applied.reload.status);
+    try std.testing.expectEqual(@as(usize, 0), page.staged_hunks.items.items.len);
+}
+
+test "accepted hunk remove consumes only its exact captured key after lineage invalidation" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer page.deinit(allocator);
+    acceptTestSource(&page);
+    const view = testView(&page, .unstaged);
+    const key = view.sessionHunkMarkKey(0) orelse return error.ExpectedSessionHunkMarkKey;
+    try page.staged_hunks.addExact(allocator, "/repo", "a", key);
+    const controller: Controller = .{
+        .page = &page,
+        .navigation = undefined,
+        .view_state = view,
+    };
+
+    page.source_session_revision +%= 1;
+    const applied = controller.applyAcceptedOutcome(allocator, .{ .unstage_hunk = .{
+        .repo_root = "/repo",
+        .path = "a",
+        .hunk_index = 0,
+        .session_mark_mutation = .{ .remove = key },
+        .reload_after_success = false,
+    } }, true);
+
+    try std.testing.expectEqualStrings("/repo", applied.reload.status);
+    try std.testing.expect(!page.staged_hunks.containsExact("/repo", "a", key));
 }
 
 fn testView(page: *const review_page.ReviewPageState, source: diff_source.SourceMode) View {
@@ -980,7 +1092,7 @@ test "retained staged-only authority builds unstage patch from fresh cached comp
     defer allocator.free(target.patch);
     try std.testing.expectEqualStrings("a", target.path);
     try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
-    try std.testing.expectEqual(git_ops.HunkMarkSource.projection, target.mark_source);
+    try std.testing.expectEqual(git_ops.SessionHunkMarkMutation.none, target.session_mark_mutation);
     try std.testing.expect(std.mem.indexOf(u8, target.patch, "@@ -1,4 +1,4 @@ first") != null);
     try std.testing.expect(std.mem.indexOf(u8, target.patch, "+new") != null);
 }
@@ -1003,7 +1115,7 @@ test "ordinary cached source hunk unstage keeps source and status reload members
         else => return error.ExpectedCachedPrimaryUnstageTarget,
     };
     defer allocator.free(target.patch);
-    try std.testing.expectEqual(git_ops.HunkMarkSource.projection, target.mark_source);
+    try std.testing.expectEqual(git_ops.SessionHunkMarkMutation.none, target.session_mark_mutation);
     try std.testing.expect(target.reload_after_success);
 
     const controller: Controller = .{
@@ -1015,7 +1127,7 @@ test "ordinary cached source hunk unstage keeps source and status reload members
         .repo_root = target.repo_root,
         .path = target.path,
         .hunk_index = target.hunk_index,
-        .mark_source = target.mark_source,
+        .session_mark_mutation = target.session_mark_mutation,
         .reload_after_success = target.reload_after_success,
     } }, true);
     try std.testing.expect(applied.reload == .source_and_aux);
@@ -1123,15 +1235,36 @@ test "unstage target requires fresh staged status" {
 }
 
 test "hunk toggle resolves source and session staged state" {
+    const allocator = std.testing.allocator;
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
-    defer page.staged_hunks.deinit(std.testing.allocator);
+    defer page.deinit(allocator);
     acceptTestSource(&page);
-    try std.testing.expectEqual(git_ops.ToggleHunkTargetResult{ .operation = .stage }, testView(&page, .unstaged).selectedHunkToggleOperation());
-    try page.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
-    try std.testing.expectEqual(git_ops.ToggleHunkTargetResult{ .operation = .unstage }, testView(&page, .unstaged).selectedHunkToggleOperation());
+    var status = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, " M a\x00");
+    try page.git_status.replace("/repo", &status);
+    const view = testView(&page, .unstaged);
+    const key = view.sessionHunkMarkKey(0) orelse return error.ExpectedSessionHunkMarkKey;
+    try std.testing.expectEqual(git_ops.ToggleHunkTargetResult{ .operation = .stage }, view.selectedHunkToggleOperation());
+    const stage_target = switch (view.selectedHunkStageTarget(allocator)) {
+        .ready => |target| target,
+        else => return error.ExpectedReadyHunkStageTarget,
+    };
+    defer allocator.free(stage_target.patch);
+    try std.testing.expect(stage_target.session_mark_mutation == .add);
+    try std.testing.expect(stage_target.session_mark_mutation.add.eql(key));
+
+    try page.staged_hunks.addExact(allocator, "/repo", "a", key);
+    try std.testing.expectEqual(git_ops.ToggleHunkTargetResult{ .operation = .unstage }, view.selectedHunkToggleOperation());
+    const unstage_target = switch (view.selectedHunkUnstageTarget(allocator)) {
+        .ready => |target| target,
+        else => return error.ExpectedReadyHunkUnstageTarget,
+    };
+    defer allocator.free(unstage_target.patch);
+    try std.testing.expect(unstage_target.session_mark_mutation == .remove);
+    try std.testing.expect(unstage_target.session_mark_mutation.remove.eql(key));
+
     try std.testing.expectEqual(git_ops.ToggleHunkTargetResult{ .operation = .unstage }, testView(&page, .cached).selectedHunkToggleOperation());
     try std.testing.expect(testView(&page, .{ .range = "main...HEAD" }).selectedHunkToggleOperation() == .unavailable_source);
 }

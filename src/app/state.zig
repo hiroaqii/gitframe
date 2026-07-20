@@ -2,6 +2,8 @@ const std = @import("std");
 const git_branch_status = @import("../git/branch_status.zig");
 const git_push = @import("../git/push.zig");
 const loaded_diff = @import("../loaded_diff.zig");
+const review_selection = @import("pages/review/selection.zig");
+const session_hunk_mark = @import("pages/review/session_hunk_mark.zig");
 const text_edit = @import("text_edit.zig");
 const page = @import("page.zig");
 
@@ -455,7 +457,7 @@ pub const ReviewDisplayState = struct {
 pub const StagedHunkMark = struct {
     repo_root: []u8,
     path_key: []u8,
-    hunk_index: usize,
+    key: session_hunk_mark.Key,
 
     pub fn deinit(self: *StagedHunkMark, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_root);
@@ -467,8 +469,10 @@ pub const StagedHunkMark = struct {
 /// Session-only marks for hunks staged from the review pane.
 ///
 /// Git reloads expose only unstaged hunks, but review needs staged hunks to
-/// remain visible as dim context. These marks keep that UI projection local to
-/// the current session and are cleared on a full diff reload.
+/// remain visible with local stage presentation while fresh projection/status
+/// catches up. A display ordinal is meaningful only inside its exact content
+/// token; callers must explicitly rebind or clear a path lineage when an exact
+/// presentation boundary is accepted.
 pub const StagedHunkMarks = struct {
     items: std.ArrayList(StagedHunkMark) = .empty,
 
@@ -494,8 +498,14 @@ pub const StagedHunkMarks = struct {
         }
     }
 
-    pub fn add(self: *StagedHunkMarks, allocator: std.mem.Allocator, repo_root: []const u8, path_key: []const u8, hunk_index: usize) !void {
-        if (self.contains(repo_root, path_key, hunk_index)) return;
+    pub fn addExact(
+        self: *StagedHunkMarks,
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        path_key: []const u8,
+        key: session_hunk_mark.Key,
+    ) !void {
+        if (self.containsExact(repo_root, path_key, key)) return;
 
         const owned_root = try allocator.dupe(u8, repo_root);
         errdefer allocator.free(owned_root);
@@ -505,13 +515,18 @@ pub const StagedHunkMarks = struct {
         try self.items.append(allocator, .{
             .repo_root = owned_root,
             .path_key = owned_path,
-            .hunk_index = hunk_index,
+            .key = key,
         });
     }
 
-    pub fn contains(self: StagedHunkMarks, repo_root: []const u8, path_key: []const u8, hunk_index: usize) bool {
+    pub fn containsExact(
+        self: StagedHunkMarks,
+        repo_root: []const u8,
+        path_key: []const u8,
+        key: session_hunk_mark.Key,
+    ) bool {
         for (self.items.items) |item| {
-            if (item.hunk_index == hunk_index and
+            if (item.key.eql(key) and
                 std.mem.eql(u8, item.repo_root, repo_root) and
                 std.mem.eql(u8, item.path_key, path_key))
             {
@@ -521,9 +536,15 @@ pub const StagedHunkMarks = struct {
         return false;
     }
 
-    pub fn remove(self: *StagedHunkMarks, allocator: std.mem.Allocator, repo_root: []const u8, path_key: []const u8, hunk_index: usize) bool {
+    pub fn removeExact(
+        self: *StagedHunkMarks,
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        path_key: []const u8,
+        key: session_hunk_mark.Key,
+    ) bool {
         for (self.items.items, 0..) |*item, index| {
-            if (item.hunk_index == hunk_index and
+            if (item.key.eql(key) and
                 std.mem.eql(u8, item.repo_root, repo_root) and
                 std.mem.eql(u8, item.path_key, path_key))
             {
@@ -533,6 +554,63 @@ pub const StagedHunkMarks = struct {
             }
         }
         return false;
+    }
+
+    pub fn clearPathLineage(
+        self: *StagedHunkMarks,
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        path_key: []const u8,
+        content: review_selection.ReviewContentToken,
+    ) void {
+        var index: usize = 0;
+        while (index < self.items.items.len) {
+            const item = &self.items.items[index];
+            if (!std.mem.eql(u8, item.repo_root, repo_root) or
+                !std.mem.eql(u8, item.path_key, path_key) or
+                !item.key.content.eql(content))
+            {
+                index += 1;
+                continue;
+            }
+            item.deinit(allocator);
+            _ = self.items.swapRemove(index);
+        }
+    }
+
+    pub fn rebindPathLineage(
+        self: *StagedHunkMarks,
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        path_key: []const u8,
+        from: review_selection.ReviewContentToken,
+        to: review_selection.ReviewContentToken,
+    ) void {
+        if (from.eql(to)) return;
+
+        var index: usize = 0;
+        while (index < self.items.items.len) {
+            const item = &self.items.items[index];
+            if (!std.mem.eql(u8, item.repo_root, repo_root) or
+                !std.mem.eql(u8, item.path_key, path_key) or
+                !item.key.content.eql(from))
+            {
+                index += 1;
+                continue;
+            }
+
+            const rebound: session_hunk_mark.Key = .{
+                .content = to,
+                .display_hunk_index = item.key.display_hunk_index,
+            };
+            if (self.containsExact(repo_root, path_key, rebound)) {
+                item.deinit(allocator);
+                _ = self.items.swapRemove(index);
+                continue;
+            }
+            item.key.content = to;
+            index += 1;
+        }
     }
 };
 
@@ -623,20 +701,36 @@ test "ReviewDisplayState defaults to showing all files" {
     try std.testing.expectEqual(loaded_diff.ChangedFileFilter.all, review_display.changed_file_filter);
 }
 
-test "StagedHunkMarks owns keys and deduplicates hunk marks" {
+fn testHunkMarkKey(source_session_revision: u64, display_hunk_index: usize) session_hunk_mark.Key {
+    return .{
+        .content = .{
+            .repo_epoch = 1,
+            .root_identity = null,
+            .source = review_selection.SourceBasis.init(.unstaged),
+            .source_session_revision = source_session_revision,
+            .display = .{ .loaded = .init("diff") },
+        },
+        .display_hunk_index = display_hunk_index,
+    };
+}
+
+test "StagedHunkMarks owns paths and deduplicates exact lineage keys" {
     var marks: StagedHunkMarks = .{};
     defer marks.deinit(std.testing.allocator);
 
-    try marks.add(std.testing.allocator, "/repo", "src/app.zig", 2);
-    try marks.add(std.testing.allocator, "/repo", "src/app.zig", 2);
+    const key = testHunkMarkKey(7, 2);
+    try marks.addExact(std.testing.allocator, "/repo", "src/app.zig", key);
+    try marks.addExact(std.testing.allocator, "/repo", "src/app.zig", key);
 
     try std.testing.expectEqual(@as(usize, 1), marks.items.items.len);
-    try std.testing.expect(marks.contains("/repo", "src/app.zig", 2));
-    try std.testing.expect(!marks.contains("/repo", "src/app.zig", 3));
-    try std.testing.expect(!marks.contains("/other", "src/app.zig", 2));
+    try std.testing.expect(marks.containsExact("/repo", "src/app.zig", key));
+    try std.testing.expect(!marks.containsExact("/repo", "src/app.zig", testHunkMarkKey(7, 3)));
+    try std.testing.expect(!marks.containsExact("/repo", "src/app.zig", testHunkMarkKey(8, 2)));
+    try std.testing.expect(!marks.containsExact("/other", "src/app.zig", key));
 
-    try std.testing.expect(marks.remove(std.testing.allocator, "/repo", "src/app.zig", 2));
-    try std.testing.expect(!marks.contains("/repo", "src/app.zig", 2));
+    try std.testing.expect(!marks.removeExact(std.testing.allocator, "/repo", "src/app.zig", testHunkMarkKey(8, 2)));
+    try std.testing.expect(marks.removeExact(std.testing.allocator, "/repo", "src/app.zig", key));
+    try std.testing.expect(!marks.containsExact("/repo", "src/app.zig", key));
     try std.testing.expectEqual(@as(usize, 0), marks.items.items.len);
 }
 
@@ -644,16 +738,56 @@ test "StagedHunkMarks clearRepo removes only matching repository marks" {
     var marks: StagedHunkMarks = .{};
     defer marks.deinit(std.testing.allocator);
 
-    try marks.add(std.testing.allocator, "/repo", "src/app.zig", 2);
-    try marks.add(std.testing.allocator, "/other", "src/app.zig", 2);
-    try marks.add(std.testing.allocator, "/repo", "src/other.zig", 1);
+    const app_key = testHunkMarkKey(7, 2);
+    const other_key = testHunkMarkKey(7, 1);
+    try marks.addExact(std.testing.allocator, "/repo", "src/app.zig", app_key);
+    try marks.addExact(std.testing.allocator, "/other", "src/app.zig", app_key);
+    try marks.addExact(std.testing.allocator, "/repo", "src/other.zig", other_key);
 
     marks.clearRepo(std.testing.allocator, "/repo");
 
-    try std.testing.expect(!marks.contains("/repo", "src/app.zig", 2));
-    try std.testing.expect(!marks.contains("/repo", "src/other.zig", 1));
-    try std.testing.expect(marks.contains("/other", "src/app.zig", 2));
+    try std.testing.expect(!marks.containsExact("/repo", "src/app.zig", app_key));
+    try std.testing.expect(!marks.containsExact("/repo", "src/other.zig", other_key));
+    try std.testing.expect(marks.containsExact("/other", "src/app.zig", app_key));
     try std.testing.expectEqual(@as(usize, 1), marks.items.items.len);
+}
+
+test "StagedHunkMarks deduplicates rebind and preserves unrelated exact lineages" {
+    var marks: StagedHunkMarks = .{};
+    defer marks.deinit(std.testing.allocator);
+
+    const from = testHunkMarkKey(7, 1).content;
+    const to = testHunkMarkKey(8, 1).content;
+    const unrelated = testHunkMarkKey(9, 1).content;
+
+    // Keep the second source mark last. Removing the first source/destination
+    // collision swap-moves it into the current index, proving the loop still
+    // visits every matching mark after deduplication.
+    try marks.addExact(std.testing.allocator, "/repo", "src/app.zig", .{ .content = from, .display_hunk_index = 1 });
+    try marks.addExact(std.testing.allocator, "/repo", "src/app.zig", .{ .content = to, .display_hunk_index = 1 });
+    try marks.addExact(std.testing.allocator, "/repo", "src/app.zig", .{ .content = unrelated, .display_hunk_index = 1 });
+    try marks.addExact(std.testing.allocator, "/repo", "src/other.zig", .{ .content = from, .display_hunk_index = 1 });
+    try marks.addExact(std.testing.allocator, "/other", "src/app.zig", .{ .content = from, .display_hunk_index = 1 });
+    try marks.addExact(std.testing.allocator, "/repo", "src/app.zig", .{ .content = from, .display_hunk_index = 2 });
+
+    marks.rebindPathLineage(std.testing.allocator, "/repo", "src/app.zig", from, to);
+
+    try std.testing.expect(!marks.containsExact("/repo", "src/app.zig", .{ .content = from, .display_hunk_index = 1 }));
+    try std.testing.expect(!marks.containsExact("/repo", "src/app.zig", .{ .content = from, .display_hunk_index = 2 }));
+    try std.testing.expect(marks.containsExact("/repo", "src/app.zig", .{ .content = to, .display_hunk_index = 1 }));
+    try std.testing.expect(marks.containsExact("/repo", "src/app.zig", .{ .content = to, .display_hunk_index = 2 }));
+    try std.testing.expect(marks.containsExact("/repo", "src/app.zig", .{ .content = unrelated, .display_hunk_index = 1 }));
+    try std.testing.expect(marks.containsExact("/repo", "src/other.zig", .{ .content = from, .display_hunk_index = 1 }));
+    try std.testing.expect(marks.containsExact("/other", "src/app.zig", .{ .content = from, .display_hunk_index = 1 }));
+    try std.testing.expectEqual(@as(usize, 5), marks.items.items.len);
+
+    marks.clearPathLineage(std.testing.allocator, "/repo", "src/app.zig", to);
+    try std.testing.expect(!marks.containsExact("/repo", "src/app.zig", .{ .content = to, .display_hunk_index = 1 }));
+    try std.testing.expect(!marks.containsExact("/repo", "src/app.zig", .{ .content = to, .display_hunk_index = 2 }));
+    try std.testing.expect(marks.containsExact("/repo", "src/app.zig", .{ .content = unrelated, .display_hunk_index = 1 }));
+    try std.testing.expect(marks.containsExact("/repo", "src/other.zig", .{ .content = from, .display_hunk_index = 1 }));
+    try std.testing.expect(marks.containsExact("/other", "src/app.zig", .{ .content = from, .display_hunk_index = 1 }));
+    try std.testing.expectEqual(@as(usize, 3), marks.items.items.len);
 }
 
 test "SecretInput clear zeroes backing buffer" {

@@ -21,6 +21,7 @@ const review_navigation = @import("app/pages/review/navigation.zig");
 const review_authority = @import("app/pages/review/authority.zig");
 const review_operations = @import("app/pages/review/operations.zig");
 const review_reload = @import("app/pages/review/reload.zig");
+const review_selection_model = @import("app/pages/review/selection.zig");
 const review_page_update = @import("app/pages/review/update.zig");
 const review_view = @import("app/pages/review/view.zig");
 const repository_page = @import("app/pages/repository.zig");
@@ -85,7 +86,7 @@ const DiffLoadFinished = app_load.DiffLoadFinished;
 const DiffLoadTask = app_load.DiffLoadTask(App.Msg);
 const DiscardTargetResult = git_ops.DiscardTargetResult;
 const EmptyReason = app_load_state.EmptyReason;
-const HunkMarkSource = git_ops.HunkMarkSource;
+const SessionHunkMarkMutation = git_ops.SessionHunkMarkMutation;
 const HunkStageTargetResult = git_ops.HunkStageTargetResult;
 const HunkUnstageTargetResult = git_ops.HunkUnstageTargetResult;
 const HorizontalDirection = app_direction.Horizontal;
@@ -482,6 +483,8 @@ pub const App = struct {
         return .{
             .page = &self.pages.review,
             .repo_root = self.activeRepoRoot(),
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.repo_state.activeIdentity(),
             .source = self.config.source,
             .layout = .{ .width = size.width, .height = size.height },
         };
@@ -699,8 +702,6 @@ pub const App = struct {
     fn updateReview(self: *App, ctx: *chasen.Ctx(Msg), msg: review_message.Msg) !void {
         var page_update = try (review_page_update.Controller{
             .navigation = self.reviewNavigation(),
-            .repo_epoch = self.repo_epoch,
-            .root_identity = self.repo_state.activeIdentity(),
         }).apply(self.allocator, msg);
         defer page_update.deinit(self.allocator);
 
@@ -2114,7 +2115,7 @@ pub const App = struct {
             .path = owned.path,
             .hunk_index = owned.hunk_index,
             .patch = owned.patch,
-            .mark_source = owned.mark_source,
+            .session_mark_mutation = owned.session_mark_mutation,
             .reload_after_success = owned.reload_after_success,
         };
         owned.patch = &.{};
@@ -2227,7 +2228,7 @@ pub const App = struct {
             .path = owned.path,
             .hunk_index = owned.hunk_index,
             .patch = owned.patch,
-            .mark_source = owned.mark_source,
+            .session_mark_mutation = owned.session_mark_mutation,
             .reload_after_success = owned.reload_after_success,
         };
         owned.patch = &.{};
@@ -3470,7 +3471,7 @@ pub const App = struct {
             .repo_root = result.repo_root,
             .path = result.path,
             .hunk_index = result.hunk_index,
-            .mark_source = result.mark_source,
+            .session_mark_mutation = result.session_mark_mutation,
         } }, active_matches);
         if (applied.local_effect_failure == .staged_hunk_mark_record) {
             self.setReviewStatus("staged hunk {d}: {s}; could not record local staged-hunk mark", .{ result.hunk_index + 1, result.path });
@@ -3520,7 +3521,7 @@ pub const App = struct {
             .repo_root = result.repo_root,
             .path = result.path,
             .hunk_index = result.hunk_index,
-            .mark_source = result.mark_source,
+            .session_mark_mutation = result.session_mark_mutation,
             .reload_after_success = result.reload_after_success,
         } }, active_matches);
         const cursor_generation = self.promoteActionCursorRefresh(ctx.allocator(), result.pending, active_matches, applied.reload);
@@ -5578,6 +5579,7 @@ test "file and hunk action repository mismatch clear only their matching cursor 
         .repo_root = try allocator.dupe(u8, "/other"),
         .path = try allocator.dupe(u8, "src/hunk.zig"),
         .hunk_index = 0,
+        .session_mark_mutation = .none,
         .result = .ok,
     });
     try std.testing.expect(app.actions.pending == null);
@@ -5649,7 +5651,7 @@ test "successful hunk action binds an exact status-only refresh" {
         .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
         .hunk_index = 1,
-        .mark_source = .projection,
+        .session_mark_mutation = .none,
         .result = .ok,
     });
 
@@ -5730,7 +5732,7 @@ test "hunk tasks launch exact typed file owners for stage and unstage" {
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
 
-    try app.pages.review.staged_hunks.add(allocator, roots.a, "a", 0);
+    try addCurrentTestSessionHunkMark(&app, allocator, roots.a, "a", 0);
     try app.unstageSelectedHunk(&ctx);
     const unstage_pending = app.actions.pending orelse return error.ExpectedPendingHunkAction;
     try std.testing.expectEqual(app_actions.ActionKind.unstage_hunk, unstage_pending.kind);
@@ -5783,7 +5785,7 @@ test "accepted hunk stage local mark allocation failure bounds its refresh owner
             .repo_root = owned_root,
             .path = owned_path,
             .hunk_index = 0,
-            .mark_source = .session,
+            .session_mark_mutation = .{ .add = try currentTestSessionHunkMarkKey(&app, 0) },
             .result = .ok,
         });
 
@@ -5813,7 +5815,7 @@ test "cached hunk unstage binds exact source and status refresh members" {
         .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
         .hunk_index = 1,
-        .mark_source = .projection,
+        .session_mark_mutation = .none,
         .reload_after_success = true,
         .result = .ok,
     });
@@ -5844,7 +5846,7 @@ test "status-only hunk refresh spawn rejection closes its exact owner" {
         .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
         .hunk_index = 1,
-        .mark_source = .projection,
+        .session_mark_mutation = .none,
         .result = .ok,
     });
     ctx._pending_tasks_with_len = 0;
@@ -7902,7 +7904,7 @@ test "final hunk stage retains exact path through cached projection acceptance" 
     const activation_id = app.activateReview();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
-    try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 0);
+    try addCurrentTestSessionHunkMark(&app, allocator, "/repo", "a", 0);
     app.pages.review.status_load = .{ .generation = 6, .pending = .{ .generation = 6 } };
     try installTestActionCursor(&app, allocator, .file, "a", 8);
     try promoteTestActionCursorWithRequirement(&app, 8, .status_only);
@@ -7917,7 +7919,7 @@ test "final hunk stage retains exact path through cached projection acceptance" 
     mixed_status = undefined;
     try std.testing.expectEqualStrings("a", app.reviewNavigationView().selectedStagePathKey().?);
 
-    try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 1);
+    try addCurrentTestSessionHunkMark(&app, allocator, "/repo", "a", 1);
     app.pages.review.status_load = .{ .generation = 7, .pending = .{ .generation = 7 } };
     try installTestActionCursor(&app, allocator, .file, "a", 9);
     try promoteTestActionCursorWithRequirement(&app, 9, .status_only);
@@ -9378,14 +9380,15 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
     defer app.clearBranchSwitch(std.testing.allocator);
     defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
 
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    const mark_key = testSessionHunkMarkKey(1, 0);
+    try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", mark_key);
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.confirmBranchSwitch(&ctx);
 
     try std.testing.expect(!app.overlay.isSwitchBranch());
     try std.testing.expect(app.branch_switch.branches.len == 0);
-    try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 0));
+    try std.testing.expect(app.pages.review.staged_hunks.containsExact("/repo", "a", mark_key));
     try std.testing.expectEqualStrings("already on branch: main", app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(app.actions.pending == null);
@@ -9410,7 +9413,7 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
     defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
 
     try app.pages.review.reviewed_store.set(allocator, app.activeRepoRoot(), app_test_support.files_two[0], true);
-    try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 0);
+    try app.pages.review.staged_hunks.addExact(allocator, "/repo", "a", testSessionHunkMarkKey(1, 0));
     try installTestActionCursor(&app, allocator, .file, "a", 99);
     setDiffSearchQuery(&app, "needle");
 
@@ -9453,8 +9456,10 @@ test "finishSwitchBranch success clears completed repo marks when active repo ch
 
     try app.pages.review.reviewed_store.set(allocator, "/repo", app_test_support.files_two[0], true);
     try app.pages.review.reviewed_store.set(allocator, "/other", app_test_support.files_two[1], true);
-    try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 0);
-    try app.pages.review.staged_hunks.add(allocator, "/other", "b", 1);
+    const old_key = testSessionHunkMarkKey(1, 0);
+    const new_key = testSessionHunkMarkKey(1, 1);
+    try app.pages.review.staged_hunks.addExact(allocator, "/repo", "a", old_key);
+    try app.pages.review.staged_hunks.addExact(allocator, "/other", "b", new_key);
 
     const pending = app.actions.begin(.switch_branch);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
@@ -9470,8 +9475,8 @@ test "finishSwitchBranch success clears completed repo marks when active repo ch
     try std.testing.expect(app.actions.pending == null);
     try std.testing.expect(!try app.pages.review.reviewed_store.containsFile(allocator, "/repo", app_test_support.files_two[0]));
     try std.testing.expect(try app.pages.review.reviewed_store.containsFile(allocator, "/other", app_test_support.files_two[1]));
-    try std.testing.expect(!app.pages.review.staged_hunks.contains("/repo", "a", 0));
-    try std.testing.expect(app.pages.review.staged_hunks.contains("/other", "b", 1));
+    try std.testing.expect(!app.pages.review.staged_hunks.containsExact("/repo", "a", old_key));
+    try std.testing.expect(app.pages.review.staged_hunks.containsExact("/other", "b", new_key));
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expectEqualStrings("switched branch: /repo", app.pages.review.status.text());
 }
@@ -13288,7 +13293,7 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
         else => return error.ExpectedNotStagedHunk,
     }
 
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    try addCurrentTestSessionHunkMark(&app, std.testing.allocator, "/repo", "a", 0);
     switch (app.reviewOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
@@ -13296,6 +13301,7 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
             try std.testing.expectEqualStrings("a", target.path);
             try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
             try std.testing.expect(target.patch.len > 0);
+            try std.testing.expect(target.session_mark_mutation == .remove);
         },
         else => return error.ExpectedReadyHunkUnstageTarget,
     }
@@ -13327,7 +13333,7 @@ test "selectedHunkUnstageTarget supports cached source without session mark" {
     switch (app.reviewOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
-            try std.testing.expectEqual(HunkMarkSource.projection, target.mark_source);
+            try std.testing.expectEqual(SessionHunkMarkMutation.none, target.session_mark_mutation);
             try std.testing.expectEqualStrings("/repo", target.repo_root);
             try std.testing.expectEqualStrings("a", target.path);
             try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
@@ -14274,7 +14280,7 @@ test "projected hunk actions route through original cached and unstaged origins"
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
             try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
-            try std.testing.expectEqual(HunkMarkSource.projection, target.mark_source);
+            try std.testing.expectEqual(SessionHunkMarkMutation.none, target.session_mark_mutation);
         },
         else => return error.ExpectedReadyProjectedUnstage,
     }
@@ -14288,7 +14294,7 @@ test "projected hunk actions route through original cached and unstaged origins"
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
             try std.testing.expectEqual(@as(usize, 1), target.hunk_index);
-            try std.testing.expectEqual(HunkMarkSource.projection, target.mark_source);
+            try std.testing.expectEqual(SessionHunkMarkMutation.none, target.session_mark_mutation);
         },
         else => return error.ExpectedReadyProjectedStage,
     }
@@ -14337,8 +14343,8 @@ test "hunk stage presentation keeps fresh staged authority without clearing acti
     defer app.pages.review.git_status.deinit();
     acceptTestSource(&app);
 
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 1);
+    try addCurrentTestSessionHunkMark(&app, std.testing.allocator, "/repo", "a", 0);
+    try addCurrentTestSessionHunkMark(&app, std.testing.allocator, "/repo", "a", 1);
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.pages.review.git_status.replace("/repo", &staged_bundle);
@@ -14373,6 +14379,7 @@ test "hunk action results mutate session staged marks" {
     defer app.pages.review.staged_hunks.deinit(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusTasks(&ctx, allocator);
+    const mark_key = try currentTestSessionHunkMarkKey(&app, 1);
 
     const stage_pending = app.actions.begin(.stage_hunk);
     try app.finishStageHunk(&ctx, .{
@@ -14380,10 +14387,11 @@ test "hunk action results mutate session staged marks" {
         .repo_root = try allocator.dupe(u8, "/repo"),
         .path = try allocator.dupe(u8, "a"),
         .hunk_index = 1,
+        .session_mark_mutation = .{ .add = mark_key },
         .result = .ok,
     });
 
-    try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 1));
+    try std.testing.expect(app.pages.review.staged_hunks.containsExact("/repo", "a", mark_key));
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.staged_hunks.items.items.len);
 
     const unstage_pending = app.actions.begin(.unstage_hunk);
@@ -14392,14 +14400,15 @@ test "hunk action results mutate session staged marks" {
         .repo_root = try allocator.dupe(u8, "/repo"),
         .path = try allocator.dupe(u8, "a"),
         .hunk_index = 1,
+        .session_mark_mutation = .{ .remove = mark_key },
         .result = .ok,
     });
 
-    try std.testing.expect(!app.pages.review.staged_hunks.contains("/repo", "a", 1));
+    try std.testing.expect(!app.pages.review.staged_hunks.containsExact("/repo", "a", mark_key));
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.staged_hunks.items.items.len);
 }
 
-test "projection hunk action results reload status without mutating session marks" {
+test "hunk action none effect reloads status without adding a session mark" {
     const allocator = std.testing.allocator;
     var app: App = .{
         .pages = .{ .review = .{
@@ -14424,27 +14433,46 @@ test "projection hunk action results reload status without mutating session mark
         .repo_root = try allocator.dupe(u8, "/repo"),
         .path = try allocator.dupe(u8, "a"),
         .hunk_index = 1,
-        .mark_source = .projection,
+        .session_mark_mutation = .none,
         .result = .ok,
     });
 
-    try std.testing.expect(!app.pages.review.staged_hunks.contains("/repo", "a", 1));
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.staged_hunks.items.items.len);
     try std.testing.expect(app.pages.review.status_load.isPending());
-    clearPendingStatusTasks(&ctx, allocator);
+}
 
-    try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 1);
+test "hunk action none effect reloads status without removing a session mark" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+        } },
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } },
+    };
+    _ = app.activateReview();
+    defer app.pages.review.staged_hunks.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusTasks(&ctx, allocator);
+
+    const mark_key = try currentTestSessionHunkMarkKey(&app, 1);
+    try app.pages.review.staged_hunks.addExact(allocator, "/repo", "a", mark_key);
     const unstage_pending = app.actions.begin(.unstage_hunk);
     try app.finishUnstageHunk(&ctx, .{
         .pending = unstage_pending,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .path = try allocator.dupe(u8, "a"),
         .hunk_index = 1,
-        .mark_source = .projection,
+        .session_mark_mutation = .none,
         .result = .ok,
     });
 
-    try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 1));
+    try std.testing.expect(app.pages.review.staged_hunks.containsExact("/repo", "a", mark_key));
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.staged_hunks.items.items.len);
     try std.testing.expect(app.pages.review.status_load.isPending());
 }
@@ -14468,19 +14496,20 @@ test "cached source hunk unstage reload decision travels with task result" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 1);
+    const mark_key = try currentTestSessionHunkMarkKey(&app, 1);
+    try app.pages.review.staged_hunks.addExact(allocator, "/repo", "a", mark_key);
     const unstage_pending = app.actions.begin(.unstage_hunk);
     try app.finishUnstageHunk(&ctx, .{
         .pending = unstage_pending,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .path = try allocator.dupe(u8, "a"),
         .hunk_index = 1,
-        .mark_source = .projection,
+        .session_mark_mutation = .none,
         .reload_after_success = true,
         .result = .ok,
     });
 
-    try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 1));
+    try std.testing.expect(app.pages.review.staged_hunks.containsExact("/repo", "a", mark_key));
     switch (app.pages.review.load.pending orelse return error.ExpectedReloadAfterCachedHunkUnstage) {
         .diff_load => {},
         .repo_discovery => return error.ExpectedReloadAfterCachedHunkUnstage,
@@ -14503,8 +14532,9 @@ test "clearLoadedDiff clears session staged hunk marks" {
     };
     defer app.pages.review.staged_hunks.deinit(allocator);
 
-    try app.pages.review.staged_hunks.add(allocator, "/repo", "a", 0);
-    try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 0));
+    const mark_key = testSessionHunkMarkKey(1, 0);
+    try app.pages.review.staged_hunks.addExact(allocator, "/repo", "a", mark_key);
+    try std.testing.expect(app.pages.review.staged_hunks.containsExact("/repo", "a", mark_key));
 
     app.reviewReload().clearLoadedDiff(app.allocator);
 
@@ -16126,7 +16156,8 @@ test "watch no-op diff load preserves session view state and staged hunk marks" 
     defer app.reviewReload().clearLoadedDiff(app.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app.pages.review.staged_hunks.add(std.testing.allocator, "/repo", "a", 0);
+    const mark_key = try currentTestSessionHunkMarkKey(&app, 0);
+    try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", mark_key);
     app.pages.review.load.generation = 2;
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
 
@@ -16140,7 +16171,7 @@ test "watch no-op diff load preserves session view state and staged hunk marks" 
     try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.diff_scroll);
     try std.testing.expectEqual(@as(usize, 4), app.pages.review.viewer.diff_horizontal_scroll);
     try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.sidebar_horizontal_scroll);
-    try std.testing.expect(app.pages.review.staged_hunks.contains("/repo", "a", 0));
+    try std.testing.expect(app.pages.review.staged_hunks.containsExact("/repo", "a", mark_key));
     try std.testing.expect(app.pages.review.pending_reload == null);
 }
 
@@ -17508,6 +17539,41 @@ fn setFileSearchInput(app: *App, query: []const u8) void {
 fn acceptTestSource(app: *App) void {
     app.pages.review.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
     syncTestActivation(app);
+}
+
+fn testSessionHunkMarkKey(source_session_revision: u64, display_hunk_index: usize) git_ops.SessionHunkMarkKey {
+    return .{
+        .content = .{
+            .repo_epoch = 0,
+            .root_identity = null,
+            .source = review_selection_model.SourceBasis.init(.unstaged),
+            .source_session_revision = source_session_revision,
+            .display = .{ .loaded = .init("test diff") },
+        },
+        .display_hunk_index = display_hunk_index,
+    };
+}
+
+fn currentTestSessionHunkMarkKey(app: *const App, display_hunk_index: usize) !git_ops.SessionHunkMarkKey {
+    return .{
+        .content = app.reviewNavigationView().currentContentToken() orelse return error.ExpectedReviewContentToken,
+        .display_hunk_index = display_hunk_index,
+    };
+}
+
+fn addCurrentTestSessionHunkMark(
+    app: *App,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    path: []const u8,
+    display_hunk_index: usize,
+) !void {
+    try app.pages.review.staged_hunks.addExact(
+        allocator,
+        repo_root,
+        path,
+        try currentTestSessionHunkMarkKey(app, display_hunk_index),
+    );
 }
 
 fn syncTestActivation(app: *App) void {

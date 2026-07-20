@@ -375,7 +375,16 @@ test "ReviewPageState deinit releases stores projection and stable order" {
         return err;
     };
 
-    try state.staged_hunks.add(allocator, "/repo", "src/main.zig", 2);
+    try state.staged_hunks.addExact(allocator, "/repo", "src/main.zig", .{
+        .content = .{
+            .repo_epoch = 1,
+            .root_identity = null,
+            .source = review_selection.SourceBasis.init(.unstaged),
+            .source_session_revision = 1,
+            .display = .{ .loaded = .init("diff") },
+        },
+        .display_hunk_index = 2,
+    });
 
     const order_key = try allocator.dupe(u8, "src/main.zig");
     state.tree_order.keys.append(allocator, order_key) catch |err| {

@@ -14,7 +14,6 @@ const review_page = @import("../review.zig");
 const review_selection = @import("selection.zig");
 const diff_selection = @import("../../../diff/selection.zig");
 const file_tree = if (builtin.is_test) @import("../../../file_tree.zig") else struct {};
-const root_capability = @import("../../../repo/root_capability.zig");
 const review_session = @import("../../../review/session.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
@@ -66,8 +65,6 @@ pub const ReviewUpdate = struct {
 
 pub const Controller = struct {
     navigation: navigation.Controller,
-    repo_epoch: u64 = 0,
-    root_identity: ?root_capability.Identity = null,
 
     /// `allocator` may be null only for transitions that neither allocate nor
     /// return an owned command. Runtime App initialization always supplies one;
@@ -279,7 +276,7 @@ pub const Controller = struct {
     }
 
     fn buildCompletedSelection(self: Controller, allocator: std.mem.Allocator, selection: diff_selection.DragSelection) !review_selection.CompletedSelection {
-        const token = self.contentToken(selection) orelse return error.StaleSelection;
+        const token = self.navigation.view().currentContentToken() orelse return error.StaleSelection;
         return switch (selection.identity) {
             .loaded_file, .projection_file => blk: {
                 const target = self.navigation.view().parsedSelectionTarget(selection.identity) orelse return error.StaleSelection;
@@ -290,32 +287,6 @@ pub const Controller = struct {
                 if (!std.mem.eql(u8, generated.path_key, bundle.path)) return error.StaleSelection;
                 break :blk try review_selection.buildGenerated(allocator, token, bundle.path, &bundle.source, selection);
             },
-        };
-    }
-
-    fn contentToken(self: Controller, selection: diff_selection.DragSelection) ?review_selection.ReviewContentToken {
-        const page = self.navigation.page;
-        const display: review_selection.DisplayBasis = switch (self.navigation.view().displayedReviewBody()) {
-            .primary => |primary| .{ .loaded = .init(primary.loaded.text) },
-            .cached => |bundle| .{ .cached_projection = .{
-                .status_snapshot_revision = page.status_snapshot_revision,
-                .cached = bundle.fingerprint,
-            } },
-            .combined => |bundle| .{ .combined_projection = bundle.presentation.content_token },
-            .retained_staged_only => |bundle| .{ .combined_projection = bundle.presentation.content_token },
-            .generated => |bundle| .{ .generated_untracked = .{
-                .status_snapshot_revision = page.status_snapshot_revision,
-                .source = bundle.fingerprint(),
-            } },
-            .none, .inert_invalid_utf8, .status, .pending => return null,
-        };
-        _ = selection;
-        return .{
-            .repo_epoch = self.repo_epoch,
-            .root_identity = self.root_identity,
-            .source = review_selection.SourceBasis.init(self.navigation.source),
-            .source_session_revision = page.source_session_revision,
-            .display = display,
         };
     }
 };
@@ -491,7 +462,6 @@ test "file search supersedes action restore only when submit changes selection" 
             .layout = .{ .width = 80, .height = 20 },
             .diagnostics = .{ .target = &page.status },
         },
-        .repo_epoch = 3,
     };
 
     var enter_same = try controller.apply(allocator, .enter_file_search);
@@ -579,7 +549,6 @@ test "review file search publishes candidates from enter and input edits" {
             .layout = .{ .width = 80, .height = 20 },
             .diagnostics = .{ .target = &page.status },
         },
-        .repo_epoch = 3,
     };
 
     var entered = try controller.apply(allocator, .enter_file_search);

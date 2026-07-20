@@ -18,6 +18,7 @@ const root_capability = @import("../../../repo/root_capability.zig");
 const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
 const review_page = @import("../review.zig");
 const review_selection = @import("selection.zig");
+const session_hunk_mark = @import("session_hunk_mark.zig");
 const file_search = @import("file_search.zig");
 const authority = @import("authority.zig");
 const navigation = @import("navigation.zig");
@@ -4648,7 +4649,11 @@ test "ordinary primary staged-only status does not enter P5b boundary" {
         primary_before.loaded.document.files[primary_before.file_index],
         2,
     );
-    try page.staged_hunks.add(allocator, "/repo", "a", 0);
+    const mark_key: session_hunk_mark.Key = .{
+        .content = controller.navigation.view().currentContentToken() orelse return error.ExpectedReviewContentToken,
+        .display_hunk_index = 0,
+    };
+    try page.staged_hunks.addExact(allocator, "/repo", "a", mark_key);
     try page.search.query.insertSlice("new");
     controller.navigation.refreshSearchForSelectedFile();
     page.viewer.diff_scroll = 2;
@@ -4674,7 +4679,7 @@ test "ordinary primary staged-only status does not enter P5b boundary" {
     try std.testing.expect(primary_after.loaded.syntax_spans.files.ptr == syntax_before);
     try std.testing.expect(primary_after.hunk_authority == null);
     try std.testing.expect(page.completed_selection != null);
-    try std.testing.expect(page.staged_hunks.contains("/repo", "a", 0));
+    try std.testing.expect(page.staged_hunks.containsExact("/repo", "a", mark_key));
     try std.testing.expect(std.meta.eql(search_before, page.search.match.?));
     try std.testing.expectEqual(search_offset_before, page.search.match_offset);
     try std.testing.expect(std.meta.eql(cursor_before, page.viewer.diff_cursor));

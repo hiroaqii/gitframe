@@ -4,6 +4,7 @@ const file_tree = @import("../file_tree.zig");
 const git_branch_status = @import("../git/branch_status.zig");
 const git_push = @import("../git/push.zig");
 const git_status = @import("../git/status.zig");
+const session_hunk_mark = @import("pages/review/session_hunk_mark.zig");
 
 /// App-local Git operation target classification.
 ///
@@ -72,10 +73,8 @@ pub const ToggleStageTargetResult = union(enum) {
 
 pub const inert_hunk_action_message = "hunk actions unavailable for non-UTF-8 diff text";
 
-pub const HunkMarkSource = enum {
-    session,
-    projection,
-};
+pub const SessionHunkMarkKey = session_hunk_mark.Key;
+pub const SessionHunkMarkMutation = session_hunk_mark.Mutation;
 
 pub const HunkStageTarget = struct {
     repo_root: []const u8,
@@ -84,7 +83,7 @@ pub const HunkStageTarget = struct {
     /// Owned patch text returned by target resolution and transferred to the
     /// async task when the request is started.
     patch: []u8,
-    mark_source: HunkMarkSource = .session,
+    session_mark_mutation: SessionHunkMarkMutation,
     reload_after_success: bool = false,
 };
 

@@ -75,7 +75,7 @@ pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *
         .path = &.{},
         .patch = &.{},
         .hunk_index = target.hunk_index,
-        .mark_source = target.mark_source,
+        .session_mark_mutation = target.session_mark_mutation,
     };
     errdefer destroyHunkTask(Task, ctx.allocator(), task);
 
@@ -102,7 +102,7 @@ pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
         .path = &.{},
         .patch = &.{},
         .hunk_index = target.hunk_index,
-        .mark_source = target.mark_source,
+        .session_mark_mutation = target.session_mark_mutation,
         .reload_after_success = target.reload_after_success,
     };
     errdefer destroyHunkTask(Task, ctx.allocator(), task);

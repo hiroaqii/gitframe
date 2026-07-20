@@ -137,7 +137,7 @@ pub const StageHunkFinished = struct {
     repo_root: []u8,
     path: []u8,
     hunk_index: usize,
-    mark_source: git_ops.HunkMarkSource = .session,
+    session_mark_mutation: git_ops.SessionHunkMarkMutation,
     result: FileActionTaskResult,
 
     pub fn deinit(self: *StageHunkFinished, allocator: std.mem.Allocator) void {
@@ -149,7 +149,7 @@ pub const StageHunkFinished = struct {
             .repo_root = &.{},
             .path = &.{},
             .hunk_index = 0,
-            .mark_source = .session,
+            .session_mark_mutation = .none,
             .result = .ok,
         };
     }
@@ -160,7 +160,7 @@ pub const UnstageHunkFinished = struct {
     repo_root: []u8,
     path: []u8,
     hunk_index: usize,
-    mark_source: git_ops.HunkMarkSource = .session,
+    session_mark_mutation: git_ops.SessionHunkMarkMutation,
     reload_after_success: bool = false,
     result: FileActionTaskResult,
 
@@ -173,7 +173,7 @@ pub const UnstageHunkFinished = struct {
             .repo_root = &.{},
             .path = &.{},
             .hunk_index = 0,
-            .mark_source = .session,
+            .session_mark_mutation = .none,
             .reload_after_success = false,
             .result = .ok,
         };
@@ -569,7 +569,7 @@ pub fn StageHunkTask(comptime Msg: type) type {
         path: []u8,
         patch: []u8,
         hunk_index: usize,
-        mark_source: git_ops.HunkMarkSource = .session,
+        session_mark_mutation: git_ops.SessionHunkMarkMutation,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
@@ -591,7 +591,7 @@ pub fn StageHunkTask(comptime Msg: type) type {
                 .repo_root = repo_root,
                 .path = path,
                 .hunk_index = task.hunk_index,
-                .mark_source = task.mark_source,
+                .session_mark_mutation = task.session_mark_mutation,
                 .result = result,
             } });
         }
@@ -615,7 +615,7 @@ pub fn StageHunkTask(comptime Msg: type) type {
                 .repo_root = repo_root,
                 .path = path,
                 .hunk_index = task.hunk_index,
-                .mark_source = task.mark_source,
+                .session_mark_mutation = task.session_mark_mutation,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
@@ -630,7 +630,7 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
         path: []u8,
         patch: []u8,
         hunk_index: usize,
-        mark_source: git_ops.HunkMarkSource = .session,
+        session_mark_mutation: git_ops.SessionHunkMarkMutation,
         reload_after_success: bool = false,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
@@ -653,7 +653,7 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
                 .repo_root = repo_root,
                 .path = path,
                 .hunk_index = task.hunk_index,
-                .mark_source = task.mark_source,
+                .session_mark_mutation = task.session_mark_mutation,
                 .reload_after_success = task.reload_after_success,
                 .result = result,
             } });
@@ -678,7 +678,7 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
                 .repo_root = repo_root,
                 .path = path,
                 .hunk_index = task.hunk_index,
-                .mark_source = task.mark_source,
+                .session_mark_mutation = task.session_mark_mutation,
                 .reload_after_success = task.reload_after_success,
                 .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
@@ -1755,6 +1755,16 @@ test "StageHunkTask failed preserves identity and transfers moved fields" {
     };
     const Task = StageHunkTask(TestMsg);
     const allocator = std.testing.allocator;
+    const mark_key: git_ops.SessionHunkMarkKey = .{
+        .content = .{
+            .repo_epoch = 2,
+            .root_identity = null,
+            .source = .init(.unstaged),
+            .source_session_revision = 4,
+            .display = .{ .loaded = .init("diff") },
+        },
+        .display_hunk_index = 3,
+    };
 
     const task = try allocator.create(Task);
     task.* = .{
@@ -1763,7 +1773,7 @@ test "StageHunkTask failed preserves identity and transfers moved fields" {
         .path = try allocator.dupe(u8, "src/main.zig"),
         .patch = try allocator.dupe(u8, "patch"),
         .hunk_index = 3,
-        .mark_source = .session,
+        .session_mark_mutation = .{ .add = mark_key },
     };
 
     const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
@@ -1777,6 +1787,8 @@ test "StageHunkTask failed preserves identity and transfers moved fields" {
     try std.testing.expectEqual(@as(u64, 7), finished.pending.generation);
     try std.testing.expectEqual(ActionKind.stage_hunk, finished.pending.kind);
     try std.testing.expectEqual(@as(usize, 3), finished.hunk_index);
+    try std.testing.expect(finished.session_mark_mutation == .add);
+    try std.testing.expect(finished.session_mark_mutation.add.eql(mark_key));
     try std.testing.expectEqualStrings("/repo", finished.repo_root);
     try std.testing.expectEqualStrings("src/main.zig", finished.path);
     try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
