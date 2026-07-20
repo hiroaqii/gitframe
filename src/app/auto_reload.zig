@@ -36,6 +36,15 @@ pub const PendingMembers = packed struct {
         return self.source or self.status or self.branch or self.deferred_source_apply;
     }
 
+    pub fn owns(self: PendingMembers, member: CycleMember) bool {
+        return switch (member) {
+            .source => self.source,
+            .status => self.status,
+            .branch => self.branch,
+            .deferred_source_apply => self.deferred_source_apply,
+        };
+    }
+
     fn set(self: *PendingMembers, member: CycleMember, value: bool) void {
         switch (member) {
             .source => self.source = value,
@@ -46,9 +55,18 @@ pub const PendingMembers = packed struct {
     }
 };
 
+/// Sticky publication authority for one background scheduling cycle.
+/// Supersession does not cancel or abandon member ownership; every started
+/// member must still drain before the cycle releases its scheduling slot.
+pub const CycleAcceptance = enum {
+    open,
+    superseded_by_mutation,
+};
+
 pub const BackgroundCycle = struct {
     id: u64,
     pending: PendingMembers = .{},
+    acceptance: CycleAcceptance = .open,
 };
 
 pub const FailureIdentity = struct {
@@ -161,8 +179,18 @@ pub const State = struct {
     pub fn markMemberStarted(self: *State, cycle_id: u64, member: CycleMember) bool {
         const cycle = &(self.background_cycle orelse return false);
         if (cycle.id != cycle_id) return false;
+        if (cycle.acceptance != .open) return false;
         cycle.pending.set(member, true);
         return true;
+    }
+
+    /// Foreground reads have no cycle and pass this half of admission. A
+    /// background result must name the exact still-active open cycle; read
+    /// epoch/phase admission remains a separate P6b contract.
+    pub fn acceptsCycle(self: State, cycle_id: ?u64) bool {
+        const id = cycle_id orelse return true;
+        const cycle = self.background_cycle orelse return false;
+        return cycle.id == id and cycle.acceptance == .open;
     }
 
     pub fn finishMember(self: *State, cycle_id: ?u64, member: CycleMember) void {
@@ -177,6 +205,9 @@ pub const State = struct {
         const id = cycle_id orelse return false;
         const cycle = &(self.background_cycle orelse return false);
         if (cycle.id != id) return false;
+        // A move transfers one existing owner; it must never manufacture work
+        // or merge two independently draining owners into a single bit.
+        if (!cycle.pending.owns(from) or cycle.pending.owns(to)) return false;
         cycle.pending.set(from, false);
         cycle.pending.set(to, true);
         return true;
@@ -187,11 +218,23 @@ pub const State = struct {
         if (cycle.id == cycle_id and !cycle.pending.any()) self.background_cycle = null;
     }
 
-    /// Ends scheduling ownership for work bound to a superseded repository
-    /// epoch. In-flight tasks still complete and free their payloads, but their
-    /// old cycle can no longer keep the new repository session permanently busy.
+    /// Repository identity replacement destroys the complete old scheduling
+    /// namespace, so it may release the cycle immediately. Mutation overlap
+    /// uses `supersedeActiveCycleByMutation` and preserves member drain.
     pub fn supersedeCycle(self: *State) void {
         self.background_cycle = null;
+    }
+
+    /// Fail closed for every remaining member of the active pre-mutation
+    /// cycle. An empty cycle is already drained and can release immediately;
+    /// otherwise its sticky state survives arbitrary member arrival order.
+    pub fn supersedeActiveCycleByMutation(self: *State) void {
+        const cycle = &(self.background_cycle orelse return);
+        if (!cycle.pending.any()) {
+            self.background_cycle = null;
+            return;
+        }
+        cycle.acceptance = .superseded_by_mutation;
     }
 
     pub fn acceptSource(self: *State, fingerprint: content_fingerprint.Fingerprint) void {
@@ -267,6 +310,97 @@ test "deferred source apply keeps its background cycle busy" {
     try std.testing.expect(state.background_cycle.?.pending.deferred_source_apply);
     try std.testing.expect(state.beginCycle() == null);
     state.finishMember(id, .deferred_source_apply);
+    try std.testing.expect(state.background_cycle == null);
+}
+
+test "mutation supersession is sticky until every cycle member drains" {
+    var state = State.init(.inherit, .{}, .unstaged);
+    const id = state.beginCycle().?;
+    try std.testing.expect(state.markMemberStarted(id, .source));
+    try std.testing.expect(state.markMemberStarted(id, .status));
+    try std.testing.expect(state.markMemberStarted(id, .branch));
+    try std.testing.expect(state.acceptsCycle(id));
+
+    state.supersedeActiveCycleByMutation();
+    try std.testing.expectEqual(CycleAcceptance.superseded_by_mutation, state.background_cycle.?.acceptance);
+    try std.testing.expect(!state.acceptsCycle(id));
+    try std.testing.expect(state.acceptsCycle(null));
+    try std.testing.expect(state.beginCycle() == null);
+
+    state.finishMember(id, .source);
+    try std.testing.expect(state.background_cycle != null);
+    state.finishMember(id, .branch);
+    try std.testing.expect(state.background_cycle != null);
+    state.finishMember(id, .status);
+    try std.testing.expect(state.background_cycle == null);
+
+    const next = state.beginCycle().?;
+    try std.testing.expect(next != id);
+    try std.testing.expect(state.acceptsCycle(next));
+    try std.testing.expect(state.markMemberStarted(next, .source));
+    try std.testing.expect(!state.acceptsCycle(id));
+    state.finishMember(id, .source);
+    try std.testing.expectEqual(next, state.background_cycle.?.id);
+    state.finishMember(next, .source);
+    try std.testing.expect(state.background_cycle == null);
+}
+
+test "superseded cycle rejects late starts but permits ownership moves and drain" {
+    var state = State.init(.inherit, .{}, .unstaged);
+    const id = state.beginCycle().?;
+    try std.testing.expect(state.markMemberStarted(id, .source));
+    try std.testing.expect(state.markMemberStarted(id, .status));
+    state.supersedeActiveCycleByMutation();
+
+    try std.testing.expect(!state.markMemberStarted(id, .branch));
+    try std.testing.expect(!state.acceptsCycle(id +% 1));
+    state.finishMember(id +% 1, .source);
+    try std.testing.expect(state.background_cycle != null);
+    try std.testing.expect(state.moveMember(id, .source, .deferred_source_apply));
+    try std.testing.expect(state.background_cycle.?.pending.deferred_source_apply);
+    state.finishMember(id, .status);
+    try std.testing.expect(state.background_cycle != null);
+    state.finishMember(id, .deferred_source_apply);
+    try std.testing.expect(state.background_cycle == null);
+}
+
+test "superseded cycle rejects ownership creation and merging while preserving drain" {
+    var state = State.init(.inherit, .{}, .unstaged);
+    const missing_source_id = state.beginCycle().?;
+    try std.testing.expect(state.markMemberStarted(missing_source_id, .status));
+    state.supersedeActiveCycleByMutation();
+
+    const before_missing_move = state.background_cycle.?.pending;
+    try std.testing.expect(!state.moveMember(missing_source_id, .source, .deferred_source_apply));
+    try std.testing.expectEqual(before_missing_move, state.background_cycle.?.pending);
+    state.finishMember(missing_source_id, .status);
+    try std.testing.expect(state.background_cycle == null);
+
+    const occupied_target_id = state.beginCycle().?;
+    try std.testing.expect(state.markMemberStarted(occupied_target_id, .source));
+    try std.testing.expect(state.markMemberStarted(occupied_target_id, .status));
+    state.supersedeActiveCycleByMutation();
+
+    const before_occupied_move = state.background_cycle.?.pending;
+    try std.testing.expect(!state.moveMember(occupied_target_id, .source, .status));
+    try std.testing.expectEqual(before_occupied_move, state.background_cycle.?.pending);
+    state.finishMember(occupied_target_id, .source);
+    try std.testing.expect(state.background_cycle != null);
+    state.finishMember(occupied_target_id, .status);
+    try std.testing.expect(state.background_cycle == null);
+
+    try std.testing.expect(state.beginCycle() != null);
+}
+
+test "empty mutation cycle and repository supersession release immediately" {
+    var state = State.init(.inherit, .{}, .unstaged);
+    _ = state.beginCycle().?;
+    state.supersedeActiveCycleByMutation();
+    try std.testing.expect(state.background_cycle == null);
+
+    const id = state.beginCycle().?;
+    try std.testing.expect(state.markMemberStarted(id, .source));
+    state.supersedeCycle();
     try std.testing.expect(state.background_cycle == null);
 }
 

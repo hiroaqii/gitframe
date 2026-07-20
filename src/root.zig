@@ -48,6 +48,7 @@ test {
     _ = @import("app/pages/review/message.zig");
     _ = @import("app/pages/review/navigation.zig");
     _ = @import("app/pages/review/authority.zig");
+    _ = @import("app/pages/review/repository_read_authority.zig");
     _ = @import("app/pages/review/operations.zig");
     _ = @import("app/pages/review/reload.zig");
     _ = @import("app/pages/review/update.zig");

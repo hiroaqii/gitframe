@@ -8,6 +8,7 @@ const review_projection = @import("../review_projection.zig");
 const app_state = @import("../state.zig");
 pub const action_cursor = @import("review/action_cursor.zig");
 const authority = @import("review/authority.zig");
+pub const repository_read_authority = @import("review/repository_read_authority.zig");
 pub const file_search = @import("review/file_search.zig");
 const review_selection = @import("review/selection.zig");
 const config = @import("../../config.zig");
@@ -168,6 +169,7 @@ pub const DeferredProjectionApply = struct {
 
 pub const ReviewPageState = struct {
     activation: authority.Lifecycle = .{},
+    repository_read_authority: repository_read_authority.ReviewRepositoryReadAuthority = .{},
     status: app_state.StatusMessage = .{},
     load: load_state.LoadRuntimeState = .{},
     auto_reload: auto_reload.State = .{},
@@ -255,6 +257,7 @@ test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
     errdefer state.deinit(allocator);
     state.init(.inherit, .{}, .unstaged);
     try std.testing.expect(state.auto_reload.enabled());
+    try std.testing.expect(state.repository_read_authority.mayStartRepositoryRead());
 
     state.deferred_source_apply = .{
         .finished = .{
