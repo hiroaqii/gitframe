@@ -656,12 +656,18 @@ const Cache = struct {
 pub const State = struct {
     displayed: Displayed = .idle,
     pending: ?Request = null,
+    /// One exact-reuse rejection may request a single eager reconstruction of
+    /// the same live presentation. Keeping only scalar presentation identity
+    /// makes the retry independent of task/request allocation and lets a
+    /// changed target invalidate it without retaining page-owned storage.
+    eager_retry_basis: ?ExpectedPresentation = null,
     syntax_pending: ?GeneratedSyntaxRequest = null,
     syntax_next_id: u64 = 0,
     cache: Cache = .{},
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         self.clearPending(allocator);
+        self.eager_retry_basis = null;
         self.clearSyntaxPending(allocator);
         self.displayed.deinit(allocator);
         self.cache.deinit(allocator);
@@ -672,7 +678,32 @@ pub const State = struct {
         self.pending = null;
     }
 
+    pub fn scheduleEagerRetry(self: *State, basis: ExpectedPresentation) void {
+        self.eager_retry_basis = basis;
+    }
+
+    /// Returns whether the next request for `live` must omit its reuse hint.
+    /// A different or absent live presentation consumes the stale retry
+    /// marker instead of letting it affect another file/session.
+    pub fn shouldForceEagerRetry(self: *State, live: ?ExpectedPresentation) bool {
+        const retry = self.eager_retry_basis orelse return false;
+        const current = live orelse {
+            self.eager_retry_basis = null;
+            return false;
+        };
+        if (!retry.eql(current)) {
+            self.eager_retry_basis = null;
+            return false;
+        }
+        return true;
+    }
+
+    pub fn finishEagerRetry(self: *State) void {
+        self.eager_retry_basis = null;
+    }
+
     pub fn clearDisplayed(self: *State, allocator: std.mem.Allocator) void {
+        self.eager_retry_basis = null;
         self.clearSyntaxPending(allocator);
         self.displayed.deinit(allocator);
     }
@@ -687,7 +718,7 @@ pub const State = struct {
     }
 
     pub fn isEmpty(self: *const State) bool {
-        return self.pending == null and self.syntax_pending == null and self.displayed.request() == null and self.cache.entries.items.len == 0;
+        return self.pending == null and self.eager_retry_basis == null and self.syntax_pending == null and self.displayed.request() == null and self.cache.entries.items.len == 0;
     }
 
     pub fn cacheLen(self: *const State) usize {
@@ -733,6 +764,7 @@ pub const State = struct {
         source_session_revision: u64,
         status_snapshot_revision: u64,
     ) void {
+        self.eager_retry_basis = null;
         self.clearSyntaxPending(allocator);
         var previous = self.displayed;
         self.displayed = .idle;
@@ -1114,6 +1146,32 @@ test "request clone owns paths and snapshots scalar presentation hint" {
     defer ordinary.deinit(allocator);
     try std.testing.expect(ordinary.expected_presentation == null);
     try std.testing.expect(request.sameSemanticKey(ordinary));
+}
+
+test "eager retry basis is bounded to one live presentation identity" {
+    const first: ExpectedPresentation = .{
+        .fingerprint = .{ .digest = [_]u8{0x11} ** 32 },
+        .content_token = .init(7),
+    };
+    const second: ExpectedPresentation = .{
+        .fingerprint = .{ .digest = [_]u8{0x22} ** 32 },
+        .content_token = .init(8),
+    };
+    var state: State = .{};
+
+    state.scheduleEagerRetry(first);
+    try std.testing.expect(state.shouldForceEagerRetry(first));
+    try std.testing.expect(state.eager_retry_basis != null);
+    state.finishEagerRetry();
+    try std.testing.expect(state.eager_retry_basis == null);
+
+    state.scheduleEagerRetry(first);
+    try std.testing.expect(!state.shouldForceEagerRetry(second));
+    try std.testing.expect(state.eager_retry_basis == null);
+
+    state.scheduleEagerRetry(first);
+    try std.testing.expect(!state.shouldForceEagerRetry(null));
+    try std.testing.expect(state.eager_retry_basis == null);
 }
 
 test "generated request and syntax clone retain pinned root identity" {

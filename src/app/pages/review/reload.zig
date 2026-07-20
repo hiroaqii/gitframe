@@ -71,11 +71,6 @@ pub const DiscoveryCommitOutcome = enum {
 
 pub const ProjectionApply = struct {
     result_transferred: bool = false,
-    /// A candidate completion passed request freshness but failed the live
-    /// token/exact-presentation gate. P4c exposes this inert signal for the
-    /// later bounded eager retry; the production worker does not emit the
-    /// candidate terminal yet.
-    reuse_rejected: bool = false,
 };
 
 pub const RedrawDisposition = enum {
@@ -469,12 +464,21 @@ pub const Controller = struct {
         if (!self.acceptsCombinedReuseCandidate(result.request, candidate)) {
             // Old presentation and stale authority remain visible but cannot
             // authorize another write under the fresh page status revision.
-            // The later enabling slice consumes this signal to issue one
-            // hint-free eager retry.
+            // Preserve only its scalar display identity so prepareProjection
+            // emits one hint-free eager request for this exact live body.
+            if (self.navigation.view().activeCombinedProjection()) |live| {
+                self.page.review_projection.scheduleEagerRetry(.{
+                    .fingerprint = live.presentation.fingerprint,
+                    .content_token = live.presentation.content_token,
+                });
+            } else {
+                self.page.review_projection.finishEagerRetry();
+            }
             self.page.review_projection.clearPending(allocator);
-            return .{ .reuse_rejected = true };
+            return .{};
         }
 
+        self.page.review_projection.finishEagerRetry();
         self.page.review_projection.clearPending(allocator);
         const request = result.request;
         result.request = undefined;
@@ -847,6 +851,7 @@ pub const Controller = struct {
         if (self.displayMutationBlockedByDrag()) return .{};
 
         const target = self.view().projectionTarget() orelse {
+            _ = self.page.review_projection.shouldForceEagerRetry(null);
             if (self.view().canRetainDisplayedProjection()) return .{};
             if (self.page.pending_display_navigation_restore != null and !self.page.status_load.isFresh()) return .{};
             const allocator = allocator_opt orelse {
@@ -967,7 +972,9 @@ pub const Controller = struct {
         errdefer self.clearCompletedSelection(allocator);
 
         const request_root_identity = if (target.kind == .generated_added_file) self.root_identity else null;
-        const expected_presentation = self.expectedPresentationForTarget(target);
+        const live_expected_presentation = self.expectedPresentationForTarget(target);
+        const force_eager_retry = self.page.review_projection.shouldForceEagerRetry(live_expected_presentation);
+        const expected_presentation = if (force_eager_retry) null else live_expected_presentation;
         var state_request = try review_projection.cloneRequestWithOptions(
             allocator,
             identity,
@@ -1387,11 +1394,24 @@ pub const Controller = struct {
             return self.applyCombinedReuseCandidate(allocator, result);
         }
 
+        // Anchor capture is the last fallible admission step before replacing
+        // the retained display. If it fails, close this completed request but
+        // keep the scalar eager-retry basis: prepareProjection can then issue
+        // a fresh hint-free request instead of leaving a permanently pending
+        // stale display. The caller still owns and cleans up `result`.
         var local_navigation = if (self.page.pending_display_navigation_restore == null)
-            try self.view().captureAnchor(allocator)
+            self.view().captureAnchor(allocator) catch |err| {
+                self.page.review_projection.clearPending(allocator);
+                return err;
+            }
         else
             null;
         defer if (local_navigation) |*anchor| anchor.deinit(allocator);
+
+        // A matching non-candidate terminal consumes the single eager retry
+        // budget only after all fallible admission work succeeds. Failure
+        // terminals remain terminal instead of scheduling another loop.
+        self.page.review_projection.finishEagerRetry();
 
         switch (result.result) {
             .ready => |*ready| {
@@ -3907,10 +3927,10 @@ test "combined reuse acceptance retains presentation and installs fresh authorit
     defer if (finished_owned) finished.deinit(allocator);
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(applied.result_transferred);
-    try std.testing.expect(!applied.reuse_rejected);
     finished_owned = false;
 
     try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.review_projection.eager_retry_basis == null);
     const accepted = &page.review_projection.displayed.ready;
     try std.testing.expectEqual(@as(u64, 1), accepted.request.status_snapshot_revision);
     const bundle = &accepted.value.combined_hunks;
@@ -3987,8 +4007,8 @@ fn testCombinedReuseRejection(
     defer finished.deinit(allocator);
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(!applied.result_transferred);
-    try std.testing.expect(applied.reuse_rejected);
     try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.review_projection.eager_retry_basis != null);
 
     const retained = &page.review_projection.displayed.ready.value.combined_hunks;
     try std.testing.expect(retained.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
@@ -3996,9 +4016,49 @@ fn testCombinedReuseRejection(
     try std.testing.expect(retained.presentation.content_token.eql(presentation_token));
     try std.testing.expectEqual(@as(u64, 0), retained.authority.status_snapshot_revision);
     try std.testing.expect(page.completed_selection != null);
+
+    if (rejection == .forced_fingerprint_collision) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, controller.prepareProjection(failing.allocator()));
+        try std.testing.expect(page.review_projection.pending == null);
+        try std.testing.expect(page.review_projection.eager_retry_basis != null);
+    }
+
+    var retry_update = try controller.prepareProjection(allocator);
+    defer retry_update.deinit(allocator);
+    const retry_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    try std.testing.expect(retry_pending.expected_presentation == null);
+    var retry_command = retry_update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    defer retry_command.deinit(allocator);
+    const retry_request = switch (retry_command) {
+        .review_projection => |owned_request| owned_request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    try std.testing.expect(retry_request.expected_presentation == null);
+    try std.testing.expectEqual(retry_pending.id, retry_request.id);
+    try std.testing.expect(page.review_projection.eager_retry_basis != null);
+
+    if (rejection == .forced_fingerprint_collision) {
+        const rejected_spawn_id = retry_pending.id;
+        controller.rejectProjectionSpawn(allocator, rejected_spawn_id);
+        try std.testing.expect(page.review_projection.pending == null);
+        try std.testing.expect(page.review_projection.eager_retry_basis != null);
+
+        var respawn_update = try controller.prepareProjection(allocator);
+        defer respawn_update.deinit(allocator);
+        const respawn_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+        try std.testing.expect(respawn_pending.expected_presentation == null);
+        try std.testing.expect(respawn_pending.id != rejected_spawn_id);
+        var respawn_command = respawn_update.takeCommand() orelse return error.ExpectedProjectionCommand;
+        defer respawn_command.deinit(allocator);
+        switch (respawn_command) {
+            .review_projection => |owned_request| try std.testing.expect(owned_request.expected_presentation == null),
+            else => return error.ExpectedProjectionCommand,
+        }
+    }
 }
 
-test "combined reuse rejection keeps old display inert for eager fallback" {
+test "combined reuse rejection keeps old display inert and schedules one eager request" {
     const allocator = std.testing.allocator;
     try testCombinedReuseRejection(allocator, .expected_token_changed);
     try testCombinedReuseRejection(allocator, .forced_fingerprint_collision);
@@ -4051,6 +4111,213 @@ test "combined reuse candidate crosses live drag deferral with one owner" {
     try std.testing.expect(page.deferred_projection_apply == null);
     try std.testing.expect(page.review_projection.pending == null);
     try std.testing.expectEqual(@as(u64, 1), page.review_projection.displayed.ready.value.combined_hunks.authority.status_snapshot_revision);
+}
+
+test "deferred combined reuse rejection schedules the same bounded eager retry" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    try installTestCombinedCandidate(controller, allocator, 1, 72, 0);
+    controller.advanceStatusSnapshotRevision(allocator);
+    var initial_update = try controller.prepareProjection(allocator);
+    defer initial_update.deinit(allocator);
+    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    var candidate = try testCombinedReuseCandidate(
+        allocator,
+        1,
+        test_combined_after_cached,
+        test_combined_changed_unstaged,
+    );
+    candidate.fingerprint = pending.expected_presentation.?.fingerprint;
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = try cloneTestProjectionRequest(allocator, pending),
+        .result = .{ .reuse_candidate = candidate },
+    };
+    candidate = undefined;
+
+    page.selection_owner = .{ .diff = .init(
+        .{ .projection_file = .{ .kind = .combined, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    const deferred = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(deferred.result_transferred);
+    try std.testing.expect(page.deferred_projection_apply != null);
+
+    page.selection_owner = .none;
+    try controller.applyDeferredProjection(allocator);
+    try std.testing.expect(page.deferred_projection_apply == null);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.review_projection.eager_retry_basis != null);
+    try std.testing.expectEqual(@as(u64, 0), page.review_projection.displayed.ready.value.combined_hunks.authority.status_snapshot_revision);
+
+    var retry_update = try controller.prepareProjection(allocator);
+    defer retry_update.deinit(allocator);
+    const retry_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    try std.testing.expect(retry_pending.expected_presentation == null);
+    var retry_command = retry_update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    defer retry_command.deinit(allocator);
+    switch (retry_command) {
+        .review_projection => |request| try std.testing.expect(request.expected_presentation == null),
+        else => return error.ExpectedProjectionCommand,
+    }
+}
+
+test "hint-free eager completion consumes retry budget and preserves exact presentation token" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    try installTestCombinedCandidate(controller, allocator, 1, 73, 0);
+    const old_token = page.review_projection.displayed.ready.value.combined_hunks.presentation.content_token;
+    controller.advanceStatusSnapshotRevision(allocator);
+    page.review_projection.scheduleEagerRetry(.{
+        .fingerprint = page.review_projection.displayed.ready.value.combined_hunks.presentation.fingerprint,
+        .content_token = old_token,
+    });
+    var retry_update = try controller.prepareProjection(allocator);
+    defer retry_update.deinit(allocator);
+    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    try std.testing.expect(pending.expected_presentation == null);
+
+    var eager_bundle = try testCombinedBundle(
+        allocator,
+        pending.id,
+        1,
+        test_combined_after_cached,
+        test_combined_after_unstaged,
+    );
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = try cloneTestProjectionRequest(allocator, pending),
+        .result = .{ .ready = .{ .combined_hunks = eager_bundle } },
+    };
+    eager_bundle = undefined;
+    var finished_owned = true;
+    defer if (finished_owned) finished.deinit(allocator);
+    const applied = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(applied.result_transferred);
+    finished_owned = false;
+
+    try std.testing.expect(page.review_projection.eager_retry_basis == null);
+    try std.testing.expect(page.review_projection.pending == null);
+    const accepted = &page.review_projection.displayed.ready.value.combined_hunks;
+    try std.testing.expectEqual(@as(u64, 1), accepted.authority.status_snapshot_revision);
+    try std.testing.expect(accepted.presentation.content_token.eql(old_token));
+    try std.testing.expect(page.completed_selection != null);
+}
+
+test "combined hint-free eager completion anchor allocation failure closes pending and preserves retry" {
+    const backing = std.testing.allocator;
+    var fail_index: usize = 0;
+    while (fail_index < 2) : (fail_index += 1) {
+        var page: review_page.ReviewPageState = .{
+            .load = test_support.loadState(test_support.loadedDiffOne()),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        };
+        defer page.deinit(backing);
+        var status_bundle = try git_status.StatusBundle.parseOwned(backing, "MM a\x00");
+        try page.git_status.replace("/repo", &status_bundle);
+        page.status_load.markSuccess();
+        var status_message = @import("../../state.zig").StatusMessage{};
+        const controller = testController(&page, &status_message, .unstaged);
+
+        try installTestCombinedCandidate(controller, backing, 1, 74 + fail_index, 0);
+        const retained_before = &page.review_projection.displayed.ready.value.combined_hunks;
+        const presentation_text_ptr = retained_before.presentation.cached_bundle.loaded.text.ptr;
+        const authority_text_ptr = retained_before.authority.cached_component.text.ptr;
+        controller.advanceStatusSnapshotRevision(backing);
+
+        var candidate_update = try controller.prepareProjection(backing);
+        defer candidate_update.deinit(backing);
+        const candidate_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+        var candidate = try testCombinedReuseCandidate(
+            backing,
+            1,
+            test_combined_after_cached,
+            test_combined_changed_unstaged,
+        );
+        // Force the fingerprint gate to reach the exact comparison, which
+        // rejects this changed presentation and schedules the eager fallback.
+        candidate.fingerprint = candidate_pending.expected_presentation.?.fingerprint;
+        var candidate_finished: app_load.ReviewProjectionFinished = .{
+            .request = try cloneTestProjectionRequest(backing, candidate_pending),
+            .result = .{ .reuse_candidate = candidate },
+        };
+        candidate = undefined;
+        defer candidate_finished.deinit(backing);
+        const rejected = try controller.applyProjectionFinished(backing, &candidate_finished);
+        try std.testing.expect(!rejected.result_transferred);
+        try std.testing.expect(page.review_projection.pending == null);
+        const retry_basis = page.review_projection.eager_retry_basis orelse return error.ExpectedEagerRetry;
+
+        var retry_update = try controller.prepareProjection(backing);
+        defer retry_update.deinit(backing);
+        const retry_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+        const failed_request_id = retry_pending.id;
+        try std.testing.expect(retry_pending.expected_presentation == null);
+        const retry_task = retry_update.command orelse return error.ExpectedProjectionCommand;
+        switch (retry_task) {
+            .review_projection => |request| try std.testing.expect(request.expected_presentation == null),
+            else => return error.ExpectedProjectionCommand,
+        }
+
+        var eager_bundle = try testCombinedBundle(
+            backing,
+            retry_pending.id,
+            1,
+            test_combined_after_cached,
+            test_combined_after_unstaged,
+        );
+        var eager_finished: app_load.ReviewProjectionFinished = .{
+            .request = try cloneTestProjectionRequest(backing, retry_pending),
+            .result = .{ .ready = .{ .combined_hunks = eager_bundle } },
+        };
+        eager_bundle = undefined;
+        defer eager_finished.deinit(backing);
+
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        try std.testing.expectError(
+            error.OutOfMemory,
+            controller.applyProjectionFinished(failing.allocator(), &eager_finished),
+        );
+
+        try std.testing.expect(page.review_projection.pending == null);
+        try std.testing.expect(page.review_projection.eager_retry_basis.?.eql(retry_basis));
+        const retained_after = &page.review_projection.displayed.ready.value.combined_hunks;
+        try std.testing.expect(retained_after.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
+        try std.testing.expect(retained_after.authority.cached_component.text.ptr == authority_text_ptr);
+        try std.testing.expectEqual(@as(u64, 0), retained_after.authority.status_snapshot_revision);
+        try std.testing.expect(page.completed_selection != null);
+
+        var replacement_update = try controller.prepareProjection(backing);
+        defer replacement_update.deinit(backing);
+        const replacement_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+        try std.testing.expect(replacement_pending.id != failed_request_id);
+        try std.testing.expect(replacement_pending.expected_presentation == null);
+        var replacement_command = replacement_update.takeCommand() orelse return error.ExpectedProjectionCommand;
+        defer replacement_command.deinit(backing);
+        switch (replacement_command) {
+            .review_projection => |request| try std.testing.expect(request.expected_presentation == null),
+            else => return error.ExpectedProjectionCommand,
+        }
+    }
 }
 
 test "combined candidate closes when replacement request allocation fails" {

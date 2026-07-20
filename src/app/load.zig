@@ -1089,22 +1089,62 @@ fn loadCombinedHunks(request: review_projection.Request, allocator: std.mem.Allo
         return .{ .failed_static = "Projection allocation failed" } } };
     defer unstaged_component.deinit();
 
+    return buildCombinedHunkTaskResult(request, allocator, io, &cached_component, &unstaged_component);
+}
+
+/// Select the cheap cross-generation candidate only when the request carries
+/// a matching presentation fingerprint. A missing hint (including the single
+/// retry after an App-side exact mismatch) and an ordinary fingerprint miss
+/// both finish in this same worker completion with the established eager
+/// decoration path.
+fn buildCombinedHunkTaskResult(
+    request: review_projection.Request,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cached_component: *projection_component.ParsedComponent,
+    unstaged_component: *projection_component.ParsedComponent,
+) review_projection.TaskResult {
+    if (request.expected_presentation) |expected| {
+        var prepared = prepareCombinedReuse(
+            allocator,
+            cached_component,
+            unstaged_component,
+        ) catch return buildCombinedHunkResult(
+            request.path_key,
+            request.status_snapshot_revision,
+            .init(request.id),
+            allocator,
+            io,
+            cached_component,
+            unstaged_component,
+        );
+
+        if (prepared.fingerprint.eql(expected.fingerprint)) {
+            return .{ .reuse_candidate = prepared.takeCandidate(
+                request.status_snapshot_revision,
+                cached_component,
+                unstaged_component,
+            ) };
+        }
+
+        prepared.deinit();
+    }
+
     return buildCombinedHunkResult(
         request.path_key,
         request.status_snapshot_revision,
         .init(request.id),
         allocator,
         io,
-        &cached_component,
-        &unstaged_component,
+        cached_component,
+        unstaged_component,
     );
 }
 
 /// Normalize two parse-only components, eagerly decorate an independent
 /// presentation generation, and transfer both owner domains only for a ready
-/// combined terminal. P3 still has no reuse branch: presentation and fresh
-/// authority are built from the same Git output while remaining independently
-/// replaceable for the later exact-reuse policy.
+/// combined terminal. This remains the authoritative path for an initial
+/// display, a fingerprint miss, and the one hint-free exact-mismatch retry.
 fn buildCombinedHunkResult(
     path_key: []const u8,
     status_snapshot_revision: u64,
@@ -1137,7 +1177,8 @@ fn buildCombinedHunkResult(
     // The parsed inputs become fresh patch authority. Reparse their already
     // owned bytes for the eager presentation so its decorated component
     // storage can outlive replacement of that authority in P4. Parsing is
-    // deliberately still same-generation and unconditional in P3.
+    // This eager branch deliberately keeps presentation and authority in one
+    // same-generation result even though their owners remain replaceable.
     var cached_presentation_component = projection_component.ParsedComponent.parse(allocator, cached_component.text) catch |err| {
         return projectionDecorationFailureResult(allocator, path_key, err);
     };
@@ -1198,16 +1239,55 @@ fn buildCombinedHunkResult(
 /// syntax. The returned candidate owns normalized comparison storage
 /// separately from fresh patch authority so acceptance can discard the former
 /// and transfer the latter without retaining a redundant projection arena.
-///
-/// P4b introduces and tests this ownership boundary without selecting it from
-/// `loadCombinedHunks`; the production worker remains eagerly decorated until
-/// candidate publication and exact App acceptance land together.
-fn buildCombinedReuseCandidate(
-    status_snapshot_revision: u64,
+const PreparedCombinedReuse = struct {
+    candidate_arena: ?std.heap.ArenaAllocator,
+    authority_arena: ?std.heap.ArenaAllocator,
+    projection: diff_hunk_projection.Projection,
+    fingerprint: diff_presentation_identity.Fingerprint,
+
+    fn deinit(self: *PreparedCombinedReuse) void {
+        if (self.candidate_arena) |*arena| arena.deinit();
+        self.candidate_arena = null;
+        if (self.authority_arena) |*arena| arena.deinit();
+        self.authority_arena = null;
+        self.projection = undefined;
+    }
+
+    /// Transfer both parsed inputs only after the worker has selected the
+    /// candidate terminal. A fingerprint miss leaves them untouched for the
+    /// ordinary eager builder.
+    fn takeCandidate(
+        self: *PreparedCombinedReuse,
+        status_snapshot_revision: u64,
+        cached_component: *projection_component.ParsedComponent,
+        unstaged_component: *projection_component.ParsedComponent,
+    ) review_projection.CombinedReuseCandidate {
+        const candidate: review_projection.CombinedReuseCandidate = .{
+            .candidate_arena = self.candidate_arena,
+            .projection = self.projection.presentation,
+            .fingerprint = self.fingerprint,
+            .fresh_authority = .{
+                .arena = self.authority_arena,
+                .projection = self.projection.authority,
+                .cached_component = cached_component.*,
+                .unstaged_component = unstaged_component.*,
+                .status_snapshot_revision = status_snapshot_revision,
+            },
+        };
+        self.candidate_arena = null;
+        self.authority_arena = null;
+        self.projection = undefined;
+        cached_component.arena = null;
+        unstaged_component.arena = null;
+        return candidate;
+    }
+};
+
+fn prepareCombinedReuse(
     allocator: std.mem.Allocator,
-    cached_component: *projection_component.ParsedComponent,
-    unstaged_component: *projection_component.ParsedComponent,
-) diff_hunk_projection.BuildError!review_projection.CombinedReuseCandidate {
+    cached_component: *const projection_component.ParsedComponent,
+    unstaged_component: *const projection_component.ParsedComponent,
+) diff_hunk_projection.BuildError!PreparedCombinedReuse {
     if (cached_component.document.files.len != 1 or unstaged_component.document.files.len != 1) {
         return error.UnsupportedFile;
     }
@@ -1227,21 +1307,23 @@ fn buildCombinedReuseCandidate(
         unstaged_component.document.files[0],
     );
 
-    const candidate: review_projection.CombinedReuseCandidate = .{
+    return .{
         .candidate_arena = candidate_arena,
-        .projection = projection.presentation,
+        .authority_arena = authority_arena,
+        .projection = projection,
         .fingerprint = diff_presentation_identity.fingerprint(projection.presentation.file),
-        .fresh_authority = .{
-            .arena = authority_arena,
-            .projection = projection.authority,
-            .cached_component = cached_component.*,
-            .unstaged_component = unstaged_component.*,
-            .status_snapshot_revision = status_snapshot_revision,
-        },
     };
-    cached_component.arena = null;
-    unstaged_component.arena = null;
-    return candidate;
+}
+
+fn buildCombinedReuseCandidate(
+    status_snapshot_revision: u64,
+    allocator: std.mem.Allocator,
+    cached_component: *projection_component.ParsedComponent,
+    unstaged_component: *projection_component.ParsedComponent,
+) diff_hunk_projection.BuildError!review_projection.CombinedReuseCandidate {
+    var prepared = try prepareCombinedReuse(allocator, cached_component, unstaged_component);
+    errdefer prepared.deinit();
+    return prepared.takeCandidate(status_snapshot_revision, cached_component, unstaged_component);
 }
 
 fn projectionDecorationFailureResult(
@@ -1549,6 +1631,145 @@ const p2_unstaged_patch =
     "@@ -3 +3 @@\n" ++
     "-const before = 3;\n" ++
     "+const current = 4;\n";
+
+fn testCombinedProjectionRequest(
+    allocator: std.mem.Allocator,
+    id: u64,
+    status_snapshot_revision: u64,
+    expected_presentation: ?review_projection.ExpectedPresentation,
+) !review_projection.Request {
+    return review_projection.cloneRequestWithOptions(
+        allocator,
+        page.RequestIdentity.review(0, 1),
+        id,
+        "/repo",
+        "a.zig",
+        .combined_hunks,
+        .unstaged,
+        0,
+        status_snapshot_revision,
+        .{ .expected_presentation = expected_presentation },
+    );
+}
+
+test "combined worker publishes provider-independent candidate only for matching hint" {
+    const allocator = std.testing.allocator;
+    var cached = try projection_component.ParsedComponent.parse(allocator, p2_cached_patch);
+    defer cached.deinit();
+    var unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
+    defer unstaged.deinit();
+
+    var probe = try prepareCombinedReuse(allocator, &cached, &unstaged);
+    const expected_fingerprint = probe.fingerprint;
+    probe.deinit();
+    var request = try testCombinedProjectionRequest(allocator, 21, 8, .{
+        .fingerprint = expected_fingerprint,
+        .content_token = .init(20),
+    });
+    defer request.deinit(allocator);
+
+    // `prepareCombinedReuse` has no I/O/provider dependency. Reaching this
+    // terminal proves the provider-capable eager branch below was not entered;
+    // App still performs allocation-free exact equality before acceptance.
+    var result = buildCombinedHunkTaskResult(request, allocator, std.testing.io, &cached, &unstaged);
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .reuse_candidate);
+    try std.testing.expect(cached.arena == null);
+    try std.testing.expect(unstaged.arena == null);
+    try std.testing.expect(result.reuse_candidate.fingerprint.eql(expected_fingerprint));
+    try std.testing.expectEqual(@as(u64, 8), result.reuse_candidate.fresh_authority.?.status_snapshot_revision);
+    try std.testing.expect(!@hasField(review_projection.CombinedReuseCandidate, "syntax_spans"));
+    try std.testing.expect(!@hasField(review_projection.CombinedReuseCandidate, "cached_bundle"));
+}
+
+test "combined worker uses one eager completion for fingerprint miss and hint-free retry" {
+    const allocator = std.testing.allocator;
+
+    var mismatch_cached = try projection_component.ParsedComponent.parse(allocator, p2_cached_patch);
+    defer mismatch_cached.deinit();
+    var mismatch_unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
+    defer mismatch_unstaged.deinit();
+    var mismatch_request = try testCombinedProjectionRequest(allocator, 22, 9, .{
+        .fingerprint = .{ .digest = [_]u8{0xa5} ** 32 },
+        .content_token = .init(20),
+    });
+    defer mismatch_request.deinit(allocator);
+    var mismatch = buildCombinedHunkTaskResult(
+        mismatch_request,
+        allocator,
+        std.testing.io,
+        &mismatch_cached,
+        &mismatch_unstaged,
+    );
+    defer mismatch.deinit(allocator);
+    try std.testing.expect(mismatch == .ready);
+    try std.testing.expect(mismatch.ready == .combined_hunks);
+    try std.testing.expect(mismatch.ready.combined_hunks.presentation.content_token.eql(.init(22)));
+
+    var retry_cached = try projection_component.ParsedComponent.parse(allocator, p2_cached_patch);
+    defer retry_cached.deinit();
+    var retry_unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
+    defer retry_unstaged.deinit();
+    var retry_request = try testCombinedProjectionRequest(allocator, 23, 10, null);
+    defer retry_request.deinit(allocator);
+    var retry = buildCombinedHunkTaskResult(
+        retry_request,
+        allocator,
+        std.testing.io,
+        &retry_cached,
+        &retry_unstaged,
+    );
+    defer retry.deinit(allocator);
+    try std.testing.expect(retry == .ready);
+    try std.testing.expect(retry.ready == .combined_hunks);
+    try std.testing.expect(retry.ready.combined_hunks.presentation.content_token.eql(.init(23)));
+}
+
+test "combined worker candidate selection releases allocation and eager fallback terminals" {
+    if (build_options.syntax_provider_flow_syntax) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var cached = try projection_component.ParsedComponent.parse(allocator, p2_cached_patch);
+    defer cached.deinit();
+    var unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
+    defer unstaged.deinit();
+    var probe = try prepareCombinedReuse(allocator, &cached, &unstaged);
+    const expected_fingerprint = probe.fingerprint;
+    probe.deinit();
+
+    const Harness = struct {
+        fn run(failing_allocator: std.mem.Allocator, expected: diff_presentation_identity.Fingerprint) !void {
+            var candidate_cached = try projection_component.ParsedComponent.parse(failing_allocator, p2_cached_patch);
+            defer candidate_cached.deinit();
+            var candidate_unstaged = try projection_component.ParsedComponent.parse(failing_allocator, p2_unstaged_patch);
+            defer candidate_unstaged.deinit();
+            var request = try testCombinedProjectionRequest(failing_allocator, 24, 11, .{
+                .fingerprint = expected,
+                .content_token = .init(20),
+            });
+            defer request.deinit(failing_allocator);
+            var result = buildCombinedHunkTaskResult(
+                request,
+                failing_allocator,
+                std.testing.io,
+                &candidate_cached,
+                &candidate_unstaged,
+            );
+            defer result.deinit(failing_allocator);
+        }
+    };
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        try std.testing.expect(fail_index < 4096);
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        Harness.run(failing.allocator(), expected_fingerprint) catch |err| switch (err) {
+            error.OutOfMemory => {},
+            else => return err,
+        };
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (!failing.has_induced_failure) break;
+    }
+}
 
 test "combined projection eagerly decorates parse-only components" {
     const allocator = std.testing.allocator;
