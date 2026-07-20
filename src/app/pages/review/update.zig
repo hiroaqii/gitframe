@@ -301,11 +301,7 @@ pub const Controller = struct {
                 .status_snapshot_revision = page.status_snapshot_revision,
                 .cached = bundle.fingerprint,
             } },
-            .combined => |bundle| .{ .combined_projection = .{
-                .status_snapshot_revision = page.status_snapshot_revision,
-                .cached = bundle.authority.cached_component.fingerprint,
-                .unstaged = bundle.authority.unstaged_component.fingerprint,
-            } },
+            .combined => |bundle| .{ .combined_projection = bundle.presentation.content_token },
             .generated => |bundle| .{ .generated_untracked = .{
                 .status_snapshot_revision = page.status_snapshot_revision,
                 .source = bundle.fingerprint(),

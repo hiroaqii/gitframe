@@ -9,6 +9,7 @@ const std = @import("std");
 const content_fingerprint = @import("../../../content_fingerprint.zig");
 const diff_file = @import("../../../diff/file.zig");
 const diff_parser = @import("../../../diff/parser.zig");
+const diff_presentation_identity = @import("../../../diff/presentation_identity.zig");
 const diff_selection = @import("../../../diff/selection.zig");
 const diff_source = @import("../../../diff/source.zig");
 const path_key = @import("../../../path_key.zig");
@@ -44,7 +45,7 @@ pub const SourceBasis = struct {
 pub const DisplayBasis = union(enum) {
     loaded: Fingerprint,
     cached_projection: struct { status_snapshot_revision: u64, cached: Fingerprint },
-    combined_projection: struct { status_snapshot_revision: u64, cached: Fingerprint, unstaged: Fingerprint },
+    combined_projection: diff_presentation_identity.ContentToken,
     generated_untracked: struct { status_snapshot_revision: u64, source: Fingerprint },
 
     pub fn eql(self: DisplayBasis, other: DisplayBasis) bool {
@@ -57,8 +58,8 @@ pub const DisplayBasis = union(enum) {
                 .cached_projection => |other_basis| basis.status_snapshot_revision == other_basis.status_snapshot_revision and basis.cached.eql(other_basis.cached),
                 else => false,
             },
-            .combined_projection => |basis| switch (other) {
-                .combined_projection => |other_basis| basis.status_snapshot_revision == other_basis.status_snapshot_revision and basis.cached.eql(other_basis.cached) and basis.unstaged.eql(other_basis.unstaged),
+            .combined_projection => |token| switch (other) {
+                .combined_projection => |other_token| token.eql(other_token),
                 else => false,
             },
             .generated_untracked => |basis| switch (other) {
@@ -312,14 +313,10 @@ test "content token ignores delivery identity by construction and separates sour
         .root_identity = base.root_identity,
         .source = base.source,
         .source_session_revision = base.source_session_revision,
-        .display = .{ .combined_projection = .{
-            .status_snapshot_revision = 9,
-            .cached = Fingerprint.init("cached"),
-            .unstaged = Fingerprint.init("unstaged"),
-        } },
+        .display = .{ .combined_projection = .init(9) },
     };
     changed = combined;
-    changed.display.combined_projection.unstaged = Fingerprint.init("changed unstaged");
+    changed.display.combined_projection = .init(10);
     try std.testing.expect(!combined.eql(changed));
 
     const generated = ReviewContentToken{

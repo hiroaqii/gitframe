@@ -1,6 +1,7 @@
 const std = @import("std");
 const diff_parser = @import("../diff/parser.zig");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
+const diff_presentation_identity = @import("../diff/presentation_identity.zig");
 const diff_syntax_view = @import("../diff/syntax_view.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const content_fingerprint = @import("../content_fingerprint.zig");
@@ -158,6 +159,8 @@ pub const CombinedPresentation = struct {
     projection: diff_hunk_projection.Presentation,
     cached_bundle: app_load.LoadedDiffBundle,
     unstaged_bundle: app_load.LoadedDiffBundle,
+    fingerprint: diff_presentation_identity.Fingerprint,
+    content_token: diff_presentation_identity.ContentToken,
 
     /// Borrows origin and token storage owned by this presentation generation
     /// for one render call. The returned view has no cleanup and must not
@@ -1131,6 +1134,8 @@ test "projection cache retained bytes include every cacheable arena" {
                 .projection = undefined,
                 .cached_bundle = .{ .arena = presentation_cached_arena, .loaded = undefined },
                 .unstaged_bundle = .{ .arena = presentation_unstaged_arena, .loaded = undefined },
+                .fingerprint = undefined,
+                .content_token = .init(2),
             },
             .authority = .{
                 .arena = authority_arena,

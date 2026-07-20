@@ -24,6 +24,7 @@ const navigation = @import("navigation.zig");
 const diff_file = @import("../../../diff/file.zig");
 const diff_hunk_projection = @import("../../../diff/hunk_projection.zig");
 const diff_parser = @import("../../../diff/parser.zig");
+const diff_presentation_identity = @import("../../../diff/presentation_identity.zig");
 const diff_source = @import("../../../diff/source.zig");
 const file_tree = @import("../../../file_tree.zig");
 const git_backend = @import("../../../git/backend.zig");
@@ -361,11 +362,16 @@ pub const Controller = struct {
         self.page.completed_selection = null;
     }
 
-    fn clearProjectionCompletedSelection(self: Controller, allocator: std.mem.Allocator) void {
+    /// Status acceptance immediately invalidates status-derived projection
+    /// candidates except for combined content. A combined candidate remains
+    /// valid against the still-live presentation while fresh authority is
+    /// pending; exact presentation acceptance later transfers its token or
+    /// clears it. This does not keep old hunk action authority fresh.
+    fn clearStatusInvalidatedCompletedSelection(self: Controller, allocator: std.mem.Allocator) void {
         const completed = self.page.completed_selection orelse return;
         switch (completed.token.display) {
-            .loaded => {},
-            .cached_projection, .combined_projection, .generated_untracked => self.clearCompletedSelection(allocator),
+            .loaded, .combined_projection => {},
+            .cached_projection, .generated_untracked => self.clearCompletedSelection(allocator),
         }
     }
 
@@ -375,11 +381,7 @@ pub const Controller = struct {
                 .status_snapshot_revision = self.page.status_snapshot_revision,
                 .cached = bundle.fingerprint,
             } },
-            .combined_hunks => |bundle| .{ .combined_projection = .{
-                .status_snapshot_revision = self.page.status_snapshot_revision,
-                .cached = bundle.authority.cached_component.fingerprint,
-                .unstaged = bundle.authority.unstaged_component.fingerprint,
-            } },
+            .combined_hunks => |bundle| .{ .combined_projection = bundle.presentation.content_token },
             .generated_added_file => |bundle| .{ .generated_untracked = .{
                 .status_snapshot_revision = self.page.status_snapshot_revision,
                 .source = bundle.fingerprint(),
@@ -395,10 +397,31 @@ pub const Controller = struct {
         };
     }
 
+    /// Preserve semantic selection identity across an eager combined rebuild
+    /// only when the still-live and incoming presentations are exactly equal.
+    /// The fingerprint is a cheap candidate hint; it never authorizes token
+    /// transfer by itself. Fresh status/component identity remains attached to
+    /// the incoming authority and is intentionally untouched here.
+    fn retainCombinedPresentationTokenIfExact(
+        self: Controller,
+        ready: *review_projection.Ready,
+    ) void {
+        const incoming = switch (ready.*) {
+            .combined_hunks => |*bundle| bundle,
+            else => return,
+        };
+        const live = self.navigation.view().activeCombinedProjection() orelse return;
+        if (!live.presentation.fingerprint.eql(incoming.presentation.fingerprint)) return;
+        if (!diff_presentation_identity.exactEqual(live.displayFile(), incoming.displayFile())) return;
+        incoming.presentation.content_token = live.presentation.content_token;
+    }
+
     /// A candidate is meaningful only for the exact semantic display basis it
-    /// captured. Delivery IDs and cache slots are intentionally absent, so an
-    /// exact rebuild survives while changed content is cleared before the old
-    /// displayed owner can be moved or freed.
+    /// captured. Delivery IDs, status revisions, component fingerprints, and
+    /// cache slots are intentionally absent from combined display identity.
+    /// Exact acceptance above transfers the live presentation token before
+    /// this check; changed content is cleared before the old owner is moved or
+    /// freed.
     fn reconcileCompletedSelectionForReady(
         self: Controller,
         allocator: std.mem.Allocator,
@@ -825,6 +848,7 @@ pub const Controller = struct {
             defer if (hit_owned) hit.deinit(allocator);
 
             if (target.kind != .generated_added_file or hit.request.matchesRootIdentity(self.root_identity)) {
+                self.retainCombinedPresentationTokenIfExact(&hit.value);
                 self.reconcileCompletedSelectionForReady(allocator, &hit.value);
                 self.page.review_projection.clearPending(allocator);
                 self.page.review_projection.cacheOrClearDisplayed(
@@ -862,7 +886,16 @@ pub const Controller = struct {
         }
         self.page.review_projection_next_id +%= 1;
         const request_id = self.page.review_projection_next_id;
-        const identity = self.page.activation.currentIdentity() orelse return .{};
+        const identity = self.page.activation.currentIdentity() orelse {
+            self.clearCompletedSelection(allocator);
+            return .{};
+        };
+
+        // From this point a fresh replacement request is the only terminal
+        // which can validate a combined candidate retained across status
+        // acceptance. If either owned request clone cannot be constructed,
+        // no completion will arrive to reconcile that candidate.
+        errdefer self.clearCompletedSelection(allocator);
 
         const request_root_identity = if (target.kind == .generated_added_file) self.root_identity else null;
         var state_request = try review_projection.cloneRequestWithRootIdentity(
@@ -899,11 +932,14 @@ pub const Controller = struct {
     }
 
     /// Shell validation/allocation/spawn failure terminal for a prepared read.
-    /// It only clears the matching page clone; the command/task owner frees its
-    /// own request independently.
+    /// It clears only the matching page clone and the candidate which was
+    /// awaiting that replacement. The command/task owner frees its own request
+    /// independently; a stale rejection cannot disturb a newer request.
     pub fn rejectProjectionSpawn(self: Controller, allocator: std.mem.Allocator, request_id: u64) void {
         const pending_id = if (self.page.review_projection.pending) |request| request.id else return;
-        if (pending_id == request_id) self.page.review_projection.clearPending(allocator);
+        if (pending_id != request_id) return;
+        self.page.review_projection.clearPending(allocator);
+        self.clearCompletedSelection(allocator);
     }
 
     /// Prepares optional syntax only for the current plain generated preview.
@@ -1276,7 +1312,10 @@ pub const Controller = struct {
         defer if (local_navigation) |*anchor| anchor.deinit(allocator);
 
         switch (result.result) {
-            .ready => |*ready| self.reconcileCompletedSelectionForReady(allocator, ready),
+            .ready => |*ready| {
+                self.retainCombinedPresentationTokenIfExact(ready);
+                self.reconcileCompletedSelectionForReady(allocator, ready);
+            },
             .failed, .failed_static => self.clearCompletedSelection(allocator),
         }
 
@@ -1586,13 +1625,13 @@ pub const Controller = struct {
         // republishes the retained query from the accepted model.
         self.page.advanceAcceptedSidebarRevision(allocator);
         if (allocator) |owner| {
-            self.clearProjectionCompletedSelection(owner);
+            self.clearStatusInvalidatedCompletedSelection(owner);
             self.page.review_projection.clearCache(owner);
         } else {
             std.debug.assert(self.page.review_projection.cacheLen() == 0);
             if (self.page.completed_selection) |completed| switch (completed.token.display) {
-                .loaded => {},
-                .cached_projection, .combined_projection, .generated_untracked => unreachable,
+                .loaded, .combined_projection => {},
+                .cached_projection, .generated_untracked => unreachable,
             };
         }
         self.page.status_snapshot_revision +%= 1;
@@ -1867,6 +1906,199 @@ fn testController(
         .source = source,
         .repo_root = "/repo",
     };
+}
+
+const test_combined_before_cached =
+    \\diff --git a/a b/a
+    \\index 1111111..2222222 100644
+    \\--- a/a
+    \\+++ b/a
+    \\@@ -3,1 +3,1 @@
+    \\-const alpha: usize = 1;
+    \\+const alpha: usize = 10;
+    \\
+;
+const test_combined_before_unstaged =
+    \\diff --git a/a b/a
+    \\index 2222222..4444444 100644
+    \\--- a/a
+    \\+++ b/a
+    \\@@ -8,1 +8,1 @@
+    \\-const beta: usize = 2;
+    \\+const beta: usize = 20;
+    \\@@ -13,1 +13,1 @@
+    \\-const gamma: usize = 3;
+    \\+const gamma: usize = 30;
+    \\
+;
+const test_combined_after_cached =
+    \\diff --git a/a b/a
+    \\index 1111111..3333333 100644
+    \\--- a/a
+    \\+++ b/a
+    \\@@ -3,1 +3,1 @@
+    \\-const alpha: usize = 1;
+    \\+const alpha: usize = 10;
+    \\@@ -8,1 +8,1 @@
+    \\-const beta: usize = 2;
+    \\+const beta: usize = 20;
+    \\
+;
+const test_combined_after_unstaged =
+    \\diff --git a/a b/a
+    \\index 3333333..4444444 100644
+    \\--- a/a
+    \\+++ b/a
+    \\@@ -13,1 +13,1 @@
+    \\-const gamma: usize = 3;
+    \\+const gamma: usize = 30;
+    \\
+;
+const test_combined_changed_unstaged =
+    \\diff --git a/a b/a
+    \\index 3333333..5555555 100644
+    \\--- a/a
+    \\+++ b/a
+    \\@@ -13,1 +13,1 @@
+    \\-const gamma: usize = 3;
+    \\+const gamma: usize = 31;
+    \\
+;
+
+fn testCombinedBundle(
+    allocator: std.mem.Allocator,
+    token_generation: u64,
+    status_snapshot_revision: u64,
+    cached_patch: []const u8,
+    unstaged_patch: []const u8,
+) !review_projection.CombinedHunkBundle {
+    var cached_bundle = try app_load.buildLoadedBundle(allocator, cached_patch);
+    errdefer cached_bundle.deinit();
+    var unstaged_bundle = try app_load.buildLoadedBundle(allocator, unstaged_patch);
+    errdefer unstaged_bundle.deinit();
+    var cached_authority = try projection_component.ParsedComponent.parse(allocator, cached_patch);
+    errdefer cached_authority.deinit();
+    var unstaged_authority = try projection_component.ParsedComponent.parse(allocator, unstaged_patch);
+    errdefer unstaged_authority.deinit();
+    var presentation_arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer presentation_arena.deinit();
+    var authority_arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer authority_arena.deinit();
+    const projection = try diff_hunk_projection.buildWithAllocators(
+        presentation_arena.allocator(),
+        authority_arena.allocator(),
+        cached_bundle.loaded.document.files[0],
+        unstaged_bundle.loaded.document.files[0],
+    );
+    return .{
+        .presentation = .{
+            .arena = presentation_arena,
+            .projection = projection.presentation,
+            .cached_bundle = cached_bundle,
+            .unstaged_bundle = unstaged_bundle,
+            .fingerprint = diff_presentation_identity.fingerprint(projection.presentation.file),
+            .content_token = .init(token_generation),
+        },
+        .authority = .{
+            .arena = authority_arena,
+            .projection = projection.authority,
+            .cached_component = cached_authority,
+            .unstaged_component = unstaged_authority,
+            .status_snapshot_revision = status_snapshot_revision,
+        },
+    };
+}
+
+fn testCombinedCandidate(
+    controller: Controller,
+    allocator: std.mem.Allocator,
+    bundle: *const review_projection.CombinedHunkBundle,
+) !review_selection.CompletedSelection {
+    const ready: review_projection.Ready = .{ .combined_hunks = bundle.* };
+    const token = controller.contentTokenForReady(&ready) orelse return error.ExpectedContentToken;
+    var drag = @import("../../../diff/selection.zig").DragSelection.init(
+        .{ .projection_file = .{ .kind = .combined, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 1 },
+    );
+    drag.moved = true;
+    return review_selection.buildParsed(allocator, token, bundle.displayFile(), drag);
+}
+
+fn installTestCombinedCandidate(
+    controller: Controller,
+    allocator: std.mem.Allocator,
+    request_id: u64,
+    token_generation: u64,
+    status_snapshot_revision: u64,
+) !void {
+    controller.page.review_projection.installReady(.{
+        .request = try review_projection.cloneRequest(
+            allocator,
+            controller.page.activation.currentIdentity().?,
+            request_id,
+            "/repo",
+            "a",
+            .combined_hunks,
+            .unstaged,
+            controller.page.source_session_revision,
+            status_snapshot_revision,
+        ),
+        .value = .{ .combined_hunks = try testCombinedBundle(
+            allocator,
+            token_generation,
+            status_snapshot_revision,
+            test_combined_before_cached,
+            test_combined_before_unstaged,
+        ) },
+    });
+    const live = &controller.page.review_projection.displayed.ready.value.combined_hunks;
+    controller.page.completed_selection = try testCombinedCandidate(controller, allocator, live);
+}
+
+fn applyTestCombinedBundle(
+    controller: Controller,
+    allocator: std.mem.Allocator,
+    request_id: u64,
+    status_snapshot_revision: u64,
+    bundle: review_projection.CombinedHunkBundle,
+) !void {
+    var owned_bundle = bundle;
+    var bundle_owned = true;
+    errdefer if (bundle_owned) owned_bundle.deinit();
+    try std.testing.expectEqual(status_snapshot_revision, controller.page.status_snapshot_revision);
+    controller.page.review_projection.pending = try review_projection.cloneRequest(
+        allocator,
+        controller.page.activation.currentIdentity().?,
+        request_id,
+        "/repo",
+        "a",
+        .combined_hunks,
+        .unstaged,
+        controller.page.source_session_revision,
+        status_snapshot_revision,
+    );
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = try review_projection.cloneRequest(
+            allocator,
+            controller.page.activation.currentIdentity().?,
+            request_id,
+            "/repo",
+            "a",
+            .combined_hunks,
+            .unstaged,
+            controller.page.source_session_revision,
+            status_snapshot_revision,
+        ),
+        .result = .{ .ready = .{ .combined_hunks = owned_bundle } },
+    };
+    bundle_owned = false;
+    owned_bundle = undefined;
+    var finished_owned = true;
+    defer if (finished_owned) finished.deinit(allocator);
+    const applied = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(applied.result_transferred);
+    finished_owned = false;
 }
 
 test "reload pending generation consumes only its owner" {
@@ -3148,6 +3380,8 @@ test "cached and combined ready completions use the live drag deferral slot" {
                 .projection = projection.presentation,
                 .cached_bundle = cached_bundle,
                 .unstaged_bundle = unstaged_bundle,
+                .fingerprint = diff_presentation_identity.fingerprint(projection.presentation.file),
+                .content_token = .init(combined_request.id),
             },
             .authority = .{
                 .arena = authority_arena,
@@ -3340,6 +3574,166 @@ test "source replacement before deferred projection rejects and frees the stale 
     try controller.applyDeferredProjection(allocator);
     try std.testing.expect(page.deferred_projection_apply == null);
     try std.testing.expect(!page.review_projection.hasDisplayed());
+}
+
+test "combined content token survives exact index partition and rejects changed presentation" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    page.review_projection.installReady(.{
+        .request = try review_projection.cloneRequest(
+            allocator,
+            page.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .combined_hunks,
+            .unstaged,
+            0,
+            0,
+        ),
+        .value = .{ .combined_hunks = try testCombinedBundle(
+            allocator,
+            1,
+            0,
+            test_combined_before_cached,
+            test_combined_before_unstaged,
+        ) },
+    });
+    const original = &page.review_projection.displayed.ready.value.combined_hunks;
+    const original_token = original.presentation.content_token;
+    const original_cached_authority = original.authority.cached_component.fingerprint;
+    page.completed_selection = try testCombinedCandidate(controller, allocator, original);
+    const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(original_clipboard);
+
+    var repartitioned = try testCombinedBundle(
+        allocator,
+        2,
+        1,
+        test_combined_after_cached,
+        test_combined_after_unstaged,
+    );
+    try std.testing.expect(original.presentation.fingerprint.eql(repartitioned.presentation.fingerprint));
+    try std.testing.expect(diff_presentation_identity.exactEqual(original.displayFile(), repartitioned.displayFile()));
+    controller.advanceStatusSnapshotRevision(allocator);
+    try std.testing.expect(page.completed_selection != null);
+    try applyTestCombinedBundle(controller, allocator, 2, 1, repartitioned);
+    repartitioned = undefined;
+
+    const accepted = &page.review_projection.displayed.ready.value.combined_hunks;
+    try std.testing.expect(accepted.presentation.content_token.eql(original_token));
+    try std.testing.expectEqual(@as(u64, 1), accepted.authority.status_snapshot_revision);
+    try std.testing.expect(!accepted.authority.cached_component.fingerprint.eql(original_cached_authority));
+    try std.testing.expect(accepted.authority.cached_component.fingerprint.eql(content_fingerprint.Fingerprint.init(test_combined_after_cached)));
+    try std.testing.expect(page.completed_selection != null);
+    try std.testing.expectEqual(@import("../../../diff/selection.zig").Side.new, page.completed_selection.?.value.parsed_diff.side);
+    const accepted_clipboard = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(accepted_clipboard);
+    try std.testing.expectEqualStrings(original_clipboard, accepted_clipboard);
+
+    var changed = try testCombinedBundle(
+        allocator,
+        3,
+        2,
+        test_combined_after_cached,
+        test_combined_changed_unstaged,
+    );
+    try std.testing.expect(!changed.presentation.fingerprint.eql(accepted.presentation.fingerprint));
+    controller.advanceStatusSnapshotRevision(allocator);
+    try std.testing.expect(page.completed_selection != null);
+    try applyTestCombinedBundle(controller, allocator, 3, 2, changed);
+    changed = undefined;
+    try std.testing.expect(page.completed_selection == null);
+    try std.testing.expect(page.review_projection.displayed.ready.value.combined_hunks.presentation.content_token.eql(.init(3)));
+
+    const changed_live = &page.review_projection.displayed.ready.value.combined_hunks;
+    page.completed_selection = try testCombinedCandidate(controller, allocator, changed_live);
+    var forced_digest_match = try testCombinedBundle(
+        allocator,
+        4,
+        3,
+        test_combined_after_cached,
+        test_combined_after_unstaged,
+    );
+    try std.testing.expect(!diff_presentation_identity.exactEqual(changed_live.displayFile(), forced_digest_match.displayFile()));
+    forced_digest_match.presentation.fingerprint = changed_live.presentation.fingerprint;
+    controller.advanceStatusSnapshotRevision(allocator);
+    try std.testing.expect(page.completed_selection != null);
+    try applyTestCombinedBundle(controller, allocator, 4, 3, forced_digest_match);
+    forced_digest_match = undefined;
+    try std.testing.expect(page.completed_selection == null);
+    const forced_accepted = &page.review_projection.displayed.ready.value.combined_hunks;
+    try std.testing.expect(forced_accepted.presentation.content_token.eql(.init(4)));
+    try std.testing.expectEqual(@as(u64, 3), forced_accepted.authority.status_snapshot_revision);
+}
+
+test "combined candidate closes when replacement request allocation fails" {
+    const backing = std.testing.allocator;
+    var fail_index: usize = 0;
+    while (fail_index < 4) : (fail_index += 1) {
+        var page: review_page.ReviewPageState = .{
+            .load = test_support.loadState(test_support.loadedDiffOne()),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        };
+        defer page.deinit(backing);
+        var status_bundle = try git_status.StatusBundle.parseOwned(backing, "MM a\x00");
+        try page.git_status.replace("/repo", &status_bundle);
+        page.status_load.markSuccess();
+        var status_message = @import("../../state.zig").StatusMessage{};
+        const controller = testController(&page, &status_message, .unstaged);
+
+        try installTestCombinedCandidate(controller, backing, 1, 1, 0);
+        controller.advanceStatusSnapshotRevision(backing);
+        try std.testing.expect(page.completed_selection != null);
+
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        try std.testing.expectError(error.OutOfMemory, controller.prepareProjection(failing.allocator()));
+        try std.testing.expect(page.review_projection.pending == null);
+        try std.testing.expect(page.completed_selection == null);
+    }
+}
+
+test "combined candidate spawn rejection closes only the matching replacement" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    try installTestCombinedCandidate(controller, allocator, 1, 1, 0);
+    controller.advanceStatusSnapshotRevision(allocator);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    const request_id = switch (update.command orelse return error.ExpectedProjectionCommand) {
+        .review_projection => |request| request.id,
+        else => return error.ExpectedProjectionCommand,
+    };
+    try std.testing.expect(page.review_projection.pending != null);
+    try std.testing.expect(page.completed_selection != null);
+
+    controller.rejectProjectionSpawn(allocator, request_id +% 1);
+    try std.testing.expect(page.review_projection.pending != null);
+    try std.testing.expect(page.completed_selection != null);
+
+    controller.rejectProjectionSpawn(allocator, request_id);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.completed_selection == null);
 }
 
 test "projection candidate survives exact rebuild and clears on changed content basis" {

@@ -7,6 +7,7 @@ const auto_reload = @import("auto_reload.zig");
 const page = @import("page.zig");
 const diff_parser = @import("../diff/parser.zig");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
+const diff_presentation_identity = @import("../diff/presentation_identity.zig");
 const diff_render = @import("../diff/render.zig");
 const diff_source = @import("../diff/source.zig");
 const diff_syntax_view = @import("../diff/syntax_view.zig");
@@ -1088,7 +1089,15 @@ fn loadCombinedHunks(request: review_projection.Request, allocator: std.mem.Allo
         return .{ .failed_static = "Projection allocation failed" } } };
     defer unstaged_component.deinit();
 
-    return buildCombinedHunkResult(request.path_key, request.status_snapshot_revision, allocator, io, &cached_component, &unstaged_component);
+    return buildCombinedHunkResult(
+        request.path_key,
+        request.status_snapshot_revision,
+        .init(request.id),
+        allocator,
+        io,
+        &cached_component,
+        &unstaged_component,
+    );
 }
 
 /// Normalize two parse-only components, eagerly decorate an independent
@@ -1099,6 +1108,7 @@ fn loadCombinedHunks(request: review_projection.Request, allocator: std.mem.Allo
 fn buildCombinedHunkResult(
     path_key: []const u8,
     status_snapshot_revision: u64,
+    content_token: diff_presentation_identity.ContentToken,
     allocator: std.mem.Allocator,
     io: std.Io,
     cached_component: *projection_component.ParsedComponent,
@@ -1171,6 +1181,7 @@ fn buildCombinedHunkResult(
         authority_arena,
         projection,
         status_snapshot_revision,
+        content_token,
         &cached_presentation_component,
         &unstaged_presentation_component,
         cached_component,
@@ -1228,6 +1239,7 @@ fn decorateCombinedProjection(
     authority_arena_owner: std.heap.ArenaAllocator,
     projection: diff_hunk_projection.Projection,
     status_snapshot_revision: u64,
+    content_token: diff_presentation_identity.ContentToken,
     cached_presentation_component: *projection_component.ParsedComponent,
     unstaged_presentation_component: *projection_component.ParsedComponent,
     cached_authority_component: *projection_component.ParsedComponent,
@@ -1247,6 +1259,8 @@ fn decorateCombinedProjection(
             .projection = projection.presentation,
             .cached_bundle = decorated.cached,
             .unstaged_bundle = decorated.unstaged,
+            .fingerprint = diff_presentation_identity.fingerprint(projection.presentation.file),
+            .content_token = content_token,
         },
         .authority = .{
             .arena = authority_arena,
@@ -1492,7 +1506,7 @@ test "combined projection eagerly decorates parse-only components" {
     var unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
     defer unstaged.deinit();
 
-    var result = buildCombinedHunkResult("a.zig", 7, allocator, std.testing.io, &cached, &unstaged);
+    var result = buildCombinedHunkResult("a.zig", 7, .init(11), allocator, std.testing.io, &cached, &unstaged);
     defer result.deinit(allocator);
     try std.testing.expect(result == .ready);
     try std.testing.expect(result.ready == .combined_hunks);
@@ -1510,6 +1524,8 @@ test "combined projection eagerly decorates parse-only components" {
     try std.testing.expectEqual(@as(usize, 1), bundle.presentation.unstaged_bundle.loaded.tree.nodes.len);
     try std.testing.expect(bundle.presentation.cached_bundle.fingerprint.eql(bundle.authority.cached_component.fingerprint));
     try std.testing.expect(bundle.presentation.unstaged_bundle.fingerprint.eql(bundle.authority.unstaged_component.fingerprint));
+    try std.testing.expect(bundle.presentation.fingerprint.eql(diff_presentation_identity.fingerprint(bundle.displayFile())));
+    try std.testing.expect(bundle.presentation.content_token.eql(.init(11)));
     const cached_action_file = bundle.actionSourceFile(.{ .cached = 0 }) orelse return error.ExpectedCachedAuthorityFile;
     const unstaged_action_file = bundle.actionSourceFile(.{ .unstaged = 0 }) orelse return error.ExpectedUnstagedAuthorityFile;
     try std.testing.expect(cached_action_file.hunks[0].lines[0].text.ptr == bundle.authority.cached_component.document.files[0].hunks[0].lines[0].text.ptr);
@@ -1528,7 +1544,7 @@ test "combined presentation and authority owners release every allocation failur
             defer cached.deinit();
             var unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
             defer unstaged.deinit();
-            var result = buildCombinedHunkResult("a.zig", 7, allocator, std.testing.io, &cached, &unstaged);
+            var result = buildCombinedHunkResult("a.zig", 7, .init(11), allocator, std.testing.io, &cached, &unstaged);
             defer result.deinit(allocator);
         }
     };
@@ -1571,7 +1587,7 @@ test "combined projection transfers both bundles when either component is inert"
         var unstaged = try projection_component.ParsedComponent.parse(allocator, if (cached_is_invalid) valid_patch else invalid_patch);
         defer unstaged.deinit();
 
-        var result = buildCombinedHunkResult("a", 7, allocator, std.testing.io, &cached, &unstaged);
+        var result = buildCombinedHunkResult("a", 7, .init(11), allocator, std.testing.io, &cached, &unstaged);
         defer result.deinit(allocator);
         try std.testing.expect(result == .ready);
         try std.testing.expect(result.ready == .inert_combined);
@@ -1607,7 +1623,7 @@ test "combined projection reports unmappable coordinates without transferring bu
     var unstaged = try projection_component.ParsedComponent.parse(allocator, unstaged_patch);
     defer unstaged.deinit();
 
-    var result = buildCombinedHunkResult("a", 7, allocator, std.testing.io, &cached, &unstaged);
+    var result = buildCombinedHunkResult("a", 7, .init(11), allocator, std.testing.io, &cached, &unstaged);
     defer result.deinit(allocator);
     try std.testing.expect(result == .ready);
     try std.testing.expect(result.ready == .status_body);

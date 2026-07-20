@@ -25,6 +25,7 @@ const context = @import("../../../context.zig");
 const diff_file = @import("../../../diff/file.zig");
 const diff_hunk_projection = @import("../../../diff/hunk_projection.zig");
 const diff_parser = @import("../../../diff/parser.zig");
+const diff_presentation_identity = @import("../../../diff/presentation_identity.zig");
 const diff_render = @import("../../../diff/render.zig");
 const diff_search = @import("../../../diff/search.zig");
 const diff_selection = @import("../../../diff/selection.zig");
@@ -3242,6 +3243,8 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
                 .projection = projection.presentation,
                 .cached_bundle = cached_bundle,
                 .unstaged_bundle = unstaged_bundle,
+                .fingerprint = diff_presentation_identity.fingerprint(projection.presentation.file),
+                .content_token = .init(1),
             },
             .authority = .{
                 .arena = authority_arena,

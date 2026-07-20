@@ -38,6 +38,7 @@ const context = @import("context.zig");
 const context_export = @import("context_export.zig");
 const config_mod = @import("config.zig");
 const content_fingerprint = @import("content_fingerprint.zig");
+const diff_presentation_identity = @import("diff/presentation_identity.zig");
 const diff_parser = @import("diff/parser.zig");
 const diff_file = @import("diff/file.zig");
 const diff_hunk_projection = @import("diff/hunk_projection.zig");
@@ -17644,6 +17645,8 @@ fn testCombinedHunkBundle(allocator: std.mem.Allocator) !app_review_projection.C
             .projection = projection.presentation,
             .cached_bundle = cached_bundle,
             .unstaged_bundle = unstaged_bundle,
+            .fingerprint = diff_presentation_identity.fingerprint(projection.presentation.file),
+            .content_token = .init(1),
         },
         .authority = .{
             .arena = authority_arena,

@@ -33,6 +33,25 @@ pub const Fingerprint = struct {
     }
 };
 
+/// Opaque identity for one accepted presentation generation.
+///
+/// This is deliberately not a content digest and must never be treated as
+/// proof that two projected files are equal. A newly built presentation gets
+/// a new token; acceptance may transfer the live token only after
+/// `Fingerprint` has selected a candidate and `exactEqual` has proved the
+/// complete canonical presentation equal.
+pub const ContentToken = struct {
+    generation: u64,
+
+    pub fn init(generation: u64) ContentToken {
+        return .{ .generation = generation };
+    }
+
+    pub fn eql(lhs: ContentToken, rhs: ContentToken) bool {
+        return lhs.generation == rhs.generation;
+    }
+};
+
 /// A typed, allocation-free view over metadata rows exposed by the diff body.
 ///
 /// Known Git facts receive distinct tags. Unknown visible rows remain exact
