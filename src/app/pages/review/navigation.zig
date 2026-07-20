@@ -3253,7 +3253,7 @@ test "invalid cached projection cannot fall through to primary hunk authority" {
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
     try harness.pages.review.git_status.replace("/repo", &status_bundle);
     harness.pages.review.review_projection.installReady(.{
-        .request = try review_projection.cloneRequest(
+        .request = try review_projection.testing.cloneRequest(
             allocator,
             harness.pages.review.activation.currentIdentity().?,
             1,
@@ -3332,7 +3332,7 @@ test "either invalid combined component remains inert without primary navigation
         var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
         try harness.pages.review.git_status.replace("/repo", &status_bundle);
         harness.pages.review.review_projection.installReady(.{
-            .request = try review_projection.cloneRequest(
+            .request = try review_projection.testing.cloneRequest(
                 allocator,
                 harness.pages.review.activation.currentIdentity().?,
                 1,
@@ -3382,7 +3382,7 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
     var cached_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
     try cached_harness.pages.review.git_status.replace("/repo", &cached_status);
     cached_harness.pages.review.review_projection.installReady(.{
-        .request = try review_projection.cloneRequest(allocator, cached_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .cached_diff, .unstaged, 0, 0),
+        .request = try review_projection.testing.cloneRequest(allocator, cached_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .cached_diff, .unstaged, 0, 0),
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, test_support.diff_cached_projection) },
     });
     defer cached_harness.pages.review.deinit(allocator);
@@ -3429,7 +3429,7 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
         unstaged_bundle.loaded.document.files[0],
     );
     combined_harness.pages.review.review_projection.installReady(.{
-        .request = try review_projection.cloneRequest(allocator, combined_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .combined_hunks, .unstaged, 0, 0),
+        .request = try review_projection.testing.cloneRequest(allocator, combined_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .combined_hunks, .unstaged, 0, 0),
         .value = .{ .combined_hunks = .{
             .presentation = .{
                 .arena = presentation_arena,
@@ -3473,7 +3473,7 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
     var generated_status = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
     try generated_harness.pages.review.git_status.replace("/repo", &generated_status);
     generated_harness.pages.review.review_projection.installReady(.{
-        .request = try review_projection.cloneRequest(allocator, generated_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .generated_added_file, .unstaged, 0, 0),
+        .request = try review_projection.testing.cloneRequest(allocator, generated_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .generated_added_file, .unstaged, 0, 0),
         .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "ABCDEFG\n") },
     });
     defer generated_harness.pages.review.deinit(allocator);
@@ -5110,7 +5110,7 @@ test "cached preview uses displayed diff for cursor movement" {
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         app_page.RequestIdentity.review(0, 1),
         1,
@@ -5150,7 +5150,7 @@ test "cached preview supports diff search" {
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         app_page.RequestIdentity.review(0, 1),
         1,
@@ -5194,7 +5194,7 @@ test "retained cached projection keeps all-staged authority on diff-file route" 
     defer app.pages.review.review_projection.deinit(std.testing.allocator);
     defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
 
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         app_page.RequestIdentity.review(0, 1),
         1,
@@ -5240,7 +5240,7 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         app_page.RequestIdentity.review(0, 1),
         1,
@@ -5281,7 +5281,7 @@ test "generated preview blocks diff search" {
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         app_page.RequestIdentity.review(0, 1),
         1,
@@ -5325,7 +5325,7 @@ test "staged new file preview blocks diff search" {
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/new.zig\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         app_page.RequestIdentity.review(0, 1),
         1,
@@ -5369,7 +5369,7 @@ test "staged new file preview does not refresh existing search query" {
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/new.zig\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         app_page.RequestIdentity.review(0, 1),
         1,

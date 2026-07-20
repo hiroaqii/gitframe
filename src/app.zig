@@ -6730,7 +6730,7 @@ test "undelivered repo and projection loads release owned payloads" {
     } } });
     repo_msg.deinitUndelivered(std.testing.allocator);
 
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         7,
@@ -7980,7 +7980,7 @@ test "final hunk stage retains exact path through cached projection acceptance" 
     var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
     abandoned.deinitUndelivered(allocator);
 
-    const result_request = try app_review_projection.cloneRequest(
+    const result_request = try app_review_projection.testing.cloneRequest(
         allocator,
         pending.identity,
         pending.id,
@@ -11620,7 +11620,7 @@ test "inactive repository change invalidates retained source before equal-finger
     const source_revision = app.pages.review.source_session_revision;
     const status_revision = app.pages.review.status_snapshot_revision;
     app.pages.review.review_projection.installReady(.{
-        .request = try app_review_projection.cloneRequest(
+        .request = try app_review_projection.testing.cloneRequest(
             allocator,
             page.RequestIdentity.review(app.repo_epoch, 1),
             1,
@@ -11635,13 +11635,14 @@ test "inactive repository change invalidates retained source before equal-finger
     });
     app.pages.review.review_projection.cacheOrClearDisplayed(
         allocator,
+        .{},
         roots.a,
         .unstaged,
         source_revision,
         status_revision,
     );
     app.pages.review.review_projection.installReady(.{
-        .request = try app_review_projection.cloneRequest(
+        .request = try app_review_projection.testing.cloneRequest(
             allocator,
             page.RequestIdentity.review(app.repo_epoch, 1),
             2,
@@ -11654,7 +11655,7 @@ test "inactive repository change invalidates retained source before equal-finger
         ),
         .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(allocator, "displayed-a", "displayed\n") },
     });
-    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
+    app.pages.review.review_projection.pending = try app_review_projection.testing.cloneRequest(
         allocator,
         page.RequestIdentity.review(app.repo_epoch, 1),
         3,
@@ -11681,6 +11682,7 @@ test "inactive repository change invalidates retained source before equal-finger
     try std.testing.expect(!app.pages.review.review_projection.hasDisplayed());
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.review_projection.cacheLen());
     try std.testing.expect(!app.pages.review.review_projection.cacheHas(
+        .{},
         roots.a,
         "cached-a",
         .generated_added_file,
@@ -12897,7 +12899,7 @@ test "generated projection syntax start failures preserve plain display and rema
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? new.zig\x00");
     try app.pages.review.git_status.replace(root_path, &status_bundle);
     app.pages.review.review_projection.installReady(.{
-        .request = try app_review_projection.cloneRequestWithRootIdentity(
+        .request = try app_review_projection.testing.cloneRequestWithRootIdentity(
             allocator,
             app.pages.review.activation.currentIdentity().?,
             11,
@@ -13397,7 +13399,7 @@ test "active diff display uses ready combined projection by identity" {
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
     try app.pages.review.git_status.replace("/repo", &mixed_bundle);
 
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -13455,7 +13457,7 @@ test "background status refresh retains combined projection while cursor moves" 
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
     try app.pages.review.git_status.replace("/repo", &mixed_bundle);
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -13517,7 +13519,7 @@ test "unchanged full cycle preserves projection semantic identity" {
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
     try app.pages.review.git_status.replace("/repo", &mixed_bundle);
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -13579,7 +13581,7 @@ test "final projection prefers explicit interim navigation override" {
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
     try app.pages.review.git_status.replace("/repo", &mixed_bundle);
 
-    const state_request = try app_review_projection.cloneRequest(
+    const state_request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -13622,7 +13624,7 @@ test "final projection prefers explicit interim navigation override" {
         .captured_input_revision = 4,
     };
 
-    const result_request = try app_review_projection.cloneRequest(
+    const result_request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -13671,7 +13673,7 @@ test "empty watch source carries combined navigation into cached projection" {
 
     var mixed_status = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
     try app.pages.review.git_status.replace("/repo", &mixed_status);
-    const displayed_request = try app_review_projection.cloneRequest(
+    const displayed_request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -13710,7 +13712,7 @@ test "empty watch source carries combined navigation into cached projection" {
     const target = app.reviewReloadView().projectionTarget() orelse return error.ExpectedCachedProjectionTarget;
     try std.testing.expectEqual(app_review_projection.Kind.cached_diff, target.kind);
 
-    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
+    app.pages.review.review_projection.pending = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         2,
@@ -13721,7 +13723,7 @@ test "empty watch source carries combined navigation into cached projection" {
         app.pages.review.source_session_revision,
         app.pages.review.status_snapshot_revision,
     );
-    const result_request = try app_review_projection.cloneRequest(
+    const result_request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         2,
@@ -13774,7 +13776,7 @@ test "empty watch source carries generated navigation into generated projection"
     app.pages.review.status_load = .{ .generation = 7, .pending = .{ .generation = 7, .origin = .background, .background_cycle_id = 1 } };
     app.pages.review.pending_reload = .{ .generation = 2, .kind = .watch };
 
-    const displayed_request = try app_review_projection.cloneRequest(
+    const displayed_request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -13811,7 +13813,7 @@ test "empty watch source carries generated navigation into generated projection"
     const target = app.reviewReloadView().projectionTarget() orelse return error.ExpectedGeneratedProjectionTarget;
     try std.testing.expectEqual(app_review_projection.Kind.generated_added_file, target.kind);
 
-    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
+    app.pages.review.review_projection.pending = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         2,
@@ -13822,7 +13824,7 @@ test "empty watch source carries generated navigation into generated projection"
         app.pages.review.source_session_revision,
         app.pages.review.status_snapshot_revision,
     );
-    const result_request = try app_review_projection.cloneRequest(
+    const result_request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         2,
@@ -13869,7 +13871,7 @@ test "fresh empty status consumes pending display restore at raw terminal" {
 
     var mixed_status = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
     try app.pages.review.git_status.replace("/repo", &mixed_status);
-    const displayed_request = try app_review_projection.cloneRequest(
+    const displayed_request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -14009,7 +14011,7 @@ test "selected path change supersedes pending display restore" {
         },
         .captured_input_revision = 0,
     };
-    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
+    app.pages.review.review_projection.pending = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         2,
@@ -14068,7 +14070,7 @@ test "file search selection remains authoritative through successor projection a
         .captured_input_revision = app.pages.review.display_navigation_input_revision,
     };
     app.pages.review.review_projection_next_id = 1;
-    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
+    app.pages.review.review_projection.pending = try app_review_projection.testing.cloneRequest(
         allocator,
         page.RequestIdentity.review(app.repo_epoch, activation_id),
         1,
@@ -14095,7 +14097,7 @@ test "file search selection remains authoritative through successor projection a
     var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
     abandoned.deinitUndelivered(allocator);
 
-    const result_request = try app_review_projection.cloneRequest(
+    const result_request = try app_review_projection.testing.cloneRequest(
         allocator,
         pending.identity,
         pending.id,
@@ -14139,7 +14141,7 @@ test "superseded projection completion cannot replace display" {
     try app.pages.review.git_status.replace("/repo", &status_bundle);
     try app.reviewReload().createStatusOnlyLoadedSession(std.testing.allocator, app.pages.review.git_status.document);
     const stale_status_revision = app.pages.review.status_snapshot_revision - 1;
-    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
+    app.pages.review.review_projection.pending = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -14150,7 +14152,7 @@ test "superseded projection completion cannot replace display" {
         app.pages.review.source_session_revision,
         stale_status_revision,
     );
-    const result_request = try app_review_projection.cloneRequest(
+    const result_request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -14194,7 +14196,7 @@ test "cached preview keeps search input while projection is pending" {
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.pages.review.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -14216,7 +14218,7 @@ test "cached preview keeps search input while projection is pending" {
     try std.testing.expectEqualStrings("staged", app.pages.review.search.query.slice());
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    const ready_request = try app_review_projection.cloneRequest(
+    const ready_request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -14259,7 +14261,7 @@ test "projected hunk actions route through original cached and unstaged origins"
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
     try app.pages.review.git_status.replace("/repo", &mixed_bundle);
 
-    const request = try app_review_projection.cloneRequest(
+    const request = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -16063,7 +16065,7 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     try std.testing.expect(branch_ctx._redraw_suppressed);
 
     app.pages.review.branch_status_load.pending = null;
-    app.pages.review.review_projection.pending = try app_review_projection.cloneRequest(
+    app.pages.review.review_projection.pending = try app_review_projection.testing.cloneRequest(
         std.testing.allocator,
         page.RequestIdentity.review(0, 1),
         1,

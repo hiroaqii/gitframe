@@ -423,6 +423,7 @@ pub const View = struct {
             .inert_invalid_utf8 => return .inert_invalid_utf8,
             .unavailable => return .no_hunk,
         }
+        if (!self.displayedProjectionReadIsFresh()) return .stale_status;
         const can_stage = diff_source.sourceAllowsStageAction(self.source);
         const can_unstage = diff_source.sourceAllowsUnstageAction(self.source);
         if (!can_stage and !can_unstage) return .unavailable_source;
@@ -464,6 +465,7 @@ pub const View = struct {
             .inert_invalid_utf8 => return .inert_invalid_utf8,
             .unavailable => return .no_hunk,
         }
+        if (!self.displayedProjectionReadIsFresh()) return .stale_status;
         if (!diff_source.sourceAllowsStageAction(self.source)) return .unavailable_source;
         if (!self.activation().satisfiesAction(.stage_hunk)) return switch (self.hunkAuthorityFailure(.stage_hunk)) {
             .stale_status => .stale_status,
@@ -508,6 +510,7 @@ pub const View = struct {
             .inert_invalid_utf8 => return .inert_invalid_utf8,
             .unavailable => return .no_hunk,
         }
+        if (!self.displayedProjectionReadIsFresh()) return .stale_status;
         if (!diff_source.sourceAllowsUnstageAction(self.source)) return .unavailable_source;
         if (!self.activation().satisfiesAction(.unstage_hunk)) return switch (self.hunkAuthorityFailure(.unstage_hunk)) {
             .stale_status => .stale_status,
@@ -639,6 +642,15 @@ pub const View = struct {
             request.status_snapshot_revision != self.page.status_snapshot_revision) return null;
         if (bundle.authority.statusSnapshotRevision() != self.page.status_snapshot_revision) return null;
         return bundle;
+    }
+
+    /// A superseded projection may remain visible while mutation reconciliation
+    /// is in flight, but it must not supply another Git patch. Unrelated retained
+    /// projections do not govern the currently displayed primary body.
+    fn displayedProjectionReadIsFresh(self: View) bool {
+        const request = self.page.review_projection.displayed.request() orelse return true;
+        if (!self.navigation.displayedProjectionRequestIsActive(request.*)) return true;
+        return request.read_epoch.eql(self.page.repository_read_authority.epoch);
     }
 
     fn activationMembers(self: View) authority.MemberVector {
@@ -1029,7 +1041,7 @@ test "stage target skips only fresh staged-only files" {
     try std.testing.expect(testView(&page, .cached).stageTarget() == .unavailable_source);
 }
 
-test "retained staged-only authority builds unstage patch from fresh cached component" {
+test "retained staged-only read epoch authority builds unstage patch and becomes inert when superseded" {
     const allocator = std.testing.allocator;
     const cached_patch =
         \\diff --git a/a b/a
@@ -1066,7 +1078,7 @@ test "retained staged-only authority builds unstage patch from fresh cached comp
     var status = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, "M  a\x00");
     try page.git_status.replace("/repo", &status);
     page.review_projection.installReady(.{
-        .request = try review_projection.cloneRequest(
+        .request = try review_projection.testing.cloneRequest(
             allocator,
             page.activation.currentIdentity().?,
             1,
@@ -1133,6 +1145,13 @@ test "retained staged-only authority builds unstage patch from fresh cached comp
     try std.testing.expect(!page.staged_hunks.containsExact("/repo", "a", mark_key));
     try std.testing.expect(page.staged_hunks.containsExact("/repo", "a", other_hunk_key));
     try std.testing.expect(page.staged_hunks.containsExact("/repo", "other.zig", mark_key));
+
+    const displayed_request = page.review_projection.displayed.request().?;
+    page.repository_read_authority.epoch = .{ .value = 2 };
+    try std.testing.expect(view.navigation.displayedProjectionRequestIsActive(displayed_request.*));
+    try std.testing.expect(view.selectedHunkToggleOperation() == .stale_status);
+    try std.testing.expect(view.selectedHunkStageTarget(allocator) == .stale_status);
+    try std.testing.expect(view.selectedHunkUnstageTarget(allocator) == .stale_status);
 }
 
 test "ordinary cached source hunk unstage keeps source and status reload membership" {
@@ -1333,7 +1352,7 @@ test "inert cached projection blocks hunk authority without changing file author
     var staged = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, "M  a\x00");
     try page.git_status.replace("/repo", &staged);
     page.review_projection.installReady(.{
-        .request = try review_projection.cloneRequest(
+        .request = try review_projection.testing.cloneRequest(
             allocator,
             app_page.RequestIdentity.review(0, 1),
             1,
@@ -1399,7 +1418,7 @@ test "either inert combined component blocks all hunk targets without primary fa
         var status = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, "MM a\x00");
         try page.git_status.replace("/repo", &status);
         page.review_projection.installReady(.{
-            .request = try review_projection.cloneRequest(
+            .request = try review_projection.testing.cloneRequest(
                 allocator,
                 app_page.RequestIdentity.review(0, 1),
                 1,

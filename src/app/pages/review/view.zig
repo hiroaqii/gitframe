@@ -1971,7 +1971,7 @@ test "inactive status-only pending and inert diff path headers keep semantic int
     try std.testing.expect(status_path.style.bold);
     try std.testing.expect(!status_path.style.dim);
 
-    page.review_projection.pending = try review_projection.cloneRequest(
+    page.review_projection.pending = try review_projection.testing.cloneRequest(
         std.testing.allocator,
         app_page.RequestIdentity.review(0, 1),
         1,

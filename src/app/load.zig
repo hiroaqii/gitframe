@@ -1708,7 +1708,10 @@ fn testCombinedProjectionRequest(
         .unstaged,
         0,
         status_snapshot_revision,
-        .{ .expected_presentation = expected_presentation },
+        .{
+            .read_epoch = .{},
+            .expected_presentation = expected_presentation,
+        },
     );
 }
 
@@ -1728,7 +1731,10 @@ fn testCachedProjectionRequest(
         .unstaged,
         0,
         status_snapshot_revision,
-        .{ .expected_presentation = expected_presentation },
+        .{
+            .read_epoch = .{},
+            .expected_presentation = expected_presentation,
+        },
     );
 }
 
@@ -2298,7 +2304,7 @@ test "generated projection uses pinned safe source snapshot" {
     defer allocator.free(root_path);
     var root = try root_capability.RootCapability.openCanonical(root_path);
     defer root.deinit();
-    var request = try review_projection.cloneRequestWithRootIdentity(
+    var request = try review_projection.testing.cloneRequestWithRootIdentity(
         allocator,
         page.RequestIdentity.review(1, 2),
         3,
@@ -2343,7 +2349,7 @@ test "generated projection keeps unsafe text inert and rejects another root iden
     defer first_root.deinit();
     var second_root = try root_capability.RootCapability.openCanonical(second_path);
     defer second_root.deinit();
-    var request = try review_projection.cloneRequestWithRootIdentity(
+    var request = try review_projection.testing.cloneRequestWithRootIdentity(
         allocator,
         page.RequestIdentity.review(1, 2),
         3,
@@ -2698,7 +2704,7 @@ test "BranchStatusLoadTask failed preserves read epoch generation and moves repo
     });
 }
 
-test "ReviewProjectionTask failed preserves request identity" {
+test "ReviewProjectionTask failed preserves request identity and read epoch" {
     const TestLoadMsg = ReadFinished;
     const TestMsg = union(enum) {
         load: TestLoadMsg,
@@ -2714,6 +2720,7 @@ test "ReviewProjectionTask failed preserves request identity" {
     task.* = .{ .request = .{
         .identity = page.RequestIdentity.review(0, 1),
         .id = 11,
+        .read_epoch = .{ .value = 53 },
         .repo_root = try allocator.dupe(u8, "/repo"),
         .path_key = try allocator.dupe(u8, "src/main.zig"),
         .kind = .cached_diff,
@@ -2735,6 +2742,7 @@ test "ReviewProjectionTask failed preserves request identity" {
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 11), finished.request.id);
+    try std.testing.expect(finished.request.read_epoch.eql(.{ .value = 53 }));
     try std.testing.expectEqual(@as(u64, 2), finished.request.source_session_revision);
     try std.testing.expectEqual(@as(u64, 3), finished.request.status_snapshot_revision);
     try std.testing.expectEqualStrings("/repo", finished.request.repo_root);
@@ -2745,7 +2753,7 @@ test "ReviewProjectionTask failed preserves request identity" {
     });
 }
 
-test "GeneratedSyntaxTask rereads pinned matching source and owns completion" {
+test "GeneratedSyntaxTask rereads pinned matching source and retains read epoch" {
     if (!source_syntax_runtime.enabled) return error.SkipZigTest;
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const TestLoadMsg = ReadFinished;
@@ -2774,6 +2782,7 @@ test "GeneratedSyntaxTask rereads pinned matching source and owns completion" {
             .identity = page.RequestIdentity.review(2, 3),
             .id = 4,
             .projection_id = 5,
+            .read_epoch = .{ .value = 59 },
             .root_identity = root.identity,
             .repo_root = try allocator.dupe(u8, root_path),
             .path_key = try allocator.dupe(u8, "new.zig"),
@@ -2795,6 +2804,7 @@ test "GeneratedSyntaxTask rereads pinned matching source and owns completion" {
         },
     };
     defer finished.deinit(allocator);
+    try std.testing.expect(finished.request.read_epoch.eql(.{ .value = 59 }));
     try std.testing.expect(finished.snapshot_fingerprint.?.eql(.init(content)));
     try std.testing.expect(finished.result == .loaded);
 }

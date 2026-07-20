@@ -133,6 +133,7 @@ pub const View = struct {
             .repo_root = self.repo_root,
         }).projectionTarget() orelse return false;
         return request.matchesBorrowed(
+            self.page.repository_read_authority.epoch,
             target.repo_root,
             target.path_key,
             target.kind,
@@ -800,7 +801,7 @@ fn installStatusBody(
     path: []const u8,
     kind: review_projection.Kind,
 ) !void {
-    const request = try review_projection.cloneRequest(
+    const request = try review_projection.testing.cloneRequest(
         allocator,
         app_page.RequestIdentity.review(4, 1),
         1,
@@ -910,7 +911,7 @@ test "Review projection target rejects retained ready body while same path succe
 
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "D  f\x00?? f\x00");
     try page.git_status.replace("/repo", &status_bundle);
-    const request = try review_projection.cloneRequest(
+    const request = try review_projection.testing.cloneRequest(
         allocator,
         app_page.RequestIdentity.review(4, 1),
         1,

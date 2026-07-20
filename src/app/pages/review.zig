@@ -158,7 +158,9 @@ pub const DeferredSourceApply = struct {
 
 /// Owns a projection completion which arrived while its displayed diff was
 /// borrowed by a live mouse drag. Source completions are drained first because
-/// they can advance the source session and make this result stale.
+/// they can advance the source session and make this result stale. The complete
+/// request remains the single read-epoch owner while deferred; do not mirror a
+/// second scalar here which could diverge from the task result provenance.
 pub const DeferredProjectionApply = struct {
     finished: load.ReviewProjectionFinished,
 
@@ -396,7 +398,7 @@ test "ReviewPageState deinit releases stores projection and stable order" {
         return err;
     };
 
-    state.review_projection.pending = try review_projection.cloneRequest(
+    state.review_projection.pending = try review_projection.testing.cloneRequest(
         allocator,
         page.RequestIdentity.review(0, 1),
         1,
@@ -407,7 +409,7 @@ test "ReviewPageState deinit releases stores projection and stable order" {
         3,
         4,
     );
-    var displayed_request = try review_projection.cloneRequest(
+    var displayed_request = try review_projection.testing.cloneRequest(
         allocator,
         page.RequestIdentity.review(0, 1),
         2,

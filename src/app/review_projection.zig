@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const diff_parser = @import("../diff/parser.zig");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
 const diff_presentation_identity = @import("../diff/presentation_identity.zig");
@@ -13,6 +14,7 @@ const syntax_style = @import("../syntax/style.zig");
 const app_load = @import("load.zig");
 const page = @import("page.zig");
 const projection_component = @import("projection_component.zig");
+const review_read_epoch = @import("review_read_epoch.zig");
 
 pub const max_generated_file_bytes = 1024 * 1024;
 pub const max_cached_entries = 4;
@@ -56,6 +58,7 @@ pub const ExpectedPresentation = struct {
 pub const Request = struct {
     identity: page.RequestIdentity,
     id: u64,
+    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
     repo_root: []u8,
     path_key: []u8,
     kind: Kind,
@@ -71,8 +74,9 @@ pub const Request = struct {
         self.* = undefined;
     }
 
-    pub fn matchesBorrowed(self: Request, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
-        return self.kind == kind and
+    pub fn matchesBorrowed(self: Request, read_epoch: review_read_epoch.ReviewRepositoryReadEpoch, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
+        return self.read_epoch.eql(read_epoch) and
+            self.kind == kind and
             self.source_kind == source_kind and
             self.source_session_revision == source_session_revision and
             self.status_snapshot_revision == status_snapshot_revision and
@@ -80,6 +84,9 @@ pub const Request = struct {
             std.mem.eql(u8, self.path_key, path_key);
     }
 
+    /// Matches the retained visual owner only. A mutation may advance the read
+    /// epoch while this body remains on screen as an inert snapshot, so callers
+    /// which need current action/cache authority must use `matchesBorrowed`.
     pub fn matchesDisplayIdentity(self: Request, repo_root: []const u8, path_key: []const u8, source_kind: SourceKind, source_session_revision: u64) bool {
         return self.source_kind == source_kind and
             self.source_session_revision == source_session_revision and
@@ -92,6 +99,7 @@ pub const Request = struct {
         // constructed. It is not part of cache/action validity; the status
         // revision and the accepted Ready value remain authoritative.
         return optionalRootIdentityEql(self.root_identity, other.root_identity) and self.matchesBorrowed(
+            other.read_epoch,
             other.repo_root,
             other.path_key,
             other.kind,
@@ -101,8 +109,9 @@ pub const Request = struct {
         );
     }
 
-    pub fn matchesAuthority(self: Request, repo_root: []const u8, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
-        return self.source_kind == source_kind and
+    pub fn matchesAuthority(self: Request, read_epoch: review_read_epoch.ReviewRepositoryReadEpoch, repo_root: []const u8, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
+        return self.read_epoch.eql(read_epoch) and
+            self.source_kind == source_kind and
             self.source_session_revision == source_session_revision and
             self.status_snapshot_revision == status_snapshot_revision and
             std.mem.eql(u8, self.repo_root, repo_root);
@@ -545,6 +554,7 @@ pub const GeneratedSyntaxRequest = struct {
     identity: page.RequestIdentity,
     id: u64,
     projection_id: u64,
+    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
     root_identity: root_capability.Identity,
     repo_root: []u8,
     path_key: []u8,
@@ -562,6 +572,7 @@ pub const GeneratedSyntaxRequest = struct {
     pub fn matches(self: GeneratedSyntaxRequest, other: GeneratedSyntaxRequest) bool {
         return self.id == other.id and
             self.projection_id == other.projection_id and
+            self.read_epoch.eql(other.read_epoch) and
             self.identity.origin == other.identity.origin and
             self.identity.repo_epoch == other.identity.repo_epoch and
             self.identity.activation_id == other.identity.activation_id and
@@ -676,6 +687,7 @@ const Cache = struct {
 
     fn hasMatching(
         self: *const Cache,
+        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
         repo_root: []const u8,
         path_key: []const u8,
         kind: Kind,
@@ -683,11 +695,12 @@ const Cache = struct {
         source_session_revision: u64,
         status_snapshot_revision: u64,
     ) bool {
-        return self.matchingIndex(repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision) != null;
+        return self.matchingIndex(read_epoch, repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision) != null;
     }
 
     fn takeMatching(
         self: *Cache,
+        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
         repo_root: []const u8,
         path_key: []const u8,
         kind: Kind,
@@ -695,7 +708,7 @@ const Cache = struct {
         source_session_revision: u64,
         status_snapshot_revision: u64,
     ) ?ReadyDisplay {
-        const index = self.matchingIndex(repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision) orelse return null;
+        const index = self.matchingIndex(read_epoch, repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision) orelse return null;
         var entry = self.entries.orderedRemove(index);
         self.retained_bytes -|= entry.retained_bytes;
         const projection = entry.projection;
@@ -705,6 +718,7 @@ const Cache = struct {
 
     fn matchingIndex(
         self: *const Cache,
+        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
         repo_root: []const u8,
         path_key: []const u8,
         kind: Kind,
@@ -714,6 +728,7 @@ const Cache = struct {
     ) ?usize {
         for (self.entries.items, 0..) |entry, index| {
             if (entry.projection.request.matchesBorrowed(
+                read_epoch,
                 repo_root,
                 path_key,
                 kind,
@@ -867,6 +882,7 @@ pub const State = struct {
 
     pub fn cacheHas(
         self: *const State,
+        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
         repo_root: []const u8,
         path_key: []const u8,
         kind: Kind,
@@ -874,11 +890,12 @@ pub const State = struct {
         source_session_revision: u64,
         status_snapshot_revision: u64,
     ) bool {
-        return self.cache.hasMatching(repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision);
+        return self.cache.hasMatching(read_epoch, repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision);
     }
 
     pub fn takeCached(
         self: *State,
+        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
         repo_root: []const u8,
         path_key: []const u8,
         kind: Kind,
@@ -886,7 +903,7 @@ pub const State = struct {
         source_session_revision: u64,
         status_snapshot_revision: u64,
     ) ?ReadyDisplay {
-        return self.cache.takeMatching(repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision);
+        return self.cache.takeMatching(read_epoch, repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision);
     }
 
     /// Moves the current display to the bounded cache only when it remains
@@ -895,6 +912,7 @@ pub const State = struct {
     pub fn cacheOrClearDisplayed(
         self: *State,
         allocator: std.mem.Allocator,
+        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
         repo_root: []const u8,
         source_kind: SourceKind,
         source_session_revision: u64,
@@ -907,7 +925,7 @@ pub const State = struct {
         switch (previous) {
             .idle => {},
             .ready => |ready| {
-                if (ready.request.matchesAuthority(repo_root, source_kind, source_session_revision, status_snapshot_revision)) {
+                if (ready.request.matchesAuthority(read_epoch, repo_root, source_kind, source_session_revision, status_snapshot_revision)) {
                     self.cache.admit(allocator, ready);
                 } else {
                     var owned = ready;
@@ -1076,14 +1094,14 @@ pub const State = struct {
         return self.displayed.request() != null;
     }
 
-    pub fn pendingMatches(self: State, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
+    pub fn pendingMatches(self: State, read_epoch: review_read_epoch.ReviewRepositoryReadEpoch, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
         const request = self.pending orelse return false;
-        return request.matchesBorrowed(repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision);
+        return request.matchesBorrowed(read_epoch, repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision);
     }
 
-    pub fn displayedMatches(self: *const State, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
+    pub fn displayedMatches(self: *const State, read_epoch: review_read_epoch.ReviewRepositoryReadEpoch, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
         const request = self.displayed.request() orelse return false;
-        return request.matchesBorrowed(repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision);
+        return request.matchesBorrowed(read_epoch, repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision);
     }
 };
 
@@ -1102,58 +1120,9 @@ fn optionalRootIdentityEql(left: ?root_capability.Identity, right: ?root_capabil
     return left.?.eql(right.?);
 }
 
-pub fn cloneRequest(
-    allocator: std.mem.Allocator,
-    identity: page.RequestIdentity,
-    id: u64,
-    repo_root: []const u8,
-    path_key: []const u8,
-    kind: Kind,
-    source_kind: SourceKind,
-    source_session_revision: u64,
-    status_snapshot_revision: u64,
-) !Request {
-    return cloneRequestWithRootIdentity(
-        allocator,
-        identity,
-        id,
-        repo_root,
-        path_key,
-        kind,
-        source_kind,
-        source_session_revision,
-        status_snapshot_revision,
-        null,
-    );
-}
-
-pub fn cloneRequestWithRootIdentity(
-    allocator: std.mem.Allocator,
-    identity: page.RequestIdentity,
-    id: u64,
-    repo_root: []const u8,
-    path_key: []const u8,
-    kind: Kind,
-    source_kind: SourceKind,
-    source_session_revision: u64,
-    status_snapshot_revision: u64,
-    root_identity: ?root_capability.Identity,
-) !Request {
-    return cloneRequestWithOptions(
-        allocator,
-        identity,
-        id,
-        repo_root,
-        path_key,
-        kind,
-        source_kind,
-        source_session_revision,
-        status_snapshot_revision,
-        .{ .root_identity = root_identity },
-    );
-}
-
 pub const RequestCloneOptions = struct {
+    /// Production request preparation must provide the page-owned value.
+    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
     root_identity: ?root_capability.Identity = null,
     expected_presentation: ?ExpectedPresentation = null,
 };
@@ -1176,6 +1145,7 @@ pub fn cloneRequestWithOptions(
     return .{
         .identity = identity,
         .id = id,
+        .read_epoch = options.read_epoch,
         .repo_root = owned_root,
         .path_key = owned_path,
         .kind = kind,
@@ -1186,6 +1156,66 @@ pub fn cloneRequestWithOptions(
         .expected_presentation = options.expected_presentation,
     };
 }
+
+/// Test-only constructors for fixtures which do not exercise repository-read
+/// authority. Production builds expose no constructor that can silently choose
+/// the canonical initial epoch; they must use `cloneRequestWithOptions` and pass
+/// the page-owned value explicitly.
+pub const testing = if (builtin.is_test) struct {
+    pub fn cloneRequest(
+        allocator: std.mem.Allocator,
+        identity: page.RequestIdentity,
+        id: u64,
+        repo_root: []const u8,
+        path_key: []const u8,
+        kind: Kind,
+        source_kind: SourceKind,
+        source_session_revision: u64,
+        status_snapshot_revision: u64,
+    ) !Request {
+        return cloneRequestWithRootIdentity(
+            allocator,
+            identity,
+            id,
+            repo_root,
+            path_key,
+            kind,
+            source_kind,
+            source_session_revision,
+            status_snapshot_revision,
+            null,
+        );
+    }
+
+    pub fn cloneRequestWithRootIdentity(
+        allocator: std.mem.Allocator,
+        identity: page.RequestIdentity,
+        id: u64,
+        repo_root: []const u8,
+        path_key: []const u8,
+        kind: Kind,
+        source_kind: SourceKind,
+        source_session_revision: u64,
+        status_snapshot_revision: u64,
+        root_identity: ?root_capability.Identity,
+    ) !Request {
+        return cloneRequestWithOptions(
+            allocator,
+            identity,
+            id,
+            repo_root,
+            path_key,
+            kind,
+            source_kind,
+            source_session_revision,
+            status_snapshot_revision,
+            .{
+                .read_epoch = .{},
+                .root_identity = root_identity,
+            },
+        );
+    }
+} else struct {};
 
 pub fn cloneGeneratedSyntaxRequest(
     allocator: std.mem.Allocator,
@@ -1198,6 +1228,7 @@ pub fn cloneGeneratedSyntaxRequest(
         .identity = request.identity,
         .id = request.id,
         .projection_id = request.projection_id,
+        .read_epoch = request.read_epoch,
         .root_identity = request.root_identity,
         .repo_root = owned_root,
         .path_key = owned_path,
@@ -1223,6 +1254,7 @@ pub fn generatedSyntaxRequestForProjection(
         .identity = identity,
         .id = id,
         .projection_id = projection.id,
+        .read_epoch = projection.read_epoch,
         .root_identity = root_identity,
         .repo_root = owned_root,
         .path_key = owned_path,
@@ -1336,15 +1368,29 @@ test "generated decoration distinguishes terminal empty and visible outcomes" {
     try std.testing.expect(bundle.retainedBytes() >= bundle.source.retainedBytes() + entries.len * @sizeOf(source_syntax.LineEntry) + spans.len * @sizeOf(@import("../syntax/token.zig").TokenSpan));
 }
 
-test "request matches semantic projection identity" {
-    var request = try cloneRequest(std.testing.allocator, page.RequestIdentity.review(0, 1), 1, "/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20);
+test "projection read epoch participates in request semantic identity" {
+    var request = try cloneRequestWithOptions(
+        std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
+        1,
+        "/repo",
+        "src/main.zig",
+        .cached_diff,
+        .unstaged,
+        10,
+        20,
+        .{ .read_epoch = .{ .value = 31 } },
+    );
     defer request.deinit(std.testing.allocator);
 
-    try std.testing.expect(request.matchesBorrowed("/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20));
-    try std.testing.expect(!request.matchesBorrowed("/repo", "src/main.zig", .generated_added_file, .unstaged, 10, 20));
-    try std.testing.expect(!request.matchesBorrowed("/repo", "src/main.zig", .cached_diff, .cached, 10, 20));
-    try std.testing.expect(!request.matchesBorrowed("/repo", "src/main.zig", .cached_diff, .unstaged, 11, 20));
-    try std.testing.expect(!request.matchesBorrowed("/other", "src/main.zig", .cached_diff, .unstaged, 10, 20));
+    const current: review_read_epoch.ReviewRepositoryReadEpoch = .{ .value = 31 };
+    try std.testing.expect(request.matchesBorrowed(current, "/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20));
+    try std.testing.expect(!request.matchesBorrowed(.{ .value = 32 }, "/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20));
+    try std.testing.expect(request.matchesDisplayIdentity("/repo", "src/main.zig", .unstaged, 10));
+    try std.testing.expect(!request.matchesBorrowed(current, "/repo", "src/main.zig", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(!request.matchesBorrowed(current, "/repo", "src/main.zig", .cached_diff, .cached, 10, 20));
+    try std.testing.expect(!request.matchesBorrowed(current, "/repo", "src/main.zig", .cached_diff, .unstaged, 11, 20));
+    try std.testing.expect(!request.matchesBorrowed(current, "/other", "src/main.zig", .cached_diff, .unstaged, 10, 20));
 }
 
 test "request clone owns paths and snapshots scalar presentation hint" {
@@ -1365,6 +1411,7 @@ test "request clone owns paths and snapshots scalar presentation hint" {
         13,
         17,
         .{
+            .read_epoch = .{ .value = 37 },
             .root_identity = root,
             .expected_presentation = expected,
         },
@@ -1374,7 +1421,7 @@ test "request clone owns paths and snapshots scalar presentation hint" {
     try std.testing.expect(request.matchesRootIdentity(root));
     try std.testing.expect(request.expected_presentation.?.eql(expected));
 
-    var ordinary = try cloneRequestWithRootIdentity(
+    var ordinary = try cloneRequestWithOptions(
         allocator,
         request.identity,
         10,
@@ -1384,11 +1431,17 @@ test "request clone owns paths and snapshots scalar presentation hint" {
         request.source_kind,
         request.source_session_revision,
         request.status_snapshot_revision,
-        root,
+        .{
+            .read_epoch = request.read_epoch,
+            .root_identity = root,
+        },
     );
     defer ordinary.deinit(allocator);
     try std.testing.expect(ordinary.expected_presentation == null);
     try std.testing.expect(request.sameSemanticKey(ordinary));
+
+    ordinary.read_epoch = .{ .value = 38 };
+    try std.testing.expect(!request.sameSemanticKey(ordinary));
 }
 
 test "eager retry basis is bounded to one live presentation identity" {
@@ -1428,10 +1481,10 @@ test "eager retry basis is bounded to one live presentation identity" {
     try std.testing.expect(state.eager_retry_basis == null);
 }
 
-test "generated request and syntax clone retain pinned root identity" {
+test "generated syntax request and clone retain projection read epoch" {
     const allocator = std.testing.allocator;
     const root = root_capability.Identity{ .device = 7, .inode = 11 };
-    var projection = try cloneRequestWithRootIdentity(
+    var projection = try cloneRequestWithOptions(
         allocator,
         page.RequestIdentity.review(3, 5),
         9,
@@ -1441,7 +1494,10 @@ test "generated request and syntax clone retain pinned root identity" {
         .unstaged,
         13,
         17,
-        root,
+        .{
+            .read_epoch = .{ .value = 43 },
+            .root_identity = root,
+        },
     );
     defer projection.deinit(allocator);
     try std.testing.expect(projection.matchesRootIdentity(root));
@@ -1452,6 +1508,58 @@ test "generated request and syntax clone retain pinned root identity" {
     var cloned = try cloneGeneratedSyntaxRequest(allocator, syntax_request);
     defer cloned.deinit(allocator);
     try std.testing.expect(syntax_request.matches(cloned));
+    try std.testing.expect(cloned.read_epoch.eql(.{ .value = 43 }));
+    cloned.read_epoch = .{ .value = 44 };
+    try std.testing.expect(!syntax_request.matches(cloned));
+}
+
+test "projection cache lookup requires matching read epoch" {
+    const allocator = std.testing.allocator;
+    var cache: Cache = .{};
+    defer cache.deinit(allocator);
+
+    var projection = try testGeneratedProjection(allocator, 1, "a", 10, 20);
+    projection.request.read_epoch = .{ .value = 47 };
+    cache.admit(allocator, projection);
+    projection = undefined;
+
+    try std.testing.expect(!cache.hasMatching(.{}, "/repo", "a", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(cache.hasMatching(.{ .value = 47 }, "/repo", "a", .generated_added_file, .unstaged, 10, 20));
+}
+
+test "projection read epoch fences pending display and cache admission" {
+    const allocator = std.testing.allocator;
+    const captured: review_read_epoch.ReviewRepositoryReadEpoch = .{ .value = 53 };
+    const successor: review_read_epoch.ReviewRepositoryReadEpoch = .{ .value = 54 };
+    var state: State = .{};
+    defer state.deinit(allocator);
+
+    state.pending = try cloneRequestWithOptions(
+        allocator,
+        page.RequestIdentity.review(0, 1),
+        1,
+        "/repo",
+        "a",
+        .generated_added_file,
+        .unstaged,
+        10,
+        20,
+        .{ .read_epoch = captured },
+    );
+    try std.testing.expect(state.pendingMatches(captured, "/repo", "a", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(!state.pendingMatches(successor, "/repo", "a", .generated_added_file, .unstaged, 10, 20));
+    state.clearPending(allocator);
+
+    var projection = try testGeneratedProjection(allocator, 2, "a", 10, 20);
+    projection.request.read_epoch = captured;
+    state.installReady(projection);
+    projection = undefined;
+    try std.testing.expect(state.displayedMatches(captured, "/repo", "a", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(!state.displayedMatches(successor, "/repo", "a", .generated_added_file, .unstaged, 10, 20));
+
+    state.cacheOrClearDisplayed(allocator, successor, "/repo", .unstaged, 10, 20);
+    try std.testing.expect(!state.hasDisplayed());
+    try std.testing.expectEqual(@as(usize, 0), state.cacheLen());
 }
 
 test "projection cache promotion re-admission and equal key replacement preserve LRU ownership" {
@@ -1467,7 +1575,7 @@ test "projection cache promotion re-admission and equal key replacement preserve
     cache.admitWithLimits(allocator, b, 2, max_cached_retained_bytes);
     b = undefined;
 
-    var promoted_a = cache.takeMatching("/repo", "a", .generated_added_file, .unstaged, 10, 20) orelse
+    var promoted_a = cache.takeMatching(.{}, "/repo", "a", .generated_added_file, .unstaged, 10, 20) orelse
         return error.ExpectedCacheHit;
     try std.testing.expectEqual(a_lines, promoted_a.value.generated_added_file.source.bytes.ptr);
     cache.admitWithLimits(allocator, promoted_a, 2, max_cached_retained_bytes);
@@ -1476,16 +1584,16 @@ test "projection cache promotion re-admission and equal key replacement preserve
     var c = try testGeneratedProjection(allocator, 3, "c", 10, 20);
     cache.admitWithLimits(allocator, c, 2, max_cached_retained_bytes);
     c = undefined;
-    try std.testing.expect(!cache.hasMatching("/repo", "b", .generated_added_file, .unstaged, 10, 20));
-    try std.testing.expect(cache.hasMatching("/repo", "a", .generated_added_file, .unstaged, 10, 20));
-    try std.testing.expect(cache.hasMatching("/repo", "c", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(!cache.hasMatching(.{}, "/repo", "b", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(cache.hasMatching(.{}, "/repo", "a", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(cache.hasMatching(.{}, "/repo", "c", .generated_added_file, .unstaged, 10, 20));
 
     var replacement_a = try testGeneratedProjection(allocator, 4, "a", 10, 20);
     const replacement_lines = replacement_a.value.generated_added_file.source.bytes.ptr;
     cache.admitWithLimits(allocator, replacement_a, 2, max_cached_retained_bytes);
     replacement_a = undefined;
     try std.testing.expectEqual(@as(usize, 2), cache.entries.items.len);
-    var final_a = cache.takeMatching("/repo", "a", .generated_added_file, .unstaged, 10, 20) orelse
+    var final_a = cache.takeMatching(.{}, "/repo", "a", .generated_added_file, .unstaged, 10, 20) orelse
         return error.ExpectedReplacement;
     defer final_a.deinit(allocator);
     try std.testing.expectEqual(replacement_lines, final_a.value.generated_added_file.source.bytes.ptr);
@@ -1504,14 +1612,14 @@ test "projection cache enforces four entry and retained byte bounds" {
         projection = undefined;
     }
     try std.testing.expectEqual(max_cached_entries, cache.entries.items.len);
-    try std.testing.expect(!cache.hasMatching("/repo", "file-0", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(!cache.hasMatching(.{}, "/repo", "file-0", .generated_added_file, .unstaged, 10, 20));
     try std.testing.expect(cache.retained_bytes <= max_cached_retained_bytes);
 
     var oversized = try testGeneratedProjection(allocator, 20, "oversized", 10, 20);
     const retained_bytes = oversized.retainedBytes();
     cache.admitWithLimits(allocator, oversized, max_cached_entries, retained_bytes - 1);
     oversized = undefined;
-    try std.testing.expect(!cache.hasMatching("/repo", "oversized", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(!cache.hasMatching(.{}, "/repo", "oversized", .generated_added_file, .unstaged, 10, 20));
 }
 
 test "projection cache byte pressure evicts LRU below the entry limit" {
@@ -1535,9 +1643,9 @@ test "projection cache byte pressure evicts LRU below the entry limit" {
     cache.admitWithLimits(allocator, c, max_cached_entries, byte_limit);
     c = undefined;
     try std.testing.expectEqual(@as(usize, 2), cache.entries.items.len);
-    try std.testing.expect(!cache.hasMatching("/repo", "a", .generated_added_file, .unstaged, 10, 20));
-    try std.testing.expect(cache.hasMatching("/repo", "b", .generated_added_file, .unstaged, 10, 20));
-    try std.testing.expect(cache.hasMatching("/repo", "c", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(!cache.hasMatching(.{}, "/repo", "a", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(cache.hasMatching(.{}, "/repo", "b", .generated_added_file, .unstaged, 10, 20));
+    try std.testing.expect(cache.hasMatching(.{}, "/repo", "c", .generated_added_file, .unstaged, 10, 20));
     try std.testing.expect(cache.retained_bytes <= byte_limit);
 }
 
@@ -1547,7 +1655,7 @@ test "projection cache rejects status body and cleans metadata allocation failur
     var cache: Cache = .{};
     defer cache.deinit(allocator);
     var status_projection = ReadyDisplay{
-        .request = try cloneRequest(allocator, page.RequestIdentity.review(0, 1), 1, "/repo", "status", .cached_diff, .unstaged, 10, 20),
+        .request = try testing.cloneRequest(allocator, page.RequestIdentity.review(0, 1), 1, "/repo", "status", .cached_diff, .unstaged, 10, 20),
         .value = .{ .status_body = try statusBodyAlloc(allocator, "status", "No staged diff.", .{}) },
     };
     cache.admit(allocator, status_projection);
@@ -1563,10 +1671,10 @@ test "projection cache rejects status body and cleans metadata allocation failur
     var state: State = .{};
     defer state.deinit(allocator);
     state.displayed = .{ .failed = .{
-        .request = try cloneRequest(allocator, page.RequestIdentity.review(0, 1), 3, "/repo", "failed", .cached_diff, .unstaged, 10, 20),
+        .request = try testing.cloneRequest(allocator, page.RequestIdentity.review(0, 1), 3, "/repo", "failed", .cached_diff, .unstaged, 10, 20),
         .body = try statusBodyAlloc(allocator, "failed", "load failed", .{}),
     } };
-    state.cacheOrClearDisplayed(allocator, "/repo", .unstaged, 10, 20);
+    state.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 10, 20);
     try std.testing.expect(!state.hasDisplayed());
     try std.testing.expectEqual(@as(usize, 0), state.cacheLen());
 }
@@ -1578,7 +1686,7 @@ test "projection cache retained bytes include every cacheable arena" {
     _ = try cached_arena.allocator().alloc(u8, 1024);
     const cached_capacity = cached_arena.queryCapacity();
     var cached = ReadyDisplay{
-        .request = try cloneRequest(allocator, page.RequestIdentity.review(0, 1), 1, "/repo", "cached", .cached_diff, .unstaged, 1, 2),
+        .request = try testing.cloneRequest(allocator, page.RequestIdentity.review(0, 1), 1, "/repo", "cached", .cached_diff, .unstaged, 1, 2),
         .value = .{ .cached_diff = .{ .arena = cached_arena, .loaded = undefined } },
     };
     cached_arena = undefined;
@@ -1606,7 +1714,7 @@ test "projection cache retained bytes include every cacheable arena" {
         authority_unstaged_arena.queryCapacity(),
     });
     var combined = ReadyDisplay{
-        .request = try cloneRequest(allocator, page.RequestIdentity.review(0, 1), 2, "/repo", "combined", .combined_hunks, .unstaged, 1, 2),
+        .request = try testing.cloneRequest(allocator, page.RequestIdentity.review(0, 1), 2, "/repo", "combined", .combined_hunks, .unstaged, 1, 2),
         .value = .{ .combined_hunks = .{
             .presentation = .{
                 .arena = presentation_arena,
@@ -1642,7 +1750,7 @@ fn testGeneratedProjection(
     source_session_revision: u64,
     status_snapshot_revision: u64,
 ) !ReadyDisplay {
-    var request = try cloneRequest(
+    var request = try testing.cloneRequest(
         allocator,
         page.RequestIdentity.review(0, 1),
         id,
