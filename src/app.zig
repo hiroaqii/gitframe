@@ -8989,6 +8989,35 @@ fn setupPushRetryRepoForTest(allocator: std.mem.Allocator, io: std.Io, tmp: *std
     return .{ .repo_root = repo_root, .oid = oid };
 }
 
+fn installPushCredentialPromptForTest(app: *App, allocator: std.mem.Allocator) !void {
+    var target = app_state.PushRetryTarget.empty();
+    var target_owned = true;
+    defer if (target_owned) target.deinit(allocator);
+    target.repo_root = try allocator.dupe(u8, "/repo");
+    target.branch = try allocator.dupe(u8, "main");
+    target.remote = try allocator.dupe(u8, "origin");
+    target.remote_branch = try allocator.dupe(u8, "main");
+    target.oid = try allocator.dupe(u8, "abc123");
+    target.remote_url = try allocator.dupe(u8, "https://example.test/owner/repo.git");
+
+    const prompt = try allocator.create(app_state.PushCredentialPrompt);
+    var prompt_owned = true;
+    defer if (prompt_owned) {
+        prompt.deinit(allocator);
+        allocator.destroy(prompt);
+    };
+    prompt.* = .{
+        .target = target,
+        .active_field = .password,
+    };
+    target_owned = false;
+    try prompt.username.insertSlice("alice");
+    try prompt.password.insertSlice("secret-token");
+
+    app.push_retry.state = .{ .credential_prompt = prompt };
+    prompt_owned = false;
+}
+
 fn runOnlyPushInspectionTaskForTest(app: *App, ctx: *chasen.Ctx(App.Msg), io: std.Io) !void {
     const pending = ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), pending.len);
@@ -12144,6 +12173,65 @@ test "finishPush failed preserves retry target oid for credential prompt" {
     try std.testing.expect(app.push_retry.state.credentialsAvailable());
 }
 
+test "credentialed push launch and runtime failure cross common action boundaries" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    defer app.clearPushError(allocator);
+    try installPushCredentialPromptForTest(&app, allocator);
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    try app.submitPushCredentials(&ctx);
+
+    try std.testing.expect(app.push_retry.state == .idle);
+    const owner = app.actions.pending orelse return error.ExpectedPendingAction;
+    try std.testing.expectEqual(app_actions.ActionKind.push, owner.token.kind);
+    try std.testing.expectEqual(app_actions.ActionLaunchPhase.accepted, owner.launch);
+
+    const queued = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    const Task = app_actions.PushTask(App.Msg);
+    const task: *Task = @ptrCast(@alignCast(queued[0].ctx));
+    try std.testing.expectEqual(owner.token.generation, task.pending.generation);
+    try std.testing.expectEqual(owner.token.kind, task.pending.kind);
+    const credentials = task.credentials orelse return error.ExpectedPushCredentials;
+    try std.testing.expectEqualStrings("alice", credentials.username);
+    try std.testing.expectEqualStrings("secret-token", credentials.password);
+
+    const message = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
+    try app.update(message, &ctx);
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.push_retry.state == .idle);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expect(app.push_error_message != null);
+}
+
+test "credentialed push queue failure never creates accepted action ownership" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    defer app.clearPushError(allocator);
+    try installPushCredentialPromptForTest(&app, allocator);
+
+    const DummyTask = struct {
+        fn run(_: std.mem.Allocator, _: std.Io) App.Msg {
+            return .quit;
+        }
+
+        fn failed(_: chasen.TaskFailure) App.Msg {
+            return .quit;
+        }
+    };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    for (0..16) |_| try ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+
+    try std.testing.expectError(error.TaskLimitExceeded, app.submitPushCredentials(&ctx));
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.push_retry.state == .idle);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 16), ctx.takePendingTasks().len);
+}
+
 test "clearPushError frees retained retry target" {
     var app: App = .{ .allocator = std.testing.allocator };
     try app.setPushErrorWithRetry(std.testing.allocator, "failed", .{
@@ -12612,6 +12700,51 @@ test "finishPushForeground ignores stale request id" {
     try std.testing.expect(app.actions.pending != null);
     try std.testing.expect(app.push_retry.state == .foreground);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+}
+
+test "finishPushForeground stale and duplicate terminals preserve newer action owner" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    defer app.clearPushForeground(allocator);
+    defer app.actions.clear();
+    app.pages.review.status.set("unchanged", .{});
+
+    const stale = beginAcceptedTestAction(&app, .push);
+    app.push_retry.state = .{ .foreground = .{
+        .request_id = .{ .id = 7 },
+        .pending = stale,
+        .origin = .{ .page_id = .review, .repo_epoch = app.repo_epoch, .activation_id = app.pages.review.activation.next_activation_id },
+        .target = .{
+            .mode = .upstream,
+            .repo_root = try allocator.dupe(u8, "/repo"),
+            .branch = try allocator.dupe(u8, "main"),
+            .remote = try allocator.dupe(u8, "origin"),
+            .remote_branch = try allocator.dupe(u8, "main"),
+            .oid = try allocator.dupe(u8, "abc123"),
+        },
+    } };
+    const current = app.actions.begin(.pull);
+    app.acceptActionLaunch(current);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.finishPushForeground(&ctx, .{
+        .request_id = .{ .id = 7 },
+        .outcome = .{ .exited = 0 },
+    });
+
+    try std.testing.expect(app.push_retry.state == .idle);
+    try std.testing.expect(app.actions.isAccepted(current));
+    try std.testing.expectEqualStrings("unchanged", app.pages.review.status.text());
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+
+    try app.finishPushForeground(&ctx, .{
+        .request_id = .{ .id = 7 },
+        .outcome = .{ .exited = 0 },
+    });
+
+    try std.testing.expect(app.actions.isAccepted(current));
+    try std.testing.expectEqualStrings("unchanged", app.pages.review.status.text());
+    try std.testing.expect(app.acceptActionTerminal(current));
 }
 
 test "inactive Review foreground completions retain diagnostics without effects" {
