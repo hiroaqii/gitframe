@@ -371,7 +371,7 @@ fn gitActionSpinnerText(app: Context, allocator: std.mem.Allocator) ?[]const u8 
     const label = if (visibleStatus(app).len > 0)
         visibleStatus(app)
     else
-        pendingActionFallbackLabel(pending.kind);
+        pendingActionFallbackLabel(pending.token.kind);
     const spinner = ui.Spinner.init(.{});
     return std.fmt.allocPrint(allocator, "{s} {s}", .{ spinner.frameAt(app.git_action_spinner_tick), label }) catch label;
 }
@@ -1504,7 +1504,7 @@ test "footer segment fit includes left inset" {
 test "footer shows pending spinner with current status label" {
     var app: ShellViewTestHarness = .{};
     app.status.set("pushing: main -> origin/main", .{});
-    app.actions.pending = .{ .generation = 1, .kind = .push };
+    app.actions.pending = .{ .token = .{ .generation = 1, .kind = .push }, .launch = .accepted };
     app.git_action_spinner_tick = 1;
 
     var ts: chasen.testing.TestSurface = undefined;
@@ -1520,7 +1520,7 @@ test "footer shows pending spinner with current status label" {
 
 test "footer falls back to pending kind when status is empty" {
     var app: ShellViewTestHarness = .{};
-    app.actions.pending = .{ .generation = 1, .kind = .push };
+    app.actions.pending = .{ .token = .{ .generation = 1, .kind = .push }, .launch = .accepted };
 
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 1);

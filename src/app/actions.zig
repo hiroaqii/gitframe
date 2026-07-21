@@ -53,12 +53,30 @@ pub const PendingAction = struct {
     kind: ActionKind,
 };
 
+pub const ActionLaunchPhase = enum {
+    preparing,
+    accepted,
+};
+
+/// App-owned launch state for one immutable task/result token.
+///
+/// Tasks carry only `PendingAction`. The phase stays here so a result cannot
+/// turn allocation/preparation into a successful launch after the fact.
+pub const PendingOwner = struct {
+    token: PendingAction,
+    launch: ActionLaunchPhase,
+
+    pub fn matches(self: PendingOwner, pending: PendingAction) bool {
+        return self.token.generation == pending.generation and self.token.kind == pending.kind;
+    }
+};
+
 /// Small App-facing receiver for future Git actions.
 ///
 /// Keep this limited to in-flight ownership. Result text remains in App's
 /// status message until concrete operation result ownership exists.
 pub const ActionState = struct {
-    pending: ?PendingAction = null,
+    pending: ?PendingOwner = null,
     generation: u64 = 0,
 
     pub fn begin(self: *ActionState, kind: ActionKind) PendingAction {
@@ -67,17 +85,39 @@ pub const ActionState = struct {
             .generation = self.generation,
             .kind = kind,
         };
-        self.pending = pending;
+        self.pending = .{
+            .token = pending,
+            .launch = .preparing,
+        };
         return pending;
     }
 
     pub fn isCurrent(self: *const ActionState, pending: PendingAction) bool {
         const current = self.pending orelse return false;
-        return current.generation == pending.generation and current.kind == pending.kind;
+        return current.matches(pending);
+    }
+
+    pub fn isAccepted(self: *const ActionState, pending: PendingAction) bool {
+        const current = self.pending orelse return false;
+        return current.matches(pending) and current.launch == .accepted;
+    }
+
+    pub fn acceptLaunch(self: *ActionState, pending: PendingAction) bool {
+        const current = if (self.pending) |*owner| owner else return false;
+        if (!current.matches(pending) or current.launch != .preparing) return false;
+        current.launch = .accepted;
+        return true;
+    }
+
+    pub fn cancelPreparing(self: *ActionState, pending: PendingAction) bool {
+        const current = self.pending orelse return false;
+        if (!current.matches(pending) or current.launch != .preparing) return false;
+        self.pending = null;
+        return true;
     }
 
     pub fn finish(self: *ActionState, pending: PendingAction) bool {
-        if (!self.isCurrent(pending)) return false;
+        if (!self.isAccepted(pending)) return false;
         self.pending = null;
         return true;
     }
@@ -1539,14 +1579,34 @@ test "ActionState tracks current pending action" {
 
     const first = state.begin(.assist_commit_message);
     try std.testing.expect(state.isCurrent(first));
+    try std.testing.expect(!state.isAccepted(first));
+    try std.testing.expect(!state.finish(first));
 
     const second = state.begin(.stage_file);
     try std.testing.expect(!state.isCurrent(first));
     try std.testing.expect(state.isCurrent(second));
 
+    try std.testing.expect(!state.acceptLaunch(first));
+    try std.testing.expect(state.acceptLaunch(second));
+    try std.testing.expect(state.isAccepted(second));
+    try std.testing.expect(!state.acceptLaunch(second));
     try std.testing.expect(!state.finish(first));
     try std.testing.expect(state.finish(second));
     try std.testing.expect(state.pending == null);
+}
+
+test "ActionState cancels only exact preparing owner" {
+    var state: ActionState = .{};
+
+    const preparing = state.begin(.pull);
+    try std.testing.expect(!state.cancelPreparing(.{ .generation = preparing.generation + 1, .kind = preparing.kind }));
+    try std.testing.expect(state.cancelPreparing(preparing));
+    try std.testing.expect(state.pending == null);
+
+    const accepted = state.begin(.fetch);
+    try std.testing.expect(state.acceptLaunch(accepted));
+    try std.testing.expect(!state.cancelPreparing(accepted));
+    try std.testing.expect(state.isAccepted(accepted));
 }
 
 test "parseCommitMessageDraft splits subject and body" {

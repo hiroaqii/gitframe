@@ -7,7 +7,8 @@
 //! A successful launcher returns its exact `PendingAction` only after
 //! `spawnWith` accepts the task. This receipt lets the App distinguish
 //! preparation from a concrete launch without inferring success from mutable
-//! `ActionState` after the fact.
+//! `ActionState` after the fact. The caller must pass that receipt through the
+//! App launch coordinator exactly once before any task completion is admitted.
 
 const std = @import("std");
 const chasen = @import("chasen");
@@ -22,7 +23,7 @@ pub fn hasPendingAction(action_state: actions.ActionState) bool {
 
 pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: git_ops.StageTarget) !actions.PendingAction {
     const pending = action_state.begin(.stage_file);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.StageFileTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -45,7 +46,7 @@ pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *
 
 pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: git_ops.UnstageTarget) !actions.PendingAction {
     const pending = action_state.begin(.unstage_file);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.UnstageFileTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -70,7 +71,7 @@ pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *
     defer consumeHunkTarget(ctx.allocator(), target);
 
     const pending = action_state.begin(.stage_hunk);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.StageHunkTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -97,7 +98,7 @@ pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
     defer consumeHunkTarget(ctx.allocator(), target);
 
     const pending = action_state.begin(.unstage_hunk);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.UnstageHunkTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -123,7 +124,7 @@ pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
 
 pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, repo_root: []const u8, path: []const u8) !actions.PendingAction {
     const pending = action_state.begin(.discard_file);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.DiscardFileTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -158,7 +159,7 @@ pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *act
     defer request.deinit(ctx.allocator());
 
     const pending = action_state.begin(.commit);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.CommitTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -196,7 +197,7 @@ pub fn startCommitMessageAssist(comptime Msg: type, ctx: *chasen.Ctx(Msg), actio
     defer request.deinit(ctx.allocator());
 
     const pending = action_state.begin(.assist_commit_message);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.CommitMessageAssistTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -219,7 +220,7 @@ pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *acti
     defer consumeAmendConfirmation(ctx.allocator(), confirmation);
 
     const pending = action_state.begin(.amend);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.AmendTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -246,7 +247,7 @@ pub fn startPush(
     defer consumePushConfirmation(ctx.allocator(), confirmation);
 
     const pending = action_state.begin(.push);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.PushTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -285,7 +286,7 @@ pub fn startPull(
     defer consumePullConfirmation(ctx.allocator(), confirmation);
 
     const pending = action_state.begin(.pull);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.PullTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -328,7 +329,7 @@ pub fn startFetch(
     defer consumeFetchRequest(ctx.allocator(), request);
 
     const pending = action_state.begin(.fetch);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.FetchTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -366,7 +367,7 @@ pub fn startSwitchBranch(
     defer consumeSwitchBranchRequest(ctx.allocator(), request);
 
     const pending = action_state.begin(.switch_branch);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.SwitchBranchTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -405,7 +406,7 @@ pub fn startCredentialedPush(
     defer credentials.deinit(ctx.allocator());
 
     const pending = action_state.begin(.push);
-    errdefer _ = action_state.finish(pending);
+    errdefer _ = action_state.cancelPreparing(pending);
 
     const Task = actions.PushTask(Msg);
     const task = try ctx.allocator().create(Task);
