@@ -9,6 +9,7 @@ const context = @import("../../../context.zig");
 const content_fingerprint = @import("../../../content_fingerprint.zig");
 const builtin = @import("builtin");
 const auto_reload = @import("../../auto_reload.zig");
+const app_actions = @import("../../actions.zig");
 const app_load = @import("../../load.zig");
 const app_page = @import("../../page.zig");
 const load_state = @import("../../load_state.zig");
@@ -474,6 +475,33 @@ pub const Controller = struct {
     ) bool {
         return self.page.repository_read_authority.acceptsRead(read_epoch) and
             self.page.auto_reload.acceptsCycle(background_cycle_id);
+    }
+
+    /// Atomically closes Review repository-read authority for one accepted
+    /// mutating action and retires projection work derived before that action.
+    ///
+    /// The displayed body and cache remain owned so launch itself cannot blank
+    /// or flicker the UI. Their old epoch prevents promotion or write
+    /// authority once P6b2d connects the common App launch/read gates. Source,
+    /// status, and branch task owners also remain intact so their terminals can
+    /// perform exact tracker and background-cycle drain.
+    ///
+    /// This owner API is behavior-neutral until the final P6b2d activation
+    /// slice calls it from `App.acceptActionLaunch` together with every read
+    /// launch gate and the exact-terminal reopen path.
+    pub fn beginMutationReadFence(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        pending: app_actions.PendingAction,
+    ) bool {
+        if (!self.page.repository_read_authority.closeForMutation(pending)) return false;
+
+        self.page.auto_reload.supersedeActiveCycleByMutation();
+        self.page.review_projection.clearPending(allocator);
+        self.page.review_projection.clearSyntaxPending(allocator);
+        if (self.page.deferred_projection_apply) |*deferred| deferred.deinit(allocator);
+        self.page.deferred_projection_apply = null;
+        return true;
     }
 
     /// The live drag is the only state which borrows displayed source or
@@ -3602,6 +3630,395 @@ test "repository read completion admission requires current open epoch and cycle
         .kind = .stage_hunk,
     } };
     try std.testing.expect(!controller.acceptsRepositoryReadCompletion(.{ .value = 11 }, null));
+}
+
+fn expectMutationFenceRetainedReadOwners(
+    page: *const review_page.ReviewPageState,
+    source_generation: u64,
+    read_epoch: ReviewRepositoryReadEpoch,
+    cycle_id: u64,
+    anchor_path_ptr: [*]const u8,
+    status_pending: auto_reload.AuxiliaryPending,
+    branch_pending: auto_reload.AuxiliaryPending,
+    cache_len: usize,
+    cache_retained_bytes: usize,
+) !void {
+    try std.testing.expect(std.meta.eql(
+        page.load.pending orelse return error.ExpectedSourcePending,
+        load_state.PendingLoad{ .diff_load = source_generation },
+    ));
+    const pending_reload = page.pending_reload orelse return error.ExpectedPendingReload;
+    try std.testing.expectEqual(source_generation, pending_reload.generation);
+    try std.testing.expect(pending_reload.read_epoch.eql(read_epoch));
+    try std.testing.expectEqual(review_page.ReloadKind.watch, pending_reload.kind);
+    const anchor = pending_reload.anchor orelse return error.ExpectedReloadAnchor;
+    try std.testing.expectEqual(anchor_path_ptr, @as([*]const u8, anchor.path_key.ptr));
+    try std.testing.expect(std.meta.eql(
+        status_pending,
+        page.status_load.pending orelse return error.ExpectedStatusPending,
+    ));
+    try std.testing.expect(std.meta.eql(
+        branch_pending,
+        page.branch_status_load.pending orelse return error.ExpectedBranchPending,
+    ));
+    const cycle = page.auto_reload.background_cycle orelse return error.ExpectedBackgroundCycle;
+    try std.testing.expectEqual(cycle_id, cycle.id);
+    try std.testing.expect(cycle.pending.owns(.source));
+    try std.testing.expect(cycle.pending.owns(.status));
+    try std.testing.expect(cycle.pending.owns(.branch));
+    try std.testing.expect(!cycle.pending.owns(.deferred_source_apply));
+    try std.testing.expectEqual(cache_len, page.review_projection.cacheLen());
+    try std.testing.expectEqual(cache_retained_bytes, page.review_projection.cacheRetainedBytes());
+    try std.testing.expect(page.review_projection.cacheHas(
+        read_epoch,
+        "/repo",
+        "cached",
+        .generated_added_file,
+        .unstaged,
+        page.source_session_revision,
+        page.status_snapshot_revision,
+    ));
+}
+
+test "mutation read fence closes one exact owner and preserves read drain ownership" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    page.auto_reload = .init(.inherit, .{}, .unstaged);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    const identity = page.activation.currentIdentity().?;
+    const root_identity: root_capability.Identity = .{ .device = 11, .inode = 17 };
+    const old_epoch = page.repository_read_authority.epoch;
+
+    const cycle_id = page.auto_reload.beginCycle().?;
+    var source_update = try controller.prepareSourceLoad(allocator, "/repo", .{
+        .clear_visible_state = false,
+        .kind = .watch,
+        .background_cycle_id = cycle_id,
+    });
+    defer source_update.deinit(allocator);
+    var source_command_owner = source_update.takeCommand() orelse return error.ExpectedSourceCommand;
+    defer source_command_owner.deinit(allocator);
+    const source_command = switch (source_command_owner) {
+        .source_load => |command| command,
+        else => return error.ExpectedSourceCommand,
+    };
+    controller.acceptSourceSpawn(cycle_id);
+
+    var status_update = try controller.prepareStatusLoad(allocator, "/repo", .background, cycle_id);
+    defer status_update.deinit(allocator);
+    var status_command_owner = status_update.takeCommand() orelse return error.ExpectedStatusCommand;
+    defer status_command_owner.deinit(allocator);
+    const status_command = switch (status_command_owner) {
+        .status_load => |command| command,
+        else => return error.ExpectedStatusCommand,
+    };
+    controller.acceptStatusSpawn(cycle_id);
+
+    var branch_update = try controller.prepareBranchStatusLoad(allocator, "/repo", cycle_id);
+    defer branch_update.deinit(allocator);
+    var branch_command_owner = branch_update.takeCommand() orelse return error.ExpectedBranchCommand;
+    defer branch_command_owner.deinit(allocator);
+    const branch_command = switch (branch_command_owner) {
+        .branch_status_load => |command| command,
+        else => return error.ExpectedBranchCommand,
+    };
+    controller.acceptBranchStatusSpawn(cycle_id);
+
+    const pending_reload = page.pending_reload orelse return error.ExpectedPendingReload;
+    const anchor_path_ptr = @as([*]const u8, (pending_reload.anchor orelse return error.ExpectedReloadAnchor).path_key.ptr);
+    const status_pending = page.status_load.pending orelse return error.ExpectedStatusPending;
+    const branch_pending = page.branch_status_load.pending orelse return error.ExpectedBranchPending;
+
+    page.review_projection.installReady(try testGeneratedReady(
+        allocator,
+        9,
+        "cached",
+        page.source_session_revision,
+        page.status_snapshot_revision,
+    ));
+    page.review_projection.cacheOrClearDisplayed(
+        allocator,
+        old_epoch,
+        "/repo",
+        .unstaged,
+        page.source_session_revision,
+        page.status_snapshot_revision,
+    );
+    const cache_len = page.review_projection.cacheLen();
+    const cache_retained_bytes = page.review_projection.cacheRetainedBytes();
+    try std.testing.expectEqual(@as(usize, 1), cache_len);
+    try std.testing.expect(cache_retained_bytes > 0);
+
+    var displayed_request = try review_projection.cloneRequestWithOptions(
+        allocator,
+        identity,
+        1,
+        "/repo",
+        "a",
+        .generated_added_file,
+        .unstaged,
+        page.source_session_revision,
+        page.status_snapshot_revision,
+        .{ .read_epoch = old_epoch, .root_identity = root_identity },
+    );
+    var displayed_request_owned = true;
+    defer if (displayed_request_owned) displayed_request.deinit(allocator);
+    var displayed_bundle = try review_projection.generatedFileFromContent(allocator, "a", "one\ntwo\n");
+    var displayed_bundle_owned = true;
+    defer if (displayed_bundle_owned) displayed_bundle.deinit(allocator);
+    page.review_projection.installReady(.{
+        .request = displayed_request,
+        .value = .{ .generated_added_file = displayed_bundle },
+    });
+    displayed_request_owned = false;
+    displayed_bundle_owned = false;
+    displayed_request = undefined;
+    displayed_bundle = undefined;
+    const displayed_source = page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr;
+
+    page.review_projection.syntax_pending = try review_projection.generatedSyntaxRequestForProjection(
+        allocator,
+        1,
+        identity,
+        page.review_projection.displayed.ready.request,
+        page.review_projection.displayed.ready.value.generated_added_file.fingerprint(),
+    );
+    page.review_projection.pending = try review_projection.cloneRequestWithOptions(
+        allocator,
+        identity,
+        2,
+        "/repo",
+        "a",
+        .generated_added_file,
+        .unstaged,
+        page.source_session_revision,
+        page.status_snapshot_revision,
+        .{ .read_epoch = old_epoch, .root_identity = root_identity },
+    );
+    page.deferred_projection_apply = .{ .finished = .{
+        .request = try cloneTestProjectionRequest(allocator, page.review_projection.pending.?),
+        .result = .{ .failed_static = "pre-mutation result" },
+    } };
+
+    const assistance: app_actions.PendingAction = .{
+        .generation = 6,
+        .kind = .assist_commit_message,
+    };
+    try std.testing.expect(!controller.beginMutationReadFence(allocator, assistance));
+    try std.testing.expect(page.repository_read_authority.epoch.eql(old_epoch));
+    try std.testing.expect(page.review_projection.pending != null);
+    try std.testing.expect(page.review_projection.syntax_pending != null);
+    try std.testing.expect(page.deferred_projection_apply != null);
+    try std.testing.expect(page.auto_reload.acceptsCycle(cycle_id));
+    try expectMutationFenceRetainedReadOwners(
+        &page,
+        source_command.generation,
+        old_epoch,
+        cycle_id,
+        anchor_path_ptr,
+        status_pending,
+        branch_pending,
+        cache_len,
+        cache_retained_bytes,
+    );
+
+    const mutation: app_actions.PendingAction = .{
+        .generation = 7,
+        .kind = .stage_hunk,
+    };
+    try std.testing.expect(controller.beginMutationReadFence(allocator, mutation));
+    const fenced_epoch = page.repository_read_authority.epoch;
+    try std.testing.expect(fenced_epoch.eql(old_epoch.next()));
+    try std.testing.expect(page.repository_read_authority.ownsMutation(mutation));
+    try std.testing.expect(!page.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.review_projection.syntax_pending == null);
+    try std.testing.expect(page.deferred_projection_apply == null);
+    try std.testing.expect(page.review_projection.hasDisplayed());
+    try std.testing.expectEqual(
+        displayed_source,
+        page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr,
+    );
+    try std.testing.expectEqual(
+        auto_reload.CycleAcceptance.superseded_by_mutation,
+        page.auto_reload.background_cycle.?.acceptance,
+    );
+    try std.testing.expect(!page.auto_reload.acceptsCycle(cycle_id));
+    try expectMutationFenceRetainedReadOwners(
+        &page,
+        source_command.generation,
+        old_epoch,
+        cycle_id,
+        anchor_path_ptr,
+        status_pending,
+        branch_pending,
+        cache_len,
+        cache_retained_bytes,
+    );
+
+    try std.testing.expect(!controller.beginMutationReadFence(allocator, mutation));
+    try std.testing.expect(page.repository_read_authority.epoch.eql(fenced_epoch));
+    try expectMutationFenceRetainedReadOwners(
+        &page,
+        source_command.generation,
+        old_epoch,
+        cycle_id,
+        anchor_path_ptr,
+        status_pending,
+        branch_pending,
+        cache_len,
+        cache_retained_bytes,
+    );
+
+    var source_finished: app_load.DiffLoadFinished = .{
+        .identity = source_command.identity,
+        .read_epoch = source_command.read_epoch,
+        .generation = source_command.generation,
+        .background_cycle_id = cycle_id,
+        .result = .{ .failed_static = "must not publish source" },
+    };
+    defer source_finished.deinit(allocator);
+    const source_applied = try controller.applySourceFinished(allocator, &source_finished, false);
+    try std.testing.expect(!source_applied.terminal_admitted);
+    try std.testing.expectEqual(RedrawDisposition.skip, source_applied.redraw);
+    try std.testing.expect(page.load.pending == null);
+    try std.testing.expect(page.pending_reload == null);
+    try std.testing.expect(page.auto_reload.background_cycle != null);
+
+    var status_finished: app_load.StatusLoadFinished = .{
+        .identity = status_command.identity,
+        .read_epoch = status_command.read_epoch,
+        .generation = status_command.generation,
+        .background_cycle_id = cycle_id,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .failed_static = "must not publish status" },
+    };
+    defer status_finished.deinit(allocator);
+    const status_applied = try controller.applyStatusFinished(allocator, &status_finished, false);
+    try std.testing.expect(!status_applied.terminal_admitted);
+    try std.testing.expect(status_applied.skip_redraw);
+    try std.testing.expect(page.status_load.pending == null);
+    try std.testing.expect(page.auto_reload.background_cycle != null);
+
+    var branch_finished: app_load.BranchStatusLoadFinished = .{
+        .identity = branch_command.identity,
+        .read_epoch = branch_command.read_epoch,
+        .generation = branch_command.generation,
+        .background_cycle_id = cycle_id,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .failed_static = "must not publish branch" },
+    };
+    defer branch_finished.deinit(allocator);
+    const branch_applied = controller.applyBranchStatusFinished(&branch_finished, false);
+    try std.testing.expect(!branch_applied.terminal_admitted);
+    try std.testing.expect(branch_applied.skip_redraw);
+    try std.testing.expect(page.branch_status_load.pending == null);
+    try std.testing.expect(page.auto_reload.background_cycle == null);
+    try std.testing.expectEqual(cache_len, page.review_projection.cacheLen());
+    try std.testing.expectEqual(cache_retained_bytes, page.review_projection.cacheRetainedBytes());
+    try std.testing.expect(page.review_projection.cacheHas(
+        old_epoch,
+        "/repo",
+        "cached",
+        .generated_added_file,
+        .unstaged,
+        page.source_session_revision,
+        page.status_snapshot_revision,
+    ));
+    try std.testing.expectEqual(
+        displayed_source,
+        page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr,
+    );
+}
+
+test "mutation read fence retains deferred source until production apply drains it" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    page.auto_reload = .init(.inherit, .{}, .unstaged);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    const old_epoch = page.repository_read_authority.epoch;
+    const cycle_id = page.auto_reload.beginCycle().?;
+
+    var update = try controller.prepareSourceLoad(allocator, "/repo", .{
+        .clear_visible_state = false,
+        .kind = .watch,
+        .background_cycle_id = cycle_id,
+    });
+    defer update.deinit(allocator);
+    var command_owner = update.takeCommand() orelse return error.ExpectedSourceCommand;
+    defer command_owner.deinit(allocator);
+    const command = switch (command_owner) {
+        .source_load => |source| source,
+        else => return error.ExpectedSourceCommand,
+    };
+    controller.acceptSourceSpawn(cycle_id);
+
+    page.selection_owner = .{ .diff = .init(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    var finished: app_load.DiffLoadFinished = .{
+        .identity = command.identity,
+        .read_epoch = command.read_epoch,
+        .generation = command.generation,
+        .background_cycle_id = cycle_id,
+        .result = .{ .loaded = try app_load.buildLoadedBundle(allocator, test_support.diff_unstaged_projection) },
+    };
+    const deferred_payload_ptr = finished.result.loaded.loaded.text.ptr;
+    const deferred = try controller.applySourceFinished(allocator, &finished, false);
+    try std.testing.expect(deferred.result_transferred);
+    finished = undefined;
+
+    const pending_reload = page.pending_reload orelse return error.ExpectedPendingReload;
+    const anchor_path_ptr = @as([*]const u8, (pending_reload.anchor orelse return error.ExpectedReloadAnchor).path_key.ptr);
+    const deferred_before = page.deferred_source_apply orelse return error.ExpectedDeferredSource;
+    try std.testing.expectEqual(cycle_id, deferred_before.cycle_id);
+    try std.testing.expectEqual(command.generation, deferred_before.finished.generation);
+    try std.testing.expect(deferred_before.finished.read_epoch.eql(old_epoch));
+    try std.testing.expectEqual(deferred_payload_ptr, deferred_before.finished.result.loaded.loaded.text.ptr);
+    try std.testing.expect(!page.auto_reload.background_cycle.?.pending.owns(.source));
+    try std.testing.expect(page.auto_reload.background_cycle.?.pending.owns(.deferred_source_apply));
+
+    const mutation: app_actions.PendingAction = .{
+        .generation = 8,
+        .kind = .unstage_hunk,
+    };
+    try std.testing.expect(controller.beginMutationReadFence(allocator, mutation));
+    const retained = page.deferred_source_apply orelse return error.ExpectedDeferredSource;
+    try std.testing.expectEqual(cycle_id, retained.cycle_id);
+    try std.testing.expectEqual(command.generation, retained.finished.generation);
+    try std.testing.expect(retained.finished.read_epoch.eql(old_epoch));
+    try std.testing.expectEqual(deferred_payload_ptr, retained.finished.result.loaded.loaded.text.ptr);
+    try std.testing.expectEqual(
+        anchor_path_ptr,
+        @as([*]const u8, page.pending_reload.?.anchor.?.path_key.ptr),
+    );
+    try std.testing.expectEqual(
+        auto_reload.CycleAcceptance.superseded_by_mutation,
+        page.auto_reload.background_cycle.?.acceptance,
+    );
+    try std.testing.expect(page.auto_reload.background_cycle.?.pending.owns(.deferred_source_apply));
+
+    page.selection_owner = .none;
+    var applied = (try controller.applyDeferredSource(allocator, false)) orelse return error.ExpectedDeferredApply;
+    defer applied.deinit(allocator);
+    try std.testing.expect(!applied.source.terminal_admitted);
+    try std.testing.expectEqual(RedrawDisposition.skip, applied.source.redraw);
+    try std.testing.expect(page.deferred_source_apply == null);
+    try std.testing.expect(page.load.pending == null);
+    try std.testing.expect(page.pending_reload == null);
+    try std.testing.expect(page.auto_reload.background_cycle == null);
 }
 
 test "old repository read source terminal retires ownership without publication" {
