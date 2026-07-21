@@ -645,7 +645,9 @@ pub const App = struct {
             .run_interactive_push => try self.runInteractivePush(ctx),
             .reload => switch (self.active_page) {
                 .review => {
-                    if (self.pages.review.action_cursor.hasOwner()) {
+                    if (!self.pages.review.repository_read_authority.mayStartRepositoryRead() or
+                        self.pages.review.action_cursor.hasOwner())
+                    {
                         self.pages.review.activation.queueRevalidation();
                         ctx.redraw().skip();
                     } else {
@@ -1505,7 +1507,8 @@ pub const App = struct {
     }
 
     fn reviewReadBusy(self: *const App) bool {
-        return self.pages.review.action_cursor.hasOwner() or
+        return !self.pages.review.repository_read_authority.mayStartRepositoryRead() or
+            self.pages.review.action_cursor.hasOwner() or
             self.pages.review.auto_reload.background_cycle != null or
             self.pages.review.load.hasPending() or self.pages.review.load.state == .loading or
             self.pages.review.status_load.isPending() or self.pages.review.branch_status_load.isPending() or
@@ -1524,6 +1527,10 @@ pub const App = struct {
 
     fn startReviewRevalidation(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (self.active_page != .review) return;
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) {
+            self.pages.review.activation.queueRevalidation();
+            return;
+        }
         if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
             try self.startRepoDiscovery(ctx, null);
             return;
@@ -1584,6 +1591,7 @@ pub const App = struct {
     }
 
     fn startRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg), background_cycle_id: ?u64) !void {
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return;
         var review_update = try self.reviewReload().prepareRepoDiscovery(ctx.allocator(), background_cycle_id);
         defer review_update.deinit(ctx.allocator());
         var command = review_update.takeCommand() orelse unreachable;
@@ -1635,6 +1643,7 @@ pub const App = struct {
     }
 
     fn startDiffLoad(self: *App, ctx: *chasen.Ctx(Msg), kind: review_page.ReloadKind) !void {
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return;
         const repo_root = self.repoRootForCurrentSource() catch {
             self.reviewReload().replaceMissingRepository(ctx.allocator());
             return;
@@ -1644,6 +1653,7 @@ pub const App = struct {
     }
 
     fn startDiffLoadWithRepoRoot(self: *App, ctx: *chasen.Ctx(Msg), repo_root: ?[]const u8, options: DiffLoadStartOptions) !void {
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return;
         const action_cursor_generation = if (options.action_cursor_generation) |generation|
             if (self.pages.review.action_cursor.ownsRefresh(generation)) generation else null
         else
@@ -1726,6 +1736,7 @@ pub const App = struct {
         origin: git_backend.ReadOrigin,
         background_cycle_id: ?u64,
     ) void {
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return;
         if (self.pages.review.action_cursor.hasOwner()) {
             self.reviewNavigation().clearActionCursor(ctx.allocator());
         }
@@ -1740,6 +1751,7 @@ pub const App = struct {
         background_cycle_id: ?u64,
         action_cursor_generation: ?u64,
     ) void {
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return;
         var review_update = self.reviewReload().prepareStatusLoad(
             ctx.allocator(),
             repo_root,
@@ -1796,6 +1808,7 @@ pub const App = struct {
     }
 
     fn startBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), repo_root: []const u8, background_cycle_id: ?u64) void {
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return;
         var review_update = self.reviewReload().prepareBranchStatusLoad(
             ctx.allocator(),
             repo_root,
@@ -4602,6 +4615,10 @@ pub const App = struct {
         }
         if (!self.pages.review.auto_reload.enabled()) return;
         if (diff_source.sourceIsOneShotInput(self.config.source)) return;
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) {
+            ctx.redraw().skip();
+            return;
+        }
         if (self.repo_picker.mode or self.pages.review.search.mode or self.pages.review.file_search.mode or self.commit_panel.is_open or
             self.pages.review.selection_owner.activeMouseSelection() or app_git_requests.hasPendingAction(self.actions) or
             self.pages.review.action_cursor.hasOwner())
@@ -11377,6 +11394,104 @@ test "inactive page timer starts no Review work" {
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "mutation read start gate retains manual and queued revalidation until reopen" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+    };
+    const activation_id = app.activateReview();
+    const owner: app_actions.PendingAction = .{
+        .generation = 61,
+        .kind = .stage_hunk,
+    };
+    try std.testing.expect(app.pages.review.repository_read_authority.closeForMutation(owner));
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingRepositoryTasks(&ctx, allocator);
+
+    try app.requestReviewRevalidation(&ctx);
+    try std.testing.expectEqual(
+        activation_id,
+        app.pages.review.activation.revalidation_requested orelse return error.ExpectedRevalidationIntent,
+    );
+    try app.maybeStartQueuedReviewRevalidation(&ctx);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(
+        activation_id,
+        app.pages.review.activation.revalidation_requested orelse return error.ExpectedRetainedRevalidationIntent,
+    );
+
+    try app.update(.reload, &ctx);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(
+        activation_id,
+        app.pages.review.activation.revalidation_requested orelse return error.ExpectedCoalescedRevalidationIntent,
+    );
+
+    try std.testing.expect(app.pages.review.repository_read_authority.reopenForMutation(owner));
+    try app.maybeStartQueuedReviewRevalidation(&ctx);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    try std.testing.expect(app.pages.review.activation.revalidation_requested == null);
+    try std.testing.expect(app.pages.review.load.pending != null);
+}
+
+test "mutation read start gate blocks forced auto reload before cycle ownership" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .pages = .{ .review = .{ .auto_reload = .{
+            .activation = .forced,
+            .interval_ns = 3 * std.time.ns_per_s,
+        } } },
+    };
+    _ = app.activateReview();
+    const owner: app_actions.PendingAction = .{
+        .generation = 62,
+        .kind = .unstage_hunk,
+    };
+    try std.testing.expect(app.pages.review.repository_read_authority.closeForMutation(owner));
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.autoReloadTick(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
+    try std.testing.expect(app.pages.review.load.pending == null);
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "mutation read start gate makes direct App read starters inert" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+    };
+    _ = app.activateReview();
+    const owner: app_actions.PendingAction = .{
+        .generation = 63,
+        .kind = .stage_file,
+    };
+    try std.testing.expect(app.pages.review.repository_read_authority.closeForMutation(owner));
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.startRepoDiscovery(&ctx, null);
+    try app.startDiffLoadWithRepoRoot(
+        &ctx,
+        "/repo",
+        .{ .clear_visible_state = true, .kind = .manual },
+    );
+    app.startStatusLoad(&ctx, "/repo", .foreground, null);
+    app.startBranchStatusLoad(&ctx, "/repo", null);
+
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expect(app.pages.review.load.pending == null);
+    try std.testing.expect(app.pages.review.pending_reload == null);
+    try std.testing.expect(app.pages.review.status_load.pending == null);
+    try std.testing.expect(app.pages.review.branch_status_load.pending == null);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.status.text().len);
 }
 
 test "Review re-entry queues one revalidation behind an older read and leaving cancels it" {

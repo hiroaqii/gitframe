@@ -477,6 +477,16 @@ pub const Controller = struct {
             self.page.auto_reload.acceptsCycle(background_cycle_id);
     }
 
+    /// Every source/status/branch preparation crosses this page-owned gate.
+    /// App scheduling normally waits before calling a prepare method, while
+    /// this boundary prevents a future direct caller from creating a
+    /// current-epoch read during an accepted repository mutation.
+    fn requireRepositoryReadStart(self: Controller) error{RepositoryReadAuthorityClosed}!void {
+        if (!self.page.repository_read_authority.mayStartRepositoryRead()) {
+            return error.RepositoryReadAuthorityClosed;
+        }
+    }
+
     /// Atomically closes Review repository-read authority for one accepted
     /// mutating action and retires projection work derived before that action.
     ///
@@ -1305,6 +1315,7 @@ pub const Controller = struct {
         repo_root: ?[]const u8,
         options: SourceLoadOptions,
     ) !ReviewUpdate {
+        try self.requireRepositoryReadStart();
         const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
         if (options.kind != .watch) self.clearDeferredSourceApply(allocator);
         if (options.kind == .repo_switch) self.page.auto_reload.clearAcceptedSource();
@@ -1345,6 +1356,7 @@ pub const Controller = struct {
         allocator: std.mem.Allocator,
         background_cycle_id: ?u64,
     ) !ReviewUpdate {
+        try self.requireRepositoryReadStart();
         const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
         const generation = self.page.load.beginRepoDiscovery();
         self.clearPendingReload(allocator);
@@ -1378,6 +1390,7 @@ pub const Controller = struct {
         origin: git_backend.ReadOrigin,
         background_cycle_id: ?u64,
     ) !ReviewUpdate {
+        try self.requireRepositoryReadStart();
         const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
         if (self.page.git_status.repo_root) |current_root| {
             if (std.mem.eql(u8, current_root, repo_root)) {
@@ -1417,6 +1430,7 @@ pub const Controller = struct {
         repo_root: []const u8,
         background_cycle_id: ?u64,
     ) !ReviewUpdate {
+        try self.requireRepositoryReadStart();
         const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
         if (self.page.branch_status.repo_root) |current_root| {
             if (std.mem.eql(u8, current_root, repo_root)) {
@@ -3628,6 +3642,54 @@ test "review read epoch is captured by source status and branch commands" {
         try std.testing.expect(command.branch_status_load.read_epoch.eql(.{ .value = 41 }));
         try std.testing.expect(page.branch_status_load.pending.?.read_epoch.eql(.{ .value = 41 }));
     }
+}
+
+test "mutation read start gate rejects every repository read preparation without changing owners" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{};
+    defer page.deinit(allocator);
+    _ = page.activation.activate(0, .fresh, .fresh, .fresh);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    const owner: app_actions.PendingAction = .{
+        .generation = 51,
+        .kind = .stage_hunk,
+    };
+    try std.testing.expect(page.repository_read_authority.closeForMutation(owner));
+
+    try std.testing.expectError(
+        error.RepositoryReadAuthorityClosed,
+        controller.prepareSourceLoad(
+            allocator,
+            "/repo",
+            .{ .clear_visible_state = true, .kind = .manual },
+        ),
+    );
+    try std.testing.expectError(
+        error.RepositoryReadAuthorityClosed,
+        controller.prepareRepoDiscovery(allocator, null),
+    );
+    try std.testing.expectError(
+        error.RepositoryReadAuthorityClosed,
+        controller.prepareStatusLoad(allocator, "/repo", .foreground, null),
+    );
+    try std.testing.expectError(
+        error.RepositoryReadAuthorityClosed,
+        controller.prepareBranchStatusLoad(allocator, "/repo", null),
+    );
+
+    try std.testing.expect(page.load.state == .idle);
+    try std.testing.expect(page.load.pending == null);
+    try std.testing.expect(page.pending_reload == null);
+    try std.testing.expectEqual(@as(u64, 0), page.load.generation);
+    try std.testing.expect(page.status_load.pending == null);
+    try std.testing.expectEqual(@as(u64, 0), page.status_load.generation);
+    try std.testing.expect(page.branch_status_load.pending == null);
+    try std.testing.expectEqual(@as(u64, 0), page.branch_status_load.generation);
+    const active = page.activation.state.active;
+    try std.testing.expectEqual(authority.MemberFreshness.fresh, active.members.source);
+    try std.testing.expectEqual(authority.MemberFreshness.fresh, active.members.status);
+    try std.testing.expectEqual(authority.MemberFreshness.fresh, active.members.branch);
 }
 
 test "repository read completion admission requires current open epoch and cycle" {
