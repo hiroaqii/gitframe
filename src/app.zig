@@ -1858,6 +1858,7 @@ pub const App = struct {
     }
 
     fn ensureReviewProjection(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return;
         var review_update = try self.reviewReload().prepareProjection(self.allocator);
         if (review_update.takeCommand()) |command| {
             const allocator = ctx.allocator();
@@ -11492,6 +11493,37 @@ test "mutation read start gate makes direct App read starters inert" {
     try std.testing.expect(app.pages.review.status_load.pending == null);
     try std.testing.expect(app.pages.review.branch_status_load.pending == null);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.status.text().len);
+}
+
+test "mutation read promotion gate makes App projection scheduling inert" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{
+            .discovery = try testSingleRepoDiscovery(allocator, "/repo"),
+        },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .selected_target = .{ .status_only = 0 } },
+        } },
+    };
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    _ = app.activateReview();
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    const owner: app_actions.PendingAction = .{
+        .generation = 64,
+        .kind = .unstage_file,
+    };
+    try std.testing.expect(app.pages.review.repository_read_authority.closeForMutation(owner));
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.ensureReviewProjection(&ctx);
+
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expect(app.pages.review.review_projection.pending == null);
 }
 
 test "Review re-entry queues one revalidation behind an older read and leaving cancels it" {

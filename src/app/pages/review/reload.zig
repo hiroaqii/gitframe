@@ -1473,6 +1473,12 @@ pub const Controller = struct {
     /// transfers one owned task request to the shell. The pending page identity
     /// is a distinct clone so task and page never share allocator ownership.
     pub fn prepareProjection(self: Controller, allocator_opt: ?std.mem.Allocator) !ReviewUpdate {
+        // A closed mutation phase retains the old displayed/cache owners as
+        // inert visual state. Do not reconcile, promote a cache hit, clear a
+        // no-target display, or prepare a current-epoch request until the exact
+        // action terminal reopens repository-read authority.
+        if (!self.page.repository_read_authority.mayStartRepositoryRead()) return .{};
+
         // Projection reconciliation can move or free the currently displayed
         // owner. A live drag borrows that owner, so even cache promotion and
         // no-target cleanup wait until release/cancel has ended the borrow.
@@ -1743,6 +1749,7 @@ pub const Controller = struct {
     /// The bundle remains `eligible` while the page-owned pending request is
     /// in flight, so immutable cache admission never needs to mutate an entry.
     pub fn prepareGeneratedSyntax(self: Controller, allocator: std.mem.Allocator) !?review_projection.GeneratedSyntaxRequest {
+        if (!self.page.repository_read_authority.mayStartRepositoryRead()) return null;
         if (!source_syntax_runtime.enabled) return null;
         const target = self.view().projectionTarget() orelse return null;
         if (target.kind != .generated_added_file) return null;
@@ -2280,6 +2287,9 @@ pub const Controller = struct {
         var deferred = self.page.deferred_projection_apply orelse return;
         self.page.deferred_projection_apply = null;
 
+        // Do not gate cleanup itself. `applyProjectionFinished` drains the
+        // exact pending clone and uses `acceptsRead` (including the common open
+        // predicate) to reject publication while a mutation owns the phase.
         var result_transferred = false;
         defer if (!result_transferred) deferred.deinit(allocator);
         result_transferred = (try self.applyProjectionFinished(allocator, &deferred.finished)).result_transferred;
@@ -4205,6 +4215,139 @@ test "mutation read fence terminal coalesces current intent and never targets a 
     try std.testing.expect(page.activation.revalidation_requested == null);
 }
 
+test "mutation read promotion gate retains current visual and cache owners until reopen" {
+    const allocator = std.testing.allocator;
+    const root = root_capability.Identity{ .device = 41, .inode = 43 };
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00?? b\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    var controller = testController(&page, &status_message, .unstaged);
+    controller.root_identity = root;
+
+    const owner: app_actions.PendingAction = .{
+        .generation = 44,
+        .kind = .stage_file,
+    };
+    try std.testing.expect(page.repository_read_authority.closeForMutation(owner));
+    const fenced_epoch = page.repository_read_authority.epoch;
+
+    page.review_projection.installReady(.{
+        .request = try review_projection.cloneRequestWithOptions(
+            allocator,
+            page.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .generated_added_file,
+            .unstaged,
+            0,
+            0,
+            .{ .read_epoch = fenced_epoch, .root_identity = root },
+        ),
+        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "cached\n") },
+    });
+    const cached_source = page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr;
+    page.review_projection.cacheOrClearDisplayed(allocator, fenced_epoch, "/repo", .unstaged, 0, 0);
+
+    page.review_projection.installReady(.{
+        .request = try review_projection.cloneRequestWithOptions(
+            allocator,
+            page.activation.currentIdentity().?,
+            2,
+            "/repo",
+            "b",
+            .generated_added_file,
+            .unstaged,
+            0,
+            0,
+            .{ .read_epoch = fenced_epoch, .root_identity = root },
+        ),
+        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "b", "retained\n") },
+    });
+    const retained_source = page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr;
+
+    var blocked = try controller.prepareProjection(allocator);
+    defer blocked.deinit(allocator);
+    try std.testing.expect(blocked.command == null);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expectEqual(retained_source, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
+    try std.testing.expect(page.review_projection.cacheHas(
+        fenced_epoch,
+        "/repo",
+        "a",
+        .generated_added_file,
+        .unstaged,
+        0,
+        0,
+    ));
+
+    try std.testing.expect(page.repository_read_authority.reopenForMutation(owner));
+    var promoted = try controller.prepareProjection(allocator);
+    defer promoted.deinit(allocator);
+    try std.testing.expect(promoted.command == null);
+    try std.testing.expectEqual(cached_source, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
+}
+
+test "mutation read promotion gate blocks generated syntax preparation until reopen" {
+    if (!source_syntax_runtime.enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const root = root_capability.Identity{ .device = 47, .inode = 53 };
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    var status_message = @import("../../state.zig").StatusMessage{};
+    var controller = testController(&page, &status_message, .unstaged);
+    controller.root_identity = root;
+
+    const owner: app_actions.PendingAction = .{
+        .generation = 54,
+        .kind = .unstage_file,
+    };
+    try std.testing.expect(page.repository_read_authority.closeForMutation(owner));
+    page.review_projection.installReady(.{
+        .request = try review_projection.cloneRequestWithOptions(
+            allocator,
+            page.activation.currentIdentity().?,
+            3,
+            "/repo",
+            "a",
+            .generated_added_file,
+            .unstaged,
+            0,
+            0,
+            .{
+                .read_epoch = page.repository_read_authority.epoch,
+                .root_identity = root,
+            },
+        ),
+        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(
+            allocator,
+            "a",
+            "const value = 1;\n",
+        ) },
+    });
+
+    try std.testing.expect((try controller.prepareGeneratedSyntax(allocator)) == null);
+    try std.testing.expect(!page.review_projection.hasSyntaxPending());
+    try std.testing.expect(page.review_projection.displayed.ready.value.generated_added_file.decoration == .eligible);
+
+    try std.testing.expect(page.repository_read_authority.reopenForMutation(owner));
+    var request = (try controller.prepareGeneratedSyntax(allocator)) orelse return error.ExpectedSyntaxRequest;
+    defer request.deinit(allocator);
+    try std.testing.expect(page.review_projection.hasSyntaxPending());
+    controller.rejectGeneratedSyntaxSpawn(allocator, request.id);
+    try std.testing.expect(!page.review_projection.hasSyntaxPending());
+}
+
 test "old repository read source terminal retires ownership without publication" {
     const allocator = std.testing.allocator;
     var page: review_page.ReviewPageState = .{
@@ -5908,7 +6051,7 @@ test "source replacement before deferred projection rejects and frees the stale 
     try std.testing.expect(!page.review_projection.hasDisplayed());
 }
 
-test "old repository read deferred projection retires pending without publication" {
+test "mutation read promotion gate drains deferred projection without publication" {
     const allocator = std.testing.allocator;
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
@@ -5951,7 +6094,12 @@ test "old repository read deferred projection retires pending without publicatio
     try std.testing.expect(page.deferred_projection_apply != null);
     try std.testing.expect(page.review_projection.pending != null);
 
-    page.repository_read_authority.epoch = old_epoch.next();
+    const owner: app_actions.PendingAction = .{
+        .generation = 55,
+        .kind = .stage_hunk,
+    };
+    try std.testing.expect(page.repository_read_authority.closeForMutation(owner));
+    try std.testing.expect(page.repository_read_authority.epoch.eql(old_epoch.next()));
     page.selection_owner = .none;
     try controller.applyDeferredProjection(allocator);
 
