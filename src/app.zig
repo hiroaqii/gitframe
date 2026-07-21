@@ -3320,11 +3320,7 @@ pub const App = struct {
             }
             return;
         };
-        // P6b2c will route foreground queue acceptance through the common App
-        // coordinator. Keep the existing interactive path behavior-equivalent
-        // while ActionState already enforces preparing/accepted ownership.
-        const accepted = self.actions.acceptLaunch(pending);
-        std.debug.assert(accepted);
+        self.acceptActionLaunch(pending);
 
         self.push_retry.state = .{ .foreground = .{
             .request_id = request_id,
@@ -12406,7 +12402,11 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
     try std.testing.expect(app.push_retry.state == .foreground);
     try std.testing.expectEqual(page.Id.review, app.push_retry.state.foreground.origin.page_id);
     try std.testing.expectEqual(app.repo_epoch, app.push_retry.state.foreground.origin.repo_epoch);
-    try std.testing.expect(app.actions.pending != null);
+    const action_owner = app.actions.pending orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(app_actions.ActionKind.push, action_owner.token.kind);
+    try std.testing.expectEqual(app_actions.ActionLaunchPhase.accepted, action_owner.launch);
+    try std.testing.expectEqual(action_owner.token.generation, app.push_retry.state.foreground.pending.generation);
+    try std.testing.expectEqual(action_owner.token.kind, app.push_retry.state.foreground.pending.kind);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_foreground_commands_len);
 
     const entry = ctx._pending_foreground_commands[0..ctx._pending_foreground_commands_len][0];
