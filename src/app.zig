@@ -1947,6 +1947,15 @@ pub const App = struct {
         std.debug.assert(accepted);
     }
 
+    /// Accept one delivered terminal for the exact current launched action.
+    ///
+    /// This remains behavior-only through P6b2c. P6b2d will extend this one
+    /// boundary to validate and reopen the matching Review read authority
+    /// before any result-specific reconciliation starts.
+    fn acceptActionTerminal(self: *App, pending: app_actions.PendingAction) bool {
+        return self.actions.finish(pending);
+    }
+
     fn stageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (app_git_requests.hasPendingAction(self.actions)) {
             self.setReviewStatus("another git action is running", .{});
@@ -3464,7 +3473,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.actions.finish(result.pending)) return;
+        if (!self.acceptActionTerminal(result.pending)) return;
 
         if (self.setActionFailureStatus("stage", result.result)) {
             _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
@@ -3486,7 +3495,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.actions.finish(result.pending)) return;
+        if (!self.acceptActionTerminal(result.pending)) return;
 
         if (self.setActionFailureStatus("hunk stage", result.result)) {
             _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
@@ -3513,7 +3522,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.actions.finish(result.pending)) return;
+        if (!self.acceptActionTerminal(result.pending)) return;
 
         if (self.setActionFailureStatus("unstage", result.result)) {
             _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
@@ -3535,7 +3544,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.actions.finish(result.pending)) return;
+        if (!self.acceptActionTerminal(result.pending)) return;
 
         if (self.setActionFailureStatus("hunk unstage", result.result)) {
             _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
@@ -3559,7 +3568,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.actions.finish(result.pending)) return;
+        if (!self.acceptActionTerminal(result.pending)) return;
 
         if (self.setActionFailureStatus("discard", result.result)) {
             _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
@@ -3594,7 +3603,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.actions.finish(result.pending)) return;
+        if (!self.acceptActionTerminal(result.pending)) return;
 
         switch (result.result) {
             .ok, .ok_static => {
@@ -3632,7 +3641,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.actions.finish(result.pending)) return;
+        if (!self.acceptActionTerminal(result.pending)) return;
         if (!self.commit_panel.is_open or self.commit_panel.mode != .commit) return;
         if (!self.activeRepoMatches(result.repo_root)) return;
 
@@ -3678,7 +3687,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.actions.finish(result.pending)) return;
+        if (!self.acceptActionTerminal(result.pending)) return;
 
         switch (result.result) {
             .ok, .ok_static => {
@@ -3713,7 +3722,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.actions.finish(result.pending)) return;
+        if (!self.acceptActionTerminal(result.pending)) return;
 
         const active_matches = self.activeRepoMatches(result.repo_root);
 
@@ -3748,7 +3757,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.actions.finish(result.pending)) return;
+        if (!self.acceptActionTerminal(result.pending)) return;
 
         const active_matches = self.activeRepoMatches(result.repo_root);
 
@@ -3783,7 +3792,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.actions.finish(result.pending)) return;
+        if (!self.acceptActionTerminal(result.pending)) return;
 
         const active_matches = self.activeRepoMatches(result.repo_root);
 
@@ -3810,7 +3819,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.actions.finish(result.pending)) return;
+        if (!self.acceptActionTerminal(result.pending)) return;
 
         const active_matches = self.activeRepoMatches(result.repo_root);
 
@@ -3897,7 +3906,7 @@ pub const App = struct {
         self.push_retry.state = .idle;
         defer foreground.deinit(ctx.allocator());
 
-        if (!self.actions.finish(foreground.pending)) return;
+        if (!self.acceptActionTerminal(foreground.pending)) return;
 
         const diagnostic_origin: EffectOrigin = .{ .page = foreground.origin };
         if (!self.effectOriginIsLive(diagnostic_origin)) {
@@ -5550,6 +5559,44 @@ fn beginAcceptedTestAction(app: *App, kind: app_actions.ActionKind) app_actions.
     const accepted = app.actions.acceptLaunch(pending);
     std.debug.assert(accepted);
     return pending;
+}
+
+test "action terminal coordinator accepts every exact launched action once" {
+    const action_kinds = [_]app_actions.ActionKind{
+        .stage_file,
+        .unstage_file,
+        .stage_hunk,
+        .unstage_hunk,
+        .discard_file,
+        .commit,
+        .assist_commit_message,
+        .amend,
+        .push,
+        .pull,
+        .fetch,
+        .switch_branch,
+    };
+    try std.testing.expectEqual(@typeInfo(app_actions.ActionKind).@"enum".fields.len, action_kinds.len);
+
+    var app: App = .{};
+    for (action_kinds) |kind| {
+        const pending = app.actions.begin(kind);
+        try std.testing.expect(!app.acceptActionTerminal(pending));
+        try std.testing.expect(app.actions.isCurrent(pending));
+
+        app.acceptActionLaunch(pending);
+        try std.testing.expect(app.acceptActionTerminal(pending));
+        try std.testing.expect(!app.acceptActionTerminal(pending));
+    }
+
+    const stale = app.actions.begin(.stage_file);
+    app.acceptActionLaunch(stale);
+    const current = app.actions.begin(.pull);
+    app.acceptActionLaunch(current);
+
+    try std.testing.expect(!app.acceptActionTerminal(stale));
+    try std.testing.expect(app.actions.isAccepted(current));
+    try std.testing.expect(app.acceptActionTerminal(current));
 }
 
 fn installTestActionCursor(
