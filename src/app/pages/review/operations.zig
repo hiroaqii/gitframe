@@ -12,6 +12,7 @@ const authority = @import("authority.zig");
 const navigation = @import("navigation.zig");
 const review_selection = @import("selection.zig");
 const review_page = @import("../review.zig");
+const app_actions = @import("../../actions.zig");
 const git_ops = @import("../../git_ops.zig");
 const review_projection = @import("../../review_projection.zig");
 const projection_component = @import("../../projection_component.zig");
@@ -205,7 +206,12 @@ pub const View = struct {
     repo_root: ?[]const u8,
     activation_state: authority.ActivationState,
 
+    /// Git operation authority is stricter than page activation lifetime.
+    /// P6b2d retains the old Review body and activation while a mutation runs,
+    /// but that visual owner must not resolve another file/hunk or remote
+    /// action until exact-terminal reconciliation reopens repository reads.
     pub fn activation(self: View) authority.ActivationState {
+        if (!self.page.repository_read_authority.mayStartRepositoryRead()) return .inactive;
         return self.activation_state;
     }
 
@@ -557,7 +563,7 @@ pub const View = struct {
         } };
     }
 
-    pub fn selectedProjectedHunkStageTarget(
+    fn selectedProjectedHunkStageTarget(
         self: View,
         allocator: std.mem.Allocator,
         repo_root: []const u8,
@@ -593,7 +599,7 @@ pub const View = struct {
         } };
     }
 
-    pub fn selectedProjectedHunkUnstageTarget(
+    fn selectedProjectedHunkUnstageTarget(
         self: View,
         allocator: std.mem.Allocator,
         repo_root: []const u8,
@@ -650,7 +656,7 @@ pub const View = struct {
     fn displayedProjectionReadIsFresh(self: View) bool {
         const request = self.page.review_projection.displayed.request() orelse return true;
         if (!self.navigation.displayedProjectionRequestIsActive(request.*)) return true;
-        return request.read_epoch.eql(self.page.repository_read_authority.epoch);
+        return self.page.repository_read_authority.acceptsRead(request.read_epoch);
     }
 
     fn activationMembers(self: View) authority.MemberVector {
@@ -1002,6 +1008,101 @@ fn acceptTestSource(page: *review_page.ReviewPageState) void {
     page.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test"));
 }
 
+test "mutation fence makes retained Review operation targets inert" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .diff_cursor = .{ .hunk_header = 0 },
+        },
+    };
+    defer page.deinit(allocator);
+    acceptTestSource(&page);
+    var status = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status);
+    var branch_builder = @import("../../../git/branch_status.zig").Builder.init(allocator);
+    errdefer branch_builder.deinit();
+    try branch_builder.setOid("abc123");
+    try branch_builder.setBranchHead("main");
+    try branch_builder.setUpstream("origin/main");
+    branch_builder.setAheadBehind(1, 0);
+    var branch = branch_builder.finish();
+    defer branch.deinit();
+    try page.branch_status.replace("/repo", &branch);
+    const view = testView(&page, .unstaged);
+
+    try std.testing.expect(view.activation().satisfiesAction(.stage_hunk));
+    switch (view.stageTarget()) {
+        .ready => {},
+        else => return error.ExpectedReadyStageTarget,
+    }
+    switch (view.unstageTarget()) {
+        .ready => {},
+        else => return error.ExpectedReadyUnstageTarget,
+    }
+    switch (view.commitSummary()) {
+        .ready => |summary| try std.testing.expectEqual(@as(usize, 1), summary.count),
+        else => return error.ExpectedReadyCommitSummary,
+    }
+    const hunk_target = switch (view.selectedHunkStageTarget(allocator)) {
+        .ready => |target| target,
+        else => return error.ExpectedReadyHunkStageTarget,
+    };
+    defer allocator.free(hunk_target.patch);
+    switch (view.pushTarget()) {
+        .ready => {},
+        else => return error.ExpectedReadyPushTarget,
+    }
+    try std.testing.expect(view.pullTarget() == .dirty_worktree);
+    switch (view.fetchTarget()) {
+        .ready => {},
+        else => return error.ExpectedReadyFetchTarget,
+    }
+    try std.testing.expect(view.branchSwitchTarget() == .dirty_worktree);
+
+    const owner: app_actions.PendingAction = .{
+        .generation = 41,
+        .kind = .stage_hunk,
+    };
+    try std.testing.expect(page.repository_read_authority.closeForMutation(owner));
+    try std.testing.expect(view.activation() == .inactive);
+    const members = view.activationMembers();
+    try std.testing.expectEqual(authority.MemberFreshness.unavailable, members.source);
+    try std.testing.expectEqual(authority.MemberFreshness.unavailable, members.status);
+    try std.testing.expectEqual(authority.MemberFreshness.unavailable, members.branch);
+
+    try std.testing.expect(view.stageTarget() == .stale_source);
+    try std.testing.expect(view.toggleStageTarget() == .stale_source);
+    try std.testing.expect(view.unstageTarget() == .stale_source);
+    try std.testing.expect(view.discardTarget() == .stale_source);
+    try std.testing.expect(view.commitSummary() == .loading_or_stale);
+    try std.testing.expect(view.selectedHunkToggleOperation() == .stale_source);
+    try std.testing.expect(view.selectedHunkStageTarget(allocator) == .stale_source);
+    try std.testing.expect(view.selectedHunkUnstageTarget(allocator) == .stale_source);
+    try std.testing.expect(view.pushTarget() == .loading_branch_status);
+    try std.testing.expect(view.pullTarget() == .loading_branch_status);
+    try std.testing.expect(view.fetchTarget() == .loading_branch_status);
+    try std.testing.expect(view.branchSwitchTarget() == .loading_branch_status);
+
+    try std.testing.expect(page.repository_read_authority.reopenForMutation(owner));
+    try std.testing.expect(view.activation().satisfiesAction(.stage_hunk));
+    switch (view.stageTarget()) {
+        .ready => {},
+        else => return error.ExpectedRestoredStageTarget,
+    }
+    switch (view.pushTarget()) {
+        .ready => {},
+        else => return error.ExpectedRestoredPushTarget,
+    }
+    try std.testing.expect(view.pullTarget() == .dirty_worktree);
+    switch (view.fetchTarget()) {
+        .ready => {},
+        else => return error.ExpectedRestoredFetchTarget,
+    }
+    try std.testing.expect(view.branchSwitchTarget() == .dirty_worktree);
+}
+
 test "stage target skips only fresh staged-only files" {
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwoWithStatuses()),
@@ -1149,6 +1250,16 @@ test "retained staged-only read epoch authority builds unstage patch and becomes
     const displayed_request = page.review_projection.displayed.request().?;
     page.repository_read_authority.epoch = .{ .value = 2 };
     try std.testing.expect(view.navigation.displayedProjectionRequestIsActive(displayed_request.*));
+    try std.testing.expect(view.selectedHunkToggleOperation() == .stale_status);
+    try std.testing.expect(view.selectedHunkStageTarget(allocator) == .stale_status);
+    try std.testing.expect(view.selectedHunkUnstageTarget(allocator) == .stale_status);
+
+    page.repository_read_authority.epoch = displayed_request.read_epoch;
+    page.repository_read_authority.phase = .{ .mutation_in_flight = .{
+        .generation = 23,
+        .kind = .unstage_hunk,
+    } };
+    try std.testing.expect(!view.displayedProjectionReadIsFresh());
     try std.testing.expect(view.selectedHunkToggleOperation() == .stale_status);
     try std.testing.expect(view.selectedHunkStageTarget(allocator) == .stale_status);
     try std.testing.expect(view.selectedHunkUnstageTarget(allocator) == .stale_status);
