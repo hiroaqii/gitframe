@@ -1949,18 +1949,33 @@ fn loadGitBranchList(allocator: std.mem.Allocator, io: std.Io, repo_root: []cons
     const current_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
     const current_result = try runGitBranchStatusCommand(allocator, io, repo_root, &current_argv);
     defer current_result.deinit(allocator);
+
+    const list_argv = [_][]const u8{ "git", "for-each-ref", "--format=%(refname:short)%00%(objectname)%00", "refs/heads" };
+    const list_result = try runGitBranchStatusCommand(allocator, io, repo_root, &list_argv);
+    defer list_result.deinit(allocator);
+
+    return branchListResultFromCommandResults(allocator, current_result, list_result);
+}
+
+/// Interpret borrowed command output and return an independently owned result.
+///
+/// `current_result` and `list_result` remain owned by the caller. Keeping this
+/// seam private lets failure terminals be tested without making process
+/// injection part of the backend API.
+fn branchListResultFromCommandResults(
+    allocator: std.mem.Allocator,
+    current_result: process_runner.Result,
+    list_result: process_runner.Result,
+) LoadError!BranchListLoadResult {
     var current: ?[]u8 = null;
+    defer if (current) |owned| allocator.free(owned);
     switch (current_result.term) {
         .exited => |code| if (code == 0) {
             current = allocator.dupe(u8, trimLineEnd(current_result.stdout)) catch return error.OutOfMemory;
         },
         else => {},
     }
-    errdefer if (current) |owned| allocator.free(owned);
 
-    const list_argv = [_][]const u8{ "git", "for-each-ref", "--format=%(refname:short)%00%(objectname)%00", "refs/heads" };
-    const list_result = try runGitBranchStatusCommand(allocator, io, repo_root, &list_argv);
-    defer list_result.deinit(allocator);
     switch (list_result.term) {
         .exited => |code| if (code != 0) return branchListCommandFailure(allocator, list_result),
         else => return branchListCommandFailure(allocator, list_result),
@@ -2003,9 +2018,12 @@ fn loadGitBranchList(allocator: std.mem.Allocator, io: std.Io, repo_root: []cons
         };
     }
 
+    const branches = items.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    const owned_current = current;
+    current = null;
     return .{ .ok = .{
-        .current = current,
-        .branches = items.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .current = owned_current,
+        .branches = branches,
     } };
 }
 
@@ -2022,6 +2040,110 @@ test "skipBranchListRecordSeparators preserves branch name after for-each-ref ne
     skipBranchListRecordSeparators(output, &index);
     try std.testing.expectEqual(@as(usize, 1), index);
     try std.testing.expectEqualStrings("zig-port", output[index .. index + "zig-port".len]);
+}
+
+test "branch list non-zero result releases current and preserves stderr" {
+    var current_stdout = "main\n".*;
+    var list_stderr = "fatal: branch list failed\n".*;
+    var empty: [0]u8 = .{};
+    const result = try branchListResultFromCommandResults(
+        std.testing.allocator,
+        .{
+            .term = .{ .exited = 0 },
+            .stdout = &current_stdout,
+            .stderr = &empty,
+        },
+        .{
+            .term = .{ .exited = 128 },
+            .stdout = &empty,
+            .stderr = &list_stderr,
+        },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed => |message| try std.testing.expectEqualStrings(&list_stderr, message),
+        .ok, .failed_static => return error.ExpectedBranchListFailure,
+    }
+}
+
+test "branch list abnormal result releases current and preserves termination" {
+    var current_stdout = "main\n".*;
+    var empty: [0]u8 = .{};
+    const result = try branchListResultFromCommandResults(
+        std.testing.allocator,
+        .{
+            .term = .{ .exited = 0 },
+            .stdout = &current_stdout,
+            .stderr = &empty,
+        },
+        .{
+            .term = .{ .unknown = 9 },
+            .stdout = &empty,
+            .stderr = &empty,
+        },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed => |message| {
+            try std.testing.expect(std.mem.indexOf(u8, message, "unknown") != null);
+            try std.testing.expect(std.mem.indexOf(u8, message, "9") != null);
+        },
+        .ok, .failed_static => return error.ExpectedBranchListFailure,
+    }
+}
+
+test "branch list diagnostic allocation failure releases current" {
+    var current_stdout = "main\n".*;
+    var list_stderr = "fatal: branch list failed\n".*;
+    var empty: [0]u8 = .{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+
+    try std.testing.expectError(error.OutOfMemory, branchListResultFromCommandResults(
+        failing.allocator(),
+        .{
+            .term = .{ .exited = 0 },
+            .stdout = &current_stdout,
+            .stderr = &empty,
+        },
+        .{
+            .term = .{ .exited = 128 },
+            .stdout = &empty,
+            .stderr = &list_stderr,
+        },
+    ));
+}
+
+test "branch list success transfers current ownership exactly once" {
+    var current_stdout = "main\n".*;
+    var list_stdout = "main\x00abc\x00\nfeature/topic\x00def\x00".*;
+    var empty: [0]u8 = .{};
+    const result = try branchListResultFromCommandResults(
+        std.testing.allocator,
+        .{
+            .term = .{ .exited = 0 },
+            .stdout = &current_stdout,
+            .stderr = &empty,
+        },
+        .{
+            .term = .{ .exited = 0 },
+            .stdout = &list_stdout,
+            .stderr = &empty,
+        },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    const list = switch (result) {
+        .ok => |list| list,
+        .failed, .failed_static => return error.ExpectedBranchList,
+    };
+    try std.testing.expectEqualStrings("main", list.current.?);
+    try std.testing.expectEqual(@as(usize, 2), list.branches.len);
+    try std.testing.expectEqualStrings("main", list.branches[0].name);
+    try std.testing.expect(list.branches[0].current);
+    try std.testing.expectEqualStrings("feature/topic", list.branches[1].name);
+    try std.testing.expect(!list.branches[1].current);
 }
 
 fn branchListCommandFailure(allocator: std.mem.Allocator, result: process_runner.Result) LoadError!BranchListLoadResult {
