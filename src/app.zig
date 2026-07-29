@@ -1667,26 +1667,15 @@ pub const App = struct {
         defer if (action_cursor_generation != null) {
             _ = self.reviewNavigation().finalizeActionCursor(ctx.allocator());
         };
-        if (repo_root) |root| {
-            self.startStatusLoadTracked(
-                ctx,
-                root,
-                if (options.kind == .watch) .background else .foreground,
-                options.background_cycle_id,
-                action_cursor_generation,
-            );
-            self.startBranchStatusLoad(ctx, root, options.background_cycle_id);
-        } else {
-            if (action_cursor_generation) |generation| {
-                _ = self.pages.review.action_cursor.failMemberBeforeStart(generation, .status);
-            }
-            self.reviewReload().dropStatusSnapshot(ctx.allocator());
-            self.reviewReload().invalidateBranchStatusSnapshot();
-        }
 
-        var review_update = self.reviewReload().prepareSourceLoad(ctx.allocator(), repo_root, options.sourceOptions()) catch |err| {
+        var review_update = self.reviewReload().prepareSourceLoad(
+            ctx.allocator(),
+            repo_root,
+            options.sourceOptions(),
+        ) catch |err| {
             if (action_cursor_generation) |generation| {
                 _ = self.pages.review.action_cursor.failMemberBeforeStart(generation, .source);
+                _ = self.pages.review.action_cursor.failMemberBeforeStart(generation, .status);
             }
             self.reviewReload().failActiveMember(.source);
             return err;
@@ -1697,11 +1686,41 @@ pub const App = struct {
         defer if (!command_consumed) command.deinit(ctx.allocator());
         const source = &command.source_load;
         const generation = source.generation;
+
+        if (repo_root) |root| {
+            self.startStatusLoadTracked(
+                ctx,
+                root,
+                if (options.kind == .watch) .background else .foreground,
+                options.background_cycle_id,
+                action_cursor_generation,
+            ) catch |err| {
+                _ = self.reviewReload().rejectSourceSpawn(ctx.allocator(), generation);
+                if (action_cursor_generation) |action_generation| {
+                    _ = self.pages.review.action_cursor.failMemberBeforeStart(
+                        action_generation,
+                        .source,
+                    );
+                }
+                return err;
+            };
+            self.startBranchStatusLoad(ctx, root, options.background_cycle_id);
+        } else {
+            if (action_cursor_generation) |action_generation| {
+                _ = self.pages.review.action_cursor.failMemberBeforeStart(
+                    action_generation,
+                    .status,
+                );
+            }
+            self.reviewReload().dropStatusSnapshot(ctx.allocator());
+            self.reviewReload().invalidateBranchStatusSnapshot();
+        }
+
         if (action_cursor_generation) |action_generation| {
             _ = self.pages.review.action_cursor.startMember(action_generation, .source, generation);
         }
         const task = ctx.allocator().create(DiffLoadTask) catch |err| {
-            self.reviewReload().rejectSourceSpawn(ctx.allocator(), generation);
+            _ = self.reviewReload().rejectSourceSpawn(ctx.allocator(), generation);
             if (action_cursor_generation) |action_generation| {
                 _ = self.pages.review.action_cursor.rejectMemberSpawn(action_generation, .source, generation);
             }
@@ -1719,11 +1738,19 @@ pub const App = struct {
         ctx.task().spawnWith(.{ .ctx = task, .run = DiffLoadTask.run, .failed = DiffLoadTask.failed }) catch |err| {
             diff_source.freeLoadRequest(ctx.allocator(), task.request);
             ctx.allocator().destroy(task);
-            self.reviewReload().rejectSourceSpawn(ctx.allocator(), generation);
+            const retained_publication = self.reviewReload().rejectSourceSpawn(
+                ctx.allocator(),
+                generation,
+            );
             if (action_cursor_generation) |action_generation| {
                 _ = self.pages.review.action_cursor.rejectMemberSpawn(action_generation, .source, generation);
             }
-            try self.reviewReload().replaceSourceFailure(ctx.allocator(), "Could not start diff load task");
+            if (!retained_publication) {
+                try self.reviewReload().replaceSourceFailure(
+                    ctx.allocator(),
+                    "Could not start diff load task",
+                );
+            }
             return err;
         };
         self.reviewReload().acceptSourceSpawn(options.background_cycle_id);
@@ -1740,7 +1767,7 @@ pub const App = struct {
         if (self.pages.review.action_cursor.hasOwner()) {
             self.reviewNavigation().clearActionCursor(ctx.allocator());
         }
-        self.startStatusLoadTracked(ctx, repo_root, origin, background_cycle_id, null);
+        self.startStatusLoadTracked(ctx, repo_root, origin, background_cycle_id, null) catch {};
     }
 
     fn startStatusLoadTracked(
@@ -1750,20 +1777,20 @@ pub const App = struct {
         origin: git_backend.ReadOrigin,
         background_cycle_id: ?u64,
         action_cursor_generation: ?u64,
-    ) void {
+    ) !void {
         if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return;
         var review_update = self.reviewReload().prepareStatusLoad(
             ctx.allocator(),
             repo_root,
             origin,
             background_cycle_id,
-        ) catch {
+        ) catch |err| {
             if (action_cursor_generation) |generation| {
                 _ = self.pages.review.action_cursor.failMemberBeforeStart(generation, .status);
             }
             self.reviewReload().failActiveMember(.status);
             self.setReviewStatus("could not allocate status repo root", .{});
-            return;
+            return err;
         };
         defer review_update.deinit(ctx.allocator());
         var command = review_update.takeCommand() orelse unreachable;
@@ -1773,13 +1800,13 @@ pub const App = struct {
         if (action_cursor_generation) |generation| {
             _ = self.pages.review.action_cursor.startMember(generation, .status, status_read.generation);
         }
-        const task = ctx.allocator().create(StatusLoadTask) catch {
+        const task = ctx.allocator().create(StatusLoadTask) catch |err| {
             self.reviewReload().rejectStatusSpawn(background_cycle_id);
             if (action_cursor_generation) |generation| {
                 _ = self.pages.review.action_cursor.rejectMemberSpawn(generation, .status, status_read.generation);
             }
             self.setReviewStatus("could not allocate status load task", .{});
-            return;
+            return err;
         };
         task.* = .{
             .identity = status_read.identity,
@@ -1791,10 +1818,10 @@ pub const App = struct {
         };
         command_consumed = true;
 
-        ctx.task().spawnWith(.{ .ctx = task, .run = StatusLoadTask.run, .failed = StatusLoadTask.failed }) catch {
-            // Status is auxiliary data. Keep the diff load going even if this
-            // task cannot start; the invalidated generation prevents any older
-            // in-flight status result from restoring a stale snapshot.
+        ctx.task().spawnWith(.{ .ctx = task, .run = StatusLoadTask.run, .failed = StatusLoadTask.failed }) catch |err| {
+            // The caller decides whether this is an auxiliary-only rejection
+            // or a canonical-publication prerequisite failure. In either
+            // case, invalidate the exact generation before propagating it.
             ctx.allocator().free(task.repo_root);
             ctx.allocator().destroy(task);
             self.reviewReload().rejectStatusSpawn(background_cycle_id);
@@ -1802,7 +1829,7 @@ pub const App = struct {
                 _ = self.pages.review.action_cursor.rejectMemberSpawn(generation, .status, status_read.generation);
             }
             self.setReviewStatus("could not start status load task", .{});
-            return;
+            return err;
         };
         self.reviewReload().acceptStatusSpawn(background_cycle_id);
     }
@@ -4106,7 +4133,13 @@ pub const App = struct {
                 defer if (action_cursor_generation != null) {
                     _ = self.reviewNavigation().finalizeActionCursor(ctx.allocator());
                 };
-                self.startStatusLoadTracked(ctx, repo_root, .foreground, null, action_cursor_generation);
+                self.startStatusLoadTracked(
+                    ctx,
+                    repo_root,
+                    .foreground,
+                    null,
+                    action_cursor_generation,
+                ) catch {};
             },
         }
     }
@@ -14030,6 +14063,69 @@ fn canonicalPublicationReuseCandidate(
     return candidate;
 }
 
+fn canonicalPublicationStagedOnlyReuseCandidate(
+    allocator: std.mem.Allocator,
+    status_snapshot_revision: u64,
+) !app_review_projection.StagedOnlyReuseCandidate {
+    var cached = try app_projection_component.ParsedComponent.parse(
+        allocator,
+        canonical_publication_combined_diff,
+    );
+    errdefer cached.deinit();
+    if (cached.document.files.len != 1) return error.ExpectedSingleCachedFile;
+    const owner = cached.arena.?.allocator();
+    const hunk_count = cached.document.files[0].hunks.len;
+    const stage_states = try owner.alloc(diff_hunk_projection.HunkStageState, hunk_count);
+    @memset(stage_states, .staged);
+    const action_origins = try owner.alloc(diff_hunk_projection.HunkActionOrigin, hunk_count);
+    for (action_origins, 0..) |*origin, hunk_index| {
+        origin.* = .{ .cached = hunk_index };
+    }
+    const candidate: app_review_projection.StagedOnlyReuseCandidate = .{
+        .fingerprint = diff_presentation_identity.fingerprint(cached.document.files[0]),
+        .fresh_authority = .{
+            .projection = .{
+                .hunk_stage_states = stage_states,
+                .hunk_action_origins = action_origins,
+            },
+            .cached_component = cached,
+            .status_snapshot_revision = status_snapshot_revision,
+        },
+    };
+    cached.arena = null;
+    return candidate;
+}
+
+fn installCanonicalPublicationLineageOwners(
+    app: *App,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+) !review_selection_model.ReviewContentToken {
+    const displayed = app.reviewNavigationView().displayedDiffFile() orelse
+        return error.ExpectedDisplayedDiff;
+    const token = app.reviewNavigationView().currentContentToken() orelse
+        return error.ExpectedReviewContentToken;
+    const selection: diff_selection.DragSelection = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 1, .line_index = 0 },
+        .focus = .{ .hunk_index = 1, .line_index = 0 },
+        .moved = true,
+    };
+    app.pages.review.completed_selection = try review_selection_model.buildParsed(
+        allocator,
+        token,
+        displayed,
+        selection,
+    );
+    try app.pages.review.staged_hunks.addExact(allocator, repo_root, "a", .{
+        .content = token,
+        .display_hunk_index = 1,
+    });
+    return token;
+}
+
 fn finishCanonicalPublicationAction(
     app: *App,
     ctx: *chasen.Ctx(App.Msg),
@@ -14588,7 +14684,10 @@ test "Review canonical publication exact acceptance retains navigation search an
     try std.testing.expectEqual(search_offset_before, app.pages.review.search.match_offset);
     const completed = app.pages.review.completed_selection orelse
         return error.ExpectedRetainedCompletedSelection;
-    try std.testing.expect(completed.token.eql(token_before));
+    const token_after = app.reviewNavigationView().currentContentToken() orelse
+        return error.ExpectedReviewContentToken;
+    try std.testing.expect(!token_after.eql(token_before));
+    try std.testing.expect(completed.token.eql(token_after));
     const clipboard_after = try completed.clipboardText(allocator);
     defer allocator.free(clipboard_after);
     try std.testing.expectEqualStrings(clipboard_before, clipboard_after);
@@ -14635,6 +14734,144 @@ test "Review canonical publication exact acceptance retains navigation search an
     try std.testing.expectEqualStrings("a", diff_file.canonicalPathKey(cached_source).?);
     try std.testing.expectEqualStrings("a", diff_file.canonicalPathKey(unstaged_source).?);
     try expectFreshCanonicalActionCapabilities(&app, allocator, roots.a);
+}
+
+test "Review canonical publication exact reuse rebinds every retained lineage owner" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+
+    const PresentationOwner = enum { self_owned, primary_backed };
+    const ReuseKind = enum { combined, staged_only };
+    for ([_]PresentationOwner{ .self_owned, .primary_backed }) |owner| {
+        for ([_]ReuseKind{ .combined, .staged_only }) |kind| {
+            var app = switch (owner) {
+                .self_owned => try canonicalPublicationTestApp(allocator, roots.a),
+                .primary_backed => try canonicalPublicationPrimaryTestApp(allocator, roots.a),
+            };
+            defer app.pages.review.deinit(allocator);
+            defer app.repo_state.deinit(allocator);
+            var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+            const token_before = try installCanonicalPublicationLineageOwners(
+                &app,
+                allocator,
+                roots.a,
+            );
+            const clipboard_before = try app.pages.review.completed_selection.?.clipboardText(
+                allocator,
+            );
+            defer allocator.free(clipboard_before);
+            const source_revision_before = app.pages.review.source_session_revision;
+
+            try finishCanonicalPublicationAction(
+                &app,
+                &ctx,
+                allocator,
+                .stage_file,
+                roots.a,
+            );
+            const reads = try takeCanonicalPublicationReads(&ctx, allocator);
+            try finishCanonicalPublicationSource(
+                &app,
+                &ctx,
+                allocator,
+                reads,
+                canonical_publication_combined_diff,
+            );
+            try finishCanonicalPublicationStatus(
+                &app,
+                &ctx,
+                allocator,
+                roots.a,
+                reads,
+                switch (kind) {
+                    .combined => "MM a\x00",
+                    .staged_only => "M  a\x00",
+                },
+            );
+            try app.ensureReviewProjection(&ctx);
+            var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
+            try std.testing.expectEqual(
+                switch (kind) {
+                    .combined => app_review_projection.Kind.combined_hunks,
+                    .staged_only => app_review_projection.Kind.cached_diff,
+                },
+                request.kind,
+            );
+            const expected = request.expected_presentation orelse
+                return error.ExpectedPriorCanonicalPresentation;
+            try std.testing.expectEqual(
+                switch (owner) {
+                    .self_owned => app_review_projection.ExpectedPresentationOwner.combined_projection,
+                    .primary_backed => app_review_projection.ExpectedPresentationOwner.primary_loaded,
+                },
+                expected.owner,
+            );
+            switch (kind) {
+                .combined => {
+                    var candidate = try canonicalPublicationReuseCandidate(
+                        allocator,
+                        request.status_snapshot_revision,
+                    );
+                    const current = app.reviewNavigationView().displayedDiffFile() orelse
+                        return error.ExpectedDisplayedDiff;
+                    try std.testing.expect(diff_presentation_identity.exactEqual(
+                        current,
+                        candidate.displayFile(),
+                    ));
+                    try app.finishReviewProjectionLoad(&ctx, .{
+                        .request = request,
+                        .result = .{ .reuse_candidate = candidate },
+                    });
+                    candidate = undefined;
+                },
+                .staged_only => {
+                    var candidate = try canonicalPublicationStagedOnlyReuseCandidate(
+                        allocator,
+                        request.status_snapshot_revision,
+                    );
+                    const current = app.reviewNavigationView().displayedDiffFile() orelse
+                        return error.ExpectedDisplayedDiff;
+                    try std.testing.expect(diff_presentation_identity.exactEqual(
+                        current,
+                        candidate.displayFile(),
+                    ));
+                    try app.finishReviewProjectionLoad(&ctx, .{
+                        .request = request,
+                        .result = .{ .staged_only_reuse_candidate = candidate },
+                    });
+                    candidate = undefined;
+                },
+            }
+            request = undefined;
+            try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
+
+            try std.testing.expectEqual(
+                source_revision_before + 1,
+                app.pages.review.source_session_revision,
+            );
+            const token_after = app.reviewNavigationView().currentContentToken() orelse
+                return error.ExpectedReviewContentToken;
+            try std.testing.expect(!token_after.eql(token_before));
+            const completed = app.pages.review.completed_selection orelse
+                return error.ExpectedRetainedCompletedSelection;
+            try std.testing.expect(completed.token.eql(token_after));
+            const clipboard_after = try completed.clipboardText(allocator);
+            defer allocator.free(clipboard_after);
+            try std.testing.expectEqualStrings(clipboard_before, clipboard_after);
+            try std.testing.expect(app.pages.review.staged_hunks.containsExact(
+                roots.a,
+                "a",
+                .{ .content = token_after, .display_hunk_index = 1 },
+            ));
+            try std.testing.expect(!app.pages.review.staged_hunks.containsExact(
+                roots.a,
+                "a",
+                .{ .content = token_before, .display_hunk_index = 1 },
+            ));
+        }
+    }
 }
 
 test "Review canonical publication startup and status failure retain last good owners" {

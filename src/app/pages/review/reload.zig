@@ -136,6 +136,29 @@ pub const SourceApply = struct {
     terminal_admitted: bool = false,
 };
 
+const PreparedCanonicalSource = union(enum) {
+    unchanged,
+    empty,
+    loaded: load_state.LoadedSession,
+
+    fn deinit(self: *PreparedCanonicalSource, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .loaded => |*session| session.deinit(allocator),
+            .unchanged, .empty => {},
+        }
+        self.* = .unchanged;
+    }
+};
+
+const PreparedCanonicalCurrentTree = struct {
+    tree: file_tree.FileTree,
+    visible_nodes: []usize,
+    visible_node_count: usize,
+    root_disclosure: file_tree.RootDisclosure,
+    previous_path_key: ?[]const u8,
+    previous_sidebar_identity: ?context.SidebarIdentity,
+};
+
 pub const DeferredSourceApplyOutcome = struct {
     source: SourceApply,
     owned_failure_message: ?[]u8 = null,
@@ -1149,6 +1172,151 @@ pub const Controller = struct {
         self.page.branch_status.clear();
     }
 
+    fn canonicalPublicationPath(
+        self: Controller,
+        repo_root: []const u8,
+        options: SourceLoadOptions,
+    ) ?[]const u8 {
+        if (options.clear_visible_state) return null;
+        switch (options.kind) {
+            .watch, .action_result => {},
+            .initial, .manual, .repo_switch => return null,
+        }
+        if (!diff_source.sourceAllowsStageProjection(self.source)) return null;
+        const displayed = self.page.review_projection.displayed.request() orelse return null;
+        if (!std.mem.eql(u8, displayed.repo_root, repo_root)) return null;
+        if (displayed.source_kind != sourceKind(self.source)) return null;
+        if (self.page.action_cursor.target()) |target| {
+            if (target.kind == .file and target.path_key.len > 0) return target.path_key;
+        }
+        return self.navigation.view().selectedStagePathKey() orelse displayed.path_key;
+    }
+
+    fn beginCanonicalPublication(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        repo_root: ?[]const u8,
+        options: SourceLoadOptions,
+        identity: app_page.RequestIdentity,
+        generation: u64,
+    ) !void {
+        const root = repo_root orelse return;
+        const path_key = self.canonicalPublicationPath(root, options) orelse return;
+        const owned_root = try allocator.dupe(u8, root);
+        errdefer allocator.free(owned_root);
+        const owned_path = try allocator.dupe(u8, path_key);
+        self.page.canonical_publication = .{
+            .identity = identity,
+            .read_epoch = self.page.repository_read_authority.epoch,
+            .source_generation = generation,
+            .kind = options.kind,
+            .repo_root = owned_root,
+            .path_key = owned_path,
+        };
+    }
+
+    fn canonicalGateMatchesSource(
+        self: Controller,
+        finished: *const app_load.DiffLoadFinished,
+    ) bool {
+        const gate = self.page.canonical_publication orelse return false;
+        return gate.phase == .waiting_members and
+            gate.source_generation == finished.generation and
+            gate.identity.origin == finished.identity.origin and
+            gate.identity.repo_epoch == finished.identity.repo_epoch and
+            gate.identity.activation_id == finished.identity.activation_id and
+            gate.read_epoch.eql(finished.read_epoch);
+    }
+
+    fn canonicalGateMatchesStatus(
+        self: Controller,
+        result: *const app_load.StatusLoadFinished,
+    ) bool {
+        const gate = self.page.canonical_publication orelse return false;
+        const generation = gate.status_generation orelse return false;
+        return gate.phase == .waiting_members and
+            generation == result.generation and
+            gate.identity.origin == result.identity.origin and
+            gate.identity.repo_epoch == result.identity.repo_epoch and
+            gate.identity.activation_id == result.identity.activation_id and
+            gate.status_read_epoch.eql(result.read_epoch) and
+            std.mem.eql(u8, gate.repo_root, result.repo_root);
+    }
+
+    fn refreshCanonicalPath(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        gate: anytype,
+    ) !bool {
+        const selected = self.navigation.view().selectedStagePathKey() orelse return false;
+        if (selected.len == 0 or std.mem.eql(u8, selected, gate.path_key)) return false;
+        const owned = try allocator.dupe(u8, selected);
+        allocator.free(gate.path_key);
+        gate.path_key = owned;
+        return true;
+    }
+
+    fn abortCanonicalPublication(self: Controller, allocator: std.mem.Allocator) void {
+        if (self.page.canonical_publication == null) return;
+        self.page.canonical_publication.?.phase = .aborting;
+        const gate_identity = self.page.canonical_publication.?.identity;
+        const source_generation = self.page.canonical_publication.?.source_generation;
+        const projection_request_id = self.page.canonical_publication.?.projection_request_id;
+        if (self.page.canonical_publication.?.status_generation) |status_generation| {
+            if (self.page.status_load.pending) |pending| {
+                if (pending.generation == status_generation and
+                    pending.read_epoch.eql(self.page.canonical_publication.?.status_read_epoch) and
+                    pending.background_cycle_id == self.page.canonical_publication.?.status_background_cycle_id)
+                {
+                    self.page.canonical_status_drain = .{
+                        .generation = status_generation,
+                        .read_epoch = pending.read_epoch,
+                        .background_cycle_id = pending.background_cycle_id,
+                    };
+                }
+            }
+        }
+
+        if (projection_request_id) |request_id| {
+            if (self.page.deferred_projection_apply) |*deferred| {
+                if (deferred.finished.request.id == request_id) {
+                    deferred.deinit(allocator);
+                    self.page.deferred_projection_apply = null;
+                }
+            }
+            if (self.page.review_projection.pending) |pending| {
+                if (pending.id == request_id) self.page.review_projection.clearPending(allocator);
+            }
+        }
+
+        if (self.page.deferred_source_apply) |deferred| {
+            if (deferred.mode == .canonical_publication and
+                deferred.finished.generation == source_generation)
+            {
+                var owned = deferred;
+                self.page.deferred_source_apply = null;
+                if (self.takeOwnedSourceTerminal(&owned.finished)) |pending_value| {
+                    var pending = pending_value;
+                    pending.deinit(allocator);
+                }
+                if (owned.cycle_id != 0) {
+                    self.page.auto_reload.finishMember(owned.cycle_id, .deferred_source_apply);
+                }
+                owned.deinit(allocator);
+            }
+        } else {
+            _ = self.page.load.clearPendingIfCurrent(.{ .diff_load = source_generation });
+            self.clearPendingReloadIfGeneration(allocator, source_generation);
+        }
+
+        self.navigation.clearActionCursor(allocator);
+        _ = self.page.activation.finishMember(gate_identity, .source, .failed);
+        _ = self.page.activation.finishMember(gate_identity, .status, .failed);
+        var gate = self.page.canonical_publication.?;
+        self.page.canonical_publication = null;
+        gate.deinit(allocator);
+    }
+
     pub fn beginPendingReload(self: Controller, allocator: std.mem.Allocator, generation: u64, kind: review_page.ReloadKind) !void {
         self.clearPendingReload(allocator);
         const anchor = switch (kind) {
@@ -1214,6 +1382,7 @@ pub const Controller = struct {
     }
 
     pub fn clearPendingReload(self: Controller, allocator: std.mem.Allocator) void {
+        self.abortCanonicalPublication(allocator);
         if (self.page.pending_reload) |*pending| pending.deinit(allocator);
         self.page.pending_reload = null;
     }
@@ -1263,7 +1432,12 @@ pub const Controller = struct {
     }
 
     pub fn clearDeferredSourceApply(self: Controller, allocator: std.mem.Allocator) void {
-        var deferred = self.page.deferred_source_apply orelse return;
+        const current = self.page.deferred_source_apply orelse return;
+        if (current.mode == .canonical_publication) {
+            self.abortCanonicalPublication(allocator);
+            return;
+        }
+        var deferred = current;
         self.page.deferred_source_apply = null;
         _ = self.retireOwnedSourceTerminal(allocator, &deferred.finished);
         self.page.auto_reload.finishMember(deferred.cycle_id, .deferred_source_apply);
@@ -1279,6 +1453,7 @@ pub const Controller = struct {
         background_blocked: bool,
     ) !?DeferredSourceApplyOutcome {
         const deferred = self.page.deferred_source_apply orelse return null;
+        if (deferred.mode == .canonical_publication) return null;
         self.page.deferred_source_apply = null;
         const publication_admitted = deferred.finished.background_cycle_id == deferred.cycle_id and
             !background_blocked and
@@ -1317,6 +1492,7 @@ pub const Controller = struct {
     ) !ReviewUpdate {
         try self.requireRepositoryReadStart();
         const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
+        self.abortCanonicalPublication(allocator);
         if (options.kind != .watch) self.clearDeferredSourceApply(allocator);
         if (options.kind == .repo_switch) self.page.auto_reload.clearAcceptedSource();
 
@@ -1330,6 +1506,10 @@ pub const Controller = struct {
         errdefer _ = self.page.load.clearPendingIfCurrent(.{ .diff_load = generation });
         try self.beginPendingReload(allocator, generation, options.kind);
         errdefer self.clearPendingReloadIfGeneration(allocator, generation);
+        try self.beginCanonicalPublication(allocator, repo_root, options, identity, generation);
+        errdefer if (self.page.canonical_publication) |gate| {
+            if (gate.source_generation == generation) self.abortCanonicalPublication(allocator);
+        };
 
         const expected_fingerprint = if (options.kind == .watch and !options.clear_visible_state)
             if (self.page.auto_reload.accepted_source) |accepted| accepted.fingerprint else null
@@ -1392,7 +1572,15 @@ pub const Controller = struct {
     ) !ReviewUpdate {
         try self.requireRepositoryReadStart();
         const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
-        if (self.page.git_status.repo_root) |current_root| {
+        const canonical_prerequisite = if (self.page.canonical_publication) |gate|
+            gate.phase == .waiting_members and
+                gate.read_epoch.eql(self.page.repository_read_authority.epoch) and
+                std.mem.eql(u8, gate.repo_root, repo_root)
+        else
+            false;
+        if (canonical_prerequisite) {
+            self.invalidateStatusSnapshot();
+        } else if (self.page.git_status.repo_root) |current_root| {
             if (std.mem.eql(u8, current_root, repo_root)) {
                 self.invalidateStatusSnapshot();
             } else {
@@ -1403,6 +1591,16 @@ pub const Controller = struct {
         }
         const owned_root = try allocator.dupe(u8, repo_root);
         self.page.status_load.begin(background_cycle_id, self.page.repository_read_authority.epoch);
+        if (self.page.canonical_publication) |*gate| {
+            if (gate.phase == .waiting_members and
+                gate.read_epoch.eql(self.page.repository_read_authority.epoch) and
+                std.mem.eql(u8, gate.repo_root, repo_root))
+            {
+                gate.status_generation = self.page.status_load.generation;
+                gate.status_read_epoch = self.page.repository_read_authority.epoch;
+                gate.status_background_cycle_id = background_cycle_id;
+            }
+        }
         self.page.activation.markPending(.status);
         return .{ .command = .{ .status_load = .{
             .identity = identity,
@@ -1463,10 +1661,372 @@ pub const Controller = struct {
         self.failActiveMember(.branch);
     }
 
-    pub fn rejectSourceSpawn(self: Controller, allocator: std.mem.Allocator, generation: u64) void {
+    pub fn rejectSourceSpawn(self: Controller, allocator: std.mem.Allocator, generation: u64) bool {
+        if (self.page.canonical_publication) |gate| {
+            if (gate.source_generation == generation) {
+                self.abortCanonicalPublication(allocator);
+                return true;
+            }
+        }
         _ = self.page.load.clearPendingIfCurrent(.{ .diff_load = generation });
         self.clearPendingReloadIfGeneration(allocator, generation);
         self.failActiveMember(.source);
+        return false;
+    }
+
+    fn canonicalSourceChanges(self: Controller, gate: anytype) bool {
+        const deferred = self.page.deferred_source_apply orelse return false;
+        if (deferred.mode != .canonical_publication or
+            deferred.finished.generation != gate.source_generation) return false;
+        return switch (deferred.finished.result) {
+            .unchanged => false,
+            .empty => true,
+            .loaded => |bundle| if (gate.kind == .watch)
+                if (self.navigation.view().activeLoadedDiffConst()) |loaded|
+                    !std.mem.eql(u8, loaded.text, bundle.loaded.text)
+                else
+                    true
+            else
+                true,
+            .failed, .failed_static => false,
+        };
+    }
+
+    fn canonicalStatusRevision(self: Controller, gate: anytype) u64 {
+        return self.page.status_snapshot_revision + @intFromBool(gate.status.changesSnapshot());
+    }
+
+    fn canonicalCandidateSourceFile(
+        self: Controller,
+        gate: anytype,
+    ) ?diff_parser.FileDiff {
+        const deferred = self.page.deferred_source_apply orelse return null;
+        if (deferred.mode != .canonical_publication or
+            deferred.finished.generation != gate.source_generation) return null;
+        const document = switch (deferred.finished.result) {
+            .loaded => |bundle| bundle.loaded.document,
+            .unchanged => if (self.navigation.view().activeLoadedDiffConst()) |loaded|
+                loaded.document
+            else
+                return null,
+            .empty, .failed, .failed_static => return null,
+        };
+        for (document.files) |file| {
+            const path_key = diff_file.canonicalPathKey(file) orelse continue;
+            if (std.mem.eql(u8, path_key, gate.path_key)) return file;
+        }
+        return null;
+    }
+
+    fn canonicalExpectedPresentation(
+        self: Controller,
+        gate: anytype,
+        target: ProjectionTarget,
+    ) ?review_projection.ExpectedPresentation {
+        const expected = self.expectedPresentationForTarget(target) orelse return null;
+        if (expected.owner != .primary_loaded or !self.canonicalSourceChanges(gate)) {
+            return expected;
+        }
+        const primary = switch (self.navigation.view().displayedReviewBody()) {
+            .primary => |value| value,
+            else => return null,
+        };
+        const candidate = self.canonicalCandidateSourceFile(gate) orelse return null;
+        return if (diff_presentation_identity.exactEqual(
+            primary.loaded.document.files[primary.file_index],
+            candidate,
+        ))
+            expected
+        else
+            null;
+    }
+
+    fn canonicalProjectionKind(
+        self: Controller,
+        gate: anytype,
+        displayed_kind: review_projection.Kind,
+    ) ?review_projection.Kind {
+        const deferred = self.page.deferred_source_apply orelse return null;
+        if (deferred.finished.result == .unchanged) {
+            const displayed = self.page.review_projection.displayed.request() orelse return null;
+            if (std.mem.eql(u8, displayed.path_key, gate.path_key)) return displayed_kind;
+        }
+        const status_document = self.canonicalStatusDocument(gate);
+        for (status_document.entries) |entry| {
+            const path_key = entry.canonicalPathKey() orelse continue;
+            if (!std.mem.eql(u8, path_key, gate.path_key)) continue;
+            return switch (file_tree.stagePresenceFromEntry(entry)) {
+                .mixed => .combined_hunks,
+                .staged_only => .cached_diff,
+                .untracked => .generated_added_file,
+                .unstaged_only, .conflict, .clean_or_unknown => null,
+            };
+        }
+        return null;
+    }
+
+    fn commitCanonicalNoop(
+        self: Controller,
+        allocator: std.mem.Allocator,
+    ) void {
+        const gate = if (self.page.canonical_publication) |*value| value else return;
+        var deferred = self.page.deferred_source_apply orelse return;
+        std.debug.assert(deferred.mode == .canonical_publication);
+        std.debug.assert(deferred.finished.generation == gate.source_generation);
+        if (!self.sourceTerminalOwnsPending(&deferred.finished)) {
+            self.abortCanonicalPublication(allocator);
+            return;
+        }
+        const fingerprint = canonicalSourceFingerprint(&deferred);
+        const source_completion = self.page.action_cursor.captureCompletion(
+            deferred.finished.identity.repo_epoch,
+            .source,
+            deferred.finished.generation,
+        );
+        var pending_reload = self.takeOwnedSourceTerminal(&deferred.finished) orelse unreachable;
+        defer pending_reload.deinit(allocator);
+        self.page.deferred_source_apply = null;
+        self.page.status_load.markSuccess();
+        if (self.acceptSourceFingerprint(fingerprint)) |failure| {
+            _ = self.page.status.clearSourceReloadFailure(failure.digest);
+        }
+        _ = self.page.activation.finishMember(
+            deferred.finished.identity,
+            .source,
+            self.acceptedSourceMember(),
+        );
+        if (source_completion) |completion| {
+            _ = self.page.action_cursor.finishCompletion(completion, true);
+        }
+        _ = self.navigation.finalizeActionCursor(allocator);
+        if (deferred.cycle_id != 0) {
+            self.page.auto_reload.finishMember(
+                deferred.cycle_id,
+                .deferred_source_apply,
+            );
+        }
+        deferred.deinit(allocator);
+        var finished_gate = self.page.canonical_publication.?;
+        self.page.canonical_publication = null;
+        finished_gate.deinit(allocator);
+    }
+
+    fn commitCanonicalPrimary(
+        self: Controller,
+        allocator: std.mem.Allocator,
+    ) !void {
+        const gate = if (self.page.canonical_publication) |*value| value else return;
+        var deferred = self.page.deferred_source_apply orelse return;
+        if (deferred.mode != .canonical_publication or
+            deferred.finished.generation != gate.source_generation or
+            !self.sourceTerminalOwnsPending(&deferred.finished))
+        {
+            self.abortCanonicalPublication(allocator);
+            return;
+        }
+        const source_changes = self.canonicalSourceChanges(gate);
+        const status_changes = gate.status.changesSnapshot();
+        const expected_source_revision = self.page.source_session_revision +
+            @intFromBool(source_changes);
+        const expected_status_revision = self.canonicalStatusRevision(gate);
+        const fingerprint = canonicalSourceFingerprint(&deferred);
+        var final_anchor = try self.view().captureAnchor(allocator);
+        defer if (final_anchor) |*anchor| anchor.deinit(allocator);
+        var prepared_source = self.prepareCanonicalSource(
+            allocator,
+            gate,
+            &deferred,
+        ) catch |err| {
+            self.abortCanonicalPublication(allocator);
+            return err;
+        };
+        defer prepared_source.deinit(allocator);
+        var prepared_tree = if (!source_changes and status_changes)
+            self.prepareCanonicalCurrentTree(
+                allocator,
+                self.canonicalStatusDocument(gate),
+            ) catch |err| {
+                self.abortCanonicalPublication(allocator);
+                return err;
+            }
+        else
+            null;
+
+        gate.phase = .committing;
+        const source_completion = self.page.action_cursor.captureCompletion(
+            deferred.finished.identity.repo_epoch,
+            .source,
+            deferred.finished.generation,
+        );
+        var pending_reload = self.takeOwnedSourceTerminal(&deferred.finished) orelse unreachable;
+        defer pending_reload.deinit(allocator);
+        self.page.deferred_source_apply = null;
+
+        if (source_changes or status_changes) {
+            self.page.file_search.markProjectionUnavailable(allocator);
+            self.page.accepted_sidebar_revision = file_search.nextAcceptedSidebarRevision(
+                self.page.accepted_sidebar_revision,
+            );
+        }
+        self.page.review_projection.clearPending(allocator);
+        self.page.review_projection.clearSyntaxPending(allocator);
+        self.page.review_projection.clearDisplayed(allocator);
+        self.page.review_projection.clearCache(allocator);
+        self.clearCompletedSelection(allocator);
+        self.page.staged_hunks.clear(allocator);
+
+        var retiring_status: ?git_status.GitStatusState = null;
+        if (gate.status.takeReplacement()) |replacement| {
+            retiring_status = self.page.git_status;
+            self.page.git_status = replacement;
+        }
+        self.page.status_snapshot_revision = expected_status_revision;
+
+        var retiring_load: ?load_state.LoadState = null;
+        if (source_changes) {
+            retiring_load = self.page.load.state;
+            switch (prepared_source) {
+                .loaded => |session| {
+                    self.page.load.state = .{ .loaded = session };
+                    prepared_source = .unchanged;
+                },
+                .empty => self.page.load.state = .{ .empty = .no_changes },
+                .unchanged => unreachable,
+            }
+            self.page.source_session_revision = expected_source_revision;
+        }
+        if (prepared_tree) |*tree| self.installCanonicalCurrentTree(tree);
+
+        if (final_anchor) |*anchor| {
+            if (self.navigation.activeLoadedDiff()) |loaded| {
+                _ = self.navigation.restoreReloadAnchor(loaded, anchor);
+            }
+            self.restoreDisplayedNavigation(anchor);
+        } else {
+            self.navigation.refreshSearchForSelectedFile();
+        }
+        self.page.status_load.markSuccess();
+        self.page.pending_initial_first_visible_selection = false;
+        if (self.acceptSourceFingerprint(fingerprint)) |failure| {
+            _ = self.page.status.clearSourceReloadFailure(failure.digest);
+        }
+        _ = self.page.activation.finishMember(
+            deferred.finished.identity,
+            .source,
+            self.acceptedSourceMember(),
+        );
+        if (source_completion) |completion| {
+            _ = self.page.action_cursor.finishCompletion(completion, true);
+        }
+        _ = self.navigation.finalizeActionCursor(allocator);
+        self.navigation.rebuildFileSearchProjection(allocator);
+
+        if (retiring_load) |*state| deinitRetiringLoadState(state, allocator);
+        if (retiring_status) |*status| status.deinit();
+        if (deferred.cycle_id != 0) {
+            self.page.auto_reload.finishMember(
+                deferred.cycle_id,
+                .deferred_source_apply,
+            );
+        }
+        deferred.deinit(allocator);
+        var finished_gate = self.page.canonical_publication.?;
+        self.page.canonical_publication = null;
+        finished_gate.deinit(allocator);
+    }
+
+    fn prepareCanonicalProjection(
+        self: Controller,
+        allocator_opt: ?std.mem.Allocator,
+    ) !ReviewUpdate {
+        const gate = if (self.page.canonical_publication) |*value| value else return .{};
+        if (gate.phase == .waiting_projection) return .{};
+        if (gate.phase != .waiting_members or !gate.status.ready()) return .{};
+        const deferred = self.page.deferred_source_apply orelse return .{};
+        if (deferred.mode != .canonical_publication or
+            deferred.finished.generation != gate.source_generation) return .{};
+
+        const allocator = allocator_opt orelse return error.MissingAllocator;
+        errdefer self.abortCanonicalPublication(allocator);
+        _ = try self.refreshCanonicalPath(allocator, gate);
+        const displayed = self.page.review_projection.displayed.request() orelse {
+            self.abortCanonicalPublication(allocator);
+            return .{};
+        };
+        const projection_kind = self.canonicalProjectionKind(gate, displayed.kind) orelse {
+            try self.commitCanonicalPrimary(allocator);
+            return .{};
+        };
+        const target: ProjectionTarget = .{
+            .repo_root = gate.repo_root,
+            .path_key = gate.path_key,
+            .kind = projection_kind,
+            .source_kind = sourceKind(self.source),
+        };
+        if (!self.canonicalSourceChanges(gate) and
+            !gate.status.changesSnapshot() and
+            displayed.matchesBorrowed(
+                gate.read_epoch,
+                target.repo_root,
+                target.path_key,
+                target.kind,
+                target.source_kind,
+                self.page.source_session_revision,
+                self.page.status_snapshot_revision,
+            ))
+        {
+            self.commitCanonicalNoop(allocator);
+            return .{};
+        }
+        const expected_presentation = self.canonicalExpectedPresentation(gate, target);
+        const source_revision = self.page.source_session_revision +
+            @intFromBool(self.canonicalSourceChanges(gate));
+        const status_revision = self.canonicalStatusRevision(gate);
+
+        self.page.review_projection_next_id +%= 1;
+        if (self.page.review_projection_next_id == 0) self.page.review_projection_next_id = 1;
+        const request_id = self.page.review_projection_next_id;
+        var state_request = try review_projection.cloneRequestWithOptions(
+            allocator,
+            gate.identity,
+            request_id,
+            gate.repo_root,
+            gate.path_key,
+            target.kind,
+            target.source_kind,
+            source_revision,
+            status_revision,
+            .{
+                .read_epoch = gate.read_epoch,
+                .root_identity = self.root_identity,
+                .expected_presentation = expected_presentation,
+            },
+        );
+        errdefer state_request.deinit(allocator);
+        var task_request = try review_projection.cloneRequestWithOptions(
+            allocator,
+            gate.identity,
+            request_id,
+            gate.repo_root,
+            gate.path_key,
+            target.kind,
+            target.source_kind,
+            source_revision,
+            status_revision,
+            .{
+                .read_epoch = gate.read_epoch,
+                .root_identity = self.root_identity,
+                .expected_presentation = expected_presentation,
+            },
+        );
+        errdefer task_request.deinit(allocator);
+
+        self.page.review_projection.clearPending(allocator);
+        self.page.review_projection.pending = state_request;
+        state_request = undefined;
+        gate.phase = .waiting_projection;
+        gate.projection_request_id = request_id;
+        return .{ .command = .{ .review_projection = task_request } };
     }
 
     /// Reconciles projection identity and, only when a read is required,
@@ -1483,6 +2043,9 @@ pub const Controller = struct {
         // owner. A live drag borrows that owner, so even cache promotion and
         // no-target cleanup wait until release/cancel has ended the borrow.
         if (self.displayMutationBlockedByDrag()) return .{};
+        if (self.page.canonical_publication != null) {
+            return self.prepareCanonicalProjection(allocator_opt);
+        }
         const read_epoch = self.page.repository_read_authority.epoch;
 
         const target = self.view().projectionTarget() orelse {
@@ -1726,6 +2289,12 @@ pub const Controller = struct {
     pub fn rejectProjectionSpawn(self: Controller, allocator: std.mem.Allocator, request_id: u64) void {
         const pending = if (self.page.review_projection.pending) |*request| request else return;
         if (pending.id != request_id) return;
+        if (self.page.canonical_publication) |gate| {
+            if (gate.projection_request_id == request_id) {
+                self.abortCanonicalPublication(allocator);
+                return;
+            }
+        }
         self.clearCompletedSelectionForProjection(allocator, .{
             .repo_root = pending.repo_root,
             .path_key = pending.path_key,
@@ -1974,12 +2543,81 @@ pub const Controller = struct {
             .read_epoch = result.read_epoch,
             .background_cycle_id = result.background_cycle_id,
         };
+        const drain_terminal = if (self.page.canonical_status_drain) |drain|
+            drain.generation == terminal.generation and
+                drain.read_epoch.eql(terminal.read_epoch) and
+                drain.background_cycle_id == terminal.background_cycle_id
+        else
+            false;
+        const canonical_terminal = self.canonicalGateMatchesStatus(result);
         const publication_admitted = !background_blocked and
             self.acceptsIdentity(result.identity) and
             self.acceptsRepositoryReadCompletion(result.read_epoch, result.background_cycle_id);
         self.page.auto_reload.finishMember(result.background_cycle_id, .status);
         const owns_terminal = self.page.status_load.finishTerminal(terminal);
-        if (!owns_terminal or !publication_admitted) return .{ .skip_redraw = true };
+        if (drain_terminal) {
+            self.page.canonical_status_drain = null;
+            if (owns_terminal) {
+                self.page.status_load.markFailure(self.page.git_status.repo_root != null);
+                _ = self.page.activation.finishMember(result.identity, .status, .failed);
+            }
+            return .{ .skip_redraw = true, .terminal_admitted = owns_terminal };
+        }
+        if (!owns_terminal) return .{ .skip_redraw = true };
+        if (!publication_admitted) {
+            if (canonical_terminal) self.abortCanonicalPublication(allocator);
+            return .{ .skip_redraw = true };
+        }
+
+        if (canonical_terminal) {
+            switch (result.result) {
+                .empty => {
+                    const same_root = if (self.page.git_status.repo_root) |root|
+                        std.mem.eql(u8, root, result.repo_root)
+                    else
+                        false;
+                    if (same_root and self.page.git_status.document.entries.len == 0) {
+                        self.page.canonical_publication.?.status = .identical;
+                    } else {
+                        self.page.canonical_publication.?.status = .{ .replacement = .{} };
+                    }
+                    _ = self.page.activation.finishMember(result.identity, .status, .fresh);
+                    self.page.pending_initial_first_visible_selection = false;
+                    return .{ .skip_redraw = true, .terminal_admitted = true };
+                },
+                .loaded => |*bundle| {
+                    const identical = if (self.page.git_status.repo_root) |root|
+                        std.mem.eql(u8, root, result.repo_root) and
+                            self.page.git_status.document.eql(bundle.document)
+                    else
+                        false;
+                    if (identical) {
+                        self.page.canonical_publication.?.status = .identical;
+                    } else {
+                        var candidate: git_status.GitStatusState = .{};
+                        candidate.replace(result.repo_root, bundle) catch |err| {
+                            self.abortCanonicalPublication(allocator);
+                            return err;
+                        };
+                        self.page.canonical_publication.?.status = .{ .replacement = candidate };
+                        result.result = .empty;
+                    }
+                    _ = self.page.activation.finishMember(result.identity, .status, .fresh);
+                    self.page.pending_initial_first_visible_selection = false;
+                    return .{ .skip_redraw = true, .terminal_admitted = true };
+                },
+                .failed => |message| return self.applyCanonicalStatusFailure(
+                    allocator,
+                    result.identity,
+                    std.mem.trim(u8, message, " \t\r\n"),
+                ),
+                .failed_static => |message| return self.applyCanonicalStatusFailure(
+                    allocator,
+                    result.identity,
+                    message,
+                ),
+            }
+        }
 
         switch (result.result) {
             .empty => {
@@ -2027,6 +2665,22 @@ pub const Controller = struct {
             .failed => |message| return self.applyStatusFailure(allocator, result.identity, result.background_cycle_id, std.mem.trim(u8, message, " \t\r\n")),
             .failed_static => |message| return self.applyStatusFailure(allocator, result.identity, result.background_cycle_id, message),
         }
+    }
+
+    fn applyCanonicalStatusFailure(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        identity: app_page.RequestIdentity,
+        message: []const u8,
+    ) CompletionApply {
+        self.page.status_load.markFailure(self.page.git_status.repo_root != null);
+        _ = self.page.activation.finishMember(identity, .status, .failed);
+        self.page.pending_initial_first_visible_selection = false;
+        self.abortCanonicalPublication(allocator);
+        return .{
+            .diagnostic = .{ .status_load_failed = message },
+            .terminal_admitted = true,
+        };
     }
 
     fn applyStatusFailure(self: Controller, allocator: std.mem.Allocator, identity: app_page.RequestIdentity, background_cycle_id: ?u64, message: []const u8) CompletionApply {
@@ -2100,6 +2754,621 @@ pub const Controller = struct {
         return .{ .diagnostic = .{ .branch_status_load_failed = message }, .terminal_admitted = true };
     }
 
+    fn canonicalStatusDocument(
+        self: Controller,
+        gate: anytype,
+    ) git_status.StatusDocument {
+        return switch (gate.status) {
+            .pending => unreachable,
+            .identical => self.page.git_status.document,
+            .replacement => |status| status.document,
+        };
+    }
+
+    fn prepareCanonicalLoadedSource(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        bundle: *app_load.LoadedDiffBundle,
+        status_document: git_status.StatusDocument,
+    ) !PreparedCanonicalSource {
+        var arena = bundle.takeArena();
+        errdefer arena.deinit();
+        var loaded = bundle.loaded;
+        try self.navigation.materializeReviewedFiles(allocator, &loaded);
+        errdefer allocator.free(loaded.reviewed_files);
+        try self.navigation.ensureTreeOrderScope(allocator);
+        loaded.tree = try file_tree.buildWithOptions(
+            arena.allocator(),
+            loaded.document,
+            status_document,
+            .{
+                .root = self.navigation.view().fileTreeRootOptions(),
+                .stable_order = self.navigation.stableOrderOptions(allocator),
+            },
+        );
+        try loaded.rebuildVisibleNodes(
+            arena.allocator(),
+            self.page.viewer.root_disclosure,
+            self.page.review_display.hide_reviewed_files,
+            self.page.review_display.changed_file_filter,
+        );
+        return .{ .loaded = .{
+            .arena = arena,
+            .loaded = loaded,
+            .reviewed_files_owned = true,
+        } };
+    }
+
+    fn prepareCanonicalStatusOnlySource(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        status_document: git_status.StatusDocument,
+    ) !PreparedCanonicalSource {
+        if (status_document.entries.len == 0) return .empty;
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        errdefer arena.deinit();
+        const arena_allocator = arena.allocator();
+        const document = diff_parser.DiffDocument{ .files = &.{} };
+        try self.navigation.ensureTreeOrderScope(allocator);
+        var loaded: loaded_diff.LoadedDiff = .{
+            .text = "",
+            .document = document,
+            .file_text_eligibility = &.{},
+            .tree = try file_tree.buildWithOptions(
+                arena_allocator,
+                document,
+                status_document,
+                .{
+                    .root = self.navigation.view().fileTreeRootOptions(),
+                    .stable_order = self.navigation.stableOrderOptions(allocator),
+                },
+            ),
+            .rendered_line_cache = try diff_view_model.RenderedLineCache.build(
+                arena_allocator,
+                document,
+            ),
+            .collapsed_hunks = &.{},
+            .collapsed_dirs = .empty,
+            .bytes = 0,
+            .lines = 0,
+        };
+        try loaded.rebuildVisibleNodes(
+            arena_allocator,
+            self.page.viewer.root_disclosure,
+            false,
+            self.page.review_display.changed_file_filter,
+        );
+        return .{ .loaded = .{
+            .arena = arena,
+            .loaded = loaded,
+            .reviewed_files_owned = false,
+        } };
+    }
+
+    fn prepareCanonicalSource(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        gate: anytype,
+        deferred: *review_page.DeferredSourceApply,
+    ) !PreparedCanonicalSource {
+        if (!self.canonicalSourceChanges(gate)) return .unchanged;
+        const status_document = self.canonicalStatusDocument(gate);
+        return switch (deferred.finished.result) {
+            .empty => self.prepareCanonicalStatusOnlySource(allocator, status_document),
+            .loaded => |*bundle| self.prepareCanonicalLoadedSource(
+                allocator,
+                bundle,
+                status_document,
+            ),
+            .unchanged => .unchanged,
+            .failed, .failed_static => unreachable,
+        };
+    }
+
+    fn prepareCanonicalCurrentTree(
+        self: Controller,
+        app_allocator: std.mem.Allocator,
+        status_document: git_status.StatusDocument,
+    ) !?PreparedCanonicalCurrentTree {
+        const loaded = self.navigation.activeLoadedDiff() orelse return null;
+        const allocator = self.navigation.loadArenaAllocator() orelse return null;
+        const previous_path_key = self.navigation.view().selectedStagePathKey();
+        const previous_sidebar_identity = self.navigation.view().selectedSidebarIdentity();
+        try self.navigation.ensureTreeOrderScope(app_allocator);
+        const tree = try file_tree.buildWithOptions(
+            allocator,
+            loaded.document,
+            status_document,
+            .{
+                .root = self.navigation.view().fileTreeRootOptions(),
+                .stable_order = self.navigation.stableOrderOptions(app_allocator),
+            },
+        );
+        var shadow = loaded.*;
+        shadow.tree = tree;
+        shadow.visible_nodes = &.{};
+        shadow.visible_node_count = 0;
+        try shadow.rebuildVisibleNodes(
+            allocator,
+            self.page.viewer.root_disclosure,
+            self.page.review_display.hide_reviewed_files,
+            self.page.review_display.changed_file_filter,
+        );
+        return .{
+            .tree = tree,
+            .visible_nodes = shadow.visible_nodes,
+            .visible_node_count = shadow.visible_node_count,
+            .root_disclosure = shadow.root_disclosure,
+            .previous_path_key = previous_path_key,
+            .previous_sidebar_identity = previous_sidebar_identity,
+        };
+    }
+
+    fn installCanonicalCurrentTree(
+        self: Controller,
+        prepared: *PreparedCanonicalCurrentTree,
+    ) void {
+        const loaded = self.navigation.activeLoadedDiff() orelse unreachable;
+        loaded.tree = prepared.tree;
+        loaded.visible_nodes = prepared.visible_nodes;
+        loaded.visible_node_count = prepared.visible_node_count;
+        loaded.root_disclosure = prepared.root_disclosure;
+        if (prepared.previous_path_key) |path_key| {
+            if (navigation.findFileNodeByPathKey(loaded, path_key)) |node_index| {
+                self.navigation.selectSidebarNode(loaded, node_index);
+            }
+        }
+        if (prepared.previous_sidebar_identity) |identity| {
+            _ = self.navigation.restoreSidebarIdentity(loaded, identity);
+        }
+        self.navigation.reconcileSelectionAfterVisibleNodeChange(loaded);
+        prepared.* = undefined;
+    }
+
+    fn canonicalSourceFingerprint(
+        deferred: *const review_page.DeferredSourceApply,
+    ) content_fingerprint.Fingerprint {
+        return switch (deferred.finished.result) {
+            .empty => content_fingerprint.Fingerprint.init(""),
+            .unchanged => |fingerprint| fingerprint,
+            .loaded => |bundle| bundle.fingerprint,
+            .failed, .failed_static => unreachable,
+        };
+    }
+
+    fn deinitRetiringLoadState(
+        state: *load_state.LoadState,
+        allocator: std.mem.Allocator,
+    ) void {
+        switch (state.*) {
+            .loaded => |*session| session.deinit(allocator),
+            .failed => |*failed| failed.deinit(),
+            .idle, .loading, .empty => {},
+        }
+        state.* = .idle;
+    }
+
+    fn acceptsCanonicalCombinedReuseCandidate(
+        self: Controller,
+        request: review_projection.Request,
+        candidate: *const review_projection.CombinedReuseCandidate,
+    ) bool {
+        const expected = request.expected_presentation orelse return false;
+        if (!candidate.fingerprint.eql(expected.fingerprint)) return false;
+        const fresh = if (candidate.fresh_authority) |*value| value else return false;
+        if (fresh.status_snapshot_revision != request.status_snapshot_revision) return false;
+        if (fresh.cached_component.document.files.len != 1) return false;
+        const candidate_hunks = candidate.displayFile().hunks.len;
+        if (fresh.projection.hunk_stage_states.len != candidate_hunks or
+            fresh.projection.hunk_action_origins.len != candidate_hunks) return false;
+
+        return switch (expected.owner) {
+            .combined_projection => blk: {
+                const live = self.ownedCombinedPresentation() orelse break :blk false;
+                if (!live.presentation.content_token.eql(expected.content_token)) break :blk false;
+                if (!live.presentation.fingerprint.eql(expected.fingerprint)) break :blk false;
+                break :blk diff_presentation_identity.exactEqual(
+                    live.display_file,
+                    candidate.displayFile(),
+                );
+            },
+            .primary_loaded => blk: {
+                const primary = switch (self.navigation.view().displayedReviewBody()) {
+                    .primary => |value| value,
+                    else => break :blk false,
+                };
+                const live_file = primary.loaded.document.files[primary.file_index];
+                if (!diff_presentation_identity.fingerprint(live_file).eql(expected.fingerprint)) {
+                    break :blk false;
+                }
+                const expected_token = diff_presentation_identity.ContentToken.init(
+                    self.page.source_session_revision,
+                );
+                if (!expected_token.eql(expected.content_token)) break :blk false;
+                break :blk diff_presentation_identity.exactEqual(
+                    live_file,
+                    candidate.displayFile(),
+                );
+            },
+        };
+    }
+
+    fn installCanonicalCombinedReuse(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        result: *app_load.ReviewProjectionFinished,
+    ) ?PresentationLineage {
+        const candidate = &result.result.reuse_candidate;
+        std.debug.assert(self.acceptsCanonicalCombinedReuseCandidate(
+            result.request,
+            candidate,
+        ));
+        const outgoing_lineage = self.currentPresentationLineageForPath(
+            result.request.repo_root,
+            result.request.path_key,
+        );
+        const expected_owner = result.request.expected_presentation.?.owner;
+        self.page.review_projection.finishEagerRetry();
+        self.page.review_projection.clearPending(allocator);
+        const request = result.request;
+        result.request = undefined;
+        switch (expected_owner) {
+            .combined_projection => self.page.review_projection.installCombinedReuse(
+                allocator,
+                request,
+                candidate,
+            ),
+            .primary_loaded => self.page.review_projection.installPrimaryCombinedReuse(
+                allocator,
+                request,
+                candidate,
+            ),
+        }
+        candidate.deinit();
+        result.result = undefined;
+        self.reconcileRetainedPresentationNavigation(allocator);
+        return outgoing_lineage;
+    }
+
+    fn acceptsCanonicalStagedOnlyReuseCandidate(
+        self: Controller,
+        request: review_projection.Request,
+        candidate: *const review_projection.StagedOnlyReuseCandidate,
+    ) bool {
+        if (request.kind != .cached_diff) return false;
+        const expected = request.expected_presentation orelse return false;
+        if (!candidate.fingerprint.eql(expected.fingerprint)) return false;
+        const fresh = if (candidate.fresh_authority) |*value| value else return false;
+        if (fresh.status_snapshot_revision != request.status_snapshot_revision) return false;
+        if (fresh.cached_component.document.files.len != 1) return false;
+        const candidate_hunks = candidate.displayFile().hunks.len;
+        if (fresh.projection.hunk_stage_states.len != candidate_hunks or
+            fresh.projection.hunk_action_origins.len != candidate_hunks) return false;
+        for (fresh.projection.hunk_stage_states, fresh.projection.hunk_action_origins, 0..) |state, origin, hunk_index| {
+            if (state != .staged) return false;
+            switch (origin) {
+                .cached => |index| if (index != hunk_index) return false,
+                .unstaged => return false,
+            }
+        }
+        return switch (expected.owner) {
+            .combined_projection => blk: {
+                const live = self.navigation.view().activeCombinedProjection() orelse break :blk false;
+                break :blk diff_presentation_identity.exactEqual(
+                    live.displayFile(),
+                    candidate.displayFile(),
+                );
+            },
+            .primary_loaded => blk: {
+                const primary = switch (self.navigation.view().displayedReviewBody()) {
+                    .primary => |value| value,
+                    else => break :blk false,
+                };
+                break :blk diff_presentation_identity.exactEqual(
+                    primary.loaded.document.files[primary.file_index],
+                    candidate.displayFile(),
+                );
+            },
+        };
+    }
+
+    fn installCanonicalStagedOnlyReuse(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        result: *app_load.ReviewProjectionFinished,
+    ) ?PresentationLineage {
+        const candidate = &result.result.staged_only_reuse_candidate;
+        std.debug.assert(self.acceptsCanonicalStagedOnlyReuseCandidate(
+            result.request,
+            candidate,
+        ));
+        const outgoing_lineage = self.currentPresentationLineageForPath(
+            result.request.repo_root,
+            result.request.path_key,
+        );
+        const expected_owner = result.request.expected_presentation.?.owner;
+        self.page.review_projection.finishEagerRetry();
+        self.page.review_projection.clearPending(allocator);
+        const request = result.request;
+        result.request = undefined;
+        switch (expected_owner) {
+            .combined_projection => self.page.review_projection.installRetainedStagedOnlyReuse(
+                allocator,
+                request,
+                candidate,
+            ),
+            .primary_loaded => self.page.review_projection.installPrimaryStagedOnlyReuse(
+                allocator,
+                request,
+                candidate,
+            ),
+        }
+        candidate.deinit();
+        result.result = undefined;
+        self.reconcileRetainedPresentationNavigation(allocator);
+        return outgoing_lineage;
+    }
+
+    fn applyCanonicalProjectionFinished(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        result: *app_load.ReviewProjectionFinished,
+    ) !ProjectionApply {
+        const gate = if (self.page.canonical_publication) |*value| value else return .{ .skip_redraw = true };
+        if (gate.phase != .waiting_projection or
+            gate.projection_request_id != result.request.id) return .{ .skip_redraw = true };
+        errdefer self.abortCanonicalPublication(allocator);
+        if (try self.refreshCanonicalPath(allocator, gate)) {
+            self.page.review_projection.clearPending(allocator);
+            gate.phase = .waiting_members;
+            gate.projection_request_id = null;
+            return .{ .skip_redraw = true };
+        }
+        const source_changes = self.canonicalSourceChanges(gate);
+        const expected_source_revision = self.page.source_session_revision +
+            @intFromBool(source_changes);
+        const expected_status_revision = self.canonicalStatusRevision(gate);
+        const displayed = self.page.review_projection.displayed.request() orelse {
+            self.abortCanonicalPublication(allocator);
+            return .{ .skip_redraw = true };
+        };
+        const expected_kind = self.canonicalProjectionKind(gate, displayed.kind) orelse {
+            self.abortCanonicalPublication(allocator);
+            return .{ .skip_redraw = true };
+        };
+        if (!result.request.matchesBorrowed(
+            gate.read_epoch,
+            gate.repo_root,
+            gate.path_key,
+            expected_kind,
+            sourceKind(self.source),
+            expected_source_revision,
+            expected_status_revision,
+        ) or !result.request.matchesRootIdentity(self.root_identity)) {
+            return .{ .skip_redraw = true };
+        }
+        if (!self.acceptsIdentity(result.request.identity) or
+            !self.page.repository_read_authority.acceptsRead(result.request.read_epoch))
+        {
+            self.abortCanonicalPublication(allocator);
+            return .{ .skip_redraw = true };
+        }
+
+        if (self.displayMutationBlockedByDrag()) {
+            if (self.page.deferred_projection_apply != null) return .{ .skip_redraw = true };
+            self.page.deferred_projection_apply = .{ .finished = result.* };
+            return .{ .result_transferred = true, .skip_redraw = true };
+        }
+
+        const combined_reuse = result.result == .reuse_candidate;
+        const staged_only_reuse = result.result == .staged_only_reuse_candidate;
+        const reused = combined_reuse or staged_only_reuse;
+        if (combined_reuse and !self.acceptsCanonicalCombinedReuseCandidate(
+            result.request,
+            &result.result.reuse_candidate,
+        )) {
+            self.abortCanonicalPublication(allocator);
+            return .{ .skip_redraw = true };
+        }
+        if (staged_only_reuse and !self.acceptsCanonicalStagedOnlyReuseCandidate(
+            result.request,
+            &result.result.staged_only_reuse_candidate,
+        )) {
+            self.abortCanonicalPublication(allocator);
+            return .{ .skip_redraw = true };
+        }
+        var static_failure = switch (result.result) {
+            .failed_static => |message| try review_projection.statusBodyAlloc(
+                allocator,
+                result.request.path_key,
+                "{s}",
+                .{message},
+            ),
+            else => null,
+        };
+        defer if (static_failure) |*body| body.deinit(allocator);
+
+        var final_anchor = if (result.result == .ready)
+            try self.view().captureAnchor(allocator)
+        else
+            null;
+        defer if (final_anchor) |*anchor| anchor.deinit(allocator);
+
+        var deferred = self.page.deferred_source_apply orelse {
+            self.abortCanonicalPublication(allocator);
+            return .{ .skip_redraw = true };
+        };
+        if (deferred.mode != .canonical_publication or
+            deferred.finished.generation != gate.source_generation)
+        {
+            self.abortCanonicalPublication(allocator);
+            return .{ .skip_redraw = true };
+        }
+        if (!self.sourceTerminalOwnsPending(&deferred.finished)) {
+            self.abortCanonicalPublication(allocator);
+            return .{ .skip_redraw = true };
+        }
+        const fingerprint = canonicalSourceFingerprint(&deferred);
+        var prepared_source = self.prepareCanonicalSource(
+            allocator,
+            gate,
+            &deferred,
+        ) catch |err| {
+            self.abortCanonicalPublication(allocator);
+            return err;
+        };
+        defer prepared_source.deinit(allocator);
+
+        const status_changes = gate.status.changesSnapshot();
+        var prepared_tree = if (!source_changes and status_changes)
+            self.prepareCanonicalCurrentTree(
+                allocator,
+                self.canonicalStatusDocument(gate),
+            ) catch |err| {
+                self.abortCanonicalPublication(allocator);
+                return err;
+            }
+        else
+            null;
+
+        const outgoing_lineage = if (combined_reuse)
+            self.installCanonicalCombinedReuse(allocator, result)
+        else if (staged_only_reuse)
+            self.installCanonicalStagedOnlyReuse(allocator, result)
+        else
+            null;
+
+        gate.phase = .committing;
+        const source_completion = self.page.action_cursor.captureCompletion(
+            deferred.finished.identity.repo_epoch,
+            .source,
+            deferred.finished.generation,
+        );
+        var pending_reload = self.takeOwnedSourceTerminal(&deferred.finished) orelse unreachable;
+        defer pending_reload.deinit(allocator);
+        self.page.deferred_source_apply = null;
+
+        if (source_changes or status_changes) {
+            self.page.file_search.markProjectionUnavailable(allocator);
+            self.page.accepted_sidebar_revision = file_search.nextAcceptedSidebarRevision(
+                self.page.accepted_sidebar_revision,
+            );
+            self.page.review_projection.clearCache(allocator);
+        }
+
+        var retiring_status: ?git_status.GitStatusState = null;
+        if (gate.status.takeReplacement()) |replacement| {
+            retiring_status = self.page.git_status;
+            self.page.git_status = replacement;
+        }
+        self.page.status_snapshot_revision = expected_status_revision;
+
+        var retiring_load: ?load_state.LoadState = null;
+        if (source_changes) {
+            retiring_load = self.page.load.state;
+            switch (prepared_source) {
+                .loaded => |session| {
+                    self.page.load.state = .{ .loaded = session };
+                    prepared_source = .unchanged;
+                },
+                .empty => self.page.load.state = .{ .empty = .no_changes },
+                .unchanged => unreachable,
+            }
+            self.page.source_session_revision = expected_source_revision;
+        }
+        if (prepared_tree) |*tree| self.installCanonicalCurrentTree(tree);
+        if (reused) {
+            // Exact comparison admitted the retained presentation before the
+            // no-fail commit, but its lineage belongs to the final source and
+            // status basis. Build the incoming token only after both live
+            // owners and revisions name that canonical publication.
+            self.finishExactPresentationTransfer(allocator, outgoing_lineage);
+        }
+
+        if (source_changes and final_anchor != null) {
+            if (self.navigation.activeLoadedDiff()) |loaded| {
+                _ = self.navigation.restoreReloadAnchor(loaded, &final_anchor.?);
+            }
+        }
+
+        self.page.status_load.markSuccess();
+        self.page.pending_initial_first_visible_selection = false;
+        if (self.acceptSourceFingerprint(fingerprint)) |failure| {
+            _ = self.page.status.clearSourceReloadFailure(failure.digest);
+        }
+        _ = self.page.activation.finishMember(
+            deferred.finished.identity,
+            .source,
+            self.acceptedSourceMember(),
+        );
+        if (source_completion) |completion| {
+            _ = self.page.action_cursor.finishCompletion(completion, true);
+        }
+
+        var result_transferred = reused;
+        if (!reused) {
+            self.clearCompletedSelectionForProjection(allocator, .{
+                .repo_root = result.request.repo_root,
+                .path_key = result.request.path_key,
+            });
+            self.page.staged_hunks.clear(allocator);
+            self.page.review_projection.finishEagerRetry();
+            self.page.review_projection.clearPending(allocator);
+            self.page.review_projection.clearDisplayed(allocator);
+            const request = result.request;
+            result.request = undefined;
+            switch (result.result) {
+                .ready => |ready| {
+                    result.result = undefined;
+                    self.page.review_projection.installReady(.{
+                        .request = request,
+                        .value = ready,
+                    });
+                },
+                .failed => |body| {
+                    result.result = undefined;
+                    self.page.review_projection.displayed = .{ .failed = .{
+                        .request = request,
+                        .body = body,
+                    } };
+                },
+                .failed_static => {
+                    const body = static_failure.?;
+                    static_failure = null;
+                    result.result = undefined;
+                    self.page.review_projection.displayed = .{ .failed = .{
+                        .request = request,
+                        .body = body,
+                    } };
+                },
+                .reuse_candidate, .staged_only_reuse_candidate => unreachable,
+            }
+            result_transferred = true;
+            if (final_anchor) |*anchor| {
+                self.restoreDisplayedNavigation(anchor);
+            } else {
+                self.clearDisplayRestore(allocator);
+            }
+        }
+
+        _ = self.navigation.finalizeActionCursor(allocator);
+        self.navigation.rebuildFileSearchProjection(allocator);
+
+        if (retiring_load) |*state| deinitRetiringLoadState(state, allocator);
+        if (retiring_status) |*status| status.deinit();
+        if (deferred.cycle_id != 0) {
+            self.page.auto_reload.finishMember(
+                deferred.cycle_id,
+                .deferred_source_apply,
+            );
+        }
+        deferred.deinit(allocator);
+        var finished_gate = self.page.canonical_publication.?;
+        self.page.canonical_publication = null;
+        finished_gate.deinit(allocator);
+        return .{ .result_transferred = result_transferred };
+    }
+
     /// Consumes a matching projection result into retained Review state. A
     /// true `result_transferred` means the caller must not deinitialize the
     /// task result: ordinary ready values move into the page, while an exact
@@ -2124,6 +3393,12 @@ pub const Controller = struct {
                 deferred.finished.request.sameSemanticKey(result.request))
             {
                 return .{ .skip_redraw = true };
+            }
+        }
+
+        if (self.page.canonical_publication) |gate| {
+            if (gate.projection_request_id == result.request.id) {
+                return self.applyCanonicalProjectionFinished(allocator, result);
             }
         }
 
@@ -2305,6 +3580,64 @@ pub const Controller = struct {
             self.acceptsIdentity(finished.identity) and
             self.acceptsRepositoryReadCompletion(finished.read_epoch, finished.background_cycle_id);
         const owns_terminal = self.sourceTerminalOwnsPending(finished);
+        const canonical_terminal = self.canonicalGateMatchesSource(finished);
+        if (canonical_terminal and (!owns_terminal or !publication_admitted)) {
+            self.page.auto_reload.finishMember(finished.background_cycle_id, .source);
+            self.abortCanonicalPublication(allocator);
+            return .{ .redraw = .skip };
+        }
+        if (canonical_terminal and owns_terminal and publication_admitted) {
+            switch (finished.result) {
+                .empty, .unchanged, .loaded => {
+                    if (self.page.deferred_source_apply != null) {
+                        self.abortCanonicalPublication(allocator);
+                        return .{ .redraw = .skip };
+                    }
+                    const cycle_id = finished.background_cycle_id orelse 0;
+                    if (finished.background_cycle_id) |background_cycle_id| {
+                        if (!self.page.auto_reload.moveMember(
+                            background_cycle_id,
+                            .source,
+                            .deferred_source_apply,
+                        )) {
+                            self.abortCanonicalPublication(allocator);
+                            return .{ .redraw = .skip };
+                        }
+                    }
+                    self.page.deferred_source_apply = .{
+                        .finished = finished.*,
+                        .cycle_id = cycle_id,
+                        .mode = .canonical_publication,
+                    };
+                    return .{ .result_transferred = true, .redraw = .skip };
+                },
+                .failed, .failed_static => {
+                    self.page.auto_reload.finishMember(finished.background_cycle_id, .source);
+                    var pending_reload = self.takeOwnedSourceTerminal(finished);
+                    defer if (pending_reload) |*pending| pending.deinit(allocator);
+                    _ = self.page.activation.finishMember(finished.identity, .source, .failed);
+                    var outcome: SourceApply = .{
+                        .redraw = .skip,
+                        .terminal_admitted = true,
+                    };
+                    if (pending_reload != null and pending_reload.?.kind == .watch) {
+                        const message = switch (finished.result) {
+                            .failed => |value| std.mem.trim(u8, value, " \t\r\n"),
+                            .failed_static => |value| value,
+                            else => unreachable,
+                        };
+                        if (self.page.auto_reload.markSourceFailure(message)) {
+                            outcome.auto_reload_failure = .{
+                                .identity = self.page.auto_reload.last_failure.?,
+                                .message = message,
+                            };
+                        }
+                    }
+                    self.abortCanonicalPublication(allocator);
+                    return outcome;
+                },
+            }
+        }
         if ((finished.result == .loaded or finished.result == .empty) and self.displayMutationBlockedByDrag() and
             owns_terminal and publication_admitted and self.page.deferred_source_apply == null)
         {
@@ -2676,11 +4009,26 @@ pub const Controller = struct {
         loaded: *loaded_diff.LoadedDiff,
         prefer_first_visible_file: bool,
     ) !void {
+        return self.rebuildLoadedTreeWithStatusDocument(
+            app_allocator,
+            loaded,
+            self.page.git_status.document,
+            prefer_first_visible_file,
+        );
+    }
+
+    fn rebuildLoadedTreeWithStatusDocument(
+        self: Controller,
+        app_allocator: std.mem.Allocator,
+        loaded: *loaded_diff.LoadedDiff,
+        status_document: git_status.StatusDocument,
+        prefer_first_visible_file: bool,
+    ) !void {
         const allocator = self.navigation.loadArenaAllocator() orelse return;
         const previous_path_key = self.navigation.view().selectedStagePathKey();
         const previous_sidebar_identity = self.navigation.view().selectedSidebarIdentity();
         try self.navigation.ensureTreeOrderScope(app_allocator);
-        loaded.tree = try file_tree.buildWithOptions(allocator, loaded.document, self.page.git_status.document, .{
+        loaded.tree = try file_tree.buildWithOptions(allocator, loaded.document, status_document, .{
             .root = self.navigation.view().fileTreeRootOptions(),
             .stable_order = self.navigation.stableOrderOptions(app_allocator),
         });
@@ -4788,7 +6136,7 @@ test "read command reject terminals clear only matching page state" {
     page.load.generation = 11;
     page.load.pending = .{ .diff_load = 11 };
     page.pending_reload = .{ .generation = 11, .kind = .manual };
-    controller.rejectSourceSpawn(allocator, 11);
+    _ = controller.rejectSourceSpawn(allocator, 11);
     try std.testing.expect(page.load.pending == null);
     try std.testing.expect(page.pending_reload == null);
 }

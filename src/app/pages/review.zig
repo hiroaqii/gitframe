@@ -166,9 +166,87 @@ pub const PendingDisplayNavigationRestore = struct {
     }
 };
 
+const CanonicalPublicationPhase = enum {
+    waiting_members,
+    waiting_projection,
+    committing,
+    aborting,
+};
+
+const CanonicalStatusCandidate = union(enum) {
+    pending,
+    identical,
+    replacement: git_status.GitStatusState,
+
+    pub fn deinit(self: *CanonicalStatusCandidate) void {
+        switch (self.*) {
+            .replacement => |*status| status.deinit(),
+            .pending, .identical => {},
+        }
+        self.* = .pending;
+    }
+
+    pub fn ready(self: CanonicalStatusCandidate) bool {
+        return switch (self) {
+            .pending => false,
+            .identical, .replacement => true,
+        };
+    }
+
+    pub fn changesSnapshot(self: CanonicalStatusCandidate) bool {
+        return switch (self) {
+            .replacement => true,
+            .pending, .identical => false,
+        };
+    }
+
+    pub fn takeReplacement(self: *CanonicalStatusCandidate) ?git_status.GitStatusState {
+        return switch (self.*) {
+            .replacement => |status| blk: {
+                self.* = .pending;
+                break :blk status;
+            },
+            .pending, .identical => null,
+        };
+    }
+};
+
+/// Private transaction metadata for a refresh which must retain the current
+/// canonical Review body until source, status, and projection agree.
+///
+/// The source task payload remains single-owned by `deferred_source_apply`;
+/// this gate owns only its exact identity plus the accepted status candidate.
+const CanonicalPublicationGate = struct {
+    identity: page.RequestIdentity,
+    read_epoch: repository_read_authority.ReviewRepositoryReadEpoch,
+    source_generation: u64,
+    kind: ReloadKind,
+    repo_root: []u8,
+    path_key: []u8,
+    phase: CanonicalPublicationPhase = .waiting_members,
+    status_generation: ?u64 = null,
+    status_read_epoch: repository_read_authority.ReviewRepositoryReadEpoch = .{},
+    status_background_cycle_id: ?u64 = null,
+    status: CanonicalStatusCandidate = .pending,
+    projection_request_id: ?u64 = null,
+
+    pub fn deinit(self: *CanonicalPublicationGate, allocator: std.mem.Allocator) void {
+        self.status.deinit();
+        allocator.free(self.repo_root);
+        allocator.free(self.path_key);
+        self.* = undefined;
+    }
+};
+
+const DeferredSourceMode = enum {
+    live_drag,
+    canonical_publication,
+};
+
 pub const DeferredSourceApply = struct {
     finished: load.DiffLoadFinished,
     cycle_id: u64,
+    mode: DeferredSourceMode = .live_drag,
 
     pub fn deinit(self: *DeferredSourceApply, allocator: std.mem.Allocator) void {
         self.finished.result.deinit(allocator);
@@ -198,6 +276,8 @@ pub const ReviewPageState = struct {
     auto_reload: auto_reload.State = .{},
     deferred_source_apply: ?DeferredSourceApply = null,
     deferred_projection_apply: ?DeferredProjectionApply = null,
+    canonical_publication: ?CanonicalPublicationGate = null,
+    canonical_status_drain: ?auto_reload.AuxiliaryTerminal = null,
     viewer: ViewerState = .{},
     search: DiffSearchState = .{},
     file_search: file_search.State = .{},
@@ -256,6 +336,7 @@ pub const ReviewPageState = struct {
         if (self.completed_selection) |*selection| selection.deinit(allocator);
         if (self.deferred_source_apply) |*deferred| deferred.deinit(allocator);
         if (self.deferred_projection_apply) |*deferred| deferred.deinit(allocator);
+        if (self.canonical_publication) |*gate| gate.deinit(allocator);
         // File-search candidates borrow paths from the accepted load arena.
         // Release their containers before load teardown frees that owner.
         self.file_search.deinit(allocator);
