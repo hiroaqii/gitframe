@@ -676,6 +676,7 @@ const BodyCursor = struct {
 };
 
 fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
+    prefillIntrinsicDiffBackground(surface, row, .{ .col = 0, .width = surface.size().width }, line.kind, presentation, styles);
     const whole_line = selection != null and selection.?.mode == .line;
     if (whole_line) fillRowRegion(surface, row, .{ .col = 0, .width = surface.size().width }, styles.selection);
     const text_style = selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, styles, hunk_side_has_visible_syntax), styles), whole_line, styles);
@@ -724,6 +725,8 @@ fn generatedSideBySideSelection(options: RenderOptions, line_index: usize, line:
 }
 
 fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
+    if (removed) |line| prefillIntrinsicDiffBackground(surface, row, geometry.old, line.kind, presentation, styles);
+    if (added) |line| prefillIntrinsicDiffBackground(surface, row, geometry.new, line.kind, presentation, styles);
     drawSideBySideSelection(surface, row, geometry, selection, styles);
     var columns = sideBySideRowColumns(surface, row, geometry);
     const selected = selection orelse SideBySideSelection{};
@@ -733,6 +736,11 @@ fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.
 }
 
 fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
+    switch (line.kind) {
+        .removed => prefillIntrinsicDiffBackground(surface, row, geometry.old, line.kind, presentation, styles),
+        .added => prefillIntrinsicDiffBackground(surface, row, geometry.new, line.kind, presentation, styles),
+        .context, .metadata => {},
+    }
     drawSideBySideSelection(surface, row, geometry, selection, styles);
     var columns = sideBySideRowColumns(surface, row, geometry);
     const selected = selection orelse SideBySideSelection{};
@@ -760,6 +768,15 @@ fn drawSideBySideSelection(surface: *chasen.Surface, row: u16, geometry: SideByS
     const selected = selection orelse return;
     if (selected.old) |old| if (old.mode == .line) fillRowRegion(surface, row, geometry.old, styles.selection);
     if (selected.new) |new| if (new.mode == .line) fillRowRegion(surface, row, geometry.new, styles.selection);
+}
+
+fn prefillIntrinsicDiffBackground(surface: *chasen.Surface, row: u16, region: SideBySideRegion, kind: diff_parser.DiffLine.Kind, presentation: RowPresentation, styles: RenderStyles) void {
+    const background = switch (kind) {
+        .added => styles.added_text.bg,
+        .removed => styles.removed_text.bg,
+        .context, .metadata => return,
+    };
+    fillRowRegion(surface, row, region, presentation.compose(.{ .bg = background }, styles));
 }
 
 fn fillRowRegion(surface: *chasen.Surface, row: u16, region: SideBySideRegion, style: chasen.TextStyle) void {
@@ -1227,6 +1244,266 @@ fn expectBgRange(surface: *chasen.Surface, row: u16, start_col: u16, end_col: u1
 
 fn expectBodyGutterLeadInBg(surface: *chasen.Surface, row: u16, text_col: u16, bg: chasen.Color) !void {
     try expectBgRange(surface, row, cursor_gutter_width, cursor_gutter_width + text_col, bg);
+}
+
+test "full-row diff background fills unified rows without leaking into chrome" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(40, 8);
+    defer ts.deinit();
+
+    const palette = reviewCursorTestPalette();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{"rename from a"},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 2,
+            .new_start = 1,
+            .new_count = 2,
+            .section = "full-row",
+            .lines = &.{
+                .{ .kind = .removed, .text = "abcdef", .old_line = 1 },
+                .{ .kind = .added, .text = "", .new_line = 1 },
+                .{ .kind = .context, .text = "same", .old_line = 2, .new_line = 2 },
+            },
+        }},
+    };
+    const hunk_line_counts = [_]usize{3};
+    const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
+    var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
+    defer spans.deinit(std.testing.allocator);
+    const keyword = try std.testing.allocator.dupe(syntax_token.TokenSpan, &.{.{ .start = 0, .end = 6, .role = .keyword }});
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .old }, .{ .spans = keyword });
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .unified,
+        .horizontal_scroll = 2,
+        .highlighted_hunk = 0,
+        .hunk_stages = .all_staged,
+        .palette = palette,
+        .syntax = .initDirect(&spans, 0),
+    });
+
+    const removed_row: u16 = 5;
+    const added_row: u16 = 6;
+    const removed_bg = palette.color(.diff_removed_bg);
+    const added_bg = palette.color(.diff_added_bg);
+    try expectBgRange(&ts.surface, removed_row, cursor_gutter_width, 40, removed_bg);
+    try expectBgRange(&ts.surface, added_row, cursor_gutter_width, 40, added_bg);
+    try std.testing.expect(!ts.surface.readCell(1, removed_row).?.style.bg.eql(removed_bg));
+    try std.testing.expect(!ts.surface.readCell(39, 3).?.style.bg.eql(removed_bg));
+    try std.testing.expect(!ts.surface.readCell(39, 3).?.style.bg.eql(added_bg));
+    try std.testing.expect(!ts.surface.readCell(39, 4).?.style.bg.eql(removed_bg));
+    try std.testing.expect(!ts.surface.readCell(39, 4).?.style.bg.eql(added_bg));
+    try std.testing.expect(!ts.surface.readCell(39, 7).?.style.bg.eql(removed_bg));
+    try std.testing.expect(!ts.surface.readCell(39, 7).?.style.bg.eql(added_bg));
+
+    const text_col = cursor_gutter_width + lineTextStart(true, .unified);
+    try ts.expectCellText(text_col, removed_row, "c");
+    try std.testing.expect(ts.surface.readCell(text_col, removed_row).?.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(ts.surface.readCell(cursor_gutter_width + 1, removed_row).?.style.fg.eql(palette.color(.diff_line_number)));
+    try ts.expectCellText(cursor_gutter_width + lineLayout(true, .unified).prefix_col, removed_row, " ");
+    try ts.expectCellText(cursor_gutter_width + lineLayout(true, .unified).prefix_col, added_row, "+");
+    try std.testing.expect(ts.surface.readCell(1, removed_row).?.style.fg.eql(palette.color(.staged)));
+}
+
+test "full-row diff background clips paired single and missing side rows" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 9);
+    defer ts.deinit();
+
+    const palette = reviewCursorTestPalette();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 4,
+            .new_start = 1,
+            .new_count = 4,
+            .section = "side regions",
+            .lines = &.{
+                .{ .kind = .context, .text = "head", .old_line = 1, .new_line = 1 },
+                .{ .kind = .removed, .text = "old one", .old_line = 2 },
+                .{ .kind = .removed, .text = "old two", .old_line = 3 },
+                .{ .kind = .added, .text = "new one", .new_line = 2 },
+                .{ .kind = .context, .text = "tail", .old_line = 4, .new_line = 3 },
+                .{ .kind = .added, .text = "", .new_line = 4 },
+            },
+        }},
+    };
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .side_by_side,
+        .palette = palette,
+    });
+
+    const geometry = sideBySideGeometry(bodyWidth(100));
+    const old_last = cursor_gutter_width + geometry.separator_col - 1;
+    const separator = cursor_gutter_width + geometry.separator_col;
+    const new_last: u16 = 99;
+    const removed_bg = palette.color(.diff_removed_bg);
+    const added_bg = palette.color(.diff_added_bg);
+
+    try std.testing.expect(!ts.surface.readCell(old_last, 4).?.style.bg.eql(removed_bg));
+    try std.testing.expect(!ts.surface.readCell(new_last, 4).?.style.bg.eql(added_bg));
+    try std.testing.expect(ts.surface.readCell(old_last, 5).?.style.bg.eql(removed_bg));
+    try std.testing.expect(ts.surface.readCell(new_last, 5).?.style.bg.eql(added_bg));
+    try std.testing.expect(!ts.surface.readCell(separator, 5).?.style.bg.eql(removed_bg));
+    try std.testing.expect(!ts.surface.readCell(separator, 5).?.style.bg.eql(added_bg));
+    try std.testing.expect(ts.surface.readCell(old_last, 6).?.style.bg.eql(removed_bg));
+    try std.testing.expect(!ts.surface.readCell(new_last, 6).?.style.bg.eql(removed_bg));
+    try std.testing.expect(!ts.surface.readCell(new_last, 6).?.style.bg.eql(added_bg));
+    try std.testing.expect(!ts.surface.readCell(old_last, 8).?.style.bg.eql(removed_bg));
+    try std.testing.expect(!ts.surface.readCell(old_last, 8).?.style.bg.eql(added_bg));
+    try std.testing.expect(ts.surface.readCell(new_last, 8).?.style.bg.eql(added_bg));
+}
+
+test "full-row diff background follows folded hunk visibility" {
+    const palette = reviewCursorTestPalette();
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "fold",
+            .lines = &.{
+                .{ .kind = .removed, .text = "old", .old_line = 1 },
+                .{ .kind = .added, .text = "new", .new_line = 1 },
+            },
+        }},
+    };
+    const geometry = sideBySideGeometry(bodyWidth(100));
+    const old_last = cursor_gutter_width + geometry.separator_col - 1;
+    const separator = cursor_gutter_width + geometry.separator_col;
+    const removed_bg = palette.color(.diff_removed_bg);
+    const added_bg = palette.color(.diff_added_bg);
+
+    var folded: chasen.testing.TestSurface = undefined;
+    try folded.init(100, 5);
+    defer folded.deinit();
+    try renderFile(&folded.surface, file, .{
+        .requested_mode = .side_by_side,
+        .folded_hunks = &.{true},
+        .palette = palette,
+    });
+    try folded.expectCellText(cursor_gutter_width, body_start_row, "▸");
+    try std.testing.expect(!folded.surface.readCell(old_last, body_start_row).?.style.bg.eql(removed_bg));
+    try std.testing.expect(!folded.surface.readCell(99, body_start_row).?.style.bg.eql(added_bg));
+
+    var unfolded: chasen.testing.TestSurface = undefined;
+    try unfolded.init(100, 5);
+    defer unfolded.deinit();
+    try renderFile(&unfolded.surface, file, .{
+        .requested_mode = .side_by_side,
+        .folded_hunks = &.{false},
+        .palette = palette,
+    });
+    try unfolded.expectCellText(cursor_gutter_width, body_start_row, "▾");
+    try std.testing.expect(unfolded.surface.readCell(old_last, body_start_row + 1).?.style.bg.eql(removed_bg));
+    try std.testing.expect(!unfolded.surface.readCell(separator, body_start_row + 1).?.style.bg.eql(removed_bg));
+    try std.testing.expect(!unfolded.surface.readCell(separator, body_start_row + 1).?.style.bg.eql(added_bg));
+    try std.testing.expect(unfolded.surface.readCell(99, body_start_row + 1).?.style.bg.eql(added_bg));
+}
+
+test "full-row diff background preserves cursor and selection precedence" {
+    const palette = reviewCursorTestPalette();
+    const added_file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 0,
+            .old_count = 0,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{.{ .kind = .added, .text = "abcd", .new_line = 1 }},
+        }},
+    };
+    const hunk_line_counts = [_]usize{1};
+    const files = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &hunk_line_counts }};
+    var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &files });
+    defer spans.deinit(std.testing.allocator);
+    const keyword = try std.testing.allocator.dupe(syntax_token.TokenSpan, &.{.{ .start = 0, .end = 4, .role = .keyword }});
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .new }, .{ .spans = keyword });
+
+    var character: chasen.testing.TestSurface = undefined;
+    try character.init(80, 5);
+    defer character.deinit();
+    try renderFile(&character.surface, added_file, .{
+        .requested_mode = .unified,
+        .cursor_offset = 1,
+        .palette = palette,
+        .syntax = .initDirect(&spans, 0),
+        .selection = .{
+            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+            .side = .new,
+            .mode = .character,
+            .start = .{ .hunk_index = 0, .line_index = 0, .leading = 1, .trailing = 2 },
+            .end = .{ .hunk_index = 0, .line_index = 0, .leading = 2, .trailing = 3 },
+        },
+    });
+
+    const row: u16 = body_start_row + 1;
+    const text_col = cursor_gutter_width + lineTextStart(true, .unified);
+    const pane_bg = palette.color(.pane_cursor_bg);
+    const selection_bg = palette.color(.diff_cursor);
+    try std.testing.expect(character.surface.readCell(0, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(character.surface.readCell(text_col, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(character.surface.readCell(text_col + 1, row).?.style.bg.eql(selection_bg));
+    try std.testing.expect(character.surface.readCell(text_col + 2, row).?.style.bg.eql(selection_bg));
+    try std.testing.expect(character.surface.readCell(79, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(character.surface.readCell(text_col + 1, row).?.style.fg.eql(palette.color(.accent)));
+
+    const paired_file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &.{
+                .{ .kind = .removed, .text = "old", .old_line = 1 },
+                .{ .kind = .added, .text = "new", .new_line = 1 },
+            },
+        }},
+    };
+    var line: chasen.testing.TestSurface = undefined;
+    try line.init(100, 5);
+    defer line.deinit();
+    try renderFile(&line.surface, paired_file, .{
+        .requested_mode = .side_by_side,
+        .cursor_offset = 1,
+        .palette = palette,
+        .selection = .{
+            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+            .side = .old,
+            .start = .{ .hunk_index = 0, .line_index = 0 },
+            .end = .{ .hunk_index = 0, .line_index = 0 },
+        },
+    });
+
+    const geometry = sideBySideGeometry(bodyWidth(100));
+    const old_last = cursor_gutter_width + geometry.separator_col - 1;
+    const separator = cursor_gutter_width + geometry.separator_col;
+    try std.testing.expect(line.surface.readCell(old_last, row).?.style.bg.eql(selection_bg));
+    try std.testing.expect(line.surface.readCell(separator, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(line.surface.readCell(99, row).?.style.bg.eql(pane_bg));
 }
 
 test "renderFile composes diff state as body background and marker foreground" {
@@ -2487,7 +2764,7 @@ test "displayPath prefers new path and strips git prefixes" {
     try std.testing.expectEqualStrings("src/main.zig", displayPath(file));
 }
 
-test "renderGeneratedAddedFile draws content on new side in side-by-side mode" {
+test "full-row diff background fills generated content on new side" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(90, 6);
     defer ts.deinit();
@@ -2500,6 +2777,8 @@ test "renderGeneratedAddedFile draws content on new side in side-by-side mode" {
     const geometry = sideBySideGeometry(bodyWidth(90));
     const new_start = cursor_gutter_width + geometry.new.col;
     try expectBgRange(&ts.surface, 3, new_start, new_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_added_bg));
+    try std.testing.expect(!ts.surface.readCell(cursor_gutter_width + geometry.separator_col - 1, 3).?.style.bg.eql(theme.Palette.default().color(.diff_added_bg)));
+    try std.testing.expect(ts.surface.readCell(89, 3).?.style.bg.eql(theme.Palette.default().color(.diff_added_bg)));
     try ts.expectCellText(0, 0, "s");
     try ts.expectCellText(cursor_gutter_width + geometry.separator_col, 3, "│");
     try ts.expectCellText(52, 3, "+");
