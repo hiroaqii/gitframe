@@ -2188,14 +2188,10 @@ pub const RepositoryPageState = struct {
             if (selected_cursor == null and (reveal_preferred or retained == null)) {
                 if (tree.nodeIndexForPath(path, self.file_visibility)) |node_index| {
                     if (tree.revealNodeFor(node_index, self.file_visibility) != null) {
-                        // Internal lens reconciliation may reveal manifest
-                        // ancestors, but it does not override a collapsed root.
-                        if (self.tree_projection.root_disclosure == .expanded) {
-                            selected_cursor = self.tree_projection.visibleIndexForTarget(
-                                tree,
-                                .{ .manifest_node = node_index },
-                            );
-                        }
+                        selected_cursor = self.tree_projection.visibleIndexForTarget(
+                            tree,
+                            .{ .manifest_node = node_index },
+                        );
                     }
                 }
             }
@@ -2518,7 +2514,7 @@ pub const RepositoryPageState = struct {
     fn selectTreeEdge(self: *RepositoryPageState, last: bool, body_height: u16) void {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
         self.viewer.tree_cursor = 0;
-        if (self.tree_projection.root_disclosure == .expanded and last) {
+        if (last) {
             var index = tree.visible_len;
             while (index > 0) {
                 index -= 1;
@@ -2531,7 +2527,7 @@ pub const RepositoryPageState = struct {
                     break;
                 }
             }
-        } else if (self.tree_projection.root_disclosure == .expanded) {
+        } else {
             for (tree.visibleNodes()) |node_index| if (tree.nodes[node_index].kind == .file) {
                 self.viewer.tree_cursor = self.tree_projection.visibleIndexForTarget(
                     tree,
@@ -2693,7 +2689,7 @@ pub const RepositoryPageState = struct {
     fn toggleCursor(self: *RepositoryPageState, body_height: u16) void {
         const tree = if (self.bundle) |*bundle| &bundle.tree else return;
         const target = self.tree_projection.targetAt(tree, self.viewer.tree_cursor) orelse return;
-        if (self.tree_projection.toggleTarget(tree, self.file_visibility, target)) {
+        if (self.tree_projection.activateTarget(tree, self.file_visibility, target)) {
             self.viewer.tree_cursor = @min(
                 self.viewer.tree_cursor,
                 self.tree_projection.visibleLen(tree) - 1,
@@ -3431,7 +3427,6 @@ fn drawTreeProjectionRow(
         .repo_root => try rootRowTextAlloc(
             surface.frameAllocator(),
             repositoryRootName(context.repo_root),
-            state.tree_projection.root_disclosure,
             state.viewer.tree_horizontal_scroll,
             width,
         ),
@@ -3573,11 +3568,10 @@ fn treeRowTextAlloc(
 fn rootRowTextAlloc(
     allocator: std.mem.Allocator,
     name: []const u8,
-    disclosure: repository_tree_projection.RootDisclosure,
     horizontal_scroll: usize,
     width: u16,
 ) ![]const u8 {
-    return treeItemTextAlloc(allocator, 0, disclosure.glyph(), name, horizontal_scroll, width);
+    return treeItemTextAlloc(allocator, 0, "▾ ", name, horizontal_scroll, width);
 }
 
 fn treeItemTextAlloc(
@@ -3687,7 +3681,7 @@ test "repository transition E1 pending and unavailable destinations suppress ret
     }
 }
 
-test "repository page navigation keeps sticky file selection on directory and root" {
+test "repository minimum tree disclosure keyboard root collapse keeps sticky file selection" {
     var document = try manifest.parseOwned(std.testing.allocator, try std.testing.allocator.dupe(u8, "a/one.zig\x00b.zig\x00"));
     const tree = try repository_tree.Tree.build(std.testing.allocator, &document);
     var state: RepositoryPageState = .{ .bundle = .{ .document = document, .tree = tree }, .load_state = .loaded };
@@ -3695,14 +3689,78 @@ test "repository page navigation keeps sticky file selection on directory and ro
     state.selected_path = state.bundle.?.tree.firstFilePath();
     state.viewer.tree_cursor = 1;
     _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 11 });
+    const directory = state.bundle.?.tree.nodeIndexForPath("a", .all) orelse return error.ExpectedDirectory;
+    try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
     try std.testing.expectEqualStrings("a/one.zig", state.selected_path.?);
     state.viewer.tree_cursor = 0;
     _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 11 });
     try std.testing.expectEqualStrings("a/one.zig", state.selected_path.?);
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
-    try std.testing.expectEqual(@as(usize, 1), state.tree_projection.visibleLen(&state.bundle.?.tree));
+    try std.testing.expect(!state.bundle.?.tree.nodes[directory].expanded);
+    try std.testing.expectEqual(@as(usize, 3), state.tree_projection.visibleLen(&state.bundle.?.tree));
+    const first_child = state.tree_projection.targetAt(&state.bundle.?.tree, 1) orelse return error.ExpectedDirectory;
+    switch (first_child) {
+        .repo_root => return error.ExpectedDirectory,
+        .manifest_node => |node_index| try std.testing.expectEqualStrings("a", state.bundle.?.tree.nodes[node_index].path),
+    }
     _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 11 });
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
+    try std.testing.expect(!state.bundle.?.tree.nodes[directory].expanded);
+    try std.testing.expectEqualStrings("a/one.zig", state.selected_path.?);
+}
+
+test "repository minimum tree disclosure root collapse preserves source and closes hidden Changed directories" {
+    const allocator = std.testing.allocator;
+    const size: chasen.Size = .{ .width = 80, .height = 12 };
+    var state = try selectionStateForTest(
+        "changed/selected.zig\x00clean/nested/file.zig\x00root.zig\x00",
+        "source\n",
+    );
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, " M changed/selected.zig\x00");
+
+    const changed_file = state.bundle.?.tree.nodeIndexForPath("changed/selected.zig", .all) orelse
+        return error.ExpectedChangedFile;
+    const clean_file = state.bundle.?.tree.nodeIndexForPath("clean/nested/file.zig", .all) orelse
+        return error.ExpectedCleanFile;
+    _ = state.tree_projection.revealManifestNode(&state.bundle.?.tree, .all, changed_file) orelse
+        return error.ExpectedChangedFile;
+    _ = state.tree_projection.revealManifestNode(&state.bundle.?.tree, .all, clean_file) orelse
+        return error.ExpectedCleanFile;
+    for (state.bundle.?.tree.nodes) |node| {
+        if (node.kind == .directory) try std.testing.expect(node.expanded);
+    }
+
+    state.viewer.tree_cursor = 0;
+    _ = state.applyNavigation(allocator, .toggle_directory, size);
+    for (state.bundle.?.tree.nodes) |node| {
+        if (node.kind == .directory) try std.testing.expect(!node.expanded);
+    }
+    try std.testing.expectEqualStrings("changed/selected.zig", state.selected_path.?);
+    try std.testing.expectEqualStrings("source\n", state.currentSource().?.bytes);
+    try std.testing.expectEqual(DisplayedDocument.Authority.accepted, state.displayed_document.?.authority);
+
+    _ = state.tree_projection.revealManifestNode(&state.bundle.?.tree, .all, changed_file) orelse
+        return error.ExpectedChangedFile;
+    _ = state.tree_projection.revealManifestNode(&state.bundle.?.tree, .all, clean_file) orelse
+        return error.ExpectedCleanFile;
+    _ = state.applyNavigation(allocator, .toggle_changed_filter, size);
+    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
+    const root_click = state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, size) orelse
+        return error.ExpectedRootMouseTarget;
+    try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, root_click);
+    _ = state.applyNavigation(allocator, root_click, size);
+    for (state.bundle.?.tree.nodes) |node| {
+        if (node.kind == .directory) try std.testing.expect(!node.expanded);
+    }
+
+    _ = state.applyNavigation(allocator, .toggle_changed_filter, size);
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    const clean = state.bundle.?.tree.nodeIndexForPath("clean", .all) orelse return error.ExpectedCleanDirectory;
+    const nested = state.bundle.?.tree.nodeIndexForPath("clean/nested", .all) orelse return error.ExpectedCleanDirectory;
+    try std.testing.expect(!state.bundle.?.tree.nodes[clean].expanded);
+    try std.testing.expect(!state.bundle.?.tree.nodes[nested].expanded);
+    try std.testing.expectEqualStrings("changed/selected.zig", state.selected_path.?);
+    try std.testing.expectEqualStrings("source\n", state.currentSource().?.bytes);
+    try std.testing.expectEqual(DisplayedDocument.Authority.accepted, state.displayed_document.?.authority);
 }
 
 test "repository manifest replacement refreshes active file search indices" {
@@ -3743,7 +3801,7 @@ test "repository All replacement restores typed directory cursor beside hidden s
     try std.testing.expectEqualStrings("dir/selected.zig", state.selected_path.?);
 }
 
-test "repository manifest replacement retains collapsed root and selected source" {
+test "repository manifest replacement retains minimum tree and selected source" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest("dir/selected.zig\x00root.zig\x00"),
@@ -3751,7 +3809,6 @@ test "repository manifest replacement retains collapsed root and selected source
     };
     defer state.deinit(allocator);
     state.selected_path = state.bundle.?.tree.filePath("dir/selected.zig", .all);
-    state.tree_projection.root_disclosure = .collapsed;
     state.viewer.tree_cursor = 0;
     state.viewer.tree_width = 42;
     state.viewer.tree_hidden = true;
@@ -3763,12 +3820,13 @@ test "repository manifest replacement retains collapsed root and selected source
     try state.replaceBundle(allocator, &incoming);
     incoming_owned = false;
 
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
     try std.testing.expect(state.viewer.tree_hidden);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 1), state.tree_projection.visibleLen(&state.bundle.?.tree));
+    try std.testing.expectEqual(@as(usize, 3), state.tree_projection.visibleLen(&state.bundle.?.tree));
+    const directory = state.bundle.?.tree.nodeIndexForPath("dir", .all) orelse return error.ExpectedDirectory;
+    try std.testing.expect(!state.bundle.?.tree.nodes[directory].expanded);
     try std.testing.expectEqualStrings("dir/selected.zig", state.selected_path.?);
 }
 
@@ -3783,7 +3841,6 @@ test "repository explicit reload restores typed root and directory across outcom
     defer state.deinit(allocator);
     state.activate(7, root.capability.identity);
     state.selected_path = state.bundle.?.tree.filePath("dir/selected.zig", .all);
-    state.tree_projection.root_disclosure = .collapsed;
     state.viewer.tree_cursor = 0;
     state.viewer.tree_width = 42;
     state.viewer.tree_hidden = true;
@@ -3800,15 +3857,15 @@ test "repository explicit reload restores typed root and directory across outcom
     };
     defer unchanged.deinit(allocator);
     try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(allocator, &unchanged));
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
     try std.testing.expect(state.viewer.tree_hidden);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     try std.testing.expectEqualStrings("dir/selected.zig", state.selected_path.?);
 
-    state.tree_projection.root_disclosure = .expanded;
     const directory = state.bundle.?.tree.nodeIndexForPath("dir", .all) orelse return error.ExpectedDirectory;
+    const directory_visible = state.bundle.?.tree.visibleIndexForPath("dir") orelse return error.ExpectedVisibleDirectory;
+    try std.testing.expect(state.bundle.?.tree.toggleVisibleFor(directory_visible, .all));
     state.viewer.tree_cursor = state.tree_projection.visibleIndexForTarget(
         &state.bundle.?.tree,
         .{ .manifest_node = directory },
@@ -3826,7 +3883,6 @@ test "repository explicit reload restores typed root and directory across outcom
     defer changed.deinit(allocator);
 
     try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &changed));
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
     try std.testing.expect(state.viewer.tree_hidden);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
@@ -3849,9 +3905,10 @@ test "repository manifest replacement falls deleted directory cursor to visible 
     defer state.deinit(allocator);
     state.selected_path = state.bundle.?.tree.filePath("a/nested/selected.zig", .all);
     const nested = state.bundle.?.tree.nodeIndexForPath("a/nested", .all) orelse return error.ExpectedDirectory;
-    state.viewer.tree_cursor = state.tree_projection.visibleIndexForTarget(
+    state.viewer.tree_cursor = state.tree_projection.revealManifestNode(
         &state.bundle.?.tree,
-        .{ .manifest_node = nested },
+        .all,
+        nested,
     ) orelse return error.ExpectedVisibleDirectory;
 
     var incoming = try bundleForTest("a/kept.zig\x00");
@@ -3868,12 +3925,11 @@ test "repository manifest replacement falls deleted directory cursor to visible 
     }
 }
 
-test "repository file search expands typed root before selecting result" {
+test "repository file search reveals collapsed ancestors before selecting result" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest("dir/target.zig\x00other.zig\x00"),
         .load_state = .loaded,
-        .tree_projection = .{ .root_disclosure = .collapsed },
     };
     defer state.deinit(allocator);
     state.selected_path = state.bundle.?.tree.filePath("other.zig", .all);
@@ -3883,7 +3939,8 @@ test "repository file search expands typed root before selecting result" {
 
     _ = state.applyNavigation(allocator, .submit_file_search, .{ .width = 80, .height = 10 });
 
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
+    const directory = state.bundle.?.tree.nodeIndexForPath("dir", .all) orelse return error.ExpectedDirectory;
+    try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
     try std.testing.expectEqualStrings("dir/target.zig", state.selected_path.?);
     const selected_target = state.tree_projection.targetAt(&state.bundle.?.tree, state.viewer.tree_cursor) orelse
         return error.ExpectedSearchTarget;
@@ -4121,7 +4178,6 @@ test "repository hidden-tree file search restores on cancel and commits visible 
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest("dir/target.zig\x00other.zig\x00"),
         .load_state = .loaded,
-        .tree_projection = .{ .root_disclosure = .collapsed },
     };
     defer state.deinit(allocator);
     state.selected_path = state.bundle.?.tree.filePath("other.zig", .all);
@@ -4178,8 +4234,9 @@ test "repository hidden-tree file search restores on cancel and commits visible 
     try std.testing.expect(!state.file_search.mode);
     try std.testing.expect(!state.viewer.tree_hidden);
     try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
     try std.testing.expectEqualStrings("dir/target.zig", state.selected_path.?);
+    const directory = state.bundle.?.tree.nodeIndexForPath("dir", .all) orelse return error.ExpectedDirectory;
+    try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
     const tree = &state.bundle.?.tree;
     const target_node = tree.nodeIndexForPath("dir/target.zig", .all) orelse return error.ExpectedSearchTarget;
     const target_visible = state.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = target_node }) orelse
@@ -4401,7 +4458,6 @@ test "repository replacement retains hidden preference behind temporary search r
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     try std.testing.expect(!state.file_search.mode);
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
     try std.testing.expect(state.selected_path == null);
 }
 
@@ -4951,7 +5007,6 @@ test "repository changed filter survives page activation and resets for reposito
     try applyBundleStatusForTest(&state.bundle.?, " M changed.zig\x00");
     state.selected_path = state.bundle.?.tree.filePath("clean.zig", .all);
     _ = state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 });
-    state.tree_projection.root_disclosure = .collapsed;
     state.viewer.tree_cursor = 0;
     state.viewer.tree_width = 42;
 
@@ -4959,13 +5014,11 @@ test "repository changed filter survives page activation and resets for reposito
     state.activate(4, identity);
     try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
     try std.testing.expectEqualStrings("clean.zig", state.all_selection_anchor.?);
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
 
     state.repositoryChanged(allocator, 5, .{ .device = 3, .inode = 4 });
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
     try std.testing.expect(state.all_selection_anchor == null);
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
 }
@@ -5400,6 +5453,9 @@ test "repository tree cursor background follows active focus and preserves seman
     defer state.deinit(allocator);
     const tree = &state.bundle.?.tree;
     state.selected_path = tree.filePath("selected.zig", .all);
+    const nested_node = tree.nodeIndexForPath("dir/nested.zig", .all) orelse return error.ExpectedNestedFile;
+    const nested_visible = state.tree_projection.revealManifestNode(tree, .all, nested_node) orelse
+        return error.ExpectedNestedFile;
     const selected_node = tree.nodeIndexForPath("selected.zig", .all) orelse return error.ExpectedSelectedFile;
     const selected_visible = state.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = selected_node }) orelse
         return error.ExpectedSelectedFile;
@@ -5428,9 +5484,6 @@ test "repository tree cursor background follows active focus and preserves seman
     const added_node = tree.nodeIndexForPath("added.zig", .all) orelse return error.ExpectedAddedFile;
     const added_visible = state.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = added_node }) orelse
         return error.ExpectedAddedFile;
-    const nested_node = tree.nodeIndexForPath("dir/nested.zig", .all) orelse return error.ExpectedNestedFile;
-    const nested_visible = state.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = nested_node }) orelse
-        return error.ExpectedNestedFile;
     const root_row = layout.header_rows;
     const directory_row = layout.header_rows + @as(u16, @intCast(directory_visible));
     const added_row = layout.header_rows + @as(u16, @intCast(added_visible));
@@ -6989,7 +7042,7 @@ test "repository manifest root liveness check rejects stable path replacement" {
     }
 }
 
-test "repository accepted empty manifest renders the typed root at its mouse target" {
+test "repository minimum tree disclosure empty typed root stays open after mouse activation" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest(""),
@@ -7021,14 +7074,14 @@ test "repository accepted empty manifest renders the typed root at its mouse tar
         return error.ExpectedRootMouseTarget;
     try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, root_click);
     _ = state.applyNavigation(allocator, root_click, full_size);
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
+    try std.testing.expectEqual(@as(usize, 1), state.tree_projection.visibleLen(&state.bundle.?.tree));
 
-    var collapsed_surface: chasen.testing.TestSurface = undefined;
-    try collapsed_surface.init(full_size.width, full_size.height);
-    defer collapsed_surface.deinit();
-    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &collapsed_surface.surface);
-    try collapsed_surface.expectCellText(0, 3, "▸");
-    try collapsed_surface.expectCellText(0, 4, "R");
+    var after_click_surface: chasen.testing.TestSurface = undefined;
+    try after_click_surface.init(full_size.width, full_size.height);
+    defer after_click_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &after_click_surface.surface);
+    try after_click_surface.expectCellText(0, 3, "▾");
+    try after_click_surface.expectCellText(0, 4, "R");
 
     const compact_size = chasen.Size{ .width = 60, .height = 3 };
     var compact_surface: chasen.testing.TestSurface = undefined;
@@ -7295,13 +7348,13 @@ test "Repository branch C2 clips width one and two without moving Files" {
     try width_two.expectCellText(1, 2, "F");
 }
 
-test "repository page renders tree and selected-document loading checkpoint" {
+test "repository minimum tree disclosure renders root entries and collapses opened descendants" {
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest("README.md\x00src/main.zig\x00"),
         .load_state = .loaded,
     };
     defer state.deinit(std.testing.allocator);
-    state.selected_path = state.bundle.?.tree.firstFilePath();
+    state.selected_path = state.bundle.?.tree.filePath("README.md", .all);
 
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(60, 10);
@@ -7312,9 +7365,9 @@ test "repository page renders tree and selected-document loading checkpoint" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "▾ gitframe") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "README.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "src") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "main.zig") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading selected file") != null);
-    const non_selected_file = test_surface.surface.readCell(4, 6) orelse return error.ExpectedFileCell;
-    try std.testing.expectEqual(theme.Palette.default().color(.foreground), non_selected_file.style.fg);
     const layout = bodyLayout(test_surface.surface.size(), state.viewer.tree_width, state.viewer.tree_hidden);
     try test_surface.expectCellText(
         layout.tree_width + 2,
@@ -7335,6 +7388,13 @@ test "repository page renders tree and selected-document loading checkpoint" {
     try std.testing.expect(source_rule.style.fg.eql(theme.Palette.default().color(.muted)));
     try std.testing.expect(source_rule.style.dim);
 
+    const directory = state.bundle.?.tree.nodeIndexForPath("src", .all) orelse return error.ExpectedDirectory;
+    state.viewer.tree_cursor = state.tree_projection.visibleIndexForTarget(
+        &state.bundle.?.tree,
+        .{ .manifest_node = directory },
+    ) orelse return error.ExpectedVisibleDirectory;
+    _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 10 });
+    try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
     state.viewer.tree_cursor = 0;
     _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 10 });
     var collapsed_surface: chasen.testing.TestSurface = undefined;
@@ -7343,8 +7403,10 @@ test "repository page renders tree and selected-document loading checkpoint" {
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/gitframe" }, &collapsed_surface.surface);
     const collapsed_snapshot = try collapsed_surface.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(collapsed_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "▸ gitframe") != null);
-    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "README.md") == null);
+    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "▾ gitframe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "README.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "src") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "main.zig") == null);
     try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "Loading selected file") != null);
 }
 
@@ -7515,7 +7577,7 @@ test "repository changed view distinguishes loading unavailable and no-match sta
     }
 }
 
-test "repository page layout and mouse mapping share tree geometry" {
+test "repository minimum tree disclosure page layout and mouse mapping share tree geometry" {
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest("dir/file.zig\x00root.zig\x00"),
         .load_state = .loaded,
@@ -7535,11 +7597,16 @@ test "repository page layout and mouse mapping share tree geometry" {
     try std.testing.expectEqual(Msg{ .mouse_row = 2 }, state.mouseToMsg(.{ .col = 1, .row = 5 }, .left, wide).?);
     try std.testing.expectEqual(Msg.wheel_down, state.mouseToMsg(.{ .col = 1, .row = 0 }, .wheel_down, wide).?);
 
+    const directory_toggle = state.mouseToMsg(.{ .col = 1, .row = 4 }, .left, wide).?;
+    _ = state.applyNavigation(std.testing.allocator, directory_toggle, wide);
+    const directory = state.bundle.?.tree.nodeIndexForPath("dir", .all) orelse return error.ExpectedDirectory;
+    try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
     const root_toggle = state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, wide).?;
     _ = state.applyNavigation(std.testing.allocator, root_toggle, wide);
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.collapsed, state.tree_projection.root_disclosure);
+    try std.testing.expect(!state.bundle.?.tree.nodes[directory].expanded);
+    try std.testing.expectEqual(@as(usize, 3), state.tree_projection.visibleLen(&state.bundle.?.tree));
     _ = state.applyNavigation(std.testing.allocator, root_toggle, wide);
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
+    try std.testing.expect(!state.bundle.?.tree.nodes[directory].expanded);
 
     const narrow = chasen.Size{ .width = 20, .height = 6 };
     try std.testing.expectEqual(narrow.width, bodyLayout(narrow, state.viewer.tree_width, state.viewer.tree_hidden).tree_width);
@@ -7686,7 +7753,7 @@ test "repository transition B1 direct unavailable renders byte-safe terminal" {
     try std.testing.expect(state.incomingUnavailable() == null);
 }
 
-test "repository transition B2a resolves exact retained manifest through All and collapsed ancestors" {
+test "repository minimum tree disclosure Review incoming expands only exact ancestors" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var state: RepositoryPageState = .{
@@ -7694,18 +7761,16 @@ test "repository transition B2a resolves exact retained manifest through All and
         .activation_id = 2,
         .repo_epoch = 4,
         .root_identity = identity,
-        .bundle = try bundleForTest("dir/target.zig\x00changed.zig\x00retained.zig\x00"),
+        .bundle = try bundleForTest("dir/target.zig\x00other/nested.zig\x00changed.zig\x00retained.zig\x00"),
         .load_state = .loaded,
         .manifest_revision = 6,
         .file_visibility = .changed,
     };
     defer state.deinit(allocator);
     try applyBundleStatusForTest(&state.bundle.?, " M changed.zig\x00");
-    state.bundle.?.tree.nodes[state.bundle.?.tree.nodeIndexForPath("dir", .all).?].expanded = false;
     state.bundle.?.tree.rebuildVisibleFor(.changed);
     state.selected_path = state.bundle.?.tree.filePath("changed.zig", .changed);
     state.all_selection_anchor = try allocator.dupe(u8, "retained.zig");
-    state.tree_projection.root_disclosure = .collapsed;
     state.viewer.tree_cursor = 0;
 
     var incoming = try page_link.RepositoryIncoming.initOwned(
@@ -7726,8 +7791,8 @@ test "repository transition B2a resolves exact retained manifest through All and
     try std.testing.expectEqualStrings("dir/target.zig", state.selected_path.?);
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
     try std.testing.expect(state.all_selection_anchor == null);
-    try std.testing.expectEqual(repository_tree_projection.RootDisclosure.expanded, state.tree_projection.root_disclosure);
     try std.testing.expect(state.bundle.?.tree.nodes[state.bundle.?.tree.nodeIndexForPath("dir", .all).?].expanded);
+    try std.testing.expect(!state.bundle.?.tree.nodes[state.bundle.?.tree.nodeIndexForPath("other", .all).?].expanded);
     const selected_target = state.tree_projection.targetAt(&state.bundle.?.tree, state.viewer.tree_cursor) orelse
         return error.ExpectedSelectedTarget;
     switch (selected_target) {
@@ -7739,6 +7804,49 @@ test "repository transition B2a resolves exact retained manifest through All and
     }
     try std.testing.expect(state.needs_document_revalidation);
     try std.testing.expectEqualStrings("Review target opened in All files", state.status.text());
+}
+
+test "repository minimum tree disclosure Review incoming root file opens no directory" {
+    const allocator = std.testing.allocator;
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 2,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .bundle = try bundleForTest("dir/nested.zig\x00other/deep/file.zig\x00root-target.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 6,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.filePath("dir/nested.zig", .all);
+    state.viewer.tree_cursor = 0;
+
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .location = .{ .path = "root-target.zig", .line = 3 } },
+    );
+    state.acceptIncoming(allocator, &incoming);
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+
+    try std.testing.expectEqualStrings("root-target.zig", state.selected_path.?);
+    for (state.bundle.?.tree.nodes) |node| {
+        if (node.kind == .directory) try std.testing.expect(!node.expanded);
+    }
+    const selected_target = state.tree_projection.targetAt(&state.bundle.?.tree, state.viewer.tree_cursor) orelse
+        return error.ExpectedSelectedTarget;
+    switch (selected_target) {
+        .repo_root => return error.ExpectedFileTarget,
+        .manifest_node => |node_index| try std.testing.expectEqualStrings(
+            "root-target.zig",
+            state.bundle.?.tree.nodes[node_index].path,
+        ),
+    }
+    const pending = state.incoming.documentIntent() orelse return error.ExpectedDocumentIntent;
+    try std.testing.expectEqual(@as(?u32, 3), pending.location.line);
+    try std.testing.expectEqualStrings("root-target.zig", pending.location.path);
 }
 
 test "repository transition B2a exact failures retain prior browser location" {
@@ -9262,14 +9370,12 @@ test "repository page row rendering is bounded for multiple maximum names" {
     }
 }
 
-test "repository root row renders disclosure and byte-safe basename" {
+test "repository root row renders fixed disclosure and byte-safe basename" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const expanded = try rootRowTextAlloc(arena.allocator(), "repo\xff\n", .expanded, 0, 40);
+    const expanded = try rootRowTextAlloc(arena.allocator(), "repo\xff\n", 0, 40);
     try std.testing.expectEqualStrings("▾ repo\\xFF\\x0A", expanded);
-    const collapsed = try rootRowTextAlloc(arena.allocator(), "repo", .collapsed, 0, 40);
-    try std.testing.expectEqualStrings("▸ repo", collapsed);
-    const partial_glyph_scroll = try rootRowTextAlloc(arena.allocator(), "repo", .expanded, 1, 40);
+    const partial_glyph_scroll = try rootRowTextAlloc(arena.allocator(), "repo", 1, 40);
     try std.testing.expectEqualStrings("repo", partial_glyph_scroll);
 }

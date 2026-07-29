@@ -9,19 +9,6 @@
 const std = @import("std");
 const repository_tree = @import("../../../repository/tree.zig");
 
-pub const RootDisclosure = enum {
-    expanded,
-    collapsed,
-
-    pub fn toggled(self: RootDisclosure) RootDisclosure {
-        return if (self == .expanded) .collapsed else .expanded;
-    }
-
-    pub fn glyph(self: RootDisclosure) []const u8 {
-        return if (self == .expanded) "▾ " else "▸ ";
-    }
-};
-
 /// A target is meaningful only with the accepted manifest tree from which it
 /// was projected. `repo_root` is page-owned and never aliases manifest index 0.
 pub const Target = union(enum) {
@@ -42,15 +29,12 @@ pub const CursorIdentity = union(enum) {
 };
 
 pub const State = struct {
-    root_disclosure: RootDisclosure = .expanded,
-
-    pub fn visibleLen(self: State, tree: *const repository_tree.Tree) usize {
-        return 1 + if (self.root_disclosure == .expanded) tree.visible_len else 0;
+    pub fn visibleLen(_: State, tree: *const repository_tree.Tree) usize {
+        return 1 + tree.visible_len;
     }
 
-    pub fn targetAt(self: State, tree: *const repository_tree.Tree, visible_index: usize) ?Target {
+    pub fn targetAt(_: State, tree: *const repository_tree.Tree, visible_index: usize) ?Target {
         if (visible_index == 0) return .repo_root;
-        if (self.root_disclosure == .collapsed) return null;
         const manifest_visible_index = visible_index - 1;
         if (manifest_visible_index >= tree.visible_len) return null;
         return .{ .manifest_node = tree.visible[manifest_visible_index] };
@@ -77,12 +61,11 @@ pub const State = struct {
     }
 
     pub fn cursorForIdentity(
-        self: State,
+        _: State,
         tree: *const repository_tree.Tree,
         visibility: repository_tree.Visibility,
         identity: CursorIdentity,
     ) usize {
-        if (self.root_disclosure == .collapsed) return 0;
         return switch (identity) {
             .repo_root => 0,
             .manifest_node => |manifest_identity| visibleCursorForIdentity(
@@ -93,17 +76,14 @@ pub const State = struct {
         };
     }
 
-    pub fn toggleTarget(
-        self: *State,
+    pub fn activateTarget(
+        _: *State,
         tree: *repository_tree.Tree,
         visibility: repository_tree.Visibility,
         target: Target,
     ) bool {
         return switch (target) {
-            .repo_root => blk: {
-                self.root_disclosure = self.root_disclosure.toggled();
-                break :blk true;
-            },
+            .repo_root => tree.collapseAllFor(visibility),
             .manifest_node => |node_index| blk: {
                 const visible_index = underlyingVisibleIndex(tree, node_index) orelse break :blk false;
                 break :blk tree.toggleVisibleFor(visible_index, visibility);
@@ -112,19 +92,17 @@ pub const State = struct {
     }
 
     pub fn revealManifestNode(
-        self: *State,
+        _: *State,
         tree: *repository_tree.Tree,
         visibility: repository_tree.Visibility,
         node_index: usize,
     ) ?usize {
         if (node_index >= tree.nodes.len or !eligible(tree.nodes[node_index], visibility)) return null;
         const manifest_visible_index = tree.revealNodeFor(node_index, visibility) orelse return null;
-        self.root_disclosure = .expanded;
         return manifest_visible_index + 1;
     }
 
-    fn visibleIndexForManifestNode(self: State, tree: *const repository_tree.Tree, node_index: usize) ?usize {
-        if (self.root_disclosure == .collapsed) return null;
+    fn visibleIndexForManifestNode(_: State, tree: *const repository_tree.Tree, node_index: usize) ?usize {
         const visible_index = underlyingVisibleIndex(tree, node_index) orelse return null;
         return visible_index + 1;
     }
@@ -192,7 +170,7 @@ fn treeForTest(bytes: []const u8) !struct {
     return .{ .document = document, .tree = tree };
 }
 
-test "Repository typed projection maps root separately from manifest rows" {
+test "repository minimum tree disclosure keeps typed root and collapses descendants" {
     var fixture = try treeForTest("README.md\x00src/main.zig\x00");
     defer fixture.tree.deinit(std.testing.allocator);
     defer fixture.document.deinit(std.testing.allocator);
@@ -204,26 +182,24 @@ test "Repository typed projection maps root separately from manifest rows" {
     try std.testing.expectEqual(CursorIdentity.repo_root, projection.cursorIdentity(&fixture.tree, 0).?);
     try std.testing.expect(projection.cursorIdentity(&fixture.tree, projection.visibleLen(&fixture.tree)) == null);
 
-    try std.testing.expect(projection.toggleTarget(&fixture.tree, .all, .repo_root));
-    try std.testing.expectEqual(RootDisclosure.collapsed, projection.root_disclosure);
-    try std.testing.expectEqual(@as(usize, 1), projection.visibleLen(&fixture.tree));
-    try std.testing.expect(projection.targetAt(&fixture.tree, 1) == null);
-    try std.testing.expect(projection.cursorIdentity(&fixture.tree, 1) == null);
-
-    try std.testing.expect(projection.toggleTarget(&fixture.tree, .all, .repo_root));
     const src_node = fixture.tree.nodeIndexForPath("src", .all) orelse return error.ExpectedDirectory;
-    try std.testing.expect(projection.toggleTarget(&fixture.tree, .all, .{ .manifest_node = src_node }));
+    try std.testing.expect(projection.activateTarget(&fixture.tree, .all, .{ .manifest_node = src_node }));
+    try std.testing.expect(fixture.tree.nodes[src_node].expanded);
+    try std.testing.expect(projection.activateTarget(&fixture.tree, .all, .repo_root));
     try std.testing.expect(!fixture.tree.nodes[src_node].expanded);
     try std.testing.expectEqual(fixture.tree.visible_len + 1, projection.visibleLen(&fixture.tree));
+    try std.testing.expectEqual(Target{ .manifest_node = src_node }, projection.targetAt(&fixture.tree, 1).?);
+    try std.testing.expect(!projection.activateTarget(&fixture.tree, .all, .repo_root));
 }
 
 test "Repository typed cursor restores exact identity then nearest visible ancestor" {
     var fixture = try treeForTest("a/kept.zig\x00a/nested/current.zig\x00other.zig\x00");
     defer fixture.tree.deinit(std.testing.allocator);
     defer fixture.document.deinit(std.testing.allocator);
-    const projection: State = .{};
+    var projection: State = .{};
 
     const nested = fixture.tree.nodeIndexForPath("a/nested", .all) orelse return error.ExpectedDirectory;
+    _ = projection.revealManifestNode(&fixture.tree, .all, nested) orelse return error.ExpectedVisibleDirectory;
     const exact_identity = CursorIdentity{ .manifest_node = .{
         .kind = .directory,
         .path = "a/nested",
@@ -237,10 +213,6 @@ test "Repository typed cursor restores exact identity then nearest visible ances
     } });
     const fallback_target = projection.targetAt(&fixture.tree, fallback_cursor).?;
     try std.testing.expectEqualStrings("a", fixture.tree.nodes[fallback_target.manifest_node].path);
-
-    var collapsed = projection;
-    collapsed.root_disclosure = .collapsed;
-    try std.testing.expectEqual(@as(usize, 0), collapsed.cursorForIdentity(&fixture.tree, .all, exact_identity));
 }
 
 test "Repository typed cursor restoration is byte exact kind aware and Changed-aware" {
@@ -248,9 +220,10 @@ test "Repository typed cursor restoration is byte exact kind aware and Changed-a
     var fixture = try treeForTest("dir/clean-\xff.zig\x00dir/changed.zig\x00");
     defer fixture.tree.deinit(std.testing.allocator);
     defer fixture.document.deinit(std.testing.allocator);
-    const projection: State = .{};
+    var projection: State = .{};
 
     const clean_node = fixture.tree.nodeIndexForPath("dir/clean-\xff.zig", .all) orelse return error.ExpectedFile;
+    _ = projection.revealManifestNode(&fixture.tree, .all, clean_node) orelse return error.ExpectedVisibleFile;
     const exact_cursor = projection.cursorForIdentity(&fixture.tree, .all, .{ .manifest_node = .{
         .kind = .file,
         .path = "dir/clean-\xff.zig",
@@ -286,18 +259,18 @@ test "Repository typed cursor does not treat same-path kind change as exact" {
     try std.testing.expectEqual(Target.repo_root, projection.targetAt(&fixture.tree, cursor).?);
 }
 
-test "Repository explicit reveal expands both root and manifest ancestors" {
-    var fixture = try treeForTest("a/b/file.zig\x00");
+test "repository minimum tree disclosure explicit reveal expands only manifest ancestors" {
+    var fixture = try treeForTest("a/b/file.zig\x00other/nested/file.zig\x00");
     defer fixture.tree.deinit(std.testing.allocator);
     defer fixture.document.deinit(std.testing.allocator);
-    var projection: State = .{ .root_disclosure = .collapsed };
+    var projection: State = .{};
     const a_node = fixture.tree.nodeIndexForPath("a", .all) orelse return error.ExpectedDirectory;
-    try std.testing.expect(fixture.tree.toggleVisibleFor(fixture.tree.visibleIndexForPath("a").?, .all));
     try std.testing.expect(!fixture.tree.nodes[a_node].expanded);
     const file_node = fixture.tree.nodeIndexForPath("a/b/file.zig", .all) orelse return error.ExpectedFile;
 
     const cursor = projection.revealManifestNode(&fixture.tree, .all, file_node) orelse return error.ExpectedVisibleFile;
-    try std.testing.expectEqual(RootDisclosure.expanded, projection.root_disclosure);
     try std.testing.expect(fixture.tree.nodes[a_node].expanded);
+    const other_node = fixture.tree.nodeIndexForPath("other", .all) orelse return error.ExpectedDirectory;
+    try std.testing.expect(!fixture.tree.nodes[other_node].expanded);
     try std.testing.expectEqual(Target{ .manifest_node = file_node }, projection.targetAt(&fixture.tree, cursor).?);
 }

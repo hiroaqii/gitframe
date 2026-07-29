@@ -21,7 +21,7 @@ pub const Node = struct {
     path: []const u8,
     name: []const u8,
     depth: usize,
-    expanded: bool = true,
+    expanded: bool = false,
     file_change: ?change_index.Kind = null,
     /// Cached descendant predicate for the Changed-only visible projection.
     /// Directories keep their normal color; this only controls reachability.
@@ -190,6 +190,20 @@ pub const Tree = struct {
         node.expanded = !node.expanded;
         self.rebuildVisibleFor(visibility);
         return true;
+    }
+
+    /// Returns every directory to the minimum tree shape. Expansion is raw
+    /// tree state shared by All and Changed projections, so even directories
+    /// hidden from the current visibility must be closed.
+    pub fn collapseAllFor(self: *Tree, visibility: Visibility) bool {
+        var changed = false;
+        for (self.nodes) |*node| {
+            if (node.kind != .directory or !node.expanded) continue;
+            node.expanded = false;
+            changed = true;
+        }
+        if (changed) self.rebuildVisibleFor(visibility);
+        return changed;
     }
 
     pub fn firstFilePath(self: *const Tree) ?[]const u8 {
@@ -371,7 +385,7 @@ fn documentForTest(bytes: []const u8) !manifest.Document {
     return manifest.parseOwned(std.testing.allocator, try std.testing.allocator.dupe(u8, bytes));
 }
 
-test "repository tree builds compact hierarchy and visible mapping" {
+test "repository minimum tree disclosure builds only top-level entries and toggles children" {
     var document = try documentForTest("README.md\x00src/app.zig\x00src/main.zig\x00");
     defer document.deinit(std.testing.allocator);
     var tree = try Tree.build(std.testing.allocator, &document);
@@ -380,39 +394,50 @@ test "repository tree builds compact hierarchy and visible mapping" {
     try std.testing.expectEqual(@as(usize, 4), tree.nodes.len);
     try std.testing.expectEqual(Kind.directory, tree.nodes[0].kind);
     try std.testing.expectEqualStrings("src", tree.nodes[0].path);
-    try std.testing.expectEqual(@as(usize, 4), tree.visible_len);
-    try std.testing.expect(tree.toggleVisible(0));
+    try std.testing.expect(!tree.nodes[0].expanded);
     try std.testing.expectEqual(@as(usize, 2), tree.visible_len);
+    try std.testing.expect(tree.toggleVisible(0));
+    try std.testing.expectEqual(@as(usize, 4), tree.visible_len);
+    try std.testing.expect(tree.collapseAllFor(.all));
+    try std.testing.expectEqual(@as(usize, 2), tree.visible_len);
+    try std.testing.expect(!tree.collapseAllFor(.all));
 }
 
-test "repository tree reveals a file below collapsed ancestors" {
-    var document = try documentForTest("a/b/file.zig\x00root.zig\x00");
+test "repository minimum tree disclosure reveals a file below collapsed ancestors only" {
+    var document = try documentForTest("a/b/file.zig\x00other/nested/file.zig\x00root.zig\x00");
     defer document.deinit(std.testing.allocator);
     var tree = try Tree.build(std.testing.allocator, &document);
     defer tree.deinit(std.testing.allocator);
-    try std.testing.expect(tree.toggleVisible(0));
     try std.testing.expect(tree.visibleIndexForPath("a/b/file.zig") == null);
     const file_index = for (tree.nodes, 0..) |node, index| {
         if (std.mem.eql(u8, node.path, "a/b/file.zig")) break index;
     } else return error.ExpectedFile;
     const visible = tree.revealNode(file_index) orelse return error.ExpectedVisibleFile;
     try std.testing.expectEqualStrings("a/b/file.zig", tree.nodes[tree.visible[visible]].path);
+    const other = tree.nodeIndexForPath("other", .all) orelse return error.ExpectedDirectory;
+    try std.testing.expect(!tree.nodes[other].expanded);
+    try std.testing.expect(tree.visibleIndexForPath("other/nested") == null);
 }
 
-test "repository tree restores collapse and selected fallback by identity" {
+test "repository minimum tree disclosure restores matching expansion and keeps new directories closed" {
     var first_document = try documentForTest("a/one.zig\x00a/two.zig\x00b/three.zig\x00");
     defer first_document.deinit(std.testing.allocator);
     var first = try Tree.build(std.testing.allocator, &first_document);
     defer first.deinit(std.testing.allocator);
     try std.testing.expect(first.toggleVisible(0));
 
-    var next_document = try documentForTest("a/one.zig\x00a/new.zig\x00b/three.zig\x00");
+    var next_document = try documentForTest("a/one.zig\x00a/new.zig\x00b/three.zig\x00c/four.zig\x00");
     defer next_document.deinit(std.testing.allocator);
     var next = try Tree.build(std.testing.allocator, &next_document);
     defer next.deinit(std.testing.allocator);
     const selected = try next.restoreStateFrom(std.testing.allocator, &first, "a/two.zig");
 
-    try std.testing.expect(!next.nodes[0].expanded);
+    const a = next.nodeIndexForPath("a", .all) orelse return error.ExpectedDirectory;
+    const b = next.nodeIndexForPath("b", .all) orelse return error.ExpectedDirectory;
+    const c = next.nodeIndexForPath("c", .all) orelse return error.ExpectedDirectory;
+    try std.testing.expect(next.nodes[a].expanded);
+    try std.testing.expect(!next.nodes[b].expanded);
+    try std.testing.expect(!next.nodes[c].expanded);
     try std.testing.expectEqualStrings("b/three.zig", selected.?);
 }
 
@@ -444,7 +469,9 @@ test "repository tree restores dash sibling collapse by raw identity" {
     _ = try new.restoreStateFrom(std.testing.allocator, &old, null);
 
     const a_index = new.visibleIndexForPath("a") orelse return error.ExpectedDirectory;
-    try std.testing.expect(!new.nodes[new.visible[a_index]].expanded);
+    try std.testing.expect(new.nodes[new.visible[a_index]].expanded);
+    const a_c = new.nodeIndexForPath("a-c", .all) orelse return error.ExpectedDirectory;
+    try std.testing.expect(!new.nodes[a_c].expanded);
 }
 
 test "repository tree projects exact file changes and changed ancestors" {
@@ -494,15 +521,16 @@ test "repository tree changed visibility keeps only matching ancestry and collap
     _ = tree.applyChangeIndex(&index);
 
     tree.rebuildVisibleFor(.changed);
-    try std.testing.expectEqual(@as(usize, 2), tree.visible_len);
-    try std.testing.expectEqualStrings("a", tree.nodes[tree.visible[0]].path);
-    try std.testing.expectEqualStrings("a/changed.zig", tree.nodes[tree.visible[1]].path);
-    try std.testing.expect(tree.toggleVisibleFor(0, .changed));
     try std.testing.expectEqual(@as(usize, 1), tree.visible_len);
+    try std.testing.expectEqualStrings("a", tree.nodes[tree.visible[0]].path);
+    try std.testing.expect(tree.toggleVisibleFor(0, .changed));
+    try std.testing.expectEqual(@as(usize, 2), tree.visible_len);
+    try std.testing.expectEqualStrings("a/changed.zig", tree.nodes[tree.visible[1]].path);
 
     tree.rebuildVisibleFor(.all);
-    try std.testing.expect(!tree.nodes[0].expanded);
-    try std.testing.expectEqual(@as(usize, 4), tree.visible_len);
+    try std.testing.expect(tree.nodes[0].expanded);
+    try std.testing.expectEqual(@as(usize, 5), tree.visible_len);
+    try std.testing.expect(tree.toggleVisibleFor(0, .all));
     tree.rebuildVisibleFor(.changed);
     try std.testing.expectEqual(@as(usize, 1), tree.visible_len);
     const changed_index = tree.nodeIndexForPath("a/changed.zig", .changed) orelse return error.ExpectedChangedFile;
