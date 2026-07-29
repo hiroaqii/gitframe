@@ -448,13 +448,17 @@ pub const View = struct {
         }
         if (self.navigation.activeHunkAuthority() != null) return .stale_status;
 
-        const file = self.navigation.selectedFile() orelse return .no_file;
+        const cached_authority = self.selectedHunkUsesCachedProjection();
+        const file = if (cached_authority)
+            self.navigation.displayedDiffFile() orelse return .no_file
+        else
+            self.navigation.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
         const hunk_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
         if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
 
-        if (sourceIsCached(self.source)) {
+        if (sourceIsCached(self.source) or cached_authority) {
             return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
         }
 
@@ -482,7 +486,11 @@ pub const View = struct {
             return self.selectedProjectedHunkStageTarget(allocator, repo_root, bundle);
         }
         if (self.navigation.activeHunkAuthority() != null) return .stale_status;
-        const file = self.navigation.selectedFile() orelse return .no_file;
+        const cached_authority = self.selectedHunkUsesCachedProjection();
+        const file = if (cached_authority)
+            self.navigation.displayedDiffFile() orelse return .no_file
+        else
+            self.navigation.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
         const hunk_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
@@ -491,6 +499,7 @@ pub const View = struct {
         if (entry.isConflict()) return .conflict_unsupported;
         if (file.is_binary) return .binary_unsupported;
         if (diff_file.status(file) != .modified or diff_file.hasModeChange(file)) return .unsupported_file_state;
+        if (cached_authority) return .already_staged_hunk;
         const mark_key = self.sessionHunkMarkKey(hunk_index) orelse return .stale_source;
         if (self.page.staged_hunks.containsExact(repo_root, path, mark_key)) return .already_staged_hunk;
 
@@ -527,14 +536,19 @@ pub const View = struct {
             return self.selectedProjectedHunkUnstageTarget(allocator, repo_root, bundle);
         }
         if (self.navigation.activeHunkAuthority() != null) return .stale_status;
-        const file = self.navigation.selectedFile() orelse return .no_file;
+        const cached_authority = self.selectedHunkUsesCachedProjection();
+        const file = if (cached_authority)
+            self.navigation.displayedDiffFile() orelse return .no_file
+        else
+            self.navigation.selectedFile() orelse return .no_file;
         const path = diff_file.canonicalPathKey(file) orelse return .no_path;
         if (!self.navigation.diffCursorIsVisible()) return .offscreen_cursor;
         const hunk_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
         if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
         if (file.is_binary) return .binary_unsupported;
         if (diff_file.status(file) != .modified or diff_file.hasModeChange(file)) return .unsupported_file_state;
-        const mark_key = if (sourceIsCached(self.source))
+        const cached_hunk = sourceIsCached(self.source) or cached_authority;
+        const mark_key = if (cached_hunk)
             null
         else
             self.sessionHunkMarkKey(hunk_index) orelse return .stale_source;
@@ -559,8 +573,15 @@ pub const View = struct {
             .hunk_index = hunk_index,
             .patch = patch,
             .session_mark_mutation = if (mark_key) |key| .{ .remove = key } else .none,
-            .reload_after_success = sourceIsCached(self.source),
+            .reload_after_success = cached_hunk,
         } };
+    }
+
+    fn selectedHunkUsesCachedProjection(self: View) bool {
+        _ = self.navigation.activeCachedDiffProjection() orelse return false;
+        const request = self.page.review_projection.displayed.request() orelse return false;
+        return request.kind == .cached_diff and
+            request.status_snapshot_revision == self.page.status_snapshot_revision;
     }
 
     fn selectedProjectedHunkStageTarget(

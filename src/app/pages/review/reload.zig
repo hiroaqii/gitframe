@@ -1183,13 +1183,30 @@ pub const Controller = struct {
             .initial, .manual, .repo_switch => return null,
         }
         if (!diff_source.sourceAllowsStageProjection(self.source)) return null;
-        const displayed = self.page.review_projection.displayed.request() orelse return null;
-        if (!std.mem.eql(u8, displayed.repo_root, repo_root)) return null;
-        if (displayed.source_kind != sourceKind(self.source)) return null;
+        const basis_path = blk: {
+            if (self.page.review_projection.displayed.request()) |displayed| {
+                if (std.mem.eql(u8, displayed.repo_root, repo_root) and
+                    displayed.source_kind == sourceKind(self.source))
+                {
+                    break :blk displayed.path_key;
+                }
+            }
+            if (!sourceIsUnstaged(self.source)) return null;
+            const active_root = self.repo_root orelse return null;
+            if (!std.mem.eql(u8, active_root, repo_root)) return null;
+            const primary = switch (self.navigation.view().displayedReviewBody()) {
+                .primary => |value| value,
+                else => return null,
+            };
+            const file = primary.loaded.document.files[primary.file_index];
+            const path_key = diff_file.canonicalPathKey(file) orelse return null;
+            if (path_key.len == 0) return null;
+            break :blk path_key;
+        };
         if (self.page.action_cursor.target()) |target| {
             if (target.kind == .file and target.path_key.len > 0) return target.path_key;
         }
-        return self.navigation.view().selectedStagePathKey() orelse displayed.path_key;
+        return self.navigation.view().selectedStagePathKey() orelse basis_path;
     }
 
     fn beginCanonicalPublication(
@@ -1744,19 +1761,16 @@ pub const Controller = struct {
     fn canonicalProjectionKind(
         self: Controller,
         gate: anytype,
-        displayed_kind: review_projection.Kind,
     ) ?review_projection.Kind {
-        const deferred = self.page.deferred_source_apply orelse return null;
-        if (deferred.finished.result == .unchanged) {
-            const displayed = self.page.review_projection.displayed.request() orelse return null;
-            if (std.mem.eql(u8, displayed.path_key, gate.path_key)) return displayed_kind;
-        }
         const status_document = self.canonicalStatusDocument(gate);
         for (status_document.entries) |entry| {
             const path_key = entry.canonicalPathKey() orelse continue;
             if (!std.mem.eql(u8, path_key, gate.path_key)) continue;
             return switch (file_tree.stagePresenceFromEntry(entry)) {
-                .mixed => .combined_hunks,
+                .mixed => if (self.canonicalCandidateSourceFile(gate) != null)
+                    .combined_hunks
+                else
+                    .cached_diff,
                 .staged_only => .cached_diff,
                 .untracked => .generated_added_file,
                 .unstaged_only, .conflict, .clean_or_unknown => null,
@@ -1949,12 +1963,14 @@ pub const Controller = struct {
         const allocator = allocator_opt orelse return error.MissingAllocator;
         errdefer self.abortCanonicalPublication(allocator);
         _ = try self.refreshCanonicalPath(allocator, gate);
-        const displayed = self.page.review_projection.displayed.request() orelse {
-            self.abortCanonicalPublication(allocator);
-            return .{};
-        };
-        const projection_kind = self.canonicalProjectionKind(gate, displayed.kind) orelse {
-            try self.commitCanonicalPrimary(allocator);
+        const source_changes = self.canonicalSourceChanges(gate);
+        const status_changes = gate.status.changesSnapshot();
+        const projection_kind = self.canonicalProjectionKind(gate) orelse {
+            if (!source_changes and !status_changes) {
+                self.commitCanonicalNoop(allocator);
+            } else {
+                try self.commitCanonicalPrimary(allocator);
+            }
             return .{};
         };
         const target: ProjectionTarget = .{
@@ -1963,9 +1979,9 @@ pub const Controller = struct {
             .kind = projection_kind,
             .source_kind = sourceKind(self.source),
         };
-        if (!self.canonicalSourceChanges(gate) and
-            !gate.status.changesSnapshot() and
-            displayed.matchesBorrowed(
+        if (!source_changes and !status_changes) {
+            const displayed = self.page.review_projection.displayed.request();
+            if (displayed != null and displayed.?.matchesBorrowed(
                 gate.read_epoch,
                 target.repo_root,
                 target.path_key,
@@ -1973,14 +1989,14 @@ pub const Controller = struct {
                 target.source_kind,
                 self.page.source_session_revision,
                 self.page.status_snapshot_revision,
-            ))
-        {
-            self.commitCanonicalNoop(allocator);
-            return .{};
+            )) {
+                self.commitCanonicalNoop(allocator);
+                return .{};
+            }
         }
         const expected_presentation = self.canonicalExpectedPresentation(gate, target);
         const source_revision = self.page.source_session_revision +
-            @intFromBool(self.canonicalSourceChanges(gate));
+            @intFromBool(source_changes);
         const status_revision = self.canonicalStatusRevision(gate);
 
         self.page.review_projection_next_id +%= 1;
@@ -2561,7 +2577,7 @@ pub const Controller = struct {
                 self.page.status_load.markFailure(self.page.git_status.repo_root != null);
                 _ = self.page.activation.finishMember(result.identity, .status, .failed);
             }
-            return .{ .skip_redraw = true, .terminal_admitted = owns_terminal };
+            return .{ .skip_redraw = true };
         }
         if (!owns_terminal) return .{ .skip_redraw = true };
         if (!publication_admitted) {
@@ -3128,11 +3144,7 @@ pub const Controller = struct {
         const expected_source_revision = self.page.source_session_revision +
             @intFromBool(source_changes);
         const expected_status_revision = self.canonicalStatusRevision(gate);
-        const displayed = self.page.review_projection.displayed.request() orelse {
-            self.abortCanonicalPublication(allocator);
-            return .{ .skip_redraw = true };
-        };
-        const expected_kind = self.canonicalProjectionKind(gate, displayed.kind) orelse {
+        const expected_kind = self.canonicalProjectionKind(gate) orelse {
             self.abortCanonicalPublication(allocator);
             return .{ .skip_redraw = true };
         };
@@ -3344,14 +3356,16 @@ pub const Controller = struct {
                 .reuse_candidate, .staged_only_reuse_candidate => unreachable,
             }
             result_transferred = true;
+        }
+
+        _ = self.navigation.finalizeActionCursor(allocator);
+        if (!reused) {
             if (final_anchor) |*anchor| {
                 self.restoreDisplayedNavigation(anchor);
             } else {
                 self.clearDisplayRestore(allocator);
             }
         }
-
-        _ = self.navigation.finalizeActionCursor(allocator);
         self.navigation.rebuildFileSearchProjection(allocator);
 
         if (retiring_load) |*state| deinitRetiringLoadState(state, allocator);
@@ -3580,7 +3594,13 @@ pub const Controller = struct {
             self.acceptsIdentity(finished.identity) and
             self.acceptsRepositoryReadCompletion(finished.read_epoch, finished.background_cycle_id);
         const owns_terminal = self.sourceTerminalOwnsPending(finished);
-        const canonical_terminal = self.canonicalGateMatchesSource(finished);
+        var canonical_terminal = self.canonicalGateMatchesSource(finished);
+        if (canonical_terminal and self.page.canonical_publication.?.status_generation == null) {
+            var unpaired_gate = self.page.canonical_publication.?;
+            self.page.canonical_publication = null;
+            unpaired_gate.deinit(allocator);
+            canonical_terminal = false;
+        }
         if (canonical_terminal and (!owns_terminal or !publication_admitted)) {
             self.page.auto_reload.finishMember(finished.background_cycle_id, .source);
             self.abortCanonicalPublication(allocator);

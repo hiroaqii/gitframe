@@ -10766,6 +10766,7 @@ test "review repository transition E3b2 unavailable path is not replayed after r
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
     const diff_task: *DiffLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[2].ctx));
+    const status_task: *StatusLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
     var replacement = app_test_support.loadedDiffTwo();
     replacement.text = "new";
     try app.finishDiffLoad(&ctx, .{
@@ -10777,12 +10778,25 @@ test "review repository transition E3b2 unavailable path is not replayed after r
             .loaded = replacement,
         } },
     });
+    try app.finishStatusLoad(&ctx, .{
+        .identity = status_task.identity,
+        .read_epoch = status_task.read_epoch,
+        .generation = status_task.generation,
+        .background_cycle_id = status_task.background_cycle_id,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .result = .empty,
+    });
+    try app.ensureReviewProjection(&ctx);
 
-    try std.testing.expectEqual(@as(usize, 2), app.reviewNavigationView().activeLoadedDiffConst().?.document.files.len);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    const reloaded = app.reviewNavigationView().activeLoadedDiffConst().?;
+    try std.testing.expectEqual(@as(usize, 2), reloaded.document.files.len);
+    try std.testing.expect(app.pages.review.viewer.selected_node < reloaded.tree.nodes.len);
+    try std.testing.expectEqualStrings(
+        "a",
+        reloaded.tree.nodes[app.pages.review.viewer.selected_node].path,
+    );
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expectEqualStrings("a", app.reviewNavigationView().activeLoadedDiffConst().?.tree.nodes[0].path);
 }
 
 test "review repository transition E3b2 inactive Repository retains contextual selection" {
@@ -14512,6 +14526,70 @@ fn expectFreshCanonicalPublication(
     }
 }
 
+fn expectFreshCanonicalCachedPublication(
+    app: *App,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    prior_content_token: diff_presentation_identity.ContentToken,
+    expected_source_revision: u64,
+    expected_status_revision: u64,
+) !void {
+    try std.testing.expectEqual(expected_source_revision, app.pages.review.source_session_revision);
+    try std.testing.expectEqual(expected_status_revision, app.pages.review.status_snapshot_revision);
+    try std.testing.expect(app.pages.review.auto_reload.sourceIsActionable());
+    try std.testing.expect(app.pages.review.status_load.isFresh());
+
+    const request = app.pages.review.review_projection.displayed.request() orelse
+        return error.ExpectedCanonicalProjectionRequest;
+    try std.testing.expect(request.matchesBorrowed(
+        app.pages.review.repository_read_authority.epoch,
+        repo_root,
+        "a",
+        .cached_diff,
+        .unstaged,
+        expected_source_revision,
+        expected_status_revision,
+    ));
+    try std.testing.expect(request.matchesRootIdentity(app.repo_state.activeIdentity()));
+    const expected_presentation = request.expected_presentation orelse
+        return error.ExpectedPriorCanonicalPresentation;
+    try std.testing.expect(expected_presentation.owner == .combined_projection);
+    try std.testing.expect(expected_presentation.content_token.eql(prior_content_token));
+    try std.testing.expect(app.reviewNavigationView().displayedReviewBody() == .cached);
+    try std.testing.expect(app.reviewNavigationView().activeCachedDiffProjection() != null);
+
+    switch (app.reviewOperations().stageTarget()) {
+        .ready => |target| try std.testing.expectEqualStrings("a", target.path),
+        else => return error.ExpectedFreshFileStageCapability,
+    }
+    switch (app.reviewOperations().unstageTarget()) {
+        .ready => |target| try std.testing.expectEqualStrings("a", target.path),
+        else => return error.ExpectedFreshFileUnstageCapability,
+    }
+
+    app.pages.review.viewer.diff_scroll = 0;
+    app.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
+    switch (app.reviewOperations().selectedHunkToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(
+            ToggleStageOperation.unstage,
+            operation,
+        ),
+        else => return error.ExpectedFreshHunkUnstageOperation,
+    }
+    switch (app.reviewOperations().selectedHunkStageTarget(allocator)) {
+        .already_staged_hunk => {},
+        else => return error.ExpectedAlreadyStagedHunk,
+    }
+    switch (app.reviewOperations().selectedHunkUnstageTarget(allocator)) {
+        .ready => |target| {
+            defer allocator.free(target.patch);
+            try std.testing.expectEqualStrings("a", target.path);
+            try std.testing.expect(target.session_mark_mutation == .none);
+        },
+        else => return error.ExpectedFreshHunkUnstageCapability,
+    }
+}
+
 test "Review ordinary primary publication retains primary until cached result" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
@@ -14805,6 +14883,7 @@ fn expectOrdinaryPrimaryNoTargetPublication(
         else => return error.ExpectedOrdinaryPrimary,
     };
     const owner_before = primary_before.loaded;
+    const source_text_before = primary_before.loaded.text.ptr;
     const tree_nodes_before = primary_before.loaded.tree.nodes.ptr;
     const status_root_before = app.pages.review.git_status.repo_root.?.ptr;
     const status_entries_before = app.pages.review.git_status.document.entries.ptr;
@@ -14956,7 +15035,7 @@ fn expectOrdinaryPrimaryNoTargetPublication(
     const token_after = app.reviewNavigationView().currentContentToken() orelse
         return error.ExpectedReviewContentToken;
     if (source_changes) {
-        try std.testing.expect(primary_after.loaded != owner_before);
+        try std.testing.expect(primary_after.loaded.text.ptr != source_text_before);
         try std.testing.expectEqualStrings(
             app_test_support.diff_unstaged_projection,
             primary_after.loaded.text,
@@ -15068,24 +15147,49 @@ test "Review canonical publication retains the prior body for every direct actio
 
                 try app.ensureReviewProjection(&ctx);
                 var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
-                const final_bundle = try canonicalPublicationFinalBundle(allocator, request);
-                try app.finishReviewProjectionLoad(&ctx, .{
-                    .request = request,
-                    .result = .{ .ready = .{ .combined_hunks = final_bundle } },
-                });
+                if (source_empty) {
+                    try std.testing.expectEqual(app_review_projection.Kind.cached_diff, request.kind);
+                    try app.finishReviewProjectionLoad(&ctx, .{
+                        .request = request,
+                        .result = .{ .ready = .{
+                            .cached_diff = try app_load.buildLoadedBundle(
+                                allocator,
+                                app_test_support.diff_cached_projection,
+                            ),
+                        } },
+                    });
+                } else {
+                    try std.testing.expectEqual(app_review_projection.Kind.combined_hunks, request.kind);
+                    const final_bundle = try canonicalPublicationFinalBundle(allocator, request);
+                    try app.finishReviewProjectionLoad(&ctx, .{
+                        .request = request,
+                        .result = .{ .ready = .{ .combined_hunks = final_bundle } },
+                    });
+                }
                 request = undefined;
                 try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
 
-                try expectFreshCanonicalPublication(
-                    &app,
-                    allocator,
-                    roots.a,
-                    prior_hunks,
-                    prior_content_token,
-                    source_revision_before + 1,
-                    status_revision_before,
-                    true,
-                );
+                if (source_empty) {
+                    try expectFreshCanonicalCachedPublication(
+                        &app,
+                        allocator,
+                        roots.a,
+                        prior_content_token,
+                        source_revision_before + 1,
+                        status_revision_before,
+                    );
+                } else {
+                    try expectFreshCanonicalPublication(
+                        &app,
+                        allocator,
+                        roots.a,
+                        prior_hunks,
+                        prior_content_token,
+                        source_revision_before + 1,
+                        status_revision_before,
+                        true,
+                    );
+                }
                 try std.testing.expect(app.pages.review.pending_reload == null);
                 try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
             }
@@ -17129,7 +17233,7 @@ test "cached source hunk unstage reload decision travels with task result" {
         } } },
     };
     _ = app.activateReview();
-    defer app.pages.review.staged_hunks.deinit(allocator);
+    defer app.pages.review.deinit(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
