@@ -17,9 +17,10 @@ pub const Phase = union(enum) {
 
 /// Page-owned authority for repository-derived reads.
 ///
-/// P6b1 defines and tests this state machine without connecting it to action
-/// routes. Runtime fencing is enabled atomically in P6b2d after every request,
-/// result, and launch route carries the required vocabulary.
+/// The App action coordinator closes this owner only after a concrete mutating
+/// task or foreground command is accepted, and reopens it only for that exact
+/// action terminal. Every repository-derived read and publication gate uses
+/// the epoch plus phase together.
 pub const ReviewRepositoryReadAuthority = struct {
     epoch: ReviewRepositoryReadEpoch = .{},
     phase: Phase = .open,

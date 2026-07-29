@@ -117,6 +117,7 @@ pub const Lifecycle = struct {
     state: ActivationState = .inactive,
     next_activation_id: u64 = 0,
     revalidation_requested: ?u64 = null,
+    action_terminal_revalidation_requested: ?u64 = null,
 
     pub fn activate(
         self: *Lifecycle,
@@ -134,12 +135,14 @@ pub const Lifecycle = struct {
             .members = .{ .source = source, .status = status, .branch = branch },
         } };
         self.revalidation_requested = null;
+        self.action_terminal_revalidation_requested = null;
         return activation_id;
     }
 
     pub fn deactivate(self: *Lifecycle) void {
         self.state = .inactive;
         self.revalidation_requested = null;
+        self.action_terminal_revalidation_requested = null;
     }
 
     pub fn currentIdentity(self: Lifecycle) ?page.RequestIdentity {
@@ -156,14 +159,47 @@ pub const Lifecycle = struct {
         };
     }
 
-    pub fn takeQueuedRevalidation(self: *Lifecycle) bool {
-        const requested = self.revalidation_requested orelse return false;
-        const matches = switch (self.state) {
-            .inactive => false,
-            .active => |active| active.activation_id == requested,
+    pub fn queueActionTerminalRevalidation(self: *Lifecycle) void {
+        self.action_terminal_revalidation_requested = switch (self.state) {
+            .inactive => null,
+            .active => |active| active.activation_id,
         };
-        self.revalidation_requested = null;
-        return matches;
+    }
+
+    pub fn hasQueuedFullRevalidation(self: Lifecycle) bool {
+        const activation_id = switch (self.state) {
+            .inactive => return false,
+            .active => |active| active.activation_id,
+        };
+        return self.revalidation_requested == activation_id or
+            self.action_terminal_revalidation_requested == activation_id;
+    }
+
+    pub fn consumeAcceptedFullRevalidation(self: *Lifecycle) void {
+        const activation_id = switch (self.state) {
+            .inactive => return,
+            .active => |active| active.activation_id,
+        };
+        if (self.revalidation_requested == activation_id) {
+            self.revalidation_requested = null;
+        }
+        if (self.action_terminal_revalidation_requested == activation_id) {
+            self.action_terminal_revalidation_requested = null;
+        }
+    }
+
+    pub fn consumeAcceptedTerminalRevalidation(self: *Lifecycle) void {
+        const activation_id = switch (self.state) {
+            .inactive => return,
+            .active => |active| active.activation_id,
+        };
+        if (self.action_terminal_revalidation_requested == activation_id) {
+            self.action_terminal_revalidation_requested = null;
+        }
+    }
+
+    pub fn discardTerminalRevalidation(self: *Lifecycle) void {
+        self.consumeAcceptedTerminalRevalidation();
     }
 
     pub fn markPending(self: *Lifecycle, member: Member) void {
@@ -263,11 +299,33 @@ test "queued revalidation belongs to the current activation" {
     var lifecycle: Lifecycle = .{};
     _ = lifecycle.activate(2, .pending, .pending, .pending);
     lifecycle.queueRevalidation();
-    try std.testing.expect(lifecycle.takeQueuedRevalidation());
-    try std.testing.expect(!lifecycle.takeQueuedRevalidation());
+    try std.testing.expect(lifecycle.hasQueuedFullRevalidation());
+    lifecycle.consumeAcceptedFullRevalidation();
+    try std.testing.expect(!lifecycle.hasQueuedFullRevalidation());
 
     _ = lifecycle.activate(2, .pending, .pending, .pending);
     lifecycle.queueRevalidation();
+    lifecycle.queueActionTerminalRevalidation();
     lifecycle.deactivate();
-    try std.testing.expect(!lifecycle.takeQueuedRevalidation());
+    try std.testing.expect(!lifecycle.hasQueuedFullRevalidation());
+    try std.testing.expect(lifecycle.revalidation_requested == null);
+    try std.testing.expect(lifecycle.action_terminal_revalidation_requested == null);
+}
+
+test "full and terminal revalidation consumption remain distinct" {
+    var lifecycle: Lifecycle = .{};
+    const activation_id = lifecycle.activate(3, .fresh, .fresh, .fresh);
+    lifecycle.queueRevalidation();
+    lifecycle.queueActionTerminalRevalidation();
+
+    lifecycle.consumeAcceptedTerminalRevalidation();
+    try std.testing.expectEqual(@as(?u64, activation_id), lifecycle.revalidation_requested);
+    try std.testing.expect(lifecycle.action_terminal_revalidation_requested == null);
+    try std.testing.expect(lifecycle.hasQueuedFullRevalidation());
+
+    lifecycle.queueActionTerminalRevalidation();
+    lifecycle.consumeAcceptedFullRevalidation();
+    try std.testing.expect(lifecycle.revalidation_requested == null);
+    try std.testing.expect(lifecycle.action_terminal_revalidation_requested == null);
+    try std.testing.expect(!lifecycle.hasQueuedFullRevalidation());
 }

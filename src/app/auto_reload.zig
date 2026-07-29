@@ -100,6 +100,7 @@ pub const AuxiliaryPending = struct {
     read_epoch: review_read_epoch.ReviewRepositoryReadEpoch = .{},
     origin: LoadOrigin = .foreground,
     background_cycle_id: ?u64 = null,
+    publication_allowed: bool = true,
 
     pub fn matchesTerminal(self: AuxiliaryPending, terminal: AuxiliaryTerminal) bool {
         return self.generation == terminal.generation and
@@ -147,6 +148,26 @@ pub const AuxiliaryTracker = struct {
         const pending = self.pending orelse return false;
         if (!pending.matchesTerminal(terminal)) return false;
         self.pending = null;
+        return true;
+    }
+
+    pub fn acceptsPublication(
+        self: AuxiliaryTracker,
+        terminal: AuxiliaryTerminal,
+    ) bool {
+        if (terminal.generation != self.generation) return false;
+        const pending = self.pending orelse return false;
+        return pending.matchesTerminal(terminal) and pending.publication_allowed;
+    }
+
+    pub fn supersedeTerminal(
+        self: *AuxiliaryTracker,
+        terminal: AuxiliaryTerminal,
+    ) bool {
+        if (terminal.generation != self.generation) return false;
+        const pending = if (self.pending) |*owned| owned else return false;
+        if (!pending.matchesTerminal(terminal)) return false;
+        pending.publication_allowed = false;
         return true;
     }
 

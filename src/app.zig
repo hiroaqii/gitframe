@@ -75,6 +75,17 @@ const PendingRecentPathDiscovery = struct {
 };
 
 const RepoCommitOutcome = enum { unchanged, changed, rejected };
+const ActionTerminalTarget = enum {
+    rejected_terminal,
+    current_review_target,
+    detached_review_target,
+};
+const ReviewRevalidationStartDisposition = enum {
+    accepted_source,
+    accepted_repo_discovery,
+    rejected_start,
+    unsupported,
+};
 
 pub const SourceMode = diff_source.SourceMode;
 pub const CliConfig = diff_source.CliConfig;
@@ -1518,10 +1529,8 @@ pub const App = struct {
     fn requestReviewRevalidation(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (self.active_page != .review) return;
         if (diff_source.sourceIsOneShotInput(self.config.source)) return;
-        if (self.reviewReadBusy()) {
-            self.pages.review.activation.queueRevalidation();
-            return;
-        }
+        self.pages.review.activation.queueRevalidation();
+        if (self.reviewReadBusy()) return;
         try self.startReviewRevalidation(ctx);
     }
 
@@ -1550,8 +1559,12 @@ pub const App = struct {
 
     fn maybeStartQueuedReviewRevalidation(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (self.active_page != .review or self.reviewReadBusy()) return;
-        if (!self.pages.review.activation.takeQueuedRevalidation()) return;
-        try self.startReviewRevalidation(ctx);
+        if (!self.pages.review.activation.hasQueuedFullRevalidation()) return;
+        if (diff_source.sourceIsOneShotInput(self.config.source)) {
+            self.pages.review.activation.discardTerminalRevalidation();
+            return;
+        }
+        self.startReviewRevalidation(ctx) catch {};
     }
 
     fn scrollHelp(self: *App, delta: isize) void {
@@ -1686,9 +1699,15 @@ pub const App = struct {
         defer if (!command_consumed) command.deinit(ctx.allocator());
         const source = &command.source_load;
         const generation = source.generation;
+        var status_receipt: ?app_auto_reload.AuxiliaryTerminal = null;
+        var branch_receipt: ?app_auto_reload.AuxiliaryTerminal = null;
+        var source_accepted = false;
+        defer if (!source_accepted) {
+            self.retireRejectedFullStartAuxiliaries(status_receipt, branch_receipt);
+        };
 
         if (repo_root) |root| {
-            self.startStatusLoadTracked(
+            status_receipt = self.startStatusLoadTracked(
                 ctx,
                 root,
                 if (options.kind == .watch) .background else .foreground,
@@ -1704,7 +1723,7 @@ pub const App = struct {
                 }
                 return err;
             };
-            self.startBranchStatusLoad(ctx, root, options.background_cycle_id);
+            branch_receipt = self.startBranchStatusLoad(ctx, root, options.background_cycle_id);
         } else {
             if (action_cursor_generation) |action_generation| {
                 _ = self.pages.review.action_cursor.failMemberBeforeStart(
@@ -1754,6 +1773,7 @@ pub const App = struct {
             return err;
         };
         self.reviewReload().acceptSourceSpawn(options.background_cycle_id);
+        source_accepted = true;
     }
 
     fn startStatusLoad(
@@ -1767,7 +1787,7 @@ pub const App = struct {
         if (self.pages.review.action_cursor.hasOwner()) {
             self.reviewNavigation().clearActionCursor(ctx.allocator());
         }
-        self.startStatusLoadTracked(ctx, repo_root, origin, background_cycle_id, null) catch {};
+        _ = self.startStatusLoadTracked(ctx, repo_root, origin, background_cycle_id, null) catch {};
     }
 
     fn startStatusLoadTracked(
@@ -1777,8 +1797,10 @@ pub const App = struct {
         origin: git_backend.ReadOrigin,
         background_cycle_id: ?u64,
         action_cursor_generation: ?u64,
-    ) !void {
-        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return;
+    ) !app_auto_reload.AuxiliaryTerminal {
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) {
+            return error.RepositoryReadAuthorityClosed;
+        }
         var review_update = self.reviewReload().prepareStatusLoad(
             ctx.allocator(),
             repo_root,
@@ -1832,10 +1854,20 @@ pub const App = struct {
             return err;
         };
         self.reviewReload().acceptStatusSpawn(background_cycle_id);
+        return .{
+            .generation = status_read.generation,
+            .read_epoch = status_read.read_epoch,
+            .background_cycle_id = status_read.background_cycle_id,
+        };
     }
 
-    fn startBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), repo_root: []const u8, background_cycle_id: ?u64) void {
-        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return;
+    fn startBranchStatusLoad(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        repo_root: []const u8,
+        background_cycle_id: ?u64,
+    ) ?app_auto_reload.AuxiliaryTerminal {
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return null;
         var review_update = self.reviewReload().prepareBranchStatusLoad(
             ctx.allocator(),
             repo_root,
@@ -1843,7 +1875,7 @@ pub const App = struct {
         ) catch {
             self.reviewReload().failActiveMember(.branch);
             self.setReviewStatus("could not allocate branch status repo root", .{});
-            return;
+            return null;
         };
         defer review_update.deinit(ctx.allocator());
         var command = review_update.takeCommand() orelse unreachable;
@@ -1853,7 +1885,7 @@ pub const App = struct {
         const task = ctx.allocator().create(BranchStatusLoadTask) catch {
             self.reviewReload().rejectBranchStatusSpawn(background_cycle_id);
             self.setReviewStatus("could not allocate branch status load task", .{});
-            return;
+            return null;
         };
         task.* = .{
             .identity = branch_read.identity,
@@ -1870,9 +1902,27 @@ pub const App = struct {
             ctx.allocator().destroy(task);
             self.reviewReload().rejectBranchStatusSpawn(background_cycle_id);
             self.setReviewStatus("could not start branch status load task", .{});
-            return;
+            return null;
         };
         self.reviewReload().acceptBranchStatusSpawn(background_cycle_id);
+        return .{
+            .generation = branch_read.generation,
+            .read_epoch = branch_read.read_epoch,
+            .background_cycle_id = branch_read.background_cycle_id,
+        };
+    }
+
+    fn retireRejectedFullStartAuxiliaries(
+        self: *App,
+        status: ?app_auto_reload.AuxiliaryTerminal,
+        branch: ?app_auto_reload.AuxiliaryTerminal,
+    ) void {
+        if (status) |terminal| {
+            _ = self.reviewReload().supersedeAcceptedStatusSpawn(terminal);
+        }
+        if (branch) |terminal| {
+            _ = self.reviewReload().supersedeAcceptedBranchStatusSpawn(terminal);
+        }
     }
 
     fn applyDeferredSource(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -1978,23 +2028,55 @@ pub const App = struct {
         };
     }
 
-    /// Commit one concrete async launch to the App-owned action state.
-    ///
-    /// This boundary is intentionally behavior-only for now. P6b2d will add
-    /// the Review repository-read fence here atomically with its launch gates
-    /// and terminal reopen path.
+    /// Atomically commit one concrete action launch and, for a mutation, close
+    /// Review repository-read authority before control returns to the caller.
     fn acceptActionLaunch(self: *App, pending: app_actions.PendingAction) void {
-        const accepted = self.actions.acceptLaunch(pending);
-        std.debug.assert(accepted);
+        if (!self.actions.acceptLaunch(pending)) {
+            @panic("action launch acceptance did not match its preparing owner");
+        }
+        if (!pending.kind.blocksBackgroundAcceptance()) return;
+
+        const allocator = self.allocator orelse
+            @panic("accepted mutating action requires App allocator");
+        if (!self.reviewReload().beginMutationReadFence(allocator, pending)) {
+            @panic("accepted mutating action could not close Review read authority");
+        }
     }
 
     /// Accept one delivered terminal for the exact current launched action.
-    ///
-    /// This remains behavior-only through P6b2c. P6b2d will extend this one
-    /// boundary to validate and reopen the matching Review read authority
-    /// before any result-specific reconciliation starts.
+    /// Mutations reopen their matching Review read fence and queue the
+    /// activation-scoped recovery intent before the action owner is retired.
     fn acceptActionTerminal(self: *App, pending: app_actions.PendingAction) bool {
+        if (!self.actions.isAccepted(pending)) return false;
+        if (pending.kind.blocksBackgroundAcceptance() and
+            !self.reviewReload().finishMutationReadFence(pending))
+        {
+            @panic("exact mutating action terminal could not reopen Review read authority");
+        }
         return self.actions.finish(pending);
+    }
+
+    fn acceptActionTerminalForTarget(
+        self: *App,
+        allocator: std.mem.Allocator,
+        pending: app_actions.PendingAction,
+        repo_root: []const u8,
+    ) ActionTerminalTarget {
+        if (!self.acceptActionTerminal(pending)) return .rejected_terminal;
+        std.debug.assert(pending.kind.blocksBackgroundAcceptance());
+
+        const current_target = self.active_page == .review and
+            self.pages.review.activation.currentIdentity() != null and
+            !diff_source.sourceIsOneShotInput(self.config.source) and
+            self.activeRepoMatches(repo_root);
+        if (current_target) return .current_review_target;
+
+        _ = self.pages.review.action_cursor.clearMatchingAction(
+            allocator,
+            pending.generation,
+        );
+        self.pages.review.activation.discardTerminalRevalidation();
+        return .detached_review_target;
     }
 
     fn stageSelectedFile(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -3514,14 +3596,19 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.acceptActionTerminal(result.pending)) return;
+        const terminal_target = self.acceptActionTerminalForTarget(
+            ctx.allocator(),
+            result.pending,
+            result.repo_root,
+        );
+        if (terminal_target == .rejected_terminal) return;
+        const active_matches = terminal_target == .current_review_target;
 
         if (self.setActionFailureStatus("stage", result.result)) {
             _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
             return;
         }
 
-        const active_matches = self.activeRepoMatches(result.repo_root);
         self.setReviewStatus("staged: {s}", .{result.path});
         const applied = self.reviewOperationController().applyAcceptedOutcome(
             ctx.allocator(),
@@ -3536,14 +3623,19 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.acceptActionTerminal(result.pending)) return;
+        const terminal_target = self.acceptActionTerminalForTarget(
+            ctx.allocator(),
+            result.pending,
+            result.repo_root,
+        );
+        if (terminal_target == .rejected_terminal) return;
+        const active_matches = terminal_target == .current_review_target;
 
         if (self.setActionFailureStatus("hunk stage", result.result)) {
             _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
             return;
         }
 
-        const active_matches = self.activeRepoMatches(result.repo_root);
         const applied = self.reviewOperationController().applyAcceptedOutcome(ctx.allocator(), .{ .stage_hunk = .{
             .repo_root = result.repo_root,
             .path = result.path,
@@ -3563,14 +3655,19 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.acceptActionTerminal(result.pending)) return;
+        const terminal_target = self.acceptActionTerminalForTarget(
+            ctx.allocator(),
+            result.pending,
+            result.repo_root,
+        );
+        if (terminal_target == .rejected_terminal) return;
+        const active_matches = terminal_target == .current_review_target;
 
         if (self.setActionFailureStatus("unstage", result.result)) {
             _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
             return;
         }
 
-        const active_matches = self.activeRepoMatches(result.repo_root);
         self.setReviewStatus("unstaged: {s}", .{result.path});
         const applied = self.reviewOperationController().applyAcceptedOutcome(
             ctx.allocator(),
@@ -3585,14 +3682,19 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.acceptActionTerminal(result.pending)) return;
+        const terminal_target = self.acceptActionTerminalForTarget(
+            ctx.allocator(),
+            result.pending,
+            result.repo_root,
+        );
+        if (terminal_target == .rejected_terminal) return;
+        const active_matches = terminal_target == .current_review_target;
 
         if (self.setActionFailureStatus("hunk unstage", result.result)) {
             _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
             return;
         }
 
-        const active_matches = self.activeRepoMatches(result.repo_root);
         self.setReviewStatus("unstaged hunk {d}: {s}", .{ result.hunk_index + 1, result.path });
         const applied = self.reviewOperationController().applyAcceptedOutcome(ctx.allocator(), .{ .unstage_hunk = .{
             .repo_root = result.repo_root,
@@ -3609,14 +3711,19 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.acceptActionTerminal(result.pending)) return;
+        const terminal_target = self.acceptActionTerminalForTarget(
+            ctx.allocator(),
+            result.pending,
+            result.repo_root,
+        );
+        if (terminal_target == .rejected_terminal) return;
+        const active_matches = terminal_target == .current_review_target;
 
         if (self.setActionFailureStatus("discard", result.result)) {
             _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), result.pending.generation);
             return;
         }
 
-        const active_matches = self.activeRepoMatches(result.repo_root);
         const applied = self.reviewOperationController().applyAcceptedOutcome(ctx.allocator(), .{ .discard_file = .{
             .repo_root = result.repo_root,
             .path = result.path,
@@ -3644,11 +3751,16 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.acceptActionTerminal(result.pending)) return;
+        const terminal_target = self.acceptActionTerminalForTarget(
+            ctx.allocator(),
+            result.pending,
+            result.repo_root,
+        );
+        if (terminal_target == .rejected_terminal) return;
+        const active_matches = terminal_target == .current_review_target;
 
         switch (result.result) {
             .ok, .ok_static => {
-                const active_matches = self.activeRepoMatches(result.repo_root);
                 const applied = self.reviewOperationController().applyAcceptedOutcome(
                     ctx.allocator(),
                     .{ .commit = .{ .repo_root = result.repo_root } },
@@ -3728,12 +3840,17 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.acceptActionTerminal(result.pending)) return;
+        const terminal_target = self.acceptActionTerminalForTarget(
+            ctx.allocator(),
+            result.pending,
+            result.repo_root,
+        );
+        if (terminal_target == .rejected_terminal) return;
+        const active_matches = terminal_target == .current_review_target;
 
         switch (result.result) {
             .ok, .ok_static => {
                 const reviewed_clear_failed = if (self.pages.review.reviewed_store.clearForRepo(ctx.allocator(), result.repo_root)) |_| false else |_| true;
-                const active_matches = self.activeRepoMatches(result.repo_root);
                 self.commit_panel.close();
                 self.cancelAmendConfirmation(ctx.allocator());
 
@@ -3743,7 +3860,7 @@ pub const App = struct {
                     } else {
                         self.setReviewStatus("amended", .{});
                     }
-                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+                    _ = self.startActionResultRevalidation(ctx, null, false);
                 } else {
                     if (reviewed_clear_failed) {
                         self.setReviewStatus("amended: {s}; could not clear reviewed marks", .{result.repo_root});
@@ -3763,15 +3880,19 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.acceptActionTerminal(result.pending)) return;
-
-        const active_matches = self.activeRepoMatches(result.repo_root);
+        const terminal_target = self.acceptActionTerminalForTarget(
+            ctx.allocator(),
+            result.pending,
+            result.repo_root,
+        );
+        if (terminal_target == .rejected_terminal) return;
+        const active_matches = terminal_target == .current_review_target;
 
         switch (result.result) {
             .ok, .ok_static => {
                 if (active_matches) {
                     self.setReviewStatus("pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
-                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+                    _ = self.startActionResultRevalidation(ctx, null, false);
                 } else {
                     self.setReviewStatus("pushed: {s}", .{result.repo_root});
                 }
@@ -3798,15 +3919,19 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.acceptActionTerminal(result.pending)) return;
-
-        const active_matches = self.activeRepoMatches(result.repo_root);
+        const terminal_target = self.acceptActionTerminalForTarget(
+            ctx.allocator(),
+            result.pending,
+            result.repo_root,
+        );
+        if (terminal_target == .rejected_terminal) return;
+        const active_matches = terminal_target == .current_review_target;
 
         switch (result.result) {
             .ok => {
                 if (active_matches) {
                     self.setReviewStatus("pulled: {s} <- {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
-                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+                    _ = self.startActionResultRevalidation(ctx, null, false);
                 } else {
                     self.setReviewStatus("pulled: {s}", .{result.repo_root});
                 }
@@ -3814,7 +3939,7 @@ pub const App = struct {
             .ok_static => |message| {
                 if (active_matches) {
                     self.setReviewStatus("{s}", .{message});
-                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+                    _ = self.startActionResultRevalidation(ctx, null, false);
                 } else {
                     self.setReviewStatus("{s}: {s}", .{ message, result.repo_root });
                 }
@@ -3824,7 +3949,7 @@ pub const App = struct {
                 // A failed pull may still have fetched remote-tracking refs
                 // before `--ff-only` or another later step failed, so refresh
                 // the active repo when it still matches the completed task.
-                if (active_matches) try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+                if (active_matches) _ = self.startActionResultRevalidation(ctx, null, false);
             },
         }
     }
@@ -3833,15 +3958,19 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.acceptActionTerminal(result.pending)) return;
-
-        const active_matches = self.activeRepoMatches(result.repo_root);
+        const terminal_target = self.acceptActionTerminalForTarget(
+            ctx.allocator(),
+            result.pending,
+            result.repo_root,
+        );
+        if (terminal_target == .rejected_terminal) return;
+        const active_matches = terminal_target == .current_review_target;
 
         switch (result.result) {
             .ok, .ok_static => {
                 if (active_matches) {
                     self.setReviewStatus("fetched: {s}", .{result.remote});
-                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+                    _ = self.startActionResultRevalidation(ctx, null, false);
                 } else {
                     self.setReviewStatus("fetched: {s}", .{result.repo_root});
                 }
@@ -3851,7 +3980,7 @@ pub const App = struct {
                 // Git can update some refs before reporting an overall fetch
                 // failure. Reload only the still-active matching repo so the UI
                 // sees those side effects without disturbing a repo switch.
-                if (active_matches) try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+                if (active_matches) _ = self.startActionResultRevalidation(ctx, null, false);
             },
         }
     }
@@ -3860,9 +3989,13 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
 
-        if (!self.acceptActionTerminal(result.pending)) return;
-
-        const active_matches = self.activeRepoMatches(result.repo_root);
+        const terminal_target = self.acceptActionTerminalForTarget(
+            ctx.allocator(),
+            result.pending,
+            result.repo_root,
+        );
+        if (terminal_target == .rejected_terminal) return;
+        const active_matches = terminal_target == .current_review_target;
 
         switch (result.result) {
             .ok, .ok_static => {
@@ -3873,14 +4006,14 @@ pub const App = struct {
                     self.reviewNavigation().clearSearch();
                     self.setReviewStatus("switched branch: {s} -> {s}", .{ result.old_branch, result.new_branch });
                     if (reviewed_clear_failed) self.setReviewStatus("switched branch: {s} -> {s}; could not clear reviewed marks", .{ result.old_branch, result.new_branch });
-                    try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = true, .kind = .action_result });
+                    _ = self.startActionResultRevalidation(ctx, null, true);
                 } else {
                     self.setReviewStatus("switched branch: {s}", .{result.repo_root});
                 }
             },
             .failed, .failed_static => {
                 _ = self.setActionFailureStatus("branch switch", result.result);
-                if (active_matches) try self.startDiffLoadWithRepoRoot(ctx, result.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+                if (active_matches) _ = self.startActionResultRevalidation(ctx, null, false);
             },
         }
     }
@@ -3947,16 +4080,19 @@ pub const App = struct {
         self.push_retry.state = .idle;
         defer foreground.deinit(ctx.allocator());
 
-        if (!self.acceptActionTerminal(foreground.pending)) return;
+        const terminal_target = self.acceptActionTerminalForTarget(
+            ctx.allocator(),
+            foreground.pending,
+            foreground.target.repo_root,
+        );
+        if (terminal_target == .rejected_terminal) return;
+        const active_matches = terminal_target == .current_review_target;
 
         const diagnostic_origin: EffectOrigin = .{ .page = foreground.origin };
         if (!self.effectOriginIsLive(diagnostic_origin)) {
             ctx.redraw().skip();
             return;
         }
-        const active_matches = foreground.origin.repo_epoch == self.repo_epoch and
-            self.activeRepoMatches(foreground.target.repo_root);
-
         switch (result.outcome) {
             .exited => |code| {
                 if (code == 0) {
@@ -4006,7 +4142,7 @@ pub const App = struct {
             // cannot infer what changed from stderr/stdout. Refresh even after
             // non-zero exits because interactive helpers may still update local
             // refs, credential state, or branch status before failing.
-            try self.startDiffLoadWithRepoRoot(ctx, foreground.target.repo_root, .{ .clear_visible_state = false, .kind = .action_result });
+            _ = self.startActionResultRevalidation(ctx, null, false);
         }
     }
 
@@ -4078,38 +4214,53 @@ pub const App = struct {
         return pending.generation;
     }
 
-    fn reloadAfterGitAction(
+    fn startActionResultRevalidation(
         self: *App,
         ctx: *chasen.Ctx(Msg),
         action_cursor_generation: ?u64,
-    ) !void {
+        clear_visible_state: bool,
+    ) ReviewRevalidationStartDisposition {
         if (diff_source.sourceIsOneShotInput(self.config.source)) {
             if (action_cursor_generation) |generation| {
                 _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
             }
+            self.pages.review.activation.discardTerminalRevalidation();
             ctx.redraw().skip();
-            return;
+            return .unsupported;
         }
         if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
             if (action_cursor_generation) |generation| {
                 _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
             }
-            try self.startRepoDiscovery(ctx, null);
-            return;
+            self.startRepoDiscovery(ctx, null) catch return .rejected_start;
+            return .accepted_repo_discovery;
         }
         // Commit/amend can change HEAD and ahead/behind counts; this reload
         // path must continue to refresh branch status for remote workflow gates.
-        try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
+        self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
             if (action_cursor_generation) |generation| {
                 _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
             }
             ctx.redraw().skip();
-            return;
+            return .unsupported;
         }, .{
-            .clear_visible_state = false,
+            .clear_visible_state = clear_visible_state,
             .kind = .action_result,
             .action_cursor_generation = action_cursor_generation,
-        });
+        }) catch return .rejected_start;
+        return .accepted_source;
+    }
+
+    fn reloadAfterGitAction(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        action_cursor_generation: ?u64,
+    ) void {
+        _ = self.startActionResultRevalidation(
+            ctx,
+            action_cursor_generation,
+            false,
+        );
     }
 
     /// Shell effect adapter for Review-local action outcomes. Review decides
@@ -4124,7 +4275,7 @@ pub const App = struct {
             .none => if (action_cursor_generation) |generation| {
                 _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
             },
-            .source_and_aux => try self.reloadAfterGitAction(ctx, action_cursor_generation),
+            .source_and_aux => self.reloadAfterGitAction(ctx, action_cursor_generation),
             .status => |repo_root| {
                 // Status startup is synchronous even though the read is not.
                 // This defer consumes an owner made terminal by preparation or
@@ -4133,13 +4284,16 @@ pub const App = struct {
                 defer if (action_cursor_generation != null) {
                     _ = self.reviewNavigation().finalizeActionCursor(ctx.allocator());
                 };
-                self.startStatusLoadTracked(
+                const accepted = self.startStatusLoadTracked(
                     ctx,
                     repo_root,
                     .foreground,
                     null,
                     action_cursor_generation,
-                ) catch {};
+                ) catch null;
+                if (accepted != null) {
+                    self.pages.review.activation.consumeAcceptedTerminalRevalidation();
+                }
             },
         }
     }
@@ -5606,9 +5760,9 @@ fn ownTestSourceRead(app: *App, generation: u64, kind: review_page.ReloadKind) v
 /// Test fixtures model a task which has already crossed the concrete launch
 /// boundary before delivering its completion to App.
 fn beginAcceptedTestAction(app: *App, kind: app_actions.ActionKind) app_actions.PendingAction {
+    if (app.allocator == null) app.allocator = std.testing.allocator;
     const pending = app.actions.begin(kind);
-    const accepted = app.actions.acceptLaunch(pending);
-    std.debug.assert(accepted);
+    app.acceptActionLaunch(pending);
     return pending;
 }
 
@@ -5629,7 +5783,7 @@ test "action terminal coordinator accepts every exact launched action once" {
     };
     try std.testing.expectEqual(@typeInfo(app_actions.ActionKind).@"enum".fields.len, action_kinds.len);
 
-    var app: App = .{};
+    var app: App = .{ .allocator = std.testing.allocator };
     for (action_kinds) |kind| {
         const pending = app.actions.begin(kind);
         try std.testing.expect(!app.acceptActionTerminal(pending));
@@ -5640,10 +5794,12 @@ test "action terminal coordinator accepts every exact launched action once" {
         try std.testing.expect(!app.acceptActionTerminal(pending));
     }
 
-    const stale = app.actions.begin(.stage_file);
-    app.acceptActionLaunch(stale);
     const current = app.actions.begin(.pull);
     app.acceptActionLaunch(current);
+    const stale: app_actions.PendingAction = .{
+        .generation = current.generation - 1,
+        .kind = .stage_file,
+    };
 
     try std.testing.expect(!app.acceptActionTerminal(stale));
     try std.testing.expect(app.actions.isAccepted(current));
@@ -5669,7 +5825,7 @@ test "Review mutation read fence follows accepted action launch and exact termin
         mutating_kinds.len,
     );
 
-    var app: App = .{};
+    var app: App = .{ .allocator = std.testing.allocator };
     _ = app.activateReview();
 
     const rejected = app.actions.begin(.stage_file);
@@ -7194,7 +7350,7 @@ test "read task spawn failure rejects status branch and projection page state" {
     var branch_app: App = .{ .allocator = allocator };
     _ = branch_app.activateReview();
     var branch_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._pending_tasks_with_len = 16 };
-    branch_app.startBranchStatusLoad(&branch_ctx, "/repo", null);
+    _ = branch_app.startBranchStatusLoad(&branch_ctx, "/repo", null);
     branch_ctx._pending_tasks_with_len = 0;
     try std.testing.expect(branch_app.pages.review.branch_status_load.pending == null);
     try std.testing.expectEqualStrings("could not start branch status load task", branch_app.pages.review.status.text());
@@ -7297,7 +7453,7 @@ test "read task allocation failure rejects source status branch and projection p
     var branch_app: App = .{ .allocator = branch_failing.allocator() };
     _ = branch_app.activateReview();
     var branch_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = branch_failing.allocator() };
-    branch_app.startBranchStatusLoad(&branch_ctx, "/repo", null);
+    _ = branch_app.startBranchStatusLoad(&branch_ctx, "/repo", null);
     try std.testing.expect(branch_app.pages.review.branch_status_load.pending == null);
     try std.testing.expectEqualStrings("could not allocate branch status load task", branch_app.pages.review.status.text());
 
@@ -9029,7 +9185,7 @@ test "source apply allocation failure closes exact action cursor member for pend
 
         try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
         try std.testing.expect(!app.reviewReadBusy());
-        try std.testing.expect(app.pages.review.activation.takeQueuedRevalidation());
+        try std.testing.expect(app.pages.review.activation.hasQueuedFullRevalidation());
     }
 }
 
@@ -9102,7 +9258,7 @@ test "status apply allocation failure closes exact action cursor member for pend
 
         try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
         try std.testing.expect(!app.reviewReadBusy());
-        try std.testing.expect(app.pages.review.activation.takeQueuedRevalidation());
+        try std.testing.expect(app.pages.review.activation.hasQueuedFullRevalidation());
     }
 }
 
@@ -12666,7 +12822,7 @@ test "mutation read start gate makes direct App read starters inert" {
         .{ .clear_visible_state = true, .kind = .manual },
     );
     app.startStatusLoad(&ctx, "/repo", .foreground, null);
-    app.startBranchStatusLoad(&ctx, "/repo", null);
+    _ = app.startBranchStatusLoad(&ctx, "/repo", null);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(app.pages.review.load.pending == null);
@@ -14051,6 +14207,7 @@ test "finishPushForeground stale and duplicate terminals preserve newer action o
             .oid = try allocator.dupe(u8, "abc123"),
         },
     } };
+    try std.testing.expect(app.acceptActionTerminal(stale));
     const current = app.actions.begin(.pull);
     app.acceptActionLaunch(current);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
@@ -16691,10 +16848,7 @@ test "Review canonical publication startup and status failure retain last good o
             ._allocator = allocator,
             ._pending_tasks_with_len = 16,
         };
-        try std.testing.expectError(
-            error.TaskLimitExceeded,
-            finishCanonicalPublicationAction(&app, &ctx, allocator, .stage_file, roots.a),
-        );
+        try finishCanonicalPublicationAction(&app, &ctx, allocator, .stage_file, roots.a);
         ctx._pending_tasks_with_len = 0;
         try expectRetainedCanonicalPublication(&app, prior_hunks);
         try std.testing.expect(app.pages.review.pending_reload == null);
@@ -18252,6 +18406,7 @@ test "hunk action results mutate session staged marks" {
         } } },
     };
     defer app.pages.review.staged_hunks.deinit(allocator);
+    acceptTestSource(&app);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusTasks(&ctx, allocator);
     const mark_key = try currentTestSessionHunkMarkKey(&app, 1);
@@ -18523,6 +18678,40 @@ fn abandonSingleQueuedAction(app: *App, ctx: *chasen.Ctx(App.Msg)) !void {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     const message = entries[0].failed(entries[0].ctx, .runtime_abandoned, ctx.allocator());
     try app.update(message, ctx);
+
+    const revalidation = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 3), revalidation.len);
+    const status_task: *StatusLoadTask = @ptrCast(@alignCast(revalidation[0].ctx));
+    const branch_task: *BranchStatusLoadTask = @ptrCast(@alignCast(revalidation[1].ctx));
+    const source_task: *DiffLoadTask = @ptrCast(@alignCast(revalidation[2].ctx));
+    const status_terminal: app_auto_reload.AuxiliaryTerminal = .{
+        .generation = status_task.generation,
+        .read_epoch = status_task.read_epoch,
+        .background_cycle_id = status_task.background_cycle_id,
+    };
+    const branch_terminal: app_auto_reload.AuxiliaryTerminal = .{
+        .generation = branch_task.generation,
+        .read_epoch = branch_task.read_epoch,
+        .background_cycle_id = branch_task.background_cycle_id,
+    };
+    const source_generation = source_task.generation;
+
+    for (revalidation) |entry| {
+        var completion = entry.failed(
+            entry.ctx,
+            .runtime_abandoned,
+            ctx.allocator(),
+        );
+        completion.deinitUndelivered(ctx.allocator());
+    }
+
+    _ = app.reviewReload().rejectSourceSpawn(ctx.allocator(), source_generation);
+    _ = app.pages.review.status_load.finishTerminal(status_terminal);
+    _ = app.pages.review.branch_status_load.finishTerminal(branch_terminal);
+    app.pages.review.status_load.markSuccess();
+    app.pages.review.branch_status_load.markSuccess();
+    app.pages.review.canonical_status_drain = null;
+    syncTestActivation(app);
 }
 
 test "stage unstage and discard launch typed action cursor owners with task generations" {
@@ -19963,13 +20152,13 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     try std.testing.expect(selection_ctx._redraw_suppressed);
 
     app.pages.review.selection_owner = .none;
-    _ = beginAcceptedTestAction(&app, .stage_file);
+    const pending = beginAcceptedTestAction(&app, .stage_file);
     var action_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.autoReloadTick(&action_ctx);
     try std.testing.expectEqual(@as(usize, 0), action_ctx._pending_tasks_with_len);
     try std.testing.expect(action_ctx._redraw_suppressed);
 
-    app.actions.clear();
+    try std.testing.expect(app.acceptActionTerminal(pending));
     try installTestActionCursor(&app, std.testing.allocator, .directory, "src", 9);
     try promoteTestActionCursor(&app, 9);
     defer app.reviewNavigation().clearActionCursor(std.testing.allocator);
@@ -20551,9 +20740,10 @@ test "background source completion during repository action is discarded and rel
     app.pages.review.load.pending = .{ .diff_load = 2 };
     app.pages.review.auto_reload = .init(.inherit, .{}, .unstaged);
     app.pages.review.auto_reload.acceptSource(accepted);
+    syncTestActivation(&app);
     const cycle_id = app.pages.review.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.review.auto_reload.markMemberStarted(cycle_id, .source));
-    _ = beginAcceptedTestAction(&app, .stage_file);
+    const pending = beginAcceptedTestAction(&app, .stage_file);
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -20570,13 +20760,12 @@ test "background source completion during repository action is discarded and rel
     try std.testing.expect(app.pages.review.pending_reload == null);
     try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
 
-    app.actions.clear();
-    app.pages.review.load.generation = 3;
-    app.pages.review.load.pending = .{ .diff_load = 3 };
-    app.pages.review.pending_reload = .{ .generation = 3, .kind = .action_result };
+    try std.testing.expect(app.acceptActionTerminal(pending));
+    ownTestSourceRead(&app, 3, .action_result);
     const authoritative = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.finishDiffLoad(&ctx, .{
         .identity = page.RequestIdentity.review(0, 1),
+        .read_epoch = app.pages.review.repository_read_authority.epoch,
         .generation = 3,
         .result = .{ .loaded = authoritative },
     });

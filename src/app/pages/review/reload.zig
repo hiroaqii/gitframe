@@ -515,13 +515,8 @@ pub const Controller = struct {
     ///
     /// The displayed body and cache remain owned so launch itself cannot blank
     /// or flicker the UI. Their old epoch prevents promotion or write
-    /// authority once P6b2d connects the common App launch/read gates. Source,
-    /// status, and branch task owners also remain intact so their terminals can
-    /// perform exact tracker and background-cycle drain.
-    ///
-    /// This owner API is behavior-neutral until the final P6b2d activation
-    /// slice calls it from `App.acceptActionLaunch` together with every read
-    /// launch gate and the exact-terminal reopen path.
+    /// authority. Source, status, and branch task owners also remain intact so
+    /// their terminals can perform exact tracker and background-cycle drain.
     pub fn beginMutationReadFence(
         self: Controller,
         allocator: std.mem.Allocator,
@@ -544,19 +539,15 @@ pub const Controller = struct {
     /// Reopening must happen before queueing: the post-update scheduler may
     /// consume this intent immediately, and every successor read must capture
     /// the already-advanced open epoch. An inactive page still releases the
-    /// gate, but `Lifecycle.queueRevalidation` deliberately does not target a
-    /// future activation. Stale, mismatched, and duplicate terminals change
-    /// neither owner.
-    ///
-    /// Like `beginMutationReadFence`, this remains behavior-neutral until the
-    /// final P6b2d activation connects both methods to the common App action
-    /// coordinator and enables every repository-read launch gate together.
+    /// gate, but the activation-scoped terminal fallback deliberately does not
+    /// target a future activation. Stale, mismatched, and duplicate terminals
+    /// change neither owner.
     pub fn finishMutationReadFence(
         self: Controller,
         pending: app_actions.PendingAction,
     ) bool {
         if (!self.page.repository_read_authority.reopenForMutation(pending)) return false;
-        self.page.activation.queueRevalidation();
+        self.page.activation.queueActionTerminalRevalidation();
         return true;
     }
 
@@ -1569,15 +1560,20 @@ pub const Controller = struct {
 
     pub fn acceptRepoDiscoverySpawn(self: Controller, background_cycle_id: ?u64) void {
         if (background_cycle_id) |cycle_id| _ = self.page.auto_reload.markMemberStarted(cycle_id, .source);
+        self.page.activation.consumeAcceptedFullRevalidation();
     }
 
     pub fn rejectRepoDiscoverySpawn(self: Controller, generation: u64) void {
         _ = self.page.load.clearPendingIfCurrent(.{ .repo_discovery = generation });
+        if (!self.page.load.hasPending() and self.page.load.state == .loading) {
+            self.page.load.state = .idle;
+        }
         self.failActiveMember(.source);
     }
 
     pub fn acceptSourceSpawn(self: Controller, background_cycle_id: ?u64) void {
         if (background_cycle_id) |cycle_id| _ = self.page.auto_reload.markMemberStarted(cycle_id, .source);
+        self.page.activation.consumeAcceptedFullRevalidation();
     }
 
     pub fn prepareStatusLoad(
@@ -1678,15 +1674,41 @@ pub const Controller = struct {
         self.failActiveMember(.branch);
     }
 
+    pub fn supersedeAcceptedStatusSpawn(
+        self: Controller,
+        terminal: auto_reload.AuxiliaryTerminal,
+    ) bool {
+        if (!self.page.status_load.supersedeTerminal(terminal)) return false;
+        self.page.status_load.markFailure(self.page.git_status.repo_root != null);
+        self.failActiveMember(.status);
+        return true;
+    }
+
+    pub fn supersedeAcceptedBranchStatusSpawn(
+        self: Controller,
+        terminal: auto_reload.AuxiliaryTerminal,
+    ) bool {
+        if (!self.page.branch_status_load.supersedeTerminal(terminal)) return false;
+        self.page.branch_status_load.markFailure(self.page.branch_status.repo_root != null);
+        self.failActiveMember(.branch);
+        return true;
+    }
+
     pub fn rejectSourceSpawn(self: Controller, allocator: std.mem.Allocator, generation: u64) bool {
         if (self.page.canonical_publication) |gate| {
             if (gate.source_generation == generation) {
                 self.abortCanonicalPublication(allocator);
+                if (!self.page.load.hasPending() and self.page.load.state == .loading) {
+                    self.page.load.state = .idle;
+                }
                 return true;
             }
         }
         _ = self.page.load.clearPendingIfCurrent(.{ .diff_load = generation });
         self.clearPendingReloadIfGeneration(allocator, generation);
+        if (!self.page.load.hasPending() and self.page.load.state == .loading) {
+            self.page.load.state = .idle;
+        }
         self.failActiveMember(.source);
         return false;
     }
@@ -2565,10 +2587,21 @@ pub const Controller = struct {
                 drain.background_cycle_id == terminal.background_cycle_id
         else
             false;
+        const drain_only_terminal = if (self.page.status_load.pending) |pending|
+            pending.matchesTerminal(terminal) and !pending.publication_allowed
+        else
+            false;
+        const drain_action_member = drain_only_terminal and
+            self.page.action_cursor.captureCompletion(
+                result.identity.repo_epoch,
+                .status,
+                result.generation,
+            ) != null;
         const canonical_terminal = self.canonicalGateMatchesStatus(result);
         const publication_admitted = !background_blocked and
             self.acceptsIdentity(result.identity) and
-            self.acceptsRepositoryReadCompletion(result.read_epoch, result.background_cycle_id);
+            self.acceptsRepositoryReadCompletion(result.read_epoch, result.background_cycle_id) and
+            self.page.status_load.acceptsPublication(terminal);
         self.page.auto_reload.finishMember(result.background_cycle_id, .status);
         const owns_terminal = self.page.status_load.finishTerminal(terminal);
         if (drain_terminal) {
@@ -2577,12 +2610,18 @@ pub const Controller = struct {
                 self.page.status_load.markFailure(self.page.git_status.repo_root != null);
                 _ = self.page.activation.finishMember(result.identity, .status, .failed);
             }
-            return .{ .skip_redraw = true };
+            return .{
+                .skip_redraw = true,
+                .terminal_admitted = owns_terminal and drain_action_member,
+            };
         }
         if (!owns_terminal) return .{ .skip_redraw = true };
         if (!publication_admitted) {
             if (canonical_terminal) self.abortCanonicalPublication(allocator);
-            return .{ .skip_redraw = true };
+            return .{
+                .skip_redraw = true,
+                .terminal_admitted = drain_action_member,
+            };
         }
 
         if (canonical_terminal) {
@@ -2725,7 +2764,8 @@ pub const Controller = struct {
         };
         const publication_admitted = !background_blocked and
             self.acceptsIdentity(result.identity) and
-            self.acceptsRepositoryReadCompletion(result.read_epoch, result.background_cycle_id);
+            self.acceptsRepositoryReadCompletion(result.read_epoch, result.background_cycle_id) and
+            self.page.branch_status_load.acceptsPublication(terminal);
         self.page.auto_reload.finishMember(result.background_cycle_id, .branch);
         const owns_terminal = self.page.branch_status_load.finishTerminal(terminal);
         if (!owns_terminal or !publication_admitted) return .{ .skip_redraw = true };
@@ -5527,15 +5567,19 @@ test "mutation read fence terminal reopens exact owner and queues active revalid
     try std.testing.expect(page.repository_read_authority.epoch.eql(fenced_epoch));
     try std.testing.expectEqual(
         activation_id,
-        page.activation.revalidation_requested orelse return error.ExpectedRevalidationIntent,
+        page.activation.action_terminal_revalidation_requested orelse
+            return error.ExpectedRevalidationIntent,
     );
-    try std.testing.expect(page.activation.takeQueuedRevalidation());
-    try std.testing.expect(!page.activation.takeQueuedRevalidation());
+    try std.testing.expect(page.activation.revalidation_requested == null);
+    try std.testing.expect(page.activation.hasQueuedFullRevalidation());
+    page.activation.consumeAcceptedFullRevalidation();
+    try std.testing.expect(!page.activation.hasQueuedFullRevalidation());
 
     const later_activation = page.activation.activate(13, .fresh, .fresh, .fresh);
     try std.testing.expect(later_activation != activation_id);
     try std.testing.expect(!controller.finishMutationReadFence(owner));
     try std.testing.expect(page.activation.revalidation_requested == null);
+    try std.testing.expect(page.activation.action_terminal_revalidation_requested == null);
 }
 
 test "mutation read fence terminal coalesces current intent and never targets a future activation" {
@@ -5561,8 +5605,14 @@ test "mutation read fence terminal coalesces current intent and never targets a 
         activation_id,
         page.activation.revalidation_requested orelse return error.ExpectedRevalidationIntent,
     );
-    try std.testing.expect(page.activation.takeQueuedRevalidation());
-    try std.testing.expect(!page.activation.takeQueuedRevalidation());
+    try std.testing.expectEqual(
+        activation_id,
+        page.activation.action_terminal_revalidation_requested orelse
+            return error.ExpectedTerminalRevalidationIntent,
+    );
+    try std.testing.expect(page.activation.hasQueuedFullRevalidation());
+    page.activation.consumeAcceptedFullRevalidation();
+    try std.testing.expect(!page.activation.hasQueuedFullRevalidation());
 
     const second: app_actions.PendingAction = .{
         .generation = 32,
@@ -5576,11 +5626,13 @@ test "mutation read fence terminal coalesces current intent and never targets a 
     try std.testing.expect(page.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expect(page.repository_read_authority.epoch.eql(fenced_epoch));
     try std.testing.expect(page.activation.revalidation_requested == null);
+    try std.testing.expect(page.activation.action_terminal_revalidation_requested == null);
 
     _ = page.activation.activate(17, .fresh, .fresh, .fresh);
     try std.testing.expect(page.activation.revalidation_requested == null);
     try std.testing.expect(!controller.finishMutationReadFence(second));
     try std.testing.expect(page.activation.revalidation_requested == null);
+    try std.testing.expect(page.activation.action_terminal_revalidation_requested == null);
 }
 
 test "mutation read promotion gate retains current visual and cache owners until reopen" {
