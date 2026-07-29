@@ -5650,6 +5650,1140 @@ test "action terminal coordinator accepts every exact launched action once" {
     try std.testing.expect(app.acceptActionTerminal(current));
 }
 
+test "Review mutation read fence follows accepted action launch and exact terminal" {
+    const mutating_kinds = [_]app_actions.ActionKind{
+        .stage_file,
+        .unstage_file,
+        .stage_hunk,
+        .unstage_hunk,
+        .discard_file,
+        .commit,
+        .amend,
+        .push,
+        .pull,
+        .fetch,
+        .switch_branch,
+    };
+    try std.testing.expectEqual(
+        @typeInfo(app_actions.ActionKind).@"enum".fields.len - 1,
+        mutating_kinds.len,
+    );
+
+    var app: App = .{};
+    _ = app.activateReview();
+
+    const rejected = app.actions.begin(.stage_file);
+    const epoch_before_rejection = app.pages.review.repository_read_authority.epoch;
+    try std.testing.expect(!app.acceptActionTerminal(rejected));
+    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expect(app.pages.review.repository_read_authority.epoch.eql(epoch_before_rejection));
+    try std.testing.expect(app.actions.cancelPreparing(rejected));
+
+    const assistance = app.actions.begin(.assist_commit_message);
+    const epoch_before_assistance = app.pages.review.repository_read_authority.epoch;
+    app.acceptActionLaunch(assistance);
+    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expect(app.pages.review.repository_read_authority.epoch.eql(epoch_before_assistance));
+    try std.testing.expect(app.acceptActionTerminal(assistance));
+    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expect(app.pages.review.repository_read_authority.epoch.eql(epoch_before_assistance));
+
+    for (mutating_kinds) |kind| {
+        const epoch_before_launch = app.pages.review.repository_read_authority.epoch;
+        const pending = app.actions.begin(kind);
+        app.acceptActionLaunch(pending);
+
+        try std.testing.expect(!app.pages.review.repository_read_authority.mayStartRepositoryRead());
+        try std.testing.expect(app.pages.review.repository_read_authority.epoch.eql(epoch_before_launch.next()));
+        try std.testing.expect(app.pages.review.repository_read_authority.ownsMutation(pending));
+
+        const stale: app_actions.PendingAction = .{
+            .generation = pending.generation - 1,
+            .kind = pending.kind,
+        };
+        try std.testing.expect(!app.acceptActionTerminal(stale));
+        try std.testing.expect(app.actions.isAccepted(pending));
+        try std.testing.expect(app.pages.review.repository_read_authority.ownsMutation(pending));
+
+        try std.testing.expect(app.acceptActionTerminal(pending));
+        try std.testing.expect(!app.actions.isCurrent(pending));
+        try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+        try std.testing.expect(app.pages.review.repository_read_authority.epoch.eql(epoch_before_launch.next()));
+        try std.testing.expect(!app.acceptActionTerminal(pending));
+    }
+}
+
+test "Review mutation read fence drains old production reads without publication" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .review,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .auto_reload = .init(.enabled, .{}, .unstaged),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        } },
+    };
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+
+    var old_status = try git_status.StatusBundle.parseOwned(allocator, " M old.zig\x00");
+    try app.pages.review.git_status.replace(roots.a, &old_status);
+    var old_branch = try branchStatusBundleForTest(allocator, .{
+        .oid = "old-oid",
+        .branch = "old-branch",
+    });
+    try app.pages.review.branch_status.replace(roots.a, &old_branch);
+    acceptTestSource(&app);
+    const identity = app.pages.review.activation.currentIdentity() orelse
+        return error.ExpectedReviewActivation;
+    const old_epoch = app.pages.review.repository_read_authority.epoch;
+    const body_ptr = app.reviewNavigationView().activeLoadedDiffConst().?.text.ptr;
+
+    const cycle_id = app.pages.review.auto_reload.beginCycle() orelse
+        return error.ExpectedBackgroundCycle;
+    var task_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    try app.startDiffLoadWithRepoRoot(&task_ctx, roots.a, .{
+        .clear_visible_state = false,
+        .kind = .watch,
+        .background_cycle_id = cycle_id,
+    });
+    app.pages.review.auto_reload.discardEmptyCycle(cycle_id);
+    const queued = task_ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 3), queued.len);
+
+    const root_identity = app.repo_state.activeIdentity() orelse
+        return error.ExpectedRootIdentity;
+    app.pages.review.review_projection.installReady(.{
+        .request = try app_review_projection.cloneRequestWithOptions(
+            allocator,
+            identity,
+            31,
+            roots.a,
+            "old-generated.zig",
+            .generated_added_file,
+            .unstaged,
+            app.pages.review.source_session_revision,
+            app.pages.review.status_snapshot_revision,
+            .{ .read_epoch = old_epoch, .root_identity = root_identity },
+        ),
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(
+            allocator,
+            "old-generated.zig",
+            "const old = true;\n",
+        ) },
+    });
+    const displayed_ptr =
+        app.pages.review.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr;
+    app.pages.review.review_projection.syntax_pending =
+        try app_review_projection.generatedSyntaxRequestForProjection(
+            allocator,
+            41,
+            identity,
+            app.pages.review.review_projection.displayed.ready.request,
+            app.pages.review.review_projection.displayed.ready.value.generated_added_file.fingerprint(),
+        );
+    const displayed_fingerprint =
+        app.pages.review.review_projection.displayed.ready.value.generated_added_file.fingerprint();
+    const old_syntax_result_request = try app_review_projection.cloneGeneratedSyntaxRequest(
+        allocator,
+        app.pages.review.review_projection.syntax_pending.?,
+    );
+    app.pages.review.review_projection.pending =
+        try app_review_projection.cloneRequestWithOptions(
+            allocator,
+            identity,
+            32,
+            roots.a,
+            "new-generated.zig",
+            .generated_added_file,
+            .unstaged,
+            app.pages.review.source_session_revision,
+            app.pages.review.status_snapshot_revision,
+            .{ .read_epoch = old_epoch, .root_identity = root_identity },
+        );
+    const old_projection_request = app.pages.review.review_projection.pending.?;
+    const old_projection_result_request = try app_review_projection.cloneRequestWithOptions(
+        allocator,
+        old_projection_request.identity,
+        old_projection_request.id,
+        old_projection_request.repo_root,
+        old_projection_request.path_key,
+        old_projection_request.kind,
+        old_projection_request.source_kind,
+        old_projection_request.source_session_revision,
+        old_projection_request.status_snapshot_revision,
+        .{
+            .read_epoch = old_projection_request.read_epoch,
+            .root_identity = old_projection_request.root_identity,
+            .expected_presentation = old_projection_request.expected_presentation,
+        },
+    );
+
+    const status_task: *StatusLoadTask = @ptrCast(@alignCast(queued[0].ctx));
+    var new_status = try git_status.StatusBundle.parseOwned(allocator, " M new.zig\x00");
+    const status_message = App.Msg.loadFinished(.{ .review = .{ .status = .{
+        .identity = status_task.identity,
+        .read_epoch = status_task.read_epoch,
+        .generation = status_task.generation,
+        .background_cycle_id = status_task.background_cycle_id,
+        .repo_root = status_task.repo_root,
+        .result = .{ .loaded = new_status },
+    } } });
+    status_task.repo_root = &.{};
+    allocator.destroy(status_task);
+    new_status = undefined;
+
+    const branch_task: *BranchStatusLoadTask = @ptrCast(@alignCast(queued[1].ctx));
+    var new_branch = try branchStatusBundleForTest(allocator, .{
+        .oid = "new-oid",
+        .branch = "new-branch",
+    });
+    const branch_message = App.Msg.loadFinished(.{ .review = .{ .branch_status = .{
+        .identity = branch_task.identity,
+        .read_epoch = branch_task.read_epoch,
+        .generation = branch_task.generation,
+        .background_cycle_id = branch_task.background_cycle_id,
+        .repo_root = branch_task.repo_root,
+        .result = .{ .loaded = new_branch },
+    } } });
+    branch_task.repo_root = &.{};
+    allocator.destroy(branch_task);
+    new_branch = undefined;
+
+    const source_task: *DiffLoadTask = @ptrCast(@alignCast(queued[2].ctx));
+    const source_message = App.Msg.loadFinished(.{ .review = .{ .source = .{
+        .identity = source_task.identity,
+        .read_epoch = source_task.read_epoch,
+        .generation = source_task.generation,
+        .background_cycle_id = source_task.background_cycle_id,
+        .result = .{ .loaded = try app_load.buildLoadedBundle(
+            allocator,
+            app_test_support.diff_unstaged_projection,
+        ) },
+    } } });
+    diff_source.freeLoadRequest(allocator, source_task.request);
+    allocator.destroy(source_task);
+
+    const pending = app.actions.begin(.stage_file);
+    app.acceptActionLaunch(pending);
+
+    const fence_closed =
+        !app.pages.review.repository_read_authority.mayStartRepositoryRead();
+    const epoch_advanced =
+        app.pages.review.repository_read_authority.epoch.eql(old_epoch.next());
+    const body_retained_at_launch =
+        app.reviewNavigationView().activeLoadedDiffConst().?.text.ptr == body_ptr;
+    const projection_retired_at_launch =
+        app.pages.review.review_projection.pending == null;
+    const syntax_retired_at_launch =
+        app.pages.review.review_projection.syntax_pending == null;
+    const displayed_retained_at_launch = switch (app.pages.review.review_projection.displayed) {
+        .ready => |ready| switch (ready.value) {
+            .generated_added_file => |generated| generated.source.bytes.ptr == displayed_ptr,
+            else => false,
+        },
+        else => false,
+    };
+    const cycle_superseded_at_launch =
+        app.pages.review.auto_reload.background_cycle != null and
+        app.pages.review.auto_reload.background_cycle.?.acceptance ==
+            .superseded_by_mutation;
+
+    var delivery_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer delivery_ctx.runtimeClearPendingEffectCopies();
+    try app.update(status_message, &delivery_ctx);
+    try app.update(branch_message, &delivery_ctx);
+    try app.update(source_message, &delivery_ctx);
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .projection = .{
+        .request = old_projection_result_request,
+        .result = .{ .ready = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(
+            allocator,
+            "new-generated.zig",
+            "const replacement = true;\n",
+        ) } },
+    } } }), &delivery_ctx);
+    app.finishGeneratedProjectionSyntax(&delivery_ctx, .{
+        .request = old_syntax_result_request,
+        .snapshot_fingerprint = displayed_fingerprint,
+        .result = .{ .terminal_plain = .provider_unavailable },
+    });
+
+    const displayed_retained_after_terminals = switch (app.pages.review.review_projection.displayed) {
+        .ready => |ready| switch (ready.value) {
+            .generated_added_file => |generated| generated.source.bytes.ptr == displayed_ptr,
+            else => false,
+        },
+        else => false,
+    };
+    const body_retained_after_terminals =
+        app.reviewNavigationView().activeLoadedDiffConst() != null and
+        app.reviewNavigationView().activeLoadedDiffConst().?.text.ptr == body_ptr;
+    const status_retained_after_terminal =
+        app.pages.review.git_status.document.entries.len == 1 and
+        std.mem.eql(
+            u8,
+            app.pages.review.git_status.document.entries[0].path,
+            "old.zig",
+        );
+    const branch_retained_after_terminal =
+        app.pages.review.branch_status.status.branchName() != null and
+        std.mem.eql(
+            u8,
+            app.pages.review.branch_status.status.branchName().?,
+            "old-branch",
+        );
+    const exact_terminal = app.acceptActionTerminal(pending);
+    const fence_reopened =
+        app.pages.review.repository_read_authority.mayStartRepositoryRead();
+
+    try std.testing.expect(fence_closed);
+    try std.testing.expect(epoch_advanced);
+    try std.testing.expect(body_retained_at_launch);
+    try std.testing.expect(projection_retired_at_launch);
+    try std.testing.expect(syntax_retired_at_launch);
+    try std.testing.expect(displayed_retained_at_launch);
+    try std.testing.expect(cycle_superseded_at_launch);
+    try std.testing.expectEqual(@as(u8, 0), delivery_ctx._pending_tasks_with_len);
+    try std.testing.expect(status_retained_after_terminal);
+    try std.testing.expect(branch_retained_after_terminal);
+    try std.testing.expect(body_retained_after_terminals);
+    try std.testing.expect(displayed_retained_after_terminals);
+    try std.testing.expect(app.pages.review.load.pending == null);
+    try std.testing.expect(app.pages.review.status_load.pending == null);
+    try std.testing.expect(app.pages.review.branch_status_load.pending == null);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
+    try std.testing.expect(exact_terminal);
+    try std.testing.expect(fence_reopened);
+}
+
+fn mutationFenceRepoTestApp(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+) !App {
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .review,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, repo_root) },
+    };
+    errdefer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(repo_root);
+    _ = app.activateReview();
+    return app;
+}
+
+fn replaceMutationFenceTestRepo(
+    app: *App,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+) !void {
+    app.repo_state.deinit(allocator);
+    app.repo_state = .{
+        .discovery = try testSingleRepoDiscovery(allocator, repo_root),
+    };
+    errdefer {
+        app.repo_state.deinit(allocator);
+        app.repo_state = .{};
+    }
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(repo_root);
+    app.repo_epoch +%= 1;
+    app.pages.review.activation.deactivate();
+    _ = app.activateReview();
+}
+
+test "Review revalidation startup retains intent through two queue rejections and scheduler acceptance" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+
+    const pending = app.actions.begin(.stage_file);
+    const epoch_before_launch = app.pages.review.repository_read_authority.epoch;
+    app.acceptActionLaunch(pending);
+    const fence_closed =
+        !app.pages.review.repository_read_authority.mayStartRepositoryRead();
+    const epoch_advanced =
+        app.pages.review.repository_read_authority.epoch.eql(epoch_before_launch.next());
+    const generation_before_terminal = app.pages.review.load.generation;
+
+    var ctx: chasen.Ctx(App.Msg) = .{
+        ._allocator = allocator,
+        ._pending_tasks_with_len = 16,
+    };
+    defer ctx.runtimeClearPendingEffectCopies();
+    const terminal_returned_normally = if (app.update(.{ .action_finished = .{
+        .stage_file = .{
+            .pending = pending,
+            .repo_root = try allocator.dupe(u8, roots.a),
+            .path = try allocator.dupe(u8, "a"),
+            .result = .ok,
+        },
+    } }, &ctx)) |_| true else |_| false;
+    const generation_after_rejections = app.pages.review.load.generation;
+    ctx._pending_tasks_with_len = 0;
+    defer clearPendingRepositoryTasks(&ctx, allocator);
+
+    try app.update(.git_action_spinner_tick, &ctx);
+    const accepted = ctx.takePendingTasksWith();
+    const accepted_count = accepted.len;
+    const generation_after_acceptance = app.pages.review.load.generation;
+    var completions: [3]App.Msg = undefined;
+    if (accepted.len == completions.len) {
+        for (accepted, 0..) |entry, index| {
+            completions[index] = entry.failed(entry.ctx, .runtime_abandoned, allocator);
+        }
+        for (&completions) |*completion| {
+            try app.update(completion.*, &ctx);
+            completion.* = undefined;
+        }
+    } else {
+        for (accepted) |entry| {
+            var completion = entry.failed(entry.ctx, .runtime_abandoned, allocator);
+            completion.deinitUndelivered(allocator);
+        }
+    }
+    const duplicate_count_after_terminal = ctx._pending_tasks_with_len;
+
+    try std.testing.expect(fence_closed);
+    try std.testing.expect(epoch_advanced);
+    try std.testing.expect(terminal_returned_normally);
+    try std.testing.expectEqual(
+        generation_before_terminal + 2,
+        generation_after_rejections,
+    );
+    try std.testing.expectEqual(@as(usize, 3), accepted_count);
+    try std.testing.expectEqual(
+        generation_before_terminal + 3,
+        generation_after_acceptance,
+    );
+    try std.testing.expectEqual(@as(u8, 0), duplicate_count_after_terminal);
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+}
+
+test "Review revalidation startup lets retained intent reach manual universal acceptance" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+
+    const pending = app.actions.begin(.stage_file);
+    app.acceptActionLaunch(pending);
+    const generation_before_terminal = app.pages.review.load.generation;
+
+    var ctx: chasen.Ctx(App.Msg) = .{
+        ._allocator = allocator,
+        ._pending_tasks_with_len = 16,
+    };
+    defer ctx.runtimeClearPendingEffectCopies();
+    const terminal_returned_normally = if (app.update(.{ .action_finished = .{
+        .stage_file = .{
+            .pending = pending,
+            .repo_root = try allocator.dupe(u8, roots.a),
+            .path = try allocator.dupe(u8, "a"),
+            .result = .ok,
+        },
+    } }, &ctx)) |_| true else |_| false;
+    const generation_after_same_update_rejections = app.pages.review.load.generation;
+
+    // A neutral update under the same queue pressure must observe the retained
+    // owner and make one more rejected scheduler attempt. An implementation
+    // which pre-consumed the intent on either earlier rejection cannot satisfy
+    // this generation transition merely because the later manual reload starts.
+    try app.update(.git_action_spinner_tick, &ctx);
+    const generation_after_later_rejection = app.pages.review.load.generation;
+
+    ctx._pending_tasks_with_len = 0;
+    defer clearPendingRepositoryTasks(&ctx, allocator);
+    try app.update(.reload, &ctx);
+    const accepted = ctx.takePendingTasksWith();
+    const accepted_count = accepted.len;
+    const generation_after_manual_acceptance = app.pages.review.load.generation;
+    var completions: [3]App.Msg = undefined;
+    if (accepted.len == completions.len) {
+        for (accepted, 0..) |entry, index| {
+            completions[index] = entry.failed(entry.ctx, .runtime_abandoned, allocator);
+        }
+        for (&completions) |*completion| {
+            try app.update(completion.*, &ctx);
+            completion.* = undefined;
+        }
+    } else {
+        for (accepted) |entry| {
+            var completion = entry.failed(entry.ctx, .runtime_abandoned, allocator);
+            completion.deinitUndelivered(allocator);
+        }
+    }
+    const duplicate_count_after_terminal = ctx._pending_tasks_with_len;
+
+    try std.testing.expect(terminal_returned_normally);
+    try std.testing.expectEqual(
+        generation_before_terminal + 2,
+        generation_after_same_update_rejections,
+    );
+    try std.testing.expectEqual(
+        generation_before_terminal + 3,
+        generation_after_later_rejection,
+    );
+    try std.testing.expectEqual(@as(usize, 3), accepted_count);
+    try std.testing.expectEqual(
+        generation_before_terminal + 4,
+        generation_after_manual_acceptance,
+    );
+    try std.testing.expectEqual(@as(u8, 0), duplicate_count_after_terminal);
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+}
+
+test "Review revalidation startup drains partial auxiliaries before one replacement" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+
+    var old_status = try git_status.StatusBundle.parseOwned(allocator, " M old.zig\x00");
+    try app.pages.review.git_status.replace(roots.a, &old_status);
+    var old_branch = try branchStatusBundleForTest(allocator, .{
+        .oid = "old-oid",
+        .branch = "old-branch",
+    });
+    try app.pages.review.branch_status.replace(roots.a, &old_branch);
+
+    const pending = app.actions.begin(.stage_file);
+    app.acceptActionLaunch(pending);
+    const fence_closed =
+        !app.pages.review.repository_read_authority.mayStartRepositoryRead();
+    app.pages.review.activation.queueRevalidation();
+
+    const saturated_slots: usize = 14;
+    var ctx: chasen.Ctx(App.Msg) = .{
+        ._allocator = allocator,
+        ._pending_tasks_with_len = saturated_slots,
+    };
+    const terminal_returned_normally = if (app.update(.{ .action_finished = .{
+        .stage_file = .{
+            .pending = pending,
+            .repo_root = try allocator.dupe(u8, roots.a),
+            .path = try allocator.dupe(u8, "a"),
+            .result = .ok,
+        },
+    } }, &ctx)) |_| true else |_| false;
+
+    const accepted_tail_len = ctx._pending_tasks_with_len - saturated_slots;
+    var status_message: ?App.Msg = null;
+    var branch_message: ?App.Msg = null;
+    if (accepted_tail_len == 2) {
+        const status_task: *StatusLoadTask =
+            @ptrCast(@alignCast(ctx._pending_tasks_with[saturated_slots].ctx));
+        var changed_status =
+            try git_status.StatusBundle.parseOwned(allocator, " M new.zig\x00");
+        status_message = App.Msg.loadFinished(.{ .review = .{ .status = .{
+            .identity = status_task.identity,
+            .read_epoch = status_task.read_epoch,
+            .generation = status_task.generation,
+            .background_cycle_id = status_task.background_cycle_id,
+            .repo_root = status_task.repo_root,
+            .result = .{ .loaded = changed_status },
+        } } });
+        status_task.repo_root = &.{};
+        allocator.destroy(status_task);
+        changed_status = undefined;
+
+        const branch_task: *BranchStatusLoadTask =
+            @ptrCast(@alignCast(ctx._pending_tasks_with[saturated_slots + 1].ctx));
+        var changed_branch = try branchStatusBundleForTest(allocator, .{
+            .oid = "new-oid",
+            .branch = "new-branch",
+        });
+        branch_message = App.Msg.loadFinished(.{ .review = .{ .branch_status = .{
+            .identity = branch_task.identity,
+            .read_epoch = branch_task.read_epoch,
+            .generation = branch_task.generation,
+            .background_cycle_id = branch_task.background_cycle_id,
+            .repo_root = branch_task.repo_root,
+            .result = .{ .loaded = changed_branch },
+        } } });
+        branch_task.repo_root = &.{};
+        allocator.destroy(branch_task);
+        changed_branch = undefined;
+    } else {
+        for (ctx._pending_tasks_with[saturated_slots..ctx._pending_tasks_with_len]) |entry| {
+            var completion = entry.failed(entry.ctx, .runtime_abandoned, allocator);
+            completion.deinitUndelivered(allocator);
+        }
+    }
+    ctx._pending_tasks_with_len = 0;
+    defer clearPendingRepositoryTasks(&ctx, allocator);
+
+    if (status_message) |message| try app.update(message, &ctx);
+    const replacement_before_branch = ctx._pending_tasks_with_len;
+    if (branch_message) |message| try app.update(message, &ctx);
+    const replacement_count = ctx._pending_tasks_with_len;
+    const status_retained =
+        app.pages.review.git_status.document.entries.len == 1 and
+        std.mem.eql(
+            u8,
+            app.pages.review.git_status.document.entries[0].path,
+            "old.zig",
+        );
+    const branch_retained =
+        app.pages.review.branch_status.status.branchName() != null and
+        std.mem.eql(
+            u8,
+            app.pages.review.branch_status.status.branchName().?,
+            "old-branch",
+        );
+
+    try std.testing.expect(fence_closed);
+    try std.testing.expect(terminal_returned_normally);
+    try std.testing.expectEqual(@as(usize, 2), accepted_tail_len);
+    try std.testing.expectEqual(@as(u8, 0), replacement_before_branch);
+    try std.testing.expectEqual(@as(u8, 3), replacement_count);
+    try std.testing.expect(status_retained);
+    try std.testing.expect(branch_retained);
+    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+}
+
+test "Review revalidation startup detaches mismatched runtime failure" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+
+    const pending = app.actions.begin(.stage_file);
+    app.acceptActionLaunch(pending);
+    const fence_closed =
+        !app.pages.review.repository_read_authority.mayStartRepositoryRead();
+    try replaceMutationFenceTestRepo(&app, allocator, roots.b);
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    try app.update(.{ .action_finished = .{ .stage_file = .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .path = try allocator.dupe(u8, "a"),
+        .result = .{ .failed_static = "runtime failure after repository move" },
+    } } }, &ctx);
+
+    try std.testing.expect(fence_closed);
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqualStrings(roots.b, app.activeRepoRoot().?);
+}
+
+test "Review revalidation startup preserves only ordinary intent after mismatch" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+
+    const pending = app.actions.begin(.stage_file);
+    app.acceptActionLaunch(pending);
+    const fence_closed =
+        !app.pages.review.repository_read_authority.mayStartRepositoryRead();
+    try replaceMutationFenceTestRepo(&app, allocator, roots.b);
+    app.pages.review.activation.queueRevalidation();
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    try app.update(.{ .action_finished = .{ .stage_file = .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .path = try allocator.dupe(u8, "a"),
+        .result = .{ .failed_static = "runtime failure after repository move" },
+    } } }, &ctx);
+
+    const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
+    const current_source_root = if (entries.len == 3) blk: {
+        const source_task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
+        break :blk source_task.request.repo_root;
+    } else null;
+
+    try std.testing.expect(fence_closed);
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expect(current_source_root != null);
+    try std.testing.expectEqualStrings(roots.b, current_source_root.?);
+}
+
+test "Review revalidation startup retries repository discovery after detached terminal" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+
+    const pending = app.actions.begin(.stage_file);
+    app.acceptActionLaunch(pending);
+    const fence_closed =
+        !app.pages.review.repository_read_authority.mayStartRepositoryRead();
+    app.repo_state.deinit(allocator);
+    app.repo_state = .{};
+    app.repo_epoch +%= 1;
+    app.pages.review.activation.deactivate();
+    _ = app.activateReview();
+    app.pages.review.activation.queueRevalidation();
+
+    var ctx: chasen.Ctx(App.Msg) = .{
+        ._allocator = allocator,
+        ._pending_tasks_with_len = 16,
+    };
+    defer ctx.runtimeClearPendingEffectCopies();
+    const terminal_returned_normally = if (app.update(.{ .action_finished = .{
+        .stage_file = .{
+            .pending = pending,
+            .repo_root = try allocator.dupe(u8, roots.a),
+            .path = try allocator.dupe(u8, "a"),
+            .result = .{ .failed_static = "runtime failure after repository removal" },
+        },
+    } }, &ctx)) |_| true else |_| false;
+    ctx._pending_tasks_with_len = 0;
+    defer clearPendingRepositoryTasks(&ctx, allocator);
+
+    try app.update(.git_action_spinner_tick, &ctx);
+    const retry_count = ctx._pending_tasks_with_len;
+
+    try std.testing.expect(fence_closed);
+    try std.testing.expect(terminal_returned_normally);
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expectEqual(@as(u8, 1), retry_count);
+}
+
+test "Review revalidation startup discards inactive and one-shot terminal fallback" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+
+    var inactive = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer inactive.pages.review.deinit(allocator);
+    defer inactive.repo_state.deinit(allocator);
+    const inactive_pending = inactive.actions.begin(.stage_file);
+    inactive.acceptActionLaunch(inactive_pending);
+    const inactive_fence_closed =
+        !inactive.pages.review.repository_read_authority.mayStartRepositoryRead();
+    inactive.pages.review.activation.deactivate();
+    inactive.active_page = .repository;
+    var inactive_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    try inactive.update(.{ .action_finished = .{ .stage_file = .{
+        .pending = inactive_pending,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .path = try allocator.dupe(u8, "a"),
+        .result = .{ .failed_static = "inactive terminal" },
+    } } }, &inactive_ctx);
+
+    var one_shot = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer one_shot.pages.review.deinit(allocator);
+    defer one_shot.repo_state.deinit(allocator);
+    one_shot.config.source = .stdin;
+    one_shot.pages.review.activation.deactivate();
+    _ = one_shot.activateReview();
+    const one_shot_pending = one_shot.actions.begin(.stage_file);
+    one_shot.acceptActionLaunch(one_shot_pending);
+    const one_shot_fence_closed =
+        !one_shot.pages.review.repository_read_authority.mayStartRepositoryRead();
+    var one_shot_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    try one_shot.update(.{ .action_finished = .{ .stage_file = .{
+        .pending = one_shot_pending,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .path = try allocator.dupe(u8, "a"),
+        .result = .{ .failed_static = "one-shot terminal" },
+    } } }, &one_shot_ctx);
+
+    try std.testing.expect(inactive_fence_closed);
+    try std.testing.expect(inactive.actions.pending == null);
+    try std.testing.expect(inactive.pages.review.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expectEqual(@as(u8, 0), inactive_ctx._pending_tasks_with_len);
+    try std.testing.expect(one_shot_fence_closed);
+    try std.testing.expect(one_shot.actions.pending == null);
+    try std.testing.expect(one_shot.pages.review.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expectEqual(@as(u8, 0), one_shot_ctx._pending_tasks_with_len);
+}
+
+fn installInteractivePushRetryForFenceTest(
+    app: *App,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    oid: []const u8,
+) !void {
+    try app.setPushErrorWithRetry(allocator, "failed", .{
+        .mode = .set_upstream,
+        .repo_root = try allocator.dupe(u8, repo_root),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, oid),
+    }, true);
+}
+
+test "Review mutation read fence follows interactive foreground queue and terminal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try setupPushRetryRepoForTest(allocator, io, &tmp);
+    defer allocator.free(repo.repo_root);
+    defer allocator.free(repo.oid);
+
+    const DummyForeground = struct {
+        fn done(_: chasen.ForegroundCommandResult) App.Msg {
+            return .quit;
+        }
+    };
+
+    // Queue rejection never crosses the accepted action/fence boundary.
+    {
+        var app = try mutationFenceRepoTestApp(allocator, repo.repo_root);
+        defer app.pages.review.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        defer app.clearPushError(allocator);
+        try installInteractivePushRetryForFenceTest(
+            &app,
+            allocator,
+            repo.repo_root,
+            repo.oid,
+        );
+        const epoch_before_rejection =
+            app.pages.review.repository_read_authority.epoch;
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+        defer ctx.runtimeClearPendingEffectCopies();
+        _ = try ctx.terminal().runForegroundCommand(.{
+            .argv = &.{"true"},
+            .cwd = repo.repo_root,
+            .finished = DummyForeground.done,
+        });
+
+        try app.runInteractivePush(&ctx);
+        try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
+
+        try std.testing.expect(app.actions.pending == null);
+        try std.testing.expect(app.push_retry.state.availableTarget() != null);
+        try std.testing.expect(
+            app.pages.review.repository_read_authority.mayStartRepositoryRead(),
+        );
+        try std.testing.expect(
+            app.pages.review.repository_read_authority.epoch.eql(
+                epoch_before_rejection,
+            ),
+        );
+        try std.testing.expectEqual(
+            @as(u8, 1),
+            ctx._pending_foreground_commands_len,
+        );
+    }
+
+    // An accepted foreground command closes the fence only after the runtime
+    // queue owns it. Its exact completion reopens before starting the matching
+    // repository replacement.
+    {
+        var app = try mutationFenceRepoTestApp(allocator, repo.repo_root);
+        defer app.pages.review.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        defer app.clearPushError(allocator);
+        try installInteractivePushRetryForFenceTest(
+            &app,
+            allocator,
+            repo.repo_root,
+            repo.oid,
+        );
+        const epoch_before_launch =
+            app.pages.review.repository_read_authority.epoch;
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+        defer ctx.runtimeClearPendingEffectCopies();
+        defer clearPendingRepositoryTasks(&ctx, allocator);
+
+        try app.runInteractivePush(&ctx);
+        try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
+        const fence_closed =
+            !app.pages.review.repository_read_authority.mayStartRepositoryRead();
+        const epoch_advanced =
+            app.pages.review.repository_read_authority.epoch.eql(
+                epoch_before_launch.next(),
+            );
+        const entry =
+            ctx._pending_foreground_commands[0..ctx._pending_foreground_commands_len][0];
+        const completion = entry.finished(.{
+            .request_id = entry.request_id,
+            .outcome = .{ .exited = 1 },
+        });
+        ctx.runtimeClearPendingEffectCopies();
+        try app.update(completion, &ctx);
+
+        try std.testing.expect(fence_closed);
+        try std.testing.expect(epoch_advanced);
+        try std.testing.expect(app.actions.pending == null);
+        try std.testing.expect(app.push_retry.state == .idle);
+        try std.testing.expect(
+            app.pages.review.repository_read_authority.mayStartRepositoryRead(),
+        );
+        try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
+    }
+
+    // The same accepted foreground owner can become detached before delivery.
+    // Its exact terminal still reopens, but must discard the action fallback
+    // before the common postlude can target the newly active repository.
+    {
+        var roots = try TestRepoPair.init();
+        defer roots.deinit();
+        var app = try mutationFenceRepoTestApp(allocator, repo.repo_root);
+        defer app.pages.review.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        defer app.clearPushError(allocator);
+        try installInteractivePushRetryForFenceTest(
+            &app,
+            allocator,
+            repo.repo_root,
+            repo.oid,
+        );
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+        defer ctx.runtimeClearPendingEffectCopies();
+        defer clearPendingRepositoryTasks(&ctx, allocator);
+
+        try app.runInteractivePush(&ctx);
+        try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
+        const fence_closed =
+            !app.pages.review.repository_read_authority.mayStartRepositoryRead();
+        const entry =
+            ctx._pending_foreground_commands[0..ctx._pending_foreground_commands_len][0];
+        const completion = entry.finished(.{
+            .request_id = entry.request_id,
+            .outcome = .{ .exited = 1 },
+        });
+        ctx.runtimeClearPendingEffectCopies();
+        try replaceMutationFenceTestRepo(&app, allocator, roots.a);
+        try app.update(completion, &ctx);
+
+        try std.testing.expect(fence_closed);
+        try std.testing.expect(app.actions.pending == null);
+        try std.testing.expect(app.push_retry.state == .idle);
+        try std.testing.expect(
+            app.pages.review.repository_read_authority.mayStartRepositoryRead(),
+        );
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+        try std.testing.expectEqualStrings(roots.a, app.activeRepoRoot().?);
+    }
+}
+
+test "Review mutation read fence follows credentialed push queue acceptance" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator };
+    defer app.pages.review.deinit(allocator);
+    defer app.clearPushError(allocator);
+    _ = app.activateReview();
+    try installPushCredentialPromptForTest(&app, allocator);
+    const epoch_before_launch = app.pages.review.repository_read_authority.epoch;
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+    try app.submitPushCredentials(&ctx);
+    const owner = app.actions.pending orelse return error.ExpectedPendingAction;
+    const fence_closed =
+        !app.pages.review.repository_read_authority.mayStartRepositoryRead();
+    const epoch_advanced =
+        app.pages.review.repository_read_authority.epoch.eql(epoch_before_launch.next());
+
+    const queued = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    const completion = queued[0].failed(
+        queued[0].ctx,
+        .runtime_abandoned,
+        allocator,
+    );
+    try app.update(completion, &ctx);
+
+    try std.testing.expectEqual(app_actions.ActionKind.push, owner.token.kind);
+    try std.testing.expect(fence_closed);
+    try std.testing.expect(epoch_advanced);
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+}
+
+test "Review mutation read fence ignores rejected hunk task launch" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try initStageHunkLaunchApp(allocator, roots.a);
+    defer app.repo_state.deinit(allocator);
+    defer app.pages.review.deinit(allocator);
+    const epoch_before_rejection = app.pages.review.repository_read_authority.epoch;
+
+    var ctx: chasen.Ctx(App.Msg) = .{
+        ._allocator = allocator,
+        ._pending_tasks_with_len = 16,
+    };
+    try std.testing.expectError(error.TaskLimitExceeded, app.stageSelectedHunk(&ctx));
+    ctx._pending_tasks_with_len = 0;
+
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expect(
+        app.pages.review.repository_read_authority.epoch.eql(epoch_before_rejection),
+    );
+}
+
+test "Review revalidation startup retains both intents after status-only rejection" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+
+    // Terminal-only fallback: rejecting the narrow status member must leave
+    // enough authority for a later neutral scheduler opportunity to start the
+    // full replacement.
+    {
+        var app = try initStageHunkLaunchApp(allocator, roots.a);
+        defer app.repo_state.deinit(allocator);
+        defer app.pages.review.deinit(allocator);
+
+        const pending = app.actions.begin(.stage_hunk);
+        try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
+        app.acceptActionLaunch(pending);
+        const fence_closed =
+            !app.pages.review.repository_read_authority.mayStartRepositoryRead();
+
+        var ctx: chasen.Ctx(App.Msg) = .{
+            ._allocator = allocator,
+            ._pending_tasks_with_len = 16,
+        };
+        defer ctx.runtimeClearPendingEffectCopies();
+        const terminal_returned_normally = if (app.update(.{ .action_finished = .{
+            .stage_hunk = .{
+                .pending = pending,
+                .repo_root = try allocator.dupe(u8, roots.a),
+                .path = try allocator.dupe(u8, "a"),
+                .hunk_index = 0,
+                .session_mark_mutation = .none,
+                .result = .ok,
+            },
+        } }, &ctx)) |_| true else |_| false;
+        ctx._pending_tasks_with_len = 0;
+        defer clearPendingRepositoryTasks(&ctx, allocator);
+
+        try app.update(.git_action_spinner_tick, &ctx);
+        const later_full_count = ctx._pending_tasks_with_len;
+
+        try std.testing.expect(fence_closed);
+        try std.testing.expect(terminal_returned_normally);
+        try std.testing.expectEqual(@as(u8, 3), later_full_count);
+        try std.testing.expect(app.actions.pending == null);
+        try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+        try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+    }
+
+    // Ordinary + terminal: the existing ordinary scalar is direct evidence
+    // that status rejection consumed neither class. The terminal-only case
+    // above supplies the independent evidence for the second scalar.
+    {
+        var app = try initStageHunkLaunchApp(allocator, roots.a);
+        defer app.repo_state.deinit(allocator);
+        defer app.pages.review.deinit(allocator);
+
+        const pending = app.actions.begin(.stage_hunk);
+        try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
+        app.acceptActionLaunch(pending);
+        app.pages.review.activation.queueRevalidation();
+        const activation_id = app.pages.review.activation.next_activation_id;
+
+        var ctx: chasen.Ctx(App.Msg) = .{
+            ._allocator = allocator,
+            ._pending_tasks_with_len = 16,
+        };
+        defer ctx.runtimeClearPendingEffectCopies();
+        const terminal_returned_normally = if (app.update(.{ .action_finished = .{
+            .stage_hunk = .{
+                .pending = pending,
+                .repo_root = try allocator.dupe(u8, roots.a),
+                .path = try allocator.dupe(u8, "a"),
+                .hunk_index = 0,
+                .session_mark_mutation = .none,
+                .result = .ok,
+            },
+        } }, &ctx)) |_| true else |_| false;
+        const ordinary_retained =
+            app.pages.review.activation.revalidation_requested == activation_id;
+        ctx._pending_tasks_with_len = 0;
+        defer clearPendingRepositoryTasks(&ctx, allocator);
+
+        try app.update(.git_action_spinner_tick, &ctx);
+        const later_full_count = ctx._pending_tasks_with_len;
+
+        try std.testing.expect(terminal_returned_normally);
+        try std.testing.expect(ordinary_retained);
+        try std.testing.expectEqual(@as(u8, 3), later_full_count);
+        try std.testing.expect(app.actions.pending == null);
+        try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    }
+}
+
+test "Review revalidation startup keeps ordinary full intent after status-only acceptance" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try initStageHunkLaunchApp(allocator, roots.a);
+    defer app.repo_state.deinit(allocator);
+    defer app.pages.review.deinit(allocator);
+
+    const pending = app.actions.begin(.stage_hunk);
+    try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
+    app.acceptActionLaunch(pending);
+    const fence_closed =
+        !app.pages.review.repository_read_authority.mayStartRepositoryRead();
+    app.pages.review.activation.queueRevalidation();
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    try app.update(.{ .action_finished = .{ .stage_hunk = .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .path = try allocator.dupe(u8, "a"),
+        .hunk_index = 0,
+        .session_mark_mutation = .none,
+        .result = .ok,
+    } } }, &ctx);
+    const status_entries = ctx.takePendingTasksWith();
+    const status_only_count = status_entries.len;
+    var status_terminal: ?App.Msg = null;
+    if (status_entries.len == 1) {
+        status_terminal = status_entries[0].failed(
+            status_entries[0].ctx,
+            .runtime_abandoned,
+            allocator,
+        );
+    } else {
+        for (status_entries) |entry| {
+            var completion = entry.failed(entry.ctx, .runtime_abandoned, allocator);
+            completion.deinitUndelivered(allocator);
+        }
+    }
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    if (status_terminal) |message| try app.update(message, &ctx);
+    const full_count_after_status_terminal = ctx._pending_tasks_with_len;
+
+    try std.testing.expect(fence_closed);
+    try std.testing.expectEqual(@as(usize, 1), status_only_count);
+    try std.testing.expectEqual(@as(u8, 3), full_count_after_status_terminal);
+    try std.testing.expect(app.actions.pending == null);
+    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+}
+
 fn installTestActionCursor(
     app: *App,
     allocator: std.mem.Allocator,
