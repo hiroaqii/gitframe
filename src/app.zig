@@ -14022,6 +14022,43 @@ fn canonicalPublicationPrimaryTestApp(
     return app;
 }
 
+fn ordinaryPrimaryPublicationTestApp(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+) !App {
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .review,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, repo_root) },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .auto_reload = .init(.enabled, .{}, .unstaged),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_node = 0,
+                .diff_cursor = .{ .hunk_header = 0 },
+                .diff_scroll = 1,
+                .diff_horizontal_scroll = 2,
+                .sidebar_horizontal_scroll = 1,
+            },
+        } },
+        .terminal_size = .{ .width = 120, .height = 40 },
+    };
+    errdefer app.pages.review.deinit(allocator);
+    errdefer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(repo_root);
+
+    var status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try app.pages.review.git_status.replace(repo_root, &status);
+    app.pages.review.status_load.markSuccess();
+    acceptTestSource(&app);
+    try std.testing.expect(app.pages.review.review_projection.displayed == .idle);
+    try std.testing.expect(app.pages.review.review_projection.pending == null);
+    try std.testing.expect(app.reviewNavigationView().displayedReviewBody() == .primary);
+    return app;
+}
+
 fn canonicalPublicationReuseCandidate(
     allocator: std.mem.Allocator,
     status_snapshot_revision: u64,
@@ -14348,6 +14385,21 @@ fn expectRetainedCanonicalPublication(
     try std.testing.expectEqual(expected_hunks, retained.displayFile().hunks.ptr);
 }
 
+fn expectRetainedOrdinaryPrimaryPublication(
+    app: *const App,
+    expected_loaded: *const loaded_diff.LoadedDiff,
+    expected_token: review_selection_model.ReviewContentToken,
+) !void {
+    const primary = switch (app.reviewNavigationView().displayedReviewBody()) {
+        .primary => |value| value,
+        else => return error.ExpectedRetainedOrdinaryPrimary,
+    };
+    try std.testing.expect(primary.loaded == expected_loaded);
+    const token = app.reviewNavigationView().currentContentToken() orelse
+        return error.ExpectedReviewContentToken;
+    try std.testing.expect(token.eql(expected_token));
+}
+
 fn expectFreshCanonicalActionCapabilities(
     app: *App,
     allocator: std.mem.Allocator,
@@ -14457,6 +14509,517 @@ fn expectFreshCanonicalPublication(
     try std.testing.expectEqualStrings("a", diff_file.canonicalPathKey(unstaged_source).?);
     if (verify_action_capabilities) {
         try expectFreshCanonicalActionCapabilities(app, allocator, repo_root);
+    }
+}
+
+test "Review ordinary primary publication retains primary until cached result" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+
+    for ([_]bool{ false, true }) |status_first| {
+        var app = try ordinaryPrimaryPublicationTestApp(allocator, roots.a);
+        defer app.pages.review.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+        app.reviewNavigation().enterSearchMode();
+        setDiffSearchInput(&app, "new");
+        app.reviewNavigation().submitSearch();
+        try std.testing.expect(app.pages.review.search.match != null);
+        const primary = switch (app.reviewNavigationView().displayedReviewBody()) {
+            .primary => |value| value,
+            else => return error.ExpectedOrdinaryPrimary,
+        };
+        const primary_owner = primary.loaded;
+        const primary_token = try installCanonicalPublicationLineageOwners(
+            &app,
+            allocator,
+            roots.a,
+        );
+        const source_revision_before = app.pages.review.source_session_revision;
+        const status_revision_before = app.pages.review.status_snapshot_revision;
+        const horizontal_before = app.pages.review.viewer.diff_horizontal_scroll;
+
+        try finishCanonicalPublicationAction(
+            &app,
+            &ctx,
+            allocator,
+            .stage_file,
+            roots.a,
+        );
+        try expectRetainedOrdinaryPrimaryPublication(&app, primary_owner, primary_token);
+        const reads = try takeCanonicalPublicationReads(&ctx, allocator);
+
+        if (status_first) {
+            try finishCanonicalPublicationStatus(
+                &app,
+                &ctx,
+                allocator,
+                roots.a,
+                reads,
+                "M  a\x00",
+            );
+        } else {
+            try finishCanonicalPublicationEmpty(&app, &ctx, reads);
+        }
+        try expectRetainedOrdinaryPrimaryPublication(&app, primary_owner, primary_token);
+
+        if (status_first) {
+            try finishCanonicalPublicationEmpty(&app, &ctx, reads);
+        } else {
+            try finishCanonicalPublicationStatus(
+                &app,
+                &ctx,
+                allocator,
+                roots.a,
+                reads,
+                "M  a\x00",
+            );
+        }
+        try expectRetainedOrdinaryPrimaryPublication(&app, primary_owner, primary_token);
+
+        try app.ensureReviewProjection(&ctx);
+        try expectRetainedOrdinaryPrimaryPublication(&app, primary_owner, primary_token);
+        var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
+        var request_owned = true;
+        defer if (request_owned) request.deinit(allocator);
+        try std.testing.expectEqual(app_review_projection.Kind.cached_diff, request.kind);
+        try std.testing.expectEqualStrings("a", request.path_key);
+        try std.testing.expect(request.expected_presentation == null);
+        request_owned = false;
+        try app.finishReviewProjectionLoad(&ctx, .{
+            .request = request,
+            .result = .{ .ready = .{
+                .cached_diff = try app_load.buildLoadedBundle(
+                    allocator,
+                    app_test_support.diff_cached_projection,
+                ),
+            } },
+        });
+        request = undefined;
+        try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
+
+        try std.testing.expect(app.reviewNavigationView().displayedReviewBody() == .cached);
+        try std.testing.expect(app.reviewNavigationView().activeCachedDiffProjection() != null);
+        try std.testing.expectEqual(
+            source_revision_before + 1,
+            app.pages.review.source_session_revision,
+        );
+        try std.testing.expectEqual(
+            status_revision_before + 1,
+            app.pages.review.status_snapshot_revision,
+        );
+        try std.testing.expect(app.pages.review.status_load.isFresh());
+        try std.testing.expectEqualStrings(
+            "a",
+            app.reviewNavigationView().selectedStagePathKey().?,
+        );
+        try std.testing.expectEqual(
+            context.SelectedTarget{ .status_only = 0 },
+            app.pages.review.viewer.selected_target.?,
+        );
+        try std.testing.expectEqualStrings("new", app.pages.review.search.query.slice());
+        try std.testing.expect(app.pages.review.search.match != null);
+        try std.testing.expect(
+            app.pages.review.viewer.diff_scroll <
+                app.reviewNavigationView().displayedDiffLineCount(),
+        );
+        try std.testing.expect(
+            app.pages.review.viewer.diff_horizontal_scroll <= horizontal_before,
+        );
+        try std.testing.expect(app.pages.review.completed_selection == null);
+        try std.testing.expect(!app.pages.review.staged_hunks.containsExact(
+            roots.a,
+            "a",
+            .{ .content = primary_token, .display_hunk_index = 1 },
+        ));
+        const final_token = app.reviewNavigationView().currentContentToken() orelse
+            return error.ExpectedFinalCachedContentToken;
+        try std.testing.expect(!final_token.eql(primary_token));
+        try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+        try std.testing.expect(!app.reviewReadBusy());
+
+        switch (app.reviewOperations().stageTarget()) {
+            .already_staged => |path| try std.testing.expectEqualStrings("a", path),
+            else => return error.ExpectedAlreadyStagedFile,
+        }
+        switch (app.reviewOperations().toggleStageTarget()) {
+            .operation => |operation| try std.testing.expectEqual(
+                ToggleStageOperation.unstage,
+                operation,
+            ),
+            else => return error.ExpectedFileUnstageOperation,
+        }
+        switch (app.reviewOperations().unstageTarget()) {
+            .ready => |target| {
+                try std.testing.expectEqualStrings(roots.a, target.repo_root);
+                try std.testing.expectEqualStrings("a", target.path);
+            },
+            else => return error.ExpectedFileUnstageCapability,
+        }
+
+        app.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
+        switch (app.reviewOperations().selectedHunkToggleOperation()) {
+            .operation => |operation| try std.testing.expectEqual(
+                ToggleStageOperation.unstage,
+                operation,
+            ),
+            else => return error.ExpectedHunkUnstageOperation,
+        }
+        switch (app.reviewOperations().selectedHunkStageTarget(allocator)) {
+            .already_staged_hunk => {},
+            else => return error.ExpectedAlreadyStagedHunk,
+        }
+        switch (app.reviewOperations().selectedHunkUnstageTarget(allocator)) {
+            .ready => |target| {
+                defer allocator.free(target.patch);
+                try std.testing.expectEqualStrings(roots.a, target.repo_root);
+                try std.testing.expectEqualStrings("a", target.path);
+                try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
+                try std.testing.expect(target.session_mark_mutation == .none);
+            },
+            else => return error.ExpectedHunkUnstageCapability,
+        }
+    }
+
+    for ([_]bool{ false, true }) |source_changes| {
+        try expectOrdinaryPrimaryNoTargetPublication(
+            allocator,
+            roots.a,
+            source_changes,
+        );
+    }
+
+    try expectOrdinaryPrimaryCandidateTargetMatrix();
+}
+
+fn expectOrdinaryPrimaryCandidateTargetMatrix() !void {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+
+    const SourceTerminal = enum { loaded, empty, unchanged };
+    const cases = [_]struct {
+        name: []const u8,
+        status: []const u8,
+        source: SourceTerminal,
+        expected: app_review_projection.Kind,
+    }{
+        .{
+            .name = "mixed with source",
+            .status = "MM a\x00",
+            .source = .loaded,
+            .expected = .combined_hunks,
+        },
+        .{
+            .name = "mixed without source",
+            .status = "MM a\x00",
+            .source = .empty,
+            .expected = .cached_diff,
+        },
+        .{
+            .name = "staged only",
+            .status = "M  a\x00",
+            .source = .loaded,
+            .expected = .cached_diff,
+        },
+        .{
+            .name = "untracked",
+            .status = "?? a\x00",
+            .source = .loaded,
+            .expected = .generated_added_file,
+        },
+    };
+
+    for (cases) |case| {
+        errdefer std.log.err("candidate target case failed: {s}", .{case.name});
+        var app = try ordinaryPrimaryPublicationTestApp(allocator, roots.a);
+        defer app.pages.review.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+        try finishCanonicalPublicationAction(
+            &app,
+            &ctx,
+            allocator,
+            .stage_file,
+            roots.a,
+        );
+        const reads = try takeCanonicalPublicationReads(&ctx, allocator);
+        try finishCanonicalPublicationStatus(
+            &app,
+            &ctx,
+            allocator,
+            roots.a,
+            reads,
+            case.status,
+        );
+        switch (case.source) {
+            .loaded => try finishCanonicalPublicationSource(
+                &app,
+                &ctx,
+                allocator,
+                reads,
+                app_test_support.diff_unstaged_projection,
+            ),
+            .empty => try finishCanonicalPublicationEmpty(&app, &ctx, reads),
+            .unchanged => try app.finishDiffLoad(&ctx, .{
+                .identity = reads.source_identity,
+                .read_epoch = reads.source_read_epoch,
+                .generation = reads.source_generation,
+                .background_cycle_id = reads.source_cycle_id,
+                .result = .{
+                    .unchanged = content_fingerprint.Fingerprint.init("unchanged"),
+                },
+            }),
+        }
+
+        try app.ensureReviewProjection(&ctx);
+        var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
+        defer request.deinit(allocator);
+        try std.testing.expectEqual(case.expected, request.kind);
+        try std.testing.expectEqualStrings("a", request.path_key);
+        try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
+    }
+}
+
+fn expectOrdinaryPrimaryNoTargetPublication(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    source_changes: bool,
+) !void {
+    var app = try ordinaryPrimaryPublicationTestApp(allocator, repo_root);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    app.reviewNavigation().enterSearchMode();
+    setDiffSearchInput(&app, "new");
+    app.reviewNavigation().submitSearch();
+    const search_before = app.pages.review.search.match orelse
+        return error.ExpectedSearchMatch;
+    const search_offset_before = app.pages.review.search.match_offset;
+    const primary_before = switch (app.reviewNavigationView().displayedReviewBody()) {
+        .primary => |value| value,
+        else => return error.ExpectedOrdinaryPrimary,
+    };
+    const owner_before = primary_before.loaded;
+    const tree_nodes_before = primary_before.loaded.tree.nodes.ptr;
+    const status_root_before = app.pages.review.git_status.repo_root.?.ptr;
+    const status_entries_before = app.pages.review.git_status.document.entries.ptr;
+    const token_before = try installCanonicalPublicationLineageOwners(
+        &app,
+        allocator,
+        repo_root,
+    );
+    const source_revision_before = app.pages.review.source_session_revision;
+    const status_revision_before = app.pages.review.status_snapshot_revision;
+    const cursor_before = app.pages.review.viewer.diff_cursor;
+    const scroll_before = app.pages.review.viewer.diff_scroll;
+    const horizontal_before = app.pages.review.viewer.diff_horizontal_scroll;
+    const sidebar_horizontal_before =
+        app.pages.review.viewer.sidebar_horizontal_scroll;
+
+    try finishCanonicalPublicationAction(
+        &app,
+        &ctx,
+        allocator,
+        .stage_file,
+        repo_root,
+    );
+    const reads = try takeCanonicalPublicationReads(&ctx, allocator);
+    try finishCanonicalPublicationStatus(
+        &app,
+        &ctx,
+        allocator,
+        repo_root,
+        reads,
+        " M a\x00",
+    );
+    try expectRetainedOrdinaryPrimaryPublication(&app, owner_before, token_before);
+    try std.testing.expect(
+        app.pages.review.git_status.repo_root.?.ptr == status_root_before,
+    );
+    try std.testing.expect(
+        app.pages.review.git_status.document.entries.ptr == status_entries_before,
+    );
+    try std.testing.expectEqual(
+        source_revision_before,
+        app.pages.review.source_session_revision,
+    );
+    try std.testing.expectEqual(
+        status_revision_before,
+        app.pages.review.status_snapshot_revision,
+    );
+    try std.testing.expect(!app.pages.review.status_load.isFresh());
+    try std.testing.expectEqual(
+        context.SelectedTarget{ .diff_file = 0 },
+        app.pages.review.viewer.selected_target.?,
+    );
+    try std.testing.expectEqual(cursor_before, app.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(scroll_before, app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(
+        horizontal_before,
+        app.pages.review.viewer.diff_horizontal_scroll,
+    );
+    try std.testing.expectEqual(
+        sidebar_horizontal_before,
+        app.pages.review.viewer.sidebar_horizontal_scroll,
+    );
+    try std.testing.expectEqual(
+        search_before.coordinate,
+        app.pages.review.search.match.?.coordinate,
+    );
+    try std.testing.expectEqual(
+        search_offset_before,
+        app.pages.review.search.match_offset,
+    );
+    const retained_selection = app.pages.review.completed_selection orelse
+        return error.ExpectedRetainedCompletedSelection;
+    try std.testing.expect(retained_selection.token.eql(token_before));
+    try std.testing.expect(app.pages.review.staged_hunks.containsExact(
+        repo_root,
+        "a",
+        .{ .content = token_before, .display_hunk_index = 1 },
+    ));
+    try std.testing.expect(app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(app.reviewReadBusy());
+    try std.testing.expect(app.reviewOperations().stageTarget() == .stale_source);
+
+    if (source_changes) {
+        try finishCanonicalPublicationSource(
+            &app,
+            &ctx,
+            allocator,
+            reads,
+            app_test_support.diff_unstaged_projection,
+        );
+    } else {
+        try app.finishDiffLoad(&ctx, .{
+            .identity = reads.source_identity,
+            .read_epoch = reads.source_read_epoch,
+            .generation = reads.source_generation,
+            .background_cycle_id = reads.source_cycle_id,
+            .result = .{
+                .unchanged = content_fingerprint.Fingerprint.init("unchanged"),
+            },
+        });
+    }
+
+    try app.ensureReviewProjection(&ctx);
+    const entries = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+    try finishCanonicalPublicationBranch(&app, &ctx, allocator, repo_root, reads);
+
+    try std.testing.expect(app.pages.review.review_projection.displayed == .idle);
+    try std.testing.expect(app.pages.review.review_projection.pending == null);
+    try std.testing.expect(app.pages.review.pending_reload == null);
+    try std.testing.expect(app.pages.review.deferred_source_apply == null);
+    try std.testing.expect(app.pages.review.canonical_publication == null);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
+    try std.testing.expect(app.pages.review.status_load.isFresh());
+    try std.testing.expectEqual(
+        status_revision_before,
+        app.pages.review.status_snapshot_revision,
+    );
+    try std.testing.expect(
+        app.pages.review.git_status.repo_root.?.ptr == status_root_before,
+    );
+    try std.testing.expect(
+        app.pages.review.git_status.document.entries.ptr == status_entries_before,
+    );
+    try std.testing.expectEqualStrings(
+        "a",
+        app.reviewNavigationView().selectedStagePathKey().?,
+    );
+    try std.testing.expectEqual(
+        context.SelectedTarget{ .diff_file = 0 },
+        app.pages.review.viewer.selected_target.?,
+    );
+    try std.testing.expect(app.reviewReloadView().projectionTarget() == null);
+    try std.testing.expectEqualStrings("new", app.pages.review.search.query.slice());
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(!app.reviewReadBusy());
+    switch (app.reviewOperations().stageTarget()) {
+        .ready => |target| {
+            try std.testing.expectEqualStrings(repo_root, target.repo_root);
+            try std.testing.expectEqualStrings("a", target.path);
+        },
+        else => return error.ExpectedFreshFileStageCapability,
+    }
+
+    const primary_after = switch (app.reviewNavigationView().displayedReviewBody()) {
+        .primary => |value| value,
+        else => return error.ExpectedFinalOrdinaryPrimary,
+    };
+    const token_after = app.reviewNavigationView().currentContentToken() orelse
+        return error.ExpectedReviewContentToken;
+    if (source_changes) {
+        try std.testing.expect(primary_after.loaded != owner_before);
+        try std.testing.expectEqualStrings(
+            app_test_support.diff_unstaged_projection,
+            primary_after.loaded.text,
+        );
+        try std.testing.expectEqual(@as(usize, 1), primary_after.loaded.document.files.len);
+        try std.testing.expectEqualStrings(
+            "a",
+            diff_file.canonicalPathKey(primary_after.loaded.document.files[0]).?,
+        );
+        try std.testing.expect(primary_after.loaded.tree.nodes.ptr != tree_nodes_before);
+        try std.testing.expectEqual(
+            source_revision_before + 1,
+            app.pages.review.source_session_revision,
+        );
+        try std.testing.expect(!token_after.eql(token_before));
+        try std.testing.expect(app.pages.review.completed_selection == null);
+        try std.testing.expect(!app.pages.review.staged_hunks.containsExact(
+            repo_root,
+            "a",
+            .{ .content = token_before, .display_hunk_index = 1 },
+        ));
+        try std.testing.expect(app.pages.review.search.match != null);
+        try std.testing.expect(
+            app.pages.review.viewer.diff_scroll <
+                app.reviewNavigationView().displayedDiffLineCount(),
+        );
+        try std.testing.expect(
+            app.pages.review.viewer.diff_horizontal_scroll <= horizontal_before,
+        );
+    } else {
+        try std.testing.expect(primary_after.loaded == owner_before);
+        try std.testing.expect(primary_after.loaded.tree.nodes.ptr == tree_nodes_before);
+        try std.testing.expectEqual(
+            source_revision_before,
+            app.pages.review.source_session_revision,
+        );
+        try std.testing.expect(token_after.eql(token_before));
+        const completed = app.pages.review.completed_selection orelse
+            return error.ExpectedRetainedCompletedSelection;
+        try std.testing.expect(completed.token.eql(token_before));
+        try std.testing.expect(app.pages.review.staged_hunks.containsExact(
+            repo_root,
+            "a",
+            .{ .content = token_before, .display_hunk_index = 1 },
+        ));
+        try std.testing.expectEqual(cursor_before, app.pages.review.viewer.diff_cursor);
+        try std.testing.expectEqual(scroll_before, app.pages.review.viewer.diff_scroll);
+        try std.testing.expectEqual(
+            horizontal_before,
+            app.pages.review.viewer.diff_horizontal_scroll,
+        );
+        try std.testing.expectEqual(
+            sidebar_horizontal_before,
+            app.pages.review.viewer.sidebar_horizontal_scroll,
+        );
+        try std.testing.expectEqual(
+            search_before.coordinate,
+            app.pages.review.search.match.?.coordinate,
+        );
+        try std.testing.expectEqual(
+            search_offset_before,
+            app.pages.review.search.match_offset,
+        );
     }
 }
 
@@ -15102,7 +15665,8 @@ test "Review canonical publication changed status waits for unchanged source and
     const prior = app.reviewNavigationView().activeCombinedProjection() orelse
         return error.ExpectedCombinedProjection;
     const prior_hunks = prior.displayFile().hunks.ptr;
-    const prior_content_token = prior.presentation.content_token;
+    const prior_review_token = app.reviewNavigationView().currentContentToken() orelse
+        return error.ExpectedReviewContentToken;
     try finishCanonicalPublicationAction(&app, &ctx, allocator, .stage_file, roots.a);
     const reads = try takeCanonicalPublicationReads(&ctx, allocator);
     try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, "M  a\x00");
@@ -15121,6 +15685,9 @@ test "Review canonical publication changed status waits for unchanged source and
 
     try app.ensureReviewProjection(&ctx);
     var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
+    var request_owned = true;
+    defer if (request_owned) request.deinit(allocator);
+    try std.testing.expectEqual(app_review_projection.Kind.cached_diff, request.kind);
     const stale_request = try app_review_projection.cloneRequestWithOptions(
         allocator,
         request.identity,
@@ -15137,38 +15704,161 @@ test "Review canonical publication changed status waits for unchanged source and
             .expected_presentation = request.expected_presentation,
         },
     );
-    var stale_bundle = try testCombinedHunkBundle(allocator);
-    stale_bundle.authority.status_snapshot_revision = stale_request.status_snapshot_revision;
     try app.finishReviewProjectionLoad(&ctx, .{
         .request = stale_request,
-        .result = .{ .ready = .{ .combined_hunks = stale_bundle } },
+        .result = .{ .ready = .{
+            .cached_diff = try app_load.buildLoadedBundle(
+                allocator,
+                app_test_support.diff_cached_projection,
+            ),
+        } },
     });
     try expectRetainedCanonicalPublication(&app, prior_hunks);
     try std.testing.expect(app.pages.review.review_projection.hasPending());
 
-    const final_bundle = try canonicalPublicationFinalBundle(allocator, request);
+    request_owned = false;
     try app.finishReviewProjectionLoad(&ctx, .{
         .request = request,
-        .result = .{ .ready = .{ .combined_hunks = final_bundle } },
+        .result = .{ .ready = .{
+            .cached_diff = try app_load.buildLoadedBundle(
+                allocator,
+                app_test_support.diff_cached_projection,
+            ),
+        } },
     });
     request = undefined;
     try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
 
     try std.testing.expectEqual(source_revision_before, app.pages.review.source_session_revision);
     try std.testing.expectEqual(status_revision_before + 1, app.pages.review.status_snapshot_revision);
-    try expectFreshCanonicalPublication(
-        &app,
-        allocator,
+    try std.testing.expect(app.reviewNavigationView().displayedReviewBody() == .cached);
+    try std.testing.expect(app.reviewNavigationView().activeCachedDiffProjection() != null);
+    const published_request = app.pages.review.review_projection.displayed.request() orelse
+        return error.ExpectedCanonicalProjectionRequest;
+    try std.testing.expect(published_request.matchesBorrowed(
+        app.pages.review.repository_read_authority.epoch,
         roots.a,
-        prior_hunks,
-        prior_content_token,
+        "a",
+        .cached_diff,
+        .unstaged,
         source_revision_before,
         status_revision_before + 1,
-        false,
-    );
+    ));
+    try std.testing.expect(!app.reviewNavigationView().currentContentToken().?.eql(
+        prior_review_token,
+    ));
+    try std.testing.expect(app.pages.review.completed_selection == null);
+    switch (app.reviewOperations().stageTarget()) {
+        .already_staged => |path| try std.testing.expectEqualStrings("a", path),
+        else => return error.ExpectedAlreadyStagedFile,
+    }
+    switch (app.reviewOperations().unstageTarget()) {
+        .ready => |target| try std.testing.expectEqualStrings("a", target.path),
+        else => return error.ExpectedFileUnstageCapability,
+    }
+    app.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
+    switch (app.reviewOperations().selectedHunkToggleOperation()) {
+        .operation => |operation| try std.testing.expectEqual(
+            ToggleStageOperation.unstage,
+            operation,
+        ),
+        else => return error.ExpectedHunkUnstageOperation,
+    }
+    switch (app.reviewOperations().selectedHunkStageTarget(allocator)) {
+        .already_staged_hunk => {},
+        else => return error.ExpectedAlreadyStagedHunk,
+    }
+    switch (app.reviewOperations().selectedHunkUnstageTarget(allocator)) {
+        .ready => |target| {
+            defer allocator.free(target.patch);
+            try std.testing.expectEqualStrings("a", target.path);
+            try std.testing.expect(target.session_mark_mutation == .none);
+        },
+        else => return error.ExpectedHunkUnstageCapability,
+    }
     try std.testing.expect(!app.pages.review.review_projection.hasPending());
     try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
     try std.testing.expect(!app.reviewReadBusy());
+
+    {
+        var mixed_app = try canonicalPublicationTestApp(allocator, roots.a);
+        defer mixed_app.pages.review.deinit(allocator);
+        defer mixed_app.repo_state.deinit(allocator);
+        var mixed_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        const mixed_status_revision = mixed_app.pages.review.status_snapshot_revision;
+        const mixed_source_revision = mixed_app.pages.review.source_session_revision;
+        const mixed_prior = mixed_app.reviewNavigationView().activeCombinedProjection() orelse
+            return error.ExpectedCombinedProjection;
+        const mixed_hunks = mixed_prior.displayFile().hunks.ptr;
+        const mixed_content_token = mixed_prior.presentation.content_token;
+
+        try finishCanonicalPublicationAction(
+            &mixed_app,
+            &mixed_ctx,
+            allocator,
+            .stage_file,
+            roots.a,
+        );
+        const mixed_reads = try takeCanonicalPublicationReads(&mixed_ctx, allocator);
+        try finishCanonicalPublicationStatus(
+            &mixed_app,
+            &mixed_ctx,
+            allocator,
+            roots.a,
+            mixed_reads,
+            "MM a\x00 M b\x00",
+        );
+        try mixed_app.finishDiffLoad(&mixed_ctx, .{
+            .identity = mixed_reads.source_identity,
+            .read_epoch = mixed_reads.source_read_epoch,
+            .generation = mixed_reads.source_generation,
+            .background_cycle_id = mixed_reads.source_cycle_id,
+            .result = .{
+                .unchanged = content_fingerprint.Fingerprint.init("unchanged"),
+            },
+        });
+        try expectRetainedCanonicalPublication(&mixed_app, mixed_hunks);
+
+        try mixed_app.ensureReviewProjection(&mixed_ctx);
+        var mixed_request = try takeCanonicalPublicationProjectionRequest(
+            &mixed_ctx,
+            allocator,
+        );
+        var mixed_request_owned = true;
+        defer if (mixed_request_owned) mixed_request.deinit(allocator);
+        try std.testing.expectEqual(
+            app_review_projection.Kind.combined_hunks,
+            mixed_request.kind,
+        );
+        const mixed_final = try canonicalPublicationFinalBundle(
+            allocator,
+            mixed_request,
+        );
+        mixed_request_owned = false;
+        try mixed_app.finishReviewProjectionLoad(&mixed_ctx, .{
+            .request = mixed_request,
+            .result = .{ .ready = .{ .combined_hunks = mixed_final } },
+        });
+        mixed_request = undefined;
+        try finishCanonicalPublicationBranch(
+            &mixed_app,
+            &mixed_ctx,
+            allocator,
+            roots.a,
+            mixed_reads,
+        );
+
+        try expectFreshCanonicalPublication(
+            &mixed_app,
+            allocator,
+            roots.a,
+            mixed_hunks,
+            mixed_content_token,
+            mixed_source_revision,
+            mixed_status_revision + 1,
+            true,
+        );
+    }
 
     {
         var superseded_app = try canonicalPublicationTestApp(allocator, roots.a);
