@@ -1484,9 +1484,24 @@ fn containsDisallowedControl(text: []const u8) bool {
 }
 
 fn actionOutputFailure(allocator: std.mem.Allocator, action_id: []const u8, output: external_action.CommandOutput) CommitMessageActionResult {
-    if (output.message.len > 0) return allocFailure(allocator, "{s}: {s}", .{ action_id, output.message });
     if (output.stderr.len > 0) return allocFailure(allocator, "{s}: {s}", .{ action_id, shortLine(output.stderr) });
+    if (output.message.len > 0) return allocFailure(allocator, "{s}: {s}", .{ action_id, output.message });
     return allocFailure(allocator, "{s} failed", .{action_id});
+}
+
+test "concurrent stdin action failure prefers captured stderr" {
+    var stderr = "git diagnostic\nignored detail".*;
+    var generic_message = "generic runner failure".*;
+    var result = actionOutputFailure(std.testing.allocator, "assist", .{
+        .stderr = &stderr,
+        .message = &generic_message,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed => |message| try std.testing.expectEqualStrings("assist: git diagnostic", message),
+        else => return error.ExpectedAllocatedFailure,
+    }
 }
 
 fn shortLine(text: []const u8) []const u8 {

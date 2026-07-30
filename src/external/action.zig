@@ -125,9 +125,23 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, request: ExternalActionRequ
     };
 }
 
-fn resultForRunFailure(allocator: std.mem.Allocator, failure: process_runner.Failure) std.mem.Allocator.Error!ExternalActionResult {
+fn resultForRunFailure(allocator: std.mem.Allocator, failure_value: process_runner.Failure) std.mem.Allocator.Error!ExternalActionResult {
+    var failure = failure_value;
+    defer failure.deinit(allocator);
+
     const message = try std.fmt.allocPrint(allocator, "external action failed: {s}", .{failure.errorName()});
-    const output: CommandOutput = .{ .message = message };
+    const output: CommandOutput = switch (failure) {
+        .stdin => |*stdin_failure| output: {
+            const result = stdin_failure.takeResult();
+            break :output .{
+                .stdout = result.stdout,
+                .stderr = result.stderr,
+                .term = result.term,
+                .message = message,
+            };
+        },
+        else => .{ .message = message },
+    };
     return switch (failure) {
         .empty_argv, .spawn => .{ .spawn_failed = output },
         .stdin, .capture, .wait => .{ .runner_failed = output },
@@ -221,4 +235,68 @@ test "ExternalAction cap overflow maps to runner_failed" {
 
     try std.testing.expect(result == .runner_failed);
     try std.testing.expect(std.mem.indexOf(u8, result.runner_failed.message, "StreamTooLong") != null);
+}
+
+test "concurrent stdin ExternalAction preserves early exit diagnostics" {
+    const stdin = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(stdin);
+    @memset(stdin, 'i');
+
+    const argv = [_][]const u8{ "sh", "-c", "exec 0<&-; printf external-diagnostic >&2; exit 7" };
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .id = .custom,
+        .argv = &argv,
+        .stdin_json = stdin,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result == .runner_failed);
+    try std.testing.expectEqualStrings("", result.runner_failed.stdout);
+    try std.testing.expectEqualStrings("external-diagnostic", result.runner_failed.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 7 }, result.runner_failed.term.?);
+    try std.testing.expect(std.mem.indexOf(u8, result.runner_failed.message, "external action failed:") != null);
+}
+
+test "concurrent stdin ExternalAction keeps writer failure when child exits zero" {
+    const stdout = try std.testing.allocator.dupe(u8, "partial-output");
+    const stderr = std.testing.allocator.dupe(u8, "partial-diagnostic") catch |err| {
+        std.testing.allocator.free(stdout);
+        return err;
+    };
+
+    var result = try resultForRunFailure(std.testing.allocator, .{
+        .stdin = .{
+            .err = error.WriteFailed,
+            .result = .{
+                .term = .{ .exited = 0 },
+                .stdout = stdout,
+                .stderr = stderr,
+            },
+        },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result == .runner_failed);
+    try std.testing.expectEqualStrings("partial-output", result.runner_failed.stdout);
+    try std.testing.expectEqualStrings("partial-diagnostic", result.runner_failed.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.runner_failed.term.?);
+    try std.testing.expect(std.mem.indexOf(u8, result.runner_failed.message, "WriteFailed") != null);
+}
+
+test "concurrent stdin ExternalAction releases evidence when message allocation fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    const allocator = failing_allocator.allocator();
+    const stdout = try allocator.dupe(u8, "out");
+    const stderr = try allocator.dupe(u8, "diagnostic");
+
+    try std.testing.expectError(error.OutOfMemory, resultForRunFailure(allocator, .{
+        .stdin = .{
+            .err = error.WriteFailed,
+            .result = .{
+                .term = .{ .exited = 7 },
+                .stdout = stdout,
+                .stderr = stderr,
+            },
+        },
+    }));
 }

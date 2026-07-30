@@ -601,6 +601,41 @@ fn operationResultFromGitCommand(allocator: std.mem.Allocator, result: process_r
     return .{ .failed = std.fmt.allocPrint(allocator, "{s} failed: {any}", .{ fallback_label, result.term }) catch return error.OutOfMemory };
 }
 
+fn operationResultFromGitStdinCommand(
+    allocator: std.mem.Allocator,
+    detailed: process_runner.DetailedResult,
+    fallback_label: []const u8,
+) LoadError!OperationResult {
+    return switch (detailed) {
+        .ok => |result| operationResultFromGitCommand(allocator, result, fallback_label),
+        .failed => |failure_value| {
+            var failure = failure_value;
+            defer failure.deinit(allocator);
+
+            const error_name = failure.errorName();
+            return switch (failure) {
+                .stdin => |*stdin_failure| {
+                    if (stdin_failure.result.stderr.len > 0) {
+                        const result = stdin_failure.takeResult();
+                        allocator.free(result.stdout);
+                        return .{ .failed = result.stderr };
+                    }
+
+                    const message = std.fmt.allocPrint(
+                        allocator,
+                        "{s} failed during stdin ({s}): {any}",
+                        .{ fallback_label, error_name, stdin_failure.result.term },
+                    ) catch return error.OutOfMemory;
+                    const result = stdin_failure.takeResult();
+                    result.deinit(allocator);
+                    return .{ .failed = message };
+                },
+                else => runnerErrorToLoadError(failure.toError()),
+            };
+        },
+    };
+}
+
 fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!LoadResult {
     // Use structured argv and force stable path prefixes so display/editor
     // paths do not depend on user diff.mnemonicPrefix/diff.noprefix config.
@@ -2261,28 +2296,28 @@ fn runGitDiscard(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8
 
 fn runGitApplyCached(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, patch: []const u8) LoadError!OperationResult {
     const argv = [_][]const u8{ "git", "apply", "--cached", "--whitespace=nowarn", "-" };
-    const result = process_runner.runWithStdin(allocator, io, .{
+    const detailed = try process_runner.runWithStdinDetailed(allocator, io, .{
         .argv = &argv,
         .cwd = .{ .path = repo_root },
         .stdin = patch,
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return runnerErrorToLoadError(err);
+    });
 
-    return operationResultFromGitCommand(allocator, result, "git apply --cached");
+    return operationResultFromGitStdinCommand(allocator, detailed, "git apply --cached");
 }
 
 fn runGitApplyCachedReverse(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, patch: []const u8) LoadError!OperationResult {
     const argv = [_][]const u8{ "git", "apply", "--cached", "--reverse", "--whitespace=nowarn", "-" };
-    const result = process_runner.runWithStdin(allocator, io, .{
+    const detailed = try process_runner.runWithStdinDetailed(allocator, io, .{
         .argv = &argv,
         .cwd = .{ .path = repo_root },
         .stdin = patch,
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return runnerErrorToLoadError(err);
+    });
 
-    return operationResultFromGitCommand(allocator, result, "git apply --cached --reverse");
+    return operationResultFromGitStdinCommand(allocator, detailed, "git apply --cached --reverse");
 }
 
 fn runGitCommit(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest) LoadError!OperationResult {
@@ -3097,6 +3132,107 @@ test "Backend exposes operation interface" {
     try std.testing.expectEqualStrings("origin", push_request.kind.push.remote);
     try std.testing.expectEqualStrings("main", push_request.kind.push.remote_branch);
     try std.testing.expectEqualStrings("abc123", push_request.kind.push.oid);
+}
+
+test "concurrent stdin Git operation mapping keeps stderr on writer failure" {
+    const stdout = try std.testing.allocator.dupe(u8, "ignored");
+    const stderr = std.testing.allocator.dupe(u8, "error: corrupt patch at line 6\n") catch |err| {
+        std.testing.allocator.free(stdout);
+        return err;
+    };
+
+    const result = try operationResultFromGitStdinCommand(std.testing.allocator, .{
+        .failed = .{ .stdin = .{
+            .err = error.WriteFailed,
+            .result = .{
+                .term = .{ .exited = 128 },
+                .stdout = stdout,
+                .stderr = stderr,
+            },
+        } },
+    }, "git apply --cached");
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed => |message| try std.testing.expectEqualStrings("error: corrupt patch at line 6\n", message),
+        else => return error.ExpectedGitDiagnosticFailure,
+    }
+}
+
+test "concurrent stdin Git mapping keeps writer failure when child exits zero" {
+    const stdout = try std.testing.allocator.dupe(u8, "ignored");
+    const stderr = std.testing.allocator.dupe(u8, "") catch |err| {
+        std.testing.allocator.free(stdout);
+        return err;
+    };
+
+    var result = try operationResultFromGitStdinCommand(std.testing.allocator, .{
+        .failed = .{ .stdin = .{
+            .err = error.WriteFailed,
+            .result = .{
+                .term = .{ .exited = 0 },
+                .stdout = stdout,
+                .stderr = stderr,
+            },
+        } },
+    }, "git apply --cached");
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed => |message| {
+            try std.testing.expect(std.mem.indexOf(u8, message, "failed during stdin") != null);
+            try std.testing.expect(std.mem.indexOf(u8, message, "WriteFailed") != null);
+            try std.testing.expect(std.mem.indexOf(u8, message, "exited = 0") != null);
+        },
+        else => return error.ExpectedGitStdinFailure,
+    }
+}
+
+test "concurrent stdin Git mapping releases evidence when fallback allocation fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const allocator = failing_allocator.allocator();
+    const stdout = try allocator.dupe(u8, "ignored");
+
+    try std.testing.expectError(error.OutOfMemory, operationResultFromGitStdinCommand(allocator, .{
+        .failed = .{ .stdin = .{
+            .err = error.WriteFailed,
+            .result = .{
+                .term = .{ .exited = 0 },
+                .stdout = stdout,
+                .stderr = &.{},
+            },
+        } },
+    }, "git apply --cached"));
+}
+
+test "concurrent stdin Git apply preserves malformed large patch diagnostic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+    const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo_root);
+
+    const malformed_prefix =
+        "diff --git a/file.txt b/file.txt\n" ++
+        "new file mode 100644\n" ++
+        "--- /dev/null\n" ++
+        "+++ b/file.txt\n" ++
+        "@@ -0,0 +1 @@\n" ++
+        "missing-prefix\n";
+    const patch = try std.testing.allocator.alloc(u8, 512 * 1024);
+    defer std.testing.allocator.free(patch);
+    @memcpy(patch[0..malformed_prefix.len], malformed_prefix);
+    @memset(patch[malformed_prefix.len..], 'x');
+
+    const result = try runGitApplyCached(std.testing.allocator, io, repo_root, patch);
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed => |message| try std.testing.expect(std.mem.indexOf(u8, message, "corrupt patch") != null),
+        else => return error.ExpectedGitDiagnosticFailure,
+    }
 }
 
 test "pushEnvironment disables interactive credential prompts" {
