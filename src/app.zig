@@ -5,7 +5,6 @@ const ui = @import("chasen_ui");
 const app_actions = @import("app/actions.zig");
 const app_auto_reload = @import("app/auto_reload.zig");
 const app_commit_panel = @import("app/commit_panel.zig");
-const app_direction = @import("app/direction.zig");
 const app_input = @import("app/input.zig");
 const app_load_state = @import("app/load_state.zig");
 const app_load = @import("app/load.zig");
@@ -87,24 +86,14 @@ const ReviewRevalidationStartDisposition = enum {
     unsupported,
 };
 
-pub const SourceMode = diff_source.SourceMode;
-pub const CliConfig = diff_source.CliConfig;
-pub const LoadRequest = diff_source.LoadRequest;
-pub const ParseArgsError = diff_source.ParseArgsError;
-pub const parseArgs = diff_source.parseArgs;
+const SourceMode = diff_source.SourceMode;
+const CliConfig = diff_source.CliConfig;
 
 const DiffLoadFinished = app_load.DiffLoadFinished;
 const DiffLoadTask = app_load.DiffLoadTask(App.Msg);
-const DiscardTargetResult = git_ops.DiscardTargetResult;
 const EmptyReason = app_load_state.EmptyReason;
 const SessionHunkMarkMutation = git_ops.SessionHunkMarkMutation;
-const HunkStageTargetResult = git_ops.HunkStageTargetResult;
-const HunkUnstageTargetResult = git_ops.HunkUnstageTargetResult;
-const HorizontalDirection = app_direction.Horizontal;
-const LoadedSession = app_load_state.LoadedSession;
 const LoadedDiff = loaded_diff.LoadedDiff;
-const LoadRuntimeState = app_load_state.LoadRuntimeState;
-const PendingLoad = app_load_state.PendingLoad;
 const RepoDiscoveryFinished = app_load.RepoDiscoveryFinished;
 const RepoDiscoveryTask = app_load.RepoDiscoveryTask(App.Msg);
 const RepoPathDiscoveryFinished = app_load.RepoPathDiscoveryFinished;
@@ -113,10 +102,8 @@ const BranchStatusLoadFinished = app_load.BranchStatusLoadFinished;
 const BranchStatusLoadTask = app_load.BranchStatusLoadTask(App.Msg);
 const BranchListLoadFinished = app_load.BranchListLoadFinished;
 const BranchListLoadTask = app_load.BranchListLoadTask(App.Msg);
-const BranchSwitchTargetResult = git_ops.BranchSwitchTargetResult;
 const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
-const PathTarget = git_ops.PathTarget;
 const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
 const ReviewProjectionTask = app_load.ReviewProjectionTask(App.Msg);
 const GeneratedSyntaxTask = app_load.GeneratedSyntaxTask(App.Msg);
@@ -131,25 +118,15 @@ const CommitFinished = app_actions.CommitFinished;
 const CommitMessageAssistFinished = app_actions.CommitMessageAssistFinished;
 const DiscardFileFinished = app_actions.DiscardFileFinished;
 const FetchFinished = app_actions.FetchFinished;
-const FetchTargetResult = git_ops.FetchTargetResult;
 const PullFinished = app_actions.PullFinished;
-const PullTargetResult = git_ops.PullTargetResult;
 const PushFinished = app_actions.PushFinished;
-const PushTargetResult = git_ops.PushTargetResult;
 const SwitchBranchFinished = app_actions.SwitchBranchFinished;
-const SwitchBranchTask = app_actions.SwitchBranchTask(App.Msg);
 const StageHunkFinished = app_actions.StageHunkFinished;
 const StageFileFinished = app_actions.StageFileFinished;
-const StageTargetResult = git_ops.StageTargetResult;
-const SizeDirection = app_direction.Size;
 const TargetKind = git_ops.TargetKind;
-const ToggleHunkTargetResult = git_ops.ToggleHunkTargetResult;
-const ToggleStageTargetResult = git_ops.ToggleStageTargetResult;
 const ToggleStageOperation = git_ops.ToggleStageOperation;
 const UnstageFileFinished = app_actions.UnstageFileFinished;
 const UnstageHunkFinished = app_actions.UnstageHunkFinished;
-const UnstageTargetResult = git_ops.UnstageTargetResult;
-const VerticalDirection = app_direction.Vertical;
 const MousePane = enum {
     sidebar,
     diff,
@@ -240,7 +217,6 @@ fn expandUserPath(allocator: std.mem.Allocator, path: []const u8, home: ?[]const
     return allocator.dupe(u8, path);
 }
 
-const ChangedFileFilter = loaded_diff.ChangedFileFilter;
 const OverlayKind = app_state.OverlayKind;
 
 const RepoCommitOrigin = enum {
@@ -1304,11 +1280,6 @@ pub const App = struct {
         return .{ .col = point.col, .row = point.row };
     }
 
-    fn contentMousePoint(self: *const App, mouse: anytype) ?MousePoint {
-        const point = self.shellLayout().terminalToContent(mouse.col, mouse.row) orelse return null;
-        return .{ .col = point.col, .row = point.row };
-    }
-
     fn keyContext(self: *const App) app_input.KeyContext {
         return .{
             .active_page = self.active_page,
@@ -1791,20 +1762,6 @@ pub const App = struct {
         };
         self.reviewReload().acceptSourceSpawn(options.background_cycle_id);
         source_accepted = true;
-    }
-
-    fn startStatusLoad(
-        self: *App,
-        ctx: *chasen.Ctx(Msg),
-        repo_root: []const u8,
-        origin: git_backend.ReadOrigin,
-        background_cycle_id: ?u64,
-    ) void {
-        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return;
-        if (self.pages.review.action_cursor.hasOwner()) {
-            self.reviewNavigation().clearActionCursor(ctx.allocator());
-        }
-        _ = self.startStatusLoadTracked(ctx, repo_root, origin, background_cycle_id, null) catch {};
     }
 
     fn startStatusLoadTracked(
@@ -5687,9 +5644,7 @@ pub const App = struct {
     }
 };
 
-const footer_rows: u16 = app_shell_layout.footer_rows;
 const sidebar_header_rows: u16 = review_layout.sidebar_header_rows;
-const diff_body_start_row: u16 = review_layout.diff_body_start_row;
 
 fn terminalBodyHeight(terminal_height: u16) u16 {
     return app_shell_layout.bodyHeight(terminal_height);
@@ -7359,7 +7314,10 @@ test "read task spawn failure rejects status branch and projection page state" {
     var status_app: App = .{ .allocator = allocator };
     _ = status_app.activateReview();
     var status_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._pending_tasks_with_len = 16 };
-    status_app.startStatusLoad(&status_ctx, "/repo", .foreground, null);
+    try std.testing.expectError(
+        error.TaskLimitExceeded,
+        status_app.startStatusLoadTracked(&status_ctx, "/repo", .foreground, null, null),
+    );
     status_ctx._pending_tasks_with_len = 0;
     try std.testing.expect(status_app.pages.review.status_load.pending == null);
     try std.testing.expectEqualStrings("could not start status load task", status_app.pages.review.status.text());
@@ -7462,7 +7420,10 @@ test "read task allocation failure rejects source status branch and projection p
     var status_app: App = .{ .allocator = status_failing.allocator() };
     _ = status_app.activateReview();
     var status_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = status_failing.allocator() };
-    status_app.startStatusLoad(&status_ctx, "/repo", .foreground, null);
+    try std.testing.expectError(
+        error.OutOfMemory,
+        status_app.startStatusLoadTracked(&status_ctx, "/repo", .foreground, null, null),
+    );
     try std.testing.expect(status_app.pages.review.status_load.pending == null);
     try std.testing.expectEqualStrings("could not allocate status load task", status_app.pages.review.status.text());
 
@@ -13018,7 +12979,10 @@ test "mutation read start gate makes direct App read starters inert" {
         "/repo",
         .{ .clear_visible_state = true, .kind = .manual },
     );
-    app.startStatusLoad(&ctx, "/repo", .foreground, null);
+    try std.testing.expectError(
+        error.RepositoryReadAuthorityClosed,
+        app.startStatusLoadTracked(&ctx, "/repo", .foreground, null, null),
+    );
     _ = app.startBranchStatusLoad(&ctx, "/repo", null);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
@@ -20223,7 +20187,7 @@ test "loaded diff with empty visible filter shows local empty state" {
 }
 
 test "load runtime pending tracks task kind and generation" {
-    var load: LoadRuntimeState = .{};
+    var load: app_load_state.LoadRuntimeState = .{};
 
     const discovery_generation = load.beginRepoDiscovery();
     try std.testing.expect(load.hasPending());
@@ -20241,7 +20205,7 @@ test "load runtime pending tracks task kind and generation" {
 }
 
 test "load runtime keeps newer pending when stale task finishes" {
-    var load: LoadRuntimeState = .{};
+    var load: app_load_state.LoadRuntimeState = .{};
 
     const stale_generation = load.beginDiffLoad();
     const current_generation = load.beginDiffLoad();
@@ -20553,7 +20517,7 @@ test "status refresh path skips identical snapshot without rebuilding active tre
     try app.pages.review.git_status.replace("/repo", &current);
     const tree_ptr = app.reviewNavigationView().activeLoadedDiffConst().?.tree.nodes.ptr;
 
-    app.startStatusLoad(&ctx, "/repo", .foreground, null);
+    _ = try app.startStatusLoadTracked(&ctx, "/repo", .foreground, null, null);
     try std.testing.expect(app.pages.review.git_status.repo_root != null);
     try std.testing.expectEqual(@as(usize, 1), ctx._pending_tasks_with[0..ctx._pending_tasks_with_len].len);
     clearPendingStatusTasks(&ctx, std.testing.allocator);
@@ -20578,7 +20542,7 @@ test "status refresh drops snapshot when repo root changes" {
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? old.zig\x00");
     try app.pages.review.git_status.replace("/old", &current);
 
-    app.startStatusLoad(&ctx, "/new", .foreground, null);
+    _ = try app.startStatusLoadTracked(&ctx, "/new", .foreground, null, null);
     defer clearPendingStatusTasks(&ctx, std.testing.allocator);
 
     try std.testing.expect(app.pages.review.git_status.repo_root == null);
@@ -21989,9 +21953,9 @@ test "fresh status-only targets fail closed without accepted source" {
     try app.reviewReload().createStatusOnlyLoadedSession(allocator, app.pages.review.git_status.document);
     try std.testing.expect(app.pages.review.auto_reload.accepted_source == null);
 
-    try std.testing.expectEqual(StageTargetResult.stale_source, app.reviewOperations().stageTarget());
-    try std.testing.expectEqual(UnstageTargetResult.stale_source, app.reviewOperations().unstageTarget());
-    try std.testing.expectEqual(DiscardTargetResult.stale_source, app.reviewOperations().discardTarget());
+    try std.testing.expectEqual(git_ops.StageTargetResult.stale_source, app.reviewOperations().stageTarget());
+    try std.testing.expectEqual(git_ops.UnstageTargetResult.stale_source, app.reviewOperations().unstageTarget());
+    try std.testing.expectEqual(git_ops.DiscardTargetResult.stale_source, app.reviewOperations().discardTarget());
 }
 
 test "empty status result tears down status-only session after empty diff" {

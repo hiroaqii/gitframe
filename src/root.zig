@@ -1,6 +1,5 @@
 const app = @import("app.zig");
 pub const config = @import("config.zig");
-pub const context = @import("context.zig");
 pub const keymap = @import("keymap");
 pub const repo_state = @import("repo/state.zig");
 pub const review_session = @import("review/session.zig");
@@ -10,9 +9,7 @@ const diff_source = @import("diff/source.zig");
 pub const App = app.App;
 pub const exportInitialSelectionContextJson = app.App.exportInitialSelectionContextJson;
 
-pub const SourceMode = diff_source.SourceMode;
 pub const CliConfig = diff_source.CliConfig;
-pub const LoadRequest = diff_source.LoadRequest;
 pub const ParseArgsError = diff_source.ParseArgsError;
 pub const parseArgs = diff_source.parseArgs;
 pub const freeSource = diff_source.freeSource;
