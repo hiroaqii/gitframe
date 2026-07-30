@@ -335,7 +335,11 @@ pub fn coordinateAtOffset(
     else
         hunkIndexAtOffsetByWalk(file, mode, offset, folded_hunks);
     const hunk_idx = hunk_index orelse return null;
-    const hunk_offset = hunkOffsetForCoordinate(file, mode, index, hunk_idx) orelse return null;
+    const hunk_offset = if (index) |line_index|
+        line_index.hunkOffset(hunk_idx)
+    else
+        hunkBodyLineOffsetFolded(file, mode, hunk_idx, folded_hunks);
+    if (offset < hunk_offset) return null;
     const local_offset = offset - hunk_offset;
     if (local_offset == 0) return .{ .hunk_header = hunk_idx };
 
@@ -1117,6 +1121,83 @@ test "coordinateAtOffset maps rendered rows back to body coordinates" {
     // Paired side-by-side rows use the first raw hunk line represented by the row.
     try std.testing.expectEqual(BodyCoordinate{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } }, coordinateAtOffset(file, .side_by_side, side_by_side.hunkOffset(0) + 1, &.{}, side_by_side).?);
     try std.testing.expectEqual(BodyCoordinate{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } }, coordinateAtOffset(file, .side_by_side, side_by_side.hunkOffset(0) + 2, &.{}, side_by_side).?);
+}
+
+test "coordinateAtOffset fallback keeps folded hunk geometry" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 1,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "folded",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old folded", .old_line = 1 },
+                    .{ .kind = .added, .text = "new folded", .new_line = 1 },
+                },
+            },
+            .{
+                .old_start = 8,
+                .old_count = 2,
+                .new_start = 8,
+                .new_count = 2,
+                .section = "visible",
+                .lines = &.{
+                    .{ .kind = .removed, .text = "old visible", .old_line = 8 },
+                    .{ .kind = .added, .text = "new visible", .new_line = 8 },
+                    .{ .kind = .context, .text = "same", .old_line = 9, .new_line = 9 },
+                },
+            },
+        },
+    };
+    const folded = [_]bool{ true, false };
+    const unified_expected = [_]BodyCoordinate{
+        .{ .hunk_header = 0 },
+        .{ .hunk_header = 1 },
+        .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } },
+        .{ .hunk_line = .{ .hunk_index = 1, .line_index = 1 } },
+        .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } },
+    };
+    const side_by_side_expected = [_]BodyCoordinate{
+        .{ .hunk_header = 0 },
+        .{ .hunk_header = 1 },
+        .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } },
+        .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } },
+    };
+    const cases = [_]struct {
+        mode: DisplayMode,
+        expected: []const BodyCoordinate,
+    }{
+        .{ .mode = .unified, .expected = &unified_expected },
+        .{ .mode = .side_by_side, .expected = &side_by_side_expected },
+    };
+
+    for (cases) |case| {
+        var index = try RenderedLineIndex.buildFolded(std.testing.allocator, file, case.mode, &folded);
+        defer index.deinit(std.testing.allocator);
+
+        for (case.expected, 0..) |expected, offset| {
+            const fallback = coordinateAtOffset(file, case.mode, offset, &folded, null);
+            try std.testing.expect(fallback != null);
+            try std.testing.expectEqual(expected, fallback.?);
+
+            const cached = coordinateAtOffset(file, case.mode, offset, &folded, index);
+            try std.testing.expect(cached != null);
+            try std.testing.expectEqual(expected, cached.?);
+        }
+
+        try std.testing.expect(coordinateAtOffset(file, case.mode, index.lineCount(), &folded, null) == null);
+        try std.testing.expect(coordinateAtOffset(file, case.mode, index.lineCount(), &folded, index) == null);
+
+        const rejected_index: RenderedLineIndex = .{ .mode = case.mode.toggled() };
+        try std.testing.expectEqual(
+            BodyCoordinate{ .hunk_header = 1 },
+            coordinateAtOffset(file, case.mode, 1, &folded, rejected_index).?,
+        );
+    }
 }
 
 test "coordinateAtOffset maps binary marker" {
