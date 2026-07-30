@@ -555,8 +555,7 @@ fn readRepositoryBranchStatus(
     allocator: std.mem.Allocator,
     io: std.Io,
 ) repository_branch.Result {
-    var backend: git_backend.LocalCommandBackend = .{};
-    const raw = backend.backend().loadBranchStatus(allocator, io, .{
+    const raw = git_backend.LocalCommandBackend.loadBranchStatus(allocator, io, .{
         .cwd = .{ .dir = cwd },
         .parent_env = env_map,
     }) catch return .{ .failed = .load_failed };
@@ -793,8 +792,7 @@ fn loadChangeMap(
     source: *const source_document.Document,
     temp_base_path: []const u8,
 ) ChangeMapResult {
-    var backend: git_backend.LocalCommandBackend = .{};
-    const loaded = backend.backend().loadRepositoryFileChange(allocator, io, .{
+    const loaded = git_backend.LocalCommandBackend.loadRepositoryFileChange(allocator, io, .{
         .cwd = cwd,
         .path = path,
         .source_bytes = source.bytes,
@@ -817,10 +815,9 @@ pub fn runManifestLoad(
     allocator: std.mem.Allocator,
     io: std.Io,
 ) TaskResult {
-    var backend: git_backend.LocalCommandBackend = .{};
-    const raw_manifest = backend.backend().loadRepositoryManifest(allocator, io, .{ .cwd = cwd }) catch
+    const raw_manifest = git_backend.LocalCommandBackend.loadRepositoryManifest(allocator, io, .{ .cwd = cwd }) catch
         return .{ .failed_static = "Repository manifest could not be loaded" };
-    const raw_status = backend.backend().loadRepositoryFileStatus(allocator, io, .{ .cwd = cwd }) catch null;
+    const raw_status = git_backend.LocalCommandBackend.loadRepositoryFileStatus(allocator, io, .{ .cwd = cwd }) catch null;
     return buildManifestTaskResult(allocator, raw_manifest, raw_status, expected_fingerprint, expected_status_fingerprint);
 }
 

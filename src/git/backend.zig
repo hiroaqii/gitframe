@@ -337,74 +337,11 @@ pub const OperationRequest = struct {
     env_map: ?*const std.process.Environ.Map = null,
 };
 
-/// Minimal Git command backend boundary.
-///
-/// The interface starts with diff loading only. Status, stage, commit, and
-/// history APIs should be added when those features are implemented, with their
-/// own result shapes instead of reusing LoadResult blindly.
-pub const Backend = struct {
-    ptr: *anyopaque,
-    load_diff_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, GitDiffRequest) LoadError!LoadResult,
-    load_repository_manifest_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult,
-    load_repository_file_status_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, RepositoryFileStatusRequest) LoadError!RepositoryFileStatusLoadResult,
-    load_repository_file_change_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, RepositoryFileChangeRequest) LoadError!RepositoryFileChangeLoadResult,
-    load_status_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, GitStatusRequest) LoadError!StatusLoadResult,
-    load_branch_status_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, BranchStatusRequest) LoadError!BranchStatusLoadResult,
-    load_branch_list_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, BranchListRequest) LoadError!BranchListLoadResult,
-    run_operation_fn: *const fn (*anyopaque, std.mem.Allocator, std.Io, OperationRequest) LoadError!OperationResult,
-
-    pub fn loadDiff(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) LoadError!LoadResult {
-        return self.load_diff_fn(self.ptr, allocator, io, request);
-    }
-
-    pub fn loadRepositoryManifest(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult {
-        return self.load_repository_manifest_fn(self.ptr, allocator, io, request);
-    }
-
-    pub fn loadRepositoryFileStatus(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileStatusRequest) LoadError!RepositoryFileStatusLoadResult {
-        return self.load_repository_file_status_fn(self.ptr, allocator, io, request);
-    }
-
-    pub fn loadRepositoryFileChange(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileChangeRequest) LoadError!RepositoryFileChangeLoadResult {
-        return self.load_repository_file_change_fn(self.ptr, allocator, io, request);
-    }
-
-    pub fn loadStatus(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
-        return self.load_status_fn(self.ptr, allocator, io, request);
-    }
-
-    pub fn loadBranchStatus(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
-        return self.load_branch_status_fn(self.ptr, allocator, io, request);
-    }
-
-    pub fn loadBranchList(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
-        return self.load_branch_list_fn(self.ptr, allocator, io, request);
-    }
-
-    pub fn runOperation(self: Backend, allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
-        return self.run_operation_fn(self.ptr, allocator, io, request);
-    }
-};
-
 pub const LocalCommandBackend = struct {
     const git_diff_unstaged = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
     const git_diff_cached = [_][]const u8{ "git", "diff", "--cached", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
 
-    pub fn backend(self: *LocalCommandBackend) Backend {
-        return .{
-            .ptr = self,
-            .load_diff_fn = loadDiffErased,
-            .load_repository_manifest_fn = loadRepositoryManifestErased,
-            .load_repository_file_status_fn = loadRepositoryFileStatusErased,
-            .load_repository_file_change_fn = loadRepositoryFileChangeErased,
-            .load_status_fn = loadStatusErased,
-            .load_branch_status_fn = loadBranchStatusErased,
-            .load_branch_list_fn = loadBranchListErased,
-            .run_operation_fn = runOperationErased,
-        };
-    }
-
-    pub fn loadDiff(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) LoadError!LoadResult {
+    pub fn loadDiff(allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) LoadError!LoadResult {
         return switch (request.kind) {
             .unstaged => loadGitDiff(allocator, io, repoRoot(request), &git_diff_unstaged),
             .cached => loadGitDiff(allocator, io, repoRoot(request), &git_diff_cached),
@@ -414,31 +351,31 @@ pub const LocalCommandBackend = struct {
         };
     }
 
-    pub fn loadStatus(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
+    pub fn loadStatus(allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
         return loadGitStatus(allocator, io, request);
     }
 
-    pub fn loadRepositoryManifest(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult {
+    pub fn loadRepositoryManifest(allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult {
         return loadGitRepositoryManifest(allocator, io, request.cwd);
     }
 
-    pub fn loadRepositoryFileStatus(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileStatusRequest) LoadError!RepositoryFileStatusLoadResult {
+    pub fn loadRepositoryFileStatus(allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileStatusRequest) LoadError!RepositoryFileStatusLoadResult {
         return loadGitRepositoryFileStatus(allocator, io, request.cwd);
     }
 
-    pub fn loadRepositoryFileChange(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileChangeRequest) LoadError!RepositoryFileChangeLoadResult {
+    pub fn loadRepositoryFileChange(allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileChangeRequest) LoadError!RepositoryFileChangeLoadResult {
         return loadGitRepositoryFileChange(allocator, io, request);
     }
 
-    pub fn loadBranchStatus(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
+    pub fn loadBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
         return loadGitBranchStatus(allocator, io, request);
     }
 
-    pub fn loadBranchList(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
+    pub fn loadBranchList(allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
         return loadGitBranchList(allocator, io, request.repo_root);
     }
 
-    pub fn runOperation(_: *LocalCommandBackend, allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
+    pub fn runOperation(allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
         return switch (request.kind) {
             .stage_file => |path| runGitAdd(allocator, io, request.repo_root, path),
             .unstage_file => |path| runGitUnstage(allocator, io, request.repo_root, path),
@@ -454,46 +391,6 @@ pub const LocalCommandBackend = struct {
             .fetch => |fetch| runGitFetch(allocator, io, request.repo_root, request.env_map, fetch),
             .switch_branch => |switch_branch| runGitSwitchBranch(allocator, io, request.repo_root, switch_branch),
         };
-    }
-
-    fn loadDiffErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) LoadError!LoadResult {
-        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
-        return self.loadDiff(allocator, io, request);
-    }
-
-    fn loadStatusErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
-        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
-        return self.loadStatus(allocator, io, request);
-    }
-
-    fn loadRepositoryManifestErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult {
-        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
-        return self.loadRepositoryManifest(allocator, io, request);
-    }
-
-    fn loadRepositoryFileStatusErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileStatusRequest) LoadError!RepositoryFileStatusLoadResult {
-        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
-        return self.loadRepositoryFileStatus(allocator, io, request);
-    }
-
-    fn loadRepositoryFileChangeErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileChangeRequest) LoadError!RepositoryFileChangeLoadResult {
-        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
-        return self.loadRepositoryFileChange(allocator, io, request);
-    }
-
-    fn loadBranchStatusErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
-        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
-        return self.loadBranchStatus(allocator, io, request);
-    }
-
-    fn loadBranchListErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
-        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
-        return self.loadBranchList(allocator, io, request);
-    }
-
-    fn runOperationErased(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
-        const self: *LocalCommandBackend = @ptrCast(@alignCast(ctx));
-        return self.runOperation(allocator, io, request);
     }
 };
 
@@ -664,7 +561,7 @@ fn loadGitFileDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const 
 const foreground_status_argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
 const background_status_argv = [_][]const u8{ "git", "--no-optional-locks", "status", "--porcelain=v1", "-z", "-uall" };
 
-pub fn statusArgvForOrigin(origin: ReadOrigin) []const []const u8 {
+fn statusArgvForOrigin(origin: ReadOrigin) []const []const u8 {
     return switch (origin) {
         .foreground => &foreground_status_argv,
         .background => &background_status_argv,
@@ -688,7 +585,7 @@ const repository_manifest_argv = [_][]const u8{
     "--deduplicate",
 };
 
-pub fn repositoryManifestArgv() []const []const u8 {
+fn repositoryManifestArgv() []const []const u8 {
     return &repository_manifest_argv;
 }
 
@@ -711,7 +608,7 @@ const repository_file_status_argv = [_][]const u8{
     "-uall",
 };
 
-pub fn repositoryFileStatusArgv() []const []const u8 {
+fn repositoryFileStatusArgv() []const []const u8 {
     return &repository_file_status_argv;
 }
 
@@ -759,8 +656,8 @@ const RepositoryChangePhaseHook = struct {
 const RepositoryChangeWriteTarget = enum { head, current };
 
 /// Private deterministic seams for contracts that require a mutation between
-/// synchronous Git commands. Production always passes null; keeping the seam
-/// below Backend prevents test vocabulary from becoming an application API.
+/// synchronous Git commands. Production always passes null so test vocabulary
+/// does not become part of the public backend namespace.
 const RepositoryChangeTestHooks = struct {
     command_index: usize = 0,
     fail_command_at: ?usize = null,
@@ -1130,8 +1027,7 @@ fn writePrivateComparisonFile(io: std.Io, dir: std.Io.Dir, name: []const u8, con
 }
 
 fn repositoryChangeMapForTest(cwd: std.Io.Dir, path: []const u8, source_bytes: []const u8, temp_base_path: []const u8) !repository_change_map.Map {
-    var backend: LocalCommandBackend = .{};
-    const result = try backend.loadRepositoryFileChange(std.testing.allocator, std.testing.io, .{
+    const result = try LocalCommandBackend.loadRepositoryFileChange(std.testing.allocator, std.testing.io, .{
         .cwd = cwd,
         .path = path,
         .source_bytes = source_bytes,
@@ -1272,8 +1168,7 @@ test "repository change backend treats pathspec magic literally and fails closed
     }
 
     try work.writeFile(io, .{ .sub_path = ".gitattributes", .data = "a\\*b.zig filter=unsafe\n" });
-    var backend: LocalCommandBackend = .{};
-    const rejected = try backend.loadRepositoryFileChange(std.testing.allocator, io, .{
+    const rejected = try LocalCommandBackend.loadRepositoryFileChange(std.testing.allocator, io, .{
         .cwd = work,
         .path = "a*b.zig",
         .source_bytes = "changed\n",
@@ -1282,7 +1177,7 @@ test "repository change backend treats pathspec magic literally and fails closed
     try std.testing.expect(rejected == .failed_static);
 
     try work.writeFile(io, .{ .sub_path = ".gitattributes", .data = "a[*]b.zig working-tree-encoding=UTF-16\n" });
-    const encoding_rejected = try backend.loadRepositoryFileChange(std.testing.allocator, io, .{
+    const encoding_rejected = try LocalCommandBackend.loadRepositoryFileChange(std.testing.allocator, io, .{
         .cwd = work,
         .path = "a*b.zig",
         .source_bytes = "changed\n",
@@ -1641,8 +1536,7 @@ test "repository file status reports real intent-to-add as current added path" {
     try work.writeFile(io, .{ .sub_path = "intent.zig", .data = "const value = 1;\n" });
     try runTestGit(io, &.{ "git", "add", "-N", "intent.zig" }, work);
 
-    var backend: LocalCommandBackend = .{};
-    var result = try backend.loadRepositoryFileStatus(std.testing.allocator, io, .{ .cwd = work });
+    var result = try LocalCommandBackend.loadRepositoryFileStatus(std.testing.allocator, io, .{ .cwd = work });
     const bytes = switch (result) {
         .ok => |owned| blk: {
             result = .{ .failed_static = "consumed" };
@@ -1672,8 +1566,7 @@ test "repository file status descriptor cwd survives path replacement" {
     try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, replacement);
     try replacement.writeFile(io, .{ .sub_path = "replacement.txt", .data = "new\n" });
 
-    var backend: LocalCommandBackend = .{};
-    const result = try backend.loadRepositoryFileStatus(std.testing.allocator, io, .{ .cwd = committed });
+    const result = try LocalCommandBackend.loadRepositoryFileStatus(std.testing.allocator, io, .{ .cwd = committed });
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |owned| owned,
@@ -1698,8 +1591,7 @@ test "repository file status with rename detection disabled keeps only current p
     try runTestGit(io, &.{ "git", "config", "status.renames", "false" }, work);
     try work.rename("old.zig", work, "new.zig", io);
 
-    var backend: LocalCommandBackend = .{};
-    var result = try backend.loadRepositoryFileStatus(std.testing.allocator, io, .{ .cwd = work });
+    var result = try LocalCommandBackend.loadRepositoryFileStatus(std.testing.allocator, io, .{ .cwd = work });
     const bytes = switch (result) {
         .ok => |owned| blk: {
             result = .{ .failed_static = "consumed" };
@@ -1739,8 +1631,7 @@ test "repository file status classifies a dirty submodule gitlink" {
     defer checked_out_child.close(io);
     try checked_out_child.writeFile(io, .{ .sub_path = "source.zig", .data = "const value = 2;\n" });
 
-    var backend: LocalCommandBackend = .{};
-    var result = try backend.loadRepositoryFileStatus(allocator, io, .{ .cwd = work });
+    var result = try LocalCommandBackend.loadRepositoryFileStatus(allocator, io, .{ .cwd = work });
     const bytes = switch (result) {
         .ok => |owned| blk: {
             result = .{ .failed_static = "consumed" };
@@ -1791,8 +1682,7 @@ test "repository manifest backend deduplicates a real three-stage conflict" {
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-am", "main" }, work);
     try runTestGitFailure(io, &.{ "git", "merge", "side" }, work);
 
-    var backend: LocalCommandBackend = .{};
-    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = work });
+    const result = try LocalCommandBackend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = work });
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |value| value,
@@ -1819,8 +1709,7 @@ test "repository manifest backend accepts gitlink as one path" {
     defer std.testing.allocator.free(cache_info);
     try runTestGit(io, &.{ "git", "update-index", "--add", "--cacheinfo", cache_info }, work);
 
-    var backend: LocalCommandBackend = .{};
-    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = work });
+    const result = try LocalCommandBackend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = work });
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |value| value,
@@ -1845,8 +1734,7 @@ test "repository manifest backend includes tracked and non-ignored untracked pat
     try work.writeFile(io, .{ .sub_path = "ignored.log", .data = "ignored\n" });
     try work.writeFile(io, .{ .sub_path = "visible.txt", .data = "visible\n" });
 
-    var backend: LocalCommandBackend = .{};
-    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = work });
+    const result = try LocalCommandBackend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = work });
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |value| value,
@@ -1875,8 +1763,7 @@ test "repository manifest descriptor cwd stays on committed directory after path
     try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, replacement);
     try replacement.writeFile(io, .{ .sub_path = "replacement.txt", .data = "new\n" });
 
-    var backend: LocalCommandBackend = .{};
-    const result = try backend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = committed });
+    const result = try LocalCommandBackend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = committed });
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |value| value,
@@ -2766,7 +2653,7 @@ const ssh_agent_not_visible_suggestion =
 ;
 
 fn sshPublicKeyFailureDiagnosis(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) LoadError!SshPublicKeyDiagnostic {
-    // `env` is the effective push environment: pushEnvironment mutates Git
+    // `env` is the effective push environment: remoteOperationEnvironment mutates Git
     // prompt settings, but preserves SSH_AUTH_SOCK for this diagnostic.
     const auth_sock = env.get("SSH_AUTH_SOCK") orelse return .{
         .message = "SSH_AUTH_SOCK is not set; ssh-agent is not visible to GitFrame",
@@ -2976,10 +2863,6 @@ fn remoteOperationEnvironment(allocator: std.mem.Allocator, parent_env: ?*const 
     return env;
 }
 
-fn pushEnvironment(allocator: std.mem.Allocator, parent_env: ?*const std.process.Environ.Map) PushEnvironmentError!std.process.Environ.Map {
-    return remoteOperationEnvironment(allocator, parent_env);
-}
-
 fn remoteEnvironmentRejectedInteractiveSsh(parent_env: ?*const std.process.Environ.Map) bool {
     const env = parent_env orelse return false;
     const ssh_command = env.get("GIT_SSH_COMMAND") orelse return false;
@@ -3073,26 +2956,7 @@ fn isNoIndexSuccess(term: std.process.Child.Term, stdout_len: usize) bool {
     };
 }
 
-test "LocalCommandBackend exposes backend interface" {
-    var local_backend: LocalCommandBackend = .{};
-    const backend = local_backend.backend();
-
-    try std.testing.expect(backend.ptr == @as(*anyopaque, @ptrCast(&local_backend)));
-}
-
-test "Backend exposes status load interface" {
-    var local_backend: LocalCommandBackend = .{};
-    const backend = local_backend.backend();
-
-    try std.testing.expect(backend.ptr == @as(*anyopaque, @ptrCast(&local_backend)));
-}
-
-test "Backend exposes operation interface" {
-    var local_backend: LocalCommandBackend = .{};
-    const backend = local_backend.backend();
-
-    try std.testing.expect(backend.ptr == @as(*anyopaque, @ptrCast(&local_backend)));
-
+test "OperationRequest represents supported operation inputs" {
     const request: OperationRequest = .{
         .repo_root = "/repo",
         .kind = .{ .unstage_file = "src/app.zig" },
@@ -3235,8 +3099,8 @@ test "concurrent stdin Git apply preserves malformed large patch diagnostic" {
     }
 }
 
-test "pushEnvironment disables interactive credential prompts" {
-    var env = try pushEnvironment(std.testing.allocator, null);
+test "remote operation environment disables interactive credential prompts" {
+    var env = try remoteOperationEnvironment(std.testing.allocator, null);
     defer env.deinit();
 
     try std.testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
@@ -3310,13 +3174,13 @@ test "askpass setup falls back when XDG_RUNTIME_DIR is relative" {
     try std.testing.expect(std.mem.startsWith(u8, setup.password_path, "/tmp/"));
 }
 
-test "pushEnvironment preserves existing ssh command while adding BatchMode" {
+test "remote operation environment preserves existing ssh command while adding BatchMode" {
     var parent = std.process.Environ.Map.init(std.testing.allocator);
     defer parent.deinit();
     try parent.put("GIT_SSH_COMMAND", "ssh -i /tmp/key");
     try parent.put("HOME", "/home/test");
 
-    var env = try pushEnvironment(std.testing.allocator, &parent);
+    var env = try remoteOperationEnvironment(std.testing.allocator, &parent);
     defer env.deinit();
 
     try std.testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
@@ -3324,19 +3188,19 @@ test "pushEnvironment preserves existing ssh command while adding BatchMode" {
     try std.testing.expectEqualStrings("/home/test", env.get("HOME").?);
 }
 
-test "pushEnvironment preserves existing BatchMode yes and rejects BatchMode no" {
+test "remote operation environment preserves existing BatchMode yes and rejects BatchMode no" {
     var parent_yes = std.process.Environ.Map.init(std.testing.allocator);
     defer parent_yes.deinit();
     try parent_yes.put("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -i /tmp/key");
 
-    var env = try pushEnvironment(std.testing.allocator, &parent_yes);
+    var env = try remoteOperationEnvironment(std.testing.allocator, &parent_yes);
     defer env.deinit();
     try std.testing.expectEqualStrings("ssh -o BatchMode=yes -i /tmp/key", env.get("GIT_SSH_COMMAND").?);
 
     var parent_no = std.process.Environ.Map.init(std.testing.allocator);
     defer parent_no.deinit();
     try parent_no.put("GIT_SSH_COMMAND", "ssh -o BatchMode=no -i /tmp/key");
-    try std.testing.expectError(error.InteractiveSshCommand, pushEnvironment(std.testing.allocator, &parent_no));
+    try std.testing.expectError(error.InteractiveSshCommand, remoteOperationEnvironment(std.testing.allocator, &parent_no));
 }
 
 test "pushFailureWithDiagnostics explains missing ssh-agent socket" {
@@ -3402,8 +3266,7 @@ test "LocalCommandBackend push rejects stale oid before contacting remote" {
     const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
     defer std.testing.allocator.free(repo_root);
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = repo_root,
         .kind = .{ .push = .{
             .branch = "main",
@@ -3439,8 +3302,7 @@ test "LocalCommandBackend push reports remote failure after snapshot check passe
     const oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
     defer std.testing.allocator.free(oid);
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = repo_root,
         .kind = .{ .push = .{
             .branch = "main",
@@ -3481,8 +3343,7 @@ test "LocalCommandBackend push succeeds to a local bare remote" {
     const oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
     defer std.testing.allocator.free(oid);
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = repo_root,
         .kind = .{ .push = .{
             .branch = "main",
@@ -3533,8 +3394,7 @@ test "LocalCommandBackend set-upstream push configures local branch upstream" {
     const oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
     defer std.testing.allocator.free(oid);
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = repo_root,
         .kind = .{ .push = .{
             .mode = .set_upstream,
@@ -3576,8 +3436,7 @@ test "LocalCommandBackend pull refresh fetches and fast-forwards from local bare
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "update" }, updater);
     try runTestGit(io, &.{ "git", "push", "origin", "main" }, updater);
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
@@ -3606,8 +3465,7 @@ test "LocalCommandBackend pull refresh reports nothing to pull as success" {
     const fixture = try setupPullRefreshFixture(io, &tmp);
     defer fixture.deinit();
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
@@ -3632,8 +3490,7 @@ test "LocalCommandBackend pull refresh rejects stale oid before fetch" {
     const fixture = try setupPullRefreshFixture(io, &tmp);
     defer fixture.deinit();
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
@@ -3668,8 +3525,7 @@ test "LocalCommandBackend pull refresh rejects local commits ahead" {
     fixture.oid = try std.testing.allocator.dupe(u8, trimLineEnd(local_oid));
     std.testing.allocator.free(local_oid);
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
@@ -3711,8 +3567,7 @@ test "LocalCommandBackend pull refresh rejects diverged branch" {
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "remote" }, updater);
     try runTestGit(io, &.{ "git", "push", "origin", "main" }, updater);
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
@@ -3745,8 +3600,7 @@ test "LocalCommandBackend pull refresh rejects changed upstream" {
     try runTestGit(io, &.{ "git", "remote", "add", "other", other_root }, work);
     try runTestGit(io, &.{ "git", "push", "-u", "other", "main" }, work);
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
@@ -3775,8 +3629,7 @@ test "LocalCommandBackend pull refresh rejects dirty worktree before fetch" {
     defer work.close(io);
     try work.writeFile(io, .{ .sub_path = "README.md", .data = "local change\n" });
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
@@ -3805,8 +3658,7 @@ test "LocalCommandBackend pull refresh rejects untracked worktree before fetch" 
     defer work.close(io);
     try work.writeFile(io, .{ .sub_path = "new.txt", .data = "untracked\n" });
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
@@ -3835,8 +3687,7 @@ test "LocalCommandBackend pull refresh rejects interactive ssh command" {
     defer parent.deinit();
     try parent.put("GIT_SSH_COMMAND", "ssh -o BatchMode=no -i /tmp/key");
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .pull_refresh_ff_only = .{
             .branch = "main",
@@ -3867,8 +3718,7 @@ test "LocalCommandBackend fetch rejects interactive ssh command" {
     defer parent.deinit();
     try parent.put("GIT_SSH_COMMAND", "ssh -o BatchMode=no -i /tmp/key");
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = repo.repo_root,
         .kind = .{ .fetch = .{ .remote = "missing" } },
         .env_map = &parent,
@@ -3917,8 +3767,7 @@ test "LocalCommandBackend fetch updates remote tracking refs from local bare rem
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "update" }, updater);
     try runTestGit(io, &.{ "git", "push", "origin", "main" }, updater);
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = repo_root,
         .kind = .{ .fetch = .{ .remote = "origin" } },
     });
@@ -3942,8 +3791,7 @@ test "LocalCommandBackend loads local branch list without record separator newli
     const fixture = try setupBranchSwitchFixture(io, &tmp);
     defer fixture.deinit();
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.loadBranchList(std.testing.allocator, io, .{ .repo_root = fixture.repo_root });
+    const result = try LocalCommandBackend.loadBranchList(std.testing.allocator, io, .{ .repo_root = fixture.repo_root });
     defer result.deinit(std.testing.allocator);
 
     const list = switch (result) {
@@ -3968,8 +3816,7 @@ test "LocalCommandBackend switch branch succeeds between local branches" {
     const fixture = try setupBranchSwitchFixture(io, &tmp);
     defer fixture.deinit();
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .switch_branch = .{
             .expected_branch = "main",
@@ -3996,8 +3843,7 @@ test "LocalCommandBackend switch branch rejects stale current branch or oid" {
     const fixture = try setupBranchSwitchFixture(io, &tmp);
     defer fixture.deinit();
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .switch_branch = .{
             .expected_branch = "main",
@@ -4030,8 +3876,7 @@ test "LocalCommandBackend switch branch rejects changed target oid" {
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "move feature" }, work);
     try runTestGit(io, &.{ "git", "switch", "main" }, work);
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .switch_branch = .{
             .expected_branch = "main",
@@ -4060,8 +3905,7 @@ test "LocalCommandBackend switch branch rejects dirty worktree" {
     defer work.close(io);
     try work.writeFile(io, .{ .sub_path = "README.md", .data = "dirty\n" });
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .switch_branch = .{
             .expected_branch = "main",
@@ -4086,8 +3930,7 @@ test "LocalCommandBackend switch branch does not guess remote-only targets" {
     const fixture = try setupBranchSwitchFixture(io, &tmp);
     defer fixture.deinit();
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.runOperation(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
         .repo_root = fixture.repo_root,
         .kind = .{ .switch_branch = .{
             .expected_branch = "main",
@@ -4131,8 +3974,7 @@ test "LocalCommandBackend loads branch status without upstream" {
     const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo_root);
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.loadBranchStatus(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.loadBranchStatus(std.testing.allocator, io, .{
         .cwd = .{ .path = repo_root },
         .parent_env = null,
     });
@@ -4171,8 +4013,7 @@ test "LocalCommandBackend loads branch status with upstream" {
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
     try runTestGit(io, &.{ "git", "push", "-u", "origin", "main" }, work);
 
-    var local_backend: LocalCommandBackend = .{};
-    const result = try local_backend.loadBranchStatus(std.testing.allocator, io, .{
+    const result = try LocalCommandBackend.loadBranchStatus(std.testing.allocator, io, .{
         .cwd = .{ .path = repo_root },
         .parent_env = null,
     });
@@ -4287,13 +4128,12 @@ test "branch status descriptor cwd survives path replacement" {
     try redirect_env.put("GIT_DIR", replacement_git_dir);
     try redirect_env.put("GIT_WORK_TREE", replacement_path);
 
-    var local_backend: LocalCommandBackend = .{};
-    const pinned_result = try local_backend.loadBranchStatus(std.testing.allocator, io, .{
+    const pinned_result = try LocalCommandBackend.loadBranchStatus(std.testing.allocator, io, .{
         .cwd = .{ .dir = pinned },
         .parent_env = &redirect_env,
     });
     defer pinned_result.deinit(std.testing.allocator);
-    const replacement_result = try local_backend.loadBranchStatus(std.testing.allocator, io, .{
+    const replacement_result = try LocalCommandBackend.loadBranchStatus(std.testing.allocator, io, .{
         .cwd = .{ .path = replacement_path },
         .parent_env = &redirect_env,
     });

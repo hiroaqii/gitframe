@@ -276,8 +276,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, request: LoadRequest) Load
         .stdin => .{ .ok = readStdin(allocator, io) catch |err| return mapReadError(err) },
         .pager => |bytes| .{ .ok = allocator.dupe(u8, bytes) catch |err| return mapReadError(err) },
         .unstaged, .cached, .range, .no_index => if (sourceUsesGitCommand(request.source)) {
-            var local_backend: git_backend.LocalCommandBackend = .{};
-            return local_backend.backend().loadDiff(allocator, io, try gitDiffRequest(request));
+            return git_backend.LocalCommandBackend.loadDiff(allocator, io, try gitDiffRequest(request));
         } else unreachable,
     };
 }

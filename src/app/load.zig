@@ -701,8 +701,7 @@ pub fn runStatusLoadWithOrigin(
     allocator: std.mem.Allocator,
     io: std.Io,
 ) StatusLoadTaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().loadStatus(allocator, io, .{ .repo_root = repo_root, .origin = origin }) catch |err| {
+    const raw_result = git_backend.LocalCommandBackend.loadStatus(allocator, io, .{ .repo_root = repo_root, .origin = origin }) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, "Status load failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Status load failed: OutOfMemory" },
@@ -734,8 +733,7 @@ pub fn runBranchStatusLoad(
     allocator: std.mem.Allocator,
     io: std.Io,
 ) BranchStatusLoadTaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().loadBranchStatus(allocator, io, .{
+    const raw_result = git_backend.LocalCommandBackend.loadBranchStatus(allocator, io, .{
         .cwd = .{ .path = repo_root },
         .parent_env = env_map,
     }) catch |err| {
@@ -961,8 +959,7 @@ fn nextZField(text: []const u8, offset: *usize) ?[]const u8 {
 }
 
 pub fn runBranchListLoad(repo_root: []const u8, allocator: std.mem.Allocator, io: std.Io) BranchListLoadTaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().loadBranchList(allocator, io, .{ .repo_root = repo_root }) catch |err| {
+    const raw_result = git_backend.LocalCommandBackend.loadBranchList(allocator, io, .{ .repo_root = repo_root }) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, "Branch list load failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Branch list load failed: OutOfMemory" },
@@ -1112,8 +1109,7 @@ fn loadFileDiffBytes(
     io: std.Io,
     base: git_backend.FileDiffBase,
 ) !?[]u8 {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = try local_backend.backend().loadDiff(allocator, io, .{
+    const raw_result = try git_backend.LocalCommandBackend.loadDiff(allocator, io, .{
         .repo_root = request.repo_root,
         .kind = .{ .file = .{ .base = base, .path = request.path_key } },
     });

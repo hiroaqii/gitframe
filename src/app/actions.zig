@@ -1574,8 +1574,7 @@ pub fn runSwitchBranch(repo_root: []const u8, expected_branch: []const u8, expec
 }
 
 fn runOperationMapped(comptime prefix: []const u8, request: git_backend.OperationRequest, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
-    var local_backend: git_backend.LocalCommandBackend = .{};
-    const raw_result = local_backend.backend().runOperation(allocator, io, request) catch |err| {
+    const raw_result = git_backend.LocalCommandBackend.runOperation(allocator, io, request) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, prefix ++ " failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = prefix ++ " failed: OutOfMemory" },
