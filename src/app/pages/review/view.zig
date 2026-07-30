@@ -447,11 +447,13 @@ fn drawSidebarDetailRow(app: Context, surface: *chasen.Surface, row: u16) !void 
     if (branchStatusSidebarPresentation(app.page, app.repo_root, surface.frameAllocator(), available_width)) |presentation| {
         try draw.copyClippedTextAt(surface, 1, row, presentation.text, sidebarBranchStyle(app.theme));
 
-        if (reviewPushHintInputReachable(app.page)) {
-            var key_buffer: [16]u8 = undefined;
-            const push_key = app.keymap.display(.push, key_buffer[0..]);
-            var hint_buffer: [32]u8 = undefined;
-            if (reviewPushHintForKey(presentation, available_width, push_key, hint_buffer[0..])) |hint| {
+        if (reviewBranchActionHintInputReachable(app.page)) {
+            var push_key_buffer: [16]u8 = undefined;
+            const push_key = app.keymap.display(.push, push_key_buffer[0..]);
+            var pull_key_buffer: [16]u8 = undefined;
+            const pull_key = app.keymap.display(.pull, pull_key_buffer[0..]);
+            var hint_buffer: [64]u8 = undefined;
+            if (reviewBranchActionHintForKeys(presentation, available_width, push_key, pull_key, hint_buffer[0..])) |hint| {
                 const hint_col = 1 + hint.base_display_width;
                 try draw.copyClippedTextAt(surface, hint_col, row, hint.text, sidebarBranchHintStyle(app.theme));
             }
@@ -992,10 +994,15 @@ const SidebarBranchPresentation = struct {
     text: []const u8,
     full_display_width: ?u16 = null,
     was_clipped: bool = false,
-    push_hint_eligible: bool = false,
+    action_hints: ActionHints = .{},
+
+    const ActionHints = struct {
+        push: bool = false,
+        pull: bool = false,
+    };
 };
 
-const ReviewPushHint = struct {
+const ReviewBranchActionHint = struct {
     text: []const u8,
     base_display_width: u16,
 };
@@ -1020,40 +1027,89 @@ fn branchStatusSidebarPresentation(page: *const review_page.ReviewPageState, rep
         .text = formatted.text,
         .full_display_width = formatted.full_display_width,
         .was_clipped = formatted.was_clipped,
-        .push_hint_eligible = branchStatusAllowsPushHint(page.branch_status.status),
+        .action_hints = branchStatusActionHints(page.branch_status.status),
     };
 }
 
-fn branchStatusAllowsPushHint(status: git_branch_status.BranchStatus) bool {
+fn branchStatusActionHints(status: git_branch_status.BranchStatus) SidebarBranchPresentation.ActionHints {
     return switch (status.head) {
-        .branch => true,
-        .detached, .unknown => false,
+        .branch => .{
+            .push = true,
+            .pull = if (status.upstream) |upstream| upstream.remote_branch.len > 0 else false,
+        },
+        .detached, .unknown => .{},
     };
 }
 
 /// Text-input modes consume keys before Review's normal action route. Keep the
 /// branch fact visible, but do not advertise a shortcut that cannot currently
-/// reach the existing push command.
-fn reviewPushHintInputReachable(page: *const review_page.ReviewPageState) bool {
+/// reach the existing push or pull command.
+fn reviewBranchActionHintInputReachable(page: *const review_page.ReviewPageState) bool {
     return !page.search.mode and !page.file_search.mode;
 }
 
 /// Compose discoverability chrome only when it fits after an unclipped base.
-/// The existing key/input and Review operation paths remain the sole push
-/// authority; this helper never infers action availability from branch text.
-fn reviewPushHintForKey(
+/// The existing key/input and Review operation paths remain the sole action
+/// authority; this helper uses only stable branch topology and bound keys.
+fn reviewBranchActionHintForKeys(
     presentation: SidebarBranchPresentation,
     available_width: u16,
     push_key: ?[]const u8,
+    pull_key: ?[]const u8,
     buffer: []u8,
-) ?ReviewPushHint {
-    if (!presentation.push_hint_eligible or presentation.was_clipped) return null;
+) ?ReviewBranchActionHint {
+    if (presentation.was_clipped) return null;
     const base_width = presentation.full_display_width orelse return null;
     if (base_width > available_width) return null;
-    const key = push_key orelse return null;
-    if (key.len == 0) return null;
 
-    const hint = std.fmt.bufPrint(buffer, "  ({s}: push)", .{key}) catch return null;
+    const push = eligibleActionKey(presentation.action_hints.push, push_key);
+    const pull = eligibleActionKey(presentation.action_hints.pull, pull_key);
+
+    if (push) |push_label| {
+        if (pull) |pull_label| {
+            if (reviewBranchActionHintCandidate(
+                base_width,
+                available_width,
+                buffer,
+                "  ({s}: push / {s}: pull)",
+                .{ push_label, pull_label },
+            )) |hint| return hint;
+        }
+        return reviewBranchActionHintCandidate(
+            base_width,
+            available_width,
+            buffer,
+            "  ({s}: push)",
+            .{push_label},
+        );
+    }
+    if (pull) |pull_label| {
+        return reviewBranchActionHintCandidate(
+            base_width,
+            available_width,
+            buffer,
+            "  ({s}: pull)",
+            .{pull_label},
+        );
+    }
+    return null;
+}
+
+fn eligibleActionKey(eligible: bool, key: ?[]const u8) ?[]const u8 {
+    if (!eligible) return null;
+    const bound_key = key orelse return null;
+    if (bound_key.len == 0) return null;
+    return bound_key;
+}
+
+fn reviewBranchActionHintCandidate(
+    base_width: u16,
+    available_width: u16,
+    buffer: []u8,
+    comptime format: []const u8,
+    args: anytype,
+) ?ReviewBranchActionHint {
+    const hint = std.fmt.bufPrint(buffer, format, args) catch return null;
     if (chasen.text.displayWidth(hint) > available_width - base_width) return null;
     return .{ .text = hint, .base_display_width = base_width };
 }
@@ -1079,15 +1135,17 @@ test "branch sidebar retains background snapshot but shows foreground loading" {
     const retained = branchStatusSidebarPresentation(&page_state, "/repo", std.testing.allocator, 80).?;
     defer std.testing.allocator.free(retained.text);
     try std.testing.expectEqualStrings("main no upstream", retained.text);
-    try std.testing.expect(retained.push_hint_eligible);
+    try std.testing.expect(retained.action_hints.push);
+    try std.testing.expect(!retained.action_hints.pull);
 
     page_state.branch_status_load.pending.?.origin = .foreground;
     const loading = branchStatusSidebarPresentation(&page_state, "/repo", std.testing.allocator, 80).?;
     try std.testing.expectEqualStrings("loading branch", loading.text);
-    try std.testing.expect(!loading.push_hint_eligible);
+    try std.testing.expect(!loading.action_hints.push);
+    try std.testing.expect(!loading.action_hints.pull);
 }
 
-test "review branch push hint renders effective key with secondary style" {
+test "review branch action hint renders effective keys with Files stats style" {
     var builder = git_branch_status.Builder.init(std.testing.allocator);
     errdefer builder.deinit();
     try builder.setBranchHead("main");
@@ -1112,35 +1170,57 @@ test "review branch push hint renders effective key with secondary style" {
     try drawSidebarDetailRow(context, &ts.surface, 0);
     const default_snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(default_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, default_snapshot, "main ↑0  (P: push)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_snapshot, "main ↑0  (P: push / U: pull)") != null);
 
     const base_cell = ts.surface.readCell(1, 0) orelse return error.ExpectedBranchBaseCell;
     const hint_cell = ts.surface.readCell(10, 0) orelse return error.ExpectedBranchHintCell;
     try std.testing.expect(base_cell.style.fg.eql(palette.color(.info)));
     try std.testing.expect(!base_cell.style.dim);
-    try std.testing.expect(hint_cell.style.fg.eql(palette.color(.muted)));
-    try std.testing.expect(hint_cell.style.dim);
+    try std.testing.expect(hint_cell.style.eql(palette.style(.muted)));
+    try std.testing.expect(!hint_cell.style.dim);
 
     var config: keymap.Config = .{};
     config.set(.push, .{ .ctrl = .s });
+    config.set(.pull, .{ .ctrl = .q });
     context.keymap = keymap.Effective.fromConfig(config);
     ts.surface.clearAll();
     try drawSidebarDetailRow(context, &ts.surface, 0);
     const configured_snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(configured_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, configured_snapshot, "main ↑0  (Ctrl+s: push)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, configured_snapshot, "main ↑0  (Ctrl+s: push / Ctrl+q: pull)") != null);
 
-    var unbound: keymap.Effective = .{};
-    unbound.bindings[@intFromEnum(keymap.PublicAction.push)] = null;
-    context.keymap = unbound;
+    var pull_unbound: keymap.Effective = .{};
+    pull_unbound.bindings[@intFromEnum(keymap.PublicAction.pull)] = null;
+    context.keymap = pull_unbound;
     ts.surface.clearAll();
     try drawSidebarDetailRow(context, &ts.surface, 0);
-    const unbound_snapshot = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(unbound_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, unbound_snapshot, ": push)") == null);
+    const pull_unbound_snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(pull_unbound_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, pull_unbound_snapshot, "main ↑0  (P: push)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pull_unbound_snapshot, ": pull)") == null);
+
+    var push_unbound: keymap.Effective = .{};
+    push_unbound.bindings[@intFromEnum(keymap.PublicAction.push)] = null;
+    context.keymap = push_unbound;
+    ts.surface.clearAll();
+    try drawSidebarDetailRow(context, &ts.surface, 0);
+    const push_unbound_snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(push_unbound_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, push_unbound_snapshot, "main ↑0  (U: pull)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, push_unbound_snapshot, ": push") == null);
+
+    push_unbound.bindings[@intFromEnum(keymap.PublicAction.pull)] = null;
+    context.keymap = push_unbound;
+    ts.surface.clearAll();
+    try drawSidebarDetailRow(context, &ts.surface, 0);
+    const both_unbound_snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(both_unbound_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, both_unbound_snapshot, "main ↑0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, both_unbound_snapshot, ": push") == null);
+    try std.testing.expect(std.mem.indexOf(u8, both_unbound_snapshot, ": pull") == null);
 }
 
-test "review branch push hint follows text input authority" {
+test "review branch action hint follows text input authority" {
     var builder = git_branch_status.Builder.init(std.testing.allocator);
     errdefer builder.deinit();
     try builder.setBranchHead("main");
@@ -1161,7 +1241,7 @@ test "review branch push hint follows text input authority" {
     try drawSidebarDetailRow(context, &ts.surface, 0);
     const normal_before = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(normal_before);
-    try std.testing.expect(std.mem.indexOf(u8, normal_before, "main ↑0  (P: push)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normal_before, "main ↑0  (P: push / U: pull)") != null);
 
     page_state.file_search.mode = true;
     ts.surface.clearAll();
@@ -1169,7 +1249,8 @@ test "review branch push hint follows text input authority" {
     const file_search = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(file_search);
     try std.testing.expect(std.mem.indexOf(u8, file_search, "main ↑0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, file_search, ": push)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, file_search, ": push") == null);
+    try std.testing.expect(std.mem.indexOf(u8, file_search, ": pull") == null);
 
     page_state.file_search.mode = false;
     page_state.search.mode = true;
@@ -1178,55 +1259,151 @@ test "review branch push hint follows text input authority" {
     const diff_search = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(diff_search);
     try std.testing.expect(std.mem.indexOf(u8, diff_search, "main ↑0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, diff_search, ": push)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, diff_search, ": push") == null);
+    try std.testing.expect(std.mem.indexOf(u8, diff_search, ": pull") == null);
 
     page_state.search.mode = false;
     ts.surface.clearAll();
     try drawSidebarDetailRow(context, &ts.surface, 0);
     const normal_after = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(normal_after);
-    try std.testing.expect(std.mem.indexOf(u8, normal_after, "main ↑0  (P: push)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normal_after, "main ↑0  (P: push / U: pull)") != null);
 }
 
-test "review branch push hint drops before base clipping and omits non-branch terminals" {
-    const no_upstream_status: git_branch_status.BranchStatus = .{ .head = .{ .branch = "main" } };
-    var formatted = try branch_chrome.formatBaseLabel(std.testing.allocator, no_upstream_status, 80);
+test "review branch action hint follows topology and width fallback" {
+    const upstream_status: git_branch_status.BranchStatus = .{
+        .head = .{ .branch = "main" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{},
+    };
+    var formatted = try branch_chrome.formatBaseLabel(std.testing.allocator, upstream_status, 80);
     defer formatted.deinit(std.testing.allocator);
     const presentation: SidebarBranchPresentation = .{
         .text = formatted.text,
         .full_display_width = formatted.full_display_width,
         .was_clipped = formatted.was_clipped,
-        .push_hint_eligible = branchStatusAllowsPushHint(no_upstream_status),
+        .action_hints = branchStatusActionHints(upstream_status),
     };
-    const hint_width = chasen.text.displayWidth("  (P: push)");
-    const exact_width = presentation.full_display_width.? + hint_width;
-    var hint_buffer: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("  (P: push)", reviewPushHintForKey(presentation, exact_width, "P", hint_buffer[0..]).?.text);
-    try std.testing.expect(reviewPushHintForKey(presentation, exact_width - 1, "P", hint_buffer[0..]) == null);
-    try std.testing.expect(reviewPushHintForKey(presentation, exact_width, null, hint_buffer[0..]) == null);
+    try std.testing.expect(presentation.action_hints.push);
+    try std.testing.expect(presentation.action_hints.pull);
 
-    var clipped = try branch_chrome.formatBaseLabel(std.testing.allocator, no_upstream_status, presentation.full_display_width.? - 1);
+    const full_hint_width = chasen.text.displayWidth("  (P: push / U: pull)");
+    const push_hint_width = chasen.text.displayWidth("  (P: push)");
+    const pull_hint_width = chasen.text.displayWidth("  (U: pull)");
+    const full_exact_width = presentation.full_display_width.? + full_hint_width;
+    const push_exact_width = presentation.full_display_width.? + push_hint_width;
+    const pull_exact_width = presentation.full_display_width.? + pull_hint_width;
+    var hint_buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "  (P: push / U: pull)",
+        reviewBranchActionHintForKeys(presentation, full_exact_width, "P", "U", hint_buffer[0..]).?.text,
+    );
+    try std.testing.expectEqualStrings(
+        "  (P: push)",
+        reviewBranchActionHintForKeys(presentation, full_exact_width - 1, "P", "U", hint_buffer[0..]).?.text,
+    );
+    try std.testing.expectEqualStrings(
+        "  (P: push)",
+        reviewBranchActionHintForKeys(presentation, push_exact_width, "P", "U", hint_buffer[0..]).?.text,
+    );
+    try std.testing.expect(reviewBranchActionHintForKeys(presentation, push_exact_width - 1, "P", "U", hint_buffer[0..]) == null);
+    try std.testing.expectEqualStrings(
+        "  (U: pull)",
+        reviewBranchActionHintForKeys(presentation, pull_exact_width, null, "U", hint_buffer[0..]).?.text,
+    );
+    try std.testing.expectEqualStrings(
+        "  (P: push)",
+        reviewBranchActionHintForKeys(presentation, push_exact_width, "P", null, hint_buffer[0..]).?.text,
+    );
+    try std.testing.expect(reviewBranchActionHintForKeys(presentation, full_exact_width, null, null, hint_buffer[0..]) == null);
+
+    const no_upstream_status: git_branch_status.BranchStatus = .{ .head = .{ .branch = "main" } };
+    const no_upstream_hints = branchStatusActionHints(no_upstream_status);
+    try std.testing.expect(no_upstream_hints.push);
+    try std.testing.expect(!no_upstream_hints.pull);
+
+    var no_upstream_formatted = try branch_chrome.formatBaseLabel(std.testing.allocator, no_upstream_status, 80);
+    defer no_upstream_formatted.deinit(std.testing.allocator);
+    const no_upstream_presentation: SidebarBranchPresentation = .{
+        .text = no_upstream_formatted.text,
+        .full_display_width = no_upstream_formatted.full_display_width,
+        .was_clipped = no_upstream_formatted.was_clipped,
+        .action_hints = no_upstream_hints,
+    };
+    try std.testing.expectEqualStrings(
+        "  (P: push)",
+        reviewBranchActionHintForKeys(no_upstream_presentation, 80, "P", "U", hint_buffer[0..]).?.text,
+    );
+
+    const malformed_upstream_status: git_branch_status.BranchStatus = .{
+        .head = .{ .branch = "main" },
+        .upstream = .{ .name = "origin", .remote = "origin", .remote_branch = "" },
+    };
+    const malformed_upstream_hints = branchStatusActionHints(malformed_upstream_status);
+    try std.testing.expect(malformed_upstream_hints.push);
+    try std.testing.expect(!malformed_upstream_hints.pull);
+
+    var malformed_upstream_formatted = try branch_chrome.formatBaseLabel(std.testing.allocator, malformed_upstream_status, 80);
+    defer malformed_upstream_formatted.deinit(std.testing.allocator);
+    const malformed_upstream_presentation: SidebarBranchPresentation = .{
+        .text = malformed_upstream_formatted.text,
+        .full_display_width = malformed_upstream_formatted.full_display_width,
+        .was_clipped = malformed_upstream_formatted.was_clipped,
+        .action_hints = malformed_upstream_hints,
+    };
+    try std.testing.expectEqualStrings(
+        "  (P: push)",
+        reviewBranchActionHintForKeys(malformed_upstream_presentation, 80, "P", "U", hint_buffer[0..]).?.text,
+    );
+}
+
+test "review branch action hint drops before base clipping and omits non-branch terminals" {
+    const upstream_status: git_branch_status.BranchStatus = .{
+        .head = .{ .branch = "main" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{},
+    };
+    var formatted = try branch_chrome.formatBaseLabel(std.testing.allocator, upstream_status, 80);
+    defer formatted.deinit(std.testing.allocator);
+    var clipped = try branch_chrome.formatBaseLabel(std.testing.allocator, upstream_status, formatted.full_display_width - 1);
     defer clipped.deinit(std.testing.allocator);
     const clipped_presentation: SidebarBranchPresentation = .{
         .text = clipped.text,
         .full_display_width = clipped.full_display_width,
         .was_clipped = clipped.was_clipped,
-        .push_hint_eligible = true,
+        .action_hints = branchStatusActionHints(upstream_status),
     };
     try std.testing.expect(clipped_presentation.was_clipped);
-    try std.testing.expect(reviewPushHintForKey(clipped_presentation, presentation.full_display_width.? - 1, "P", hint_buffer[0..]) == null);
+    var hint_buffer: [64]u8 = undefined;
+    try std.testing.expect(reviewBranchActionHintForKeys(
+        clipped_presentation,
+        formatted.full_display_width - 1,
+        "P",
+        "U",
+        hint_buffer[0..],
+    ) == null);
 
     const loading: SidebarBranchPresentation = .{ .text = "loading branch" };
-    const detached: SidebarBranchPresentation = .{ .text = "detached", .full_display_width = 8 };
-    const unknown: SidebarBranchPresentation = .{ .text = "unknown branch", .full_display_width = 14 };
-    try std.testing.expect(!branchStatusAllowsPushHint(.{ .head = .detached }));
-    try std.testing.expect(!branchStatusAllowsPushHint(.{ .head = .unknown }));
-    try std.testing.expect(reviewPushHintForKey(loading, 80, "P", hint_buffer[0..]) == null);
-    try std.testing.expect(reviewPushHintForKey(detached, 80, "P", hint_buffer[0..]) == null);
-    try std.testing.expect(reviewPushHintForKey(unknown, 80, "P", hint_buffer[0..]) == null);
+    const detached: SidebarBranchPresentation = .{
+        .text = "detached",
+        .full_display_width = 8,
+        .action_hints = branchStatusActionHints(.{ .head = .detached }),
+    };
+    const unknown: SidebarBranchPresentation = .{
+        .text = "unknown branch",
+        .full_display_width = 14,
+        .action_hints = branchStatusActionHints(.{ .head = .unknown }),
+    };
+    try std.testing.expect(!detached.action_hints.push);
+    try std.testing.expect(!detached.action_hints.pull);
+    try std.testing.expect(!unknown.action_hints.push);
+    try std.testing.expect(!unknown.action_hints.pull);
+    try std.testing.expect(reviewBranchActionHintForKeys(loading, 80, "P", "U", hint_buffer[0..]) == null);
+    try std.testing.expect(reviewBranchActionHintForKeys(detached, 80, "P", "U", hint_buffer[0..]) == null);
+    try std.testing.expect(reviewBranchActionHintForKeys(unknown, 80, "P", "U", hint_buffer[0..]) == null);
 }
 
-test "review filter summary owns sidebar detail row over push hint" {
+test "review filter summary owns sidebar detail row over branch action hint" {
     var builder = git_branch_status.Builder.init(std.testing.allocator);
     errdefer builder.deinit();
     try builder.setBranchHead("main");
@@ -1252,7 +1429,8 @@ test "review filter summary owns sidebar detail row over push hint" {
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified only") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "main ↑0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, ": push)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, ": push") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, ": pull") == null);
 }
 
 pub fn drawSearchMatchMarker(app: Context, surface: *chasen.Surface) void {
@@ -1319,7 +1497,7 @@ fn sidebarBranchStyle(palette: theme.Palette) chasen.TextStyle {
 }
 
 fn sidebarBranchHintStyle(palette: theme.Palette) chasen.TextStyle {
-    return .{ .fg = palette.color(.muted), .dim = true };
+    return palette.style(.muted);
 }
 
 /// Selected-file identity is stable chrome rather than a pane-focus signal.
