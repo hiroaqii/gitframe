@@ -2171,7 +2171,6 @@ test "inactive status-only pending and inert diff path headers keep semantic int
     inert_loaded.file_text_eligibility = &inert_eligibility;
     page.load = test_support.loadState(inert_loaded);
     page.viewer.selected_target = .{ .diff_file = 0 };
-    page.viewer.selected_file = 0;
     var inert: chasen.testing.TestSurface = undefined;
     try inert.init(40, 6);
     defer inert.deinit();

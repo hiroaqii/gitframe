@@ -48,11 +48,6 @@ pub const ViewerState = struct {
     ///
     /// Directory sidebar rows can be selected without changing this value.
     selected_target: ?context.SelectedTarget = .{ .diff_file = 0 },
-    /// Transitional cache for older tests and helpers. Runtime reads should go
-    /// through selectedFileIndex().
-    /// TODO(phase8): remove after status-only targets replace diff-file-only
-    /// assumptions across the app.
-    selected_file: usize = 0,
     /// Sidebar cursor. This may point at a directory, diff file, or later a
     /// status-only row; it is not necessarily the action target.
     selected_node: usize = 0,

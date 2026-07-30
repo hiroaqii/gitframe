@@ -1097,15 +1097,6 @@ pub const View = struct {
         return loaded.foldedHunksForFile(file_index);
     }
 
-    pub fn selectedHunkOffset(self: View, mode: diff_render.DisplayMode, hunk_index: usize) usize {
-        if (!self.bodyAllowsHunkInteraction()) return 0;
-        if (self.activeCombinedProjection()) |bundle| return bundle.displayLineIndex(mode).hunkOffset(hunk_index);
-        const loaded = self.activeLoadedDiffConst() orelse return 0;
-        const file_index = self.selectedFileIndex(loaded) orelse return 0;
-        if (loaded.rendered_line_cache.indexFor(file_index, mode)) |index| return index.hunkOffset(hunk_index);
-        return diff_view_model.hunkBodyLineOffsetFolded(loaded.document.files[file_index], mode, hunk_index, loaded.foldedHunksForFile(file_index));
-    }
-
     pub fn selectedHunkIndex(self: View) ?usize {
         if (!self.bodyAllowsHunkInteraction()) return null;
         return self.rawSelectedHunkIndex();
@@ -1302,10 +1293,6 @@ pub const Controller = struct {
     }
 
     pub fn clearDiffSelection(self: Controller) void {
-        self.terminateDiffSelection();
-    }
-
-    pub fn terminateDiffSelection(self: Controller) void {
         self.page.selection_owner = .none;
     }
 
@@ -1492,16 +1479,6 @@ pub const Controller = struct {
         }
     }
 
-    pub fn pageDiff(self: Controller, direction: VerticalDirection) void {
-        const rows = self.view().diffVisibleRows();
-        const step: usize = @max(rows, 1);
-        switch (direction) {
-            .up => self.page.viewer.diff_scroll -|= step,
-            .down => self.page.viewer.diff_scroll += step,
-        }
-        self.clampDiffNavigation();
-    }
-
     pub fn moveDiffCursorRows(self: Controller, direction: VerticalDirection) void {
         const current = self.view().selectedDiffCursorOffset() orelse {
             self.initializeDiffCursorForSelectedFile();
@@ -1587,18 +1564,6 @@ pub const Controller = struct {
         self.updateSearchMatchOffset();
         self.applyDiffCursorScrolloff();
         self.clampDiffNavigation();
-    }
-
-    pub fn scrollSelectedHunkIntoView(self: Controller) void {
-        const mode = self.view().effectiveDisplayMode();
-        const hunk_index = self.view().selectedHunkIndex() orelse return;
-        const target = self.view().selectedHunkOffset(mode, hunk_index);
-        const visible_rows = self.view().diffVisibleRows();
-        if (target < self.page.viewer.diff_scroll) {
-            self.page.viewer.diff_scroll = target;
-        } else if (visible_rows > 0 and target >= self.page.viewer.diff_scroll + visible_rows) {
-            self.page.viewer.diff_scroll = target + 1 - visible_rows;
-        }
     }
 
     pub fn clampDiffNavigation(self: Controller) void {
@@ -2311,7 +2276,6 @@ pub const Controller = struct {
                 }
             }
             self.page.viewer.selected_target = null;
-            self.page.viewer.selected_file = 0;
             self.page.viewer.selected_node = 0;
             return;
         }
@@ -2368,7 +2332,6 @@ pub const Controller = struct {
             false;
         if (!same_target) self.clearDiffSelection();
         self.page.viewer.selected_target = .{ .diff_file = file_index };
-        self.page.viewer.selected_file = file_index;
     }
 
     pub fn syncSidebarNodeToSelectedFile(self: Controller, loaded: *const LoadedDiff) void {
@@ -2396,10 +2359,6 @@ pub const Controller = struct {
             reviewed_files[index] = try self.page.reviewed_store.containsFile(allocator, self.repo_root, file);
         }
         loaded.reviewed_files = reviewed_files;
-    }
-
-    pub fn loadedDiff(self: Controller) ?*LoadedDiff {
-        return self.activeLoadedDiff();
     }
 
     pub fn activeLoadedDiff(self: Controller) ?*LoadedDiff {
@@ -2516,14 +2475,6 @@ pub const Controller = struct {
         };
     }
 };
-
-pub fn findNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
-    for (loaded.tree.nodes, 0..) |node, index| {
-        const node_key = if (node.path_key.len > 0) node.path_key else node.path;
-        if (std.mem.eql(u8, node_key, path_key)) return index;
-    }
-    return null;
-}
 
 pub fn findNodeBySidebarIdentity(
     loaded: *const LoadedDiff,
@@ -3197,7 +3148,8 @@ test "Review navigation keeps diff position at file selection boundary" {
     }, .{ .width = 100, .height = 8 });
 
     harness.controller().selectFileDelta(-1);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.selected_file);
+    const loaded = harness.controller().activeLoadedDiff().?;
+    try std.testing.expectEqual(@as(?usize, 0), harness.view().selectedFileIndex(loaded));
     try std.testing.expectEqual(@as(usize, 4), harness.pages.review.viewer.diff_scroll);
     try std.testing.expectEqual(@as(?usize, 1), harness.view().selectedHunkIndex());
 
@@ -3215,7 +3167,7 @@ test "Review navigation keeps selected hunk visible across mode changes" {
         },
     }, .{ .width = 100, .height = 9 });
 
-    harness.controller().scrollSelectedHunkIntoView();
+    harness.controller().applyDiffCursorScrolloff();
     try std.testing.expect(harness.pages.review.viewer.diff_scroll > 0);
 
     harness.pages.review.viewer.display_mode = .side_by_side;
@@ -3369,7 +3321,6 @@ test "invalid primary file is inert while its valid sibling remains selectable" 
         .load = test_support.loadState(loaded),
         .viewer = .{
             .selected_target = .{ .diff_file = 1 },
-            .selected_file = 1,
             .selected_node = 1,
             .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } },
             .display_mode = .unified,
@@ -3388,7 +3339,7 @@ test "invalid primary file is inert while its valid sibling remains selectable" 
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.review.viewer.diff_cursor);
     try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
     try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
-    harness.controller().pageDiff(.down);
+    harness.controller().moveDiffCursorPage(.down);
     harness.controller().scrollDiff(.down);
     harness.controller().scrollDiffHorizontal(.right);
     harness.controller().selectHunkDelta(1);
@@ -3461,7 +3412,7 @@ test "invalid cached projection cannot fall through to primary hunk authority" {
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.review.viewer.diff_cursor);
     try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
     try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
-    harness.controller().pageDiff(.down);
+    harness.controller().moveDiffCursorPage(.down);
     harness.controller().scrollDiff(.down);
     harness.controller().scrollDiffHorizontal(.right);
     try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
@@ -3539,7 +3490,7 @@ test "either invalid combined component remains inert without primary navigation
         try std.testing.expect(harness.view().selectedHunkIndex() == null);
         try std.testing.expectEqual(HunkInteractionAvailability.inert_invalid_utf8, harness.view().hunkInteractionAvailability());
         harness.controller().clampDiffNavigation();
-        harness.controller().pageDiff(.down);
+        harness.controller().moveDiffCursorPage(.down);
         harness.controller().scrollDiff(.down);
         harness.controller().scrollDiffHorizontal(.right);
         harness.controller().selectHunkDelta(1);
@@ -3727,7 +3678,6 @@ test "sidebar visibility toggle uses full diff width and keeps selection" {
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .focus = .sidebar,
-                .selected_file = 0,
                 .selected_node = 1,
                 .display_mode = .side_by_side,
             },
@@ -3741,7 +3691,7 @@ test "sidebar visibility toggle uses full diff width and keeps selection" {
 
     try std.testing.expect(app.pages.review.viewer.sidebar_hidden);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.reviewNavigationView().effectiveDisplayMode());
 
@@ -4417,7 +4367,7 @@ test "toggle selected hunk fold updates active rendered line cache" {
     try std.testing.expectEqual(@as(usize, 10), app.reviewNavigationView().selectedFileLineIndex(.unified).lineCount());
     app.reviewNavigation().toggleSelectedHunkFold();
 
-    const active = app.reviewNavigation().loadedDiff().?;
+    const active = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expect(active.isHunkFolded(0, 0));
     try std.testing.expectEqual(@as(usize, 5), app.reviewNavigationView().selectedFileLineIndex(.unified).lineCount());
     try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .unified).hunkLineCount(0));
@@ -4445,7 +4395,7 @@ test "search unfolds folded hunk body matches before setting offset" {
 
     app.reviewNavigation().submitSearch();
 
-    const active = app.reviewNavigation().loadedDiff().?;
+    const active = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expect(!active.isHunkFolded(0, 0));
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
     try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
@@ -4471,7 +4421,7 @@ test "manual fold keeps hunk open when it contains active search match" {
 
     app.reviewNavigation().toggleSelectedHunkFold();
 
-    const active = app.reviewNavigation().loadedDiff().?;
+    const active = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expect(!active.isHunkFolded(0, 0));
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
     try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
@@ -4489,7 +4439,7 @@ test "file change resyncs retained search query to selected file" {
 
     app.reviewNavigation().selectFileAbsolute(1);
 
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
     try expectSearchCoordinate(&app, .{ .metadata = 0 });
     try std.testing.expectEqual(@as(?usize, 0), app.pages.review.search.match_offset);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
@@ -4500,7 +4450,6 @@ test "sidebar navigation can select directories without changing selected file" 
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
             .viewer = .{
-                .selected_file = 0,
                 .selected_node = 1,
             },
         } },
@@ -4509,15 +4458,15 @@ test "sidebar navigation can select directories without changing selected file" 
 
     app.reviewNavigation().selectFileDelta(-1);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 
     app.reviewNavigation().selectFileDelta(1);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 
     app.reviewNavigation().selectFileDelta(1);
     try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "toggling selected directory collapses visible descendants" {
@@ -4525,7 +4474,6 @@ test "toggling selected directory collapses visible descendants" {
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
             .viewer = .{
-                .selected_file = 0,
                 .selected_node = 0,
             },
         } },
@@ -4550,7 +4498,6 @@ test "review root expansion ignores toggle and expand while retaining diff targe
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 0,
             },
         } },
@@ -4560,7 +4507,7 @@ test "review root expansion ignores toggle and expand while retaining diff targe
 
     try app.reviewNavigation().toggleSelectedDirectory();
 
-    var loaded = app.reviewNavigation().loadedDiff().?;
+    var loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 4), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(u16, 1), loaded.tree.nodes[loaded.visibleNodeAt(1).?].depth);
@@ -4570,7 +4517,7 @@ test "review root expansion ignores toggle and expand while retaining diff targe
 
     try app.reviewNavigation().expandSelectedDirectory();
 
-    loaded = app.reviewNavigation().loadedDiff().?;
+    loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 4), loaded.visibleNodeCount());
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
@@ -4581,7 +4528,6 @@ test "review root expansion mouse click selects root without hiding children" {
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 3,
                 .focus = .diff,
             },
@@ -4591,7 +4537,7 @@ test "review root expansion mouse click selects root without hiding children" {
 
     try app.reviewNavigation().clickSidebarNode(0);
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 4), loaded.visibleNodeCount());
@@ -4604,7 +4550,6 @@ test "repository switch resets Review navigation" {
         .pages = .{ .review = .{
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 3,
             },
             .search = .{
@@ -4629,7 +4574,6 @@ test "review root expansion keeps left and right on root as no-ops" {
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
                 .selected_node = 1,
             },
         } },
@@ -4637,7 +4581,7 @@ test "review root expansion keeps left and right on root as no-ops" {
     defer app.clearLoadedDiff();
 
     try app.reviewNavigation().collapseOrSelectParentDirectory();
-    var loaded = app.reviewNavigation().loadedDiff().?;
+    var loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
 
@@ -4645,11 +4589,11 @@ test "review root expansion keeps left and right on root as no-ops" {
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
 
     try app.reviewNavigation().collapseOrSelectParentDirectory();
-    loaded = app.reviewNavigation().loadedDiff().?;
+    loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
 
     try app.reviewNavigation().expandSelectedDirectory();
-    loaded = app.reviewNavigation().loadedDiff().?;
+    loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
 }
@@ -4659,7 +4603,6 @@ test "file search selects matching file and expands ancestors" {
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), fileSearchLoadedNested()),
             .viewer = .{
-                .selected_file = 0,
                 .selected_node = 0,
             },
             .file_search = .{ .mode = true },
@@ -4668,16 +4611,16 @@ test "file search selects matching file and expands ancestors" {
     };
     defer app.clearLoadedDiff();
 
-    var loaded = app.reviewNavigation().loadedDiff().?;
+    var loaded = app.reviewNavigation().activeLoadedDiff().?;
     try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
     setAndRebuildFileSearch(&app, "src/b");
 
     app.reviewNavigation().submitFileSearch(std.testing.allocator);
 
-    loaded = app.reviewNavigation().loadedDiff().?;
+    loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expect(!app.pages.review.file_search.mode);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
@@ -4688,7 +4631,6 @@ test "review root expansion file search reveals only collapsed ancestors" {
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), fileSearchLoadedRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
                 .selected_node = 0,
             },
             .file_search = .{ .mode = true },
@@ -4697,7 +4639,7 @@ test "review root expansion file search reveals only collapsed ancestors" {
     };
     defer app.clearLoadedDiff();
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try loaded.rebuildVisibleNodes(
         app.reviewNavigation().loadArenaAllocator().?,
         false,
@@ -4727,14 +4669,14 @@ test "review transition D1 exact lookup accepts diff status and collapsed raw pa
         var app: TestHarness = .{
             .pages = .{ .review = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-                .viewer = .{ .selected_node = 1, .selected_file = 0 },
+                .viewer = .{ .selected_node = 1 },
             } },
             .repo_epoch = 4,
             .root_identity = identity,
         };
         defer app.clearLoadedDiff();
 
-        const loaded = app.reviewNavigation().loadedDiff().?;
+        const loaded = app.reviewNavigation().activeLoadedDiff().?;
         try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
 
         try expectExactPathReady(
@@ -4785,7 +4727,7 @@ test "review transition D1 exact lookup rejects non-current repository sources" 
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-            .viewer = .{ .selected_node = 1, .selected_file = 0 },
+            .viewer = .{ .selected_node = 1 },
         } },
         .repo_epoch = 4,
         .root_identity = identity,
@@ -4987,7 +4929,7 @@ test "review transition D1 exact lookup rejects identity absence and non-file pa
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
-            .viewer = .{ .selected_node = 1, .selected_file = 0 },
+            .viewer = .{ .selected_node = 1 },
         } },
         .repo_epoch = 4,
         .root_identity = identity,
@@ -5041,7 +4983,6 @@ test "review transition D2b exact reveal expands only target ancestors and selec
             }),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
                 .selected_node = 3,
                 .focus = .diff,
                 .diff_scroll = 8,
@@ -5060,7 +5001,7 @@ test "review transition D2b exact reveal expands only target ancestors and selec
     };
     defer app.clearLoadedDiff();
     const allocator = app.reviewNavigation().loadArenaAllocator().?;
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try file_tree.collapse(allocator, &loaded.collapsed_dirs, "src");
     try file_tree.collapse(allocator, &loaded.collapsed_dirs, "lib");
     setDiffSearchQuery(&app, "target");
@@ -5074,7 +5015,6 @@ test "review transition D2b exact reveal expands only target ancestors and selec
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "lib"));
     try std.testing.expectEqual(@as(?usize, 4), loaded.visibleNodeAt(3));
     try std.testing.expectEqual(@as(usize, 4), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
     try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.diff_horizontal_scroll);
@@ -5104,7 +5044,6 @@ test "review transition D2b exact reveal selects status-only and reports unchang
             }),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
                 .selected_node = 0,
                 .display_mode = .unified,
             },
@@ -5141,7 +5080,6 @@ test "review transition D2b selected exact node still reveals collapsed ancestor
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 2,
             },
         } },
@@ -5149,7 +5087,7 @@ test "review transition D2b selected exact node still reveals collapsed ancestor
         .root_identity = identity,
     };
     defer app.clearLoadedDiff();
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
     try std.testing.expectEqual(@as(?usize, null), loaded.visibleRowOfNode(2));
 
@@ -5171,7 +5109,6 @@ test "review root expansion exact reveal expands only ordinary ancestors" {
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 0,
             },
         } },
@@ -5179,7 +5116,7 @@ test "review root expansion exact reveal expands only ordinary ancestors" {
         .root_identity = identity,
     };
     defer app.clearLoadedDiff();
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     const allocator = app.reviewNavigation().loadArenaAllocator().?;
     try file_tree.collapse(allocator, &loaded.collapsed_dirs, "src");
     try loaded.rebuildVisibleNodes(allocator, false, .all);
@@ -5213,7 +5150,6 @@ test "review transition D2b unavailable result preserves navigation folds and fi
             }),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 2,
                 .diff_scroll = 6,
                 .diff_horizontal_scroll = 2,
@@ -5225,7 +5161,7 @@ test "review transition D2b unavailable result preserves navigation folds and fi
         .root_identity = identity,
     };
     defer app.clearLoadedDiff();
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
 
     try expectExactPathRevealUnavailable(
@@ -5251,7 +5187,6 @@ test "review transition D2b allocation failure rolls back before ancestor expans
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
                 .selected_node = 1,
                 .focus = .diff,
                 .diff_scroll = 7,
@@ -5270,7 +5205,7 @@ test "review transition D2b allocation failure rolls back before ancestor expans
         .root_identity = identity,
     };
     defer app.clearLoadedDiff();
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
     const visible_before = loaded.visibleNodeCount();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
@@ -5311,7 +5246,7 @@ test "file search keeps prompt open on no match" {
 
     try std.testing.expect(app.pages.review.file_search.mode);
     try std.testing.expect(app.pages.review.file_search.no_match);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "file search skips hidden reviewed matches" {
@@ -5333,7 +5268,7 @@ test "file search skips hidden reviewed matches" {
         } },
     };
     defer app.clearLoadedDiff();
-    try app.reviewNavigation().loadedDiff().?.rebuildVisibleNodes(
+    try app.reviewNavigation().activeLoadedDiff().?.rebuildVisibleNodes(
         app.reviewNavigation().loadArenaAllocator().?,
         true,
         .all,
@@ -5345,7 +5280,7 @@ test "file search skips hidden reviewed matches" {
     try std.testing.expect(!app.pages.review.file_search.mode);
     try std.testing.expect(!app.pages.review.file_search.no_match);
     try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
 
@@ -5367,14 +5302,14 @@ test "file search empty Enter accepts the first exact candidate" {
     try std.testing.expect(!app.pages.review.file_search.mode);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "file search Enter commits the displayed moved candidate" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(fileSearchLoadedNested()),
-            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_file = 0, .selected_node = 1, .focus = .diff },
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 1, .focus = .diff },
         } },
         .terminal_size = .{ .width = 100, .height = 12 },
     };
@@ -5388,7 +5323,6 @@ test "file search Enter commits the displayed moved candidate" {
 
     try std.testing.expect(!app.pages.review.file_search.mode);
     try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
@@ -5397,7 +5331,7 @@ test "file search Enter keeps unavailable and stale projections inert" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(fileSearchLoadedNested()),
-            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_file = 0, .selected_node = 1 },
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 1 },
             .file_search = .{ .mode = true },
         } },
     };
@@ -5426,14 +5360,14 @@ test "file search disclosure allocation failure preserves prompt folds and selec
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), fileSearchLoadedNested()),
-            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_file = 0, .selected_node = 1 },
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 1 },
             .file_search = .{ .mode = true },
         } },
     };
     defer app.clearLoadedDiff();
     defer app.pages.review.file_search.deinit(std.testing.allocator);
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
     setAndRebuildFileSearch(&app, "src/b");
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
@@ -5510,7 +5444,7 @@ test "file search keeps diff focus while sidebar is hidden" {
 
     try std.testing.expect(!app.pages.review.file_search.mode);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "selectedStagePathKey accepts diff and status-only selections" {
@@ -5955,7 +5889,7 @@ test "typed action cursor remaps a directory without changing the sticky diff ta
         1,
     );
     app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
 
     try std.testing.expect(app.reviewNavigation().remapActionCursor(loaded));
     try std.testing.expect(app.pages.review.action_cursor.hasOwner());
@@ -6000,7 +5934,7 @@ test "typed action cursor remaps a repository root without changing the sticky d
     );
     app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
 
-    try std.testing.expect(app.reviewNavigation().remapActionCursor(app.reviewNavigation().loadedDiff().?));
+    try std.testing.expect(app.reviewNavigation().remapActionCursor(app.reviewNavigation().activeLoadedDiff().?));
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 }
@@ -6011,7 +5945,6 @@ test "review root expansion terminal file action reveals an ordinary folded ance
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 1,
             },
         } },
@@ -6020,7 +5953,7 @@ test "review root expansion terminal file action reveals an ordinary folded ance
     defer app.pages.review.action_cursor.deinit(std.testing.allocator);
 
     try app.reviewNavigation().toggleSelectedDirectory();
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
 
@@ -6064,7 +5997,6 @@ test "filtered directory action cursor falls back to repository root instead of 
             .review_display = .{ .changed_file_filter = .added },
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
                 .selected_node = 0,
             },
         } },
@@ -6087,7 +6019,7 @@ test "filtered directory action cursor falls back to repository root instead of 
 
     try std.testing.expect(app.reviewNavigation().finalizeActionCursor(std.testing.allocator));
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(file_tree.Node.Kind.repo_root, app.reviewNavigation().loadedDiff().?.tree.nodes[0].kind);
+    try std.testing.expectEqual(file_tree.Node.Kind.repo_root, app.reviewNavigation().activeLoadedDiff().?.tree.nodes[0].kind);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
@@ -6100,7 +6032,6 @@ test "disappeared file action cursor keeps the existing nearest-file fallback" {
             .load = app_test_support.loadStateWithArena(arena, loaded),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
                 .selected_node = 2,
             },
         } },
@@ -6134,19 +6065,18 @@ test "changed file filter keeps only matching status rows" {
             .viewer = .{
                 .selected_node = 1,
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
             },
         } },
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().loadedDiff().?.rebuildVisibleNodes(
+    try app.reviewNavigation().activeLoadedDiff().?.rebuildVisibleNodes(
         app.reviewNavigation().loadArenaAllocator().?,
         false,
         app.pages.review.review_display.changed_file_filter,
     );
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
 }
@@ -6158,7 +6088,6 @@ test "cycling changed file filter rebuilds visible nodes and reconciles selectio
             .viewer = .{
                 .selected_node = 1,
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
             },
         } },
     };
@@ -6166,11 +6095,11 @@ test "cycling changed file filter rebuilds visible nodes and reconciles selectio
 
     try app.reviewNavigation().cycleChangedFileFilter(std.testing.allocator);
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(ChangedFileFilter.modified, app.pages.review.review_display.changed_file_filter);
     try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "file visibility lens replaces candidate basis and rebuilds retained query" {
@@ -6257,7 +6186,7 @@ test "file visibility lens preparation failure preserves old lens and candidates
     try std.testing.expectEqual(@as(u64, 1), app.pages.review.accepted_sidebar_revision);
     try std.testing.expect(app.pages.review.file_search.projection_available);
     try std.testing.expectEqual(@as(usize, 2), app.pages.review.file_search.candidates.len);
-    try std.testing.expectEqual(@as(usize, 1), app.reviewNavigation().loadedDiff().?.visibleNodeCount());
+    try std.testing.expectEqual(@as(usize, 1), app.reviewNavigation().activeLoadedDiff().?.visibleNodeCount());
 }
 
 test "candidate rebuild failure cannot reject committed file visibility lens" {
@@ -6292,7 +6221,7 @@ test "candidate rebuild failure cannot reject committed file visibility lens" {
 
     try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
     try std.testing.expectEqual(@as(u64, 2), app.pages.review.accepted_sidebar_revision);
-    try std.testing.expectEqual(@as(usize, 1), app.reviewNavigation().loadedDiff().?.visibleNodeCount());
+    try std.testing.expectEqual(@as(usize, 1), app.reviewNavigation().activeLoadedDiff().?.visibleNodeCount());
     try std.testing.expect(app.pages.review.file_search.mode);
     try std.testing.expectEqualStrings("b", app.pages.review.file_search.input.slice());
     try std.testing.expect(!app.pages.review.file_search.projection_available);
@@ -6320,7 +6249,7 @@ test "file search skips files outside active changed filter" {
 
     try std.testing.expect(app.pages.review.file_search.mode);
     try std.testing.expect(app.pages.review.file_search.no_match);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "toggleReviewedFile toggles selected diff target" {
@@ -6339,7 +6268,6 @@ test "toggleReviewedFile toggles selected diff target" {
             }),
             .viewer = .{
                 .selected_node = 0,
-                .selected_file = 0,
             },
         } },
     };
@@ -6373,7 +6301,6 @@ test "toggleReviewedFile uses selected target while cursor is on directory" {
             .viewer = .{
                 .selected_node = 0,
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
             },
         } },
     };
@@ -6421,7 +6348,6 @@ test "raw reviewed state stays in active load only" {
             .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
             .viewer = .{
                 .selected_node = 0,
-                .selected_file = 0,
             },
         } },
         .allocator = std.testing.allocator,
@@ -6429,7 +6355,7 @@ test "raw reviewed state stays in active load only" {
     defer app.clearLoadedDiff();
     defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
 
-    var loaded = app.reviewNavigation().loadedDiff().?;
+    var loaded = app.reviewNavigation().activeLoadedDiff().?;
     try app.reviewNavigation().materializeReviewedFiles(std.testing.allocator, loaded);
     app.pages.review.load.state.loaded.reviewed_files_owned = true;
 
@@ -6438,7 +6364,7 @@ test "raw reviewed state stays in active load only" {
 
     app.clearLoadedDiff();
     app.pages.review.load.state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffTwo()) };
-    loaded = app.reviewNavigation().loadedDiff().?;
+    loaded = app.reviewNavigation().activeLoadedDiff().?;
     try app.reviewNavigation().materializeReviewedFiles(std.testing.allocator, loaded);
     app.pages.review.load.state.loaded.reviewed_files_owned = true;
 
@@ -6461,7 +6387,6 @@ test "hide reviewed files removes reviewed file rows from visible list" {
             }),
             .viewer = .{
                 .selected_node = 1,
-                .selected_file = 0,
             },
         } },
     };
@@ -6469,13 +6394,13 @@ test "hide reviewed files removes reviewed file rows from visible list" {
 
     try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
     try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "hide reviewed files removes directories with no visible file descendants" {
@@ -6494,7 +6419,6 @@ test "hide reviewed files removes directories with no visible file descendants" 
             }),
             .viewer = .{
                 .selected_node = 1,
-                .selected_file = 0,
             },
         } },
     };
@@ -6502,7 +6426,7 @@ test "hide reviewed files removes directories with no visible file descendants" 
 
     try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
 }
 
@@ -6522,7 +6446,6 @@ test "hide reviewed files keeps directories for non-contiguous unreviewed descen
             }),
             .viewer = .{
                 .selected_node = 1,
-                .selected_file = 0,
             },
         } },
     };
@@ -6530,7 +6453,7 @@ test "hide reviewed files keeps directories for non-contiguous unreviewed descen
 
     try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(?usize, 4), loaded.visibleNodeAt(1));
@@ -6552,14 +6475,13 @@ test "marking a visible file as reviewed while hidden moves selection" {
             }),
             .viewer = .{
                 .selected_node = 1,
-                .selected_file = 0,
             },
             .review_display = .{ .hide_reviewed_files = true },
         } },
     };
     defer app.clearLoadedDiff();
     defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
-    try app.reviewNavigation().loadedDiff().?.rebuildVisibleNodes(
+    try app.reviewNavigation().activeLoadedDiff().?.rebuildVisibleNodes(
         app.reviewNavigation().loadArenaAllocator().?,
         true,
         .all,
@@ -6567,13 +6489,13 @@ test "marking a visible file as reviewed while hidden moves selection" {
 
     try app.reviewNavigation().toggleReviewedFile(std.testing.allocator);
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
     try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "marking reviewed under hidden lens rebuilds file search eligibility" {
@@ -6593,7 +6515,6 @@ test "marking reviewed under hidden lens rebuilds file search eligibility" {
             .viewer = .{
                 .selected_node = 0,
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
             },
             .file_search = .{ .mode = true },
             .review_display = .{ .hide_reviewed_files = true },
@@ -6602,7 +6523,7 @@ test "marking reviewed under hidden lens rebuilds file search eligibility" {
     defer app.clearLoadedDiff();
     defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
     defer app.pages.review.file_search.deinit(std.testing.allocator);
-    try app.reviewNavigation().loadedDiff().?.rebuildVisibleNodes(
+    try app.reviewNavigation().activeLoadedDiff().?.rebuildVisibleNodes(
         app.reviewNavigation().loadArenaAllocator().?,
         true,
         .all,

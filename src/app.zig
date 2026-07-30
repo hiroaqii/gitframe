@@ -533,7 +533,7 @@ pub const App = struct {
                 // Mouse coordinates are relative to the old geometry. End the
                 // borrow before changing layout, then drain deferred owners at
                 // the common post-update boundary below.
-                self.reviewNavigation().terminateDiffSelection();
+                self.reviewNavigation().clearDiffSelection();
                 self.pages.repository.cancelMouseOwner();
                 const previous_width = self.reviewNavigationView().diffPaneWidth();
                 const previous_mode = self.reviewNavigationView().effectiveDisplayMode();
@@ -653,7 +653,7 @@ pub const App = struct {
             },
             .auto_reload_tick => try self.autoReloadTick(ctx),
             .focus_lost => switch (self.active_page) {
-                .review => self.reviewNavigation().terminateDiffSelection(),
+                .review => self.reviewNavigation().clearDiffSelection(),
                 .repository => self.pages.repository.cancelMouseOwner(),
                 .history, .config => {},
             },
@@ -8347,7 +8347,7 @@ test "mouse click selects sidebar file rows" {
 
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "mouse click toggles sidebar directory rows" {
@@ -8355,7 +8355,7 @@ test "mouse click toggles sidebar directory rows" {
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(arena, app_test_support.loadedDiffNested()),
-            .viewer = .{ .focus = .diff, .selected_node = 1, .selected_file = 0 },
+            .viewer = .{ .focus = .diff, .selected_node = 1 },
         } },
         .terminal_size = .{ .width = 100, .height = 20 },
     };
@@ -8366,10 +8366,10 @@ test "mouse click toggles sidebar directory rows" {
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedSidebarDirectoryClickMessage;
     try app.update(msg, undefined);
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
 }
 
@@ -8406,7 +8406,7 @@ test "mouse click uses filtered sidebar projection" {
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
-            .viewer = .{ .focus = .diff, .selected_node = 0, .selected_file = 0 },
+            .viewer = .{ .focus = .diff, .selected_node = 0 },
             .review_display = .{ .changed_file_filter = .deleted },
         } },
         .terminal_size = .{ .width = 100, .height = 20 },
@@ -8420,7 +8420,7 @@ test "mouse click uses filtered sidebar projection" {
 
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "mouse wheel scrolls the pane under the pointer" {
@@ -8436,7 +8436,7 @@ test "mouse wheel scrolls the pane under the pointer" {
     const sidebar_msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedSidebarWheelMessage;
     try app.update(sidebar_msg, undefined);
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 
     app.reviewNavigation().selectFileAbsolute(0);
     const diff_col = content.col + sidebarWidth(app.layoutSize().width, app.pages.review.viewer.sidebar_width) + 1;
@@ -8511,7 +8511,6 @@ test "confirmation overlay blocks mouse clicks and wheels" {
             .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
             .viewer = .{
                 .focus = .diff,
-                .selected_file = 0,
             },
         } },
         .terminal_size = .{ .width = 100, .height = 8 },
@@ -8522,7 +8521,7 @@ test "confirmation overlay blocks mouse clicks and wheels" {
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) == null);
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
 test "terminal resize clamps push error scroll" {
@@ -8650,7 +8649,6 @@ test "sidebar navigation keeps status-only target through clamp" {
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffOne()),
             .viewer = .{
-                .selected_file = 0,
                 .selected_node = 0,
             },
         } },
@@ -8665,7 +8663,7 @@ test "sidebar navigation keeps status-only target through clamp" {
     try app.pages.review.git_status.replace("/repo", &status_bundle);
     try app.reviewReload().applyStatusProjection(std.testing.allocator, false, .accepted_status);
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     const status_node = blk: {
         for (loaded.tree.nodes, 0..) |node, index| {
             switch (node.target) {
@@ -8787,7 +8785,7 @@ fn expectLaterDirectoryLikeSelectionAcrossRefresh(
     defer app.pages.review.deinit(allocator);
 
     const activation_id = app.activateReview();
-    const loaded = app.reviewNavigation().loadedDiff() orelse return error.ExpectedLoadedDiff;
+    const loaded = app.reviewNavigation().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
     const selected_file = review_navigation.findFileNodeByPathKey(loaded, "src/a") orelse return error.ExpectedSelectedFile;
     app.reviewNavigation().selectSidebarNode(loaded, selected_file);
 
@@ -8880,7 +8878,6 @@ fn expectDirectoryCursorAfterActionRefresh(status_first: bool) !void {
             .load = app_test_support.loadStateWithArena(arena, current),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 1,
             },
             .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
@@ -8939,8 +8936,11 @@ fn expectDirectoryCursorAfterActionRefresh(status_first: bool) !void {
     }
 
     try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
-    const loaded = app.reviewNavigation().loadedDiff() orelse return error.ExpectedLoadedDiff;
-    const directory_node = review_navigation.findNodeByPathKey(loaded, "src") orelse return error.ExpectedDirectoryNode;
+    const loaded = app.reviewNavigation().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
+    const directory_node = review_navigation.findNodeBySidebarIdentity(
+        loaded,
+        .{ .directory = "src" },
+    ) orelse return error.ExpectedDirectoryNode;
     try std.testing.expectEqual(file_tree.Node.Kind.directory, loaded.tree.nodes[directory_node].kind);
     try std.testing.expectEqual(directory_node, app.pages.review.viewer.selected_node);
     // Directory restoration owns only the sidebar cursor. The body remains a
@@ -9036,7 +9036,7 @@ fn expectTerminalActionRefreshRepublishesFileSearch(status_first: bool) !void {
     }
 
     try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
-    const loaded = app.reviewNavigation().loadedDiff() orelse return error.ExpectedLoadedDiff;
+    const loaded = app.reviewNavigation().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
     for (loaded.tree.nodes) |node| {
         try std.testing.expect(!std.mem.eql(u8, node.path_key, "legacy.zig"));
     }
@@ -9381,7 +9381,7 @@ test "final hunk stage retains exact path through cached projection acceptance" 
     // materializes its staged-only row and reapplies the retained path anchor.
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqualStrings("a", app.reviewNavigationView().selectedStagePathKey().?);
-    const current_loaded = app.reviewNavigation().loadedDiff() orelse return error.ExpectedLoadedDiff;
+    const current_loaded = app.reviewNavigation().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
     const original_a_node = review_navigation.findFileNodeByPathKey(current_loaded, "a") orelse return error.ExpectedActionFileNode;
     const original_b_node = review_navigation.findFileNodeByPathKey(current_loaded, "b") orelse return error.ExpectedNeighborFileNode;
     const tree_allocator = app.reviewNavigation().loadArenaAllocator() orelse return error.ExpectedLoadArena;
@@ -9564,7 +9564,6 @@ test "action cursor waits for the exact status member after source is terminal" 
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffOne()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
                 .selected_node = 0,
             },
         } },
@@ -9923,7 +9922,6 @@ test "action cursor survives exact status projection while source member is pend
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffTwo()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 1,
             },
         } },
@@ -9958,7 +9956,6 @@ test "action cursor closes after status completion when source failed before gen
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffOne()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
                 .selected_node = 0,
             },
             .status_load = .{ .generation = 7, .pending = .{ .generation = 7 } },
@@ -11489,7 +11486,6 @@ test "review repository transition E2a commit selects exact retained Review path
                 .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
                 .viewer = .{
                     .selected_target = .{ .diff_file = 0 },
-                    .selected_file = 0,
                     .selected_node = 0,
                 },
             },
@@ -11513,7 +11509,6 @@ test "review repository transition E2a commit selects exact retained Review path
     try std.testing.expect(!app.pages.repository.active);
     try std.testing.expect(app.pages.repository.incoming == .none);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqual(@as(usize, 0), app.status.text().len);
     try std.testing.expectEqual(@as(u64, 7), app.pages.review.activation.state.active.repo_epoch);
@@ -11542,7 +11537,6 @@ test "review repository transition E2a commit maps unchanged and unavailable out
                     .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
                     .viewer = .{
                         .selected_target = .{ .diff_file = 1 },
-                        .selected_file = 1,
                         .selected_node = 1,
                         .diff_scroll = 9,
                     },
@@ -11642,7 +11636,6 @@ test "review repository transition E2b common switch commits exact path before r
                 .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
                 .viewer = .{
                     .selected_target = .{ .diff_file = 0 },
-                    .selected_file = 0,
                     .selected_node = 0,
                 },
             },
@@ -11752,7 +11745,6 @@ test "review repository transition E3a keyboard and page bar open the same exact
                     .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
                     .viewer = .{
                         .selected_target = .{ .diff_file = 0 },
-                        .selected_file = 0,
                         .selected_node = 0,
                     },
                 },
@@ -11884,7 +11876,6 @@ test "review repository transition E3b1 common switch maps retained-location out
                     .load = app_test_support.loadState(loaded),
                     .viewer = .{
                         .selected_target = .{ .diff_file = case.retained_index },
-                        .selected_file = case.retained_index,
                         .selected_node = case.retained_index,
                         .diff_cursor = if (case.retained_index == 0) .{ .metadata = 0 } else .{ .metadata = 1 },
                         .diff_scroll = 9,
@@ -11916,7 +11907,6 @@ test "review repository transition E3b1 common switch maps retained-location out
         try std.testing.expectEqual(page.Id.review, app.active_page);
         try std.testing.expect(!app.pages.repository.active);
         try std.testing.expectEqual(case.retained_index, app.pages.review.viewer.selected_node);
-        try std.testing.expectEqual(case.retained_index, app.pages.review.viewer.selected_file);
         try std.testing.expectEqual(context.SelectedTarget{ .diff_file = case.retained_index }, app.pages.review.viewer.selected_target.?);
         try std.testing.expect(std.meta.eql(
             if (case.retained_index == 0)
@@ -12006,7 +11996,6 @@ test "review repository transition E3b2 unavailable path is not replayed after r
                 .load = app_test_support.loadState(initial_loaded),
                 .viewer = .{
                     .selected_target = .{ .diff_file = 0 },
-                    .selected_file = 0,
                     .selected_node = 0,
                     .diff_cursor = .{ .metadata = 0 },
                     .diff_scroll = 5,
@@ -12063,7 +12052,6 @@ test "review repository transition E3b2 unavailable path is not replayed after r
         "a",
         reloaded.tree.nodes[app.pages.review.viewer.selected_node].path,
     );
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
@@ -12081,7 +12069,6 @@ test "review repository transition E3b2 inactive Repository retains contextual s
                 .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
                 .viewer = .{
                     .selected_target = .{ .diff_file = 0 },
-                    .selected_file = 0,
                     .selected_node = 0,
                 },
             },
@@ -12114,7 +12101,6 @@ test "review repository transition E3b2 inactive Repository retains contextual s
     try std.testing.expect(!app.pages.repository.active);
     try std.testing.expectEqualStrings("b", app.pages.repository.selected_path.?);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_file);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
 }
@@ -12762,7 +12748,6 @@ test "repository incoming viewport scroll App immediate and deferred routes use 
                 .load = app_test_support.loadState(repositoryIncomingViewportReviewDiffForTest()),
                 .viewer = .{
                     .selected_target = .{ .diff_file = 1 },
-                    .selected_file = 1,
                     .selected_node = 3,
                 },
             } },
@@ -13190,7 +13175,6 @@ test "repo picker capability rejection preserves Review navigation and does not 
     const prior_epoch = app.repo_epoch;
     const prior_identity = app.repo_state.activeIdentity().?;
     app.pages.review.viewer.selected_target = .{ .diff_file = 3 };
-    app.pages.review.viewer.selected_file = 3;
     app.pages.review.viewer.selected_node = 7;
     app.pages.review.search.mode = true;
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
@@ -13201,7 +13185,7 @@ test "repo picker capability rejection preserves Review navigation and does not 
     try std.testing.expectEqual(prior_epoch, app.repo_epoch);
     try std.testing.expectEqualStrings(roots.a, app.activeRepoRoot().?);
     try std.testing.expect(prior_identity.eql(app.repo_state.activeIdentity().?));
-    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 3 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqual(@as(usize, 7), app.pages.review.viewer.selected_node);
     try std.testing.expect(app.pages.review.search.mode);
     try std.testing.expectEqualStrings("Repository root could not be opened safely", app.status.text());
@@ -13222,7 +13206,6 @@ test "committed repository replacement resets Review before source spawn failure
         .external_selection,
     ));
     app.pages.review.viewer.selected_target = .{ .diff_file = 3 };
-    app.pages.review.viewer.selected_file = 3;
     app.pages.review.viewer.selected_node = 7;
     app.pages.review.search.mode = true;
     setDiffSearchQuery(&app, "needle");
@@ -13241,7 +13224,7 @@ test "committed repository replacement resets Review before source spawn failure
     ctx._pending_tasks_with_len = 0;
 
     try std.testing.expectEqualStrings(roots.b, app.activeRepoRoot().?);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expect(!app.pages.review.search.mode);
@@ -13456,7 +13439,7 @@ test "inactive repository change invalidates retained source before equal-finger
     try std.testing.expectEqualStrings(roots.b, app.activeRepoRoot().?);
     try std.testing.expect(app.pages.review.auto_reload.accepted_source == null);
     try std.testing.expect(app.pages.review.load.state == .idle);
-    try std.testing.expect(app.reviewNavigation().loadedDiff() == null);
+    try std.testing.expect(app.reviewNavigation().activeLoadedDiff() == null);
     try std.testing.expect(app.pages.review.review_projection.pending == null);
     try std.testing.expect(!app.pages.review.review_projection.hasDisplayed());
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.review_projection.cacheLen());
@@ -19279,7 +19262,6 @@ test "stage unstage and discard launch typed action cursor owners with task gene
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 0,
             },
         } },
@@ -19428,7 +19410,7 @@ test "finishDiffLoad applies active changed file filter" {
         .result = .{ .loaded = bundle },
     });
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 2), loaded.document.files.len);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
@@ -20353,7 +20335,6 @@ test "status projection rebuild keeps selected node on same path key" {
             .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 1,
             },
             .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
@@ -20395,7 +20376,6 @@ test "review root expansion survives status projection and retains sticky diff t
             .load = app_test_support.loadStateWithArena(arena, current),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 0,
             },
             .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
@@ -20416,7 +20396,7 @@ test "review root expansion survives status projection and retains sticky diff t
         .result = .{ .loaded = status_bundle },
     });
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expect(loaded.visibleNodeCount() > 1);
     try std.testing.expectEqual(file_tree.Node.Kind.repo_root, loaded.tree.nodes[loaded.visibleNodeAt(0).?].kind);
     try std.testing.expectEqual(@as(u16, 1), loaded.tree.nodes[loaded.visibleNodeAt(1).?].depth);
@@ -20438,7 +20418,6 @@ test "review root expansion status-first action refresh retains visible root chi
             .load = app_test_support.loadStateWithArena(arena, current),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 3,
             },
             .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
@@ -20465,7 +20444,7 @@ test "review root expansion status-first action refresh retains visible root chi
         .result = .{ .loaded = status_bundle },
     });
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expect(app.pages.review.action_cursor.hasOwner());
     try std.testing.expect(loaded.visibleNodeCount() > 1);
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
@@ -20755,7 +20734,6 @@ test "watch no-op diff load preserves session view state and staged hunk marks" 
             .load = app_test_support.loadState(current),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
                 .selected_node = 0,
                 .diff_cursor = .{ .hunk_header = 1 },
                 .diff_scroll = 3,
@@ -21483,7 +21461,6 @@ test "anchored reload keeps cursor when search query is present" {
             .load = app_test_support.loadState(current),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
                 .selected_node = 0,
                 .diff_cursor = .{ .hunk_header = 1 },
                 .diff_scroll = 2,
@@ -21528,7 +21505,6 @@ test "manual reload restores anchor after visible state is cleared" {
             .load = app_test_support.loadState(current),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 1,
                 .diff_cursor = .{ .metadata = 0 },
                 .diff_scroll = 2,
@@ -21578,7 +21554,6 @@ test "review root expansion survives manual reload and retains sticky target" {
             .load = app_test_support.loadStateWithArena(current_arena, current),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 0,
             },
         } },
@@ -21608,7 +21583,7 @@ test "review root expansion survives manual reload and retains sticky target" {
         .result = .{ .loaded = bundle },
     });
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 4), loaded.visibleNodeCount());
     try std.testing.expectEqual(file_tree.Node.Kind.repo_root, loaded.tree.nodes[loaded.visibleNodeAt(0).?].kind);
     try std.testing.expectEqual(@as(u16, 1), loaded.tree.nodes[loaded.visibleNodeAt(1).?].depth);
@@ -21624,7 +21599,6 @@ test "watch no-op preserves selected path when status finishes before diff" {
             .load = app_test_support.loadState(current),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 1,
             },
             .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
@@ -21667,7 +21641,6 @@ test "watch no-op preserves selected path when status finishes after diff" {
             .load = app_test_support.loadState(current),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
-                .selected_file = 1,
                 .selected_node = 1,
             },
             .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
@@ -21768,7 +21741,7 @@ test "finishDiffLoad projects earlier status snapshot into empty diff" {
         .result = .empty,
     });
 
-    const loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 0), loaded.document.files.len);
     try std.testing.expectEqual(@as(usize, 2), loaded.tree.nodes.len);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
@@ -21804,8 +21777,8 @@ test "clean loaded status tears down status-only session after empty diff" {
     });
     const empty_fingerprint = content_fingerprint.Fingerprint.init("");
 
-    try std.testing.expect(app.reviewNavigation().loadedDiff() != null);
-    try std.testing.expectEqual(@as(usize, 0), app.reviewNavigation().loadedDiff().?.document.files.len);
+    try std.testing.expect(app.reviewNavigation().activeLoadedDiff() != null);
+    try std.testing.expectEqual(@as(usize, 0), app.reviewNavigation().activeLoadedDiff().?.document.files.len);
     try std.testing.expect(app.pages.review.auto_reload.accepted_source.?.fingerprint.eql(empty_fingerprint));
 
     const clean = try git_status.StatusBundle.parseOwned(allocator, "");
@@ -21817,7 +21790,7 @@ test "clean loaded status tears down status-only session after empty diff" {
     });
 
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.git_status.document.entries.len);
-    try std.testing.expect(app.reviewNavigation().loadedDiff() == null);
+    try std.testing.expect(app.reviewNavigation().activeLoadedDiff() == null);
     try std.testing.expect(app.pages.review.load.state == .empty);
     try std.testing.expectEqual(EmptyReason.no_changes, app.pages.review.load.state.empty);
     try std.testing.expect(app.pages.review.auto_reload.accepted_source.?.fingerprint.eql(empty_fingerprint));
@@ -21864,7 +21837,7 @@ test "source failure before clean status-only teardown remains stale" {
     try app.pages.review.git_status.replace("/repo", &current);
     ownTestSourceRead(&app, 2, .initial);
     try app.finishDiffLoad(&ctx, .{ .identity = page.RequestIdentity.review(0, 1), .generation = 2, .result = .empty });
-    try std.testing.expect(app.reviewNavigation().loadedDiff() != null);
+    try std.testing.expect(app.reviewNavigation().activeLoadedDiff() != null);
 
     app.pages.review.load.generation = 3;
     app.pages.review.load.pending = .{ .diff_load = 3 };
@@ -21884,7 +21857,7 @@ test "source failure before clean status-only teardown remains stale" {
         .result = .{ .loaded = clean },
     });
 
-    try std.testing.expect(app.reviewNavigation().loadedDiff() == null);
+    try std.testing.expect(app.reviewNavigation().activeLoadedDiff() == null);
     try std.testing.expect(!app.pages.review.auto_reload.sourceIsActionable());
     try std.testing.expect(app.pages.review.auto_reload.last_failure != null);
     try std.testing.expectEqualStrings("auto reload failed: source transient", app.pages.review.status.text());
@@ -21983,7 +21956,7 @@ test "empty status result tears down status-only session after empty diff" {
         .result = .empty,
     });
 
-    try std.testing.expect(app.reviewNavigation().loadedDiff() != null);
+    try std.testing.expect(app.reviewNavigation().activeLoadedDiff() != null);
 
     try app.finishStatusLoad(&ctx, .{
         .identity = page.RequestIdentity.review(0, 1),
@@ -21993,7 +21966,7 @@ test "empty status result tears down status-only session after empty diff" {
     });
 
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.git_status.document.entries.len);
-    try std.testing.expect(app.reviewNavigation().loadedDiff() == null);
+    try std.testing.expect(app.reviewNavigation().activeLoadedDiff() == null);
     try std.testing.expect(app.pages.review.load.state == .empty);
     try std.testing.expectEqual(EmptyReason.no_changes, app.pages.review.load.state.empty);
 }
@@ -22023,7 +21996,7 @@ test "identical staged-only status keeps status-only session after empty diff" {
         .result = .empty,
     });
 
-    const loaded_after_diff = app.reviewNavigation().loadedDiff() orelse return error.ExpectedLoadedDiff;
+    const loaded_after_diff = app.reviewNavigation().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
     try std.testing.expectEqual(@as(usize, 0), loaded_after_diff.document.files.len);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.git_status.document.entries.len);
 
@@ -22035,7 +22008,7 @@ test "identical staged-only status keeps status-only session after empty diff" {
         .result = .{ .loaded = same },
     });
 
-    const loaded_after_status = app.reviewNavigation().loadedDiff() orelse return error.ExpectedLoadedDiff;
+    const loaded_after_status = app.reviewNavigation().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
     try std.testing.expectEqual(@as(usize, 0), loaded_after_status.document.files.len);
     try std.testing.expect(loaded_after_status.visibleNodeCount() > 0);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.git_status.document.entries.len);

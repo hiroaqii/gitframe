@@ -22,7 +22,6 @@ test "selectionContext exposes selected diff file model coordinate" {
             .load = test_support.loadState(test_support.loadedDiffTwo()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
-                .selected_file = 0,
                 .diff_cursor = .{ .hunk_header = 1 },
             },
         } },

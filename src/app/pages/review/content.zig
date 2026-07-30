@@ -781,7 +781,6 @@ test "Review repository target reports accepted deleted file as unavailable" {
         .load = test_support.loadState(test_support.loadedDiffTwoWithStatuses()),
         .viewer = .{
             .selected_target = .{ .diff_file = 1 },
-            .selected_file = 1,
             .selected_node = 1,
             .diff_cursor = .{ .metadata = 0 },
             .display_mode = .unified,
