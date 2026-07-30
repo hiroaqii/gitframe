@@ -658,77 +658,6 @@ pub fn sideBySideLineIndexAtRenderedOffset(lines: []const diff_parser.DiffLine, 
     return null;
 }
 
-/// Converts a hunk's raw unified lines into the rows used by side-by-side mode.
-///
-/// Git commonly emits replacement blocks as a removed run followed by an added
-/// run (`-a -b +A +B`). Pairing those runs by index keeps the two sides aligned
-/// for rendering, counting, and search.
-pub const SideBySideIterator = struct {
-    lines: []const diff_parser.DiffLine,
-    index: usize = 0,
-    block_removed_start: usize = 0,
-    block_removed_len: usize = 0,
-    block_added_start: usize = 0,
-    block_added_len: usize = 0,
-    block_offset: usize = 0,
-    in_block: bool = false,
-
-    pub fn init(lines: []const diff_parser.DiffLine) SideBySideIterator {
-        return .{ .lines = lines };
-    }
-
-    pub fn next(self: *SideBySideIterator) ?SideBySideRow {
-        if (self.in_block) return self.nextBlockRow();
-        if (self.index >= self.lines.len) return null;
-
-        const line = self.lines[self.index];
-        if (line.kind == .removed) {
-            const removed_start = self.index;
-            var added_start = removed_start;
-            while (added_start < self.lines.len and self.lines[added_start].kind == .removed) : (added_start += 1) {}
-
-            var added_end = added_start;
-            while (added_end < self.lines.len and self.lines[added_end].kind == .added) : (added_end += 1) {}
-
-            if (added_end > added_start) {
-                self.in_block = true;
-                self.block_removed_start = removed_start;
-                self.block_removed_len = added_start - removed_start;
-                self.block_added_start = added_start;
-                self.block_added_len = added_end - added_start;
-                self.block_offset = 0;
-                return self.nextBlockRow();
-            }
-        }
-
-        self.index += 1;
-        return .{ .single = line };
-    }
-
-    pub fn skipRows(self: *SideBySideIterator, count: usize) void {
-        var skipped: usize = 0;
-        while (skipped < count) : (skipped += 1) {
-            if (self.next() == null) return;
-        }
-    }
-
-    fn nextBlockRow(self: *SideBySideIterator) ?SideBySideRow {
-        const max_len = @max(self.block_removed_len, self.block_added_len);
-        if (self.block_offset >= max_len) {
-            self.index = self.block_added_start + self.block_added_len;
-            self.in_block = false;
-            return self.next();
-        }
-
-        const offset = self.block_offset;
-        self.block_offset += 1;
-        return .{ .paired = .{
-            .removed = if (offset < self.block_removed_len) self.lines[self.block_removed_start + offset] else null,
-            .added = if (offset < self.block_added_len) self.lines[self.block_added_start + offset] else null,
-        } };
-    }
-};
-
 pub const SideBySideIndexedIterator = struct {
     lines: []const diff_parser.DiffLine,
     index: usize = 0,
@@ -1240,14 +1169,18 @@ test "side-by-side pairs removed and added runs by index" {
         .{ .kind = .added, .text = "new two", .new_line = 2 },
     };
 
-    var rows = SideBySideIterator.init(lines[0..]);
+    var rows = SideBySideIndexedIterator.init(lines[0..]);
     const first = rows.next().?.paired;
     const second = rows.next().?.paired;
 
-    try std.testing.expectEqualStrings("old one", first.removed.?.text);
-    try std.testing.expectEqualStrings("new one", first.added.?.text);
-    try std.testing.expectEqualStrings("old two", second.removed.?.text);
-    try std.testing.expectEqualStrings("new two", second.added.?.text);
+    try std.testing.expectEqualStrings("old one", first.removed.?.line.text);
+    try std.testing.expectEqual(@as(usize, 0), first.removed.?.line_index);
+    try std.testing.expectEqualStrings("new one", first.added.?.line.text);
+    try std.testing.expectEqual(@as(usize, 2), first.added.?.line_index);
+    try std.testing.expectEqualStrings("old two", second.removed.?.line.text);
+    try std.testing.expectEqual(@as(usize, 1), second.removed.?.line_index);
+    try std.testing.expectEqualStrings("new two", second.added.?.line.text);
+    try std.testing.expectEqual(@as(usize, 3), second.added.?.line_index);
     try std.testing.expect(rows.next() == null);
     try std.testing.expectEqual(@as(usize, 3), renderedBodyLineCount(.{
         .header = "diff --git a/a b/a",

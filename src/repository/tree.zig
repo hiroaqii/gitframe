@@ -179,10 +179,6 @@ pub const Tree = struct {
         return self.visible[0..self.visible_len];
     }
 
-    pub fn toggleVisible(self: *Tree, visible_index: usize) bool {
-        return self.toggleVisibleFor(visible_index, .all);
-    }
-
     pub fn toggleVisibleFor(self: *Tree, visible_index: usize, visibility: Visibility) bool {
         if (visible_index >= self.visible_len) return false;
         const node = &self.nodes[self.visible[visible_index]];
@@ -236,17 +232,6 @@ pub const Tree = struct {
             return index;
         }
         return null;
-    }
-
-    pub fn visibleIndexForPath(self: *const Tree, path: []const u8) ?usize {
-        for (self.visibleNodes(), 0..) |node_index, visible_index| {
-            if (std.mem.eql(u8, self.nodes[node_index].path, path)) return visible_index;
-        }
-        return null;
-    }
-
-    pub fn revealNode(self: *Tree, node_index: usize) ?usize {
-        return self.revealNodeFor(node_index, .all);
     }
 
     pub fn revealNodeFor(self: *Tree, node_index: usize, visibility: Visibility) ?usize {
@@ -396,7 +381,7 @@ test "repository minimum tree disclosure builds only top-level entries and toggl
     try std.testing.expectEqualStrings("src", tree.nodes[0].path);
     try std.testing.expect(!tree.nodes[0].expanded);
     try std.testing.expectEqual(@as(usize, 2), tree.visible_len);
-    try std.testing.expect(tree.toggleVisible(0));
+    try std.testing.expect(tree.toggleVisibleFor(0, .all));
     try std.testing.expectEqual(@as(usize, 4), tree.visible_len);
     try std.testing.expect(tree.collapseAllFor(.all));
     try std.testing.expectEqual(@as(usize, 2), tree.visible_len);
@@ -408,15 +393,14 @@ test "repository minimum tree disclosure reveals a file below collapsed ancestor
     defer document.deinit(std.testing.allocator);
     var tree = try Tree.build(std.testing.allocator, &document);
     defer tree.deinit(std.testing.allocator);
-    try std.testing.expect(tree.visibleIndexForPath("a/b/file.zig") == null);
-    const file_index = for (tree.nodes, 0..) |node, index| {
-        if (std.mem.eql(u8, node.path, "a/b/file.zig")) break index;
-    } else return error.ExpectedFile;
-    const visible = tree.revealNode(file_index) orelse return error.ExpectedVisibleFile;
+    const file_index = tree.nodeIndexForPath("a/b/file.zig", .all) orelse return error.ExpectedFile;
+    try std.testing.expect(std.mem.indexOfScalar(usize, tree.visibleNodes(), file_index) == null);
+    const visible = tree.revealNodeFor(file_index, .all) orelse return error.ExpectedVisibleFile;
     try std.testing.expectEqualStrings("a/b/file.zig", tree.nodes[tree.visible[visible]].path);
     const other = tree.nodeIndexForPath("other", .all) orelse return error.ExpectedDirectory;
     try std.testing.expect(!tree.nodes[other].expanded);
-    try std.testing.expect(tree.visibleIndexForPath("other/nested") == null);
+    const other_nested = tree.nodeIndexForPath("other/nested", .all) orelse return error.ExpectedDirectory;
+    try std.testing.expect(std.mem.indexOfScalar(usize, tree.visibleNodes(), other_nested) == null);
 }
 
 test "repository minimum tree disclosure restores matching expansion and keeps new directories closed" {
@@ -424,7 +408,7 @@ test "repository minimum tree disclosure restores matching expansion and keeps n
     defer first_document.deinit(std.testing.allocator);
     var first = try Tree.build(std.testing.allocator, &first_document);
     defer first.deinit(std.testing.allocator);
-    try std.testing.expect(first.toggleVisible(0));
+    try std.testing.expect(first.toggleVisibleFor(0, .all));
 
     var next_document = try documentForTest("a/one.zig\x00a/new.zig\x00b/three.zig\x00c/four.zig\x00");
     defer next_document.deinit(std.testing.allocator);
@@ -460,7 +444,10 @@ test "repository tree restores dash sibling collapse by raw identity" {
     defer old_document.deinit(std.testing.allocator);
     var old = try Tree.build(std.testing.allocator, &old_document);
     defer old.deinit(std.testing.allocator);
-    try std.testing.expect(old.toggleVisible(old.visibleIndexForPath("a").?));
+    const old_a = old.nodeIndexForPath("a", .all) orelse return error.ExpectedDirectory;
+    const old_a_visible = std.mem.indexOfScalar(usize, old.visibleNodes(), old_a) orelse
+        return error.ExpectedDirectory;
+    try std.testing.expect(old.toggleVisibleFor(old_a_visible, .all));
 
     var new_document = try documentForTest("a/f.zig\x00a-c/g.zig\x00");
     defer new_document.deinit(std.testing.allocator);
@@ -468,8 +455,8 @@ test "repository tree restores dash sibling collapse by raw identity" {
     defer new.deinit(std.testing.allocator);
     _ = try new.restoreStateFrom(std.testing.allocator, &old, null);
 
-    const a_index = new.visibleIndexForPath("a") orelse return error.ExpectedDirectory;
-    try std.testing.expect(new.nodes[new.visible[a_index]].expanded);
+    const a = new.nodeIndexForPath("a", .all) orelse return error.ExpectedDirectory;
+    try std.testing.expect(new.nodes[a].expanded);
     const a_c = new.nodeIndexForPath("a-c", .all) orelse return error.ExpectedDirectory;
     try std.testing.expect(!new.nodes[a_c].expanded);
 }

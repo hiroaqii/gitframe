@@ -3824,7 +3824,7 @@ test "repository All replacement restores typed directory cursor beside hidden s
     };
     defer state.deinit(allocator);
     state.selected_path = state.bundle.?.tree.filePath("dir/selected.zig", .all);
-    try std.testing.expect(state.bundle.?.tree.toggleVisible(0));
+    try std.testing.expect(state.bundle.?.tree.toggleVisibleFor(0, .all));
     state.viewer.tree_cursor = 1;
 
     var incoming = try bundleForTest("dir/selected.zig\x00root.zig\x00");
@@ -3898,7 +3898,11 @@ test "repository explicit reload restores typed root and directory across outcom
     try std.testing.expectEqualStrings("dir/selected.zig", state.selected_path.?);
 
     const directory = state.bundle.?.tree.nodeIndexForPath("dir", .all) orelse return error.ExpectedDirectory;
-    const directory_visible = state.bundle.?.tree.visibleIndexForPath("dir") orelse return error.ExpectedVisibleDirectory;
+    const directory_visible = std.mem.indexOfScalar(
+        usize,
+        state.bundle.?.tree.visibleNodes(),
+        directory,
+    ) orelse return error.ExpectedVisibleDirectory;
     try std.testing.expect(state.bundle.?.tree.toggleVisibleFor(directory_visible, .all));
     state.viewer.tree_cursor = state.tree_projection.visibleIndexForTarget(
         &state.bundle.?.tree,

@@ -121,10 +121,6 @@ pub const Effective = struct {
         return self.bindings[@intFromEnum(action)];
     }
 
-    pub fn isBound(self: Effective, action: PublicAction) bool {
-        return self.spec(action) != null;
-    }
-
     pub fn actionForKey(self: Effective, key: chasen.Key) ?PublicAction {
         inline for (@typeInfo(PublicAction).@"enum".fields) |field| {
             const action: PublicAction = @enumFromInt(field.value);
@@ -194,7 +190,7 @@ pub fn validateConfig(config: Config) bool {
     return true;
 }
 
-pub fn formatKeySpec(buffer: []u8, spec: KeySpec) []const u8 {
+fn formatKeySpec(buffer: []u8, spec: KeySpec) []const u8 {
     return switch (spec) {
         .plain_codepoint => |codepoint| writeCodepoint(buffer, codepoint),
         .exact => |codepoint| writeCodepoint(buffer, codepoint),
@@ -403,14 +399,14 @@ test "effective keymap matches overridden actions" {
 
 test "fetch is unbound by default and configurable" {
     const defaults: Effective = .{};
-    try std.testing.expect(!defaults.isBound(.fetch));
+    try std.testing.expect(defaults.spec(.fetch) == null);
     try std.testing.expect(defaults.actionForKey(.{ .codepoint = 'F' }) != PublicAction.fetch);
     try std.testing.expect(defaults.display(.fetch, &.{}) == null);
 
     var config: Config = .{};
     config.set(.fetch, .{ .ctrl = .s });
     const effective = Effective.fromConfig(config);
-    try std.testing.expect(effective.isBound(.fetch));
+    try std.testing.expect(effective.spec(.fetch) != null);
     try std.testing.expectEqual(PublicAction.fetch, effective.actionForKey(.{ .codepoint = 's', .mods = .{ .ctrl = true } }).?);
 
     var buffer: [16]u8 = undefined;
