@@ -652,14 +652,41 @@ pub const View = struct {
     }
 
     pub fn visibleBodyTextMaxHorizontalScroll(self: View) usize {
-        if (self.displayedReviewBody() == .inert_invalid_utf8) return 0;
-        const file = self.selectedFile() orelse return 0;
         const mode = self.effectiveDisplayMode();
         const visible_rows = self.diffVisibleRows();
         if (visible_rows == 0) return 0;
 
         const pane_width = self.diffPaneWidth();
-        const line_index = self.selectedFileCachedLineIndex(mode);
+        switch (self.displayedReviewBody()) {
+            .generated => |bundle| {
+                const row_count = bundle.source.rowCount();
+                const first_row = @min(self.page.viewer.diff_scroll, row_count);
+                const end_row = @min(first_row +| visible_rows, row_count);
+                var max_scroll: usize = 0;
+                for (first_row..end_row) |row_index| {
+                    const line: diff_parser.DiffLine = .{
+                        .kind = .added,
+                        .text = bundle.source.lineBody(row_index) orelse continue,
+                        .new_line = @intCast(row_index + 1),
+                    };
+                    const body_row: diff_view_model.BodyRow = switch (mode) {
+                        .unified => .{ .unified_line = line },
+                        .side_by_side => .{ .side_by_side = .{ .paired = .{ .added = line } } },
+                    };
+                    max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(
+                        body_row,
+                        pane_width,
+                        self.page.viewer.view_options.line_numbers,
+                    ));
+                }
+                return max_scroll;
+            },
+            .primary, .cached, .combined, .retained_staged_only => {},
+            .none, .inert_invalid_utf8, .status, .pending => return 0,
+        }
+
+        const file = self.displayedDiffFile() orelse return 0;
+        const line_index = self.displayedDiffLineIndex(mode);
         var max_scroll: usize = 0;
         var rows = if (line_index) |index|
             diff_view_model.BodyRowIterator.initAtWithFolded(file, mode, index, self.page.viewer.diff_scroll, self.selectedFoldedHunks())
@@ -917,13 +944,13 @@ pub const View = struct {
     }
 
     pub fn displayedDiffLineIndex(self: View, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
-        if (self.activeCombinedProjection()) |bundle| return bundle.displayLineIndex(mode);
-        if (self.activeRetainedStagedOnlyProjection()) |bundle| return bundle.displayLineIndex(mode);
-        if (self.activeCachedDiffProjection()) |bundle| {
-            if (bundle.loaded.document.files.len == 0) return null;
-            return bundle.loaded.cachedRenderedLineIndex(0, mode);
-        }
-        return null;
+        return switch (self.displayedReviewBody()) {
+            .primary => |primary| primary.loaded.cachedRenderedLineIndex(primary.file_index, mode),
+            .cached => |bundle| bundle.loaded.cachedRenderedLineIndex(0, mode),
+            .combined => |bundle| bundle.displayLineIndex(mode),
+            .retained_staged_only => |bundle| bundle.displayLineIndex(mode),
+            .none, .generated, .inert_invalid_utf8, .status, .pending => null,
+        };
     }
 
     pub fn activeDiffDisplay(self: View, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?ActiveDiffDisplay {
@@ -2856,6 +2883,190 @@ const TestHarness = struct {
     }
 };
 
+const displayed_body_horizontal_scroll_wide_text =
+    "wide-0123456789-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-" ++
+    "0123456789-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-" ++
+    "0123456789-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+const displayed_body_horizontal_scroll_cached_patch =
+    "diff --git a/a b/a\n" ++
+    "index 1111111..2222222 100644\n" ++
+    "--- a/a\n" ++
+    "+++ b/a\n" ++
+    "@@ -10 +10 @@\n" ++
+    "-old staged\n" ++
+    "+" ++ displayed_body_horizontal_scroll_wide_text ++ "\n";
+
+const displayed_body_horizontal_scroll_unstaged_patch =
+    "diff --git a/a b/a\n" ++
+    "index 2222222..3333333 100644\n" ++
+    "--- a/a\n" ++
+    "+++ b/a\n" ++
+    "@@ -20 +20 @@\n" ++
+    "-old unstaged\n" ++
+    "+new unstaged\n";
+
+const displayed_body_horizontal_scroll_retained_authority_patch =
+    "diff --git a/a b/a\n" ++
+    "index 1111111..3333333 100644\n" ++
+    "--- a/a\n" ++
+    "+++ b/a\n" ++
+    "@@ -10 +10 @@\n" ++
+    "-old staged\n" ++
+    "+" ++ displayed_body_horizontal_scroll_wide_text ++ "\n" ++
+    "@@ -20 +20 @@\n" ++
+    "-old unstaged\n" ++
+    "+new unstaged\n";
+
+fn prepareStatusOnlyHorizontalScrollHarness(
+    harness: *TestHarness,
+    allocator: std.mem.Allocator,
+    status_text: []const u8,
+) !void {
+    harness.repo_root = "/repo";
+    _ = harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, status_text);
+    try harness.pages.review.git_status.replace("/repo", &status_bundle);
+}
+
+fn installCombinedHorizontalScrollProjection(
+    harness: *TestHarness,
+    allocator: std.mem.Allocator,
+) !void {
+    var cached_bundle = try app_load.buildLoadedBundle(allocator, displayed_body_horizontal_scroll_cached_patch);
+    errdefer cached_bundle.deinit();
+    var unstaged_bundle = try app_load.buildLoadedBundle(allocator, displayed_body_horizontal_scroll_unstaged_patch);
+    errdefer unstaged_bundle.deinit();
+    var cached_authority = try projection_component.ParsedComponent.parse(allocator, displayed_body_horizontal_scroll_cached_patch);
+    errdefer cached_authority.deinit();
+    var unstaged_authority = try projection_component.ParsedComponent.parse(allocator, displayed_body_horizontal_scroll_unstaged_patch);
+    errdefer unstaged_authority.deinit();
+    var presentation_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer presentation_arena.deinit();
+    var authority_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer authority_arena.deinit();
+    const projection = try diff_hunk_projection.buildWithAllocators(
+        presentation_arena.allocator(),
+        authority_arena.allocator(),
+        cached_bundle.loaded.document.files[0],
+        unstaged_bundle.loaded.document.files[0],
+    );
+    var request = try review_projection.testing.cloneRequest(
+        allocator,
+        harness.pages.review.activation.currentIdentity().?,
+        1,
+        "/repo",
+        "a",
+        .combined_hunks,
+        .unstaged,
+        harness.pages.review.source_session_revision,
+        harness.pages.review.status_snapshot_revision,
+    );
+    errdefer request.deinit(allocator);
+
+    harness.pages.review.review_projection.installReady(.{
+        .request = request,
+        .value = .{ .combined_hunks = .{
+            .presentation = .{
+                .arena = presentation_arena,
+                .projection = projection.presentation,
+                .cached_bundle = cached_bundle,
+                .unstaged_bundle = unstaged_bundle,
+                .fingerprint = diff_presentation_identity.fingerprint(projection.presentation.file),
+                .content_token = .init(1),
+            },
+            .authority = .{
+                .arena = authority_arena,
+                .projection = projection.authority,
+                .cached_component = cached_authority,
+                .unstaged_component = unstaged_authority,
+                .status_snapshot_revision = harness.pages.review.status_snapshot_revision,
+            },
+        } },
+    });
+}
+
+fn retainCombinedHorizontalScrollProjection(
+    harness: *TestHarness,
+    allocator: std.mem.Allocator,
+) !void {
+    const displayed = harness.pages.review.review_projection.displayed.ready.value.combined_hunks.displayFile();
+    var cached_component = try projection_component.ParsedComponent.parse(
+        allocator,
+        displayed_body_horizontal_scroll_retained_authority_patch,
+    );
+    errdefer cached_component.deinit();
+    if (!diff_presentation_identity.exactEqual(displayed, cached_component.document.files[0])) {
+        return error.InvalidHorizontalScrollTestFixture;
+    }
+
+    const authority_allocator = cached_component.arena.?.allocator();
+    const hunk_count = cached_component.document.files[0].hunks.len;
+    const stage_states = try authority_allocator.alloc(diff_hunk_projection.HunkStageState, hunk_count);
+    @memset(stage_states, .staged);
+    const action_origins = try authority_allocator.alloc(diff_hunk_projection.HunkActionOrigin, hunk_count);
+    for (action_origins, 0..) |*origin, hunk_index| {
+        origin.* = .{ .cached = hunk_index };
+    }
+
+    var request = try review_projection.testing.cloneRequest(
+        allocator,
+        harness.pages.review.activation.currentIdentity().?,
+        2,
+        "/repo",
+        "a",
+        .cached_diff,
+        .unstaged,
+        harness.pages.review.source_session_revision,
+        harness.pages.review.status_snapshot_revision,
+    );
+    errdefer request.deinit(allocator);
+    var candidate: review_projection.StagedOnlyReuseCandidate = .{
+        .fingerprint = diff_presentation_identity.fingerprint(cached_component.document.files[0]),
+        .fresh_authority = .{
+            .projection = .{
+                .hunk_stage_states = stage_states,
+                .hunk_action_origins = action_origins,
+            },
+            .cached_component = cached_component,
+            .status_snapshot_revision = harness.pages.review.status_snapshot_revision,
+        },
+    };
+    harness.pages.review.review_projection.installRetainedStagedOnlyReuse(
+        allocator,
+        request,
+        &candidate,
+    );
+    candidate.deinit();
+}
+
+fn expectDisplayedBodyHorizontalScrollGeometry(harness: *TestHarness) !void {
+    harness.terminal_size = .{ .width = 140, .height = 16 };
+    harness.pages.review.viewer.diff_scroll = 0;
+    inline for ([_]diff_render.DisplayMode{ .unified, .side_by_side }) |mode| {
+        harness.pages.review.viewer.display_mode = mode;
+        harness.pages.review.viewer.view_options.line_numbers = true;
+        const with_line_numbers = harness.view().visibleBodyTextMaxHorizontalScroll();
+        try std.testing.expect(with_line_numbers >= 8);
+
+        harness.pages.review.viewer.diff_horizontal_scroll = 0;
+        harness.controller().scrollDiffHorizontal(.right);
+        try std.testing.expectEqual(@as(usize, 8), harness.pages.review.viewer.diff_horizontal_scroll);
+
+        harness.pages.review.viewer.view_options.line_numbers = false;
+        const without_line_numbers = harness.view().visibleBodyTextMaxHorizontalScroll();
+        try std.testing.expect(with_line_numbers > without_line_numbers);
+    }
+
+    harness.terminal_size = .{ .width = 60, .height = 16 };
+    harness.pages.review.viewer.view_options.line_numbers = true;
+    harness.pages.review.viewer.display_mode = .side_by_side;
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, harness.view().effectiveDisplayMode());
+    const requested_side_by_side = harness.view().visibleBodyTextMaxHorizontalScroll();
+    harness.pages.review.viewer.display_mode = .unified;
+    try std.testing.expectEqual(requested_side_by_side, harness.view().visibleBodyTextMaxHorizontalScroll());
+}
+
 fn exactReviewIntent(app: *const TestHarness, path: []const u8) page_link.ReviewLocationIntent {
     return .{
         .repo_epoch = app.repo_epoch,
@@ -3607,6 +3818,275 @@ test "horizontal scroll uses diff focus arrows and clamps to visible text" {
 
     app.reviewNavigation().scrollDiffHorizontal(.left);
     try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll <= app.reviewNavigationView().visibleBodyTextMaxHorizontalScroll());
+}
+
+test "displayed body horizontal scroll preserves primary behavior without a cached index" {
+    var harness = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffWide()),
+        .viewer = .{
+            .focus = .diff,
+            .display_mode = .unified,
+        },
+    }, .{ .width = 80, .height = 12 });
+
+    try std.testing.expect(harness.view().displayedReviewBody() == .primary);
+    try std.testing.expect(harness.view().displayedDiffLineIndex(.unified) == null);
+    const with_line_numbers = harness.view().visibleBodyTextMaxHorizontalScroll();
+    try std.testing.expect(with_line_numbers >= 8);
+
+    harness.controller().scrollDiffHorizontal(.right);
+    try std.testing.expectEqual(@as(usize, 8), harness.pages.review.viewer.diff_horizontal_scroll);
+    harness.pages.review.viewer.view_options.line_numbers = false;
+    try std.testing.expect(
+        harness.view().visibleBodyTextMaxHorizontalScroll() < with_line_numbers,
+    );
+}
+
+test "displayed body horizontal scroll uses cached combined retained and generated authority" {
+    const allocator = std.testing.allocator;
+
+    var cached = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .selected_target = .{ .status_only = 0 },
+            .focus = .diff,
+            .sidebar_hidden = true,
+        },
+    }, .{ .width = 140, .height = 16 });
+    try prepareStatusOnlyHorizontalScrollHarness(&cached, allocator, "M  a\x00");
+    cached.pages.review.review_projection.installReady(.{
+        .request = try review_projection.testing.cloneRequest(
+            allocator,
+            cached.pages.review.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            cached.pages.review.source_session_revision,
+            cached.pages.review.status_snapshot_revision,
+        ),
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(
+            allocator,
+            displayed_body_horizontal_scroll_cached_patch,
+        ) },
+    });
+    defer cached.pages.review.deinit(allocator);
+    try std.testing.expect(cached.view().displayedReviewBody() == .cached);
+    try expectDisplayedBodyHorizontalScrollGeometry(&cached);
+
+    var combined = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .focus = .diff,
+            .sidebar_hidden = true,
+        },
+    }, .{ .width = 140, .height = 16 });
+    try prepareStatusOnlyHorizontalScrollHarness(&combined, allocator, "MM a\x00");
+    try installCombinedHorizontalScrollProjection(&combined, allocator);
+    defer combined.pages.review.deinit(allocator);
+    try std.testing.expect(combined.view().displayedReviewBody() == .combined);
+    try expectDisplayedBodyHorizontalScrollGeometry(&combined);
+
+    var retained = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .focus = .diff,
+            .sidebar_hidden = true,
+        },
+    }, .{ .width = 140, .height = 16 });
+    try prepareStatusOnlyHorizontalScrollHarness(&retained, allocator, "MM a\x00");
+    try installCombinedHorizontalScrollProjection(&retained, allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try retained.pages.review.git_status.replace("/repo", &staged_status);
+    try retainCombinedHorizontalScrollProjection(&retained, allocator);
+    defer retained.pages.review.deinit(allocator);
+    try std.testing.expect(retained.view().displayedReviewBody() == .retained_staged_only);
+    try expectDisplayedBodyHorizontalScrollGeometry(&retained);
+
+    var generated = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .selected_target = .{ .status_only = 0 },
+            .focus = .diff,
+            .sidebar_hidden = true,
+        },
+    }, .{ .width = 140, .height = 16 });
+    try prepareStatusOnlyHorizontalScrollHarness(&generated, allocator, "?? a\x00");
+    generated.pages.review.review_projection.installReady(.{
+        .request = try review_projection.testing.cloneRequest(
+            allocator,
+            generated.pages.review.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .generated_added_file,
+            .unstaged,
+            generated.pages.review.source_session_revision,
+            generated.pages.review.status_snapshot_revision,
+        ),
+        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(
+            allocator,
+            "a",
+            displayed_body_horizontal_scroll_wide_text ++ "\n",
+        ) },
+    });
+    defer generated.pages.review.deinit(allocator);
+    try std.testing.expect(generated.view().displayedReviewBody() == .generated);
+    try expectDisplayedBodyHorizontalScrollGeometry(&generated);
+}
+
+test "displayed body horizontal scroll follows generated visible rows" {
+    const allocator = std.testing.allocator;
+    const content =
+        "short\n" ++
+        "short\n" ++
+        "short\n" ++
+        "short\n" ++
+        "short\n" ++
+        "short\n" ++
+        "short\n" ++
+        "short\n" ++
+        "short\n" ++
+        "short\n" ++
+        "short\n" ++
+        "short\n" ++
+        displayed_body_horizontal_scroll_wide_text ++ "\n";
+    var harness = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .selected_target = .{ .status_only = 0 },
+            .focus = .diff,
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+        },
+    }, .{ .width = 80, .height = 12 });
+    try prepareStatusOnlyHorizontalScrollHarness(&harness, allocator, "?? a\x00");
+    harness.pages.review.review_projection.installReady(.{
+        .request = try review_projection.testing.cloneRequest(
+            allocator,
+            harness.pages.review.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .generated_added_file,
+            .unstaged,
+            harness.pages.review.source_session_revision,
+            harness.pages.review.status_snapshot_revision,
+        ),
+        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(
+            allocator,
+            "a",
+            content,
+        ) },
+    });
+    defer harness.pages.review.deinit(allocator);
+
+    try std.testing.expect(harness.view().diffVisibleRows() > 0);
+    try std.testing.expect(harness.view().diffVisibleRows() < 12);
+    try std.testing.expectEqual(@as(usize, 0), harness.view().visibleBodyTextMaxHorizontalScroll());
+
+    harness.pages.review.viewer.diff_scroll = 12;
+    const visible_max = harness.view().visibleBodyTextMaxHorizontalScroll();
+    try std.testing.expect(visible_max > 0);
+    harness.pages.review.viewer.diff_horizontal_scroll = std.math.maxInt(usize);
+    harness.controller().clampDiffHorizontalScrollToVisibleRows();
+    try std.testing.expectEqual(visible_max, harness.pages.review.viewer.diff_horizontal_scroll);
+}
+
+test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
+    const allocator = std.testing.allocator;
+
+    var none = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffWide()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .sidebar_hidden = true },
+    }, .{ .width = 80, .height = 12 });
+    try prepareStatusOnlyHorizontalScrollHarness(&none, allocator, "M  a\x00");
+    defer none.pages.review.deinit(allocator);
+    try std.testing.expect(none.view().displayedReviewBody() == .none);
+    none.pages.review.viewer.diff_horizontal_scroll = 99;
+    none.controller().clampDiffHorizontalScrollToVisibleRows();
+    try std.testing.expectEqual(@as(usize, 0), none.pages.review.viewer.diff_horizontal_scroll);
+
+    var pending = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffWide()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .sidebar_hidden = true },
+    }, .{ .width = 80, .height = 12 });
+    try prepareStatusOnlyHorizontalScrollHarness(&pending, allocator, "M  a\x00");
+    pending.pages.review.review_projection.pending = try review_projection.testing.cloneRequest(
+        allocator,
+        pending.pages.review.activation.currentIdentity().?,
+        1,
+        "/repo",
+        "a",
+        .cached_diff,
+        .unstaged,
+        pending.pages.review.source_session_revision,
+        pending.pages.review.status_snapshot_revision,
+    );
+    defer pending.pages.review.deinit(allocator);
+    try std.testing.expect(pending.view().displayedReviewBody() == .pending);
+    try std.testing.expectEqual(@as(usize, 0), pending.view().visibleBodyTextMaxHorizontalScroll());
+
+    var status = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffWide()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .sidebar_hidden = true },
+    }, .{ .width = 80, .height = 12 });
+    try prepareStatusOnlyHorizontalScrollHarness(&status, allocator, "M  a\x00");
+    status.pages.review.review_projection.installReady(.{
+        .request = try review_projection.testing.cloneRequest(
+            allocator,
+            status.pages.review.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            status.pages.review.source_session_revision,
+            status.pages.review.status_snapshot_revision,
+        ),
+        .value = .{ .status_body = try review_projection.statusBodyAlloc(
+            allocator,
+            "a",
+            "No staged diff.",
+            .{},
+        ) },
+    });
+    defer status.pages.review.deinit(allocator);
+    try std.testing.expect(status.view().displayedReviewBody() == .status);
+    try std.testing.expectEqual(@as(usize, 0), status.view().visibleBodyTextMaxHorizontalScroll());
+
+    const invalid_patch =
+        "diff --git a/a b/a\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+bad\xff\n";
+    var inert = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffWide()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 }, .sidebar_hidden = true },
+    }, .{ .width = 80, .height = 12 });
+    try prepareStatusOnlyHorizontalScrollHarness(&inert, allocator, "M  a\x00");
+    inert.pages.review.review_projection.installReady(.{
+        .request = try review_projection.testing.cloneRequest(
+            allocator,
+            inert.pages.review.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            inert.pages.review.source_session_revision,
+            inert.pages.review.status_snapshot_revision,
+        ),
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, invalid_patch) },
+    });
+    defer inert.pages.review.deinit(allocator);
+    try std.testing.expect(inert.view().displayedReviewBody() == .inert_invalid_utf8);
+    try std.testing.expectEqual(@as(usize, 0), inert.view().visibleBodyTextMaxHorizontalScroll());
 }
 
 test "layout changes reset horizontal scroll only when diff pane width changes" {
