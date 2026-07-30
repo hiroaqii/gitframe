@@ -1605,6 +1605,7 @@ const ShellViewTestHarness = struct {
             .repository = .{
                 .page_state = &self.repository,
                 .palette = self.theme,
+                .keymap = self.keymap,
                 .repo_root = self.repo_state.activeRoot(),
             },
             .active_page = .review,

@@ -1,6 +1,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const draw = @import("draw");
+const keymap = @import("keymap");
 const theme = @import("theme");
 const app_state = @import("../state.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
@@ -1197,7 +1198,7 @@ pub const RepositoryPageState = struct {
             owner.free(anchor);
         }
         self.all_selection_anchor = null;
-        self.file_visibility = .all;
+        self.file_visibility = .changed;
         self.tree_projection = .{};
         const retained_tree_width = self.viewer.tree_width;
         const retained_tree_hidden = self.preferredTreeHidden();
@@ -2498,7 +2499,10 @@ pub const RepositoryPageState = struct {
         self.viewer.focus = if (self.viewer.tree_hidden) .source else .tree;
     }
 
-    pub fn inputContext(self: *const RepositoryPageState, keymap: @import("keymap").Effective) repository_input.Context {
+    pub fn inputContext(
+        self: *const RepositoryPageState,
+        effective_keymap: keymap.Effective,
+    ) repository_input.Context {
         const source_available = self.currentSource() != null;
         return .{
             .focus = if (self.viewer.tree_hidden) .source else if (source_available) self.viewer.focus else .tree,
@@ -2507,7 +2511,7 @@ pub const RepositoryPageState = struct {
             .source_search_mode = self.source_search.mode,
             .file_search_mode = self.file_search.mode,
             .source_query_len = self.source_search.query.len,
-            .keymap = keymap,
+            .keymap = effective_keymap,
         };
     }
 
@@ -3134,6 +3138,7 @@ pub fn pasteToMsg(context: repository_input.Context, text: []const u8) ?Msg {
 pub const ViewContext = struct {
     page_state: *const RepositoryPageState,
     palette: theme.Palette,
+    keymap: keymap.Effective = .{},
     /// Borrowed active canonical root. The page owns object identity but does
     /// not duplicate path metadata merely to render its safe basename.
     repo_root: ?[]const u8 = null,
@@ -3162,7 +3167,9 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             draw.copyClippedTextAt(surface, 1, size.height / 2, label, context.palette.style(if (state.load_state == .failed) .danger else .muted)) catch {};
             return;
         },
-        .loading => if (state.file_visibility == .all and !state.file_search.mode) {
+        .loading => if (state.bundle == null or
+            (state.file_visibility == .all and !state.file_search.mode))
+        {
             draw.copyClippedTextAt(surface, 1, size.height / 2, "Loading repository files...", context.palette.style(.muted)) catch {};
             return;
         },
@@ -3175,10 +3182,16 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     if (layout.tree_visible) {
         var left = surface.child(.{ .col = 0, .row = 0, .width = layout.tree_width, .height = size.height });
         try drawRepositoryBranchRow(state, &left, context.palette);
-        const tree_header: []const u8 = if (state.file_visibility == .changed) " Files [changed]" else " Files";
-        // Match Review's literal leading-cell clipping. The ellipsis-producing
-        // text helper would turn a width-one title into `…` instead of blank.
-        if (size.height > 2) _ = left.borrowTextAt(0, 2, tree_header, context.palette.boldStyle(.accent));
+        const mode_header: []const u8 = if (state.file_visibility == .changed) "Files [changed]" else "Files [all]";
+        var key_buffer: [16]u8 = undefined;
+        var header_buffer: [64]u8 = undefined;
+        const tree_header = if (context.keymap.display(.changed_file_filter, key_buffer[0..])) |binding|
+            std.fmt.bufPrint(header_buffer[0..], "{s}  ({s}: toggle)", .{ mode_header, binding }) catch mode_header
+        else
+            mode_header;
+        // Copy frame-local text and let the surface clip its right edge without
+        // adding a marker; the current mode therefore remains the leading fact.
+        if (size.height > 2) _ = left.copyTextAt(0, 2, tree_header, context.palette.boldStyle(.accent)) catch {};
         if (layout.tree_width < size.width) {
             var separator_style = context.palette.style(.muted);
             separator_style.dim = true;
@@ -4457,7 +4470,7 @@ test "repository replacement retains hidden preference behind temporary search r
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     try std.testing.expect(!state.file_search.mode);
-    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
     try std.testing.expect(state.selected_path == null);
 }
 
@@ -4993,7 +5006,7 @@ test "repository changed filter allocation failure leaves mode and selection unc
     try std.testing.expectEqualStrings("Could not preserve All selection", state.status.text());
 }
 
-test "repository changed filter survives page activation and resets for repository identity" {
+test "repository filter discoverability defaults new identity and preserves same identity mode" {
     const allocator = std.testing.allocator;
     const identity = root_capability.Identity{ .device = 1, .inode = 2 };
     var state: RepositoryPageState = .{
@@ -5016,11 +5029,32 @@ test "repository changed filter survives page activation and resets for reposito
     try std.testing.expectEqualStrings("clean.zig", state.all_selection_anchor.?);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
 
-    state.repositoryChanged(allocator, 5, .{ .device = 3, .inode = 4 });
+    _ = state.applyNavigation(allocator, .toggle_changed_filter, .{ .width = 80, .height = 10 });
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    try std.testing.expectEqualStrings("clean.zig", state.selected_path.?);
+    try std.testing.expect(state.all_selection_anchor == null);
+
+    state.deactivate();
+    state.activate(4, identity);
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    try std.testing.expectEqualStrings("clean.zig", state.selected_path.?);
+
+    state.repositoryChanged(allocator, 5, .{ .device = 3, .inode = 4 });
+    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
     try std.testing.expect(state.all_selection_anchor == null);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
+
+    var replacement = try bundleForTest("next-change.zig\x00next-clean.zig\x00");
+    var replacement_owned = true;
+    defer if (replacement_owned) replacement.deinit(allocator);
+    try applyBundleStatusForTest(&replacement, " M next-change.zig\x00");
+    try state.replaceBundle(allocator, &replacement);
+    replacement_owned = false;
+    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
+    try std.testing.expectEqual(@as(usize, 1), state.bundle.?.tree.visible_len);
+    try std.testing.expectEqualStrings("next-change.zig", state.selected_path.?);
+    try std.testing.expect(state.bundle.?.tree.filePath("next-clean.zig", .changed) == null);
 }
 
 fn manifestResultForTest(bytes: []const u8) !git_backend.RepositoryManifestLoadResult {
@@ -5494,8 +5528,8 @@ test "repository tree cursor background follows active focus and preserves seman
     try active_surface.init(size.width, size.height);
     defer active_surface.deinit();
     try view(.{ .page_state = &state, .palette = palette }, &active_surface.surface);
-    try active_surface.expectCellText(0, 2, " ");
-    try active_surface.expectCellText(1, 2, "F");
+    try active_surface.expectCellText(0, 2, "F");
+    try active_surface.expectCellText(1, 2, "i");
     const active_header = active_surface.surface.readCell(0, 2) orelse return error.ExpectedTreeHeader;
     const active_root = active_surface.surface.readCell(0, root_row) orelse return error.ExpectedRoot;
     const active_directory = active_surface.surface.readCell(4, directory_row) orelse return error.ExpectedDirectory;
@@ -5569,8 +5603,8 @@ test "repository tree cursor background follows active focus and preserves seman
     try inactive_surface.init(size.width, size.height);
     defer inactive_surface.deinit();
     try view(.{ .page_state = &state, .palette = palette }, &inactive_surface.surface);
-    try inactive_surface.expectCellText(0, 2, " ");
-    try inactive_surface.expectCellText(1, 2, "F");
+    try inactive_surface.expectCellText(0, 2, "F");
+    try inactive_surface.expectCellText(1, 2, "i");
     const inactive_header = inactive_surface.surface.readCell(0, 2) orelse return error.ExpectedTreeHeader;
     const inactive_root = inactive_surface.surface.readCell(0, root_row) orelse return error.ExpectedRoot;
     const inactive_directory = inactive_surface.surface.readCell(4, directory_row) orelse return error.ExpectedDirectory;
@@ -7055,8 +7089,8 @@ test "repository minimum tree disclosure empty typed root stays open after mouse
     try expanded_surface.init(full_size.width, full_size.height);
     defer expanded_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &expanded_surface.surface);
-    try expanded_surface.expectCellText(0, 2, " ");
-    try expanded_surface.expectCellText(1, 2, "F");
+    try expanded_surface.expectCellText(0, 2, "F");
+    try expanded_surface.expectCellText(1, 2, "i");
     try expanded_surface.expectCellText(0, 3, "▾");
     try expanded_surface.expectCellText(0, 4, "R");
     const expanded_snapshot = try expanded_surface.snapshot(allocator);
@@ -7088,8 +7122,8 @@ test "repository minimum tree disclosure empty typed root stays open after mouse
     try compact_surface.init(compact_size.width, compact_size.height);
     defer compact_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &compact_surface.surface);
-    try compact_surface.expectCellText(0, 2, " ");
-    try compact_surface.expectCellText(1, 2, "F");
+    try compact_surface.expectCellText(0, 2, "F");
+    try compact_surface.expectCellText(1, 2, "i");
     const compact_snapshot = try compact_surface.snapshot(allocator);
     defer allocator.free(compact_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "empty-repo") == null);
@@ -7099,14 +7133,14 @@ test "repository minimum tree disclosure empty typed root stays open after mouse
     try width_one.init(1, compact_size.height);
     defer width_one.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &width_one.surface);
-    try width_one.expectCellText(0, 2, " ");
+    try width_one.expectCellText(0, 2, "F");
 
     var width_two: chasen.testing.TestSurface = undefined;
     try width_two.init(2, compact_size.height);
     defer width_two.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &width_two.surface);
-    try width_two.expectCellText(0, 2, " ");
-    try width_two.expectCellText(1, 2, "F");
+    try width_two.expectCellText(0, 2, "F");
+    try width_two.expectCellText(1, 2, "i");
 }
 
 test "Repository branch C2 renders read-only facts without moving tree geometry" {
@@ -7132,8 +7166,8 @@ test "Repository branch C2 renders read-only facts without moving tree geometry"
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "push") == null);
     try test_surface.expectCellText(1, 0, "m");
     try test_surface.expectCellText(0, 1, " ");
-    try test_surface.expectCellText(0, 2, " ");
-    try test_surface.expectCellText(1, 2, "F");
+    try test_surface.expectCellText(0, 2, "F");
+    try test_surface.expectCellText(1, 2, "i");
     try test_surface.expectCellText(0, 3, "▾");
     const branch_cell = test_surface.surface.readCell(1, 0) orelse return error.ExpectedRepositoryBranchCell;
     try std.testing.expect(branch_cell.style.fg.eql(palette.color(.info)));
@@ -7335,7 +7369,7 @@ test "Repository branch C2 clips width one and two without moving Files" {
     try view(.{ .page_state = &state, .palette = .default() }, &width_one.surface);
     try width_one.expectCellText(0, 0, " ");
     try width_one.expectCellText(0, 1, " ");
-    try width_one.expectCellText(0, 2, " ");
+    try width_one.expectCellText(0, 2, "F");
 
     var width_two: chasen.testing.TestSurface = undefined;
     try width_two.init(2, 3);
@@ -7344,8 +7378,8 @@ test "Repository branch C2 clips width one and two without moving Files" {
     try width_two.expectCellText(0, 0, " ");
     try width_two.expectCellText(1, 0, "…");
     try width_two.expectCellText(0, 1, " ");
-    try width_two.expectCellText(0, 2, " ");
-    try width_two.expectCellText(1, 2, "F");
+    try width_two.expectCellText(0, 2, "F");
+    try width_two.expectCellText(1, 2, "i");
 }
 
 test "repository minimum tree disclosure renders root entries and collapses opened descendants" {
@@ -7498,7 +7532,106 @@ test "repository page anchors inert checkpoint below source header rule" {
     try std.testing.expect(source_rule.style.dim);
 }
 
-test "repository changed view distinguishes loading unavailable and no-match states" {
+test "repository filter discoverability header follows effective keymap and clips mode first" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("changed.zig\x00clean.zig\x00"),
+        .load_state = .loaded,
+        .file_visibility = .changed,
+        .freshness = .fresh,
+    };
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, " M changed.zig\x00");
+    _ = state.rebuildTreeProjection(null, false, 0);
+
+    {
+        var test_surface: chasen.testing.TestSurface = undefined;
+        try test_surface.init(70, 8);
+        defer test_surface.deinit();
+        try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+        const snapshot = try test_surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [changed]  (F: toggle)") != null);
+        try test_surface.expectCellText(27, 2, ")");
+    }
+
+    var config: keymap.Config = .{};
+    config.set(.changed_file_filter, .{ .plain_codepoint = 'z' });
+    const effective = keymap.Effective.fromConfig(config);
+    const toggle = keyToMsg(state.inputContext(effective), .{ .codepoint = 'z' }) orelse
+        return error.ExpectedConfiguredFilterToggle;
+    try std.testing.expectEqual(Msg.toggle_changed_filter, toggle);
+    _ = state.applyNavigation(allocator, toggle, .{ .width = 70, .height = 8 });
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+
+    {
+        var test_surface: chasen.testing.TestSurface = undefined;
+        try test_surface.init(70, 8);
+        defer test_surface.deinit();
+        try view(.{
+            .page_state = &state,
+            .palette = .default(),
+            .keymap = effective,
+        }, &test_surface.surface);
+        const snapshot = try test_surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [all]  (z: toggle)") != null);
+    }
+
+    var unbound = effective;
+    unbound.bindings[@intFromEnum(keymap.PublicAction.changed_file_filter)] = null;
+    try std.testing.expect(keyToMsg(state.inputContext(unbound), .{ .codepoint = 'z' }) == null);
+    {
+        var test_surface: chasen.testing.TestSurface = undefined;
+        try test_surface.init(70, 8);
+        defer test_surface.deinit();
+        try view(.{
+            .page_state = &state,
+            .palette = .default(),
+            .keymap = unbound,
+        }, &test_surface.surface);
+        const snapshot = try test_surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [all]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "toggle") == null);
+    }
+
+    state.file_visibility = .changed;
+    _ = state.rebuildTreeProjection(null, false, 0);
+    {
+        var test_surface: chasen.testing.TestSurface = undefined;
+        try test_surface.init(12, 8);
+        defer test_surface.deinit();
+        try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+        const snapshot = try test_surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [chang") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "…") == null);
+        try std.testing.expectEqual(@as(u16, 12), bodyLayout(
+            test_surface.surface.size(),
+            state.viewer.tree_width,
+            state.viewer.tree_hidden,
+        ).tree_width);
+    }
+}
+
+test "repository filter discoverability bundle-less Changed loading is safe" {
+    const allocator = std.testing.allocator;
+    const state: RepositoryPageState = .{
+        .load_state = .loading,
+        .file_visibility = .changed,
+    };
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(60, 8);
+    defer test_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
+    const snapshot = try test_surface.snapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading repository files...") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [changed]") == null);
+}
+
+test "repository filter discoverability distinguishes loading unavailable and no-match states" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest("main.zig\x00"),
@@ -7516,8 +7649,8 @@ test "repository changed view distinguishes loading unavailable and no-match sta
         defer test_surface.deinit();
         const palette: theme.Palette = .default();
         try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
-        try test_surface.expectCellText(0, 2, " ");
-        try test_surface.expectCellText(1, 2, "F");
+        try test_surface.expectCellText(0, 2, "F");
+        try test_surface.expectCellText(27, 2, ")");
         const layout = bodyLayout(.{ .width = 120, .height = 8 }, state.viewer.tree_width, state.viewer.tree_hidden);
         const message_cell = test_surface.surface.readCell(0, layout.header_rows + 1) orelse
             return error.ExpectedChangedFilesMessage;
@@ -7525,7 +7658,7 @@ test "repository changed view distinguishes loading unavailable and no-match sta
         try std.testing.expect(!message_cell.style.dim);
         const snapshot = try test_surface.snapshot(allocator);
         defer allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [changed]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [changed]  (F: toggle)") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading changed files...") != null);
     }
 
@@ -7543,8 +7676,33 @@ test "repository changed view distinguishes loading unavailable and no-match sta
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Changed-file status unavailable") != null);
     }
 
+    const toggle = keyToMsg(state.inputContext(.{}), .{ .codepoint = 'F' }) orelse
+        return error.ExpectedDefaultFilterToggle;
+    _ = state.applyNavigation(allocator, toggle, .{ .width = 120, .height = 8 });
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    _ = state.applyNavigation(allocator, toggle, .{ .width = 120, .height = 8 });
+    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
+
     try applyBundleStatusForTest(&state.bundle.?, "");
     _ = state.rebuildTreeProjection(null, false, 0);
+    {
+        var test_surface: chasen.testing.TestSurface = undefined;
+        try test_surface.init(120, 8);
+        defer test_surface.deinit();
+        try view(.{
+            .page_state = &state,
+            .palette = .default(),
+            .repo_root = "/work/clean-repo",
+        }, &test_surface.surface);
+        const snapshot = try test_surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "clean-repo") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "No changed files") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "No file selected") != null);
+    }
+
+    _ = state.applyNavigation(allocator, toggle, .{ .width = 120, .height = 8 });
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
     {
         var test_surface: chasen.testing.TestSurface = undefined;
         try test_surface.init(120, 8);
@@ -7552,9 +7710,11 @@ test "repository changed view distinguishes loading unavailable and no-match sta
         try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
         const snapshot = try test_surface.snapshot(allocator);
         defer allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "No changed files") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "No file selected") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [all]  (F: toggle)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "main.zig") != null);
     }
+    _ = state.applyNavigation(allocator, toggle, .{ .width = 120, .height = 8 });
+    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
 
     // At the minimum split width and five rows the full prose is clipped, but
     // each state still exposes a distinct leading label instead of falling
@@ -7753,7 +7913,7 @@ test "repository transition B1 direct unavailable renders byte-safe terminal" {
     try std.testing.expect(state.incomingUnavailable() == null);
 }
 
-test "repository minimum tree disclosure Review incoming expands only exact ancestors" {
+test "repository minimum tree disclosure repository filter discoverability Review incoming expands only exact ancestors" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var state: RepositoryPageState = .{

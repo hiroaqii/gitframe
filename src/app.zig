@@ -1091,6 +1091,7 @@ pub const App = struct {
             .repository = .{
                 .page_state = &self.pages.repository,
                 .palette = self.theme,
+                .keymap = self.keymap,
                 .repo_root = self.activeRepoRoot(),
             },
             .active_page = self.active_page,
