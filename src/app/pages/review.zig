@@ -315,6 +315,15 @@ pub const ReviewPageState = struct {
         self.auto_reload = .init(cli, user, source);
     }
 
+    /// Only an ordinary source completion deferred behind a live drag borrows
+    /// display state strongly enough to block a page transition. Canonical
+    /// publication owns no live pointer borrow and is retired by the Review
+    /// owner when an allowed page exit commits.
+    pub fn deferredSourceBlocksPageTransition(self: *const ReviewPageState) bool {
+        const deferred = self.deferred_source_apply orelse return false;
+        return deferred.mode == .live_drag;
+    }
+
     /// Invalidate every candidate borrow before the accepted sidebar owner is
     /// replaced, then open a new semantic namespace for later publication.
     /// Prompt mode and input intentionally survive so the replacement path can
@@ -437,6 +446,24 @@ test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
     try std.testing.expect(!state.action_cursor.hasOwner());
     try std.testing.expect(state.pending_reload == null);
     try std.testing.expect(state.pending_display_navigation_restore == null);
+}
+
+test "Review canonical publication page transition distinguishes live drag from canonical deferred source" {
+    const allocator = std.testing.allocator;
+    var state: ReviewPageState = .{};
+    defer state.deinit(allocator);
+    state.deferred_source_apply = .{
+        .finished = .{
+            .identity = page.RequestIdentity.review(0, 1),
+            .generation = 5,
+            .result = .{ .failed_static = "test terminal" },
+        },
+        .cycle_id = 2,
+    };
+
+    try std.testing.expect(state.deferredSourceBlocksPageTransition());
+    state.deferred_source_apply.?.mode = .canonical_publication;
+    try std.testing.expect(!state.deferredSourceBlocksPageTransition());
 }
 
 test "ReviewPageState deinit releases loaded snapshots and file filter" {

@@ -1371,7 +1371,7 @@ pub const App = struct {
         return .{
             .review_mouse_selection = self.pages.review.selection_owner.activeMouseSelection(),
             .repository_mouse_selection = self.pages.repository.activeSourceRange(),
-            .review_deferred_apply = self.pages.review.deferred_source_apply != null,
+            .review_deferred_apply = self.pages.review.deferredSourceBlocksPageTransition(),
             .review_search = self.pages.review.search.mode,
             .review_file_search = self.pages.review.file_search.mode,
             .repository_source_search = self.pages.repository.source_search.mode,
@@ -1389,6 +1389,16 @@ pub const App = struct {
             .live_review_waiter = if (self.review_output) |output| !output.ready else false,
             .teardown = self.teardown_requested,
         };
+    }
+
+    /// Commits the Review side of an allowed page exit. Canonical publication
+    /// is bound to the current activation, so retire it before closing that
+    /// activation; live-drag deferred source cannot reach this boundary.
+    fn deactivateReviewForPageSwitch(self: *App, allocator: std.mem.Allocator) void {
+        std.debug.assert(self.active_page == .review);
+        std.debug.assert(!self.pages.review.deferredSourceBlocksPageTransition());
+        self.reviewReload().retireCanonicalPublicationForPageExit(allocator);
+        self.pages.review.activation.deactivate();
     }
 
     /// Fallible half of Review -> Repository contextual navigation.
@@ -1426,7 +1436,7 @@ pub const App = struct {
     ) void {
         std.debug.assert(self.active_page == .review);
         self.pages.repository.acceptIncoming(allocator, incoming);
-        self.pages.review.activation.deactivate();
+        self.deactivateReviewForPageSwitch(allocator);
         self.active_page = .repository;
         self.pages.repository.activate(self.repo_epoch, self.repo_state.activeIdentity());
         _ = self.pages.repository.resolveIncomingAfterActivation(
@@ -1508,7 +1518,9 @@ pub const App = struct {
             return;
         }
 
-        if (self.active_page == .review) self.pages.review.activation.deactivate();
+        if (self.active_page == .review) {
+            self.deactivateReviewForPageSwitch(self.allocator orelse ctx.allocator());
+        }
         if (self.active_page == .repository) self.pages.repository.deactivate();
         self.active_page = target;
         switch (target) {
@@ -16063,6 +16075,402 @@ fn expectFreshCanonicalCachedPublication(
             try std.testing.expect(target.session_mark_mutation == .none);
         },
         else => return error.ExpectedFreshHunkUnstageCapability,
+    }
+}
+
+const CanonicalPageTransitionInput = enum {
+    keyboard,
+    page_bar,
+};
+
+const CanonicalPageTransitionSource = enum {
+    changed,
+    unchanged,
+    empty,
+};
+
+fn canonicalPageTransitionMessage(
+    app: *App,
+    target: page.Id,
+    input: CanonicalPageTransitionInput,
+) !App.Msg {
+    return switch (input) {
+        .keyboard => app.handleEvent(.{ .key_press = .{
+            .codepoint = switch (target) {
+                .review => '1',
+                .repository => '2',
+                .history => '3',
+                .config => '4',
+            },
+        } }),
+        .page_bar => blk: {
+            const bar = app.shellLayout().page_bar orelse return error.ExpectedPageBar;
+            const tab = page.tab(target);
+            break :blk app.handleEvent(app_test_support.mouseEvent(
+                bar.col + tab.col,
+                bar.row,
+                .left,
+            ));
+        },
+    } orelse error.ExpectedPageSwitch;
+}
+
+fn requestCanonicalPageTransition(
+    app: *App,
+    ctx: *chasen.Ctx(App.Msg),
+    target: page.Id,
+    input: CanonicalPageTransitionInput,
+) !void {
+    const message = try canonicalPageTransitionMessage(app, target, input);
+    switch (message) {
+        .switch_page => |requested| {
+            try std.testing.expectEqual(target, requested);
+            try app.requestPageSwitch(ctx, requested);
+        },
+        else => return error.ExpectedPageSwitch,
+    }
+}
+
+fn applyCanonicalPageTransitionFilterToggle(
+    app: *App,
+    ctx: *chasen.Ctx(App.Msg),
+) !void {
+    const message = app.handleEvent(.{ .key_press = .{ .codepoint = 'F' } }) orelse
+        return error.ExpectedFilterToggle;
+    switch (message) {
+        .review => |review_msg| try app.updateReview(ctx, review_msg),
+        .repository => |repository_msg| try app.updateRepository(ctx, repository_msg),
+        else => return error.ExpectedFilterToggle,
+    }
+}
+
+fn finishCanonicalPageTransitionSource(
+    app: *App,
+    ctx: *chasen.Ctx(App.Msg),
+    allocator: std.mem.Allocator,
+    reads: CanonicalPublicationReads,
+    result: CanonicalPageTransitionSource,
+) !void {
+    switch (result) {
+        .changed => try finishCanonicalPublicationSource(
+            app,
+            ctx,
+            allocator,
+            reads,
+            app_test_support.diff_unstaged_projection,
+        ),
+        .unchanged => try app.finishDiffLoad(ctx, .{
+            .identity = reads.source_identity,
+            .read_epoch = reads.source_read_epoch,
+            .generation = reads.source_generation,
+            .background_cycle_id = reads.source_cycle_id,
+            .result = .{
+                .unchanged = content_fingerprint.Fingerprint.init("unchanged"),
+            },
+        }),
+        .empty => try finishCanonicalPublicationEmpty(app, ctx, reads),
+    }
+}
+
+fn finishCanonicalPageTransitionBranch(
+    app: *App,
+    ctx: *chasen.Ctx(App.Msg),
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    reads: CanonicalPublicationReads,
+) !void {
+    app.finishBranchStatusLoad(ctx, .{
+        .identity = reads.branch_identity,
+        .read_epoch = reads.branch_read_epoch,
+        .generation = reads.branch_generation,
+        .background_cycle_id = reads.branch_cycle_id,
+        .repo_root = try allocator.dupe(u8, repo_root),
+        .result = .empty,
+    });
+}
+
+fn expectFreshCanonicalPageTransitionReads(
+    app: *App,
+    ctx: *chasen.Ctx(App.Msg),
+    allocator: std.mem.Allocator,
+    old_identity: page.RequestIdentity,
+) !void {
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
+    try std.testing.expect(!app.reviewReadBusy());
+    try app.maybeStartQueuedReviewRevalidation(ctx);
+    const fresh = try takeCanonicalPublicationReads(ctx, allocator);
+    const active = app.pages.review.activation.currentIdentity() orelse
+        return error.ExpectedReviewActivation;
+    try std.testing.expect(active.activation_id != old_identity.activation_id);
+    try std.testing.expectEqual(active, fresh.source_identity);
+    try std.testing.expectEqual(active, fresh.status_identity);
+    try std.testing.expectEqual(active, fresh.branch_identity);
+}
+
+fn expectRetainedCanonicalPageTransitionBody(
+    app: *const App,
+    prior_hunks: [*]const diff_parser.Hunk,
+    source_revision: u64,
+    status_revision: u64,
+) !void {
+    try expectRetainedCanonicalPublication(app, prior_hunks);
+    try std.testing.expectEqual(source_revision, app.pages.review.source_session_revision);
+    try std.testing.expectEqual(status_revision, app.pages.review.status_snapshot_revision);
+}
+
+test "Review canonical publication page transition drains source-first results and starts fresh revalidation" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    const cases = [_]struct {
+        source: CanonicalPageTransitionSource,
+        exit_input: CanonicalPageTransitionInput,
+        entry_input: CanonicalPageTransitionInput,
+    }{
+        .{ .source = .changed, .exit_input = .keyboard, .entry_input = .page_bar },
+        .{ .source = .unchanged, .exit_input = .page_bar, .entry_input = .keyboard },
+        .{ .source = .empty, .exit_input = .keyboard, .entry_input = .keyboard },
+    };
+
+    for (cases) |case| {
+        var app = try canonicalPublicationTestApp(allocator, roots.a);
+        defer app.pages.review.deinit(allocator);
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+        const prior = app.reviewNavigationView().activeCombinedProjection() orelse
+            return error.ExpectedCombinedProjection;
+        const prior_hunks = prior.displayFile().hunks.ptr;
+        const source_revision = app.pages.review.source_session_revision;
+        const status_revision = app.pages.review.status_snapshot_revision;
+        const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
+        try finishCanonicalPageTransitionSource(
+            &app,
+            &ctx,
+            allocator,
+            reads,
+            case.source,
+        );
+        try std.testing.expect(app.pages.review.deferred_source_apply != null);
+        try std.testing.expect(!app.pages.review.deferredSourceBlocksPageTransition());
+        for (0..6) |_| try applyCanonicalPageTransitionFilterToggle(&app, &ctx);
+
+        try requestCanonicalPageTransition(
+            &app,
+            &ctx,
+            .repository,
+            case.exit_input,
+        );
+        try std.testing.expectEqual(page.Id.repository, app.active_page);
+        try std.testing.expect(app.pages.review.activation.state == .inactive);
+        try std.testing.expect(app.pages.review.canonical_publication == null);
+        try std.testing.expect(app.pages.review.deferred_source_apply == null);
+        try std.testing.expect(app.pages.review.canonical_status_drain != null);
+        try expectRetainedCanonicalPageTransitionBody(
+            &app,
+            prior_hunks,
+            source_revision,
+            status_revision,
+        );
+        for (0..2) |_| try applyCanonicalPageTransitionFilterToggle(&app, &ctx);
+
+        try requestCanonicalPageTransition(
+            &app,
+            &ctx,
+            .review,
+            case.entry_input,
+        );
+        const new_activation = app.pages.review.activation.currentIdentity() orelse
+            return error.ExpectedReviewActivation;
+        try std.testing.expect(new_activation.activation_id != reads.source_identity.activation_id);
+        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+
+        try finishCanonicalPublicationStatus(
+            &app,
+            &ctx,
+            allocator,
+            roots.a,
+            reads,
+            "MM a\x00",
+        );
+        try std.testing.expect(app.pages.review.canonical_status_drain == null);
+        try finishCanonicalPageTransitionBranch(
+            &app,
+            &ctx,
+            allocator,
+            roots.a,
+            reads,
+        );
+        try expectRetainedCanonicalPageTransitionBody(
+            &app,
+            prior_hunks,
+            source_revision,
+            status_revision,
+        );
+        try expectFreshCanonicalPageTransitionReads(
+            &app,
+            &ctx,
+            allocator,
+            reads.source_identity,
+        );
+    }
+}
+
+test "Review canonical publication page transition drains status-first source without stale publication" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    const prior = app.reviewNavigationView().activeCombinedProjection() orelse
+        return error.ExpectedCombinedProjection;
+    const prior_hunks = prior.displayFile().hunks.ptr;
+    const source_revision = app.pages.review.source_session_revision;
+    const status_revision = app.pages.review.status_snapshot_revision;
+    const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
+    try finishCanonicalPublicationStatus(
+        &app,
+        &ctx,
+        allocator,
+        roots.a,
+        reads,
+        "MM a\x00",
+    );
+    try std.testing.expect(app.pages.review.deferred_source_apply == null);
+
+    try requestCanonicalPageTransition(&app, &ctx, .repository, .page_bar);
+    try std.testing.expect(app.pages.review.canonical_publication == null);
+    try std.testing.expect(app.pages.review.canonical_status_drain == null);
+    try requestCanonicalPageTransition(&app, &ctx, .review, .keyboard);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+
+    try finishCanonicalPageTransitionSource(
+        &app,
+        &ctx,
+        allocator,
+        reads,
+        .changed,
+    );
+    try finishCanonicalPageTransitionBranch(
+        &app,
+        &ctx,
+        allocator,
+        roots.a,
+        reads,
+    );
+    try expectRetainedCanonicalPageTransitionBody(
+        &app,
+        prior_hunks,
+        source_revision,
+        status_revision,
+    );
+    try expectFreshCanonicalPageTransitionReads(
+        &app,
+        &ctx,
+        allocator,
+        reads.source_identity,
+    );
+}
+
+test "Review canonical publication page transition retires an old projection request" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    const prior = app.reviewNavigationView().activeCombinedProjection() orelse
+        return error.ExpectedCombinedProjection;
+    const prior_hunks = prior.displayFile().hunks.ptr;
+    const source_revision = app.pages.review.source_session_revision;
+    const status_revision = app.pages.review.status_snapshot_revision;
+    const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
+    try finishCanonicalPublicationStatus(
+        &app,
+        &ctx,
+        allocator,
+        roots.a,
+        reads,
+        "MM a\x00",
+    );
+    try finishCanonicalPageTransitionSource(
+        &app,
+        &ctx,
+        allocator,
+        reads,
+        .changed,
+    );
+    try app.ensureReviewProjection(&ctx);
+    var old_request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
+    var old_request_owned = true;
+    defer if (old_request_owned) old_request.deinit(allocator);
+    try std.testing.expect(app.pages.review.review_projection.pending != null);
+
+    try requestCanonicalPageTransition(&app, &ctx, .repository, .keyboard);
+    try std.testing.expect(app.pages.review.canonical_publication == null);
+    try std.testing.expect(app.pages.review.deferred_source_apply == null);
+    try std.testing.expect(app.pages.review.review_projection.pending == null);
+    try requestCanonicalPageTransition(&app, &ctx, .review, .page_bar);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+
+    try app.finishReviewProjectionLoad(&ctx, .{
+        .request = old_request,
+        .result = .{ .failed_static = "stale projection" },
+    });
+    old_request_owned = false;
+    try finishCanonicalPageTransitionBranch(
+        &app,
+        &ctx,
+        allocator,
+        roots.a,
+        reads,
+    );
+    try expectRetainedCanonicalPageTransitionBody(
+        &app,
+        prior_hunks,
+        source_revision,
+        status_revision,
+    );
+    try expectFreshCanonicalPageTransitionReads(
+        &app,
+        &ctx,
+        allocator,
+        reads.source_identity,
+    );
+}
+
+test "Review canonical publication page transition retires generic page exits" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+
+    for ([_]page.Id{ .history, .config }, 0..) |target, index| {
+        var app = try canonicalPublicationTestApp(allocator, roots.a);
+        defer app.pages.review.deinit(allocator);
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        _ = try startCanonicalPublicationWatch(&app, &ctx, allocator);
+
+        try requestCanonicalPageTransition(
+            &app,
+            &ctx,
+            target,
+            if (index == 0) .keyboard else .page_bar,
+        );
+
+        try std.testing.expectEqual(target, app.active_page);
+        try std.testing.expect(app.pages.review.activation.state == .inactive);
+        try std.testing.expect(app.pages.review.canonical_publication == null);
+        try std.testing.expect(app.pages.review.deferred_source_apply == null);
     }
 }
 

@@ -1325,6 +1325,27 @@ pub const Controller = struct {
         gate.deinit(allocator);
     }
 
+    /// Closes an activation-bound canonical transaction before Review becomes
+    /// inactive. Ordinary live-drag deferred source owns a separate borrow and
+    /// must remain protected by the page-transition policy instead.
+    pub fn retireCanonicalPublicationForPageExit(
+        self: Controller,
+        allocator: std.mem.Allocator,
+    ) void {
+        if (self.page.canonical_publication == null) {
+            if (self.page.deferred_source_apply) |deferred| {
+                std.debug.assert(deferred.mode == .live_drag);
+            }
+            return;
+        }
+        if (self.page.deferred_source_apply) |deferred| {
+            std.debug.assert(deferred.mode == .canonical_publication);
+        }
+        self.abortCanonicalPublication(allocator);
+        std.debug.assert(self.page.canonical_publication == null);
+        std.debug.assert(self.page.deferred_source_apply == null);
+    }
+
     pub fn beginPendingReload(self: Controller, allocator: std.mem.Allocator, generation: u64, kind: review_page.ReloadKind) !void {
         self.clearPendingReload(allocator);
         const anchor = switch (kind) {
