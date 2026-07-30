@@ -749,7 +749,8 @@ pub const App = struct {
             .manifest_finished => |finished| {
                 var owned = finished;
                 defer owned.deinit(ctx.allocator());
-                const outcome = self.pages.repository.applyFinished(ctx.allocator(), &owned);
+                const body_size = self.shellLayout().bodySize();
+                const outcome = self.pages.repository.applyFinished(ctx.allocator(), &owned, body_size);
                 if (self.active_page != .repository or outcome == .discarded or outcome == .unchanged) ctx.redraw().skip();
             },
             .branch_finished => |finished| {
@@ -1428,7 +1429,10 @@ pub const App = struct {
         self.pages.review.activation.deactivate();
         self.active_page = .repository;
         self.pages.repository.activate(self.repo_epoch, self.repo_state.activeIdentity());
-        _ = self.pages.repository.resolveIncomingAfterActivation(allocator);
+        _ = self.pages.repository.resolveIncomingAfterActivation(
+            allocator,
+            self.shellLayout().bodySize(),
+        );
     }
 
     /// Infallibly commit Repository -> Review contextual navigation after the
@@ -12687,6 +12691,186 @@ test "review repository transition C2 page bar exposes deleted target as unavail
     try std.testing.expectEqualStrings("src/deleted.zig", unavailable.path);
     try std.testing.expect(app.pages.repository.selected_path == null);
     try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
+}
+
+const repository_incoming_viewport_review_files = [_]diff_parser.FileDiff{
+    .{
+        .header = "diff --git a/src/app.zig b/src/app.zig",
+        .old_path = "a/src/app.zig",
+        .new_path = "b/src/app.zig",
+        .metadata = &.{"index 1..2 100644"},
+        .hunks = &.{},
+    },
+    .{
+        .header = "diff --git a/src/app/pages/repository.zig b/src/app/pages/repository.zig",
+        .old_path = "a/src/app/pages/repository.zig",
+        .new_path = "b/src/app/pages/repository.zig",
+        .metadata = &.{"index 1..2 100644"},
+        .hunks = &.{},
+    },
+};
+const repository_incoming_viewport_review_eligibility =
+    [_]loaded_diff.FileTextEligibility{ .selectable_utf8, .selectable_utf8 };
+const repository_incoming_viewport_review_tree_nodes = [_]file_tree.Node{
+    .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
+    .{ .kind = .directory, .name = "app", .path = "src/app", .depth = 1 },
+    .{ .kind = .directory, .name = "pages", .path = "src/app/pages", .depth = 2 },
+    .{
+        .kind = .file,
+        .name = "repository.zig",
+        .path = "src/app/pages/repository.zig",
+        .depth = 3,
+        .target = .{ .diff_file = 1 },
+    },
+    .{
+        .kind = .file,
+        .name = "app.zig",
+        .path = "src/app.zig",
+        .depth = 1,
+        .target = .{ .diff_file = 0 },
+    },
+};
+fn repositoryIncomingViewportReviewDiffForTest() LoadedDiff {
+    return .{
+        .text = "",
+        .document = .{ .files = &repository_incoming_viewport_review_files },
+        .file_text_eligibility = &repository_incoming_viewport_review_eligibility,
+        .tree = .{ .nodes = &repository_incoming_viewport_review_tree_nodes },
+        .collapsed_dirs = .{},
+        .bytes = 0,
+        .lines = 0,
+    };
+}
+
+fn repositoryIncomingViewportBundleForTest(allocator: std.mem.Allocator) !repository_page.Bundle {
+    const repository_manifest = @import("repository/manifest.zig");
+    const repository_tree = @import("repository/tree.zig");
+    var document = try repository_manifest.parseOwned(
+        allocator,
+        try allocator.dupe(u8, "src/app.zig\x00src/app/pages/repository.zig\x00"),
+    );
+    errdefer document.deinit(allocator);
+    return .{
+        .document = document,
+        .tree = try repository_tree.Tree.build(allocator, &document),
+    };
+}
+
+fn expectRepositoryProjectedPathForTest(
+    state: *const repository_page.RepositoryPageState,
+    visible_index: usize,
+    expected_path: []const u8,
+) !void {
+    const tree = &state.bundle.?.tree;
+    const target = state.tree_projection.targetAt(tree, visible_index) orelse
+        return error.ExpectedProjectedPath;
+    switch (target) {
+        .repo_root => return error.ExpectedManifestPath,
+        .manifest_node => |node_index| try std.testing.expectEqualStrings(
+            expected_path,
+            tree.nodes[node_index].path,
+        ),
+    }
+}
+
+test "repository incoming viewport scroll App immediate and deferred routes use current body size" {
+    const allocator = std.testing.allocator;
+    const Route = enum { keyboard, page_bar, deferred_manifest };
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+
+    for ([_]Route{ .keyboard, .page_bar, .deferred_manifest }) |route| {
+        var app: App = .{
+            .allocator = allocator,
+            .repo_epoch = 4,
+            .terminal_size = .{ .width = 120, .height = 12 },
+            .config = .{ .source = .unstaged },
+            .pages = .{ .review = .{
+                .load = app_test_support.loadState(repositoryIncomingViewportReviewDiffForTest()),
+                .viewer = .{
+                    .selected_target = .{ .diff_file = 1 },
+                    .selected_file = 1,
+                    .selected_node = 3,
+                },
+            } },
+        };
+        defer app.pages.review.deinit(allocator);
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        app.repo_state.discovery = try testSingleRepoDiscovery(allocator, roots.a);
+        app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+        const identity = app.repo_state.activeIdentity().?;
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        defer clearPendingRepositoryTasks(&ctx, allocator);
+        try std.testing.expectEqual(
+            chasen.Size{ .width = 118, .height = 7 },
+            app.shellLayout().bodySize(),
+        );
+
+        switch (route) {
+            .keyboard, .page_bar => {
+                app.pages.repository.repo_epoch = 4;
+                app.pages.repository.root_identity = identity;
+                app.pages.repository.bundle = try repositoryIncomingViewportBundleForTest(allocator);
+                app.pages.repository.load_state = .loaded;
+                app.pages.repository.manifest_revision = 2;
+                app.pages.repository.viewer = .{
+                    .tree_cursor = 5,
+                    .tree_vertical_scroll = 99,
+                };
+                app.pages.repository.selected_path =
+                    app.pages.repository.bundle.?.tree.filePath("src/app.zig", .all).?;
+                acceptTestSource(&app);
+                const msg = if (route == .keyboard)
+                    app.handleEvent(.{ .key_press = .{ .codepoint = '2' } }) orelse
+                        return error.ExpectedPageSwitch
+                else blk: {
+                    const repository_tab = page.tab(.repository);
+                    const bar = app.shellLayout().page_bar orelse return error.ExpectedPageBar;
+                    break :blk app.handleEvent(app_test_support.mouseEvent(
+                        bar.col + repository_tab.col,
+                        bar.row,
+                        .left,
+                    )) orelse return error.ExpectedPageSwitch;
+                };
+                try app.update(msg, &ctx);
+            },
+            .deferred_manifest => {
+                app.active_page = .repository;
+                app.pages.repository = .{
+                    .initialized = true,
+                    .active = true,
+                    .activation_id = 2,
+                    .repo_epoch = 4,
+                    .root_identity = identity,
+                    .generation = 7,
+                    .pending_generation = 7,
+                    .load_state = .loading,
+                    .viewer = .{ .tree_vertical_scroll = 99 },
+                };
+                var incoming = try page_link.RepositoryIncoming.initOwned(
+                    allocator,
+                    4,
+                    identity,
+                    .{ .location = .{ .path = "src/app/pages/repository.zig" } },
+                );
+                app.pages.repository.acceptIncoming(allocator, &incoming);
+                try app.update(.{ .repository = .{ .manifest_finished = .{
+                    .identity = .{ .origin = .repository, .repo_epoch = 4, .activation_id = 2 },
+                    .root_identity = identity,
+                    .generation = 7,
+                    .result = .{ .loaded = try repositoryIncomingViewportBundleForTest(allocator) },
+                } } }, &ctx);
+            },
+        }
+
+        try std.testing.expectEqual(page.Id.repository, app.active_page);
+        try std.testing.expectEqualStrings("src/app/pages/repository.zig", app.pages.repository.selected_path.?);
+        try std.testing.expectEqual(@as(usize, 4), app.pages.repository.viewer.tree_cursor);
+        try std.testing.expectEqual(@as(usize, 1), app.pages.repository.viewer.tree_vertical_scroll);
+        try expectRepositoryProjectedPathForTest(&app.pages.repository, 1, "src");
+        try expectRepositoryProjectedPathForTest(&app.pages.repository, 4, "src/app/pages/repository.zig");
+    }
 }
 
 test "live review waiter blocks direct keyboard and mouse page switches with one reason" {

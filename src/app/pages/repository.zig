@@ -1269,16 +1269,24 @@ pub const RepositoryPageState = struct {
     /// destination identity. Slice C calls this allocation-free operation
     /// after its owner-move/deactivate/activate sequence; accepted async
     /// manifest completions use the same resolver while inactive or active.
-    pub fn resolveIncomingAfterActivation(self: *RepositoryPageState, allocator: std.mem.Allocator) bool {
+    pub fn resolveIncomingAfterActivation(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        body_size: chasen.Size,
+    ) bool {
         std.debug.assert(self.active);
-        return self.resolveIncomingManifest(allocator);
+        return self.resolveIncomingManifest(allocator, body_size);
     }
 
     /// Resolve only against the full accepted manifest. Normal Repository
     /// restoration is intentionally not reused because it may choose a nearby
     /// file when the preferred path is absent. An explicit cross-page target
     /// either selects the byte-exact file or becomes unavailable.
-    fn resolveIncomingManifest(self: *RepositoryPageState, allocator: std.mem.Allocator) bool {
+    fn resolveIncomingManifest(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        body_size: chasen.Size,
+    ) bool {
         const location = if (self.incoming.manifestIntent()) |intent| intent.* else return false;
         const active_root = self.root_identity orelse {
             return self.incoming.terminalize(.request_failed);
@@ -1323,7 +1331,7 @@ pub const RepositoryPageState = struct {
         }
         self.selected_path = exact_path;
         self.viewer.tree_cursor = visible_index;
-        self.clampScroll(0);
+        self.placeIncomingTreeForBodySize(body_size);
         if (!matching_document) {
             self.invalidateSelectedDocument(allocator);
         }
@@ -1392,8 +1400,9 @@ pub const RepositoryPageState = struct {
         self: *RepositoryPageState,
         allocator: std.mem.Allocator,
         outcome: ApplyOutcome,
+        body_size: chasen.Size,
     ) ApplyOutcome {
-        if (!self.resolveIncomingManifest(allocator)) return outcome;
+        if (!self.resolveIncomingManifest(allocator, body_size)) return outcome;
         return switch (outcome) {
             .unchanged => .changed,
             .discarded, .changed, .failed => outcome,
@@ -1813,7 +1822,12 @@ pub const RepositoryPageState = struct {
         self.status.set("Repository root could not be opened safely", .{});
     }
 
-    pub fn applyFinished(self: *RepositoryPageState, allocator: std.mem.Allocator, finished: *ManifestFinished) ApplyOutcome {
+    pub fn applyFinished(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        finished: *ManifestFinished,
+        body_size: chasen.Size,
+    ) ApplyOutcome {
         if (finished.identity.origin != .repository or
             finished.identity.repo_epoch != self.repo_epoch or
             finished.identity.activation_id != self.activation_id or
@@ -1843,6 +1857,7 @@ pub const RepositoryPageState = struct {
                 return self.applyIncomingManifestResolution(
                     allocator,
                     if (changed_status_message) .changed else .unchanged,
+                    body_size,
                 );
             },
             .status_changed => |*update| {
@@ -1852,7 +1867,7 @@ pub const RepositoryPageState = struct {
                     // its owned payload remains with `finished.deinit`.
                     self.freshness = if (self.active) .fresh else .validating;
                     self.status.clear();
-                    return self.applyIncomingManifestResolution(allocator, .unchanged);
+                    return self.applyIncomingManifestResolution(allocator, .unchanged, body_size);
                 };
                 const previous_selected = self.selected_path;
                 const previous_status_available = bundle.status_available;
@@ -1891,6 +1906,7 @@ pub const RepositoryPageState = struct {
                 return self.applyIncomingManifestResolution(
                     allocator,
                     if (visible_changed or selection_changed or status_availability_changed or changed_status_message) .changed else .unchanged,
+                    body_size,
                 );
             },
             .loaded => |*incoming| {
@@ -1911,7 +1927,7 @@ pub const RepositoryPageState = struct {
                 self.displayed_document = null;
                 self.freshness = if (self.active) .fresh else .validating;
                 self.status.clear();
-                return self.applyIncomingManifestResolution(allocator, .changed);
+                return self.applyIncomingManifestResolution(allocator, .changed, body_size);
             },
             .failed_static => |message| {
                 self.acceptFailure(message);
@@ -2731,6 +2747,14 @@ pub const RepositoryPageState = struct {
         if (self.viewer.tree_cursor < self.viewer.tree_vertical_scroll) self.viewer.tree_vertical_scroll = self.viewer.tree_cursor;
         if (self.viewer.tree_cursor >= self.viewer.tree_vertical_scroll + rows) self.viewer.tree_vertical_scroll = self.viewer.tree_cursor - rows + 1;
         self.viewer.tree_vertical_scroll = @min(self.viewer.tree_vertical_scroll, visible_len -| rows);
+    }
+
+    fn placeIncomingTreeForBodySize(self: *RepositoryPageState, body_size: chasen.Size) void {
+        const layout = bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
+        self.viewer.tree_vertical_scroll = 0;
+        const rows = layout.treeRows(body_size.height);
+        if (rows == 0) return;
+        self.clampScroll(rows);
     }
 
     pub fn clampForBodySize(self: *RepositoryPageState, body_size: chasen.Size) void {
@@ -3869,7 +3893,7 @@ test "repository explicit reload restores typed root and directory across outcom
         .result = .{ .unchanged = state.bundle.?.document.fingerprint },
     };
     defer unchanged.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(allocator, &unchanged));
+    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(allocator, &unchanged, test_body_size));
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
     try std.testing.expect(state.viewer.tree_hidden);
@@ -3895,7 +3919,7 @@ test "repository explicit reload restores typed root and directory across outcom
     };
     defer changed.deinit(allocator);
 
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &changed));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &changed, test_body_size));
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
     try std.testing.expect(state.viewer.tree_hidden);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
@@ -4376,7 +4400,7 @@ test "repository changed file search reclassifies status-only availability trans
         .result = .{ .status_changed = .unavailable },
     };
     defer unavailable.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &unavailable));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &unavailable, test_body_size));
     try std.testing.expect(state.file_search.mode);
     try std.testing.expectEqualStrings("target", state.file_search.input.slice());
     try std.testing.expect(!state.file_search.projection_available);
@@ -4403,7 +4427,7 @@ test "repository changed file search reclassifies status-only availability trans
         ) } },
     };
     defer available_empty.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &available_empty));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &available_empty, test_body_size));
     try std.testing.expect(state.file_search.mode);
     try std.testing.expectEqualStrings("target", state.file_search.input.slice());
     try std.testing.expect(state.file_search.projection_available);
@@ -4491,6 +4515,25 @@ fn bundleForTest(bytes: []const u8) !Bundle {
     var document = try manifest.parseOwned(std.testing.allocator, try std.testing.allocator.dupe(u8, bytes));
     errdefer document.deinit(std.testing.allocator);
     return .{ .tree = try repository_tree.Tree.build(std.testing.allocator, &document), .document = document };
+}
+
+const test_body_size: chasen.Size = .{ .width = 80, .height = 24 };
+
+fn expectProjectedPathForTest(
+    state: *const RepositoryPageState,
+    visible_index: usize,
+    expected_path: []const u8,
+) !void {
+    const tree = &state.bundle.?.tree;
+    const target = state.tree_projection.targetAt(tree, visible_index) orelse
+        return error.ExpectedProjectedPath;
+    switch (target) {
+        .repo_root => return error.ExpectedManifestPath,
+        .manifest_node => |node_index| try std.testing.expectEqualStrings(
+            expected_path,
+            tree.nodes[node_index].path,
+        ),
+    }
 }
 
 fn repositoryBranchViewStateForTest() !RepositoryPageState {
@@ -4838,7 +4881,7 @@ test "repository source header SH5 bounds clone failure and retains exact unchan
         .result = .{ .unchanged = state.bundle.?.document.fingerprint },
     };
     defer unchanged.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(allocator, &unchanged));
+    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(allocator, &unchanged, test_body_size));
     try std.testing.expect(state.activeMouseOwner());
     try std.testing.expect(state.sourceHeaderSelected());
 
@@ -5212,7 +5255,7 @@ test "repository status-only completion preserves source and revisions" {
     };
     defer finished.deinit(allocator);
 
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &finished));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &finished, test_body_size));
     try std.testing.expectEqual(@as(u64, 7), state.manifest_revision);
     try std.testing.expectEqual(@as(u64, 11), state.source_revision);
     try std.testing.expectEqual(displayed_path_address, @intFromPtr(state.displayed_document.?.path.ptr));
@@ -5230,7 +5273,7 @@ test "repository status-only completion preserves source and revisions" {
         .result = .{ .status_changed = .unavailable },
     };
     defer unavailable.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &unavailable));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &unavailable, test_body_size));
     try std.testing.expect(state.bundle.?.tree.nodes[0].file_change == null);
     try std.testing.expect(!state.bundle.?.status_available);
     try std.testing.expectEqual(@as(u64, 7), state.manifest_revision);
@@ -5270,7 +5313,7 @@ test "repository changed status loss clears projection and All restores anchor" 
         .result = .{ .status_changed = .unavailable },
     };
     defer unavailable.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &unavailable));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &unavailable, test_body_size));
     try std.testing.expect(state.selected_path == null);
     try std.testing.expect(state.displayed_document == null);
     try std.testing.expect(!state.needs_document_revalidation);
@@ -5317,7 +5360,7 @@ test "repository changed status refresh moves clears and repopulates selection" 
             ) } },
         };
         defer finished.deinit(allocator);
-        try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &finished));
+        try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &finished, test_body_size));
         if (expected_path) |path|
             try std.testing.expectEqualStrings(path, state.selected_path.?)
         else
@@ -5408,7 +5451,7 @@ test "repository real reload updates status color and selected source" {
         ),
     };
     defer initial_finished.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &initial_finished));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &initial_finished, test_body_size));
     try std.testing.expect(state.wantsDocumentRequest());
 
     var initial_document_request = try state.prepareDocumentRequest(allocator, &capability);
@@ -5448,7 +5491,7 @@ test "repository real reload updates status color and selected source" {
     };
     defer reload_finished.deinit(allocator);
     try std.testing.expect(reload_finished.result == .status_changed);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &reload_finished));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &reload_finished, test_body_size));
     try std.testing.expectEqual(manifest_revision, state.manifest_revision);
     try std.testing.expectEqual(repository_change_index.Kind.modified, state.bundle.?.tree.nodes[0].file_change.?);
     try std.testing.expect(state.wantsDocumentRequest());
@@ -6270,7 +6313,7 @@ test "repository page accepts active and inactive matching manifest completions"
         .result = .{ .loaded = try bundleForTest("src/main.zig\x00") },
     };
     defer finished.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(std.testing.allocator, &finished));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(std.testing.allocator, &finished, test_body_size));
     try std.testing.expectEqualStrings("src/main.zig", state.selected_path.?);
     try std.testing.expect(state.freshness == .fresh);
 
@@ -6285,7 +6328,7 @@ test "repository page accepts active and inactive matching manifest completions"
         .result = .{ .unchanged = retained_bundle.document.fingerprint },
     };
     defer unchanged.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(std.testing.allocator, &unchanged));
+    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(std.testing.allocator, &unchanged, test_body_size));
     try std.testing.expectEqual(retained_bundle, &state.bundle.?);
 
     state.needs_revalidation = true;
@@ -6299,7 +6342,7 @@ test "repository page accepts active and inactive matching manifest completions"
         .result = .{ .loaded = try bundleForTest("README.md\x00src/main.zig\x00") },
     };
     defer inactive.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(std.testing.allocator, &inactive));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(std.testing.allocator, &inactive, test_body_size));
     try std.testing.expect(state.bundle != null);
     try std.testing.expect(state.freshness == .validating);
     state.activate(7, root.capability.identity);
@@ -6321,7 +6364,7 @@ test "repository page rejects stale completion and undelivered message frees pay
         .result = .{ .loaded = try bundleForTest("old.zig\x00") },
     };
     defer stale.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(std.testing.allocator, &stale));
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(std.testing.allocator, &stale, test_body_size));
     try std.testing.expect(state.bundle == null);
 
     var undelivered = Msg{ .manifest_finished = .{
@@ -6349,7 +6392,7 @@ test "repository page rejects matching generation with wrong root identity" {
     };
     defer finished.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(std.testing.allocator, &finished));
+    try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(std.testing.allocator, &finished, test_body_size));
     try std.testing.expect(state.bundle == null);
     try std.testing.expectEqual(@as(u64, 0), state.manifest_revision);
     try std.testing.expect(!state.needs_document_revalidation);
@@ -6370,7 +6413,7 @@ test "repository page accepts selected document and renders plain source" {
         .result = .{ .loaded = try bundleForTest("src/main.zig\x00") },
     };
     defer manifest_finished.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(std.testing.allocator, &manifest_finished));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(std.testing.allocator, &manifest_finished, test_body_size));
     try std.testing.expect(state.wantsDocumentRequest());
 
     var request = try state.prepareDocumentRequest(std.testing.allocator, &root.capability);
@@ -7913,6 +7956,174 @@ test "repository transition B1 direct unavailable renders byte-safe terminal" {
     try std.testing.expect(state.incomingUnavailable() == null);
 }
 
+test "repository incoming viewport scroll places immediate target from root with real tree rows" {
+    const allocator = std.testing.allocator;
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 2,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .bundle = try bundleForTest("src/app.zig\x00src/app/pages/repository.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 6,
+        .file_visibility = .changed,
+    };
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(
+        &state.bundle.?,
+        " M src/app.zig\x00 M src/app/pages/repository.zig\x00",
+    );
+    state.bundle.?.tree.rebuildVisibleFor(.changed);
+    state.selected_path = state.bundle.?.tree.filePath("src/app.zig", .changed);
+    state.viewer.tree_cursor = 2;
+    state.viewer.tree_vertical_scroll = 99;
+
+    var fitting = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .location = .{ .path = "src/app/pages/repository.zig" } },
+    );
+    state.acceptIncoming(allocator, &fitting);
+    try std.testing.expect(state.resolveIncomingAfterActivation(
+        allocator,
+        .{ .width = 80, .height = 31 },
+    ));
+    try std.testing.expectEqual(@as(usize, 4), state.viewer.tree_cursor);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_vertical_scroll);
+    try std.testing.expectEqual(
+        repository_tree_projection.Target.repo_root,
+        state.tree_projection.targetAt(&state.bundle.?.tree, 0).?,
+    );
+    try expectProjectedPathForTest(&state, 1, "src");
+    try expectProjectedPathForTest(&state, 2, "src/app");
+    try expectProjectedPathForTest(&state, 3, "src/app/pages");
+    try expectProjectedPathForTest(&state, 4, "src/app/pages/repository.zig");
+    try expectProjectedPathForTest(&state, 5, "src/app.zig");
+
+    state.dismissIncoming(allocator);
+    var narrow = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .location = .{ .path = "src/app/pages/repository.zig" } },
+    );
+    state.acceptIncoming(allocator, &narrow);
+    const narrow_body: chasen.Size = .{ .width = 80, .height = 7 };
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator, narrow_body));
+    try std.testing.expectEqual(@as(usize, 4), state.viewer.tree_cursor);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.tree_vertical_scroll);
+    try expectProjectedPathForTest(&state, 1, "src");
+    try expectProjectedPathForTest(&state, 4, "src/app/pages/repository.zig");
+
+    _ = state.applyNavigation(allocator, .move_up, narrow_body);
+    try std.testing.expectEqual(@as(usize, 3), state.viewer.tree_cursor);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.tree_vertical_scroll);
+    _ = state.applyNavigation(allocator, .move_down, narrow_body);
+    try std.testing.expectEqual(@as(usize, 4), state.viewer.tree_cursor);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.tree_vertical_scroll);
+
+    state.dismissIncoming(allocator);
+    var zero_rows = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .location = .{ .path = "src/app/pages/repository.zig" } },
+    );
+    state.acceptIncoming(allocator, &zero_rows);
+    try std.testing.expect(state.resolveIncomingAfterActivation(
+        allocator,
+        .{ .width = 80, .height = 3 },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_vertical_scroll);
+    state.clampForBodySize(.{ .width = 80, .height = 8 });
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_vertical_scroll);
+}
+
+test "repository incoming viewport scroll preserves same-target source viewport" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest(
+        "src/app/pages/repository.zig\x00",
+        "0123456789abcdefghijklmnop\n1\n2\n3\n4\n5\n6\n7\n",
+    );
+    defer state.deinit(allocator);
+    state.freshness = .fresh;
+    state.viewer.focus = .source;
+    state.viewer.source_cursor = 6;
+    state.viewer.source_vertical_scroll = 0;
+    state.viewer.source_horizontal_scroll = 9;
+    const identity = state.root_identity.?;
+
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        state.repo_epoch,
+        identity,
+        .{ .location = .{ .path = "src/app/pages/repository.zig" } },
+    );
+    state.acceptIncoming(allocator, &incoming);
+    try std.testing.expect(state.resolveIncomingAfterActivation(
+        allocator,
+        .{ .width = 20, .height = 4 },
+    ));
+
+    try std.testing.expect(state.incoming == .none);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 9), state.viewer.source_horizontal_scroll);
+}
+
+test "repository incoming viewport scroll applies deferred manifest with the same placement" {
+    const allocator = std.testing.allocator;
+    const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 2,
+        .repo_epoch = 4,
+        .root_identity = identity,
+        .generation = 7,
+        .pending_generation = 7,
+        .load_state = .loading,
+        .file_visibility = .changed,
+    };
+    defer state.deinit(allocator);
+
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        4,
+        identity,
+        .{ .location = .{ .path = "src/app/pages/repository.zig" } },
+    );
+    state.acceptIncoming(allocator, &incoming);
+
+    var bundle = try bundleForTest("src/app.zig\x00src/app/pages/repository.zig\x00");
+    try applyBundleStatusForTest(
+        &bundle,
+        " M src/app.zig\x00 M src/app/pages/repository.zig\x00",
+    );
+    var finished: ManifestFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = 4, .activation_id = 2 },
+        .root_identity = identity,
+        .generation = 7,
+        .result = .{ .loaded = bundle },
+    };
+    defer finished.deinit(allocator);
+
+    try std.testing.expectEqual(
+        ApplyOutcome.changed,
+        state.applyFinished(allocator, &finished, .{ .width = 80, .height = 7 }),
+    );
+    try std.testing.expectEqualStrings(
+        "src/app/pages/repository.zig",
+        state.selected_path.?,
+    );
+    try std.testing.expectEqual(@as(usize, 4), state.viewer.tree_cursor);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.tree_vertical_scroll);
+    try expectProjectedPathForTest(&state, 1, "src");
+    try expectProjectedPathForTest(&state, 4, "src/app/pages/repository.zig");
+}
+
 test "repository minimum tree disclosure repository filter discoverability Review incoming expands only exact ancestors" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
@@ -7941,7 +8152,7 @@ test "repository minimum tree disclosure repository filter discoverability Revie
     );
     const owned_address = @intFromPtr(incoming.location.path.ptr);
     state.acceptIncoming(allocator, &incoming);
-    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator, test_body_size));
 
     try std.testing.expect(state.incoming == .awaiting_document);
     const pending = state.incoming.documentIntent().?;
@@ -7989,7 +8200,7 @@ test "repository minimum tree disclosure Review incoming root file opens no dire
         .{ .location = .{ .path = "root-target.zig", .line = 3 } },
     );
     state.acceptIncoming(allocator, &incoming);
-    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator, test_body_size));
 
     try std.testing.expectEqualStrings("root-target.zig", state.selected_path.?);
     for (state.bundle.?.tree.nodes) |node| {
@@ -8030,7 +8241,7 @@ test "repository transition B2a exact failures retain prior browser location" {
         .{ .location = .{ .path = "missing.zig", .line = null } },
     );
     state.acceptIncoming(allocator, &missing);
-    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator, test_body_size));
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.path_not_found, state.incomingUnavailable().?.reason);
     try std.testing.expectEqualStrings("missing.zig", state.incomingUnavailable().?.path);
     try std.testing.expectEqualStrings("retained.zig", state.selected_path.?);
@@ -8042,7 +8253,7 @@ test "repository transition B2a exact failures retain prior browser location" {
         .{ .location = .{ .path = "retained.zig", .line = 1 } },
     );
     state.acceptIncoming(allocator, &wrong_repository);
-    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator, test_body_size));
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.request_failed, state.incomingUnavailable().?.reason);
     try std.testing.expectEqualStrings("retained.zig", state.selected_path.?);
 }
@@ -8070,7 +8281,7 @@ test "repository transition B2a first owner install waits for activation identit
     try std.testing.expectEqualStrings("retained.zig", state.selected_path.?);
 
     state.activate(4, identity);
-    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_document);
     try std.testing.expectEqualStrings("target.zig", state.selected_path.?);
     try std.testing.expectEqual(@as(?u32, 3), state.incoming.documentIntent().?.location.line);
@@ -8106,7 +8317,7 @@ test "repository transition B2a resolves or terminalizes matching manifest compl
         .result = .{ .loaded = try bundleForTest("README.md\x00src/main.zig\x00") },
     };
     defer finished.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &finished));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &finished, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_document);
     try std.testing.expectEqualStrings("src/main.zig", state.selected_path.?);
     try std.testing.expectEqual(@as(u64, 1), state.incoming.documentIntent().?.manifest_revision);
@@ -8129,7 +8340,7 @@ test "repository transition B2a resolves or terminalizes matching manifest compl
         .result = .{ .failed_static = "manifest failed" },
     };
     defer failed.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(allocator, &failed));
+    try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(allocator, &failed, test_body_size));
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.request_failed, state.incomingUnavailable().?.reason);
 }
 
@@ -8534,7 +8745,7 @@ test "repository transition B2b1 resolves an already accepted source without a t
             .{ .location = .{ .path = "main.zig", .line = case.line } },
         );
         state.acceptIncoming(allocator, &incoming);
-        try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+        try std.testing.expect(state.resolveIncomingAfterActivation(allocator, test_body_size));
         try std.testing.expect(state.incoming == .none);
         try std.testing.expectEqual(source_address, @intFromPtr(state.currentSource().?));
         try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
@@ -8553,7 +8764,7 @@ test "repository transition B2b1 resolves an already accepted source without a t
         .{ .location = .{ .path = "main.zig", .line = null } },
     );
     state.acceptIncoming(allocator, &path_only);
-    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator, test_body_size));
     try std.testing.expect(state.incoming == .none);
     try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
     try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
@@ -8585,7 +8796,7 @@ fn expectReactivatedIncomingDocumentForTest(
     );
     state.acceptIncoming(allocator, &incoming);
     state.activate(state.repo_epoch, root.capability.identity);
-    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_document);
     try std.testing.expect(state.needs_revalidation);
     try std.testing.expect(!state.needs_document_revalidation);
@@ -8602,7 +8813,7 @@ fn expectReactivatedIncomingDocumentForTest(
         .result = .{ .unchanged = state.bundle.?.document.fingerprint },
     };
     defer manifest_finished.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(allocator, &manifest_finished));
+    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(allocator, &manifest_finished, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_document);
     try std.testing.expect(state.needs_document_revalidation);
 
@@ -8672,7 +8883,7 @@ fn expectIncomingDocumentLineForTest(
         .{ .location = .{ .path = "main.zig", .line = line } },
     );
     state.acceptIncoming(allocator, &incoming);
-    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_document);
     try std.testing.expect(state.wantsDocumentRequest());
 
@@ -8734,7 +8945,7 @@ test "repository transition B2b1 inert document moves request path to unavailabl
     );
     const owned_address = @intFromPtr(incoming.location.path.ptr);
     state.acceptIncoming(allocator, &incoming);
-    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator, test_body_size));
     var request = try state.prepareDocumentRequest(allocator, &root.capability);
     defer request.deinit(allocator);
     var finished: DocumentFinished = .{
@@ -8779,7 +8990,7 @@ test "repository transition B2b1 wrong root terminalizes the bound owner" {
     );
     const owned_address = @intFromPtr(incoming.location.path.ptr);
     state.acceptIncoming(allocator, &incoming);
-    try std.testing.expect(state.resolveIncomingAfterActivation(allocator));
+    try std.testing.expect(state.resolveIncomingAfterActivation(allocator, test_body_size));
     var request = try state.prepareDocumentRequest(allocator, &root.capability);
     defer request.deinit(allocator);
     const bytes = try allocator.dupe(u8, "source\n");
@@ -8864,7 +9075,7 @@ test "repository transition B2b2a manifest start failures close the owner" {
         .result = .{ .loaded = try bundleForTest("predecessor.zig\x00") },
     };
     defer predecessor_finished.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &predecessor_finished));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &predecessor_finished, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_document);
     try std.testing.expectEqual(predecessor_address, @intFromPtr(state.incoming.documentIntent().?.location.path.ptr));
 
@@ -8963,7 +9174,7 @@ test "repository transition B2b2b1 manual reload rebinds one destination through
         .result = .{ .unchanged = state.bundle.?.document.fingerprint },
     };
     defer manifest_finished.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &manifest_finished));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &manifest_finished, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_document);
     try std.testing.expect(state.needs_document_revalidation);
 
@@ -9036,7 +9247,7 @@ test "repository transition B2b2b1 reactivation rewinds or terminalizes document
         .result = .{ .loaded = try bundleForTest("retained.zig\x00") },
     };
     defer manifest_finished.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &manifest_finished));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &manifest_finished, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_document);
 
     var document_request = try state.prepareDocumentRequest(allocator, &root.capability);
@@ -9091,7 +9302,7 @@ test "repository transition B2b2b1 reactivation invalidates manifest predecessor
         .result = .{ .loaded = try bundleForTest("pending.zig\x00") },
     };
     defer stale_manifest.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &stale_manifest));
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &stale_manifest, test_body_size));
     try expectIncomingRequestFailureForTest(&state, owned_address);
     try std.testing.expect(state.bundle == null);
 }
@@ -9117,7 +9328,7 @@ test "repository transition B2b2b2a manifest mismatch keeps a current task succe
         .result = .{ .failed_static = "stale manifest" },
     };
     defer stale.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &stale));
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &stale, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_manifest);
     try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.manifestIntent().?.path.ptr));
 
@@ -9128,20 +9339,20 @@ test "repository transition B2b2b2a manifest mismatch keeps a current task succe
         .result = .{ .loaded = try bundleForTest("target.zig\x00") },
     };
     defer current.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &current));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &current, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_document);
     try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.documentIntent().?.location.path.ptr));
 
     // The manifest payload has no document-acceptance authority, but its
     // rejection still classifies the remaining owner's liveness. The accepted
     // manifest scheduled document revalidation, so that successor retains it.
-    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &stale));
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &stale, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_document);
 
     // Without that named document successor, the same reverse cross-stage
     // rejection closes the same path owner instead of retaining it forever.
     state.needs_document_revalidation = false;
-    try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(allocator, &stale));
+    try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(allocator, &stale, test_body_size));
     try expectIncomingRequestFailureForTest(&state, owned_address);
 }
 
@@ -9166,7 +9377,7 @@ test "repository transition B2b2b2a manifest mismatch keeps a scheduled successo
         .result = .{ .failed_static = "unmatched manifest" },
     };
     defer unmatched.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &unmatched));
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &unmatched, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_manifest);
     try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.manifestIntent().?.path.ptr));
 
@@ -9196,7 +9407,7 @@ test "repository transition B2b2b2a manifest mismatch keeps a dormant successor"
         .result = .{ .failed_static = "old activation" },
     };
     defer unmatched.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &unmatched));
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyFinished(allocator, &unmatched, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_manifest);
     try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.manifestIntent().?.path.ptr));
 
@@ -9229,7 +9440,7 @@ test "repository transition B2b2b2a manifest mismatch without successor closes o
         .result = .{ .failed_static = "unowned completion" },
     };
     defer unmatched.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(allocator, &unmatched));
+    try std.testing.expectEqual(ApplyOutcome.failed, state.applyFinished(allocator, &unmatched, test_body_size));
     try expectIncomingRequestFailureForTest(&state, owned_address);
     try std.testing.expect(state.bundle == null);
 }
