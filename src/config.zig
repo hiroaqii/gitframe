@@ -59,30 +59,15 @@ pub const ExternalActionsConfig = struct {
 };
 
 pub const ExternalActionInput = enum {
-    selection_context,
-    review_context,
     staged_diff,
     commit_message_context,
 };
 
-pub const ExternalActionScope = enum {
-    generic,
-    commit,
-};
-
-pub const ExternalActionOutput = enum {
-    display,
-    commit_message,
-};
-
 pub const ExternalActionConfig = struct {
     id: []const u8 = "",
-    label: ?[]const u8 = null,
     argv: [max_external_action_argv][]const u8 = undefined,
     argv_len: u8 = 0,
-    stdin: ExternalActionInput = .selection_context,
-    scope: ExternalActionScope = .generic,
-    output: ExternalActionOutput = .display,
+    stdin: ExternalActionInput = .staged_diff,
 
     pub fn argvSlice(self: *const ExternalActionConfig) []const []const u8 {
         return self.argv[0..self.argv_len];
@@ -127,13 +112,23 @@ pub const LoadWarning = enum {
     read_failed,
 };
 
-pub const LoadConfigResult = struct {
-    config: OwnedConfig = .{},
-    warning: ?LoadWarning = null,
+pub const ConfigLoadFailure = enum {
+    read_failed,
+    invalid_toml,
+    unsupported_schema_version,
+    unsupported_action_schema,
+};
+
+pub const LoadConfigResult = union(enum) {
+    success: OwnedConfig,
+    failure: ConfigLoadFailure,
 
     pub fn deinit(self: *LoadConfigResult) void {
-        self.config.deinit();
-        self.* = .{};
+        switch (self.*) {
+            .success => |*config| config.deinit(),
+            .failure => {},
+        }
+        self.* = undefined;
     }
 };
 
@@ -247,22 +242,23 @@ fn loadTomlConfig(
     io: std.Io,
     path: ?[]const u8,
 ) LoadConfigResult {
-    const file_path = path orelse return .{};
+    const file_path = path orelse return .{ .success = .{} };
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_config_bytes)) catch |err| {
-        return .{ .warning = switch (err) {
-            error.FileNotFound => null,
-            else => .read_failed,
-        } };
+        return switch (err) {
+            error.FileNotFound => .{ .success = .{} },
+            else => .{ .failure = .read_failed },
+        };
     };
     const config = parseConfigToml(bytes) catch |err| {
         allocator.free(bytes);
-        return .{ .warning = switch (err) {
+        return .{ .failure = switch (err) {
             error.UnsupportedSchemaVersion => .unsupported_schema_version,
+            error.UnsupportedActionSchema => .unsupported_action_schema,
             else => .invalid_toml,
         } };
     };
 
-    return .{ .config = .{
+    return .{ .success = .{
         .value = config,
         .source_bytes = bytes,
         .allocator = allocator,
@@ -283,9 +279,6 @@ const TomlParseError = error{
     InvalidKeyBinding,
     InvalidActionId,
     InvalidActionInput,
-    InvalidActionScope,
-    InvalidActionOutput,
-    InvalidActionContract,
     UnknownSection,
     UnknownKey,
     TooManyArguments,
@@ -293,10 +286,12 @@ const TomlParseError = error{
     MissingPathPlaceholder,
     MissingActionId,
     MissingActionArgv,
+    MissingActionInput,
     UnknownPlaceholder,
     DuplicateKey,
     DuplicateActionId,
     UnsupportedSchemaVersion,
+    UnsupportedActionSchema,
 };
 
 fn parseConfigToml(input: []const u8) TomlParseError!Config {
@@ -450,17 +445,14 @@ fn isActionsArrayHeader(line: []const u8) bool {
 const ExternalActionParseState = struct {
     value: ExternalActionConfig = .{},
     seen_id: bool = false,
-    seen_label: bool = false,
     seen_argv: bool = false,
     seen_stdin: bool = false,
-    seen_scope: bool = false,
-    seen_output: bool = false,
 };
 
 fn flushExternalAction(config: *ExternalActionsConfig, state: *?ExternalActionParseState) TomlParseError!void {
     const current = state.* orelse return;
     if (config.len >= max_external_actions) return error.TooManyActions;
-    try validateExternalActionConfig(current.value, current.seen_id, current.seen_argv);
+    try validateExternalActionConfig(current.value, current.seen_id, current.seen_argv, current.seen_stdin);
 
     config.items[config.len] = current.value;
     config.len += 1;
@@ -474,12 +466,6 @@ fn parseExternalActionField(state: *ExternalActionParseState, key: []const u8, v
         if (!isValidExternalActionId(id)) return error.InvalidActionId;
         state.value.id = id;
         state.seen_id = true;
-    } else if (std.mem.eql(u8, key, "label")) {
-        if (state.seen_label) return error.DuplicateKey;
-        const label = try parseTomlString(value);
-        if (label.len == 0) return error.InvalidString;
-        state.value.label = label;
-        state.seen_label = true;
     } else if (std.mem.eql(u8, key, "argv")) {
         if (state.seen_argv) return error.DuplicateKey;
         try parseStringArrayInto(max_external_action_argv, &state.value.argv, &state.value.argv_len, value);
@@ -488,14 +474,11 @@ fn parseExternalActionField(state: *ExternalActionParseState, key: []const u8, v
         if (state.seen_stdin) return error.DuplicateKey;
         state.value.stdin = try parseExternalActionInput(value);
         state.seen_stdin = true;
-    } else if (std.mem.eql(u8, key, "scope")) {
-        if (state.seen_scope) return error.DuplicateKey;
-        state.value.scope = try parseExternalActionScope(value);
-        state.seen_scope = true;
-    } else if (std.mem.eql(u8, key, "output")) {
-        if (state.seen_output) return error.DuplicateKey;
-        state.value.output = try parseExternalActionOutput(value);
-        state.seen_output = true;
+    } else if (std.mem.eql(u8, key, "label") or
+        std.mem.eql(u8, key, "scope") or
+        std.mem.eql(u8, key, "output"))
+    {
+        return error.UnsupportedActionSchema;
     } else {
         return error.UnknownKey;
     }
@@ -503,24 +486,14 @@ fn parseExternalActionField(state: *ExternalActionParseState, key: []const u8, v
 
 fn parseExternalActionInput(value: []const u8) TomlParseError!ExternalActionInput {
     const text = try parseTomlString(value);
-    if (std.mem.eql(u8, text, "selection_context")) return .selection_context;
-    if (std.mem.eql(u8, text, "review_context")) return .review_context;
     if (std.mem.eql(u8, text, "staged_diff")) return .staged_diff;
     if (std.mem.eql(u8, text, "commit_message_context")) return .commit_message_context;
+    if (std.mem.eql(u8, text, "selection_context") or
+        std.mem.eql(u8, text, "review_context"))
+    {
+        return error.UnsupportedActionSchema;
+    }
     return error.InvalidActionInput;
-}
-
-fn parseExternalActionScope(value: []const u8) TomlParseError!ExternalActionScope {
-    const text = try parseTomlString(value);
-    if (std.mem.eql(u8, text, "commit")) return .commit;
-    return error.InvalidActionScope;
-}
-
-fn parseExternalActionOutput(value: []const u8) TomlParseError!ExternalActionOutput {
-    const text = try parseTomlString(value);
-    if (std.mem.eql(u8, text, "display")) return .display;
-    if (std.mem.eql(u8, text, "commit_message")) return .commit_message;
-    return error.InvalidActionOutput;
 }
 
 fn parseEditorArgv(value: []const u8) TomlParseError!EditorConfig {
@@ -582,9 +555,15 @@ fn validateEditorConfig(editor: EditorConfig) TomlParseError!void {
     if (!has_path) return error.MissingPathPlaceholder;
 }
 
-fn validateExternalActionConfig(action: ExternalActionConfig, seen_id: bool, seen_argv: bool) TomlParseError!void {
+fn validateExternalActionConfig(
+    action: ExternalActionConfig,
+    seen_id: bool,
+    seen_argv: bool,
+    seen_stdin: bool,
+) TomlParseError!void {
     if (!seen_id) return error.MissingActionId;
     if (!seen_argv) return error.MissingActionArgv;
+    if (!seen_stdin) return error.MissingActionInput;
 
     // Keep the entry-level contract here even when field parsers already reject
     // the same bad values; callers that construct this type directly get the
@@ -594,23 +573,8 @@ fn validateExternalActionConfig(action: ExternalActionConfig, seen_id: bool, see
 
     for (action.argvSlice()) |arg| {
         if (arg.len == 0) return error.InvalidString;
-        try validateExternalActionPlaceholders(action.scope, arg);
+        try validateExternalActionPlaceholders(arg);
     }
-
-    if (!isValidExternalActionContract(action.scope, action.stdin, action.output)) return error.InvalidActionContract;
-}
-
-fn isValidExternalActionContract(scope: ExternalActionScope, stdin: ExternalActionInput, output: ExternalActionOutput) bool {
-    return switch (scope) {
-        .generic => switch (stdin) {
-            .selection_context, .review_context => output == .display,
-            .staged_diff, .commit_message_context => false,
-        },
-        .commit => switch (stdin) {
-            .staged_diff, .commit_message_context => output == .commit_message,
-            .selection_context, .review_context => false,
-        },
-    };
 }
 
 fn validateExternalActionsConfig(actions: ExternalActionsConfig) TomlParseError!void {
@@ -667,7 +631,7 @@ fn validatePlaceholders(arg: []const u8) TomlParseError!void {
     if (std.mem.indexOfScalarPos(u8, arg, cursor, '}') != null) return error.UnknownPlaceholder;
 }
 
-fn validateExternalActionPlaceholders(scope: ExternalActionScope, arg: []const u8) TomlParseError!void {
+fn validateExternalActionPlaceholders(arg: []const u8) TomlParseError!void {
     var cursor: usize = 0;
     while (std.mem.indexOfScalarPos(u8, arg, cursor, '{')) |open| {
         if (std.mem.indexOfScalarPos(u8, arg, cursor, '}')) |stray| {
@@ -675,8 +639,7 @@ fn validateExternalActionPlaceholders(scope: ExternalActionScope, arg: []const u
         }
         const close = std.mem.indexOfScalarPos(u8, arg, open + 1, '}') orelse return error.UnknownPlaceholder;
         const placeholder = arg[open .. close + 1];
-        if (!isKnownPlaceholder(placeholder)) return error.UnknownPlaceholder;
-        if (scope == .commit and !std.mem.eql(u8, placeholder, "{repo_root}")) return error.UnknownPlaceholder;
+        if (!std.mem.eql(u8, placeholder, "{repo_root}")) return error.UnknownPlaceholder;
         cursor = close + 1;
     }
     if (std.mem.indexOfScalarPos(u8, arg, cursor, '}') != null) return error.UnknownPlaceholder;
@@ -757,19 +720,43 @@ test "loadConfig uses defaults when path is missing" {
     var result = loadConfig(std.testing.allocator, std.testing.io, null);
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(u32, supported_schema_version), result.config.value.schema_version);
-    try std.testing.expect(result.warning == null);
+    const loaded = switch (result) {
+        .success => |*config| config,
+        .failure => return error.ExpectedConfigSuccess,
+    };
+    try std.testing.expectEqual(@as(u32, supported_schema_version), loaded.value.schema_version);
+    try std.testing.expect(loaded.source_bytes == null);
 }
 
 test "loadConfig uses defaults when file is missing" {
     var result = loadConfig(std.testing.allocator, std.testing.io, "zig-cache/tmp/gitframe-missing-config.toml");
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(u32, supported_schema_version), result.config.value.schema_version);
-    try std.testing.expect(result.warning == null);
+    const loaded = switch (result) {
+        .success => |*config| config,
+        .failure => return error.ExpectedConfigSuccess,
+    };
+    try std.testing.expectEqual(@as(u32, supported_schema_version), loaded.value.schema_version);
+    try std.testing.expect(loaded.source_bytes == null);
 }
 
-test "loadConfig warns for invalid toml" {
+test "loadConfig fails when an existing config path cannot be read" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(path);
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.read_failed, failure);
+}
+
+test "loadConfig fails for invalid toml without a config payload" {
     const allocator = std.testing.allocator;
     const path = "zig-cache/tmp/gitframe-invalid-config.toml";
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
@@ -778,7 +765,11 @@ test "loadConfig warns for invalid toml" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects unknown fields" {
@@ -790,7 +781,11 @@ test "loadConfig rejects unknown fields" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadState ignores unknown fields" {
@@ -806,7 +801,7 @@ test "loadState ignores unknown fields" {
     try std.testing.expectEqual(@as(u32, supported_schema_version), result.state.value.schema_version);
 }
 
-test "loadConfig warns for unsupported schema version" {
+test "loadConfig fails for unsupported schema version without a config payload" {
     const allocator = std.testing.allocator;
     const path = "zig-cache/tmp/gitframe-schema-config.toml";
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
@@ -815,7 +810,11 @@ test "loadConfig warns for unsupported schema version" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.unsupported_schema_version, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.unsupported_schema_version, failure);
 }
 
 test "loadConfig accepts reserved empty TOML sections" {
@@ -835,10 +834,14 @@ test "loadConfig accepts reserved empty TOML sections" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expect(result.warning == null);
-    try std.testing.expectEqual(@as(u32, supported_schema_version), result.config.value.schema_version);
-    try std.testing.expect(result.config.value.reload.auto);
-    try std.testing.expectEqual(@as(u8, 3), result.config.value.reload.interval_seconds);
+    const loaded = switch (result) {
+        .success => |*config| config,
+        .failure => return error.ExpectedConfigSuccess,
+    };
+    try std.testing.expectEqual(@as(u32, supported_schema_version), loaded.value.schema_version);
+    try std.testing.expect(loaded.value.reload.auto);
+    try std.testing.expectEqual(@as(u8, 3), loaded.value.reload.interval_seconds);
+    try std.testing.expect(loaded.source_bytes != null);
 }
 
 test "parse config accepts reload policy" {
@@ -898,11 +901,14 @@ test "loadConfig accepts editor argv template" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expect(result.warning == null);
-    try std.testing.expectEqual(@as(u8, 3), result.config.value.editor.argv_len);
-    try std.testing.expectEqualStrings("nvim", result.config.value.editor.argv[0]);
-    try std.testing.expectEqualStrings("+{line}", result.config.value.editor.argv[1]);
-    try std.testing.expectEqualStrings("{path}", result.config.value.editor.argv[2]);
+    const loaded = switch (result) {
+        .success => |*config| config,
+        .failure => return error.ExpectedConfigSuccess,
+    };
+    try std.testing.expectEqual(@as(u8, 3), loaded.value.editor.argv_len);
+    try std.testing.expectEqualStrings("nvim", loaded.value.editor.argv[0]);
+    try std.testing.expectEqualStrings("+{line}", loaded.value.editor.argv[1]);
+    try std.testing.expectEqualStrings("{path}", loaded.value.editor.argv[2]);
 }
 
 test "loadConfig accepts editor argv empty non-command argument" {
@@ -919,9 +925,12 @@ test "loadConfig accepts editor argv empty non-command argument" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expect(result.warning == null);
-    try std.testing.expectEqual(@as(u8, 5), result.config.value.editor.argv_len);
-    try std.testing.expectEqualStrings("", result.config.value.editor.argv[3]);
+    const loaded = switch (result) {
+        .success => |*config| config,
+        .failure => return error.ExpectedConfigSuccess,
+    };
+    try std.testing.expectEqual(@as(u8, 5), loaded.value.editor.argv_len);
+    try std.testing.expectEqualStrings("", loaded.value.editor.argv[3]);
 }
 
 test "loadConfig accepts theme color overrides" {
@@ -943,13 +952,16 @@ test "loadConfig accepts theme color overrides" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expect(result.warning == null);
-    try std.testing.expect(result.config.value.theme.get(.accent).?.toChasen().eql(.{ .index = 14 }));
-    try std.testing.expect(result.config.value.theme.get(.success).?.toChasen().eql(.{ .rgb = .{ 1, 2, 3 } }));
-    try std.testing.expect(result.config.value.theme.get(.diff_added).?.toChasen().eql(.{ .index = 10 }));
-    try std.testing.expect(result.config.value.theme.get(.diff_modified).?.toChasen().eql(.{ .index = 12 }));
-    try std.testing.expect(result.config.value.theme.get(.pane_cursor_bg).?.toChasen().eql(.{ .rgb = .{ 41, 42, 43 } }));
-    try std.testing.expect(result.config.value.theme.get(.pane_active_line_number).?.toChasen().eql(.{ .rgb = .{ 255, 218, 170 } }));
+    const loaded = switch (result) {
+        .success => |*config| config,
+        .failure => return error.ExpectedConfigSuccess,
+    };
+    try std.testing.expect(loaded.value.theme.get(.accent).?.toChasen().eql(.{ .index = 14 }));
+    try std.testing.expect(loaded.value.theme.get(.success).?.toChasen().eql(.{ .rgb = .{ 1, 2, 3 } }));
+    try std.testing.expect(loaded.value.theme.get(.diff_added).?.toChasen().eql(.{ .index = 10 }));
+    try std.testing.expect(loaded.value.theme.get(.diff_modified).?.toChasen().eql(.{ .index = 12 }));
+    try std.testing.expect(loaded.value.theme.get(.pane_cursor_bg).?.toChasen().eql(.{ .rgb = .{ 41, 42, 43 } }));
+    try std.testing.expect(loaded.value.theme.get(.pane_active_line_number).?.toChasen().eql(.{ .rgb = .{ 255, 218, 170 } }));
 }
 
 test "parse config rejects removed repository cursor theme key" {
@@ -983,9 +995,12 @@ test "loadConfig accepts keymap overrides" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expect(result.warning == null);
-    try std.testing.expect(result.config.value.keymap.get(.commit).?.eql(.{ .plain_codepoint = 'm' }));
-    try std.testing.expect(result.config.value.keymap.get(.repo_picker).?.eql(.{ .shifted_ascii = .{ .lower = 'o', .upper = 'O' } }));
+    const loaded = switch (result) {
+        .success => |*config| config,
+        .failure => return error.ExpectedConfigSuccess,
+    };
+    try std.testing.expect(loaded.value.keymap.get(.commit).?.eql(.{ .plain_codepoint = 'm' }));
+    try std.testing.expect(loaded.value.keymap.get(.repo_picker).?.eql(.{ .shifted_ascii = .{ .lower = 'o', .upper = 'O' } }));
 }
 
 test "loadConfig accepts external action definitions" {
@@ -996,56 +1011,34 @@ test "loadConfig accepts external action definitions" {
         \\schema_version = 1
         \\
         \\[[actions]]
-        \\id = "ai-review-selection"
-        \\label = "AI review selection"
-        \\argv = ["gitframe-ai-review", "--input-json", "{path}"]
-        \\stdin = "selection_context"
-        \\
-        \\[[actions]]
-        \\id = "copy_context"
-        \\argv = ["cat"]
-        \\stdin = "review_context"
-        \\
-        \\[[actions]]
         \\id = "commit-message"
         \\argv = ["helper", "{repo_root}"]
         \\stdin = "staged_diff"
-        \\scope = "commit"
-        \\output = "commit_message"
         \\
         \\[[actions]]
         \\id = "commit-message-improve"
         \\argv = ["helper", "--improve", "{repo_root}"]
         \\stdin = "commit_message_context"
-        \\scope = "commit"
-        \\output = "commit_message"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expect(result.warning == null);
+    const loaded = switch (result) {
+        .success => |*config| config,
+        .failure => return error.ExpectedConfigSuccess,
+    };
 
-    const actions = result.config.value.actions.slice();
-    try std.testing.expectEqual(@as(usize, 4), actions.len);
-    try std.testing.expectEqualStrings("ai-review-selection", actions[0].id);
-    try std.testing.expectEqualStrings("AI review selection", actions[0].label.?);
-    try std.testing.expectEqual(@as(u8, 3), actions[0].argv_len);
-    try std.testing.expectEqualStrings("gitframe-ai-review", actions[0].argv[0]);
-    try std.testing.expectEqualStrings("{path}", actions[0].argv[2]);
-    try std.testing.expectEqual(ExternalActionInput.selection_context, actions[0].stdin);
-    try std.testing.expectEqualStrings("copy_context", actions[1].id);
-    try std.testing.expect(actions[1].label == null);
-    try std.testing.expectEqual(ExternalActionInput.review_context, actions[1].stdin);
-    try std.testing.expectEqualStrings("commit-message", actions[2].id);
-    try std.testing.expectEqual(ExternalActionInput.staged_diff, actions[2].stdin);
-    try std.testing.expectEqual(ExternalActionScope.commit, actions[2].scope);
-    try std.testing.expectEqual(ExternalActionOutput.commit_message, actions[2].output);
-    try std.testing.expectEqualStrings("commit-message-improve", actions[3].id);
-    try std.testing.expectEqual(ExternalActionInput.commit_message_context, actions[3].stdin);
-    try std.testing.expectEqual(ExternalActionScope.commit, actions[3].scope);
-    try std.testing.expectEqual(ExternalActionOutput.commit_message, actions[3].output);
+    const actions = loaded.value.actions.slice();
+    try std.testing.expectEqual(@as(usize, 2), actions.len);
+    try std.testing.expectEqualStrings("commit-message", actions[0].id);
+    try std.testing.expectEqual(@as(u8, 2), actions[0].argv_len);
+    try std.testing.expectEqualStrings("helper", actions[0].argv[0]);
+    try std.testing.expectEqualStrings("{repo_root}", actions[0].argv[1]);
+    try std.testing.expectEqual(ExternalActionInput.staged_diff, actions[0].stdin);
+    try std.testing.expectEqualStrings("commit-message-improve", actions[1].id);
+    try std.testing.expectEqual(ExternalActionInput.commit_message_context, actions[1].stdin);
 }
 
 test "loadConfig accepts empty actions section" {
@@ -1061,8 +1054,11 @@ test "loadConfig accepts empty actions section" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expect(result.warning == null);
-    try std.testing.expectEqual(@as(usize, 0), result.config.value.actions.slice().len);
+    const loaded = switch (result) {
+        .success => |*config| config,
+        .failure => return error.ExpectedConfigSuccess,
+    };
+    try std.testing.expectEqual(@as(usize, 0), loaded.value.actions.slice().len);
 }
 
 test "loadConfig rejects mixed actions table forms" {
@@ -1076,13 +1072,18 @@ test "loadConfig rejects mixed actions table forms" {
         \\[[actions]]
         \\id = "tool"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects invalid external action ids" {
@@ -1094,13 +1095,18 @@ test "loadConfig rejects invalid external action ids" {
         \\[[actions]]
         \\id = "-bad"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects duplicate external action ids" {
@@ -1112,34 +1118,45 @@ test "loadConfig rejects duplicate external action ids" {
         \\[[actions]]
         \\id = "tool"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\
         \\[[actions]]
         \\id = "tool"
         \\argv = ["other-tool"]
+        \\stdin = "commit_message_context"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
-test "loadConfig rejects external action missing required fields" {
+test "loadConfig rejects external action missing explicit stdin" {
     const allocator = std.testing.allocator;
     const path = "zig-cache/tmp/gitframe-actions-missing-required-config.toml";
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
         \\schema_version = 1
         \\[[actions]]
-        \\label = "No argv"
+        \\id = "tool"
+        \\argv = ["tool"]
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects external action missing id" {
@@ -1150,13 +1167,18 @@ test "loadConfig rejects external action missing id" {
         \\schema_version = 1
         \\[[actions]]
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects invalid external action argv" {
@@ -1168,13 +1190,18 @@ test "loadConfig rejects invalid external action argv" {
         \\[[actions]]
         \\id = "tool"
         \\argv = ["tool", ""]
+        \\stdin = "staged_diff"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects too many external actions" {
@@ -1186,61 +1213,82 @@ test "loadConfig rejects too many external actions" {
         \\[[actions]]
         \\id = "tool0"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool1"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool2"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool3"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool4"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool5"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool6"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool7"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool8"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool9"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool10"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool11"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool12"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool13"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool14"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool15"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\[[actions]]
         \\id = "tool16"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects too many external action argv items" {
@@ -1252,13 +1300,18 @@ test "loadConfig rejects too many external action argv items" {
         \\[[actions]]
         \\id = "tool"
         \\argv = ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10", "a11", "a12", "a13", "a14", "a15", "a16", "a17", "a18", "a19", "a20", "a21", "a22", "a23", "a24", "a25", "a26", "a27", "a28", "a29", "a30", "a31", "a32"]
+        \\stdin = "staged_diff"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects unknown external action stdin values" {
@@ -1277,27 +1330,64 @@ test "loadConfig rejects unknown external action stdin values" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
-test "loadConfig rejects invalid external action scope and output" {
+test "loadConfig distinguishes unsupported external action schema" {
     const allocator = std.testing.allocator;
-    const path = "zig-cache/tmp/gitframe-actions-invalid-scope-output-config.toml";
+    const path = "zig-cache/tmp/gitframe-actions-unsupported-schema-config.toml";
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
-        \\schema_version = 1
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const cases = [_][]const u8{
         \\[[actions]]
         \\id = "tool"
         \\argv = ["tool"]
-        \\scope = "selection"
+        \\stdin = "staged_diff"
+        \\label = "removed"
+        \\
+        ,
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\stdin = "staged_diff"
+        \\scope = "commit"
+        \\
+        ,
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\output = "commit_message"
         \\
-    });
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
-
-    var result = loadConfig(allocator, std.testing.io, path);
-    defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+        ,
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\stdin = "selection_context"
+        \\
+        ,
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\stdin = "review_context"
+        \\
+        ,
+    };
+    for (cases) |contents| {
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = contents });
+        var result = loadConfig(allocator, std.testing.io, path);
+        defer result.deinit();
+        const failure = switch (result) {
+            .failure => |value| value,
+            .success => return error.ExpectedConfigFailure,
+        };
+        try std.testing.expectEqual(ConfigLoadFailure.unsupported_action_schema, failure);
+    }
 }
 
 test "loadConfig rejects commit action target placeholders" {
@@ -1310,35 +1400,17 @@ test "loadConfig rejects commit action target placeholders" {
         \\id = "commit-message"
         \\argv = ["helper", "{path}"]
         \\stdin = "staged_diff"
-        \\scope = "commit"
-        \\output = "commit_message"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
-}
-
-test "loadConfig rejects commit message context outside commit scope" {
-    const allocator = std.testing.allocator;
-    const path = "zig-cache/tmp/gitframe-actions-commit-context-generic-config.toml";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
-        \\schema_version = 1
-        \\[[actions]]
-        \\id = "commit-message-improve"
-        \\argv = ["helper"]
-        \\stdin = "commit_message_context"
-        \\output = "display"
-        \\
-    });
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
-
-    var result = loadConfig(allocator, std.testing.io, path);
-    defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects unknown external action keys" {
@@ -1350,6 +1422,7 @@ test "loadConfig rejects unknown external action keys" {
         \\[[actions]]
         \\id = "tool"
         \\argv = ["tool"]
+        \\stdin = "staged_diff"
         \\command = "tool"
         \\
     });
@@ -1357,7 +1430,11 @@ test "loadConfig rejects unknown external action keys" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects invalid keymap overrides" {
@@ -1374,7 +1451,11 @@ test "loadConfig rejects invalid keymap overrides" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loaded theme config feeds palette derivation" {
@@ -1392,9 +1473,12 @@ test "loaded theme config feeds palette derivation" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expect(result.warning == null);
+    const loaded = switch (result) {
+        .success => |*config| config,
+        .failure => return error.ExpectedConfigSuccess,
+    };
 
-    const palette = theme.Palette.fromConfig(result.config.value.theme);
+    const palette = theme.Palette.fromConfig(loaded.value.theme);
     try std.testing.expect(palette.color(.success).eql(.{ .rgb = .{ 1, 2, 3 } }));
     try std.testing.expect(palette.color(.diff_added).eql(.{ .rgb = .{ 1, 2, 3 } }));
     try std.testing.expect(palette.color(.diff_modified).eql(.{ .rgb = .{ 7, 8, 9 } }));
@@ -1414,7 +1498,11 @@ test "loadConfig rejects unknown theme keys" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects invalid theme color values" {
@@ -1431,7 +1519,11 @@ test "loadConfig rejects invalid theme color values" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects editor argv without path placeholder" {
@@ -1448,7 +1540,11 @@ test "loadConfig rejects editor argv without path placeholder" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects unknown editor placeholders" {
@@ -1465,7 +1561,11 @@ test "loadConfig rejects unknown editor placeholders" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects stray editor placeholder closing brace" {
@@ -1482,7 +1582,11 @@ test "loadConfig rejects stray editor placeholder closing brace" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }
 
 test "loadConfig rejects empty editor command" {
@@ -1499,5 +1603,9 @@ test "loadConfig rejects empty editor command" {
 
     var result = loadConfig(allocator, std.testing.io, path);
     defer result.deinit();
-    try std.testing.expectEqual(LoadWarning.invalid_toml, result.warning.?);
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
 }

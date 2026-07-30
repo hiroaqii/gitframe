@@ -2662,7 +2662,7 @@ pub const App = struct {
     fn resolveGenerateCommitMessageAction(self: *const App) CommitMessageActionResolveError!config_mod.ExternalActionConfig {
         var found: ?config_mod.ExternalActionConfig = null;
         for (self.user_config.actions.slice()) |action| {
-            if (action.scope == .commit and action.stdin == .staged_diff and action.output == .commit_message) {
+            if (action.stdin == .staged_diff) {
                 if (found != null) return error.Multiple;
                 found = action;
             }
@@ -2673,7 +2673,7 @@ pub const App = struct {
     fn resolveImproveCommitMessageAction(self: *const App) CommitMessageActionResolveError!config_mod.ExternalActionConfig {
         var found: ?config_mod.ExternalActionConfig = null;
         for (self.user_config.actions.slice()) |action| {
-            if (action.scope == .commit and action.stdin == .commit_message_context and action.output == .commit_message) {
+            if (action.stdin == .commit_message_context) {
                 if (found != null) return error.Multiple;
                 found = action;
             }
@@ -9888,7 +9888,7 @@ test "finishCommitMessageAssist ignores improved draft after close and reopen" {
     try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.review.status.text());
 }
 
-test "resolveCommitMessageAction reports missing and multiple configs" {
+test "resolveCommitMessageAction resolves minimal configs and reports missing or multiple" {
     var missing = testAppWithCommitPanel();
     defer missing.commit_panel.deinit();
     try std.testing.expectError(error.Missing, missing.resolveGenerateCommitMessageAction());
@@ -9901,19 +9901,27 @@ test "resolveCommitMessageAction reports missing and multiple configs" {
     action.argv[0] = "helper";
     action.argv_len = 1;
     action.stdin = .staged_diff;
-    action.scope = .commit;
-    action.output = .commit_message;
     var other = action;
     other.id = "commit-message-b";
     multiple.user_config.actions.items[0] = action;
+    multiple.user_config.actions.len = 1;
+    try std.testing.expectEqualStrings(
+        "commit-message-a",
+        (try multiple.resolveGenerateCommitMessageAction()).id,
+    );
+
     multiple.user_config.actions.items[1] = other;
     multiple.user_config.actions.len = 2;
-
     try std.testing.expectError(error.Multiple, multiple.resolveGenerateCommitMessageAction());
 
     multiple.user_config.actions.items[0].stdin = .commit_message_context;
     multiple.user_config.actions.items[1].stdin = .commit_message_context;
     try std.testing.expectError(error.Multiple, multiple.resolveImproveCommitMessageAction());
+    multiple.user_config.actions.len = 1;
+    try std.testing.expectEqualStrings(
+        "commit-message-a",
+        (try multiple.resolveImproveCommitMessageAction()).id,
+    );
 }
 
 test "action cursor survives exact status projection while source member is pending" {

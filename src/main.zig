@@ -39,16 +39,24 @@ pub fn main(init: std.process.Init) !void {
 
     var config_paths = try gitframe.config.resolvePaths(init.gpa, init.environ_map);
     defer config_paths.deinit(init.gpa);
-    var user_config = gitframe.config.loadConfig(init.gpa, init.io, config_paths.config);
-    defer user_config.deinit();
+    var user_config_result = gitframe.config.loadConfig(init.gpa, init.io, config_paths.config);
+    defer user_config_result.deinit();
+    var config_stderr_buffer: [512]u8 = undefined;
+    const user_config = try configForStartupFile(
+        &user_config_result,
+        config_paths.config,
+        .stderr(),
+        init.io,
+        &config_stderr_buffer,
+    );
     var app_state = gitframe.config.loadState(init.gpa, init.io, config_paths.state);
     defer app_state.deinit();
     var recent_repos: gitframe.repo_state.RecentStore = .{};
     errdefer recent_repos.deinit(init.gpa);
     try recent_repos.loadFromRecentState(init.gpa, app_state.state.value.recent_repositories);
 
-    const palette = gitframe.theme.Palette.fromConfig(user_config.config.value.theme);
-    const effective_keymap = gitframe.keymap.Effective.fromConfig(user_config.config.value.keymap);
+    const palette = gitframe.theme.Palette.fromConfig(user_config.theme);
+    const effective_keymap = gitframe.keymap.Effective.fromConfig(user_config.keymap);
 
     if (config.stats_summary) {
         var summary: StatsSummary = .{};
@@ -72,7 +80,7 @@ pub fn main(init: std.process.Init) !void {
             .config = config,
             .env_map = init.environ_map,
             .review_output = review_output_ptr,
-            .user_config = user_config.config.value,
+            .user_config = user_config.*,
             .state_path = config_paths.state,
             .recent_repos = app_recent_repos,
             .keymap = effective_keymap,
@@ -101,13 +109,65 @@ pub fn main(init: std.process.Init) !void {
         .config = config,
         .env_map = init.environ_map,
         .review_output = review_output_ptr,
-        .user_config = user_config.config.value,
+        .user_config = user_config.*,
         .state_path = config_paths.state,
         .recent_repos = app_recent_repos,
         .keymap = effective_keymap,
         .theme = palette,
     });
     try finishReviewOutputIfNeeded(init.io, config, &review_output);
+}
+
+fn startupDiagnosticWriter(file: std.Io.File, io: std.Io, buffer: []u8) std.Io.File.Writer {
+    // A positional writer does not advance a regular file's shared descriptor
+    // offset. If main then returns an error, Zig's top-level error terminal can
+    // overwrite the diagnostic from offset zero.
+    return .initStreaming(file, io, buffer);
+}
+
+fn configForStartupFile(
+    result: *const gitframe.config.LoadConfigResult,
+    path: ?[]const u8,
+    file: std.Io.File,
+    io: std.Io,
+    buffer: []u8,
+) !*const gitframe.config.Config {
+    var stderr = startupDiagnosticWriter(file, io, buffer);
+    return configForStartup(result, path, &stderr.interface);
+}
+
+fn configForStartup(
+    result: *const gitframe.config.LoadConfigResult,
+    path: ?[]const u8,
+    stderr: *std.Io.Writer,
+) !*const gitframe.config.Config {
+    return switch (result.*) {
+        .success => |*owned| &owned.value,
+        .failure => |failure| {
+            const display_path = path orelse "<unresolved>";
+            switch (failure) {
+                .read_failed => try stderr.print(
+                    "gitframe: cannot load config {s}: read failed\n",
+                    .{display_path},
+                ),
+                .invalid_toml => try stderr.print(
+                    "gitframe: cannot load config {s}: invalid TOML\n",
+                    .{display_path},
+                ),
+                .unsupported_schema_version => try stderr.print(
+                    "gitframe: cannot load config {s}: unsupported schema version\n",
+                    .{display_path},
+                ),
+                .unsupported_action_schema => try stderr.print(
+                    "gitframe: cannot load config {s}: unsupported external action schema;\n" ++
+                        "only id, argv, and stdin = \"staged_diff\" or \"commit_message_context\" are supported\n",
+                    .{display_path},
+                ),
+            }
+            try stderr.flush();
+            return error.InvalidConfig;
+        },
+    };
 }
 
 fn wantsHelp(args: []const []const u8) bool {
@@ -254,6 +314,143 @@ fn printCliError(io: std.Io, err: gitframe.ParseArgsError) !void {
 test "wantsHelp detects help flags" {
     const args = [_][]const u8{ "gitframe", "--help" };
     try std.testing.expect(wantsHelp(args[0..]));
+}
+
+test "config startup borrows a successful result-owned config" {
+    var result: gitframe.config.LoadConfigResult = .{ .success = .{} };
+    defer result.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+
+    const config = try configForStartup(&result, null, &stderr.writer);
+
+    try std.testing.expectEqual(gitframe.config.supported_schema_version, config.schema_version);
+    try std.testing.expectEqual(@as(usize, 0), stderr.written().len);
+}
+
+test "config startup rejects every failure reason before runtime setup" {
+    const Case = struct {
+        failure: gitframe.config.ConfigLoadFailure,
+        reason: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .failure = .read_failed, .reason = "read failed" },
+        .{ .failure = .invalid_toml, .reason = "invalid TOML" },
+        .{ .failure = .unsupported_schema_version, .reason = "unsupported schema version" },
+        .{ .failure = .unsupported_action_schema, .reason = "unsupported external action schema" },
+    };
+
+    for (cases) |case| {
+        var result: gitframe.config.LoadConfigResult = .{ .failure = case.failure };
+        defer result.deinit();
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+
+        try std.testing.expectError(
+            error.InvalidConfig,
+            configForStartup(&result, "/tmp/config.toml", &stderr.writer),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, stderr.written(), "/tmp/config.toml") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stderr.written(), case.reason) != null);
+    }
+}
+
+test "config startup rejects each unsupported external action fixture" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-startup-unsupported-action.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const fixtures = [_][]const u8{
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\stdin = "selection_context"
+        \\
+        ,
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\stdin = "staged_diff"
+        \\label = "removed"
+        \\
+        ,
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\stdin = "staged_diff"
+        \\scope = "commit"
+        \\
+        ,
+        \\[[actions]]
+        \\id = "tool"
+        \\argv = ["tool"]
+        \\stdin = "staged_diff"
+        \\output = "commit_message"
+        \\
+        ,
+    };
+    const expected =
+        "gitframe: cannot load config " ++ path ++ ": unsupported external action schema;\n" ++
+        "only id, argv, and stdin = \"staged_diff\" or \"commit_message_context\" are supported\n";
+
+    for (fixtures) |contents| {
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = contents });
+        var result = gitframe.config.loadConfig(allocator, std.testing.io, path);
+        defer result.deinit();
+        switch (result) {
+            .failure => |failure| try std.testing.expectEqual(
+                gitframe.config.ConfigLoadFailure.unsupported_action_schema,
+                failure,
+            ),
+            .success => return error.ExpectedConfigFailure,
+        }
+
+        var stderr: std.Io.Writer.Allocating = .init(allocator);
+        defer stderr.deinit();
+        try std.testing.expectError(
+            error.InvalidConfig,
+            configForStartup(&result, path, &stderr.writer),
+        );
+        try std.testing.expectEqualStrings(expected, stderr.written());
+    }
+}
+
+test "config startup diagnostic survives a later error terminal in a regular file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "stderr.log", .{ .read = true });
+    defer file.close(std.testing.io);
+
+    var result: gitframe.config.LoadConfigResult = .{ .failure = .unsupported_action_schema };
+    defer result.deinit();
+    var diagnostic_buffer: [512]u8 = undefined;
+    try std.testing.expectError(
+        error.InvalidConfig,
+        configForStartupFile(
+            &result,
+            "/tmp/config.toml",
+            file,
+            std.testing.io,
+            &diagnostic_buffer,
+        ),
+    );
+
+    // Model the top-level error terminal writing to the same redirected stderr
+    // after main returns error.InvalidConfig.
+    var terminal_buffer: [128]u8 = undefined;
+    var terminal_writer: std.Io.File.Writer = .initStreaming(file, std.testing.io, &terminal_buffer);
+    try terminal_writer.interface.writeAll("error: InvalidConfig\n");
+    try terminal_writer.flush();
+
+    var contents: [512]u8 = undefined;
+    const len = try file.readPositionalAll(std.testing.io, &contents, 0);
+    try std.testing.expectEqualStrings(
+        "gitframe: cannot load config /tmp/config.toml: unsupported external action schema;\n" ++
+            "only id, argv, and stdin = \"staged_diff\" or \"commit_message_context\" are supported\n" ++
+            "error: InvalidConfig\n",
+        contents[0..len],
+    );
 }
 
 test "StatsSummary tracks max phase timings" {
