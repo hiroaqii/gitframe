@@ -7,22 +7,6 @@ const git_status = @import("git/status.zig");
 
 pub const CollapsedSet = std.StringHashMapUnmanaged(void);
 
-/// Page-owned disclosure state for the synthetic repository boundary.
-///
-/// This is intentionally separate from `CollapsedSet`: the repository root
-/// has no ordinary relative path and must not be encoded as the empty string.
-pub const RootDisclosure = enum {
-    expanded,
-    collapsed,
-
-    pub fn toggled(self: RootDisclosure) RootDisclosure {
-        return switch (self) {
-            .expanded => .collapsed,
-            .collapsed => .expanded,
-        };
-    }
-};
-
 pub const Stats = diff_file.Stats;
 pub const Status = diff_file.Status;
 

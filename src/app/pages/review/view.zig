@@ -416,7 +416,6 @@ pub fn viewSidebar(app: Context, surface: *chasen.Surface, loaded: loaded_diff.L
         const row_model = sidebar_view_model.rowAt(.{
             .tree = loaded.tree,
             .collapsed = &loaded.collapsed_dirs,
-            .root_disclosure = loaded.root_disclosure,
             .reviewed_files = loaded.reviewed_files,
             .visible_nodes = loaded.materializedVisibleNodes(),
         }, visible_index, app.page.viewer.selected_node) orelse continue;
@@ -1851,7 +1850,7 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "very_long") != null);
 }
 
-test "sidebar renderer left-aligns root and directory without a selection marker" {
+test "review root expansion renderer keeps expanded root glyph and alignment" {
     const nodes = [_]file_tree.Node{
         .{
             .kind = .repo_root,
@@ -1870,18 +1869,16 @@ test "sidebar renderer left-aligns root and directory without a selection marker
     };
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
     const collapsed: file_tree.CollapsedSet = .empty;
-    const root = sidebar_view_model.rowForNode(tree, &collapsed, .expanded, &.{}, 0, 0).?;
-    const collapsed_root = sidebar_view_model.rowForNode(tree, &collapsed, .collapsed, &.{}, 0, 0).?;
-    const directory = sidebar_view_model.rowForNode(tree, &collapsed, .expanded, &.{}, 1, 1).?;
+    const root = sidebar_view_model.rowForNode(tree, &collapsed, &.{}, 0, 0).?;
+    const directory = sidebar_view_model.rowForNode(tree, &collapsed, &.{}, 1, 1).?;
 
     var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(40, 3);
+    try ts.init(40, 2);
     defer ts.deinit();
     const palette = paletteWithOverride(.pane_cursor_bg, .{ .rgb = .{ .r = 10, .g = 11, .b = 12 } });
 
     try drawSidebarRow(&ts.surface, 0, root, true, 0, palette);
     try drawSidebarRow(&ts.surface, 1, directory, true, 0, palette);
-    try drawSidebarRow(&ts.surface, 2, collapsed_root, true, 0, palette);
 
     try ts.expectCellText(0, 0, "▾");
     try std.testing.expect(!ts.surface.readCell(0, 0).?.style.reverse);
@@ -1895,8 +1892,6 @@ test "sidebar renderer left-aligns root and directory without a selection marker
     try ts.expectCellText(2, 1, "▾");
     try ts.expectCellText(4, 1, "s");
     try std.testing.expect(ts.surface.readCell(39, 1).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try ts.expectCellText(0, 2, "▸");
-    try ts.expectCellText(2, 2, "g");
 
     ts.surface.clearAll();
     try drawSidebarRow(&ts.surface, 0, root, false, 0, palette);

@@ -1657,7 +1657,7 @@ fn decorateLoadedDiff(
         .collapsed_hunks = collapsed_hunks,
         .collapsed_dirs = .empty,
     };
-    try loaded.rebuildVisibleNodes(arena_allocator, .expanded, false, .all);
+    try loaded.rebuildVisibleNodes(arena_allocator, false, .all);
     return loaded;
 }
 

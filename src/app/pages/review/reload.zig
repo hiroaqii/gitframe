@@ -154,7 +154,6 @@ const PreparedCanonicalCurrentTree = struct {
     tree: file_tree.FileTree,
     visible_nodes: []usize,
     visible_node_count: usize,
-    root_disclosure: file_tree.RootDisclosure,
     previous_path_key: ?[]const u8,
     previous_sidebar_identity: ?context.SidebarIdentity,
 };
@@ -2865,7 +2864,6 @@ pub const Controller = struct {
         );
         try loaded.rebuildVisibleNodes(
             arena.allocator(),
-            self.page.viewer.root_disclosure,
             self.page.review_display.hide_reviewed_files,
             self.page.review_display.changed_file_filter,
         );
@@ -2911,7 +2909,6 @@ pub const Controller = struct {
         };
         try loaded.rebuildVisibleNodes(
             arena_allocator,
-            self.page.viewer.root_disclosure,
             false,
             self.page.review_display.changed_file_filter,
         );
@@ -2967,7 +2964,6 @@ pub const Controller = struct {
         shadow.visible_node_count = 0;
         try shadow.rebuildVisibleNodes(
             allocator,
-            self.page.viewer.root_disclosure,
             self.page.review_display.hide_reviewed_files,
             self.page.review_display.changed_file_filter,
         );
@@ -2975,7 +2971,6 @@ pub const Controller = struct {
             .tree = tree,
             .visible_nodes = shadow.visible_nodes,
             .visible_node_count = shadow.visible_node_count,
-            .root_disclosure = shadow.root_disclosure,
             .previous_path_key = previous_path_key,
             .previous_sidebar_identity = previous_sidebar_identity,
         };
@@ -2989,7 +2984,6 @@ pub const Controller = struct {
         loaded.tree = prepared.tree;
         loaded.visible_nodes = prepared.visible_nodes;
         loaded.visible_node_count = prepared.visible_node_count;
-        loaded.root_disclosure = prepared.root_disclosure;
         if (prepared.previous_path_key) |path_key| {
             if (navigation.findFileNodeByPathKey(loaded, path_key)) |node_index| {
                 self.navigation.selectSidebarNode(loaded, node_index);
@@ -3797,12 +3791,10 @@ pub const Controller = struct {
                 errdefer arena.deinit();
                 try self.navigation.materializeReviewedFiles(allocator, &loaded);
                 errdefer allocator.free(loaded.reviewed_files);
-                // The Review page owns root disclosure across compatible
-                // reloads. Always rematerialize the accepted load with that
-                // state, even when no file filter is active.
+                // Always rematerialize the accepted load so directory folds
+                // and file-visibility filters stay coherent across reloads.
                 try loaded.rebuildVisibleNodes(
                     arena.allocator(),
-                    self.page.viewer.root_disclosure,
                     self.page.review_display.hide_reviewed_files,
                     self.page.review_display.changed_file_filter,
                 );
@@ -4115,7 +4107,6 @@ pub const Controller = struct {
         });
         try loaded.rebuildVisibleNodes(
             allocator,
-            self.page.viewer.root_disclosure,
             self.page.review_display.hide_reviewed_files,
             self.page.review_display.changed_file_filter,
         );
@@ -4172,7 +4163,6 @@ pub const Controller = struct {
         };
         try loaded.rebuildVisibleNodes(
             arena_allocator,
-            self.page.viewer.root_disclosure,
             false,
             self.page.review_display.changed_file_filter,
         );
@@ -6742,7 +6732,7 @@ fn testPageWithDiffAndStatusOnlyFileSearchCandidate(allocator: std.mem.Allocator
         .bytes = text.len,
         .lines = std.mem.count(u8, text, "\n"),
     };
-    try loaded.rebuildVisibleNodes(arena_allocator, .expanded, false, .all);
+    try loaded.rebuildVisibleNodes(arena_allocator, false, .all);
 
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadStateWithArena(arena, loaded),

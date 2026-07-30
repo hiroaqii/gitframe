@@ -638,7 +638,6 @@ pub const View = struct {
         const source = sidebar_view_model.Source{
             .tree = loaded.tree,
             .collapsed = &loaded.collapsed_dirs,
-            .root_disclosure = loaded.root_disclosure,
             .reviewed_files = loaded.reviewed_files,
             .visible_nodes = loaded.materializedVisibleNodes(),
         };
@@ -1238,7 +1237,6 @@ pub const Controller = struct {
     fn rebuildVisibleNodes(self: Controller, loaded: *LoadedDiff, allocator: std.mem.Allocator) !void {
         try loaded.rebuildVisibleNodes(
             allocator,
-            self.page.viewer.root_disclosure,
             self.page.review_display.hide_reviewed_files,
             self.page.review_display.changed_file_filter,
         );
@@ -1354,16 +1352,11 @@ pub const Controller = struct {
         const loaded = self.activeLoadedDiff() orelse return;
         if (self.page.viewer.selected_node >= loaded.tree.nodes.len) return;
         const node = loaded.tree.nodes[self.page.viewer.selected_node];
-        if (node.kind != .repo_root and node.kind != .directory) return;
+        if (node.kind != .directory) return;
         const allocator = self.loadArenaAllocator() orelse return;
         var prepared = try loaded.prepareVisibleNodeRebuild(allocator);
-        switch (node.kind) {
-            .repo_root => self.page.viewer.root_disclosure = self.page.viewer.root_disclosure.toggled(),
-            .directory => try file_tree.toggle(allocator, &loaded.collapsed_dirs, node.path),
-            .file => unreachable,
-        }
+        try file_tree.toggle(allocator, &loaded.collapsed_dirs, node.path);
         prepared.commit(
-            self.page.viewer.root_disclosure,
             self.page.review_display.hide_reviewed_files,
             self.page.review_display.changed_file_filter,
         );
@@ -1380,7 +1373,7 @@ pub const Controller = struct {
         self.selectSidebarNode(loaded, node_index);
 
         const node = loaded.tree.nodes[node_index];
-        if (node.kind == .repo_root or node.kind == .directory) try self.toggleSelectedDirectory();
+        if (node.kind == .directory) try self.toggleSelectedDirectory();
 
         self.clampSelection(loaded.document.files.len);
         self.clampDiffNavigation();
@@ -1391,19 +1384,13 @@ pub const Controller = struct {
         if (self.page.viewer.selected_node >= loaded.tree.nodes.len) return;
         const node = loaded.tree.nodes[self.page.viewer.selected_node];
         switch (node.kind) {
-            .repo_root => if (self.page.viewer.root_disclosure == .expanded) return,
             .directory => if (!file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) return,
-            .file => return,
+            .repo_root, .file => return,
         }
         const allocator = self.loadArenaAllocator() orelse return;
         var prepared = try loaded.prepareVisibleNodeRebuild(allocator);
-        switch (node.kind) {
-            .repo_root => self.page.viewer.root_disclosure = .expanded,
-            .directory => file_tree.expand(&loaded.collapsed_dirs, node.path),
-            .file => unreachable,
-        }
+        file_tree.expand(&loaded.collapsed_dirs, node.path);
         prepared.commit(
-            self.page.viewer.root_disclosure,
             self.page.review_display.hide_reviewed_files,
             self.page.review_display.changed_file_filter,
         );
@@ -1415,21 +1402,11 @@ pub const Controller = struct {
         const loaded = self.activeLoadedDiff() orelse return;
         if (self.page.viewer.selected_node >= loaded.tree.nodes.len) return;
         const node = loaded.tree.nodes[self.page.viewer.selected_node];
-        const expanded_target = switch (node.kind) {
-            .repo_root => self.page.viewer.root_disclosure == .expanded,
-            .directory => !file_tree.isCollapsed(&loaded.collapsed_dirs, node.path),
-            .file => false,
-        };
-        if (expanded_target) {
+        if (node.kind == .directory and !file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) {
             const allocator = self.loadArenaAllocator() orelse return;
             var prepared = try loaded.prepareVisibleNodeRebuild(allocator);
-            switch (node.kind) {
-                .repo_root => self.page.viewer.root_disclosure = .collapsed,
-                .directory => try file_tree.collapse(allocator, &loaded.collapsed_dirs, node.path),
-                .file => unreachable,
-            }
+            try file_tree.collapse(allocator, &loaded.collapsed_dirs, node.path);
             prepared.commit(
-                self.page.viewer.root_disclosure,
                 self.page.review_display.hide_reviewed_files,
                 self.page.review_display.changed_file_filter,
             );
@@ -1659,7 +1636,6 @@ pub const Controller = struct {
     pub fn resetAfterRepositorySwitch(self: Controller) void {
         self.setSelectedDiffFile(0);
         self.page.viewer.selected_node = 0;
-        self.page.viewer.root_disclosure = .expanded;
         self.clearSearch();
     }
 
@@ -1739,7 +1715,6 @@ pub const Controller = struct {
             self.page.advanceAcceptedSidebarRevision(allocator);
             loaded.reviewed_files[file_index] = reviewed;
             prepared.commit(
-                self.page.viewer.root_disclosure,
                 self.page.review_display.hide_reviewed_files,
                 self.page.review_display.changed_file_filter,
             );
@@ -1788,7 +1763,6 @@ pub const Controller = struct {
             self.page.review_display.hide_reviewed_files = hide_reviewed_files;
             self.page.review_display.changed_file_filter = changed_file_filter;
             prepared.commit(
-                self.page.viewer.root_disclosure,
                 hide_reviewed_files,
                 changed_file_filter,
             );
@@ -2087,10 +2061,8 @@ pub const Controller = struct {
     fn revealActionNode(self: Controller, loaded: *LoadedDiff, node_index: usize) bool {
         const allocator = self.loadArenaAllocator() orelse return false;
         var prepared = loaded.prepareVisibleNodeRebuild(allocator) catch return false;
-        self.page.viewer.root_disclosure = .expanded;
         file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
         prepared.commit(
-            self.page.viewer.root_disclosure,
             self.page.review_display.hide_reviewed_files,
             self.page.review_display.changed_file_filter,
         );
@@ -2483,8 +2455,8 @@ pub const Controller = struct {
         return .{ .selected = node_index };
     }
 
-    /// Commit one already validated exact file node through the single Review
-    /// disclosure and navigation transaction. Candidate/path admission and
+    /// Commit one already validated exact file node through the Review
+    /// ancestor-reveal and navigation transaction. Candidate/path admission and
     /// caller-specific failure policy deliberately remain outside this helper.
     fn revealAndSelectExactNode(
         self: Controller,
@@ -2497,10 +2469,8 @@ pub const Controller = struct {
         if (loaded.visibleRowOfNode(node_index) == null) {
             const allocator = visible_allocator orelse return error.MissingVisibleNodeAllocator;
             var prepared = try loaded.prepareVisibleNodeRebuild(allocator);
-            self.page.viewer.root_disclosure = .expanded;
             file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
             prepared.commit(
-                self.page.viewer.root_disclosure,
                 self.page.review_display.hide_reviewed_files,
                 self.page.review_display.changed_file_filter,
             );
@@ -4094,7 +4064,7 @@ test "toggling selected directory collapses visible descendants" {
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
 }
 
-test "repository root disclosure toggles typed projection and retains diff target" {
+test "review root expansion ignores toggle and expand while retaining diff target" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
@@ -4111,10 +4081,9 @@ test "repository root disclosure toggles typed projection and retains diff targe
     try app.reviewNavigation().toggleSelectedDirectory();
 
     var loaded = app.reviewNavigation().loadedDiff().?;
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, app.pages.review.viewer.root_disclosure);
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
-    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(usize, 4), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
+    try std.testing.expectEqual(@as(u16, 1), loaded.tree.nodes[loaded.visibleNodeAt(1).?].depth);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, ""));
@@ -4122,13 +4091,11 @@ test "repository root disclosure toggles typed projection and retains diff targe
     try app.reviewNavigation().expandSelectedDirectory();
 
     loaded = app.reviewNavigation().loadedDiff().?;
-    try std.testing.expectEqual(file_tree.RootDisclosure.expanded, app.pages.review.viewer.root_disclosure);
-    try std.testing.expectEqual(file_tree.RootDisclosure.expanded, loaded.root_disclosure);
     try std.testing.expectEqual(@as(usize, 4), loaded.visibleNodeCount());
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
-test "repository root mouse click selects and toggles the real target" {
+test "review root expansion mouse click selects root without hiding children" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
@@ -4147,19 +4114,18 @@ test "repository root mouse click selects and toggles the real target" {
     const loaded = app.reviewNavigation().loadedDiff().?;
     try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, app.pages.review.viewer.root_disclosure);
-    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(usize, 4), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(u16, 1), loaded.tree.nodes[loaded.visibleNodeAt(1).?].depth);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
-test "repository switch resets Review root disclosure" {
+test "repository switch resets Review navigation" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
                 .selected_file = 1,
                 .selected_node = 3,
-                .root_disclosure = .collapsed,
             },
             .search = .{
                 .mode = true,
@@ -4170,7 +4136,6 @@ test "repository switch resets Review root disclosure" {
 
     app.reviewNavigation().resetAfterRepositorySwitch();
 
-    try std.testing.expectEqual(file_tree.RootDisclosure.expanded, app.pages.review.viewer.root_disclosure);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
     try std.testing.expect(!app.pages.review.search.mode);
@@ -4178,7 +4143,7 @@ test "repository switch resets Review root disclosure" {
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.search.query.len);
 }
 
-test "left and right navigation use repository root as a directory parent" {
+test "review root expansion keeps left and right on root as no-ops" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
@@ -4201,12 +4166,10 @@ test "left and right navigation use repository root as a directory parent" {
 
     try app.reviewNavigation().collapseOrSelectParentDirectory();
     loaded = app.reviewNavigation().loadedDiff().?;
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, app.pages.review.viewer.root_disclosure);
-    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
 
     try app.reviewNavigation().expandSelectedDirectory();
     loaded = app.reviewNavigation().loadedDiff().?;
-    try std.testing.expectEqual(file_tree.RootDisclosure.expanded, app.pages.review.viewer.root_disclosure);
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
 }
@@ -4239,7 +4202,7 @@ test "file search selects matching file and expands ancestors" {
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
 
-test "file search expands collapsed repository root before selecting its match" {
+test "review root expansion file search reveals only collapsed ancestors" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), fileSearchLoadedRootedNested()),
@@ -4247,7 +4210,6 @@ test "file search expands collapsed repository root before selecting its match" 
                 .selected_target = .{ .diff_file = 0 },
                 .selected_file = 0,
                 .selected_node = 0,
-                .root_disclosure = .collapsed,
             },
             .file_search = .{ .mode = true },
         } },
@@ -4258,17 +4220,19 @@ test "file search expands collapsed repository root before selecting its match" 
     const loaded = app.reviewNavigation().loadedDiff().?;
     try loaded.rebuildVisibleNodes(
         app.reviewNavigation().loadArenaAllocator().?,
-        app.pages.review.viewer.root_disclosure,
         false,
         .all,
     );
     try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+    try loaded.rebuildVisibleNodes(
+        app.reviewNavigation().loadArenaAllocator().?,
+        false,
+        .all,
+    );
     setAndRebuildFileSearch(&app, "src/b");
 
     app.reviewNavigation().submitFileSearch(std.testing.allocator);
 
-    try std.testing.expectEqual(file_tree.RootDisclosure.expanded, app.pages.review.viewer.root_disclosure);
-    try std.testing.expectEqual(file_tree.RootDisclosure.expanded, loaded.root_disclosure);
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, ""));
     try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.selected_node);
@@ -4720,7 +4684,7 @@ test "review transition D2b selected exact node still reveals collapsed ancestor
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
-test "review transition expands typed repository root before exact reveal" {
+test "review root expansion exact reveal expands only ordinary ancestors" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var app: TestHarness = .{
         .pages = .{ .review = .{
@@ -4729,7 +4693,6 @@ test "review transition expands typed repository root before exact reveal" {
                 .selected_target = .{ .diff_file = 1 },
                 .selected_file = 1,
                 .selected_node = 0,
-                .root_disclosure = .collapsed,
             },
         } },
         .repo_epoch = 4,
@@ -4739,7 +4702,7 @@ test "review transition expands typed repository root before exact reveal" {
     const loaded = app.reviewNavigation().loadedDiff().?;
     const allocator = app.reviewNavigation().loadArenaAllocator().?;
     try file_tree.collapse(allocator, &loaded.collapsed_dirs, "src");
-    try loaded.rebuildVisibleNodes(allocator, .collapsed, false, .all);
+    try loaded.rebuildVisibleNodes(allocator, false, .all);
     try std.testing.expectEqual(@as(?usize, null), loaded.visibleRowOfNode(3));
 
     try expectExactPathRevealSelected(
@@ -4747,8 +4710,6 @@ test "review transition expands typed repository root before exact reveal" {
         3,
     );
 
-    try std.testing.expectEqual(file_tree.RootDisclosure.expanded, app.pages.review.viewer.root_disclosure);
-    try std.testing.expectEqual(file_tree.RootDisclosure.expanded, loaded.root_disclosure);
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(?usize, 3), loaded.visibleRowOfNode(3));
     try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.selected_node);
@@ -4894,7 +4855,6 @@ test "file search skips hidden reviewed matches" {
     defer app.clearLoadedDiff();
     try app.reviewNavigation().loadedDiff().?.rebuildVisibleNodes(
         app.reviewNavigation().loadArenaAllocator().?,
-        app.pages.review.viewer.root_disclosure,
         true,
         .all,
     );
@@ -5565,14 +5525,14 @@ test "typed action cursor remaps a repository root without changing the sticky d
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
-test "terminal directory action cursor reveals exact target under collapsed repository root" {
+test "review root expansion terminal file action reveals an ordinary folded ancestor" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
                 .selected_file = 1,
-                .selected_node = 0,
+                .selected_node = 1,
             },
         } },
     };
@@ -5581,14 +5541,15 @@ test "terminal directory action cursor reveals exact target under collapsed repo
 
     try app.reviewNavigation().toggleSelectedDirectory();
     const loaded = app.reviewNavigation().loadedDiff().?;
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
+    try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
+    try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
 
     var prepared = try review_page.action_cursor.Prepared.init(
         std.testing.allocator,
         3,
         .{ .device = 5, .inode = 8 },
-        .directory,
-        "src",
+        .file,
+        "src/b",
         0,
     );
     app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
@@ -5600,8 +5561,8 @@ test "terminal directory action cursor reveals exact target under collapsed repo
 
     try std.testing.expect(app.reviewNavigation().finalizeActionCursor(std.testing.allocator));
     try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
-    try std.testing.expectEqual(file_tree.RootDisclosure.expanded, loaded.root_disclosure);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
+    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
@@ -5616,7 +5577,7 @@ test "filtered directory action cursor falls back to repository root instead of 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var loaded = app_test_support.loadedDiffTwo();
     loaded.tree = .{ .nodes = &nodes };
-    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .added);
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .added);
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
@@ -5653,7 +5614,7 @@ test "filtered directory action cursor falls back to repository root instead of 
 test "disappeared file action cursor keeps the existing nearest-file fallback" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var loaded = app_test_support.loadedDiffRootedNested();
-    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
@@ -5701,7 +5662,6 @@ test "changed file filter keeps only matching status rows" {
 
     try app.reviewNavigation().loadedDiff().?.rebuildVisibleNodes(
         app.reviewNavigation().loadArenaAllocator().?,
-        app.pages.review.viewer.root_disclosure,
         false,
         app.pages.review.review_display.changed_file_filter,
     );
@@ -6121,7 +6081,6 @@ test "marking a visible file as reviewed while hidden moves selection" {
     defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
     try app.reviewNavigation().loadedDiff().?.rebuildVisibleNodes(
         app.reviewNavigation().loadArenaAllocator().?,
-        app.pages.review.viewer.root_disclosure,
         true,
         .all,
     );
@@ -6165,7 +6124,6 @@ test "marking reviewed under hidden lens rebuilds file search eligibility" {
     defer app.pages.review.file_search.deinit(std.testing.allocator);
     try app.reviewNavigation().loadedDiff().?.rebuildVisibleNodes(
         app.reviewNavigation().loadArenaAllocator().?,
-        app.pages.review.viewer.root_disclosure,
         true,
         .all,
     );

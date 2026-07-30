@@ -39,7 +39,6 @@ pub const RowLayout = struct {
 pub const Source = struct {
     tree: file_tree.FileTree,
     collapsed: *const file_tree.CollapsedSet,
-    root_disclosure: file_tree.RootDisclosure,
     reviewed_files: []const bool,
     /// Null means the caller has no materialized visible-node cache; use the
     /// tree's collapsed-directory traversal instead. An empty slice means the
@@ -50,7 +49,6 @@ pub const Source = struct {
 pub fn rowForNode(
     tree: file_tree.FileTree,
     collapsed: *const file_tree.CollapsedSet,
-    root_disclosure: file_tree.RootDisclosure,
     reviewed_files: []const bool,
     node_index: usize,
     selected_node: usize,
@@ -59,10 +57,7 @@ pub fn rowForNode(
 
     const node = tree.nodes[node_index];
     const fold: Row.Fold = switch (node.kind) {
-        .repo_root => switch (root_disclosure) {
-            .expanded => .expanded,
-            .collapsed => .collapsed,
-        },
+        .repo_root => .expanded,
         .directory => if (file_tree.isCollapsed(collapsed, node.path)) .collapsed else .expanded,
         .file => .none,
     };
@@ -88,24 +83,23 @@ pub fn rowForNode(
 
 pub fn rowAt(source: Source, visible_index: usize, selected_node: usize) ?Row {
     if (source.visible_nodes) |nodes| {
-        return visibleRowAt(source.tree, source.collapsed, source.root_disclosure, source.reviewed_files, nodes, visible_index, selected_node);
+        return visibleRowAt(source.tree, source.collapsed, source.reviewed_files, nodes, visible_index, selected_node);
     }
 
     const node_index = source.tree.visibleNodeAt(source.collapsed, visible_index) orelse return null;
-    return rowForNode(source.tree, source.collapsed, source.root_disclosure, source.reviewed_files, node_index, selected_node);
+    return rowForNode(source.tree, source.collapsed, source.reviewed_files, node_index, selected_node);
 }
 
 fn visibleRowAt(
     tree: file_tree.FileTree,
     collapsed: *const file_tree.CollapsedSet,
-    root_disclosure: file_tree.RootDisclosure,
     reviewed_files: []const bool,
     visible_nodes: []const usize,
     visible_index: usize,
     selected_node: usize,
 ) ?Row {
     if (visible_index >= visible_nodes.len) return null;
-    return rowForNode(tree, collapsed, root_disclosure, reviewed_files, visible_nodes[visible_index], selected_node);
+    return rowForNode(tree, collapsed, reviewed_files, visible_nodes[visible_index], selected_node);
 }
 
 pub fn layout(row: Row, width: u16) RowLayout {
@@ -211,13 +205,13 @@ test "rowForNode exposes sidebar row semantics" {
     };
 
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
-    const row = rowForNode(tree, &collapsed, .expanded, &.{}, 0, 0).?;
+    const row = rowForNode(tree, &collapsed, &.{}, 0, 0).?;
 
     try std.testing.expectEqual(@as(usize, 0), row.node_index);
     try std.testing.expect(row.selected);
     try std.testing.expectEqual(Row.Fold.collapsed, row.fold);
     try std.testing.expectEqual(@as(usize, 3), row.stats.added);
-    const file_row = rowForNode(tree, &collapsed, .expanded, &.{}, 1, 0).?;
+    const file_row = rowForNode(tree, &collapsed, &.{}, 1, 0).?;
     try std.testing.expect(file_row.mode_changed);
 }
 
@@ -236,7 +230,7 @@ test "layout keeps sidebar columns in one place" {
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
     const collapsed: file_tree.CollapsedSet = .empty;
     const reviewed = [_]bool{true};
-    const row = rowForNode(tree, &collapsed, .expanded, &reviewed, 0, 1).?;
+    const row = rowForNode(tree, &collapsed, &reviewed, 0, 1).?;
     const row_layout = layout(row, 40);
 
     try std.testing.expect(!row.selected);
@@ -266,7 +260,7 @@ test "layout reserves a mode badge column for mode-changed file rows" {
     };
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
     const collapsed: file_tree.CollapsedSet = .empty;
-    const row = rowForNode(tree, &collapsed, .expanded, &.{false}, 0, 0).?;
+    const row = rowForNode(tree, &collapsed, &.{false}, 0, 0).?;
     const row_layout = layout(row, 40);
 
     try std.testing.expectEqual(@as(u16, 2), row_layout.badge_col.?);
@@ -290,8 +284,8 @@ test "layout reserves reviewed gutter for status-less file rows" {
     const unreviewed = [_]bool{false};
     const reviewed = [_]bool{true};
 
-    const unreviewed_layout = layout(rowForNode(tree, &collapsed, .expanded, &unreviewed, 0, 0).?, 40);
-    const reviewed_layout = layout(rowForNode(tree, &collapsed, .expanded, &reviewed, 0, 0).?, 40);
+    const unreviewed_layout = layout(rowForNode(tree, &collapsed, &unreviewed, 0, 0).?, 40);
+    const reviewed_layout = layout(rowForNode(tree, &collapsed, &reviewed, 0, 0).?, 40);
 
     try std.testing.expectEqual(@as(?u16, null), unreviewed_layout.reviewed_col);
     try std.testing.expectEqual(@as(u16, 1), reviewed_layout.reviewed_col.?);
@@ -314,7 +308,7 @@ test "layout omits zero line stats" {
     };
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
     const collapsed: file_tree.CollapsedSet = .empty;
-    const row_layout = layout(rowForNode(tree, &collapsed, .expanded, &.{false}, 0, 0).?, 40);
+    const row_layout = layout(rowForNode(tree, &collapsed, &.{false}, 0, 0).?, 40);
 
     try std.testing.expectEqual(@as(?u16, null), row_layout.stats_col);
     try std.testing.expectEqual(@as(u16, 0), row_layout.stats_width);
@@ -335,7 +329,7 @@ test "layout prioritizes file name over stats in narrow sidebars" {
     };
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
     const collapsed: file_tree.CollapsedSet = .empty;
-    const row_layout = layout(rowForNode(tree, &collapsed, .expanded, &.{false}, 0, 0).?, 14);
+    const row_layout = layout(rowForNode(tree, &collapsed, &.{false}, 0, 0).?, 14);
 
     try std.testing.expectEqual(@as(?u16, null), row_layout.stats_col);
     try std.testing.expectEqual(@as(u16, 0), row_layout.stats_width);
@@ -363,8 +357,8 @@ test "layout shows stats only for repository root rows" {
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
     const collapsed: file_tree.CollapsedSet = .empty;
 
-    const root_layout = layout(rowForNode(tree, &collapsed, .expanded, &.{}, 0, 0).?, 40);
-    const directory_layout = layout(rowForNode(tree, &collapsed, .expanded, &.{}, 1, 0).?, 40);
+    const root_layout = layout(rowForNode(tree, &collapsed, &.{}, 0, 0).?, 40);
+    const directory_layout = layout(rowForNode(tree, &collapsed, &.{}, 1, 0).?, 40);
 
     try std.testing.expectEqual(@as(u16, 0), root_layout.tree_content_col);
     try std.testing.expectEqual(@as(u16, 2), root_layout.name_col);
@@ -374,7 +368,7 @@ test "layout shows stats only for repository root rows" {
     try std.testing.expectEqual(@as(?u16, null), directory_layout.stats_col);
 }
 
-test "repository root fold follows typed disclosure instead of collapsed path keys" {
+test "review root expansion always renders repository root as expanded" {
     const nodes = [_]file_tree.Node{.{
         .kind = .repo_root,
         .name = "repo",
@@ -385,10 +379,8 @@ test "repository root fold follows typed disclosure instead of collapsed path ke
     const tree: file_tree.FileTree = .{ .nodes = &nodes };
     const collapsed: file_tree.CollapsedSet = .empty;
 
-    const expanded = rowForNode(tree, &collapsed, .expanded, &.{}, 0, 0).?;
-    const collapsed_root = rowForNode(tree, &collapsed, .collapsed, &.{}, 0, 0).?;
+    const root = rowForNode(tree, &collapsed, &.{}, 0, 0).?;
 
-    try std.testing.expectEqual(Row.Fold.expanded, expanded.fold);
-    try std.testing.expectEqual(Row.Fold.collapsed, collapsed_root.fold);
+    try std.testing.expectEqual(Row.Fold.expanded, root.fold);
     try std.testing.expect(!file_tree.isCollapsed(&collapsed, ""));
 }

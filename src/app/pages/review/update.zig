@@ -406,7 +406,7 @@ test "explicit sidebar update supersedes action restore while internal remap doe
     var arena: std.heap.ArenaAllocator = .init(allocator);
     var loaded = test_support.loadedDiffTwo();
     loaded.tree.nodes = &file_search_input_nodes;
-    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadStateWithArena(arena, loaded),
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 0 },
@@ -444,7 +444,7 @@ test "file search supersedes action restore only when submit changes selection" 
     var arena: std.heap.ArenaAllocator = .init(allocator);
     var loaded = test_support.loadedDiffTwo();
     loaded.tree.nodes = &file_search_input_nodes;
-    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadStateWithArena(arena, loaded),
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 0 },
@@ -504,7 +504,7 @@ test "explicit parent selection supersedes file action restore" {
     const allocator = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(allocator);
     var loaded = test_support.loadedDiffRootedNested();
-    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadStateWithArena(arena, loaded),
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 2 },

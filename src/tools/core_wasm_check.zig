@@ -64,7 +64,6 @@ pub fn gitframeCoreWasmCompileCheck() usize {
     const row = sidebar_view_model.rowAt(.{
         .tree = tree,
         .collapsed = &collapsed,
-        .root_disclosure = .expanded,
         .reviewed_files = &reviewed_files,
         .visible_nodes = &visible_nodes,
     }, 0, 0) orelse unreachable;

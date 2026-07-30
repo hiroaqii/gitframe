@@ -7143,7 +7143,7 @@ fn initStageHunkLaunchApp(
     var arena_owned = true;
     errdefer if (arena_owned) arena.deinit();
     var loaded = app_test_support.loadedDiffTwo();
-    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
     var app: App = .{
         .allocator = allocator,
         .config = .{ .source = .unstaged },
@@ -8440,7 +8440,7 @@ test "mouse click uses filtered sidebar projection" {
     var loaded = app_test_support.loadedDiffTwoWithStatuses();
     loaded.reviewed_files = try arena.allocator().alloc(bool, loaded.document.files.len);
     @memset(loaded.reviewed_files, false);
-    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .deleted);
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .deleted);
 
     var app: App = .{
         .pages = .{ .review = .{
@@ -8777,7 +8777,7 @@ fn buildRootedNestedActionBundle(allocator: std.mem.Allocator) !app_load.LoadedD
         .{ .entries = &.{} },
         .{ .root = .{ .name = "repo" } },
     );
-    try bundle.loaded.rebuildVisibleNodes(arena, .expanded, false, .all);
+    try bundle.loaded.rebuildVisibleNodes(arena, false, .all);
     return bundle;
 }
 
@@ -8913,7 +8913,7 @@ fn expectDirectoryCursorAfterActionRefresh(status_first: bool) !void {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     var current = app_test_support.loadedDiffRootedNested();
-    try current.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    try current.rebuildVisibleNodes(arena.allocator(), false, .all);
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(arena, current),
@@ -9283,7 +9283,7 @@ fn expectStatusOnlyHunkRefreshPath(later_selection: bool) !void {
     const allocator = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(allocator);
     var loaded = app_test_support.loadedDiffTwo();
-    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
     var app: App = .{
         .allocator = allocator,
         .config = .{ .source = .unstaged },
@@ -9350,7 +9350,7 @@ test "final hunk stage retains exact path through cached projection acceptance" 
     const allocator = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(allocator);
     var loaded = app_test_support.loadedDiffFileOneFirst();
-    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
     var app: App = .{
         .allocator = allocator,
         .config = .{ .source = .unstaged },
@@ -9428,7 +9428,7 @@ test "final hunk stage retains exact path through cached projection acceptance" 
     reordered_nodes[0] = current_loaded.tree.nodes[original_b_node];
     reordered_nodes[1] = current_loaded.tree.nodes[original_a_node];
     current_loaded.tree.nodes = reordered_nodes;
-    try current_loaded.rebuildVisibleNodes(tree_allocator, .expanded, false, .all);
+    try current_loaded.rebuildVisibleNodes(tree_allocator, false, .all);
     app.pages.review.viewer.selected_node = 1;
     const a_node = review_navigation.findFileNodeByPathKey(current_loaded, "a") orelse return error.ExpectedActionFileNode;
     const b_node = review_navigation.findFileNodeByPathKey(current_loaded, "b") orelse return error.ExpectedNeighborFileNode;
@@ -9503,7 +9503,7 @@ fn expectSelectionAcrossSourceAndStatus(status_first: bool, later_selection: boo
     const allocator = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(allocator);
     var loaded = app_test_support.loadedDiffTwo();
-    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
     var app: App = .{
         .allocator = allocator,
         .config = .{ .source = .unstaged },
@@ -13260,7 +13260,6 @@ test "committed repository replacement resets Review before source spawn failure
     app.pages.review.viewer.selected_target = .{ .diff_file = 3 };
     app.pages.review.viewer.selected_file = 3;
     app.pages.review.viewer.selected_node = 7;
-    app.pages.review.viewer.root_disclosure = .collapsed;
     app.pages.review.search.mode = true;
     setDiffSearchQuery(&app, "needle");
 
@@ -13271,7 +13270,6 @@ test "committed repository replacement resets Review before source spawn failure
         .external_selection,
     );
     try std.testing.expectEqual(RepoCommitOutcome.changed, outcome);
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, app.pages.review.viewer.root_disclosure);
     try std.testing.expect(app.pages.review.search.mode);
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._pending_tasks_with_len = 16 };
@@ -13279,7 +13277,6 @@ test "committed repository replacement resets Review before source spawn failure
     ctx._pending_tasks_with_len = 0;
 
     try std.testing.expectEqualStrings(roots.b, app.activeRepoRoot().?);
-    try std.testing.expectEqual(file_tree.RootDisclosure.expanded, app.pages.review.viewer.root_disclosure);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_file);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
@@ -20208,7 +20205,7 @@ test "loaded diff with empty visible filter shows local empty state" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var loaded = app_test_support.loadedDiffTwoWithStatuses();
-    try loaded.rebuildVisibleNodes(arena.allocator(), .expanded, false, .binary);
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .binary);
 
     var app: App = .{
         .pages = .{ .review = .{
@@ -20420,10 +20417,10 @@ test "status projection rebuild keeps selected node on same path key" {
     try std.testing.expectEqualStrings("b", after_path);
 }
 
-test "status projection retains collapsed Review root and sticky diff target" {
+test "review root expansion survives status projection and retains sticky diff target" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var current = app_test_support.loadedDiffRootedNested();
-    try current.rebuildVisibleNodes(arena.allocator(), .collapsed, false, .all);
+    try current.rebuildVisibleNodes(arena.allocator(), false, .all);
     var app: App = .{
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
@@ -20436,7 +20433,6 @@ test "status projection retains collapsed Review root and sticky diff target" {
                 .selected_target = .{ .diff_file = 1 },
                 .selected_file = 1,
                 .selected_node = 0,
-                .root_disclosure = .collapsed,
             },
             .status_load = .{ .generation = 1, .pending = .{ .generation = 1 } },
         } },
@@ -20457,17 +20453,17 @@ test "status projection retains collapsed Review root and sticky diff target" {
     });
 
     const loaded = app.reviewNavigation().loadedDiff().?;
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, app.pages.review.viewer.root_disclosure);
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
-    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
+    try std.testing.expect(loaded.visibleNodeCount() > 1);
+    try std.testing.expectEqual(file_tree.Node.Kind.repo_root, loaded.tree.nodes[loaded.visibleNodeAt(0).?].kind);
+    try std.testing.expectEqual(@as(u16, 1), loaded.tree.nodes[loaded.visibleNodeAt(1).?].depth);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
-test "status-first action refresh remaps a hidden directory cursor to typed root without consuming it" {
+test "review root expansion status-first action refresh retains visible root children" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var current = app_test_support.loadedDiffRootedNested();
-    try current.rebuildVisibleNodes(arena.allocator(), .expanded, false, .all);
+    try current.rebuildVisibleNodes(arena.allocator(), false, .all);
     var app: App = .{
         .repo_state = .{ .discovery = .{ .single_repo = .{
             .label = "repo",
@@ -20497,15 +20493,6 @@ test "status-first action refresh remaps a hidden directory cursor to typed root
     try std.testing.expect(app.pages.review.action_cursor.startMember(9, .source, 2));
     try std.testing.expect(app.pages.review.action_cursor.startMember(9, .status, 1));
 
-    // The root can be folded while the exact pair is in flight. Status-first
-    // replacement must remap to a typed ancestor, not retain the old numeric
-    // file row and not consume the directory intent before source completes.
-    var loaded = app.reviewNavigation().loadedDiff().?;
-    app.reviewNavigation().selectSidebarNode(loaded, 0);
-    try app.reviewNavigation().toggleSelectedDirectory();
-    loaded = app.reviewNavigation().loadedDiff().?;
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
-
     const status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  b\x00");
     try app.finishStatusLoad(&ctx, .{
         .identity = page.RequestIdentity.review(0, 1),
@@ -20514,12 +20501,11 @@ test "status-first action refresh remaps a hidden directory cursor to typed root
         .result = .{ .loaded = status_bundle },
     });
 
-    loaded = app.reviewNavigation().loadedDiff().?;
+    const loaded = app.reviewNavigation().loadedDiff().?;
     try std.testing.expect(app.pages.review.action_cursor.hasOwner());
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, app.pages.review.viewer.root_disclosure);
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
-    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
+    try std.testing.expect(loaded.visibleNodeCount() > 1);
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
+    try std.testing.expectEqual(@as(u16, 1), loaded.tree.nodes[loaded.visibleNodeAt(1).?].depth);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
@@ -21614,11 +21600,15 @@ test "manual reload restores anchor after visible state is cleared" {
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, app.pages.review.viewer.diff_cursor);
 }
 
-test "manual reload retains collapsed Review repository root" {
+test "review root expansion survives manual reload and retains sticky target" {
     var current_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var rooted_nodes = app_test_support.tree_rooted_nested_nodes;
+    rooted_nodes[2].path_key = "a";
+    rooted_nodes[3].path_key = "b";
     var current = app_test_support.loadedDiffRootedNested();
+    current.tree = .{ .nodes = &rooted_nodes };
     current.text = "old";
-    try current.rebuildVisibleNodes(current_arena.allocator(), .collapsed, false, .all);
+    try current.rebuildVisibleNodes(current_arena.allocator(), false, .all);
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(current_arena, current),
@@ -21626,7 +21616,6 @@ test "manual reload retains collapsed Review repository root" {
                 .selected_target = .{ .diff_file = 1 },
                 .selected_file = 1,
                 .selected_node = 0,
-                .root_disclosure = .collapsed,
             },
         } },
         .allocator = std.testing.allocator,
@@ -21642,6 +21631,7 @@ test "manual reload retains collapsed Review repository root" {
     app.pages.review.load.state = .loading;
 
     var changed = app_test_support.loadedDiffRootedNested();
+    changed.tree = .{ .nodes = &rooted_nodes };
     changed.text = "changed";
     const bundle = app_load.LoadedDiffBundle{
         .arena = .init(std.testing.allocator),
@@ -21655,9 +21645,9 @@ test "manual reload retains collapsed Review repository root" {
     });
 
     const loaded = app.reviewNavigation().loadedDiff().?;
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, app.pages.review.viewer.root_disclosure);
-    try std.testing.expectEqual(file_tree.RootDisclosure.collapsed, loaded.root_disclosure);
-    try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
+    try std.testing.expectEqual(@as(usize, 4), loaded.visibleNodeCount());
+    try std.testing.expectEqual(file_tree.Node.Kind.repo_root, loaded.tree.nodes[loaded.visibleNodeAt(0).?].kind);
+    try std.testing.expectEqual(@as(u16, 1), loaded.tree.nodes[loaded.visibleNodeAt(1).?].depth);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }

@@ -1355,15 +1355,13 @@ test "stage toggle resolves file operation from fresh status" {
     try std.testing.expect(testView(&page, .{ .range = "main...HEAD" }).toggleStageTarget() == .unavailable_source);
 }
 
-test "collapsed repository root retains whole-repository stage authority" {
-    var loaded = test_support.loadedDiffRootedNested();
-    loaded.root_disclosure = .collapsed;
+test "review root expansion retains whole-repository stage authority" {
+    const loaded = test_support.loadedDiffRootedNested();
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(loaded),
         .viewer = .{
             .selected_target = .{ .diff_file = 1 },
             .selected_node = 0,
-            .root_disclosure = .collapsed,
         },
     };
     defer page.git_status.deinit();
@@ -1373,6 +1371,8 @@ test "collapsed repository root retains whole-repository stage authority" {
         return error.ExpectedRepositoryActionTarget;
     try std.testing.expectEqual(git_ops.TargetKind.repository, target.kind);
     try std.testing.expectEqualStrings("", target.path);
+    try std.testing.expect(page.load.state.loaded.loaded.visibleNodeCount() > 1);
+    try std.testing.expect(page.load.state.loaded.loaded.tree.nodes[0].kind == .repo_root);
 
     var unstaged = try @import("../../../git/status.zig").StatusBundle.parseOwned(
         std.testing.allocator,
