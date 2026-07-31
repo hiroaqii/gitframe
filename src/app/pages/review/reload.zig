@@ -2098,14 +2098,11 @@ pub const Controller = struct {
         self.page.review_projection_next_id +%= 1;
         if (self.page.review_projection_next_id == 0) self.page.review_projection_next_id = 1;
         const request_id = self.page.review_projection_next_id;
-        var state_request = try review_projection.cloneRequestWithOptions(
+        var pair = try self.buildProjectionRequestPair(
             allocator,
             gate.identity,
             request_id,
-            gate.repo_root,
-            gate.path_key,
-            target.kind,
-            target.source_kind,
+            target,
             source_revision,
             status_revision,
             .{
@@ -2114,31 +2111,61 @@ pub const Controller = struct {
                 .expected_presentation = expected_presentation,
             },
         );
-        errdefer state_request.deinit(allocator);
-        var task_request = try review_projection.cloneRequestWithOptions(
-            allocator,
-            gate.identity,
-            request_id,
-            gate.repo_root,
-            gate.path_key,
-            target.kind,
-            target.source_kind,
-            source_revision,
-            status_revision,
-            .{
-                .read_epoch = gate.read_epoch,
-                .root_identity = self.root_identity,
-                .expected_presentation = expected_presentation,
-            },
-        );
-        errdefer task_request.deinit(allocator);
 
         self.page.review_projection.clearPending(allocator);
-        self.page.review_projection.pending = state_request;
-        state_request = undefined;
+        self.page.review_projection.pending = pair.pending;
+        pair.pending = undefined;
         gate.phase = .waiting_projection;
         gate.projection_request_id = request_id;
-        return .{ .command = .{ .review_projection = task_request } };
+        return .{ .command = .{ .review_projection = pair.task } };
+    }
+
+    const ProjectionRequestPair = struct {
+        pending: review_projection.Request,
+        task: review_projection.Request,
+    };
+
+    /// Builds the page-owned pending clone and the task-owned clone of one
+    /// projection request with identical identity. Task and page never share
+    /// allocator ownership; the caller installs `pending` and hands `task` to
+    /// the shell.
+    fn buildProjectionRequestPair(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        identity: app_page.RequestIdentity,
+        request_id: u64,
+        target: ProjectionTarget,
+        source_revision: u64,
+        status_revision: u64,
+        options: review_projection.RequestCloneOptions,
+    ) !ProjectionRequestPair {
+        _ = self;
+        var state_request = try review_projection.cloneRequestWithOptions(
+            allocator,
+            identity,
+            request_id,
+            target.repo_root,
+            target.path_key,
+            target.kind,
+            target.source_kind,
+            source_revision,
+            status_revision,
+            options,
+        );
+        errdefer state_request.deinit(allocator);
+        const task_request = try review_projection.cloneRequestWithOptions(
+            allocator,
+            identity,
+            request_id,
+            target.repo_root,
+            target.path_key,
+            target.kind,
+            target.source_kind,
+            source_revision,
+            status_revision,
+            options,
+        );
+        return .{ .pending = state_request, .task = task_request };
     }
 
     /// Reconciles projection identity and, only when a read is required,
@@ -2353,14 +2380,11 @@ pub const Controller = struct {
         const request_root_identity = if (target.kind == .generated_added_file) self.root_identity else null;
         const force_eager_retry = self.page.review_projection.shouldForceEagerRetry(live_expected_presentation);
         const expected_presentation = if (force_eager_retry) null else live_expected_presentation;
-        var state_request = try review_projection.cloneRequestWithOptions(
+        var pair = try self.buildProjectionRequestPair(
             allocator,
             identity,
             request_id,
-            target.repo_root,
-            target.path_key,
-            target.kind,
-            target.source_kind,
+            target,
             self.page.source_session_revision,
             self.page.status_snapshot_revision,
             .{
@@ -2369,29 +2393,10 @@ pub const Controller = struct {
                 .expected_presentation = expected_presentation,
             },
         );
-        errdefer state_request.deinit(allocator);
 
-        var task_request = try review_projection.cloneRequestWithOptions(
-            allocator,
-            identity,
-            request_id,
-            target.repo_root,
-            target.path_key,
-            target.kind,
-            target.source_kind,
-            self.page.source_session_revision,
-            self.page.status_snapshot_revision,
-            .{
-                .read_epoch = read_epoch,
-                .root_identity = request_root_identity,
-                .expected_presentation = expected_presentation,
-            },
-        );
-        errdefer task_request.deinit(allocator);
-
-        self.page.review_projection.pending = state_request;
-        state_request = undefined;
-        return .{ .command = .{ .review_projection = task_request } };
+        self.page.review_projection.pending = pair.pending;
+        pair.pending = undefined;
+        return .{ .command = .{ .review_projection = pair.task } };
     }
 
     /// Shell validation/allocation/spawn failure terminal for a prepared read.
@@ -3276,36 +3281,15 @@ pub const Controller = struct {
             });
             self.page.staged_hunks.clear(allocator);
             self.page.review_projection.finishEagerRetry();
-            self.page.review_projection.clearPending(allocator);
-            self.page.review_projection.clearDisplayed(allocator);
-            const request = result.request;
-            result.request = undefined;
-            switch (result.result) {
-                .ready => |ready| {
-                    result.result = undefined;
-                    self.page.review_projection.installReady(.{
-                        .request = request,
-                        .value = ready,
-                    });
-                },
-                .failed => |body| {
-                    result.result = undefined;
-                    self.page.review_projection.displayed = .{ .failed = .{
-                        .request = request,
-                        .body = body,
-                    } };
-                },
-                .failed_static => {
-                    const body = static_failure.?;
-                    static_failure = null;
-                    result.result = undefined;
-                    self.page.review_projection.displayed = .{ .failed = .{
-                        .request = request,
-                        .body = body,
-                    } };
-                },
-                .reuse_candidate, .staged_only_reuse_candidate => unreachable,
+            // The publication route owns its static failure body: it was
+            // preallocated before the no-fail commit, so the arm converts to a
+            // consuming `.failed` terminal here (route difference from the
+            // navigation route, whose `.failed_static` stays caller-owned).
+            if (result.result == .failed_static) {
+                result.result = .{ .failed = static_failure.? };
+                static_failure = null;
             }
+            self.commitProjectionTerminal(allocator, result, .clear_displayed);
             result_transferred = true;
         }
 
@@ -3332,6 +3316,66 @@ pub const Controller = struct {
         self.page.canonical_publication = null;
         finished_gate.deinit(allocator);
         return .{ .result_transferred = result_transferred };
+    }
+
+    /// What happens to the outgoing displayed projection when a consuming
+    /// terminal replaces it. The navigation route may promote it into the
+    /// reuse cache; the publication route replaces wholesale and never caches.
+    const ProjectionCachePolicy = union(enum) {
+        cache_or_clear: struct {
+            read_epoch: ReviewRepositoryReadEpoch,
+            repo_root: []const u8,
+            source_kind: review_projection.SourceKind,
+        },
+        clear_displayed,
+    };
+
+    /// No-fail install of a consuming projection terminal (`.ready` or
+    /// `.failed`). The route adapter has already finished admission and every
+    /// fallible step (anchor capture, static-body preallocation), and applies
+    /// its own navigation policy afterwards. `.failed_static` is not handled
+    /// here because the two routes own that result differently: the navigation
+    /// route leaves it caller-owned (request clone + body allocation stay at
+    /// its install position so the OOM failure order is unchanged), while the
+    /// publication route preallocates the body and converts the arm to
+    /// `.failed` before calling this primitive.
+    fn commitProjectionTerminal(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        result: *app_load.ReviewProjectionFinished,
+        cache_policy: ProjectionCachePolicy,
+    ) void {
+        self.page.review_projection.clearPending(allocator);
+        switch (cache_policy) {
+            .cache_or_clear => |scope| self.page.review_projection.cacheOrClearDisplayed(
+                allocator,
+                scope.read_epoch,
+                scope.repo_root,
+                scope.source_kind,
+                self.page.source_session_revision,
+                self.page.status_snapshot_revision,
+            ),
+            .clear_displayed => self.page.review_projection.clearDisplayed(allocator),
+        }
+        const request = result.request;
+        result.request = undefined;
+        switch (result.result) {
+            .ready => |ready| {
+                result.result = undefined;
+                self.page.review_projection.installReady(.{
+                    .request = request,
+                    .value = ready,
+                });
+            },
+            .failed => |body| {
+                result.result = undefined;
+                self.page.review_projection.displayed = .{ .failed = .{
+                    .request = request,
+                    .body = body,
+                } };
+            },
+            .reuse_candidate, .staged_only_reuse_candidate, .failed_static => unreachable,
+        }
     }
 
     /// Consumes a matching projection result into retained Review state. A
@@ -3460,34 +3504,36 @@ pub const Controller = struct {
             },
         }
 
-        self.page.review_projection.clearPending(allocator);
-        self.page.review_projection.cacheOrClearDisplayed(
-            allocator,
-            self.page.repository_read_authority.epoch,
-            current.repo_root,
-            current.source_kind,
-            self.page.source_session_revision,
-            self.page.status_snapshot_revision,
-        );
         switch (result.result) {
-            .ready => |ready| {
-                self.page.review_projection.installReady(.{
-                    .request = result.request,
-                    .value = ready,
-                });
+            .ready => {
+                self.commitProjectionTerminal(allocator, result, .{ .cache_or_clear = .{
+                    .read_epoch = self.page.repository_read_authority.epoch,
+                    .repo_root = current.repo_root,
+                    .source_kind = current.source_kind,
+                } });
                 self.reconcileInstalledProjectionNavigation(allocator, if (local_navigation) |*anchor| anchor else null);
                 return .{ .result_transferred = true };
             },
-            .failed => |body| {
-                self.page.review_projection.displayed = .{ .failed = .{
-                    .request = result.request,
-                    .body = body,
-                } };
+            .failed => {
+                self.commitProjectionTerminal(allocator, result, .{ .cache_or_clear = .{
+                    .read_epoch = self.page.repository_read_authority.epoch,
+                    .repo_root = current.repo_root,
+                    .source_kind = current.source_kind,
+                } });
                 self.clearDisplayRestore(allocator);
                 return .{ .result_transferred = true };
             },
             .reuse_candidate, .staged_only_reuse_candidate => unreachable,
             .failed_static => |message| {
+                self.page.review_projection.clearPending(allocator);
+                self.page.review_projection.cacheOrClearDisplayed(
+                    allocator,
+                    self.page.repository_read_authority.epoch,
+                    current.repo_root,
+                    current.source_kind,
+                    self.page.source_session_revision,
+                    self.page.status_snapshot_revision,
+                );
                 var request = try review_projection.cloneRequestWithOptions(
                     allocator,
                     result.request.identity,
