@@ -889,14 +889,24 @@ pub const Controller = struct {
         };
     }
 
+    /// How reuse admission re-derives the live presentation identity when a
+    /// worker candidate arrives. The navigation route re-resolves the live
+    /// projection target so a selection or status move rejects the candidate
+    /// into one bounded eager retry. The publication route compares against
+    /// the displayed body directly: the gate fixed its expected snapshot when
+    /// the transaction issued the request, and live status may legitimately
+    /// have moved on while the transaction was in flight.
+    const ReuseAdmissionBasis = enum { live_target, publication_snapshot };
+
     /// Candidate fingerprints are only a worker hint. Fresh authority may be
     /// installed only while the request's expected token still names the live
     /// presentation and the allocation-free canonical comparator proves the
     /// normalized candidate exactly equal.
-    fn acceptsCombinedReuseCandidate(
+    fn admitCombinedReuse(
         self: Controller,
         request: review_projection.Request,
         candidate: *const review_projection.CombinedReuseCandidate,
+        basis: ReuseAdmissionBasis,
     ) bool {
         const expected = request.expected_presentation orelse return false;
         if (!candidate.fingerprint.eql(expected.fingerprint)) return false;
@@ -916,32 +926,38 @@ pub const Controller = struct {
                 break :blk diff_presentation_identity.exactEqual(live.display_file, candidate.displayFile());
             },
             .primary_loaded => blk: {
-                const target = self.view().projectionTarget() orelse break :blk false;
-                const live = self.expectedPresentationForTarget(target) orelse break :blk false;
-                if (!live.eql(expected) or live.owner != .primary_loaded) break :blk false;
+                if (basis == .live_target) {
+                    const target = self.view().projectionTarget() orelse break :blk false;
+                    const live = self.expectedPresentationForTarget(target) orelse break :blk false;
+                    if (!live.eql(expected) or live.owner != .primary_loaded) break :blk false;
+                }
                 const primary = switch (self.navigation.view().displayedReviewBody()) {
                     .primary => |primary| primary,
                     else => break :blk false,
                 };
-                break :blk diff_presentation_identity.exactEqual(
-                    primary.loaded.document.files[primary.file_index],
-                    candidate.displayFile(),
+                const live_file = primary.loaded.document.files[primary.file_index];
+                if (!diff_presentation_identity.fingerprint(live_file).eql(expected.fingerprint)) {
+                    break :blk false;
+                }
+                const live_token = diff_presentation_identity.ContentToken.init(
+                    self.page.source_session_revision,
                 );
+                if (!live_token.eql(expected.content_token)) break :blk false;
+                break :blk diff_presentation_identity.exactEqual(live_file, candidate.displayFile());
             },
         };
     }
 
-    fn applyCombinedReuseCandidate(
+    /// Installs an exactly accepted combined reuse candidate. Admission must
+    /// already have succeeded for the same basis; rejection consequences
+    /// (eager retry vs publication abort) belong to the route adapter, as does
+    /// applying the returned outgoing lineage at its own commit point.
+    fn installCombinedReuseExact(
         self: Controller,
         allocator: std.mem.Allocator,
         result: *app_load.ReviewProjectionFinished,
-    ) ProjectionApply {
+    ) ?PresentationLineage {
         const candidate = &result.result.reuse_candidate;
-        if (!self.acceptsCombinedReuseCandidate(result.request, candidate)) {
-            self.rejectPresentationReuseCandidate(allocator);
-            return .{};
-        }
-
         const outgoing_lineage = self.currentPresentationLineageForPath(
             result.request.repo_root,
             result.request.path_key,
@@ -974,19 +990,32 @@ pub const Controller = struct {
         }
         candidate.deinit();
         result.result = undefined;
-        self.finishExactPresentationTransfer(allocator, outgoing_lineage);
-        if (returns_from_staged_only) {
-            self.reconcileRetainedPresentationNavigation(allocator);
-        } else {
-            self.reconcileInstalledProjectionNavigation(allocator, null);
+        return outgoing_lineage;
+    }
+
+    fn applyCombinedReuseCandidate(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        result: *app_load.ReviewProjectionFinished,
+    ) ProjectionApply {
+        if (!self.admitCombinedReuse(result.request, &result.result.reuse_candidate, .live_target)) {
+            self.rejectPresentationReuseCandidate(allocator);
+            return .{};
         }
+        const outgoing_lineage = self.installCombinedReuseExact(allocator, result);
+        self.finishExactPresentationTransfer(allocator, outgoing_lineage);
+        // Exact reuse retains the presentation, so navigation (cursor, scroll,
+        // search match, selection) is reconciled in place rather than rebuilt.
+        // The previous installed-reconcile on this arm was the C4 drift.
+        self.reconcileRetainedPresentationNavigation(allocator);
         return .{ .result_transferred = true };
     }
 
-    fn acceptsStagedOnlyReuseCandidate(
+    fn admitStagedOnlyReuse(
         self: Controller,
         request: review_projection.Request,
         candidate: *const review_projection.StagedOnlyReuseCandidate,
+        basis: ReuseAdmissionBasis,
     ) bool {
         if (request.kind != .cached_diff) return false;
         const expected = request.expected_presentation orelse return false;
@@ -1009,12 +1038,19 @@ pub const Controller = struct {
             }
         }
 
-        const target = self.view().projectionTarget() orelse return false;
-        const live = self.expectedPresentationForTarget(target) orelse return false;
-        if (!live.eql(expected)) return false;
+        if (basis == .live_target) {
+            const target = self.view().projectionTarget() orelse return false;
+            const live = self.expectedPresentationForTarget(target) orelse return false;
+            if (!live.eql(expected)) return false;
+        }
         return switch (expected.owner) {
             .combined_projection => blk: {
                 const projection = self.navigation.view().activeCombinedProjection() orelse break :blk false;
+                if (basis == .publication_snapshot) {
+                    const live = self.ownedCombinedPresentation() orelse break :blk false;
+                    if (!live.presentation.content_token.eql(expected.content_token)) break :blk false;
+                    if (!live.presentation.fingerprint.eql(expected.fingerprint)) break :blk false;
+                }
                 break :blk diff_presentation_identity.exactEqual(projection.displayFile(), candidate.displayFile());
             },
             .primary_loaded => blk: {
@@ -1022,10 +1058,17 @@ pub const Controller = struct {
                     .primary => |primary| primary,
                     else => break :blk false,
                 };
-                break :blk diff_presentation_identity.exactEqual(
-                    primary.loaded.document.files[primary.file_index],
-                    candidate.displayFile(),
-                );
+                const live_file = primary.loaded.document.files[primary.file_index];
+                if (basis == .publication_snapshot) {
+                    if (!diff_presentation_identity.fingerprint(live_file).eql(expected.fingerprint)) {
+                        break :blk false;
+                    }
+                    const live_token = diff_presentation_identity.ContentToken.init(
+                        self.page.source_session_revision,
+                    );
+                    if (!live_token.eql(expected.content_token)) break :blk false;
+                }
+                break :blk diff_presentation_identity.exactEqual(live_file, candidate.displayFile());
             },
         };
     }
@@ -1045,17 +1088,15 @@ pub const Controller = struct {
         self.page.review_projection.clearPending(allocator);
     }
 
-    fn applyStagedOnlyReuseCandidate(
+    /// Installs an exactly accepted staged-only reuse candidate. Same contract
+    /// as installCombinedReuseExact: admission and rejection consequences are
+    /// the route adapter's, and the returned lineage is applied by the caller.
+    fn installStagedOnlyReuseExact(
         self: Controller,
         allocator: std.mem.Allocator,
         result: *app_load.ReviewProjectionFinished,
-    ) ProjectionApply {
+    ) ?PresentationLineage {
         const candidate = &result.result.staged_only_reuse_candidate;
-        if (!self.acceptsStagedOnlyReuseCandidate(result.request, candidate)) {
-            self.rejectPresentationReuseCandidate(allocator);
-            return .{};
-        }
-
         const outgoing_lineage = self.currentPresentationLineageForPath(
             result.request.repo_root,
             result.request.path_key,
@@ -1071,6 +1112,19 @@ pub const Controller = struct {
         }
         candidate.deinit();
         result.result = undefined;
+        return outgoing_lineage;
+    }
+
+    fn applyStagedOnlyReuseCandidate(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        result: *app_load.ReviewProjectionFinished,
+    ) ProjectionApply {
+        if (!self.admitStagedOnlyReuse(result.request, &result.result.staged_only_reuse_candidate, .live_target)) {
+            self.rejectPresentationReuseCandidate(allocator);
+            return .{};
+        }
+        const outgoing_lineage = self.installStagedOnlyReuseExact(allocator, result);
         self.finishExactPresentationTransfer(allocator, outgoing_lineage);
         self.reconcileRetainedPresentationNavigation(allocator);
         return .{ .result_transferred = true };
@@ -3019,167 +3073,6 @@ pub const Controller = struct {
         state.* = .idle;
     }
 
-    fn acceptsCanonicalCombinedReuseCandidate(
-        self: Controller,
-        request: review_projection.Request,
-        candidate: *const review_projection.CombinedReuseCandidate,
-    ) bool {
-        const expected = request.expected_presentation orelse return false;
-        if (!candidate.fingerprint.eql(expected.fingerprint)) return false;
-        const fresh = if (candidate.fresh_authority) |*value| value else return false;
-        if (fresh.status_snapshot_revision != request.status_snapshot_revision) return false;
-        if (fresh.cached_component.document.files.len != 1) return false;
-        const candidate_hunks = candidate.displayFile().hunks.len;
-        if (fresh.projection.hunk_stage_states.len != candidate_hunks or
-            fresh.projection.hunk_action_origins.len != candidate_hunks) return false;
-
-        return switch (expected.owner) {
-            .combined_projection => blk: {
-                const live = self.ownedCombinedPresentation() orelse break :blk false;
-                if (!live.presentation.content_token.eql(expected.content_token)) break :blk false;
-                if (!live.presentation.fingerprint.eql(expected.fingerprint)) break :blk false;
-                break :blk diff_presentation_identity.exactEqual(
-                    live.display_file,
-                    candidate.displayFile(),
-                );
-            },
-            .primary_loaded => blk: {
-                const primary = switch (self.navigation.view().displayedReviewBody()) {
-                    .primary => |value| value,
-                    else => break :blk false,
-                };
-                const live_file = primary.loaded.document.files[primary.file_index];
-                if (!diff_presentation_identity.fingerprint(live_file).eql(expected.fingerprint)) {
-                    break :blk false;
-                }
-                const expected_token = diff_presentation_identity.ContentToken.init(
-                    self.page.source_session_revision,
-                );
-                if (!expected_token.eql(expected.content_token)) break :blk false;
-                break :blk diff_presentation_identity.exactEqual(
-                    live_file,
-                    candidate.displayFile(),
-                );
-            },
-        };
-    }
-
-    fn installCanonicalCombinedReuse(
-        self: Controller,
-        allocator: std.mem.Allocator,
-        result: *app_load.ReviewProjectionFinished,
-    ) ?PresentationLineage {
-        const candidate = &result.result.reuse_candidate;
-        std.debug.assert(self.acceptsCanonicalCombinedReuseCandidate(
-            result.request,
-            candidate,
-        ));
-        const outgoing_lineage = self.currentPresentationLineageForPath(
-            result.request.repo_root,
-            result.request.path_key,
-        );
-        const expected_owner = result.request.expected_presentation.?.owner;
-        self.page.review_projection.finishEagerRetry();
-        self.page.review_projection.clearPending(allocator);
-        const request = result.request;
-        result.request = undefined;
-        switch (expected_owner) {
-            .combined_projection => self.page.review_projection.installCombinedReuse(
-                allocator,
-                request,
-                candidate,
-            ),
-            .primary_loaded => self.page.review_projection.installPrimaryCombinedReuse(
-                allocator,
-                request,
-                candidate,
-            ),
-        }
-        candidate.deinit();
-        result.result = undefined;
-        self.reconcileRetainedPresentationNavigation(allocator);
-        return outgoing_lineage;
-    }
-
-    fn acceptsCanonicalStagedOnlyReuseCandidate(
-        self: Controller,
-        request: review_projection.Request,
-        candidate: *const review_projection.StagedOnlyReuseCandidate,
-    ) bool {
-        if (request.kind != .cached_diff) return false;
-        const expected = request.expected_presentation orelse return false;
-        if (!candidate.fingerprint.eql(expected.fingerprint)) return false;
-        const fresh = if (candidate.fresh_authority) |*value| value else return false;
-        if (fresh.status_snapshot_revision != request.status_snapshot_revision) return false;
-        if (fresh.cached_component.document.files.len != 1) return false;
-        const candidate_hunks = candidate.displayFile().hunks.len;
-        if (fresh.projection.hunk_stage_states.len != candidate_hunks or
-            fresh.projection.hunk_action_origins.len != candidate_hunks) return false;
-        for (fresh.projection.hunk_stage_states, fresh.projection.hunk_action_origins, 0..) |state, origin, hunk_index| {
-            if (state != .staged) return false;
-            switch (origin) {
-                .cached => |index| if (index != hunk_index) return false,
-                .unstaged => return false,
-            }
-        }
-        return switch (expected.owner) {
-            .combined_projection => blk: {
-                const live = self.navigation.view().activeCombinedProjection() orelse break :blk false;
-                break :blk diff_presentation_identity.exactEqual(
-                    live.displayFile(),
-                    candidate.displayFile(),
-                );
-            },
-            .primary_loaded => blk: {
-                const primary = switch (self.navigation.view().displayedReviewBody()) {
-                    .primary => |value| value,
-                    else => break :blk false,
-                };
-                break :blk diff_presentation_identity.exactEqual(
-                    primary.loaded.document.files[primary.file_index],
-                    candidate.displayFile(),
-                );
-            },
-        };
-    }
-
-    fn installCanonicalStagedOnlyReuse(
-        self: Controller,
-        allocator: std.mem.Allocator,
-        result: *app_load.ReviewProjectionFinished,
-    ) ?PresentationLineage {
-        const candidate = &result.result.staged_only_reuse_candidate;
-        std.debug.assert(self.acceptsCanonicalStagedOnlyReuseCandidate(
-            result.request,
-            candidate,
-        ));
-        const outgoing_lineage = self.currentPresentationLineageForPath(
-            result.request.repo_root,
-            result.request.path_key,
-        );
-        const expected_owner = result.request.expected_presentation.?.owner;
-        self.page.review_projection.finishEagerRetry();
-        self.page.review_projection.clearPending(allocator);
-        const request = result.request;
-        result.request = undefined;
-        switch (expected_owner) {
-            .combined_projection => self.page.review_projection.installRetainedStagedOnlyReuse(
-                allocator,
-                request,
-                candidate,
-            ),
-            .primary_loaded => self.page.review_projection.installPrimaryStagedOnlyReuse(
-                allocator,
-                request,
-                candidate,
-            ),
-        }
-        candidate.deinit();
-        result.result = undefined;
-        self.reconcileRetainedPresentationNavigation(allocator);
-        return outgoing_lineage;
-    }
-
     fn applyCanonicalProjectionFinished(
         self: Controller,
         allocator: std.mem.Allocator,
@@ -3230,16 +3123,18 @@ pub const Controller = struct {
         const combined_reuse = result.result == .reuse_candidate;
         const staged_only_reuse = result.result == .staged_only_reuse_candidate;
         const reused = combined_reuse or staged_only_reuse;
-        if (combined_reuse and !self.acceptsCanonicalCombinedReuseCandidate(
+        if (combined_reuse and !self.admitCombinedReuse(
             result.request,
             &result.result.reuse_candidate,
+            .publication_snapshot,
         )) {
             self.abortCanonicalPublication(allocator);
             return .{ .skip_redraw = true };
         }
-        if (staged_only_reuse and !self.acceptsCanonicalStagedOnlyReuseCandidate(
+        if (staged_only_reuse and !self.admitStagedOnlyReuse(
             result.request,
             &result.result.staged_only_reuse_candidate,
+            .publication_snapshot,
         )) {
             self.abortCanonicalPublication(allocator);
             return .{ .skip_redraw = true };
@@ -3299,11 +3194,12 @@ pub const Controller = struct {
             null;
 
         const outgoing_lineage = if (combined_reuse)
-            self.installCanonicalCombinedReuse(allocator, result)
+            self.installCombinedReuseExact(allocator, result)
         else if (staged_only_reuse)
-            self.installCanonicalStagedOnlyReuse(allocator, result)
+            self.installStagedOnlyReuseExact(allocator, result)
         else
             null;
+        if (reused) self.reconcileRetainedPresentationNavigation(allocator);
 
         gate.phase = .committing;
         const source_completion = self.page.action_cursor.captureCompletion(
@@ -7864,6 +7760,163 @@ test "ordinary primary exact combined candidate retains primary presentation and
     const accepted_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(accepted_clipboard);
     try std.testing.expectEqualStrings(original_clipboard, accepted_clipboard);
+}
+
+test "ordinary primary exact combined reuse retains active search match and cursor" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = try testPrimaryCombinedLoadState(allocator),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .display_mode = .unified },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    try page.search.query.insertSlice("beta");
+    controller.navigation.refreshSearchForSelectedFile();
+    const search_before = page.search.match orelse return error.ExpectedSearchMatch;
+    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 2, .line_index = 1 } };
+    page.viewer.diff_scroll = 1;
+    page.viewer.diff_horizontal_scroll = 2;
+    const search_offset_before = page.search.match_offset;
+    const cursor_before = page.viewer.diff_cursor;
+
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const request = switch (command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    command = undefined;
+    var candidate = try testCombinedReuseCandidate(
+        allocator,
+        page.status_snapshot_revision,
+        test_combined_after_cached,
+        test_combined_after_unstaged,
+    );
+    try std.testing.expect(candidate.fingerprint.eql(request.expected_presentation.?.fingerprint));
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = request,
+        .result = .{ .reuse_candidate = candidate },
+    };
+    candidate = undefined;
+    const applied = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(applied.result_transferred);
+
+    // BC4 regression: exact reuse reconciles retained navigation on the
+    // live-target route. The previous installed-reconcile on this arm was the
+    // C4 drift: it discarded the active match and moved the cursor to the
+    // first match even though the presentation bytes were unchanged.
+    try std.testing.expect(std.meta.eql(search_before, page.search.match.?));
+    try std.testing.expectEqual(search_offset_before, page.search.match_offset);
+    try std.testing.expect(std.meta.eql(cursor_before, page.viewer.diff_cursor));
+    try std.testing.expectEqual(@as(usize, 1), page.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 2), page.viewer.diff_horizontal_scroll);
+}
+
+test "publication snapshot staged-only admission requires live presentation identity" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .display_mode = .unified },
+    };
+    defer page.deinit(allocator);
+    var mixed_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &mixed_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    try installTestCombinedCandidate(controller, allocator, 1, 81, 0);
+    controller.advanceStatusSnapshotRevision(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    var request = switch (command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    command = undefined;
+    defer request.deinit(allocator);
+    var candidate = try testStagedOnlyReuseCandidate(allocator, page.status_snapshot_revision, test_combined_primary);
+    defer candidate.deinit();
+
+    try std.testing.expect(controller.admitStagedOnlyReuse(request, &candidate, .live_target));
+    try std.testing.expect(controller.admitStagedOnlyReuse(request, &candidate, .publication_snapshot));
+
+    // BC1 regression: the publication snapshot basis validates the live
+    // presentation identity, not just exact bytes. A stale content token must
+    // reject the candidate even though the display file compares equal.
+    var tampered = request;
+    tampered.expected_presentation.?.content_token = .init(9999);
+    try std.testing.expect(!controller.admitStagedOnlyReuse(tampered, &candidate, .publication_snapshot));
+}
+
+test "publication snapshot combined reuse returns retained staged-only owner to combined" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .display_mode = .unified },
+    };
+    defer page.deinit(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    try installTestRetainedStagedOnly(controller, allocator, 1, 101, page.status_snapshot_revision);
+    const retained = &page.review_projection.displayed.ready.value.retained_staged_only;
+    const presentation_text_ptr = retained.presentation.cached_bundle.loaded.text.ptr;
+    const presentation_token = retained.presentation.content_token;
+
+    controller.advanceStatusSnapshotRevision(allocator);
+    var mixed_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &mixed_status);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const request = switch (command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    command = undefined;
+    var candidate = try testCombinedReuseCandidate(
+        allocator,
+        page.status_snapshot_revision,
+        test_combined_after_cached,
+        test_combined_after_unstaged,
+    );
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = request,
+        .result = .{ .reuse_candidate = candidate },
+    };
+    candidate = undefined;
+
+    try std.testing.expect(controller.admitCombinedReuse(
+        finished.request,
+        &finished.result.reuse_candidate,
+        .publication_snapshot,
+    ));
+    // BC2 regression: the publication route must route a P5c return through
+    // the retained staged-only install. The removed canonical install always
+    // consumed the ordinary combined owner and reached unreachable here.
+    const outgoing_lineage = controller.installCombinedReuseExact(allocator, &finished);
+    controller.finishExactPresentationTransfer(allocator, outgoing_lineage);
+    controller.reconcileRetainedPresentationNavigation(allocator);
+
+    const ready = &page.review_projection.displayed.ready;
+    try std.testing.expect(ready.value == .combined_hunks);
+    const combined = &ready.value.combined_hunks;
+    try std.testing.expect(combined.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
+    try std.testing.expect(combined.presentation.content_token.eql(presentation_token));
+    try std.testing.expectEqual(page.status_snapshot_revision, combined.authority.status_snapshot_revision);
 }
 
 test "ordinary primary staged-only status does not enter P5b boundary" {
