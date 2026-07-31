@@ -4866,14 +4866,18 @@ pub const App = struct {
                 return;
             };
             errdefer self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
-            // The tick's own guards already rejected one-shot sources and a
-            // closed read authority (drop-and-next-tick semantics), so only
-            // the repo-root and load outcomes are reachable here.
-            _ = try self.startReviewReload(ctx, .{
+            // The tick's own guards already rejected one-shot sources, a
+            // closed read authority (drop-and-next-tick semantics), and the
+            // repo-discovery case, so only the repo-root and load outcomes
+            // are reachable here.
+            switch (try self.startReviewReload(ctx, .{
                 .clear_visible_state = self.pages.review.load.state == .idle,
                 .kind = .watch,
                 .background_cycle_id = cycle_id,
-            }, .drop);
+            }, .drop)) {
+                .no_repo_root, .source_started => {},
+                .one_shot_source, .authority_closed, .needs_repo_discovery => unreachable,
+            }
             self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
         }
         ctx.redraw().skip();
@@ -17721,6 +17725,67 @@ test "Review canonical publication startup and status failure retain last good o
         try std.testing.expect(app.pages.review.pending_reload == null);
         try std.testing.expect(!app.reviewReadBusy());
     }
+}
+
+test "Review canonical publication projection failure publishes failure body atomically" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    const source_revision_before = app.pages.review.source_session_revision;
+    const status_revision_before = app.pages.review.status_snapshot_revision;
+    const prior = app.reviewNavigationView().activeCombinedProjection() orelse
+        return error.ExpectedCombinedProjection;
+    const prior_hunks = prior.displayFile().hunks.ptr;
+
+    const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
+    const cycle_id = reads.source_cycle_id orelse return error.ExpectedBackgroundCycle;
+    try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, "MM a\x00");
+    try expectRetainedCanonicalPublication(&app, prior_hunks);
+    try finishCanonicalPublicationSource(
+        &app,
+        &ctx,
+        allocator,
+        reads,
+        app_test_support.diff_unstaged_projection,
+    );
+    try expectCanonicalPublicationCycleTransfer(&app, cycle_id);
+    try expectRetainedCanonicalPublication(&app, prior_hunks);
+
+    try app.ensureReviewProjection(&ctx);
+    var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
+    const expected_source_revision = request.source_session_revision;
+    const expected_status_revision = request.status_snapshot_revision;
+    try std.testing.expectEqual(source_revision_before + 1, expected_source_revision);
+    try std.testing.expectEqual(status_revision_before, expected_status_revision);
+    try app.finishReviewProjectionLoad(&ctx, .{
+        .request = request,
+        .result = .{ .failed_static = "projection failed" },
+    });
+    request = undefined;
+    try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
+
+    // Audit regression (slice 5): the publication route's failure arm commits
+    // atomically — the gate is consumed, the accepted source and status are
+    // published exactly once, and the preallocated failure body becomes the
+    // displayed projection instead of leaving a stale retained body plus a
+    // live transaction.
+    try std.testing.expect(app.pages.review.canonical_publication == null);
+    try std.testing.expect(app.pages.review.deferred_source_apply == null);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
+    try std.testing.expectEqual(expected_source_revision, app.pages.review.source_session_revision);
+    try std.testing.expectEqual(expected_status_revision, app.pages.review.status_snapshot_revision);
+    switch (app.pages.review.review_projection.displayed) {
+        .failed => {},
+        else => return error.ExpectedFailedProjectionDisplay,
+    }
+    try std.testing.expect(app.pages.review.pending_reload == null);
+    try std.testing.expect(app.pages.review.review_projection.pending == null);
+    try std.testing.expect(!app.reviewReadBusy());
 }
 
 test "Review canonical publication changed status waits for unchanged source and stale generations drain" {

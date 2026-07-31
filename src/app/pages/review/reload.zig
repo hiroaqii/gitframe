@@ -150,7 +150,7 @@ const PreparedCanonicalSource = union(enum) {
     }
 };
 
-const PreparedCanonicalCurrentTree = struct {
+const PreparedCurrentTree = struct {
     tree: file_tree.FileTree,
     visible_nodes: []usize,
     visible_node_count: usize,
@@ -3075,7 +3075,7 @@ pub const Controller = struct {
         self: Controller,
         app_allocator: std.mem.Allocator,
         status_document: git_status.StatusDocument,
-    ) !?PreparedCanonicalCurrentTree {
+    ) !?PreparedCurrentTree {
         const loaded = self.navigation.activeLoadedDiff() orelse return null;
         const allocator = self.navigation.loadArenaAllocator() orelse return null;
         const previous_path_key = self.navigation.view().selectedStagePathKey();
@@ -3110,7 +3110,7 @@ pub const Controller = struct {
 
     fn installCurrentTree(
         self: Controller,
-        prepared: *PreparedCanonicalCurrentTree,
+        prepared: *PreparedCurrentTree,
         policy: CurrentTreeNavigation,
     ) void {
         const loaded = self.navigation.activeLoadedDiff() orelse unreachable;
@@ -3146,7 +3146,7 @@ pub const Controller = struct {
     fn restorePreparedTreeSelection(
         self: Controller,
         loaded: *loaded_diff.LoadedDiff,
-        prepared: *const PreparedCanonicalCurrentTree,
+        prepared: *const PreparedCurrentTree,
     ) void {
         if (prepared.previous_path_key) |path_key| {
             if (navigation.findFileNodeByPathKey(loaded, path_key)) |node_index| {
