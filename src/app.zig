@@ -639,12 +639,15 @@ pub const App = struct {
                         ctx.redraw().skip();
                     } else {
                         self.clearBranchSwitch(ctx.allocator());
-                        if (diff_source.sourceIsOneShotInput(self.config.source)) {
-                            ctx.redraw().skip();
-                        } else if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
-                            try self.startRepoDiscovery(ctx, null);
-                        } else {
-                            try self.startDiffLoad(ctx, .manual);
+                        switch (try self.startReviewReload(
+                            ctx,
+                            .{ .clear_visible_state = true, .kind = .manual },
+                            .queue_revalidation,
+                        )) {
+                            .one_shot_source, .authority_closed => ctx.redraw().skip(),
+                            .needs_repo_discovery => try self.startRepoDiscovery(ctx, null),
+                            .no_repo_root => self.reviewReload().replaceMissingRepository(ctx.allocator()),
+                            .source_started => {},
                         }
                     }
                 },
@@ -1524,25 +1527,18 @@ pub const App = struct {
 
     fn startReviewRevalidation(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (self.active_page != .review) return;
-        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) {
-            self.pages.review.activation.queueRevalidation();
-            return;
-        }
-        if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
-            try self.startRepoDiscovery(ctx, null);
-            return;
-        }
-        const cycle_id = self.pages.review.auto_reload.beginCycle();
+        var cycle_id = self.pages.review.auto_reload.beginCycle();
         errdefer if (cycle_id) |id| self.pages.review.auto_reload.discardEmptyCycle(id);
-        try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
-            if (cycle_id) |id| self.pages.review.auto_reload.discardEmptyCycle(id);
-            return;
-        }, .{
+        const outcome = try self.startReviewReload(ctx, .{
             .clear_visible_state = self.pages.review.load.state == .idle,
             .kind = .watch,
             .background_cycle_id = cycle_id,
-        });
-        if (cycle_id) |id| self.pages.review.auto_reload.discardEmptyCycle(id);
+        }, .queue_revalidation);
+        if (cycle_id) |id| {
+            self.pages.review.auto_reload.discardEmptyCycle(id);
+            cycle_id = null;
+        }
+        if (outcome == .needs_repo_discovery) try self.startRepoDiscovery(ctx, null);
     }
 
     fn maybeStartQueuedReviewRevalidation(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -1651,6 +1647,51 @@ pub const App = struct {
         };
 
         try self.startDiffLoadWithRepoRoot(ctx, repo_root, .{ .clear_visible_state = true, .kind = kind });
+    }
+
+    /// What a Review reload route does when the repository read authority is
+    /// closed by an in-flight mutation. Manual, queued-revalidation, and
+    /// action-terminal routes queue one coalesced revalidation that fires when
+    /// the authority reopens; the watch tick drops instead because its
+    /// periodic retry is the route's own recovery semantics.
+    const ClosedAuthorityConsequence = enum { queue_revalidation, drop };
+
+    const ReviewReloadStart = enum {
+        one_shot_source,
+        authority_closed,
+        needs_repo_discovery,
+        no_repo_root,
+        source_started,
+    };
+
+    /// The one Review reload decision sequence shared by every route: one-shot
+    /// rejection, read-authority pre-check with the route's closed
+    /// consequence, the repo-discovery decision, repo-root resolution, and the
+    /// diff-load start. Route-specific guards run before this call, and
+    /// route-specific consequences (cycle bookkeeping, action-cursor cleanup,
+    /// missing-repository display, the discovery start itself) key off the
+    /// returned value, so all five routes share one predicate order while
+    /// keeping their own terminal behavior.
+    fn startReviewReload(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        options: DiffLoadStartOptions,
+        closed_authority: ClosedAuthorityConsequence,
+    ) !ReviewReloadStart {
+        if (diff_source.sourceIsOneShotInput(self.config.source)) return .one_shot_source;
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) {
+            switch (closed_authority) {
+                .queue_revalidation => self.pages.review.activation.queueRevalidation(),
+                .drop => {},
+            }
+            return .authority_closed;
+        }
+        if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
+            return .needs_repo_discovery;
+        }
+        const repo_root = self.repoRootForCurrentSource() catch return .no_repo_root;
+        try self.startDiffLoadWithRepoRoot(ctx, repo_root, options);
+        return .source_started;
     }
 
     fn startDiffLoadWithRepoRoot(self: *App, ctx: *chasen.Ctx(Msg), repo_root: ?[]const u8, options: DiffLoadStartOptions) !void {
@@ -4194,35 +4235,51 @@ pub const App = struct {
         action_cursor_generation: ?u64,
         clear_visible_state: bool,
     ) ReviewRevalidationStartDisposition {
-        if (diff_source.sourceIsOneShotInput(self.config.source)) {
-            if (action_cursor_generation) |generation| {
-                _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
-            }
-            self.pages.review.activation.discardTerminalRevalidation();
-            ctx.redraw().skip();
-            return .unsupported;
-        }
-        if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
-            if (action_cursor_generation) |generation| {
-                _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
-            }
-            self.startRepoDiscovery(ctx, null) catch return .rejected_start;
-            return .accepted_repo_discovery;
-        }
         // Commit/amend can change HEAD and ahead/behind counts; this reload
         // path must continue to refresh branch status for remote workflow gates.
-        self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
-            if (action_cursor_generation) |generation| {
-                _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
-            }
-            ctx.redraw().skip();
-            return .unsupported;
-        }, .{
+        const outcome = self.startReviewReload(ctx, .{
             .clear_visible_state = clear_visible_state,
             .kind = .action_result,
             .action_cursor_generation = action_cursor_generation,
-        }) catch return .rejected_start;
-        return .accepted_source;
+        }, .queue_revalidation) catch return .rejected_start;
+        switch (outcome) {
+            .one_shot_source => {
+                if (action_cursor_generation) |generation| {
+                    _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
+                }
+                self.pages.review.activation.discardTerminalRevalidation();
+                ctx.redraw().skip();
+                return .unsupported;
+            },
+            .authority_closed => {
+                // BC3: the post-action revalidation intent is queued by the
+                // shared pre-check instead of being silently dropped by the
+                // inner read gate; the queued full revalidation fires once
+                // when the read authority reopens. The action pair is
+                // finished here because the queued revalidation runs as an
+                // ordinary watch-kind read without the action membership.
+                if (action_cursor_generation) |generation| {
+                    _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
+                }
+                ctx.redraw().skip();
+                return .rejected_start;
+            },
+            .needs_repo_discovery => {
+                if (action_cursor_generation) |generation| {
+                    _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
+                }
+                self.startRepoDiscovery(ctx, null) catch return .rejected_start;
+                return .accepted_repo_discovery;
+            },
+            .no_repo_root => {
+                if (action_cursor_generation) |generation| {
+                    _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
+                }
+                ctx.redraw().skip();
+                return .unsupported;
+            },
+            .source_started => return .accepted_source,
+        }
     }
 
     fn reloadAfterGitAction(
@@ -4374,17 +4431,13 @@ pub const App = struct {
         }
         if (foreground.origin.page_id != .review or foreground.origin.repo_epoch != self.repo_epoch) return;
 
-        if (diff_source.sourceIsOneShotInput(self.config.source)) {
-            ctx.redraw().skip();
-            return;
-        }
-        if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
-            try self.startRepoDiscovery(ctx, null);
-        } else {
-            try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
-                ctx.redraw().skip();
-                return;
-            }, .{ .clear_visible_state = self.pages.review.load.state == .idle, .kind = .action_result });
+        switch (try self.startReviewReload(ctx, .{
+            .clear_visible_state = self.pages.review.load.state == .idle,
+            .kind = .action_result,
+        }, .queue_revalidation)) {
+            .one_shot_source, .authority_closed, .no_repo_root => ctx.redraw().skip(),
+            .needs_repo_discovery => try self.startRepoDiscovery(ctx, null),
+            .source_started => {},
         }
     }
 
@@ -4813,15 +4866,14 @@ pub const App = struct {
                 return;
             };
             errdefer self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
-            try self.startDiffLoadWithRepoRoot(ctx, self.repoRootForCurrentSource() catch {
-                self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
-                ctx.redraw().skip();
-                return;
-            }, .{
+            // The tick's own guards already rejected one-shot sources and a
+            // closed read authority (drop-and-next-tick semantics), so only
+            // the repo-root and load outcomes are reachable here.
+            _ = try self.startReviewReload(ctx, .{
                 .clear_visible_state = self.pages.review.load.state == .idle,
                 .kind = .watch,
                 .background_cycle_id = cycle_id,
-            });
+            }, .drop);
             self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
         }
         ctx.redraw().skip();
@@ -12949,6 +13001,89 @@ test "mutation read start gate blocks forced auto reload before cycle ownership"
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
     try std.testing.expect(app.pages.review.load.pending == null);
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "closed read authority queues action-terminal revalidation instead of dropping" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+    };
+    _ = app.activateReview();
+    const owner: app_actions.PendingAction = .{
+        .generation = 71,
+        .kind = .stage_file,
+    };
+    try std.testing.expect(app.pages.review.repository_read_authority.closeForMutation(owner));
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    // BC3 regression: the pre-check queues one coalesced revalidation where
+    // the old route reached the inner read gate and silently dropped the
+    // post-action refresh intent.
+    const disposition = app.startActionResultRevalidation(&ctx, null, false);
+
+    try std.testing.expectEqual(ReviewRevalidationStartDisposition.rejected_start, disposition);
+    try std.testing.expect(app.pages.review.activation.hasQueuedFullRevalidation());
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expect(app.pages.review.load.pending == null);
+    try std.testing.expect(app.pages.review.pending_reload == null);
+    try std.testing.expect(ctx._redraw_suppressed);
+}
+
+test "closed read authority consequence is a typed route policy" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+    };
+    _ = app.activateReview();
+    const owner: app_actions.PendingAction = .{
+        .generation = 72,
+        .kind = .unstage_file,
+    };
+    try std.testing.expect(app.pages.review.repository_read_authority.closeForMutation(owner));
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try std.testing.expectEqual(
+        App.ReviewReloadStart.authority_closed,
+        try app.startReviewReload(&ctx, .{ .clear_visible_state = false, .kind = .watch }, .drop),
+    );
+    try std.testing.expect(!app.pages.review.activation.hasQueuedFullRevalidation());
+
+    try std.testing.expectEqual(
+        App.ReviewReloadStart.authority_closed,
+        try app.startReviewReload(&ctx, .{ .clear_visible_state = false, .kind = .action_result }, .queue_revalidation),
+    );
+    try std.testing.expect(app.pages.review.activation.hasQueuedFullRevalidation());
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+}
+
+test "closed read authority keeps watch tick drop semantics without queueing" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .pages = .{ .review = .{ .auto_reload = .{
+            .activation = .forced,
+            .interval_ns = 3 * std.time.ns_per_s,
+        } } },
+    };
+    _ = app.activateReview();
+    const owner: app_actions.PendingAction = .{
+        .generation = 73,
+        .kind = .stage_hunk,
+    };
+    try std.testing.expect(app.pages.review.repository_read_authority.closeForMutation(owner));
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.autoReloadTick(&ctx);
+
+    // Copy 5 keeps its drop-and-next-tick semantics: no queued revalidation
+    // fires when the authority reopens.
+    try std.testing.expect(!app.pages.review.activation.hasQueuedFullRevalidation());
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
     try std.testing.expect(ctx._redraw_suppressed);
 }
 
