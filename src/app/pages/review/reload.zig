@@ -1952,7 +1952,7 @@ pub const Controller = struct {
         };
         defer prepared_source.deinit(allocator);
         var prepared_tree = if (!source_changes and status_changes)
-            self.prepareCanonicalCurrentTree(
+            self.prepareCurrentTree(
                 allocator,
                 self.canonicalStatusDocument(gate),
             ) catch |err| {
@@ -2005,7 +2005,7 @@ pub const Controller = struct {
             }
             self.page.source_session_revision = expected_source_revision;
         }
-        if (prepared_tree) |*tree| self.installCanonicalCurrentTree(tree);
+        if (prepared_tree) |*tree| self.installCurrentTree(tree, .restore_previous);
 
         if (final_anchor) |*anchor| {
             if (self.navigation.activeLoadedDiff()) |loaded| {
@@ -2706,11 +2706,7 @@ pub const Controller = struct {
         if (canonical_terminal) {
             switch (result.result) {
                 .empty => {
-                    const same_root = if (self.page.git_status.repo_root) |root|
-                        std.mem.eql(u8, root, result.repo_root)
-                    else
-                        false;
-                    if (same_root and self.page.git_status.document.entries.len == 0) {
+                    if (self.statusSnapshotMatchesRetained(result.repo_root, null)) {
                         self.page.canonical_publication.?.status = .identical;
                     } else {
                         self.page.canonical_publication.?.status = .{ .replacement = .{} };
@@ -2720,12 +2716,7 @@ pub const Controller = struct {
                     return .{ .skip_redraw = true, .terminal_admitted = true };
                 },
                 .loaded => |*bundle| {
-                    const identical = if (self.page.git_status.repo_root) |root|
-                        std.mem.eql(u8, root, result.repo_root) and
-                            self.page.git_status.document.eql(bundle.document)
-                    else
-                        false;
-                    if (identical) {
+                    if (self.statusSnapshotMatchesRetained(result.repo_root, bundle.document)) {
                         self.page.canonical_publication.?.status = .identical;
                     } else {
                         var candidate: git_status.GitStatusState = .{};
@@ -2801,27 +2792,48 @@ pub const Controller = struct {
         }
     }
 
-    fn applyCanonicalStatusFailure(
+    /// Whether a fresh status result is identical to the retained snapshot:
+    /// same repository root and, for loaded results, an equal document (a
+    /// null document asks about the empty-status case). One implementation so
+    /// the publication arms cannot drift on the identity definition.
+    fn statusSnapshotMatchesRetained(
+        self: Controller,
+        repo_root: []const u8,
+        document: ?git_status.StatusDocument,
+    ) bool {
+        const root = self.page.git_status.repo_root orelse return false;
+        if (!std.mem.eql(u8, root, repo_root)) return false;
+        return if (document) |value|
+            self.page.git_status.document.eql(value)
+        else
+            self.page.git_status.document.entries.len == 0;
+    }
+
+    /// Whether a failed status read keeps the retained snapshot. The
+    /// publication route always retains an existing snapshot (the aborted
+    /// transaction leaves the old presentation authoritative); the navigation
+    /// route drops it on foreground failures so stale status cannot
+    /// reauthorize actions, retaining only for background watch cycles.
+    const StatusFailureRetention = union(enum) {
+        retain_existing,
+        drop_unless_background: ?u64,
+    };
+
+    fn finishStatusFailureTerminal(
         self: Controller,
         allocator: std.mem.Allocator,
         identity: app_page.RequestIdentity,
         message: []const u8,
+        retention: StatusFailureRetention,
     ) CompletionApply {
-        self.page.status_load.markFailure(self.page.git_status.repo_root != null);
-        _ = self.page.activation.finishMember(identity, .status, .failed);
-        self.page.pending_initial_first_visible_selection = false;
-        self.abortCanonicalPublication(allocator);
-        return .{
-            .diagnostic = .{ .status_load_failed = message },
-            .terminal_admitted = true,
+        const retain = switch (retention) {
+            .retain_existing => self.page.git_status.repo_root != null,
+            .drop_unless_background => |background_cycle_id| background_cycle_id != null and
+                self.page.git_status.repo_root != null,
         };
-    }
-
-    fn applyStatusFailure(self: Controller, allocator: std.mem.Allocator, identity: app_page.RequestIdentity, background_cycle_id: ?u64, message: []const u8) CompletionApply {
-        const retain = background_cycle_id != null and self.page.git_status.repo_root != null;
         self.page.status_load.markFailure(retain);
         _ = self.page.activation.finishMember(identity, .status, .failed);
-        if (!retain) {
+        if (!retain and retention == .drop_unless_background) {
             if (self.page.git_status.repo_root != null or self.page.git_status.document.entries.len != 0) {
                 self.advanceStatusSnapshotRevision(allocator);
             }
@@ -2829,6 +2841,26 @@ pub const Controller = struct {
         }
         self.page.pending_initial_first_visible_selection = false;
         return .{ .diagnostic = .{ .status_load_failed = message }, .terminal_admitted = true };
+    }
+
+    fn applyCanonicalStatusFailure(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        identity: app_page.RequestIdentity,
+        message: []const u8,
+    ) CompletionApply {
+        const apply = self.finishStatusFailureTerminal(allocator, identity, message, .retain_existing);
+        self.abortCanonicalPublication(allocator);
+        return apply;
+    }
+
+    fn applyStatusFailure(self: Controller, allocator: std.mem.Allocator, identity: app_page.RequestIdentity, background_cycle_id: ?u64, message: []const u8) CompletionApply {
+        return self.finishStatusFailureTerminal(
+            allocator,
+            identity,
+            message,
+            .{ .drop_unless_background = background_cycle_id },
+        );
     }
 
     pub fn applyBranchStatusFinished(
@@ -2900,45 +2932,68 @@ pub const Controller = struct {
         };
     }
 
+    /// Builds the loaded session for an accepted source bundle. The sole
+    /// construction for both routes: `status_merge` carries the publication
+    /// transaction's candidate status document (tree rebuilt with status
+    /// rows), while the destructive route passes null and keeps the bundle's
+    /// source-only tree because its status arrives at a separate terminal and
+    /// is merged by the later status projection (two-phase product
+    /// semantics).
+    fn prepareLoadedSession(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        bundle: *app_load.LoadedDiffBundle,
+        status_merge: ?git_status.StatusDocument,
+    ) !load_state.LoadedSession {
+        var arena = bundle.takeArena();
+        errdefer arena.deinit();
+        var loaded = bundle.loaded;
+        try self.navigation.materializeReviewedFiles(allocator, &loaded);
+        errdefer allocator.free(loaded.reviewed_files);
+        if (status_merge) |status_document| {
+            try self.navigation.ensureTreeOrderScope(allocator);
+            loaded.tree = try file_tree.buildWithOptions(
+                arena.allocator(),
+                loaded.document,
+                status_document,
+                .{
+                    .root = self.navigation.view().fileTreeRootOptions(),
+                    .stable_order = self.navigation.stableOrderOptions(allocator),
+                },
+            );
+        }
+        // Always rematerialize the accepted load so directory folds and
+        // file-visibility filters stay coherent across reloads.
+        try loaded.rebuildVisibleNodes(
+            arena.allocator(),
+            self.page.review_display.hide_reviewed_files,
+            self.page.review_display.changed_file_filter,
+        );
+        return .{
+            .arena = arena,
+            .loaded = loaded,
+            .reviewed_files_owned = true,
+        };
+    }
+
     fn prepareCanonicalLoadedSource(
         self: Controller,
         allocator: std.mem.Allocator,
         bundle: *app_load.LoadedDiffBundle,
         status_document: git_status.StatusDocument,
     ) !PreparedCanonicalSource {
-        var arena = bundle.takeArena();
-        errdefer arena.deinit();
-        var loaded = bundle.loaded;
-        try self.navigation.materializeReviewedFiles(allocator, &loaded);
-        errdefer allocator.free(loaded.reviewed_files);
-        try self.navigation.ensureTreeOrderScope(allocator);
-        loaded.tree = try file_tree.buildWithOptions(
-            arena.allocator(),
-            loaded.document,
-            status_document,
-            .{
-                .root = self.navigation.view().fileTreeRootOptions(),
-                .stable_order = self.navigation.stableOrderOptions(allocator),
-            },
-        );
-        try loaded.rebuildVisibleNodes(
-            arena.allocator(),
-            self.page.review_display.hide_reviewed_files,
-            self.page.review_display.changed_file_filter,
-        );
-        return .{ .loaded = .{
-            .arena = arena,
-            .loaded = loaded,
-            .reviewed_files_owned = true,
-        } };
+        return .{ .loaded = try self.prepareLoadedSession(allocator, bundle, status_document) };
     }
 
-    fn prepareCanonicalStatusOnlySource(
+    /// Builds a status-only loaded session: an empty diff document whose tree
+    /// carries the status rows. The sole construction for both the status
+    /// projection route and the publication transaction; navigation and
+    /// revision policy stay with the callers.
+    fn prepareStatusOnlySession(
         self: Controller,
         allocator: std.mem.Allocator,
         status_document: git_status.StatusDocument,
-    ) !PreparedCanonicalSource {
-        if (status_document.entries.len == 0) return .empty;
+    ) !load_state.LoadedSession {
         var arena: std.heap.ArenaAllocator = .init(allocator);
         errdefer arena.deinit();
         const arena_allocator = arena.allocator();
@@ -2971,11 +3026,20 @@ pub const Controller = struct {
             false,
             self.page.review_display.changed_file_filter,
         );
-        return .{ .loaded = .{
+        return .{
             .arena = arena,
             .loaded = loaded,
             .reviewed_files_owned = false,
-        } };
+        };
+    }
+
+    fn prepareCanonicalStatusOnlySource(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        status_document: git_status.StatusDocument,
+    ) !PreparedCanonicalSource {
+        if (status_document.entries.len == 0) return .empty;
+        return .{ .loaded = try self.prepareStatusOnlySession(allocator, status_document) };
     }
 
     fn prepareCanonicalSource(
@@ -2998,7 +3062,16 @@ pub const Controller = struct {
         };
     }
 
-    fn prepareCanonicalCurrentTree(
+    /// Post-install navigation for a rebuilt current tree. The publication
+    /// route restores the previous selection identity only; the status
+    /// projection route keeps its action-cursor / pending-restore /
+    /// first-visible precedence.
+    const CurrentTreeNavigation = union(enum) {
+        restore_previous,
+        status_projection: struct { prefer_first_visible_file: bool },
+    };
+
+    fn prepareCurrentTree(
         self: Controller,
         app_allocator: std.mem.Allocator,
         status_document: git_status.StatusDocument,
@@ -3035,14 +3108,46 @@ pub const Controller = struct {
         };
     }
 
-    fn installCanonicalCurrentTree(
+    fn installCurrentTree(
         self: Controller,
         prepared: *PreparedCanonicalCurrentTree,
+        policy: CurrentTreeNavigation,
     ) void {
         const loaded = self.navigation.activeLoadedDiff() orelse unreachable;
         loaded.tree = prepared.tree;
         loaded.visible_nodes = prepared.visible_nodes;
         loaded.visible_node_count = prepared.visible_node_count;
+        defer prepared.* = undefined;
+        switch (policy) {
+            .restore_previous => self.restorePreparedTreeSelection(loaded, prepared),
+            .status_projection => |options| {
+                if (self.page.action_cursor.hasRestoreAuthority()) {
+                    _ = self.navigation.remapActionCursor(loaded);
+                    return;
+                }
+                // Source replacement can temporarily make the anchored path
+                // absent until the fresh status snapshot is projected back
+                // into the tree. Reapply that still-owned display anchor
+                // here, where a staged-only row can finally satisfy it, and
+                // retain the anchor until the matching projection result
+                // restores the body navigation.
+                if (self.page.pending_display_navigation_restore) |*restore| {
+                    if (self.navigation.restoreReloadAnchor(loaded, restore.authoritative())) return;
+                }
+                if (options.prefer_first_visible_file) {
+                    self.navigation.selectFirstVisibleFile(loaded);
+                } else {
+                    self.restorePreparedTreeSelection(loaded, prepared);
+                }
+            },
+        }
+    }
+
+    fn restorePreparedTreeSelection(
+        self: Controller,
+        loaded: *loaded_diff.LoadedDiff,
+        prepared: *const PreparedCanonicalCurrentTree,
+    ) void {
         if (prepared.previous_path_key) |path_key| {
             if (navigation.findFileNodeByPathKey(loaded, path_key)) |node_index| {
                 self.navigation.selectSidebarNode(loaded, node_index);
@@ -3052,7 +3157,6 @@ pub const Controller = struct {
             _ = self.navigation.restoreSidebarIdentity(loaded, identity);
         }
         self.navigation.reconcileSelectionAfterVisibleNodeChange(loaded);
-        prepared.* = undefined;
     }
 
     fn canonicalSourceFingerprint(
@@ -3188,7 +3292,7 @@ pub const Controller = struct {
 
         const status_changes = gate.status.changesSnapshot();
         var prepared_tree = if (!source_changes and status_changes)
-            self.prepareCanonicalCurrentTree(
+            self.prepareCurrentTree(
                 allocator,
                 self.canonicalStatusDocument(gate),
             ) catch |err| {
@@ -3244,7 +3348,7 @@ pub const Controller = struct {
             }
             self.page.source_session_revision = expected_source_revision;
         }
-        if (prepared_tree) |*tree| self.installCanonicalCurrentTree(tree);
+        if (prepared_tree) |*tree| self.installCurrentTree(tree, .restore_previous);
         if (reused) {
             // Exact comparison admitted the retained presentation before the
             // no-fail commit, but its lineage belongs to the final source and
@@ -3643,12 +3747,7 @@ pub const Controller = struct {
                             .failed_static => |value| value,
                             else => unreachable,
                         };
-                        if (self.page.auto_reload.markSourceFailure(message)) {
-                            outcome.auto_reload_failure = .{
-                                .identity = self.page.auto_reload.last_failure.?,
-                                .message = message,
-                            };
-                        }
+                        self.recordWatchSourceFailure(&outcome, message);
                     }
                     self.abortCanonicalPublication(allocator);
                     return outcome;
@@ -3728,23 +3827,8 @@ pub const Controller = struct {
                     null;
                 errdefer if (acceptance_restore) |*restore| restore.deinit(allocator);
                 self.clearSourceDisplayForReplacement(allocator);
-                var loaded = bundle.loaded;
-                var arena = bundle.takeArena();
-                errdefer arena.deinit();
-                try self.navigation.materializeReviewedFiles(allocator, &loaded);
-                errdefer allocator.free(loaded.reviewed_files);
-                // Always rematerialize the accepted load so directory folds
-                // and file-visibility filters stay coherent across reloads.
-                try loaded.rebuildVisibleNodes(
-                    arena.allocator(),
-                    self.page.review_display.hide_reviewed_files,
-                    self.page.review_display.changed_file_filter,
-                );
-                self.page.load.replaceLoaded(allocator, .{
-                    .arena = arena,
-                    .loaded = loaded,
-                    .reviewed_files_owned = true,
-                });
+                const session = try self.prepareLoadedSession(allocator, bundle, null);
+                self.page.load.replaceLoaded(allocator, session);
                 if (acceptance_restore) |restore| {
                     self.installDisplayRestore(allocator, restore);
                     acceptance_restore = null;
@@ -3799,6 +3883,18 @@ pub const Controller = struct {
         return outcome;
     }
 
+    /// Records a watch-cycle source failure into the outcome. The non-watch
+    /// consequence (failure display vs publication abort) stays with the
+    /// route.
+    fn recordWatchSourceFailure(self: Controller, outcome: *SourceApply, message: []const u8) void {
+        if (self.page.auto_reload.markSourceFailure(message)) {
+            outcome.auto_reload_failure = .{
+                .identity = self.page.auto_reload.last_failure.?,
+                .message = message,
+            };
+        }
+    }
+
     fn applySourceFailure(
         self: Controller,
         allocator: std.mem.Allocator,
@@ -3806,13 +3902,10 @@ pub const Controller = struct {
         message: []const u8,
     ) !SourceApply {
         if (pending_reload != null and pending_reload.?.kind == .watch) {
-            if (self.page.auto_reload.markSourceFailure(message)) {
-                return .{ .auto_reload_failure = .{
-                    .identity = self.page.auto_reload.last_failure.?,
-                    .message = message,
-                } };
-            }
-            return .{ .redraw = .skip };
+            var outcome: SourceApply = .{ .redraw = .skip };
+            self.recordWatchSourceFailure(&outcome, message);
+            if (outcome.auto_reload_failure != null) outcome.redraw = .normal;
+            return outcome;
         }
         try self.replaceSourceFailure(allocator, message);
         return .{};
@@ -3913,6 +4006,11 @@ pub const Controller = struct {
     /// not revoke accepted source authority; callers choose the destructive or
     /// replacement transition below explicitly.
     pub fn clearLoadedDiff(self: Controller, allocator: ?std.mem.Allocator) void {
+        // A live publication gate owns the retained display: every route that
+        // reaches this destructive teardown aborts the gate first (new read,
+        // pending-reload clear, repo discovery, page exit). Assert that
+        // invariant instead of silently tearing down a transaction's owner.
+        std.debug.assert(self.page.canonical_publication == null);
         if (allocator == null) std.debug.assert(self.page.review_projection.isEmpty());
         self.advanceSourceSessionRevision(allocator);
         self.navigation.clearDiffSelection();
@@ -4039,44 +4137,11 @@ pub const Controller = struct {
         status_document: git_status.StatusDocument,
         prefer_first_visible_file: bool,
     ) !void {
-        const allocator = self.navigation.loadArenaAllocator() orelse return;
-        const previous_path_key = self.navigation.view().selectedStagePathKey();
-        const previous_sidebar_identity = self.navigation.view().selectedSidebarIdentity();
-        try self.navigation.ensureTreeOrderScope(app_allocator);
-        loaded.tree = try file_tree.buildWithOptions(allocator, loaded.document, status_document, .{
-            .root = self.navigation.view().fileTreeRootOptions(),
-            .stable_order = self.navigation.stableOrderOptions(app_allocator),
+        std.debug.assert(loaded == self.navigation.activeLoadedDiff().?);
+        var prepared = (try self.prepareCurrentTree(app_allocator, status_document)) orelse return;
+        self.installCurrentTree(&prepared, .{
+            .status_projection = .{ .prefer_first_visible_file = prefer_first_visible_file },
         });
-        try loaded.rebuildVisibleNodes(
-            allocator,
-            self.page.review_display.hide_reviewed_files,
-            self.page.review_display.changed_file_filter,
-        );
-        if (self.page.action_cursor.hasRestoreAuthority()) {
-            _ = self.navigation.remapActionCursor(loaded);
-            return;
-        }
-        // Source replacement can temporarily make the anchored path absent
-        // until the fresh status snapshot is projected back into the tree.
-        // Reapply that still-owned display anchor here, where a staged-only
-        // row can finally satisfy it, and retain the anchor until the matching
-        // projection result restores the body navigation.
-        if (self.page.pending_display_navigation_restore) |*restore| {
-            if (self.navigation.restoreReloadAnchor(loaded, restore.authoritative())) return;
-        }
-        if (prefer_first_visible_file) {
-            self.navigation.selectFirstVisibleFile(loaded);
-        } else {
-            if (previous_path_key) |path_key| {
-                if (navigation.findFileNodeByPathKey(loaded, path_key)) |node_index| {
-                    self.navigation.selectSidebarNode(loaded, node_index);
-                }
-            }
-            if (previous_sidebar_identity) |identity| {
-                _ = self.navigation.restoreSidebarIdentity(loaded, identity);
-            }
-            self.navigation.reconcileSelectionAfterVisibleNodeChange(loaded);
-        }
     }
 
     pub fn createStatusOnlyLoadedSession(
@@ -4084,40 +4149,13 @@ pub const Controller = struct {
         allocator: std.mem.Allocator,
         status_document: git_status.StatusDocument,
     ) !void {
-        var arena: std.heap.ArenaAllocator = .init(allocator);
-        errdefer arena.deinit();
-        const arena_allocator = arena.allocator();
-        const document = diff_parser.DiffDocument{ .files = &.{} };
-        try self.navigation.ensureTreeOrderScope(allocator);
-        var loaded: loaded_diff.LoadedDiff = .{
-            .text = "",
-            .document = document,
-            .file_text_eligibility = &.{},
-            .tree = try file_tree.buildWithOptions(arena_allocator, document, status_document, .{
-                .root = self.navigation.view().fileTreeRootOptions(),
-                .stable_order = self.navigation.stableOrderOptions(allocator),
-            }),
-            .rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena_allocator, document),
-            .collapsed_hunks = &.{},
-            .collapsed_dirs = .empty,
-            .bytes = 0,
-            .lines = 0,
-        };
-        try loaded.rebuildVisibleNodes(
-            arena_allocator,
-            false,
-            self.page.review_display.changed_file_filter,
-        );
+        const session = try self.prepareStatusOnlySession(allocator, status_document);
 
         self.advanceSourceSessionRevision(allocator);
         if (self.page.pending_display_navigation_restore) |*restore| {
             restore.source_session_revision = self.page.source_session_revision;
         }
-        self.page.load.replaceLoaded(allocator, .{
-            .arena = arena,
-            .loaded = loaded,
-            .reviewed_files_owned = false,
-        });
+        self.page.load.replaceLoaded(allocator, session);
 
         const active_loaded = self.navigation.activeLoadedDiff().?;
         var visible_index: usize = 0;
