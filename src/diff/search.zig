@@ -16,6 +16,11 @@ const Candidate = struct {
     match: Match,
 };
 
+/// Search consumes the canonical `BodyRowIterator` so rendered row order has
+/// one source of truth. The fold-free `init` is deliberate policy: lines
+/// inside folded hunks stay searchable — the viewer's fold state never
+/// narrows the search space — and offsets therefore live in the same
+/// fold-free space as `renderedOffsetForCoordinate(..., null)`.
 pub fn findMatch(
     file: diff_parser.FileDiff,
     mode: diff_view_model.DisplayMode,
@@ -36,55 +41,50 @@ pub fn findMatch(
     var before_base: ?Candidate = null;
     var offset: usize = 0;
 
-    for (file.metadata, 0..) |line, index| {
-        if (!diff_view_model.isVisibleMetadataLine(line)) continue;
-        collectCandidate(.{ .metadata = index }, line, query, offset, base_offset, &first, &last, &after_base, &before_base);
-        offset += 1;
-    }
-
-    if (file.is_binary) {
-        collectCandidate(.binary_marker, "Binary file", query, offset, base_offset, &first, &last, &after_base, &before_base);
-        offset += 1;
-    }
-
-    for (file.hunks, 0..) |hunk, hunk_index| {
-        collectCandidate(.{ .hunk_header = hunk_index }, hunk.section, query, offset, base_offset, &first, &last, &after_base, &before_base);
-        offset += 1;
-
-        switch (mode) {
-            .unified => {
-                for (hunk.lines, 0..) |line, line_index| {
-                    collectCandidate(
-                        .{ .hunk_line = .{ .hunk_index = hunk_index, .line_index = line_index } },
-                        line.text,
-                        query,
-                        offset,
+    var rows = diff_view_model.BodyRowIterator.init(file, mode);
+    while (rows.next()) |row| {
+        switch (row) {
+            .metadata => |line| collectCandidate(
+                .{ .metadata = rows.currentMetadataIndex().? },
+                line,
+                query,
+                offset,
+                base_offset,
+                &first,
+                &last,
+                &after_base,
+                &before_base,
+            ),
+            .binary_marker => collectCandidate(.binary_marker, "Binary file", query, offset, base_offset, &first, &last, &after_base, &before_base),
+            .hunk_header => |header| collectCandidate(.{ .hunk_header = header.hunk_index }, header.section, query, offset, base_offset, &first, &last, &after_base, &before_base),
+            .unified_line => |line| collectCandidate(
+                .{ .hunk_line = .{
+                    .hunk_index = rows.currentHunkIndex().?,
+                    .line_index = rows.currentUnifiedLineIndex().?,
+                } },
+                line.text,
+                query,
+                offset,
+                base_offset,
+                &first,
+                &last,
+                &after_base,
+                &before_base,
+            ),
+            .side_by_side => {
+                if (matchedSideBySideCoordinate(rows.currentSideBySideRow().?, rows.currentHunkIndex().?, query)) |coordinate| {
+                    recordCandidate(
+                        .{ .offset = offset, .match = .{ .coordinate = coordinate } },
                         base_offset,
                         &first,
                         &last,
                         &after_base,
                         &before_base,
                     );
-                    offset += 1;
-                }
-            },
-            .side_by_side => {
-                var rows = diff_view_model.SideBySideIndexedIterator.init(hunk.lines);
-                while (rows.next()) |row| {
-                    if (matchedSideBySideCoordinate(row, hunk_index, query)) |coordinate| {
-                        recordCandidate(
-                            .{ .offset = offset, .match = .{ .coordinate = coordinate } },
-                            base_offset,
-                            &first,
-                            &last,
-                            &after_base,
-                            &before_base,
-                        );
-                    }
-                    offset += 1;
                 }
             },
         }
+        offset += 1;
     }
 
     const selected = switch (direction) {
@@ -295,6 +295,36 @@ test "search base and direction probes traverse rendered row order" {
     const binary = bridgeProbeBinaryFile();
     try expectMatch(.binary_marker, findMatch(binary, .unified, "Binary", null, .forward));
     try expectMatch(.binary_marker, findMatch(binary, .unified, "Binary", .{ .metadata = 1 }, .forward));
+}
+
+test "binary file with residual hunks searches only through the binary marker" {
+    // A malformed patch can leave hunks on a binary file. Rendered row order
+    // ends at the binary marker, so those residual hunk rows are outside the
+    // search space — matching `renderedOffsetForCoordinate`, which never
+    // assigned them an offset in the first place.
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{ "index 1..2", "old mode QQ" },
+        .is_binary = true,
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 1,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "QQ head",
+                .lines = &.{
+                    .{ .kind = .context, .text = "QQ tail", .old_line = 1, .new_line = 1 },
+                },
+            },
+        },
+    };
+
+    try expectMatch(.{ .metadata = 1 }, findMatch(file, .unified, "QQ", null, .forward));
+    try expectMatch(.{ .metadata = 1 }, findMatch(file, .unified, "QQ", null, .backward));
+    try expectMatch(.binary_marker, findMatch(file, .unified, "Binary", null, .forward));
+    try std.testing.expect(findMatch(file, .unified, "tail", null, .forward) == null);
+    try std.testing.expect(findMatch(file, .unified, "head", null, .forward) == null);
 }
 
 fn expectRenderedOffset(
