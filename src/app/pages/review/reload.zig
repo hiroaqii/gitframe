@@ -311,6 +311,11 @@ pub const OwnedReadCommand = union(enum) {
 
 pub const ReviewUpdate = struct {
     command: ?OwnedReadCommand = null,
+    /// True when this call itself published new visual state (cache
+    /// promotion, combined-to-ordinary boundary, canonical primary commit).
+    /// The update tail runs after the handler's redraw decision, so the shell
+    /// uses this bit to force a frame past an earlier skip latch.
+    display_changed: bool = false,
 
     pub fn deinit(self: *ReviewUpdate, allocator: std.mem.Allocator) void {
         if (self.command) |*command| command.deinit(allocator);
@@ -2070,10 +2075,10 @@ pub const Controller = struct {
         const projection_kind = self.canonicalProjectionKind(gate) orelse {
             if (!source_changes and !status_changes) {
                 self.commitCanonicalNoop(allocator);
-            } else {
-                try self.commitCanonicalPrimary(allocator);
+                return .{};
             }
-            return .{};
+            try self.commitCanonicalPrimary(allocator);
+            return .{ .display_changed = true };
         };
         const target: ProjectionTarget = .{
             .repo_root = gate.repo_root,
@@ -2261,7 +2266,7 @@ pub const Controller = struct {
                         ),
                         .primary_backed => self.reconcileRetainedPresentationNavigation(allocator),
                     }
-                    return .{};
+                    return .{ .display_changed = true };
                 }
             }
             if (self.boundaryInertRetention()) {
@@ -2370,7 +2375,7 @@ pub const Controller = struct {
                 self.page.review_projection.installReady(hit);
                 hit_owned = false;
                 self.reconcileInstalledProjectionNavigation(allocator, if (local_navigation) |*anchor| anchor else null);
-                return .{};
+                return .{ .display_changed = true };
             }
         }
         if (self.page.review_projection.pendingMatches(
@@ -3716,11 +3721,13 @@ pub const Controller = struct {
     /// delivery which filled this slot already skipped its redraw; this later
     /// call runs inside the input event which ended the borrow, whose redraw is
     /// still needed to remove or finalize the selection presentation.
+    /// Returns true when the deferred completion was actually published so
+    /// the shell can restore the redraw an earlier handler skipped.
     pub fn applyDeferredProjection(
         self: Controller,
         allocator: std.mem.Allocator,
-    ) !void {
-        var deferred = self.page.deferred_projection_apply orelse return;
+    ) !bool {
+        var deferred = self.page.deferred_projection_apply orelse return false;
         self.page.deferred_projection_apply = null;
 
         // Do not gate cleanup itself. `applyProjectionFinished` drains the
@@ -3729,6 +3736,7 @@ pub const Controller = struct {
         var result_transferred = false;
         defer if (!result_transferred) deferred.deinit(allocator);
         result_transferred = (try self.applyProjectionFinished(allocator, &deferred.finished)).result_transferred;
+        return result_transferred;
     }
 
     pub fn applySourceFinished(
@@ -7156,7 +7164,7 @@ test "projection completion defers without moving displayed ownership during liv
     try std.testing.expect(page.deferred_projection_apply != null);
 
     page.selection_owner = .none;
-    try controller.applyDeferredProjection(allocator);
+    _ = try controller.applyDeferredProjection(allocator);
     try std.testing.expect(page.deferred_projection_apply == null);
     try std.testing.expect(page.review_projection.pending == null);
     try std.testing.expect(page.review_projection.hasDisplayed());
@@ -7194,7 +7202,7 @@ test "projection failed terminals defer through the same owned result slot" {
     const failed_apply = try owned_controller.applyProjectionFinished(allocator, &failed);
     try std.testing.expect(failed_apply.result_transferred);
     owned_page.selection_owner = .none;
-    try owned_controller.applyDeferredProjection(allocator);
+    _ = try owned_controller.applyDeferredProjection(allocator);
     try std.testing.expect(owned_page.review_projection.displayed == .failed);
 
     var static_page: review_page.ReviewPageState = .{
@@ -7225,7 +7233,7 @@ test "projection failed terminals defer through the same owned result slot" {
     const static_apply = try static_controller.applyProjectionFinished(allocator, &failed_static);
     try std.testing.expect(static_apply.result_transferred);
     static_page.selection_owner = .none;
-    try static_controller.applyDeferredProjection(allocator);
+    _ = try static_controller.applyDeferredProjection(allocator);
     try std.testing.expect(static_page.review_projection.displayed == .failed);
 }
 
@@ -7262,7 +7270,7 @@ test "cached and combined ready completions use the live drag deferral slot" {
     try std.testing.expect(cached_apply.result_transferred);
     try std.testing.expect(cached_page.deferred_projection_apply != null);
     cached_page.selection_owner = .none;
-    try cached_controller.applyDeferredProjection(allocator);
+    _ = try cached_controller.applyDeferredProjection(allocator);
     try std.testing.expect(cached_page.review_projection.displayed.ready.value == .cached_diff);
 
     var combined_page: review_page.ReviewPageState = .{
@@ -7341,7 +7349,7 @@ test "cached and combined ready completions use the live drag deferral slot" {
     unstaged_authority_owned = false;
     try std.testing.expect(combined_page.deferred_projection_apply != null);
     combined_page.selection_owner = .none;
-    try combined_controller.applyDeferredProjection(allocator);
+    _ = try combined_controller.applyDeferredProjection(allocator);
     try std.testing.expect(combined_page.review_projection.displayed.ready.value == .combined_hunks);
 }
 
@@ -7410,7 +7418,7 @@ test "either inert combined component defers caches promotes and deinits exactly
         try std.testing.expect(!page.review_projection.hasDisplayed());
 
         page.selection_owner = .none;
-        try controller.applyDeferredProjection(allocator);
+        _ = try controller.applyDeferredProjection(allocator);
         try std.testing.expect(page.deferred_projection_apply == null);
         try std.testing.expect(page.review_projection.displayed.ready.value == .inert_combined);
 
@@ -7510,7 +7518,7 @@ test "source replacement before deferred projection rejects and frees the stale 
     // projection is reconsidered.
     controller.clearLoadedDiff(allocator);
     try std.testing.expectEqual(@as(u64, 1), page.source_session_revision);
-    try controller.applyDeferredProjection(allocator);
+    _ = try controller.applyDeferredProjection(allocator);
     try std.testing.expect(page.deferred_projection_apply == null);
     try std.testing.expect(!page.review_projection.hasDisplayed());
 }
@@ -7565,7 +7573,7 @@ test "mutation read promotion gate drains deferred projection without publicatio
     try std.testing.expect(page.repository_read_authority.closeForMutation(owner));
     try std.testing.expect(page.repository_read_authority.epoch.eql(old_epoch.next()));
     page.selection_owner = .none;
-    try controller.applyDeferredProjection(allocator);
+    _ = try controller.applyDeferredProjection(allocator);
 
     try std.testing.expect(page.deferred_projection_apply == null);
     try std.testing.expect(page.review_projection.pending == null);
@@ -9681,7 +9689,7 @@ test "combined reuse candidate crosses live drag deferral with one owner" {
     try std.testing.expectEqual(@as(u64, 0), page.review_projection.displayed.ready.value.combined_hunks.authority.status_snapshot_revision);
 
     page.selection_owner = .none;
-    try controller.applyDeferredProjection(allocator);
+    _ = try controller.applyDeferredProjection(allocator);
     try std.testing.expect(page.deferred_projection_apply == null);
     try std.testing.expect(page.review_projection.pending == null);
     try std.testing.expectEqual(@as(u64, 1), page.review_projection.displayed.ready.value.combined_hunks.authority.status_snapshot_revision);
@@ -9728,7 +9736,7 @@ test "deferred combined reuse rejection schedules the same bounded eager retry" 
     try std.testing.expect(page.deferred_projection_apply != null);
 
     page.selection_owner = .none;
-    try controller.applyDeferredProjection(allocator);
+    _ = try controller.applyDeferredProjection(allocator);
     try std.testing.expect(page.deferred_projection_apply == null);
     try std.testing.expect(page.review_projection.pending == null);
     try std.testing.expect(page.review_projection.eager_retry_basis != null);
