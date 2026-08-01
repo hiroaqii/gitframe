@@ -836,19 +836,10 @@ pub const App = struct {
             self.pages.repository.rejectSpawn(generation);
             return err;
         };
-        task.* = .{
-            .identity = request.identity,
-            .generation = request.generation,
-            .root_path = request.root_path,
-            .root = request.root,
-            .expected_fingerprint = request.expected_fingerprint,
-            .expected_status_fingerprint = request.expected_status_fingerprint,
-        };
+        task.* = .{ .request = request };
         request_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = RepositoryManifestTask.run, .failed = RepositoryManifestTask.failed }) catch |err| {
-            ctx.allocator().free(task.root_path);
-            task.root.deinit();
-            ctx.allocator().destroy(task);
+            task.destroy(ctx.allocator());
             self.pages.repository.rejectSpawn(generation);
             return err;
         };
@@ -871,18 +862,10 @@ pub const App = struct {
             self.pages.repository.rejectDocumentSpawn(generation);
             return err;
         };
-        task.* = .{
-            .identity = request.identity,
-            .generation = request.generation,
-            .manifest_revision = request.manifest_revision,
-            .path = request.path,
-            .root = request.root,
-        };
+        task.* = .{ .request = request };
         request_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = RepositoryDocumentTask.run, .failed = RepositoryDocumentTask.failed }) catch |err| {
-            ctx.allocator().free(task.path);
-            task.root.deinit();
-            ctx.allocator().destroy(task);
+            task.destroy(ctx.allocator());
             self.pages.repository.rejectDocumentSpawn(generation);
             return err;
         };
@@ -947,20 +930,10 @@ pub const App = struct {
             self.pages.repository.rejectSyntaxSpawn(generation);
             return;
         };
-        task.* = .{
-            .identity = request.identity,
-            .generation = request.generation,
-            .manifest_revision = request.manifest_revision,
-            .source_revision = request.source_revision,
-            .expected_fingerprint = request.expected_fingerprint,
-            .path = request.path,
-            .root = request.root,
-        };
+        task.* = .{ .request = request };
         request_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = RepositorySyntaxTask.run, .failed = RepositorySyntaxTask.failed }) catch {
-            ctx.allocator().free(task.path);
-            task.root.deinit();
-            ctx.allocator().destroy(task);
+            task.destroy(ctx.allocator());
             self.pages.repository.rejectSyntaxSpawn(generation);
         };
     }
@@ -983,23 +956,10 @@ pub const App = struct {
             self.pages.repository.rejectChangeMapSpawn(generation);
             return;
         };
-        task.* = .{
-            .identity = request.identity,
-            .generation = request.generation,
-            .manifest_revision = request.manifest_revision,
-            .source_revision = request.source_revision,
-            .expected_fingerprint = request.expected_fingerprint,
-            .expected_content_line_count = request.expected_content_line_count,
-            .path = request.path,
-            .root = request.root,
-            .temp_base_path = request.temp_base_path,
-        };
+        task.* = .{ .request = request };
         request_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = RepositoryChangeMapTask.run, .failed = RepositoryChangeMapTask.failed }) catch {
-            ctx.allocator().free(task.path);
-            task.root.deinit();
-            ctx.allocator().free(task.temp_base_path);
-            ctx.allocator().destroy(task);
+            task.destroy(ctx.allocator());
             self.pages.repository.rejectChangeMapSpawn(generation);
         };
     }
@@ -1645,7 +1605,7 @@ pub const App = struct {
         };
         command_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = RepoDiscoveryTask.run, .failed = RepoDiscoveryTask.failed }) catch |err| {
-            ctx.allocator().destroy(task);
+            task.destroy(ctx.allocator());
             self.reviewReload().rejectRepoDiscoverySpawn(generation);
             try self.reviewReload().replaceSourceFailure(ctx.allocator(), "Could not start repo discovery task");
             return err;
@@ -1822,8 +1782,7 @@ pub const App = struct {
         };
         command_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = DiffLoadTask.run, .failed = DiffLoadTask.failed }) catch |err| {
-            diff_source.freeLoadRequest(ctx.allocator(), task.request);
-            ctx.allocator().destroy(task);
+            task.destroy(ctx.allocator());
             const retained_publication = self.reviewReload().rejectSourceSpawn(
                 ctx.allocator(),
                 generation,
@@ -1897,8 +1856,7 @@ pub const App = struct {
             // The caller decides whether this is an auxiliary-only rejection
             // or a canonical-publication prerequisite failure. In either
             // case, invalidate the exact generation before propagating it.
-            ctx.allocator().free(task.repo_root);
-            ctx.allocator().destroy(task);
+            task.destroy(ctx.allocator());
             self.reviewReload().rejectStatusSpawn(background_cycle_id);
             if (action_cursor_generation) |generation| {
                 _ = self.pages.review.action_cursor.rejectMemberSpawn(generation, .status, status_read.generation);
@@ -1951,8 +1909,7 @@ pub const App = struct {
         command_consumed = true;
 
         ctx.task().spawnWith(.{ .ctx = task, .run = BranchStatusLoadTask.run, .failed = BranchStatusLoadTask.failed }) catch {
-            ctx.allocator().free(task.repo_root);
-            ctx.allocator().destroy(task);
+            task.destroy(ctx.allocator());
             self.reviewReload().rejectBranchStatusSpawn(background_cycle_id);
             self.setReviewStatus("could not start branch status load task", .{});
             return null;
@@ -2030,9 +1987,7 @@ pub const App = struct {
                     command_consumed = true;
 
                     ctx.task().spawnWith(.{ .ctx = task, .run = ReviewProjectionTask.run, .failed = ReviewProjectionTask.failed }) catch |err| {
-                        task.request.deinit(allocator);
-                        if (task.root) |*owned| owned.deinit();
-                        allocator.destroy(task);
+                        task.destroy(allocator);
                         self.reviewReload().rejectProjectionSpawn(allocator, request_id);
                         return err;
                     };
@@ -2077,9 +2032,7 @@ pub const App = struct {
         request_consumed = true;
         root_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = GeneratedSyntaxTask.run, .failed = GeneratedSyntaxTask.failed }) catch {
-            task.request.deinit(allocator);
-            task.root.deinit();
-            allocator.destroy(task);
+            task.destroy(allocator);
             self.reviewReload().rejectGeneratedSyntaxSpawn(allocator, request_id);
             return;
         };
@@ -3270,9 +3223,8 @@ pub const App = struct {
             .repo_root = &.{},
             .generation = generation,
         };
-        errdefer ctx.allocator().destroy(task);
+        errdefer task.destroy(ctx.allocator());
         task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
-        errdefer ctx.allocator().free(task.repo_root);
         try ctx.task().spawnWith(.{ .ctx = task, .run = BranchListLoadTask.run, .failed = BranchListLoadTask.failed });
     }
 
@@ -11484,18 +11436,18 @@ test "repository activation and manual reload route to page-owned manifest tasks
     try app.update(.{ .switch_page = .repository }, &ctx);
     try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
     const first: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
-    try std.testing.expectEqual(page.Id.repository, first.identity.origin);
-    try std.testing.expectEqual(app.repo_epoch, first.identity.repo_epoch);
-    const first_generation = first.generation;
+    try std.testing.expectEqual(page.Id.repository, first.request.identity.origin);
+    try std.testing.expectEqual(app.repo_epoch, first.request.identity.repo_epoch);
+    const first_generation = first.request.generation;
     const first_branch: *RepositoryBranchTask = @ptrCast(@alignCast(ctx._pending_tasks_with[1].ctx));
     const first_branch_generation = first_branch.request.generation;
-    try std.testing.expectEqual(first.identity, first_branch.request.identity);
+    try std.testing.expectEqual(first.request.identity, first_branch.request.identity);
 
     try app.update(.reload, &ctx);
     try std.testing.expectEqual(@as(u8, 4), ctx._pending_tasks_with_len);
     const second: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[2].ctx));
-    try std.testing.expect(second.generation > first_generation);
-    try std.testing.expectEqual(second.generation, app.pages.repository.pending_generation.?);
+    try std.testing.expect(second.request.generation > first_generation);
+    try std.testing.expectEqual(second.request.generation, app.pages.repository.pending_generation.?);
     const second_branch: *RepositoryBranchTask = @ptrCast(@alignCast(ctx._pending_tasks_with[3].ctx));
     try std.testing.expect(second_branch.request.generation > first_branch_generation);
     try std.testing.expectEqual(second_branch.request.generation, app.pages.repository.branch.pending.?.generation);
@@ -12246,16 +12198,16 @@ test "review repository transition E3b3 active repository replacement rejects ol
     try app.maybeStartRepositoryManifest(&ctx);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
     const old_task: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
-    const old_identity = old_task.identity;
-    const old_root_identity = old_task.root.identity;
-    const old_generation = old_task.generation;
+    const old_identity = old_task.request.identity;
+    const old_root_identity = old_task.request.root.identity;
+    const old_generation = old_task.request.generation;
     try std.testing.expectEqual(page.Id.repository, old_identity.origin);
     try std.testing.expectEqual(app.pages.repository.repo_epoch, old_identity.repo_epoch);
     try std.testing.expectEqual(app.pages.repository.activation_id, old_identity.activation_id);
     try std.testing.expectEqual(app.pages.repository.generation, old_generation);
     try std.testing.expectEqual(old_generation, app.pages.repository.pending_generation.?);
     try std.testing.expect(old_root_identity.eql(root_a_identity));
-    try std.testing.expectEqualStrings(roots.a, old_task.root_path);
+    try std.testing.expectEqualStrings(roots.a, old_task.request.root_path);
 
     try std.testing.expectEqual(RepoCommitOutcome.changed, app.commitRepoDiscovery(
         allocator,

@@ -227,8 +227,6 @@ pub fn Task(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *Self = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-
             const outcome = switch (task.metadata.kind) {
                 .verify_snapshot => if (verifySnapshot(allocator, io, task.target)) |matches|
                     if (matches) Outcome{ .snapshot_valid = {} } else Outcome{ .snapshot_changed = {} }
@@ -237,20 +235,21 @@ pub fn Task(comptime Msg: type) type {
                 .lookup_remote => lookupRemote(allocator, io, &task.target) catch
                     Outcome{ .inspection_failed = "could not read push remote URL" },
             };
-            return Msg.pushInspectionFinished(task.finish(outcome));
+            return Msg.pushInspectionFinished(task.finish(allocator, outcome));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *Self = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-            const message = switch (failure) {
-                .start_failed => |message| message,
-                .runtime_abandoned => "runtime shutting down",
-            };
-            return Msg.pushInspectionFinished(task.finish(.{ .inspection_failed = message }));
+            return Msg.pushInspectionFinished(task.finish(
+                allocator,
+                .{ .inspection_failed = actions.taskFailureMessage(failure) },
+            ));
         }
 
-        fn finish(task: *Self, outcome: Outcome) Finished {
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *Self, allocator: std.mem.Allocator, outcome: Outcome) Finished {
+            defer allocator.destroy(task);
             return .{
                 .generation = task.metadata.generation,
                 .kind = task.metadata.kind,

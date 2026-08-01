@@ -331,6 +331,12 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
             return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
+        /// Spawn-failure counterpart of the terminal epilogue: releases the
+        /// task-owned payload without producing a Msg.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            allocator.destroy(task);
+        }
+
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: RepoDiscoveryTaskResult) Msg {
@@ -421,6 +427,13 @@ pub fn DiffLoadTask(comptime Msg: type) type {
             return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
+        /// Spawn-failure counterpart of the terminal epilogue: releases the
+        /// task-owned payload without producing a Msg.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.request.deinit(allocator);
+            allocator.destroy(task);
+        }
+
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: DiffLoadTaskResult) Msg {
@@ -456,6 +469,13 @@ pub fn StatusLoadTask(comptime Msg: type) type {
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
+
+        /// Spawn-failure counterpart of the terminal epilogue: releases the
+        /// task-owned payload without producing a Msg.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            allocator.free(task.repo_root);
+            allocator.destroy(task);
         }
 
         /// Terminal epilogue shared by run and failed; owned-field release,
@@ -497,6 +517,13 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
             return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
+        /// Spawn-failure counterpart of the terminal epilogue: releases the
+        /// task-owned payload without producing a Msg.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            allocator.free(task.repo_root);
+            allocator.destroy(task);
+        }
+
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: BranchStatusLoadTaskResult) Msg {
@@ -533,6 +560,13 @@ pub fn BranchListLoadTask(comptime Msg: type) type {
             return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
+        /// Spawn-failure counterpart of the terminal epilogue: releases the
+        /// task-owned payload without producing a Msg.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            allocator.free(task.repo_root);
+            allocator.destroy(task);
+        }
+
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: BranchListLoadTaskResult) Msg {
@@ -566,6 +600,14 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
             return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
+        /// Spawn-failure counterpart of the terminal epilogue: releases the
+        /// task-owned payload without producing a Msg.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.request.deinit(allocator);
+            if (task.root) |*root| root.deinit();
+            allocator.destroy(task);
+        }
+
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: review_projection.TaskResult) Msg {
@@ -588,6 +630,14 @@ pub fn GeneratedSyntaxTask(comptime Msg: type) type {
     return struct {
         request: review_projection.GeneratedSyntaxRequest,
         root: root_capability.RootCapability,
+
+        /// Spawn-failure counterpart of the terminal epilogue: releases the
+        /// task-owned payload without producing a Msg.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.request.deinit(allocator);
+            task.root.deinit();
+            allocator.destroy(task);
+        }
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));

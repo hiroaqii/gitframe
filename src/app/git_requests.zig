@@ -317,6 +317,10 @@ pub fn startPull(
 pub const FetchRequest = struct {
     repo_root: []u8,
     remote: []u8,
+
+    pub fn deinit(self: *FetchRequest, allocator: std.mem.Allocator) void {
+        consumeFetchRequest(allocator, self);
+    }
 };
 
 pub fn startFetch(
@@ -458,8 +462,7 @@ fn destroyFileTask(comptime Task: type, allocator: std.mem.Allocator, task: *Tas
 }
 
 fn consumeHunkTarget(allocator: std.mem.Allocator, target: anytype) void {
-    if (target.patch.len > 0) allocator.free(target.patch);
-    target.patch = &.{};
+    target.deinit(allocator);
 }
 
 fn consumeAmendConfirmation(allocator: std.mem.Allocator, confirmation: *app_state.AmendConfirmation) void {

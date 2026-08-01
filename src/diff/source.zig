@@ -58,6 +58,10 @@ pub const LoadRequest = struct {
     pub fn requiresRepo(self: LoadRequest) bool {
         return sourceRequiresRepo(self.source);
     }
+
+    pub fn deinit(self: LoadRequest, allocator: std.mem.Allocator) void {
+        freeLoadRequest(allocator, self);
+    }
 };
 
 pub fn sourceRequiresRepo(source: SourceMode) bool {

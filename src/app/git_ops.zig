@@ -85,6 +85,11 @@ pub const HunkStageTarget = struct {
     patch: []u8,
     session_mark_mutation: SessionHunkMarkMutation,
     reload_after_success: bool = false,
+
+    pub fn deinit(self: *HunkStageTarget, allocator: std.mem.Allocator) void {
+        if (self.patch.len > 0) allocator.free(self.patch);
+        self.patch = &.{};
+    }
 };
 
 pub const HunkStageTargetResult = union(enum) {

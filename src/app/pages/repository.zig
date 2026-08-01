@@ -4,6 +4,7 @@ const draw = @import("draw");
 const keymap = @import("keymap");
 const theme = @import("theme");
 const app_state = @import("../state.zig");
+const actions = @import("../actions.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const page = @import("../page.zig");
 const page_link = @import("../page_link.zig");
@@ -402,48 +403,42 @@ pub const RepositoryUpdate = struct {
 
 pub fn ManifestTask(comptime AppMsg: type) type {
     return struct {
-        identity: page.RequestIdentity,
-        generation: u64,
-        root_path: []u8,
-        root: root_capability.RootCapability,
-        expected_fingerprint: ?content_fingerprint.Fingerprint,
-        expected_status_fingerprint: ?content_fingerprint.Fingerprint = null,
+        request: Request,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-            defer allocator.free(task.root_path);
-            defer task.root.deinit();
-            const result = runManifestLoadChecked(
-                task.root_path,
-                task.root,
-                task.expected_fingerprint,
-                task.expected_status_fingerprint,
+            return task.finish(allocator, runManifestLoadChecked(
+                task.request.root_path,
+                task.request.root,
+                task.request.expected_fingerprint,
+                task.request.expected_status_fingerprint,
                 allocator,
                 io,
-            );
-            const finished = ManifestFinished{
-                .identity = task.identity,
-                .root_identity = task.root.identity,
-                .generation = task.generation,
-                .result = result,
-            };
-            return .{ .repository = .{ .manifest_finished = finished } };
+            ));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
+
+        /// Spawn-failure counterpart of the terminal epilogue: releases the
+        /// task-owned payload without producing a Msg.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.request.deinit(allocator);
+            allocator.destroy(task);
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: TaskResult) AppMsg {
             defer allocator.destroy(task);
-            defer allocator.free(task.root_path);
-            defer task.root.deinit();
+            defer task.request.deinit(allocator);
             const finished = ManifestFinished{
-                .identity = task.identity,
-                .root_identity = task.root.identity,
-                .generation = task.generation,
-                .result = .{ .failed_static = switch (failure) {
-                    .start_failed => |message| message,
-                    .runtime_abandoned => "runtime shutting down",
-                } },
+                .identity = task.request.identity,
+                .root_identity = task.request.root.identity,
+                .generation = task.request.generation,
+                .result = result,
             };
             return .{ .repository = .{ .manifest_finished = finished } };
         }
@@ -462,35 +457,35 @@ pub fn BranchTask(comptime AppMsg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-            defer task.request.deinit(allocator);
-            const finished = BranchFinished{
-                .identity = task.request.identity,
-                .root_identity = task.request.root.identity,
-                .generation = task.request.generation,
-                .result = runRepositoryBranchLoadChecked(
-                    task.request.root_path,
-                    task.request.root,
-                    task.env_map,
-                    allocator,
-                    io,
-                ),
-            };
-            return .{ .repository = .{ .branch_finished = finished } };
+            return task.finish(allocator, runRepositoryBranchLoadChecked(
+                task.request.root_path,
+                task.request.root,
+                task.env_map,
+                allocator,
+                io,
+            ));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            // Branch keeps its typed failure vocabulary; the shared
+            // failure-string helper intentionally does not apply here.
+            return task.finish(allocator, .{ .failed = switch (failure) {
+                .start_failed => .start_failed,
+                .runtime_abandoned => .runtime_abandoned,
+            } });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: repository_branch.Result) AppMsg {
             defer allocator.destroy(task);
             defer task.request.deinit(allocator);
             const finished = BranchFinished{
                 .identity = task.request.identity,
                 .root_identity = task.request.root.identity,
                 .generation = task.request.generation,
-                .result = .{ .failed = switch (failure) {
-                    .start_failed => .start_failed,
-                    .runtime_abandoned => .runtime_abandoned,
-                } },
+                .result = result,
             };
             return .{ .repository = .{ .branch_finished = finished } };
         }
@@ -591,46 +586,49 @@ fn runManifestLoadChecked(
 /// variant of the success result.
 pub fn DocumentTask(comptime AppMsg: type) type {
     return struct {
-        identity: page.RequestIdentity,
-        generation: u64,
-        manifest_revision: u64,
-        path: []u8,
-        root: root_capability.RootCapability,
+        request: DocumentRequest,
+
+        /// Spawn-failure counterpart of the terminal epilogue: releases the
+        /// task-owned payload without producing a Msg.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.request.deinit(allocator);
+            allocator.destroy(task);
+        }
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
-            defer task.root.deinit();
-            var snapshot = selected_document.load(task.root, task.path, allocator, io);
+            defer task.request.deinit(allocator);
+            var snapshot = selected_document.load(task.request.root, task.request.path, allocator, io);
             defer snapshot.deinit(allocator);
             const value = DocumentValue.fromLoaded(allocator, &snapshot.value);
             const finished = DocumentFinished{
-                .identity = task.identity,
-                .root_identity = task.root.identity,
-                .generation = task.generation,
-                .manifest_revision = task.manifest_revision,
-                .path = task.path,
+                .identity = task.request.identity,
+                .root_identity = task.request.root.identity,
+                .generation = task.request.generation,
+                .manifest_revision = task.request.manifest_revision,
+                .path = task.request.path,
                 .value = value,
                 .metadata = metadataAfterDocumentConversion(&value, snapshot.metadata),
             };
             snapshot.metadata = null;
-            task.path = &.{};
+            task.request.path = &.{};
             return .{ .repository = .{ .document_finished = finished } };
         }
 
         pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
-            defer task.root.deinit();
+            defer task.request.deinit(allocator);
             const finished = DocumentFinished{
-                .identity = task.identity,
-                .root_identity = task.root.identity,
-                .generation = task.generation,
-                .manifest_revision = task.manifest_revision,
-                .path = task.path,
+                .identity = task.request.identity,
+                .root_identity = task.request.root.identity,
+                .generation = task.request.generation,
+                .manifest_revision = task.request.manifest_revision,
+                .path = task.request.path,
                 .value = .{ .inert = .unreadable },
             };
-            task.path = &.{};
+            task.request.path = &.{};
             return .{ .repository = .{ .document_finished = finished } };
         }
     };
@@ -641,25 +639,26 @@ pub fn DocumentTask(comptime AppMsg: type) type {
 /// while success reports the measured one.
 pub fn SyntaxTask(comptime AppMsg: type) type {
     return struct {
-        identity: page.RequestIdentity,
-        generation: u64,
-        manifest_revision: u64,
-        source_revision: u64,
-        expected_fingerprint: content_fingerprint.Fingerprint,
-        path: []u8,
-        root: root_capability.RootCapability,
+        request: SyntaxRequest,
+
+        /// Spawn-failure counterpart of the terminal epilogue: releases the
+        /// task-owned payload without producing a Msg.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.request.deinit(allocator);
+            allocator.destroy(task);
+        }
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
-            defer task.root.deinit();
+            defer task.request.deinit(allocator);
             // Re-read through an independently owned root/path instead of
             // borrowing DisplayedDocument across threads. The extra bounded
             // read keeps plain-source acceptance immediate and avoids shared or
             // refcounted mutable lifetime between page state and the worker.
-            var snapshot = selected_document.load(task.root, task.path, allocator, io);
+            var snapshot = selected_document.load(task.request.root, task.request.path, allocator, io);
             defer snapshot.deinit(allocator);
-            var fingerprint = task.expected_fingerprint;
+            var fingerprint = task.request.expected_fingerprint;
             var result: SyntaxResult = .unavailable;
             switch (snapshot.value) {
                 .text => |text| {
@@ -668,41 +667,41 @@ pub fn SyntaxTask(comptime AppMsg: type) type {
                         snapshot.value = .unreadable;
                         defer source.deinit(allocator);
                         fingerprint = source.fingerprint;
-                        const spans: ?source_syntax.SourceSpans = source_syntax_runtime.buildSourceSpans(allocator, io, source, task.path) catch null;
+                        const spans: ?source_syntax.SourceSpans = source_syntax_runtime.buildSourceSpans(allocator, io, source, task.request.path) catch null;
                         if (spans) |owned| result = .{ .loaded = owned };
                     }
                 },
                 else => {},
             }
             const finished = SyntaxFinished{
-                .identity = task.identity,
-                .root_identity = task.root.identity,
-                .generation = task.generation,
-                .manifest_revision = task.manifest_revision,
-                .source_revision = task.source_revision,
-                .path = task.path,
+                .identity = task.request.identity,
+                .root_identity = task.request.root.identity,
+                .generation = task.request.generation,
+                .manifest_revision = task.request.manifest_revision,
+                .source_revision = task.request.source_revision,
+                .path = task.request.path,
                 .fingerprint = fingerprint,
                 .result = result,
             };
-            task.path = &.{};
+            task.request.path = &.{};
             return .{ .repository = .{ .syntax_finished = finished } };
         }
 
         pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
-            defer task.root.deinit();
+            defer task.request.deinit(allocator);
             const finished = SyntaxFinished{
-                .identity = task.identity,
-                .root_identity = task.root.identity,
-                .generation = task.generation,
-                .manifest_revision = task.manifest_revision,
-                .source_revision = task.source_revision,
-                .path = task.path,
-                .fingerprint = task.expected_fingerprint,
+                .identity = task.request.identity,
+                .root_identity = task.request.root.identity,
+                .generation = task.request.generation,
+                .manifest_revision = task.request.manifest_revision,
+                .source_revision = task.request.source_revision,
+                .path = task.request.path,
+                .fingerprint = task.request.expected_fingerprint,
                 .result = .unavailable,
             };
-            task.path = &.{};
+            task.request.path = &.{};
             return .{ .repository = .{ .syntax_finished = finished } };
         }
     };
@@ -713,26 +712,24 @@ pub fn SyntaxTask(comptime AppMsg: type) type {
 /// line count, while success reports measured values.
 pub fn ChangeMapTask(comptime AppMsg: type) type {
     return struct {
-        identity: page.RequestIdentity,
-        generation: u64,
-        manifest_revision: u64,
-        source_revision: u64,
-        expected_fingerprint: content_fingerprint.Fingerprint,
-        expected_content_line_count: usize,
-        path: []u8,
-        root: root_capability.RootCapability,
-        temp_base_path: []u8,
+        request: ChangeMapRequest,
+
+        /// Spawn-failure counterpart of the terminal epilogue: releases the
+        /// task-owned payload without producing a Msg.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.request.deinit(allocator);
+            allocator.destroy(task);
+        }
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
-            defer task.root.deinit();
-            defer allocator.free(task.temp_base_path);
+            defer task.request.deinit(allocator);
 
-            var fingerprint = task.expected_fingerprint;
-            var content_line_count = task.expected_content_line_count;
+            var fingerprint = task.request.expected_fingerprint;
+            var content_line_count = task.request.expected_content_line_count;
             var result: ChangeMapResult = .unavailable;
-            var snapshot = selected_document.load(task.root, task.path, allocator, io);
+            var snapshot = selected_document.load(task.request.root, task.request.path, allocator, io);
             defer snapshot.deinit(allocator);
             var value = DocumentValue.fromLoaded(allocator, &snapshot.value);
             defer value.deinit(allocator);
@@ -740,16 +737,16 @@ pub fn ChangeMapTask(comptime AppMsg: type) type {
                 .source => |*source| {
                     fingerprint = source.fingerprint;
                     content_line_count = source.contentLineCount();
-                    if (task.expected_fingerprint.eql(fingerprint) and
-                        task.expected_content_line_count == content_line_count)
+                    if (task.request.expected_fingerprint.eql(fingerprint) and
+                        task.request.expected_content_line_count == content_line_count)
                     {
                         result = loadChangeMap(
                             allocator,
                             io,
-                            task.root.dir(),
-                            task.path,
+                            task.request.root.dir(),
+                            task.request.path,
                             source,
-                            task.temp_base_path,
+                            task.request.temp_base_path,
                         );
                     }
                 },
@@ -757,37 +754,36 @@ pub fn ChangeMapTask(comptime AppMsg: type) type {
             }
 
             const finished = ChangeMapFinished{
-                .identity = task.identity,
-                .root_identity = task.root.identity,
-                .generation = task.generation,
-                .manifest_revision = task.manifest_revision,
-                .source_revision = task.source_revision,
-                .path = task.path,
+                .identity = task.request.identity,
+                .root_identity = task.request.root.identity,
+                .generation = task.request.generation,
+                .manifest_revision = task.request.manifest_revision,
+                .source_revision = task.request.source_revision,
+                .path = task.request.path,
                 .fingerprint = fingerprint,
                 .content_line_count = content_line_count,
                 .result = result,
             };
-            task.path = &.{};
+            task.request.path = &.{};
             return .{ .repository = .{ .change_map_finished = finished } };
         }
 
         pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
             defer allocator.destroy(task);
-            defer task.root.deinit();
-            defer allocator.free(task.temp_base_path);
+            defer task.request.deinit(allocator);
             const finished = ChangeMapFinished{
-                .identity = task.identity,
-                .root_identity = task.root.identity,
-                .generation = task.generation,
-                .manifest_revision = task.manifest_revision,
-                .source_revision = task.source_revision,
-                .path = task.path,
-                .fingerprint = task.expected_fingerprint,
-                .content_line_count = task.expected_content_line_count,
+                .identity = task.request.identity,
+                .root_identity = task.request.root.identity,
+                .generation = task.request.generation,
+                .manifest_revision = task.request.manifest_revision,
+                .source_revision = task.request.source_revision,
+                .path = task.request.path,
+                .fingerprint = task.request.expected_fingerprint,
+                .content_line_count = task.request.expected_content_line_count,
                 .result = .unavailable,
             };
-            task.path = &.{};
+            task.request.path = &.{};
             return .{ .repository = .{ .change_map_finished = finished } };
         }
     };
@@ -5925,11 +5921,13 @@ test "repository tasks derive completion root identity from their descriptor" {
     const Manifest = ManifestTask(TaskIdentityTestMsg);
     const manifest_task = try allocator.create(Manifest);
     manifest_task.* = .{
-        .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
-        .generation = 5,
-        .root_path = try allocator.dupe(u8, root_a.path),
-        .root = try root_b.capability.duplicate(),
-        .expected_fingerprint = null,
+        .request = .{
+            .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
+            .generation = 5,
+            .root_path = try allocator.dupe(u8, root_a.path),
+            .root = try root_b.capability.duplicate(),
+            .expected_fingerprint = null,
+        },
     };
     var manifest_message = Manifest.run(manifest_task, allocator, io);
     defer manifest_message.repository.deinitUndelivered(allocator);
@@ -5944,11 +5942,13 @@ test "repository tasks derive completion root identity from their descriptor" {
     const Document = DocumentTask(TaskIdentityTestMsg);
     const document_task = try allocator.create(Document);
     document_task.* = .{
-        .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
-        .generation = 6,
-        .manifest_revision = 7,
-        .path = try allocator.dupe(u8, "missing.txt"),
-        .root = try root_b.capability.duplicate(),
+        .request = .{
+            .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
+            .generation = 6,
+            .manifest_revision = 7,
+            .path = try allocator.dupe(u8, "missing.txt"),
+            .root = try root_b.capability.duplicate(),
+        },
     };
     var document_message = Document.run(document_task, allocator, io);
     defer document_message.repository.deinitUndelivered(allocator);
@@ -5967,11 +5967,13 @@ test "repository document task builds the bounded source model before delivery" 
     const Document = DocumentTask(TaskIdentityTestMsg);
     const task = try allocator.create(Document);
     task.* = .{
-        .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
-        .generation = 5,
-        .manifest_revision = 6,
-        .path = try allocator.dupe(u8, "source.zig"),
-        .root = try root.capability.duplicate(),
+        .request = .{
+            .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
+            .generation = 5,
+            .manifest_revision = 6,
+            .path = try allocator.dupe(u8, "source.zig"),
+            .root = try root.capability.duplicate(),
+        },
     };
     var message = Document.run(task, allocator, std.testing.io);
     defer message.repository.deinitUndelivered(allocator);
@@ -6024,13 +6026,15 @@ test "repository syntax task is plain-first and accepts only matching source ide
     const Syntax = SyntaxTask(TaskIdentityTestMsg);
     const task = try allocator.create(Syntax);
     task.* = .{
-        .identity = request.identity,
-        .generation = request.generation,
-        .manifest_revision = request.manifest_revision,
-        .source_revision = request.source_revision,
-        .expected_fingerprint = request.expected_fingerprint,
-        .path = try allocator.dupe(u8, request.path),
-        .root = try request.root.duplicate(),
+        .request = .{
+            .identity = request.identity,
+            .generation = request.generation,
+            .manifest_revision = request.manifest_revision,
+            .source_revision = request.source_revision,
+            .expected_fingerprint = request.expected_fingerprint,
+            .path = try allocator.dupe(u8, request.path),
+            .root = try request.root.duplicate(),
+        },
     };
     var message = Syntax.run(task, allocator, std.testing.io);
     defer message.repository.deinitUndelivered(allocator);
