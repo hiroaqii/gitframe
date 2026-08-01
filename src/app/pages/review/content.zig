@@ -775,6 +775,36 @@ test "Review cached target requires fresh exact status with no worktree change" 
     try expectRepositoryLocation(view.repositoryTarget(), "a", null);
 }
 
+test "Review repository target keeps authority for retained staged-only owner" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } },
+            .display_mode = .unified,
+        },
+    };
+    defer page.deinit(allocator);
+    _ = page.activation.activate(4, .fresh, .fresh, .fresh);
+
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    var status: app_state.StatusMessage = .{};
+    const controller = reviewReloadTestController(&page, &status);
+    try review_reload.testing.installRetainedStagedOnly(
+        controller,
+        allocator,
+        1,
+        85,
+        page.status_snapshot_revision,
+    );
+
+    const target = reviewContentTestView(&page, .unstaged).repositoryTarget();
+    try std.testing.expect(target == .location);
+    try std.testing.expectEqualStrings("a", target.location.path);
+}
+
 test "Review repository target reports accepted deleted file as unavailable" {
     const allocator = std.testing.allocator;
     var page: review_page.ReviewPageState = .{

@@ -368,27 +368,26 @@ pub const View = struct {
         };
     }
 
-    /// P5b only crosses an already-materialized combined presentation into a
-    /// staged-only authority generation. Fresh status alone is insufficient:
-    /// an ordinary primary body has no combined owner/token to reuse and must
-    /// keep its existing status-only session path instead of starting an
-    /// eager cached projection.
-    fn hasCombinedBoundaryOwner(self: View, path_key: []const u8) bool {
-        return switch (self.navigation.displayedReviewBody()) {
-            .combined => |bundle| if (diff_file.canonicalPathKey(bundle.displayFile())) |display_path|
-                std.mem.eql(u8, display_path, path_key)
-            else
-                false,
-            .primary => |primary| blk: {
-                const hunk_authority = primary.hunk_authority orelse break :blk false;
-                if (hunk_authority != .combined) break :blk false;
-                const display_path = diff_file.canonicalPathKey(
-                    primary.loaded.document.files[primary.file_index],
-                ) orelse break :blk false;
-                break :blk std.mem.eql(u8, display_path, path_key);
-            },
-            else => false,
-        };
+    /// Whether an owned projection request (displayed or pending) already
+    /// names this path for the current source generation. This mirrors the
+    /// identity the renderer uses to decide visibility, so "the body is on
+    /// screen" and "a target is derived for it" cannot drift apart: a visible
+    /// projection-owned body always re-derives its own target instead of
+    /// depending on the displayed body's kind (the enumeration that produced
+    /// the boundary drop). Fresh status alone stays insufficient: an ordinary
+    /// primary body owns no projection request and must keep its existing
+    /// status-only session path instead of starting an eager cached
+    /// projection.
+    fn ownsProjectionForPath(self: View, repo_root: []const u8, path_key: []const u8) bool {
+        const request = self.page.review_projection.displayed.request() orelse
+            (if (self.page.review_projection.pending) |*pending| pending else null) orelse
+            return false;
+        return request.matchesDisplayIdentity(
+            repo_root,
+            path_key,
+            sourceKind(self.source),
+            self.page.source_session_revision,
+        );
     }
 
     pub fn projectionTarget(self: View) ?ProjectionTarget {
@@ -407,20 +406,27 @@ pub const View = struct {
                         .source_kind = projection_source,
                     };
                 }
-                // The final unstaged hunk can leave the watched primary file
-                // selected until a later source reload removes it. Publish the
-                // staged-only target from fresh status immediately so P5b can
-                // compare against the still-owned presentation and preserve
-                // the exact path/cursor instead of waiting for ordinal remap.
-                if (file_tree.stagePresenceFromEntry(entry) == .staged_only and
-                    self.hasCombinedBoundaryOwner(path_key))
-                {
-                    return .{
-                        .repo_root = repo_root,
-                        .path_key = path_key,
-                        .kind = .cached_diff,
-                        .source_kind = projection_source,
-                    };
+                // A staged body can outlive its combined display kind: the
+                // final unstaged hunk leaves the watched primary file selected
+                // until a later source reload removes it (P5b), and the
+                // installed staged-only owner must keep deriving the same
+                // target afterwards or the next prepareProjection drops it.
+                // Ownership of the projection request, not the displayed body
+                // kind, decides the target; fresh status decides the kind
+                // (combined only through the candidate arm above so that a
+                // mixed entry whose file no longer qualifies, e.g. worktree
+                // deletion, falls back to the staged preview instead of an
+                // invalid combined request).
+                switch (file_tree.stagePresenceFromEntry(entry)) {
+                    .staged_only, .mixed => if (self.ownsProjectionForPath(repo_root, path_key)) {
+                        return .{
+                            .repo_root = repo_root,
+                            .path_key = path_key,
+                            .kind = .cached_diff,
+                            .source_kind = projection_source,
+                        };
+                    },
+                    else => {},
                 }
             }
         }
@@ -4818,6 +4824,13 @@ fn installTestRetainedStagedOnly(
     );
 }
 
+/// Test-only fixtures shared with sibling modules whose tests need a page in
+/// the staged-only boundary steady state (e.g. content.zig cross-page
+/// authority coverage).
+pub const testing = if (builtin.is_test) struct {
+    pub const installRetainedStagedOnly = installTestRetainedStagedOnly;
+} else struct {};
+
 fn installTestPrimaryStagedOnly(
     controller: Controller,
     allocator: std.mem.Allocator,
@@ -8294,6 +8307,231 @@ test "final hunk stage retains primary presentation with staged-only authority" 
     try std.testing.expectEqual(horizontal_before, page.viewer.diff_horizontal_scroll);
     try std.testing.expect(controller.navigation.view().displayedSearchTarget(.unified) != null);
     try std.testing.expect(page.completed_selection != null);
+}
+
+test "retained staged-only owner derives its own target after boundary install" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    try installTestRetainedStagedOnly(controller, allocator, 1, 82, page.status_snapshot_revision);
+
+    const retained_before = &page.review_projection.displayed.ready.value.retained_staged_only;
+    const presentation_text_ptr = retained_before.presentation.cached_bundle.loaded.text.ptr;
+
+    const target = controller.view().projectionTarget() orelse return error.ExpectedOwnedStagedTarget;
+    try std.testing.expectEqual(review_projection.Kind.cached_diff, target.kind);
+    try std.testing.expectEqualStrings("a", target.path_key);
+    try std.testing.expect(controller.view().displayedMatchesStableIdentity(target));
+
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    try std.testing.expect(update.command == null);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.review_projection.displayed == .ready);
+    try std.testing.expect(page.review_projection.displayed.ready.value == .retained_staged_only);
+    const retained_after = &page.review_projection.displayed.ready.value.retained_staged_only;
+    try std.testing.expect(retained_after.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
+    const authority_view = controller.navigation.view().activeHunkAuthority() orelse return error.ExpectedStagedOnlyAuthority;
+    try std.testing.expect(authority_view.authority == .staged_only);
+}
+
+test "staged-only ready cached body derives its own target after boundary install" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var mixed_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &mixed_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    try installTestCombinedCandidate(controller, allocator, 1, 83, 0);
+
+    controller.advanceStatusSnapshotRevision(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const request = switch (command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    command = undefined;
+
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = request,
+        .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, test_combined_primary) } },
+    };
+    const applied = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(applied.result_transferred);
+    try std.testing.expect(page.review_projection.displayed == .ready);
+    try std.testing.expect(page.review_projection.displayed.ready.value == .cached_diff);
+    const cached_text_ptr = page.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr;
+
+    const target = controller.view().projectionTarget() orelse return error.ExpectedOwnedStagedTarget;
+    try std.testing.expectEqual(review_projection.Kind.cached_diff, target.kind);
+    var second = try controller.prepareProjection(allocator);
+    defer second.deinit(allocator);
+    try std.testing.expect(second.command == null);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.review_projection.displayed == .ready);
+    try std.testing.expect(page.review_projection.displayed.ready.value == .cached_diff);
+    try std.testing.expect(page.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr == cached_text_ptr);
+}
+
+test "primary staged-only authority survives following prepareProjection" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = try testPrimaryCombinedLoadState(allocator),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    try installTestPrimaryStagedOnly(controller, allocator, 1, page.status_snapshot_revision);
+
+    const primary_before = switch (controller.navigation.view().displayedReviewBody()) {
+        .primary => |primary| primary,
+        else => return error.ExpectedPrimaryDisplay,
+    };
+    try std.testing.expect(primary_before.hunk_authority.? == .staged_only);
+    const primary_owner = primary_before.loaded;
+
+    const target = controller.view().projectionTarget() orelse return error.ExpectedOwnedStagedTarget;
+    try std.testing.expectEqual(review_projection.Kind.cached_diff, target.kind);
+
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    try std.testing.expect(update.command == null);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.review_projection.displayed == .ready);
+    try std.testing.expect(page.review_projection.displayed.ready.value == .primary_staged_only_authority);
+    const primary_after = switch (controller.navigation.view().displayedReviewBody()) {
+        .primary => |primary| primary,
+        else => return error.ExpectedRetainedPrimaryDisplay,
+    };
+    try std.testing.expect(primary_after.loaded == primary_owner);
+    try std.testing.expect(primary_after.hunk_authority.? == .staged_only);
+    const authority_view = controller.navigation.view().activeHunkAuthority() orelse return error.ExpectedStagedOnlyAuthority;
+    try std.testing.expect(authority_view.authority == .staged_only);
+}
+
+test "hint-free retry install keeps deriving its target at the staged boundary" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var mixed_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &mixed_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    try installTestCombinedCandidate(controller, allocator, 1, 93, 0);
+
+    controller.advanceStatusSnapshotRevision(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const expected = pending.expected_presentation orelse return error.ExpectedCombinedPresentationHint;
+    var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const request = switch (command) {
+        .review_projection => |request| request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    command = undefined;
+
+    var candidate = try testStagedOnlyReuseCandidate(allocator, page.status_snapshot_revision, test_combined_primary_changed);
+    candidate.fingerprint = expected.fingerprint;
+    var finished: app_load.ReviewProjectionFinished = .{
+        .request = request,
+        .result = .{ .staged_only_reuse_candidate = candidate },
+    };
+    candidate = undefined;
+    defer finished.deinit(allocator);
+    const rejected = try controller.applyProjectionFinished(allocator, &finished);
+    try std.testing.expect(!rejected.result_transferred);
+
+    var retry = try controller.prepareProjection(allocator);
+    defer retry.deinit(allocator);
+    var retry_command = retry.takeCommand() orelse return error.ExpectedProjectionCommand;
+    const retry_request = switch (retry_command) {
+        .review_projection => |retry_request| retry_request,
+        else => return error.ExpectedProjectionCommand,
+    };
+    retry_command = undefined;
+    try std.testing.expect(retry_request.expected_presentation == null);
+
+    var retry_finished: app_load.ReviewProjectionFinished = .{
+        .request = retry_request,
+        .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, test_combined_primary) } },
+    };
+    const applied = try controller.applyProjectionFinished(allocator, &retry_finished);
+    try std.testing.expect(applied.result_transferred);
+    try std.testing.expect(page.review_projection.displayed == .ready);
+    try std.testing.expect(page.review_projection.displayed.ready.value == .cached_diff);
+
+    var third = try controller.prepareProjection(allocator);
+    defer third.deinit(allocator);
+    try std.testing.expect(third.command == null);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.review_projection.displayed == .ready);
+    try std.testing.expect(page.review_projection.displayed.ready.value == .cached_diff);
+}
+
+test "mixed entry without combined candidate keeps staged preview target" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    try installTestRetainedStagedOnly(controller, allocator, 1, 84, page.status_snapshot_revision);
+
+    // The worktree copy is deleted after the boundary: the entry turns mixed
+    // (MD) but is no combined-hunk candidate, so the owned body must map to
+    // the staged preview instead of an invalid combined request.
+    var deleted_worktree_status = try git_status.StatusBundle.parseOwned(allocator, "MD a\x00");
+    try page.git_status.replace("/repo", &deleted_worktree_status);
+
+    const retained_before = &page.review_projection.displayed.ready.value.retained_staged_only;
+    const presentation_text_ptr = retained_before.presentation.cached_bundle.loaded.text.ptr;
+
+    const target = controller.view().projectionTarget() orelse return error.ExpectedOwnedStagedTarget;
+    try std.testing.expectEqual(review_projection.Kind.cached_diff, target.kind);
+
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    if (update.command) |command| switch (command) {
+        .review_projection => |issued| try std.testing.expect(issued.kind != .combined_hunks),
+        else => {},
+    };
+    try std.testing.expect(page.review_projection.displayed == .ready);
+    try std.testing.expect(page.review_projection.displayed.ready.value == .retained_staged_only);
+    const retained_after = &page.review_projection.displayed.ready.value.retained_staged_only;
+    try std.testing.expect(retained_after.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
 }
 
 test "one hunk unstage restores combined authority over retained owned presentation" {
