@@ -586,6 +586,9 @@ fn runManifestLoadChecked(
     return result;
 }
 
+/// run/failed intentionally stay separate terminals (no shared `finish`):
+/// the failure path returns an inert unreadable body, not a failure-string
+/// variant of the success result.
 pub fn DocumentTask(comptime AppMsg: type) type {
     return struct {
         identity: page.RequestIdentity,
@@ -633,6 +636,9 @@ pub fn DocumentTask(comptime AppMsg: type) type {
     };
 }
 
+/// run/failed intentionally stay separate terminals (no shared `finish`):
+/// the failure path returns `.unavailable` with the expected fingerprint,
+/// while success reports the measured one.
 pub fn SyntaxTask(comptime AppMsg: type) type {
     return struct {
         identity: page.RequestIdentity,
@@ -702,6 +708,9 @@ pub fn SyntaxTask(comptime AppMsg: type) type {
     };
 }
 
+/// run/failed intentionally stay separate terminals (no shared `finish`):
+/// the failure path returns `.unavailable` with the expected fingerprint and
+/// line count, while success reports measured values.
 pub fn ChangeMapTask(comptime AppMsg: type) type {
     return struct {
         identity: page.RequestIdentity,

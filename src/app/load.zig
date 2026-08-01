@@ -323,25 +323,23 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-
-            return Msg.loadFinished(.{ .coordinator = .{ .repo_discovery = RepoDiscoveryFinished{
-                .identity = task.identity,
-                .generation = task.generation,
-                .background_cycle_id = task.background_cycle_id,
-                .result = runDiscovery(allocator, io),
-            } } });
+            return task.finish(allocator, runDiscovery(allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
 
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: RepoDiscoveryTaskResult) Msg {
+            defer allocator.destroy(task);
             return Msg.loadFinished(.{ .coordinator = .{ .repo_discovery = RepoDiscoveryFinished{
                 .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
-                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
+                .result = result,
             } } });
         }
     };
@@ -364,29 +362,24 @@ pub fn RepoPathDiscoveryTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-
-            const submitted_path = task.path;
-            task.path = &.{};
-
-            return Msg.loadFinished(.{ .shell = .{ .repo_path_discovery = RepoPathDiscoveryFinished{
-                .generation = task.generation,
-                .submitted_path = submitted_path,
-                .result = runPathDiscovery(submitted_path, allocator, io),
-            } } });
+            return task.finish(allocator, runPathDiscovery(task.path, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
 
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: RepoPathDiscoveryTaskResult) Msg {
+            defer allocator.destroy(task);
             const submitted_path = task.path;
             task.path = &.{};
-
             return Msg.loadFinished(.{ .shell = .{ .repo_path_discovery = RepoPathDiscoveryFinished{
                 .generation = task.generation,
                 .submitted_path = submitted_path,
-                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
+                .result = result,
             } } });
         }
     };
@@ -420,33 +413,27 @@ pub fn DiffLoadTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer {
-                diff_source.freeLoadRequest(allocator, task.request);
-                allocator.destroy(task);
-            }
-
-            return Msg.loadFinished(.{ .review = .{ .source = DiffLoadFinished{
-                .identity = task.identity,
-                .read_epoch = task.read_epoch,
-                .generation = task.generation,
-                .background_cycle_id = task.background_cycle_id,
-                .result = runLoadExpected(task.request, task.expected_fingerprint, allocator, io),
-            } } });
+            return task.finish(allocator, runLoadExpected(task.request, task.expected_fingerprint, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: DiffLoadTaskResult) Msg {
             defer {
                 diff_source.freeLoadRequest(allocator, task.request);
                 allocator.destroy(task);
             }
-
             return Msg.loadFinished(.{ .review = .{ .source = DiffLoadFinished{
                 .identity = task.identity,
                 .read_epoch = task.read_epoch,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
-                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
+                .result = result,
             } } });
         }
     };
@@ -463,36 +450,28 @@ pub fn StatusLoadTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-
-            const result = StatusLoadFinished{
-                .identity = task.identity,
-                .read_epoch = task.read_epoch,
-                .generation = task.generation,
-                .background_cycle_id = task.background_cycle_id,
-                .repo_root = task.repo_root,
-                .result = runStatusLoadWithOrigin(task.repo_root, task.origin, allocator, io),
-            };
-            task.repo_root = &.{};
-
-            return Msg.loadFinished(.{ .review = .{ .status = result } });
+            return task.finish(allocator, runStatusLoadWithOrigin(task.repo_root, task.origin, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
 
-            const result = StatusLoadFinished{
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: StatusLoadTaskResult) Msg {
+            defer allocator.destroy(task);
+            const finished = StatusLoadFinished{
                 .identity = task.identity,
                 .read_epoch = task.read_epoch,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
-                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
+                .result = result,
             };
             task.repo_root = &.{};
-
-            return Msg.loadFinished(.{ .review = .{ .status = result } });
+            return Msg.loadFinished(.{ .review = .{ .status = finished } });
         }
     };
 }
@@ -510,36 +489,28 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-
-            const result = BranchStatusLoadFinished{
-                .identity = task.identity,
-                .read_epoch = task.read_epoch,
-                .generation = task.generation,
-                .background_cycle_id = task.background_cycle_id,
-                .repo_root = task.repo_root,
-                .result = runBranchStatusLoad(task.repo_root, task.env_map, allocator, io),
-            };
-            task.repo_root = &.{};
-
-            return Msg.loadFinished(.{ .review = .{ .branch_status = result } });
+            return task.finish(allocator, runBranchStatusLoad(task.repo_root, task.env_map, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
 
-            const result = BranchStatusLoadFinished{
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: BranchStatusLoadTaskResult) Msg {
+            defer allocator.destroy(task);
+            const finished = BranchStatusLoadFinished{
                 .identity = task.identity,
                 .read_epoch = task.read_epoch,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
-                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
+                .result = result,
             };
             task.repo_root = &.{};
-
-            return Msg.loadFinished(.{ .review = .{ .branch_status = result } });
+            return Msg.loadFinished(.{ .review = .{ .branch_status = finished } });
         }
     };
 }
@@ -554,36 +525,28 @@ pub fn BranchListLoadTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-
-            const result = BranchListLoadFinished{
-                .origin = task.origin,
-                .repo_epoch = task.repo_epoch,
-                .activation_id = task.activation_id,
-                .generation = task.generation,
-                .repo_root = task.repo_root,
-                .result = runBranchListLoad(task.repo_root, allocator, io),
-            };
-            task.repo_root = &.{};
-
-            return Msg.loadFinished(.{ .shell = .{ .branch_list = result } });
+            return task.finish(allocator, runBranchListLoad(task.repo_root, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
 
-            const result = BranchListLoadFinished{
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: BranchListLoadTaskResult) Msg {
+            defer allocator.destroy(task);
+            const finished = BranchListLoadFinished{
                 .origin = task.origin,
                 .repo_epoch = task.repo_epoch,
                 .activation_id = task.activation_id,
                 .generation = task.generation,
                 .repo_root = task.repo_root,
-                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
+                .result = result,
             };
             task.repo_root = &.{};
-
-            return Msg.loadFinished(.{ .shell = .{ .branch_list = result } });
+            return Msg.loadFinished(.{ .shell = .{ .branch_list = finished } });
         }
     };
 }
@@ -595,34 +558,32 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-            defer if (task.root) |*root| root.deinit();
-
-            const request = task.request;
-            task.request = undefined;
-
-            return Msg.loadFinished(.{ .review = .{ .projection = ReviewProjectionFinished{
-                .request = request,
-                .result = runReviewProjectionLoad(request, task.root, allocator, io),
-            } } });
+            return task.finish(allocator, runReviewProjectionLoad(task.request, task.root, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: review_projection.TaskResult) Msg {
             defer allocator.destroy(task);
             defer if (task.root) |*root| root.deinit();
-
             const request = task.request;
             task.request = undefined;
-
             return Msg.loadFinished(.{ .review = .{ .projection = ReviewProjectionFinished{
                 .request = request,
-                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
+                .result = result,
             } } });
         }
     };
 }
 
+/// run/failed intentionally stay separate terminals (no shared `finish`):
+/// the failure path discards the failure and returns `.terminal_plain`
+/// (plain display) instead of a failure-string variant of the success result.
 pub fn GeneratedSyntaxTask(comptime Msg: type) type {
     return struct {
         request: review_projection.GeneratedSyntaxRequest,
