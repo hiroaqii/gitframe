@@ -1511,6 +1511,52 @@ test "inert cached projection blocks hunk authority without changing file author
     try std.testing.expect(view.unstageTarget() == .ready);
 }
 
+test "inert boundary retained preview never yields a hunk write" {
+    const allocator = std.testing.allocator;
+    var cached = try app_load.buildLoadedBundle(allocator, test_support.diff_one);
+    var cached_owned = true;
+    defer if (cached_owned) cached.deinit();
+
+    var page: review_page.ReviewPageState = .{
+        .viewer = .{
+            .selected_target = .{ .status_only = 0 },
+            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } },
+        },
+    };
+    defer page.deinit(allocator);
+    acceptTestSource(&page);
+    // The boundary already advanced status past the preview owner: the entry
+    // is unstaged-only and the retained request is one revision behind.
+    var unstaged = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, " M a\x00");
+    try page.git_status.replace("/repo", &unstaged);
+    page.review_projection.installReady(.{
+        .request = try review_projection.testing.cloneRequest(
+            allocator,
+            app_page.RequestIdentity.review(0, 1),
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            0,
+            page.status_snapshot_revision,
+        ),
+        .value = .{ .cached_diff = cached },
+    });
+    cached_owned = false;
+    page.status_snapshot_revision += 1;
+
+    // The stale revision disqualifies the cached projection as hunk
+    // authority (`selectedHunkUsesCachedProjection` requires the current
+    // status snapshot revision) and the status-only row offers no source
+    // file, so every hunk write resolves to `.no_file` without producing a
+    // patch.
+    const view = testView(&page, .unstaged);
+    try std.testing.expect(view.selectedHunkToggleOperation() == .no_file);
+    try std.testing.expect(view.selectedHunkStageTarget(allocator) == .no_file);
+    try std.testing.expect(view.selectedHunkUnstageTarget(allocator) == .no_file);
+}
+
 test "either inert combined component blocks all hunk targets without primary fallback" {
     const allocator = std.testing.allocator;
     const valid_patch =

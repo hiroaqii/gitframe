@@ -2174,6 +2174,34 @@ pub const Controller = struct {
         return .{ .pending = state_request, .task = task_request };
     }
 
+    /// Target-less boundaries that must keep the owned body visible instead
+    /// of dropping it: the selection still names the displayed owner's path,
+    /// no source file exists to reveal as a primary fallback, a fresh status
+    /// entry for the path exists, and that entry's stage presence has no
+    /// projection target arm (unstaged-only after the last staged hunk was
+    /// unstaged, or a conflict). Dropping in that state would publish an
+    /// empty body. Every other no-target arrival — selection moved away,
+    /// entry gone clean, a source file available to reveal, missing repo
+    /// root — keeps the ordinary cache-or-clear path.
+    fn boundaryInertRetention(self: Controller) bool {
+        const repo_root = self.repo_root orelse return false;
+        const request = self.page.review_projection.displayed.request() orelse return false;
+        const view_state = self.view();
+        if (view_state.navigation.selectedFile() != null) return false;
+        const path_key = view_state.navigation.selectedStagePathKey() orelse return false;
+        if (!request.matchesDisplayIdentity(
+            repo_root,
+            path_key,
+            sourceKind(self.source),
+            self.page.source_session_revision,
+        )) return false;
+        const entry = view_state.navigation.freshStatusEntryForPathKey(repo_root, path_key) orelse return false;
+        return switch (file_tree.stagePresenceFromEntry(entry)) {
+            .unstaged_only, .conflict => true,
+            else => false,
+        };
+    }
+
     /// Reconciles projection identity and, only when a read is required,
     /// transfers one owned task request to the shell. The pending page identity
     /// is a distinct clone so task and page never share allocator ownership.
@@ -2235,6 +2263,18 @@ pub const Controller = struct {
                     }
                     return .{};
                 }
+            }
+            if (self.boundaryInertRetention()) {
+                // B7/B10: the selection still points at the owner path but the
+                // fresh entry offers no projection target (the last staged
+                // hunk was unstaged, or the entry is in conflict). Dropping
+                // here would publish an empty body; instead keep the owned
+                // body visible as inert state — stale-status admission already
+                // blocks writes against it — and queue the full revalidation
+                // that reconciles the display. The update tail consumes the
+                // queue in this same cycle.
+                self.page.activation.queueRevalidation();
+                return .{};
             }
             if (outgoing_lineage) |lineage| self.clearPresentationLineage(allocator, lineage);
             self.reconcileCompletedSelectionForNoProjectionTarget(allocator);
@@ -8532,6 +8572,117 @@ test "mixed entry without combined candidate keeps staged preview target" {
     try std.testing.expect(page.review_projection.displayed.ready.value == .retained_staged_only);
     const retained_after = &page.review_projection.displayed.ready.value.retained_staged_only;
     try std.testing.expect(retained_after.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
+}
+
+fn installTestCachedPreviewOwner(
+    controller: Controller,
+    allocator: std.mem.Allocator,
+) !void {
+    controller.page.review_projection.installReady(.{
+        .request = try review_projection.testing.cloneRequest(
+            allocator,
+            controller.page.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            controller.page.source_session_revision,
+            controller.page.status_snapshot_revision,
+        ),
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, test_combined_primary) },
+    });
+}
+
+test "unstaged-only boundary retains staged preview and queues repair" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    try installTestCachedPreviewOwner(controller, allocator);
+    const text_ptr = page.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr;
+
+    // B7: the only staged hunk gets unstaged and the entry turns
+    // unstaged-only; no target arm exists for the still-selected row.
+    controller.advanceStatusSnapshotRevision(allocator);
+    var unstaged_status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try page.git_status.replace("/repo", &unstaged_status);
+
+    try std.testing.expect(controller.view().projectionTarget() == null);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    try std.testing.expect(update.command == null);
+    try std.testing.expect(page.review_projection.displayed == .ready);
+    try std.testing.expect(page.review_projection.displayed.ready.value == .cached_diff);
+    try std.testing.expect(page.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr == text_ptr);
+    try std.testing.expect(page.activation.hasQueuedFullRevalidation());
+
+    // B10: a conflict entry keeps the same inert retention.
+    var conflict_status = try git_status.StatusBundle.parseOwned(allocator, "UU a\x00");
+    try page.git_status.replace("/repo", &conflict_status);
+    var second = try controller.prepareProjection(allocator);
+    defer second.deinit(allocator);
+    try std.testing.expect(second.command == null);
+    try std.testing.expect(page.review_projection.displayed == .ready);
+    try std.testing.expect(page.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr == text_ptr);
+}
+
+test "boundary retention does not survive entry disappearance" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    try installTestCachedPreviewOwner(controller, allocator);
+
+    controller.advanceStatusSnapshotRevision(allocator);
+    var cleared_status = try git_status.StatusBundle.parseOwned(allocator, "");
+    try page.git_status.replace("/repo", &cleared_status);
+
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    try std.testing.expect(update.command == null);
+    try std.testing.expect(page.review_projection.displayed == .idle);
+    try std.testing.expect(!page.activation.hasQueuedFullRevalidation());
+}
+
+test "boundary retention yields to selection moved to another path" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    try installTestCachedPreviewOwner(controller, allocator);
+
+    // The owner path "a" keeps a staged row, but the user selects the
+    // unstaged-only row "b": ordinary cache promotion handling applies.
+    var moved_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00 M b\x00");
+    try page.git_status.replace("/repo", &moved_status);
+    page.viewer.selected_target = .{ .status_only = 1 };
+
+    try std.testing.expect(controller.view().projectionTarget() == null);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    try std.testing.expect(update.command == null);
+    try std.testing.expect(page.review_projection.displayed == .idle);
+    try std.testing.expect(page.review_projection.cacheLen() == 1);
+    try std.testing.expect(!page.activation.hasQueuedFullRevalidation());
 }
 
 test "one hunk unstage restores combined authority over retained owned presentation" {

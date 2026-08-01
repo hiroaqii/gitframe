@@ -678,7 +678,19 @@ pub const App = struct {
         try self.maybeStartRepositoryDocument(ctx);
         try self.maybeStartRepositorySyntax(ctx);
         self.maybeStartRepositoryChangeMap(ctx);
+        const revalidation_queued_before_projection =
+            self.pages.review.activation.hasQueuedFullRevalidation();
         if (self.active_page == .review) try self.ensureReviewProjection(ctx);
+        // Boundary inert retention queues its repair revalidation inside
+        // ensureReviewProjection, after the consumption point above already
+        // ran. Consume a queue born in this tail so the repair starts in the
+        // same cycle even with watch off and no further input. Pre-existing
+        // queued intent keeps its single consumption point above.
+        if (!revalidation_queued_before_projection and
+            self.pages.review.activation.hasQueuedFullRevalidation())
+        {
+            try self.maybeStartQueuedReviewRevalidation(ctx);
+        }
         self.reconcileGitActionSpinnerTimer(ctx);
     }
 
@@ -22891,6 +22903,85 @@ test "Review staged boundary result defers during drag and lands afterward" {
     try std.testing.expect(app.pages.review.deferred_projection_apply == null);
     try expectRetainedStagedOnlyOwner(&app, prior_hunks);
     try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+}
+
+test "Review boundary repair revalidation starts in the same update cycle" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .review,
+        .config = .{ .source = .unstaged },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+        .pages = .{ .review = .{
+            .viewer = .{ .selected_target = .{ .status_only = 0 } },
+        } },
+        .terminal_size = .{ .width = 120, .height = 40 },
+    };
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+
+    var source = try app_load.buildLoadedBundle(allocator, cached_projection_b_diff);
+    app.pages.review.load.replaceLoaded(allocator, .{
+        .arena = source.takeArena(),
+        .loaded = source.loaded,
+        .reviewed_files_owned = false,
+    });
+    var status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try app.pages.review.git_status.replace(roots.a, &status);
+    app.pages.review.status_load.markSuccess();
+    acceptTestSource(&app);
+    const identity = app.pages.review.activation.currentIdentity() orelse
+        return error.ExpectedReviewActivation;
+    app.pages.review.review_projection.displayed = .{ .ready = .{
+        .request = try app_review_projection.testing.cloneRequest(
+            allocator,
+            identity,
+            1,
+            roots.a,
+            "a",
+            .cached_diff,
+            .unstaged,
+            app.pages.review.source_session_revision,
+            app.pages.review.status_snapshot_revision,
+        ),
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(
+            allocator,
+            app_test_support.diff_cached_projection,
+        ) },
+    } };
+    const text_ptr =
+        app.pages.review.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr;
+
+    // Watch is off and no further input arrives after the status terminal:
+    // the repair reload must still start inside this same update cycle. The
+    // unstage action's cursor restores the path anchor exactly like the real
+    // hunk-unstage flow does.
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+    app.pages.review.status_load = .{ .generation = 6, .pending = .{ .generation = 6 } };
+    try installTestActionCursor(&app, allocator, .file, "a", 8);
+    try promoteTestActionCursorWithRequirement(&app, 8, .status_only);
+    try std.testing.expect(app.pages.review.action_cursor.startMember(8, .status, 6));
+    var unstaged_status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .status = .{
+        .identity = identity,
+        .generation = 6,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .result = .{ .loaded = unstaged_status },
+    } } }), &ctx);
+    unstaged_status = undefined;
+
+    try std.testing.expect(app.pages.review.review_projection.displayed == .ready);
+    try std.testing.expect(app.pages.review.review_projection.displayed.ready.value == .cached_diff);
+    try std.testing.expect(
+        app.pages.review.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr == text_ptr,
+    );
+    try std.testing.expect(!app.pages.review.activation.hasQueuedFullRevalidation());
+    const reads = try takeCanonicalPublicationReads(&ctx, allocator);
+    _ = reads;
 }
 
 fn testCombinedHunkBundle(allocator: std.mem.Allocator) !app_review_projection.CombinedHunkBundle {
