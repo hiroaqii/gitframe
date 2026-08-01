@@ -5,8 +5,8 @@ const provider = @import("provider.zig");
 const token = @import("token.zig");
 const text_eligibility = @import("../diff/text_eligibility.zig");
 
-// `tools/projection_perf.zig` mirrors this hunk-side pipeline for stage-level
-// measurements. Keep that developer-only mirror in sync when this work order changes.
+// `tools/projection_perf.zig` measures this hunk-side pipeline by calling the
+// stage helpers below directly; no instrumentation lives in this module.
 pub fn buildDocumentSpans(allocator: std.mem.Allocator, io: std.Io, document: diff_parser.DiffDocument, eligibility: []const text_eligibility.FileTextEligibility) !provider.DocumentSpans {
     std.debug.assert(eligibility.len == document.files.len);
     var spans = try provider.allocateEmptyForDocument(allocator, document);
@@ -43,7 +43,7 @@ pub fn buildDocumentSpans(allocator: std.mem.Allocator, io: std.Io, document: di
     return spans;
 }
 
-const HunkSideKey = struct {
+pub const HunkSideKey = struct {
     file_index: usize,
     hunk_index: usize,
     side: provider.Side,
@@ -61,10 +61,34 @@ fn highlightHunkSide(
     defer fragment.deinit(allocator);
     if (fragment.text.len == 0 or fragment.lines.len == 0) return;
 
-    var syntax = try flow_syntax.create_guess_file_type_static(allocator, fragment.text, filePathForSide(file, key.side), query_cache);
+    var syntax = try createHunkSideSyntax(allocator, fragment.text, file, key.side, query_cache);
     defer syntax.destroy();
     try syntax.refresh_full(fragment.text);
 
+    try renderAndStoreHunkSideSpans(allocator, document_spans, syntax, fragment, key);
+}
+
+/// Stage helper shared with the projection profiler: guesses the file type
+/// for one hunk side and creates its flow-syntax instance.
+pub fn createHunkSideSyntax(
+    allocator: std.mem.Allocator,
+    fragment_text: []const u8,
+    file: diff_parser.FileDiff,
+    side: provider.Side,
+    query_cache: *flow_syntax.QueryCache,
+) !*flow_syntax {
+    return flow_syntax.create_guess_file_type_static(allocator, fragment_text, filePathForSide(file, side), query_cache);
+}
+
+/// Stage helper shared with the projection profiler: renders the fragment's
+/// spans, sanitizes them per line, and stores them under `key`.
+pub fn renderAndStoreHunkSideSpans(
+    allocator: std.mem.Allocator,
+    document_spans: *provider.DocumentSpans,
+    syntax: *flow_syntax,
+    fragment: provider.Fragment,
+    key: HunkSideKey,
+) !void {
     const line_lists = try allocator.alloc(std.ArrayList(token.TokenSpan), fragment.lines.len);
     defer allocator.free(line_lists);
     for (line_lists) |*list| list.* = .empty;

@@ -16,8 +16,8 @@
 //!
 //! Results report median and observed range for each stage. A checksum consumes the
 //! generated model so optimized builds cannot discard the measured work. The
-//! hunk-side syntax pipeline mirrors `syntax/provider_flow_syntax.zig` and must stay
-//! synchronized when that production pipeline changes.
+//! hunk-side stages call `syntax/provider_flow_syntax.zig`'s production helpers
+//! directly, so the profiler always measures the real pipeline.
 
 const std = @import("std");
 
@@ -30,11 +30,11 @@ const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
 const flow_syntax = @import("flow_syntax");
 const provider = @import("../syntax/provider.zig");
-const token = @import("../syntax/token.zig");
+const provider_flow_syntax = @import("../syntax/provider_flow_syntax.zig");
 
-// This developer-only profiler mirrors `syntax/provider_flow_syntax.zig`'s
-// hunk-side pipeline. It intentionally propagates non-OOM side errors and counts
-// binary hunks in the reported shape even though both paths skip highlighting them.
+// Intentional differences from production `buildDocumentSpans`: this profiler
+// propagates non-OOM side errors, counts binary hunks in the reported shape,
+// and applies no text-eligibility filter.
 const max_patch_bytes = 64 * 1024 * 1024;
 const default_iterations = 7;
 const max_iterations = 31;
@@ -496,11 +496,7 @@ fn materializeVisibleNodes(allocator: std.mem.Allocator, tree: file_tree.FileTre
     return visible_nodes[0..count];
 }
 
-const HunkSideKey = struct {
-    file_index: usize,
-    hunk_index: usize,
-    side: provider.Side,
-};
+const HunkSideKey = provider_flow_syntax.HunkSideKey;
 
 fn profileHunkSide(
     allocator: std.mem.Allocator,
@@ -522,10 +518,11 @@ fn profileHunkSide(
     shape.highlighted_sides += 1;
 
     timer = Stopwatch.start(io);
-    var syntax = try flow_syntax.create_guess_file_type_static(
+    var syntax = try provider_flow_syntax.createHunkSideSyntax(
         allocator,
         fragment.text,
-        filePathForSide(file, key.side),
+        file,
+        key.side,
         query_cache,
     );
     sample[@intFromEnum(Phase.syntax_create)] +%= timer.read();
@@ -536,66 +533,27 @@ fn profileHunkSide(
     sample[@intFromEnum(Phase.syntax_refresh)] +%= timer.read();
 
     timer = Stopwatch.start(io);
-    const line_lists = try allocator.alloc(std.ArrayList(token.TokenSpan), fragment.lines.len);
-    defer allocator.free(line_lists);
-    for (line_lists) |*list| list.* = .empty;
-    defer for (line_lists) |*list| list.deinit(allocator);
+    try provider_flow_syntax.renderAndStoreHunkSideSpans(
+        allocator,
+        document_spans,
+        syntax,
+        fragment,
+        key,
+    );
+    sample[@intFromEnum(Phase.render_sanitize)] +%= timer.read();
 
-    var ctx: RenderContext = .{
-        .allocator = allocator,
-        .line_maps = fragment.lines,
-        .line_lists = line_lists,
-    };
-    syntax.render(&ctx, RenderContext.capture, flow_syntax.SimpleNonRegex(*RenderContext), null) catch |err| switch (err) {
-        error.Stop => if (ctx.allocation_failed) return error.OutOfMemory,
-        else => return err,
-    };
-
-    for (fragment.lines, 0..) |line_map, index| {
-        const line_spans = try token.sanitizeLineSpans(allocator, line_map.text, line_lists[index].items);
-        checksum.* +%= line_spans.spans.len;
-        provider.putLineSpans(document_spans, .{
+    // Checksum accounting happens outside the timed region by reading the
+    // stored spans back; the production helper carries no profiler-serving
+    // bookkeeping.
+    for (fragment.lines) |line_map| {
+        checksum.* +%= document_spans.lineSpans(.{
             .file_index = key.file_index,
             .hunk_index = key.hunk_index,
             .line_index = line_map.line_index,
             .side = key.side,
-        }, line_spans);
+        }).spans.len;
     }
-    sample[@intFromEnum(Phase.render_sanitize)] +%= timer.read();
 }
-
-fn filePathForSide(file: diff_parser.FileDiff, side: provider.Side) ?[]const u8 {
-    return switch (side) {
-        .old => file.old_path orelse file.new_path,
-        .new => file.new_path orelse file.old_path,
-    };
-}
-
-const RenderContext = struct {
-    allocator: std.mem.Allocator,
-    line_maps: []const provider.FragmentLine,
-    line_lists: []std.ArrayList(token.TokenSpan),
-    allocation_failed: bool = false,
-
-    fn capture(
-        self: *RenderContext,
-        range: flow_syntax.Range,
-        scope: []const u8,
-        _: u32,
-        capture_index: usize,
-        _: *const flow_syntax.Node,
-    ) error{Stop}!void {
-        if (capture_index != 0) return;
-        const role = token.roleFromScope(scope);
-        provider.appendRangeSpans(self.allocator, self.line_maps, self.line_lists, .{
-            .start = @intCast(range.start_byte),
-            .end = @intCast(range.end_byte),
-        }, role) catch {
-            self.allocation_failed = true;
-            return error.Stop;
-        };
-    }
-};
 
 fn printSummary(label: []const u8, samples: []const Sample, phase_index: usize) void {
     var values: [max_iterations]u64 = undefined;
