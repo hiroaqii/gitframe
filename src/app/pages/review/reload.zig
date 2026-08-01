@@ -8693,6 +8693,139 @@ test "boundary retention yields to selection moved to another path" {
     try std.testing.expect(!page.activation.hasQueuedFullRevalidation());
 }
 
+test "status-only session cleans stale owner through successor target" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    try installTestCachedPreviewOwner(controller, allocator);
+
+    const revision_before = page.source_session_revision;
+    try controller.createStatusOnlyLoadedSession(allocator, page.git_status.document);
+    try std.testing.expectEqual(revision_before + 1, page.source_session_revision);
+
+    // The staged-only row still derives a successor target under the new
+    // source generation; the stale owner is cleaned through the successor
+    // preparation path, not the no-target path.
+    const target = controller.view().projectionTarget() orelse return error.ExpectedSuccessorTarget;
+    try std.testing.expectEqual(review_projection.Kind.cached_diff, target.kind);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    const pending = page.review_projection.pending orelse return error.ExpectedSuccessorPending;
+    try std.testing.expectEqual(page.source_session_revision, pending.source_session_revision);
+    try std.testing.expect(update.command != null);
+    try std.testing.expect(page.review_projection.displayed == .idle);
+}
+
+test "status-only session cleans stale owner through no-target path" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var unstaged_status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try page.git_status.replace("/repo", &unstaged_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    try installTestCachedPreviewOwner(controller, allocator);
+
+    try controller.createStatusOnlyLoadedSession(allocator, page.git_status.document);
+
+    // The unstaged-only row has no target arm and the stale owner no longer
+    // matches the display identity, so boundary retention must not trigger:
+    // the orphan is cleaned through the ordinary no-target path.
+    try std.testing.expect(controller.view().projectionTarget() == null);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    try std.testing.expect(update.command == null);
+    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.review_projection.displayed == .idle);
+    try std.testing.expect(!page.activation.hasQueuedFullRevalidation());
+}
+
+test "failed displayed request derives its own target" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.deinit(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    page.review_projection.displayed = .{ .failed = .{
+        .request = try review_projection.testing.cloneRequest(
+            allocator,
+            page.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            page.source_session_revision,
+            page.status_snapshot_revision,
+        ),
+        .body = try review_projection.statusBodyAlloc(allocator, "a", "Preview unavailable", .{}),
+    } };
+
+    // The ownership predicate includes a failed displayed request: the failed
+    // body keeps deriving its target instead of being dropped at the staged
+    // boundary.
+    const target = controller.view().projectionTarget() orelse return error.ExpectedOwnedTarget;
+    try std.testing.expectEqual(review_projection.Kind.cached_diff, target.kind);
+    try std.testing.expectEqualStrings("a", target.path_key);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    try std.testing.expect(page.review_projection.displayed == .failed);
+}
+
+test "failed displayed body joins boundary inert retention" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    page.review_projection.displayed = .{ .failed = .{
+        .request = try review_projection.testing.cloneRequest(
+            allocator,
+            page.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            page.source_session_revision,
+            page.status_snapshot_revision,
+        ),
+        .body = try review_projection.statusBodyAlloc(allocator, "a", "Preview unavailable", .{}),
+    } };
+
+    controller.advanceStatusSnapshotRevision(allocator);
+    var unstaged_status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try page.git_status.replace("/repo", &unstaged_status);
+
+    try std.testing.expect(controller.view().projectionTarget() == null);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    try std.testing.expect(update.command == null);
+    try std.testing.expect(page.review_projection.displayed == .failed);
+    try std.testing.expect(page.activation.hasQueuedFullRevalidation());
+}
+
 test "one hunk unstage restores combined authority over retained owned presentation" {
     const allocator = std.testing.allocator;
     var page: review_page.ReviewPageState = .{
