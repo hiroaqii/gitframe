@@ -493,46 +493,32 @@ pub fn StageFileTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, runStageTarget(task.repo_root, task.path, task.target_kind, allocator, io));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 if (task.label.len > 0) allocator.free(task.label);
                 allocator.destroy(task);
             }
-
-            const result = runStageTarget(task.repo_root, task.path, task.target_kind, allocator, io);
             const path = task.label;
             task.label = &.{};
             const repo_root = task.repo_root;
             task.repo_root = &.{};
-
             return Msg.actionFinished(.{ .stage_file = StageFileFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
                 .path = path,
                 .result = result,
-            } });
-        }
-
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.path.len > 0) allocator.free(task.path);
-                if (task.label.len > 0) allocator.free(task.label);
-                allocator.destroy(task);
-            }
-
-            const path = task.label;
-            task.label = &.{};
-            const repo_root = task.repo_root;
-            task.repo_root = &.{};
-
-            return Msg.actionFinished(.{ .stage_file = StageFileFinished{
-                .pending = task.pending,
-                .repo_root = repo_root,
-                .path = path,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -553,46 +539,32 @@ pub fn UnstageFileTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, runUnstageTarget(task.repo_root, task.path, task.target_kind, allocator, io));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 if (task.label.len > 0) allocator.free(task.label);
                 allocator.destroy(task);
             }
-
-            const result = runUnstageTarget(task.repo_root, task.path, task.target_kind, allocator, io);
             const path = task.label;
             task.label = &.{};
             const repo_root = task.repo_root;
             task.repo_root = &.{};
-
             return Msg.actionFinished(.{ .unstage_file = UnstageFileFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
                 .path = path,
                 .result = result,
-            } });
-        }
-
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.path.len > 0) allocator.free(task.path);
-                if (task.label.len > 0) allocator.free(task.label);
-                allocator.destroy(task);
-            }
-
-            const path = task.label;
-            task.label = &.{};
-            const repo_root = task.repo_root;
-            task.repo_root = &.{};
-
-            return Msg.actionFinished(.{ .unstage_file = UnstageFileFinished{
-                .pending = task.pending,
-                .repo_root = repo_root,
-                .path = path,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -613,19 +585,27 @@ pub fn StageHunkTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, runStageHunk(task.repo_root, task.patch, allocator, io));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 allocator.free(task.patch);
                 allocator.destroy(task);
             }
-
-            const result = runStageHunk(task.repo_root, task.patch, allocator, io);
             const repo_root = task.repo_root;
             const path = task.path;
             task.repo_root = &.{};
             task.path = &.{};
-
             return Msg.actionFinished(.{ .stage_hunk = StageHunkFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
@@ -633,30 +613,6 @@ pub fn StageHunkTask(comptime Msg: type) type {
                 .hunk_index = task.hunk_index,
                 .session_mark_mutation = task.session_mark_mutation,
                 .result = result,
-            } });
-        }
-
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.path.len > 0) allocator.free(task.path);
-                allocator.free(task.patch);
-                allocator.destroy(task);
-            }
-
-            const repo_root = task.repo_root;
-            const path = task.path;
-            task.repo_root = &.{};
-            task.path = &.{};
-
-            return Msg.actionFinished(.{ .stage_hunk = StageHunkFinished{
-                .pending = task.pending,
-                .repo_root = repo_root,
-                .path = path,
-                .hunk_index = task.hunk_index,
-                .session_mark_mutation = task.session_mark_mutation,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -675,19 +631,27 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, runUnstageHunk(task.repo_root, task.patch, allocator, io));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 allocator.free(task.patch);
                 allocator.destroy(task);
             }
-
-            const result = runUnstageHunk(task.repo_root, task.patch, allocator, io);
             const repo_root = task.repo_root;
             const path = task.path;
             task.repo_root = &.{};
             task.path = &.{};
-
             return Msg.actionFinished(.{ .unstage_hunk = UnstageHunkFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
@@ -696,31 +660,6 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
                 .session_mark_mutation = task.session_mark_mutation,
                 .reload_after_success = task.reload_after_success,
                 .result = result,
-            } });
-        }
-
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.path.len > 0) allocator.free(task.path);
-                allocator.free(task.patch);
-                allocator.destroy(task);
-            }
-
-            const repo_root = task.repo_root;
-            const path = task.path;
-            task.repo_root = &.{};
-            task.path = &.{};
-
-            return Msg.actionFinished(.{ .unstage_hunk = UnstageHunkFinished{
-                .pending = task.pending,
-                .repo_root = repo_root,
-                .path = path,
-                .hunk_index = task.hunk_index,
-                .session_mark_mutation = task.session_mark_mutation,
-                .reload_after_success = task.reload_after_success,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -738,44 +677,31 @@ pub fn DiscardFileTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, runDiscardFile(task.repo_root, task.path, allocator, io));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
             defer {
                 allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 allocator.destroy(task);
             }
-
-            const result = runDiscardFile(task.repo_root, task.path, allocator, io);
             const repo_root = task.repo_root;
             const path = task.path;
             task.repo_root = &.{};
             task.path = &.{};
-
             return Msg.actionFinished(.{ .discard_file = DiscardFileFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
                 .path = path,
                 .result = result,
-            } });
-        }
-
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer {
-                allocator.free(task.repo_root);
-                if (task.path.len > 0) allocator.free(task.path);
-                allocator.destroy(task);
-            }
-
-            const repo_root = task.repo_root;
-            const path = task.path;
-            task.repo_root = &.{};
-            task.path = &.{};
-
-            return Msg.actionFinished(.{ .discard_file = DiscardFileFinished{
-                .pending = task.pending,
-                .repo_root = repo_root,
-                .path = path,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -794,40 +720,29 @@ pub fn CommitTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                allocator.free(task.subject);
-                if (task.body) |body| allocator.free(body);
-                allocator.destroy(task);
-            }
-
-            const result = runCommit(task.repo_root, task.subject, task.body, allocator, io);
-            const repo_root = task.repo_root;
-            task.repo_root = &.{};
-
-            return Msg.actionFinished(.{ .commit = CommitFinished{
-                .pending = task.pending,
-                .repo_root = repo_root,
-                .result = result,
-            } });
+            return task.finish(allocator, runCommit(task.repo_root, task.subject, task.body, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 allocator.free(task.subject);
                 if (task.body) |body| allocator.free(body);
                 allocator.destroy(task);
             }
-
             const repo_root = task.repo_root;
             task.repo_root = &.{};
-
             return Msg.actionFinished(.{ .commit = CommitFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
+                .result = result,
             } });
         }
     };
@@ -849,16 +764,24 @@ pub fn CommitMessageAssistTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer destroyCommitMessageAssistTask(@This(), allocator, task);
+            return task.finish(allocator, runCommitMessageAssist(task.repo_root, task.action_id, task.argv, task.mode, allocator, io));
+        }
 
-            const result = runCommitMessageAssist(task.repo_root, task.action_id, task.argv, task.mode, allocator, io);
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: CommitMessageActionResult) Msg {
+            defer destroyCommitMessageAssistTask(@This(), allocator, task);
             const repo_root = task.repo_root;
             const action_id = task.action_id;
             const mode = task.mode;
             task.repo_root = &.{};
             task.action_id = &.{};
             task.mode = .generate;
-
             return Msg.actionFinished(.{ .assist_commit_message = CommitMessageAssistFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
@@ -866,27 +789,6 @@ pub fn CommitMessageAssistTask(comptime Msg: type) type {
                 .launch_revision = task.launch_revision,
                 .mode = mode,
                 .result = result,
-            } });
-        }
-
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer destroyCommitMessageAssistTask(@This(), allocator, task);
-
-            const repo_root = task.repo_root;
-            const action_id = task.action_id;
-            const mode = task.mode;
-            task.repo_root = &.{};
-            task.action_id = &.{};
-            task.mode = .generate;
-
-            return Msg.actionFinished(.{ .assist_commit_message = CommitMessageAssistFinished{
-                .pending = task.pending,
-                .repo_root = repo_root,
-                .action_id = action_id,
-                .launch_revision = task.launch_revision,
-                .mode = mode,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -902,40 +804,29 @@ pub fn AmendTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                allocator.free(task.subject);
-                if (task.body) |body| allocator.free(body);
-                allocator.destroy(task);
-            }
-
-            const result = runAmend(task.repo_root, task.subject, task.body, allocator, io);
-            const repo_root = task.repo_root;
-            task.repo_root = &.{};
-
-            return Msg.actionFinished(.{ .amend = AmendFinished{
-                .pending = task.pending,
-                .repo_root = repo_root,
-                .result = result,
-            } });
+            return task.finish(allocator, runAmend(task.repo_root, task.subject, task.body, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 allocator.free(task.subject);
                 if (task.body) |body| allocator.free(body);
                 allocator.destroy(task);
             }
-
             const repo_root = task.repo_root;
             task.repo_root = &.{};
-
             return Msg.actionFinished(.{ .amend = AmendFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
+                .result = result,
             } });
         }
     };
@@ -959,6 +850,17 @@ pub fn PushTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, runPush(task.mode, task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, if (task.credentials) |credentials| credentials else null, allocator, io));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.branch.len > 0) allocator.free(task.branch);
@@ -968,8 +870,6 @@ pub fn PushTask(comptime Msg: type) type {
                 if (task.credentials) |*credentials| credentials.deinit(allocator);
                 allocator.destroy(task);
             }
-
-            const result = runPush(task.mode, task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, if (task.credentials) |credentials| credentials else null, allocator, io);
             const mode = task.mode;
             const repo_root = task.repo_root;
             const branch = task.branch;
@@ -981,7 +881,6 @@ pub fn PushTask(comptime Msg: type) type {
             task.remote = &.{};
             task.remote_branch = &.{};
             task.oid = &.{};
-
             return Msg.actionFinished(.{ .push = PushFinished{
                 .pending = task.pending,
                 .mode = mode,
@@ -991,42 +890,6 @@ pub fn PushTask(comptime Msg: type) type {
                 .remote_branch = remote_branch,
                 .oid = oid,
                 .result = result,
-            } });
-        }
-
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.branch.len > 0) allocator.free(task.branch);
-                if (task.remote.len > 0) allocator.free(task.remote);
-                if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
-                allocator.free(task.oid);
-                if (task.credentials) |*credentials| credentials.deinit(allocator);
-                allocator.destroy(task);
-            }
-
-            const repo_root = task.repo_root;
-            const mode = task.mode;
-            const branch = task.branch;
-            const remote = task.remote;
-            const remote_branch = task.remote_branch;
-            const oid = task.oid;
-            task.repo_root = &.{};
-            task.branch = &.{};
-            task.remote = &.{};
-            task.remote_branch = &.{};
-            task.oid = &.{};
-
-            return Msg.actionFinished(.{ .push = PushFinished{
-                .pending = task.pending,
-                .mode = mode,
-                .repo_root = repo_root,
-                .branch = branch,
-                .remote = remote,
-                .remote_branch = remote_branch,
-                .oid = oid,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -1044,6 +907,17 @@ pub fn PullTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, runPullRefresh(task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, allocator, io));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.branch.len > 0) allocator.free(task.branch);
@@ -1052,8 +926,6 @@ pub fn PullTask(comptime Msg: type) type {
                 allocator.free(task.oid);
                 allocator.destroy(task);
             }
-
-            const result = runPullRefresh(task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, allocator, io);
             const repo_root = task.repo_root;
             const branch = task.branch;
             const remote = task.remote;
@@ -1064,7 +936,6 @@ pub fn PullTask(comptime Msg: type) type {
             task.remote = &.{};
             task.remote_branch = &.{};
             task.oid = &.{};
-
             return Msg.actionFinished(.{ .pull = PullFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
@@ -1073,39 +944,6 @@ pub fn PullTask(comptime Msg: type) type {
                 .remote_branch = remote_branch,
                 .oid = oid,
                 .result = result,
-            } });
-        }
-
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.branch.len > 0) allocator.free(task.branch);
-                if (task.remote.len > 0) allocator.free(task.remote);
-                if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
-                allocator.free(task.oid);
-                allocator.destroy(task);
-            }
-
-            const repo_root = task.repo_root;
-            const branch = task.branch;
-            const remote = task.remote;
-            const remote_branch = task.remote_branch;
-            const oid = task.oid;
-            task.repo_root = &.{};
-            task.branch = &.{};
-            task.remote = &.{};
-            task.remote_branch = &.{};
-            task.oid = &.{};
-
-            return Msg.actionFinished(.{ .pull = PullFinished{
-                .pending = task.pending,
-                .repo_root = repo_root,
-                .branch = branch,
-                .remote = remote,
-                .remote_branch = remote_branch,
-                .oid = oid,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -1120,44 +958,31 @@ pub fn FetchTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, runFetch(task.repo_root, task.remote, task.env_map, allocator, io));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 allocator.free(task.remote);
                 allocator.destroy(task);
             }
-
-            const result = runFetch(task.repo_root, task.remote, task.env_map, allocator, io);
             const repo_root = task.repo_root;
             const remote = task.remote;
             task.repo_root = &.{};
             task.remote = &.{};
-
             return Msg.actionFinished(.{ .fetch = FetchFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
                 .remote = remote,
                 .result = result,
-            } });
-        }
-
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                allocator.free(task.remote);
-                allocator.destroy(task);
-            }
-
-            const repo_root = task.repo_root;
-            const remote = task.remote;
-            task.repo_root = &.{};
-            task.remote = &.{};
-
-            return Msg.actionFinished(.{ .fetch = FetchFinished{
-                .pending = task.pending,
-                .repo_root = repo_root,
-                .remote = remote,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
             } });
         }
     };
@@ -1174,6 +999,17 @@ pub fn SwitchBranchTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, runSwitchBranch(task.repo_root, task.expected_branch, task.expected_oid, task.target_branch, task.target_oid, allocator, io));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        }
+
+        /// Terminal epilogue shared by run and failed; owned-field release,
+        /// moves, and destroy live only here.
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.expected_branch.len > 0) allocator.free(task.expected_branch);
@@ -1182,15 +1018,12 @@ pub fn SwitchBranchTask(comptime Msg: type) type {
                 allocator.free(task.target_oid);
                 allocator.destroy(task);
             }
-
-            const result = runSwitchBranch(task.repo_root, task.expected_branch, task.expected_oid, task.target_branch, task.target_oid, allocator, io);
             const repo_root = task.repo_root;
             const old_branch = task.expected_branch;
             const new_branch = task.target_branch;
             task.repo_root = &.{};
             task.expected_branch = &.{};
             task.target_branch = &.{};
-
             return Msg.actionFinished(.{ .switch_branch = SwitchBranchFinished{
                 .pending = task.pending,
                 .repo_root = repo_root,
@@ -1199,37 +1032,10 @@ pub fn SwitchBranchTask(comptime Msg: type) type {
                 .result = result,
             } });
         }
-
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.expected_branch.len > 0) allocator.free(task.expected_branch);
-                allocator.free(task.expected_oid);
-                if (task.target_branch.len > 0) allocator.free(task.target_branch);
-                allocator.free(task.target_oid);
-                allocator.destroy(task);
-            }
-
-            const repo_root = task.repo_root;
-            const old_branch = task.expected_branch;
-            const new_branch = task.target_branch;
-            task.repo_root = &.{};
-            task.expected_branch = &.{};
-            task.target_branch = &.{};
-
-            return Msg.actionFinished(.{ .switch_branch = SwitchBranchFinished{
-                .pending = task.pending,
-                .repo_root = repo_root,
-                .old_branch = old_branch,
-                .new_branch = new_branch,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
-            } });
-        }
     };
 }
 
-fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
+pub fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
     return switch (failure) {
         .start_failed => |message| message,
         .runtime_abandoned => "runtime shutting down",
@@ -1298,7 +1104,11 @@ pub fn runCommit(repo_root: []const u8, subject: []const u8, body: ?[]const u8, 
     }, allocator, io);
 }
 
-fn destroyCommitMessageAssistTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
+/// Single teardown for CommitMessageAssistTask, shared by the task's own
+/// terminal epilogue and the launcher's spawn-failure path. The unconditional
+/// `argv` free is equivalent to a guarded one: std `Allocator.free` returns
+/// early for zero-length slices.
+pub fn destroyCommitMessageAssistTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
     if (task.repo_root.len > 0) allocator.free(task.repo_root);
     if (task.action_id.len > 0) allocator.free(task.action_id);
     for (task.argv) |arg| allocator.free(arg);

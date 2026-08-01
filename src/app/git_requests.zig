@@ -210,7 +210,7 @@ pub fn startCommitMessageAssist(comptime Msg: type, ctx: *chasen.Ctx(Msg), actio
         .mode = request.mode,
     };
     request.* = .{ .repo_root = &.{}, .action_id = &.{}, .argv = &.{}, .launch_revision = 0, .mode = .generate };
-    errdefer destroyCommitMessageAssistTask(Task, ctx.allocator(), task);
+    errdefer actions.destroyCommitMessageAssistTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
     return pending;
@@ -559,15 +559,6 @@ fn destroyCommitTask(comptime Task: type, allocator: std.mem.Allocator, task: *T
     if (task.repo_root.len > 0) allocator.free(task.repo_root);
     if (task.subject.len > 0) allocator.free(task.subject);
     if (task.body) |body| allocator.free(body);
-    allocator.destroy(task);
-}
-
-fn destroyCommitMessageAssistTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
-    if (task.repo_root.len > 0) allocator.free(task.repo_root);
-    if (task.action_id.len > 0) allocator.free(task.action_id);
-    for (task.argv) |arg| allocator.free(arg);
-    if (task.argv.len > 0) allocator.free(task.argv);
-    task.mode.deinit(allocator);
     allocator.destroy(task);
 }
 

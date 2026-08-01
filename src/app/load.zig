@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const chasen = @import("chasen");
 const auto_reload = @import("auto_reload.zig");
+const actions = @import("actions.zig");
 const page = @import("page.zig");
 const diff_parser = @import("../diff/parser.zig");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
@@ -340,7 +341,7 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
                 .identity = task.identity,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
+                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
             } } });
         }
     };
@@ -385,7 +386,7 @@ pub fn RepoPathDiscoveryTask(comptime Msg: type) type {
             return Msg.loadFinished(.{ .shell = .{ .repo_path_discovery = RepoPathDiscoveryFinished{
                 .generation = task.generation,
                 .submitted_path = submitted_path,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
+                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
             } } });
         }
     };
@@ -445,7 +446,7 @@ pub fn DiffLoadTask(comptime Msg: type) type {
                 .read_epoch = task.read_epoch,
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
+                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
             } } });
         }
     };
@@ -487,7 +488,7 @@ pub fn StatusLoadTask(comptime Msg: type) type {
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
+                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
             };
             task.repo_root = &.{};
 
@@ -534,7 +535,7 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
                 .generation = task.generation,
                 .background_cycle_id = task.background_cycle_id,
                 .repo_root = task.repo_root,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
+                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
             };
             task.repo_root = &.{};
 
@@ -578,7 +579,7 @@ pub fn BranchListLoadTask(comptime Msg: type) type {
                 .activation_id = task.activation_id,
                 .generation = task.generation,
                 .repo_root = task.repo_root,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
+                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
             };
             task.repo_root = &.{};
 
@@ -616,7 +617,7 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
 
             return Msg.loadFinished(.{ .review = .{ .projection = ReviewProjectionFinished{
                 .request = request,
-                .result = .{ .failed_static = taskFailureMessage(failure) },
+                .result = .{ .failed_static = actions.taskFailureMessage(failure) },
             } } });
         }
     };
@@ -681,13 +682,6 @@ pub fn GeneratedSyntaxTask(comptime Msg: type) type {
                 .result = .{ .terminal_plain = .provider_unavailable },
             } } });
         }
-    };
-}
-
-fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
-    return switch (failure) {
-        .start_failed => |message| message,
-        .runtime_abandoned => "runtime shutting down",
     };
 }
 
