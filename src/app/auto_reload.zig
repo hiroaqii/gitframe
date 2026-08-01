@@ -215,6 +215,10 @@ pub const State = struct {
     pub fn beginCycle(self: *State) ?u64 {
         if (!self.enabled() or self.background_cycle != null) return null;
         self.next_cycle_id +%= 1;
+        // Cycle id 0 is the no-cycle sentinel on owned terminals
+        // (`cycle_id != 0` gates); a wrapped id must skip it or member
+        // completion for that cycle would never run.
+        if (self.next_cycle_id == 0) self.next_cycle_id = 1;
         self.background_cycle = .{ .id = self.next_cycle_id };
         return self.next_cycle_id;
     }
@@ -327,6 +331,15 @@ test "policy resolution honors cli config and source eligibility" {
     try std.testing.expectEqual(Activation.disabled, State.init(.inherit, .{}, .stdin).activation);
     try std.testing.expectEqual(Activation.automatic, State.init(.inherit, .{}, .{ .no_index = .{ .left = "a", .right = "b" } }).activation);
     try std.testing.expectEqual(@as(u64, std.time.ns_per_s), State.init(.inherit, .{ .interval_seconds = 1 }, .unstaged).interval_ns);
+}
+
+test "background cycle id survives counter wrap without hitting the zero sentinel" {
+    var state = State.init(.inherit, .{}, .unstaged);
+    state.next_cycle_id = std.math.maxInt(u64);
+    const id = state.beginCycle() orelse return error.ExpectedBackgroundCycle;
+    try std.testing.expect(id != 0);
+    try std.testing.expectEqual(@as(u64, 1), id);
+    try std.testing.expectEqual(@as(u64, 1), state.background_cycle.?.id);
 }
 
 test "background cycle remains busy until every member finishes" {

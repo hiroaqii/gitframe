@@ -2419,6 +2419,7 @@ pub const Controller = struct {
             }
         }
         self.page.review_projection_next_id +%= 1;
+        if (self.page.review_projection_next_id == 0) self.page.review_projection_next_id = 1;
         const request_id = self.page.review_projection_next_id;
         const identity = self.page.activation.currentIdentity() orelse {
             self.clearCompletedSelectionForProjection(allocator, selection_scope);
@@ -8694,6 +8695,26 @@ test "boundary retention yields to selection moved to another path" {
     try std.testing.expect(page.review_projection.displayed == .idle);
     try std.testing.expect(page.review_projection.cacheLen() == 1);
     try std.testing.expect(!page.activation.hasQueuedFullRevalidation());
+}
+
+test "ordinary projection request id survives counter wrap without hitting the zero sentinel" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try page.git_status.replace("/repo", &staged_status);
+    page.status_load.markSuccess();
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+
+    page.review_projection_next_id = std.math.maxInt(u64);
+    var update = try controller.prepareProjection(allocator);
+    defer update.deinit(allocator);
+    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    try std.testing.expect(pending.id != 0);
+    try std.testing.expectEqual(@as(u64, 1), pending.id);
 }
 
 test "status-only session cleans stale owner through successor target" {
