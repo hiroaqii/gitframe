@@ -231,6 +231,26 @@ const PageStates = struct {
     config: page.LazyPlaceholder = .{},
 };
 
+/// Composition of redraw intent for one update cycle: a required frame
+/// always wins over any number of skip requests, and silence means redraw
+/// (the runtime default).
+pub const RedrawPlan = struct {
+    skip_requested: bool = false,
+    frame_required: bool = false,
+
+    pub fn requestSkip(self: *RedrawPlan) void {
+        self.skip_requested = true;
+    }
+
+    pub fn requireFrame(self: *RedrawPlan) void {
+        self.frame_required = true;
+    }
+
+    pub fn resolvesToSkip(self: RedrawPlan) bool {
+        return self.skip_requested and !self.frame_required;
+    }
+};
+
 pub const App = struct {
     active_page: page.Id = .review,
     repo_epoch: u64 = 0,
@@ -248,6 +268,10 @@ pub const App = struct {
     teardown_requested: bool = false,
     allocator: ?std.mem.Allocator = null,
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
+    /// Per-update redraw disposition owned by this root orchestrator.
+    /// Handlers and tail code record intent; `update` resets the plan on
+    /// entry and applies the resolved decision to the runtime exactly once.
+    redraw_plan: RedrawPlan = .{},
     actions: app_actions.ActionState = .{},
     git_action_spinner_tick: u8 = 0,
     git_action_spinner_timer_running: bool = false,
@@ -525,6 +549,8 @@ pub const App = struct {
     }
 
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
+        self.redraw_plan = .{};
+        defer if (self.redraw_plan.resolvesToSkip()) ctx.redraw().skip();
         self.clearEphemeralStatusForUserAction(msg);
 
         switch (msg) {
@@ -636,7 +662,7 @@ pub const App = struct {
                         self.pages.review.action_cursor.hasOwner())
                     {
                         self.pages.review.activation.queueRevalidation();
-                        ctx.redraw().skip();
+                        self.redraw_plan.requestSkip();
                     } else {
                         self.clearBranchSwitch(ctx.allocator());
                         switch (try self.startReviewReload(
@@ -644,7 +670,7 @@ pub const App = struct {
                             .{ .clear_visible_state = true, .kind = .manual },
                             .queue_revalidation,
                         )) {
-                            .one_shot_source, .authority_closed => ctx.redraw().skip(),
+                            .one_shot_source, .authority_closed => self.redraw_plan.requestSkip(),
                             .needs_repo_discovery => try self.startRepoDiscovery(ctx, null),
                             .no_repo_root => self.reviewReload().replaceMissingRepository(ctx.allocator()),
                             .source_started => {},
@@ -666,12 +692,11 @@ pub const App = struct {
         if (self.pages.review.action_cursor.actionGeneration()) |generation| {
             if (self.actions.generation > generation) self.reviewNavigation().clearActionCursor(ctx.allocator());
         }
-        var tail_display_changed = false;
         if (!self.pages.review.selection_owner.activeMouseSelection() and self.pages.review.deferred_source_apply != null) {
-            if (try self.applyDeferredSource(ctx)) tail_display_changed = true;
+            try self.applyDeferredSource(ctx);
         }
         if (!self.pages.review.selection_owner.activeMouseSelection() and self.pages.review.deferred_projection_apply != null) {
-            if (try self.reviewReload().applyDeferredProjection(ctx.allocator())) tail_display_changed = true;
+            if (try self.reviewReload().applyDeferredProjection(ctx.allocator())) self.redraw_plan.requireFrame();
         }
         try self.maybeStartQueuedReviewRevalidation(ctx);
         try self.maybeStartRepositoryManifest(ctx);
@@ -681,9 +706,7 @@ pub const App = struct {
         self.maybeStartRepositoryChangeMap(ctx);
         const revalidation_queued_before_projection =
             self.pages.review.activation.hasQueuedFullRevalidation();
-        if (self.active_page == .review) {
-            if (try self.ensureReviewProjection(ctx)) tail_display_changed = true;
-        }
+        if (self.active_page == .review) try self.ensureReviewProjection(ctx);
         // Boundary inert retention queues its repair revalidation inside
         // ensureReviewProjection, after the consumption point above already
         // ran. Consume a queue born in this tail so the repair starts in the
@@ -694,9 +717,6 @@ pub const App = struct {
         {
             try self.maybeStartQueuedReviewRevalidation(ctx);
         }
-        // The tail runs after the handler already latched its redraw
-        // decision; a tail-side display change must still produce a frame.
-        if (tail_display_changed) ctx.redraw().force();
         self.reconcileGitActionSpinnerTimer(ctx);
     }
 
@@ -748,7 +768,7 @@ pub const App = struct {
                 defer owned.deinit(ctx.allocator());
                 const body_size = self.shellLayout().bodySize();
                 const outcome = self.pages.repository.applyFinished(ctx.allocator(), &owned, body_size);
-                if (self.active_page != .repository or outcome == .discarded or outcome == .unchanged) ctx.redraw().skip();
+                if (self.active_page != .repository or outcome == .discarded or outcome == .unchanged) self.redraw_plan.requestSkip();
             },
             .branch_finished => |finished| {
                 var owned = finished;
@@ -757,29 +777,29 @@ pub const App = struct {
                 if (self.active_page != .repository or switch (outcome) {
                     .changed, .failed => false,
                     .discarded, .unchanged => true,
-                }) ctx.redraw().skip();
+                }) self.redraw_plan.requestSkip();
             },
             .document_finished => |finished| {
                 var owned = finished;
                 defer owned.deinit(ctx.allocator());
                 const outcome = self.pages.repository.applyDocumentFinished(ctx.allocator(), &owned);
-                if (self.active_page != .repository or outcome == .discarded or outcome == .unchanged) ctx.redraw().skip();
+                if (self.active_page != .repository or outcome == .discarded or outcome == .unchanged) self.redraw_plan.requestSkip();
             },
             .syntax_finished => |finished| {
                 var owned = finished;
                 defer owned.deinit(ctx.allocator());
                 const outcome = self.pages.repository.applySyntaxFinished(ctx.allocator(), &owned);
-                if (self.active_page != .repository or outcome != .changed) ctx.redraw().skip();
+                if (self.active_page != .repository or outcome != .changed) self.redraw_plan.requestSkip();
             },
             .change_map_finished => |finished| {
                 var owned = finished;
                 defer owned.deinit(ctx.allocator());
                 const outcome = self.pages.repository.applyChangeMapFinished(ctx.allocator(), &owned);
-                if (self.active_page != .repository or outcome != .changed) ctx.redraw().skip();
+                if (self.active_page != .repository or outcome != .changed) self.redraw_plan.requestSkip();
             },
             else => {
                 if (self.active_page != .repository) {
-                    ctx.redraw().skip();
+                    self.redraw_plan.requestSkip();
                     return;
                 }
                 var page_update = self.pages.repository.applyNavigation(ctx.allocator(), msg, self.shellLayout().bodySize());
@@ -1059,7 +1079,7 @@ pub const App = struct {
             self.git_action_spinner_tick = 0;
             self.git_action_spinner_timer_running = false;
             ctx.timer().cancel(git_action_spinner_timer_id) catch {};
-            ctx.redraw().skip();
+            self.redraw_plan.requestSkip();
             return;
         }
         self.git_action_spinner_tick +%= 1;
@@ -1634,7 +1654,7 @@ pub const App = struct {
     }
 
     fn finishRepoDiscovery(self: *App, ctx: *chasen.Ctx(Msg), finished: RepoDiscoveryFinished) !void {
-        defer if (self.active_page != .review) ctx.redraw().skip();
+        defer if (self.active_page != .review) self.redraw_plan.requestSkip();
         var result = finished;
         defer result.deinit(ctx.allocator());
 
@@ -1958,25 +1978,22 @@ pub const App = struct {
         }
     }
 
-    /// Returns true when the deferred source was applied with a visible
-    /// Review display so the update tail can restore a skipped redraw.
-    fn applyDeferredSource(self: *App, ctx: *chasen.Ctx(Msg)) !bool {
+    fn applyDeferredSource(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         var applied = try self.reviewReload().applyDeferredSource(
             ctx.allocator(),
             self.backgroundActionBlocksAcceptance(),
-        ) orelse return false;
+        ) orelse return;
         defer applied.deinit(ctx.allocator());
         self.applySourceShellOutcome(ctx, applied.source);
-        return self.active_page == .review and applied.source.redraw == .normal;
+        if (self.active_page == .review and applied.source.redraw == .normal) self.redraw_plan.requireFrame();
     }
 
-    /// Returns true when reconciliation itself published new visual state
-    /// (cache promotion, combined-to-ordinary boundary, canonical primary
-    /// commit) so the update tail can restore a skipped redraw.
-    fn ensureReviewProjection(self: *App, ctx: *chasen.Ctx(Msg)) !bool {
-        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return false;
+    fn ensureReviewProjection(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) return;
         var review_update = try self.reviewReload().prepareProjection(self.allocator);
-        const display_changed = review_update.display_changed;
+        // Reconciliation may itself publish new visual state (cache
+        // promotion, combined-to-ordinary boundary, canonical commit).
+        if (review_update.display_changed) self.redraw_plan.requireFrame();
         if (review_update.takeCommand()) |command| {
             const allocator = ctx.allocator();
             var owned_command = command;
@@ -1991,11 +2008,11 @@ pub const App = struct {
                     if (request.kind == .generated_added_file) {
                         const capability = self.repo_state.activeCapability() orelse {
                             self.reviewReload().rejectProjectionSpawn(allocator, request_id);
-                            return display_changed;
+                            return;
                         };
                         if (!request.matchesRootIdentity(capability.identity)) {
                             self.reviewReload().rejectProjectionSpawn(allocator, request_id);
-                            return display_changed;
+                            return;
                         }
                         root = capability.duplicate() catch |err| {
                             self.reviewReload().rejectProjectionSpawn(allocator, request_id);
@@ -2019,12 +2036,11 @@ pub const App = struct {
                         self.reviewReload().rejectProjectionSpawn(allocator, request_id);
                         return err;
                     };
-                    return display_changed;
+                    return;
                 },
             }
         }
         if (source_syntax_runtime.enabled) self.ensureGeneratedProjectionSyntax(ctx);
-        return display_changed;
     }
 
     /// Best-effort decoration for an already usable generated-file preview.
@@ -3449,7 +3465,7 @@ pub const App = struct {
                 self.setEffectStatus(diagnostic_origin, "{s}", .{message});
             },
         }
-        if (self.active_page != result.origin.page_id) ctx.redraw().skip();
+        if (self.active_page != result.origin.page_id) self.redraw_plan.requestSkip();
     }
 
     fn startInteractivePushAfterInspection(
@@ -4109,7 +4125,7 @@ pub const App = struct {
                 self.clearBranchSwitch(ctx.allocator());
             },
         }
-        if (self.active_page != result.origin) ctx.redraw().skip();
+        if (self.active_page != result.origin) self.redraw_plan.requestSkip();
     }
 
     fn finishPushForeground(self: *App, ctx: *chasen.Ctx(Msg), result: chasen.ForegroundCommandResult) !void {
@@ -4131,7 +4147,7 @@ pub const App = struct {
 
         const diagnostic_origin: EffectOrigin = .{ .page = foreground.origin };
         if (!self.effectOriginIsLive(diagnostic_origin)) {
-            ctx.redraw().skip();
+            self.redraw_plan.requestSkip();
             return;
         }
         switch (result.outcome) {
@@ -4174,7 +4190,7 @@ pub const App = struct {
         }
 
         if (self.active_page != foreground.origin.page_id) {
-            ctx.redraw().skip();
+            self.redraw_plan.requestSkip();
             return;
         }
 
@@ -4274,7 +4290,7 @@ pub const App = struct {
                     _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
                 }
                 self.pages.review.activation.discardTerminalRevalidation();
-                ctx.redraw().skip();
+                self.redraw_plan.requestSkip();
                 return .unsupported;
             },
             .authority_closed => {
@@ -4287,7 +4303,7 @@ pub const App = struct {
                 if (action_cursor_generation) |generation| {
                     _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
                 }
-                ctx.redraw().skip();
+                self.redraw_plan.requestSkip();
                 return .rejected_start;
             },
             .needs_repo_discovery => {
@@ -4301,7 +4317,7 @@ pub const App = struct {
                 if (action_cursor_generation) |generation| {
                     _ = self.pages.review.action_cursor.clearMatchingAction(ctx.allocator(), generation);
                 }
-                ctx.redraw().skip();
+                self.redraw_plan.requestSkip();
                 return .unsupported;
             },
             .source_started => return .accepted_source,
@@ -4435,7 +4451,7 @@ pub const App = struct {
         self.editor_foreground_request = null;
         const diagnostic_origin: EffectOrigin = .{ .page = foreground.origin };
         if (!self.effectOriginIsLive(diagnostic_origin)) {
-            ctx.redraw().skip();
+            self.redraw_plan.requestSkip();
             return;
         }
         switch (result.outcome) {
@@ -4452,7 +4468,7 @@ pub const App = struct {
         }
 
         if (self.active_page != foreground.origin.page_id) {
-            ctx.redraw().skip();
+            self.redraw_plan.requestSkip();
             return;
         }
         if (foreground.origin.page_id != .review or foreground.origin.repo_epoch != self.repo_epoch) return;
@@ -4461,7 +4477,7 @@ pub const App = struct {
             .clear_visible_state = self.pages.review.load.state == .idle,
             .kind = .action_result,
         }, .queue_revalidation)) {
-            .one_shot_source, .authority_closed, .no_repo_root => ctx.redraw().skip(),
+            .one_shot_source, .authority_closed, .no_repo_root => self.redraw_plan.requestSkip(),
             .needs_repo_discovery => try self.startRepoDiscovery(ctx, null),
             .source_started => {},
         }
@@ -4630,13 +4646,14 @@ pub const App = struct {
     }
 
     fn finishClipboardCopy(self: *App, ctx: *chasen.Ctx(Msg), finished: ClipboardCopyFinished) void {
+        _ = ctx;
         const removed = self.clipboard_copy_states.fetchRemove(finished.request_id.id) orelse {
-            ctx.redraw().skip();
+            self.redraw_plan.requestSkip();
             return;
         };
         const state = removed.value;
         if (!self.effectOriginIsLive(state.origin)) {
-            ctx.redraw().skip();
+            self.redraw_plan.requestSkip();
             return;
         }
         switch (finished.outcome) {
@@ -4645,7 +4662,7 @@ pub const App = struct {
             .write_failed => |err| self.setEffectStatus(state.origin, "clipboard copy failed: {s}: {s}", .{ state.label, err }),
         }
         switch (state.origin) {
-            .page => |origin_page| if (self.active_page != origin_page.page_id) ctx.redraw().skip(),
+            .page => |origin_page| if (self.active_page != origin_page.page_id) self.redraw_plan.requestSkip(),
             .shell_surface => {},
         }
     }
@@ -4851,36 +4868,36 @@ pub const App = struct {
 
     fn autoReloadTick(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         if (self.active_page != .review) {
-            ctx.redraw().skip();
+            self.redraw_plan.requestSkip();
             return;
         }
         if (!self.pages.review.auto_reload.enabled()) return;
         if (diff_source.sourceIsOneShotInput(self.config.source)) return;
         if (!self.pages.review.repository_read_authority.mayStartRepositoryRead()) {
-            ctx.redraw().skip();
+            self.redraw_plan.requestSkip();
             return;
         }
         if (self.repo_picker.mode or self.pages.review.search.mode or self.pages.review.file_search.mode or self.commit_panel.is_open or
             self.pages.review.selection_owner.activeMouseSelection() or app_git_requests.hasPendingAction(self.actions) or
             self.pages.review.action_cursor.hasOwner())
         {
-            ctx.redraw().skip();
+            self.redraw_plan.requestSkip();
             return;
         }
         if (self.pages.review.auto_reload.background_cycle != null or self.pages.review.load.hasPending() or self.pages.review.load.state == .loading or
             self.pages.review.status_load.isPending() or self.pages.review.branch_status_load.isPending() or self.pages.review.review_projection.hasPending())
         {
-            ctx.redraw().skip();
+            self.redraw_plan.requestSkip();
             return;
         }
 
         if (diff_source.sourceRequiresRepo(self.config.source) and self.needsRepoDiscovery()) {
             if (self.pages.review.auto_reload.activation != .forced) {
-                ctx.redraw().skip();
+                self.redraw_plan.requestSkip();
                 return;
             }
             const cycle_id = self.pages.review.auto_reload.beginCycle() orelse {
-                ctx.redraw().skip();
+                self.redraw_plan.requestSkip();
                 return;
             };
             errdefer self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
@@ -4888,7 +4905,7 @@ pub const App = struct {
             self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
         } else {
             const cycle_id = self.pages.review.auto_reload.beginCycle() orelse {
-                ctx.redraw().skip();
+                self.redraw_plan.requestSkip();
                 return;
             };
             errdefer self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
@@ -4906,7 +4923,7 @@ pub const App = struct {
             }
             self.pages.review.auto_reload.discardEmptyCycle(cycle_id);
         }
-        ctx.redraw().skip();
+        self.redraw_plan.requestSkip();
     }
 
     fn backgroundAcceptanceBlocked(self: *const App, background_cycle_id: ?u64) bool {
@@ -5167,6 +5184,7 @@ pub const App = struct {
     }
 
     fn applySourceShellOutcome(self: *App, ctx: *chasen.Ctx(Msg), applied: review_reload.SourceApply) void {
+        _ = ctx;
         var recovered_failure_cleared = false;
         if (applied.recovered_failure) |failure| {
             recovered_failure_cleared = self.pages.review.status.clearSourceReloadFailure(failure.digest);
@@ -5179,13 +5197,13 @@ pub const App = struct {
             );
         }
         if (self.active_page != .review) {
-            ctx.redraw().skip();
+            self.redraw_plan.requestSkip();
             return;
         }
         switch (applied.redraw) {
             .normal => {},
-            .skip => ctx.redraw().skip(),
-            .skip_unless_recovered_failure_cleared => if (!recovered_failure_cleared) ctx.redraw().skip(),
+            .skip => self.redraw_plan.requestSkip(),
+            .skip_unless_recovered_failure_cleared => if (!recovered_failure_cleared) self.redraw_plan.requestSkip(),
         }
     }
 
@@ -5223,7 +5241,7 @@ pub const App = struct {
             .status_load_failed => |message| self.setReviewStatus("status load failed: {s}", .{message}),
             else => unreachable,
         };
-        if ((applied.skip_redraw and !finalized_action_cursor) or self.active_page != .review) ctx.redraw().skip();
+        if ((applied.skip_redraw and !finalized_action_cursor) or self.active_page != .review) self.redraw_plan.requestSkip();
     }
 
     fn finishBranchStatusLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: BranchStatusLoadFinished) void {
@@ -5238,7 +5256,7 @@ pub const App = struct {
             .branch_status_parse_failed => self.setReviewStatus("branch status parse failed", .{}),
             else => unreachable,
         };
-        if (applied.skip_redraw or self.active_page != .review) ctx.redraw().skip();
+        if (applied.skip_redraw or self.active_page != .review) self.redraw_plan.requestSkip();
     }
 
     fn finishReviewProjectionLoad(self: *App, ctx: *chasen.Ctx(Msg), finished: ReviewProjectionFinished) !void {
@@ -5247,7 +5265,7 @@ pub const App = struct {
         defer if (!result_transferred) result.deinit(ctx.allocator());
         const applied = try self.reviewReload().applyProjectionFinished(ctx.allocator(), &result);
         result_transferred = applied.result_transferred;
-        if (applied.skip_redraw or self.active_page != .review) ctx.redraw().skip();
+        if (applied.skip_redraw or self.active_page != .review) self.redraw_plan.requestSkip();
     }
 
     fn finishGeneratedProjectionSyntax(
@@ -5258,7 +5276,7 @@ pub const App = struct {
         var result = finished;
         defer result.deinit(ctx.allocator());
         const applied = self.reviewReload().applyGeneratedSyntaxFinished(ctx.allocator(), &result);
-        if (applied.skip_redraw or self.active_page != .review) ctx.redraw().skip();
+        if (applied.skip_redraw or self.active_page != .review) self.redraw_plan.requestSkip();
     }
 
     fn enterRepoPickerMode(self: *App, allocator: std.mem.Allocator) !void {
@@ -7624,7 +7642,7 @@ test "inactive Review clipboard completion retains diagnostic without redraw" {
 
     try std.testing.expectEqualStrings("clipboard copy sent: current line", app.pages.review.status.text());
     try std.testing.expectEqualStrings("", app.status.text());
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "repository selection slice C copy uses Repository origin without opening AI UI" {
@@ -7749,7 +7767,7 @@ test "repository selection slice C late clipboard completion cannot target a new
 
     try std.testing.expectEqual(@as(usize, 0), app.clipboard_copy_states.count());
     try std.testing.expectEqualStrings("", app.pages.repository.status.text());
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "repository selection slice C inactive page accepts same-instance clipboard completion" {
@@ -7774,7 +7792,7 @@ test "repository selection slice C inactive page accepts same-instance clipboard
 
     try std.testing.expectEqualStrings("clipboard copy sent: source selection", app.pages.repository.status.text());
     try std.testing.expectEqualStrings("", app.status.text());
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "copyPopup queues push error message text" {
@@ -7817,7 +7835,7 @@ test "closed shell surface discards clipboard completion presentation" {
 
     try std.testing.expectEqualStrings("", app.status.text());
     try std.testing.expectEqualStrings("", app.pages.review.status.text());
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "live shell surface owns clipboard completion presentation" {
@@ -7860,7 +7878,7 @@ test "reopened shell surface rejects prior clipboard completion" {
     app.finishClipboardCopy(&ctx, .{ .request_id = .{ .id = 7 }, .outcome = .sent });
 
     try std.testing.expectEqualStrings("", app.status.text());
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
     try std.testing.expectEqual(@as(usize, 0), app.clipboard_copy_states.count());
 }
 
@@ -7879,11 +7897,11 @@ test "clipboard completion rejects unknown id and superseded page instance" {
     try std.testing.expectEqual(@as(usize, 1), app.clipboard_copy_states.count());
     try std.testing.expectEqualStrings("", app.pages.review.status.text());
 
-    ctx._redraw_suppressed = false;
+    app.redraw_plan = .{};
     app.finishClipboardCopy(&ctx, .{ .request_id = .{ .id = 8 }, .outcome = .sent });
     try std.testing.expectEqual(@as(usize, 0), app.clipboard_copy_states.count());
     try std.testing.expectEqualStrings("", app.pages.review.status.text());
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "copyPopup reports empty target outside copyable popup" {
@@ -9178,7 +9196,7 @@ test "inactive Review consumes matching action refresh terminals without shell r
 
     try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
     try std.testing.expectEqual(page.Id.repository, app.active_page);
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 const ActionCursorPeerState = enum {
@@ -9478,7 +9496,7 @@ test "final hunk stage retains exact path through cached projection acceptance" 
     try std.testing.expect(b_node < a_node);
     try std.testing.expectEqualStrings("a", app.reviewNavigationView().selectedStagePathKey().?);
 
-    _ = try app.ensureReviewProjection(&ctx);
+    try app.ensureReviewProjection(&ctx);
     const pending = app.pages.review.review_projection.pending orelse return error.ExpectedCachedProjection;
     try std.testing.expectEqual(app_review_projection.Kind.cached_diff, pending.kind);
     try std.testing.expectEqualStrings("a", pending.path_key);
@@ -10331,9 +10349,9 @@ test "Repository branch App completion suppresses stale unchanged and inactive r
     } });
     try std.testing.expectEqual(request.generation, app.pages.repository.branch.pending.?.generation);
     try std.testing.expect(app.pages.repository.branch.snapshot.identity == null);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
-    ctx.resetRedrawSuppressed();
+    app.redraw_plan = .{};
     try app.updateRepository(&ctx, .{ .branch_finished = .{
         .identity = request.identity,
         .root_identity = request.root.identity,
@@ -10341,20 +10359,20 @@ test "Repository branch App completion suppresses stale unchanged and inactive r
         .result = .{ .loaded = try branchStatusBundleForTest(allocator, .{ .branch = "main" }) },
     } });
     try std.testing.expectEqualStrings("main", app.pages.repository.branch.snapshot.status.branchName().?);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 
     app.pages.repository.requestReload(true);
     app.pages.repository.needs_revalidation = false;
     var unchanged_request = try app.pages.repository.prepareBranchRequest(allocator, root_path, &app.repo_state.root.?);
     defer unchanged_request.deinit(allocator);
-    ctx.resetRedrawSuppressed();
+    app.redraw_plan = .{};
     try app.updateRepository(&ctx, .{ .branch_finished = .{
         .identity = unchanged_request.identity,
         .root_identity = unchanged_request.root.identity,
         .generation = unchanged_request.generation,
         .result = .{ .loaded = try branchStatusBundleForTest(allocator, .{ .branch = "main" }) },
     } });
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     app.pages.repository.requestReload(true);
     app.pages.repository.needs_revalidation = false;
@@ -10362,7 +10380,7 @@ test "Repository branch App completion suppresses stale unchanged and inactive r
     defer inactive_request.deinit(allocator);
     app.pages.repository.deactivate();
     app.active_page = .history;
-    ctx.resetRedrawSuppressed();
+    app.redraw_plan = .{};
     try app.updateRepository(&ctx, .{ .branch_finished = .{
         .identity = inactive_request.identity,
         .root_identity = inactive_request.root.identity,
@@ -10371,7 +10389,7 @@ test "Repository branch App completion suppresses stale unchanged and inactive r
     } });
     try std.testing.expectEqualStrings("inactive", app.pages.repository.branch.snapshot.status.branchName().?);
     try std.testing.expect(app.pages.repository.branch.freshness == .validating);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 fn setupPushRetryRepoForTest(allocator: std.mem.Allocator, io: std.Io, tmp: *std.testing.TmpDir) !struct { repo_root: []u8, oid: []u8 } {
@@ -10904,7 +10922,7 @@ test "stale branch-list diagnostic does not overwrite reactivated Review" {
     try std.testing.expect(!app.branch_switch.hasState());
     try std.testing.expect(!app.overlay.isSwitchBranch());
     try std.testing.expectEqualStrings("new Review diagnostic", app.pages.review.status.text());
-    try std.testing.expect(!ctx._redraw_suppressed);
+    try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 }
 
 test "confirmBranchSwitch treats current branch as no-op without clearing state" {
@@ -12133,7 +12151,7 @@ test "review repository transition E3b2 unavailable path is not replayed after r
         .repo_root = try allocator.dupe(u8, roots.a),
         .result = .empty,
     });
-    _ = try app.ensureReviewProjection(&ctx);
+    try app.ensureReviewProjection(&ctx);
 
     const reloaded = app.reviewNavigationView().activeLoadedDiffConst().?;
     try std.testing.expectEqual(@as(usize, 2), reloaded.document.files.len);
@@ -12274,7 +12292,7 @@ test "review repository transition E3b3 active repository replacement rejects ol
     try std.testing.expect(app.pages.repository.needs_revalidation);
     try std.testing.expect(app.pages.repository.wantsManifestRequest());
     try std.testing.expectEqual(@as(usize, 0), app.pages.repository.status.text().len);
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "review repository transition C1 prepare failures leave both pages unchanged" {
@@ -12964,7 +12982,7 @@ test "inactive page timer starts no Review work" {
     try app.autoReloadTick(&ctx);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "mutation read start gate retains manual and queued revalidation until reopen" {
@@ -13031,7 +13049,7 @@ test "mutation read start gate blocks forced auto reload before cycle ownership"
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
     try std.testing.expect(app.pages.review.load.pending == null);
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "closed read authority queues action-terminal revalidation instead of dropping" {
@@ -13058,7 +13076,7 @@ test "closed read authority queues action-terminal revalidation instead of dropp
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(app.pages.review.load.pending == null);
     try std.testing.expect(app.pages.review.pending_reload == null);
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "closed read authority consequence is a typed route policy" {
@@ -13114,7 +13132,7 @@ test "closed read authority keeps watch tick drop semantics without queueing" {
     try std.testing.expect(!app.pages.review.activation.hasQueuedFullRevalidation());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "mutation read start gate makes direct App read starters inert" {
@@ -13176,7 +13194,7 @@ test "mutation read promotion gate makes App projection scheduling inert" {
     try std.testing.expect(app.pages.review.repository_read_authority.closeForMutation(owner));
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
-    _ = try app.ensureReviewProjection(&ctx);
+    try app.ensureReviewProjection(&ctx);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(app.pages.review.review_projection.pending == null);
@@ -13658,7 +13676,7 @@ test "inactive Review failure stays page scoped and skips redraw" {
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expectEqualStrings("", app.status.text());
     try std.testing.expectEqualStrings("status load failed: offline", app.pages.review.status.text());
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "review cancel remains available when source validation failed" {
@@ -14272,7 +14290,7 @@ test "inactive Review accepts push inspection diagnostic without redraw" {
 
     try std.testing.expect(app.push_retry.state.availableTarget() != null);
     try std.testing.expectEqualStrings("could not verify push retry target", app.pages.review.status.text());
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "Review reactivation discards an old push inspection completion" {
@@ -14576,9 +14594,9 @@ test "inactive Review foreground completions retain diagnostics without effects"
 
     try std.testing.expectEqualStrings("interactive push exited for /repo: 1", app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
-    ctx._redraw_suppressed = false;
+    app.redraw_plan = .{};
     app.editor_foreground_request = .{
         .request_id = .{ .id = 8 },
         .origin = .{ .page_id = .review, .repo_epoch = 3, .activation_id = 0 },
@@ -14590,7 +14608,7 @@ test "inactive Review foreground completions retain diagnostics without effects"
 
     try std.testing.expectEqualStrings("editor closed", app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "push remote inspection rejects non-HTTPS and restores retry target" {
@@ -16525,7 +16543,7 @@ test "Review canonical publication page transition retires an old projection req
         reads,
         .changed,
     );
-    _ = try app.ensureReviewProjection(&ctx);
+    try app.ensureReviewProjection(&ctx);
     var old_request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
     var old_request_owned = true;
     defer if (old_request_owned) old_request.deinit(allocator);
@@ -16658,7 +16676,7 @@ test "Review ordinary primary publication retains primary until cached result" {
         }
         try expectRetainedOrdinaryPrimaryPublication(&app, primary_owner, primary_token);
 
-        _ = try app.ensureReviewProjection(&ctx);
+        try app.ensureReviewProjection(&ctx);
         try expectRetainedOrdinaryPrimaryPublication(&app, primary_owner, primary_token);
         var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
         var request_owned = true;
@@ -16854,7 +16872,7 @@ fn expectOrdinaryPrimaryCandidateTargetMatrix() !void {
             }),
         }
 
-        _ = try app.ensureReviewProjection(&ctx);
+        try app.ensureReviewProjection(&ctx);
         var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
         defer request.deinit(allocator);
         try std.testing.expectEqual(case.expected, request.kind);
@@ -16987,7 +17005,7 @@ fn expectOrdinaryPrimaryNoTargetPublication(
         });
     }
 
-    _ = try app.ensureReviewProjection(&ctx);
+    try app.ensureReviewProjection(&ctx);
     const entries = ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 0), entries.len);
     try finishCanonicalPublicationBranch(&app, &ctx, allocator, repo_root, reads);
@@ -17146,7 +17164,7 @@ test "Review canonical publication retains the prior body for every direct actio
                     try expectRetainedCanonicalPublication(&app, prior_hunks);
                 }
 
-                _ = try app.ensureReviewProjection(&ctx);
+                try app.ensureReviewProjection(&ctx);
                 var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
                 if (source_empty) {
                     try std.testing.expectEqual(app_review_projection.Kind.cached_diff, request.kind);
@@ -17250,7 +17268,7 @@ test "Review canonical publication retains the prior body for a stage hunk succe
     try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, "MM a\x00 M b\x00");
     try expectRetainedCanonicalPublication(&app, prior_hunks);
 
-    _ = try app.ensureReviewProjection(&ctx);
+    try app.ensureReviewProjection(&ctx);
     var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
     const final_bundle = try canonicalPublicationFinalBundle(allocator, request);
     try app.finishReviewProjectionLoad(&ctx, .{
@@ -17325,7 +17343,7 @@ test "Review canonical publication exact acceptance retains navigation search an
         canonical_publication_combined_diff,
     );
     try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, "MM a\x00");
-    _ = try app.ensureReviewProjection(&ctx);
+    try app.ensureReviewProjection(&ctx);
     var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
     var candidate = try canonicalPublicationReuseCandidate(
         allocator,
@@ -17458,7 +17476,7 @@ test "Review canonical publication exact reuse rebinds every retained lineage ow
                     .staged_only => "M  a\x00",
                 },
             );
-            _ = try app.ensureReviewProjection(&ctx);
+            try app.ensureReviewProjection(&ctx);
             var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
             try std.testing.expectEqual(
                 switch (kind) {
@@ -17726,7 +17744,7 @@ test "Review canonical publication startup and status failure retain last good o
         );
         try expectCanonicalPublicationCycleTransfer(&app, retry_cycle_id);
         try expectRetainedCanonicalPublication(&app, prior_hunks);
-        _ = try app.ensureReviewProjection(&ctx);
+        try app.ensureReviewProjection(&ctx);
         var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
         const final_bundle = try canonicalPublicationFinalBundle(allocator, request);
         try app.finishReviewProjectionLoad(&ctx, .{
@@ -17782,7 +17800,7 @@ test "Review canonical publication projection failure publishes failure body ato
     try expectCanonicalPublicationCycleTransfer(&app, cycle_id);
     try expectRetainedCanonicalPublication(&app, prior_hunks);
 
-    _ = try app.ensureReviewProjection(&ctx);
+    try app.ensureReviewProjection(&ctx);
     var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
     const expected_source_revision = request.source_session_revision;
     const expected_status_revision = request.status_snapshot_revision;
@@ -17846,7 +17864,7 @@ test "Review canonical publication changed status waits for unchanged source and
     try std.testing.expectEqual(source_revision_before, app.pages.review.source_session_revision);
     try expectRetainedCanonicalPublication(&app, prior_hunks);
 
-    _ = try app.ensureReviewProjection(&ctx);
+    try app.ensureReviewProjection(&ctx);
     var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
     var request_owned = true;
     defer if (request_owned) request.deinit(allocator);
@@ -17982,7 +18000,7 @@ test "Review canonical publication changed status waits for unchanged source and
         });
         try expectRetainedCanonicalPublication(&mixed_app, mixed_hunks);
 
-        _ = try mixed_app.ensureReviewProjection(&mixed_ctx);
+        try mixed_app.ensureReviewProjection(&mixed_ctx);
         var mixed_request = try takeCanonicalPublicationProjectionRequest(
             &mixed_ctx,
             allocator,
@@ -18112,7 +18130,7 @@ test "Review canonical publication changed status waits for unchanged source and
             "MM a\x00",
         );
         try expectRetainedCanonicalPublication(&superseded_app, superseded_hunks);
-        _ = try superseded_app.ensureReviewProjection(&superseded_ctx);
+        try superseded_app.ensureReviewProjection(&superseded_ctx);
         var superseded_request = try takeCanonicalPublicationProjectionRequest(
             &superseded_ctx,
             allocator,
@@ -18206,7 +18224,7 @@ test "background status refresh retains combined projection while cursor moves" 
     syncTestActivation(&app);
     app.pages.review.load.generation +%= 1;
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    _ = try app.ensureReviewProjection(&ctx);
+    try app.ensureReviewProjection(&ctx);
 
     const retained = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedRetainedProjection;
     try std.testing.expectEqual(hunks_before, retained.displayFile().hunks.ptr);
@@ -18274,7 +18292,7 @@ test "unchanged full cycle preserves projection semantic identity" {
     app.pages.review.status_load.markSuccess();
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    _ = try app.ensureReviewProjection(&ctx);
+    try app.ensureReviewProjection(&ctx);
 
     const projection_after = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
     try std.testing.expectEqual(hunks_before, projection_after.displayFile().hunks.ptr);
@@ -18755,7 +18773,7 @@ test "selected path change supersedes pending display restore" {
     );
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    _ = try app.ensureReviewProjection(&ctx);
+    try app.ensureReviewProjection(&ctx);
 
     try std.testing.expect(app.pages.review.pending_display_navigation_restore == null);
     try std.testing.expect(app.pages.review.review_projection.pending != null);
@@ -18903,7 +18921,7 @@ test "superseded projection completion cannot replace display" {
 
     try std.testing.expect(app.pages.review.review_projection.pending == null);
     try std.testing.expect(!app.pages.review.review_projection.hasDisplayed());
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "old generated syntax completion drains pending and suppresses redraw" {
@@ -18963,7 +18981,7 @@ test "old generated syntax completion drains pending and suppresses redraw" {
 
     try std.testing.expect(app.pages.review.review_projection.syntax_pending == null);
     try std.testing.expect(bundle.decoration == .eligible);
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "cached preview keeps search input while projection is pending" {
@@ -20874,14 +20892,15 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     var status_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     try app.autoReloadTick(&status_ctx);
     try std.testing.expectEqual(@as(usize, 0), status_ctx._pending_tasks_with_len);
-    try std.testing.expect(status_ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     app.pages.review.status_load.pending = null;
     app.pages.review.branch_status_load.pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 };
     var branch_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    app.redraw_plan = .{};
     try app.autoReloadTick(&branch_ctx);
     try std.testing.expectEqual(@as(usize, 0), branch_ctx._pending_tasks_with_len);
-    try std.testing.expect(branch_ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     app.pages.review.branch_status_load.pending = null;
     app.pages.review.review_projection.pending = try app_review_projection.testing.cloneRequest(
@@ -20896,32 +20915,36 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
         1,
     );
     var projection_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    app.redraw_plan = .{};
     try app.autoReloadTick(&projection_ctx);
     try std.testing.expectEqual(@as(usize, 0), projection_ctx._pending_tasks_with_len);
-    try std.testing.expect(projection_ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
     app.pages.review.review_projection.clearPending(std.testing.allocator);
 
     app.pages.review.selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } };
     var selection_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    app.redraw_plan = .{};
     try app.autoReloadTick(&selection_ctx);
     try std.testing.expectEqual(@as(usize, 0), selection_ctx._pending_tasks_with_len);
-    try std.testing.expect(selection_ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     app.pages.review.selection_owner = .none;
     const pending = beginAcceptedTestAction(&app, .stage_file);
     var action_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    app.redraw_plan = .{};
     try app.autoReloadTick(&action_ctx);
     try std.testing.expectEqual(@as(usize, 0), action_ctx._pending_tasks_with_len);
-    try std.testing.expect(action_ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     try std.testing.expect(app.acceptActionTerminal(pending));
     try installTestActionCursor(&app, std.testing.allocator, .directory, "src", 9);
     try promoteTestActionCursor(&app, 9);
     defer app.reviewNavigation().clearActionCursor(std.testing.allocator);
     var action_refresh_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    app.redraw_plan = .{};
     try app.autoReloadTick(&action_refresh_ctx);
     try std.testing.expectEqual(@as(usize, 0), action_refresh_ctx._pending_tasks_with_len);
-    try std.testing.expect(action_refresh_ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
     try std.testing.expect(app.pages.review.action_cursor.hasOwner());
 }
 
@@ -21103,7 +21126,7 @@ test "unchanged recovery clears its source failure and redraws" {
     try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
     try std.testing.expectEqual(before, app.reviewNavigationView().activeLoadedDiffConst().?.text.ptr);
     try std.testing.expectEqualStrings("", app.pages.review.status.text());
-    try std.testing.expect(!ctx._redraw_suppressed);
+    try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 }
 
 test "unchanged source recovery preserves a newer auxiliary failure" {
@@ -21134,7 +21157,7 @@ test "unchanged source recovery preserves a newer auxiliary failure" {
     });
 
     try std.testing.expectEqualStrings("status load failed: auxiliary transient", app.pages.review.status.text());
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "auxiliary failure followed by source failure clears only the recovered source message" {
@@ -21181,7 +21204,7 @@ test "auxiliary failure followed by source failure clears only the recovered sou
         .result = .{ .unchanged = fingerprint },
     });
     try std.testing.expectEqualStrings("", app.pages.review.status.text());
-    try std.testing.expect(!ctx._redraw_suppressed);
+    try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 }
 
 test "ordinary unchanged source completion suppresses redraw" {
@@ -21208,7 +21231,7 @@ test "ordinary unchanged source completion suppresses redraw" {
         .result = .{ .unchanged = fingerprint },
     });
 
-    try std.testing.expect(ctx._redraw_suppressed);
+    try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "changed loaded recovery clears its matching source failure and redraws" {
@@ -21240,7 +21263,7 @@ test "changed loaded recovery clears its matching source failure and redraws" {
 
     try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
     try std.testing.expectEqualStrings("", app.pages.review.status.text());
-    try std.testing.expect(!ctx._redraw_suppressed);
+    try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 }
 
 test "empty recovery clears its matching source failure and redraws" {
@@ -21272,7 +21295,7 @@ test "empty recovery clears its matching source failure and redraws" {
     try std.testing.expect(app.pages.review.load.state == .empty);
     try std.testing.expect(app.pages.review.auto_reload.sourceIsFresh());
     try std.testing.expectEqualStrings("", app.pages.review.status.text());
-    try std.testing.expect(!ctx._redraw_suppressed);
+    try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 }
 
 test "destructive action-result failure invalidates accepted source before identical success" {
@@ -21472,7 +21495,7 @@ test "changed watch result arriving during mouse selection defers apply until re
     try std.testing.expect(app.pages.review.auto_reload.background_cycle.?.pending.deferred_source_apply);
 
     app.reviewNavigation().clearDiffSelection();
-    _ = try app.applyDeferredSource(&ctx);
+    try app.applyDeferredSource(&ctx);
     try std.testing.expect(app.pages.review.deferred_source_apply == null);
     try std.testing.expectEqualStrings(app_test_support.diff_one, app.reviewNavigationView().activeLoadedDiffConst().?.text);
     try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
@@ -21559,7 +21582,7 @@ test "deferred background source is discarded when a repository action starts" {
 
     _ = beginAcceptedTestAction(&app, .stage_file);
     app.reviewNavigation().clearDiffSelection();
-    _ = try app.applyDeferredSource(&ctx);
+    try app.applyDeferredSource(&ctx);
 
     try std.testing.expectEqualStrings("old", app.reviewNavigationView().activeLoadedDiffConst().?.text);
     try std.testing.expect(app.pages.review.deferred_source_apply == null);
@@ -21611,7 +21634,7 @@ test "deferred changed watch captures navigation when selection ends" {
     app.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
     const navigation_at_apply = app.pages.review.viewer.diff_cursor;
     app.reviewNavigation().clearDiffSelection();
-    _ = try app.applyDeferredSource(&ctx);
+    try app.applyDeferredSource(&ctx);
 
     try std.testing.expect(app.pages.review.deferred_source_apply == null);
     try std.testing.expectEqual(navigation_at_apply, app.pages.review.viewer.diff_cursor);
@@ -22985,6 +23008,93 @@ test "Review unchanged tail keeps handler redraw skip" {
     try app.update(.git_action_spinner_tick, &ctx);
     try std.testing.expect(ctx.redrawWasSuppressed());
     try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+}
+
+test "canonical noop commit clearing failure banner forces frame" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
+    try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, "MM a\x00");
+    try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
+
+    // A previous watch failure left a banner; this cycle finds the same
+    // content again (noop commit) and recovers that failure.
+    const failure = app_auto_reload.FailureIdentity.init("watch failed");
+    app.pages.review.auto_reload.last_failure = failure;
+    app.pages.review.status.setSourceReloadFailure(
+        failure.digest,
+        "auto reload failed: {s}",
+        .{"boom"},
+    );
+
+    // The unchanged source terminal lands on a skip-latched cycle; the tail's
+    // noop commit clears the banner and must still produce a frame.
+    ctx.resetRedrawSuppressed();
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .source = .{
+        .identity = reads.source_identity,
+        .read_epoch = reads.source_read_epoch,
+        .generation = reads.source_generation,
+        .background_cycle_id = reads.source_cycle_id,
+        .result = .{ .unchanged = content_fingerprint.Fingerprint.init("test source") },
+    } } }), &ctx);
+
+    try std.testing.expect(app.pages.review.canonical_publication == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, app.pages.review.status.text(), "auto reload failed") == null,
+    );
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+}
+
+test "canonical noop commit without projection kind clears banner and forces frame" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    // Baseline where the gate path resolves no canonical projection kind:
+    // the entry is unstaged-only, so the commit takes the kind-less noop
+    // branch instead of the displayed-match branch.
+    var unstaged_baseline = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try app.pages.review.git_status.replace(roots.a, &unstaged_baseline);
+
+    const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
+    try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, " M a\x00");
+    try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
+
+    const failure = app_auto_reload.FailureIdentity.init("watch failed");
+    app.pages.review.auto_reload.last_failure = failure;
+    app.pages.review.status.setSourceReloadFailure(
+        failure.digest,
+        "auto reload failed: {s}",
+        .{"boom"},
+    );
+
+    ctx.resetRedrawSuppressed();
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .source = .{
+        .identity = reads.source_identity,
+        .read_epoch = reads.source_read_epoch,
+        .generation = reads.source_generation,
+        .background_cycle_id = reads.source_cycle_id,
+        .result = .{ .unchanged = content_fingerprint.Fingerprint.init("test source") },
+    } } }), &ctx);
+
+    try std.testing.expect(app.pages.review.canonical_publication == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, app.pages.review.status.text(), "auto reload failed") == null,
+    );
+    try std.testing.expect(!ctx.redrawWasSuppressed());
 }
 
 test "Review boundary repair revalidation starts in the same update cycle" {

@@ -1886,17 +1886,20 @@ pub const Controller = struct {
         return null;
     }
 
+    /// Returns true when the accepted fingerprint recovered a previously
+    /// bannered source failure and its banner was actually cleared: even a
+    /// noop commit changes visible status state in that case.
     fn commitCanonicalNoop(
         self: Controller,
         allocator: std.mem.Allocator,
-    ) void {
-        const gate = if (self.page.canonical_publication) |*value| value else return;
-        var deferred = self.page.deferred_source_apply orelse return;
+    ) bool {
+        const gate = if (self.page.canonical_publication) |*value| value else return false;
+        var deferred = self.page.deferred_source_apply orelse return false;
         std.debug.assert(deferred.mode == .canonical_publication);
         std.debug.assert(deferred.finished.generation == gate.source_generation);
         if (!self.sourceTerminalOwnsPending(&deferred.finished)) {
             self.abortCanonicalPublication(allocator);
-            return;
+            return false;
         }
         const fingerprint = canonicalSourceFingerprint(&deferred);
         const source_completion = self.page.action_cursor.captureCompletion(
@@ -1908,8 +1911,9 @@ pub const Controller = struct {
         defer pending_reload.deinit(allocator);
         self.page.deferred_source_apply = null;
         self.page.status_load.markSuccess();
+        var banner_cleared = false;
         if (self.acceptSourceFingerprint(fingerprint)) |failure| {
-            _ = self.page.status.clearSourceReloadFailure(failure.digest);
+            banner_cleared = self.page.status.clearSourceReloadFailure(failure.digest);
         }
         _ = self.page.activation.finishMember(
             deferred.finished.identity,
@@ -1930,6 +1934,7 @@ pub const Controller = struct {
         var finished_gate = self.page.canonical_publication.?;
         self.page.canonical_publication = null;
         finished_gate.deinit(allocator);
+        return banner_cleared;
     }
 
     fn commitCanonicalPrimary(
@@ -2074,8 +2079,7 @@ pub const Controller = struct {
         const status_changes = gate.status.changesSnapshot();
         const projection_kind = self.canonicalProjectionKind(gate) orelse {
             if (!source_changes and !status_changes) {
-                self.commitCanonicalNoop(allocator);
-                return .{};
+                return .{ .display_changed = self.commitCanonicalNoop(allocator) };
             }
             try self.commitCanonicalPrimary(allocator);
             return .{ .display_changed = true };
@@ -2097,8 +2101,7 @@ pub const Controller = struct {
                 self.page.source_session_revision,
                 self.page.status_snapshot_revision,
             )) {
-                self.commitCanonicalNoop(allocator);
-                return .{};
+                return .{ .display_changed = self.commitCanonicalNoop(allocator) };
             }
         }
         const expected_presentation = self.canonicalExpectedPresentation(gate, target);
