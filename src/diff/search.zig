@@ -241,6 +241,116 @@ test "search match ignores hidden patch metadata" {
     try expectMatch(.{ .metadata = 3 }, findMatch(file, .unified, "old mode", null, .forward));
 }
 
+test "search offsets stay aligned with rendered offsets across row kinds" {
+    const file = bridgeProbeFile();
+
+    // Unified: visible metadata, headers, and every hunk line count one row
+    // each; the hidden metadata line occupies no offset.
+    try expectRenderedOffset(file, .unified, .{ .metadata = 1 }, 0);
+    try expectRenderedOffset(file, .unified, .{ .hunk_header = 0 }, 1);
+    try expectRenderedOffset(file, .unified, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } }, 2);
+    try expectRenderedOffset(file, .unified, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } }, 3);
+    try expectRenderedOffset(file, .unified, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } }, 4);
+    try expectRenderedOffset(file, .unified, .{ .hunk_header = 1 }, 5);
+    try expectRenderedOffset(file, .unified, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } }, 6);
+
+    // Side-by-side: the removed/added pair shares one rendered row.
+    try expectRenderedOffset(file, .side_by_side, .{ .metadata = 1 }, 0);
+    try expectRenderedOffset(file, .side_by_side, .{ .hunk_header = 0 }, 1);
+    try expectRenderedOffset(file, .side_by_side, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } }, 2);
+    try expectRenderedOffset(file, .side_by_side, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } }, 3);
+    try expectRenderedOffset(file, .side_by_side, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } }, 3);
+    try expectRenderedOffset(file, .side_by_side, .{ .hunk_header = 1 }, 4);
+    try expectRenderedOffset(file, .side_by_side, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } }, 5);
+
+    const binary = bridgeProbeBinaryFile();
+    try expectRenderedOffset(binary, .unified, .{ .metadata = 1 }, 0);
+    try expectRenderedOffset(binary, .unified, .binary_marker, 1);
+}
+
+test "search base and direction probes traverse rendered row order" {
+    const file = bridgeProbeFile();
+
+    // Unified forward chain from every row kind, plus wrap at both ends.
+    try expectMatch(.{ .metadata = 1 }, findMatch(file, .unified, "QQ", null, .forward));
+    try expectMatch(.{ .hunk_header = 0 }, findMatch(file, .unified, "QQ", .{ .metadata = 1 }, .forward));
+    try expectMatch(.{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } }, findMatch(file, .unified, "QQ", .{ .hunk_header = 0 }, .forward));
+    try expectMatch(.{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } }, findMatch(file, .unified, "QQ", .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } }, .forward));
+    try expectMatch(.{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } }, findMatch(file, .unified, "QQ", .{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } }, .forward));
+    try expectMatch(.{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } }, findMatch(file, .unified, "QQ", .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } }, .forward));
+    try expectMatch(.{ .metadata = 1 }, findMatch(file, .unified, "QQ", .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } }, .forward));
+
+    // Unified backward chain, plus wrap.
+    try expectMatch(.{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } }, findMatch(file, .unified, "QQ", .{ .metadata = 1 }, .backward));
+    try expectMatch(.{ .metadata = 1 }, findMatch(file, .unified, "QQ", .{ .hunk_header = 0 }, .backward));
+    try expectMatch(.{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } }, findMatch(file, .unified, "QQ", .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } }, .backward));
+
+    // Side-by-side: the context row precedes the shared pair row; the pair
+    // reports its removed side first and both sides share one offset.
+    try expectMatch(.{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } }, findMatch(file, .side_by_side, "QQ", .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } }, .forward));
+    try expectMatch(.{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } }, findMatch(file, .side_by_side, "QQ", .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } }, .forward));
+    try expectMatch(.{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } }, findMatch(file, .side_by_side, "QQ", .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } }, .backward));
+
+    // Binary marker participates in the same offset space.
+    const binary = bridgeProbeBinaryFile();
+    try expectMatch(.binary_marker, findMatch(binary, .unified, "Binary", null, .forward));
+    try expectMatch(.binary_marker, findMatch(binary, .unified, "Binary", .{ .metadata = 1 }, .forward));
+}
+
+fn expectRenderedOffset(
+    file: diff_parser.FileDiff,
+    mode: diff_view_model.DisplayMode,
+    coordinate: diff_view_model.BodyCoordinate,
+    expected: usize,
+) !void {
+    try std.testing.expectEqual(
+        @as(?usize, expected),
+        diff_view_model.renderedOffsetForCoordinate(file, mode, coordinate, null),
+    );
+}
+
+fn bridgeProbeFile() diff_parser.FileDiff {
+    return .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{ "index 1..2", "old mode QQ" },
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 2,
+                .new_start = 1,
+                .new_count = 2,
+                .section = "QQ head",
+                .lines = &.{
+                    .{ .kind = .context, .text = "QQ ctx", .old_line = 1, .new_line = 1 },
+                    .{ .kind = .removed, .text = "QQ gone", .old_line = 2 },
+                    .{ .kind = .added, .text = "QQ came", .new_line = 2 },
+                },
+            },
+            .{
+                .old_start = 20,
+                .old_count = 1,
+                .new_start = 20,
+                .new_count = 1,
+                .section = "plain",
+                .lines = &.{
+                    .{ .kind = .context, .text = "QQ tail", .old_line = 20, .new_line = 20 },
+                },
+            },
+        },
+    };
+}
+
+fn bridgeProbeBinaryFile() diff_parser.FileDiff {
+    return .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{ "index 1..2", "old mode QQ" },
+        .is_binary = true,
+        .hunks = &.{},
+    };
+}
+
 fn expectMatch(expected: diff_view_model.BodyCoordinate, actual: ?Match) !void {
     try std.testing.expect(actual != null);
     try std.testing.expect(std.meta.eql(expected, actual.?.coordinate));

@@ -57,6 +57,7 @@ pub const BodyRowIterator = struct {
     line_index: usize = 0,
     side_by_side_rows: SideBySideIndexedIterator = .init(&.{}),
     folded_hunks: []const bool = &.{},
+    last_metadata_index: ?usize = null,
     last_unified_line_index: ?usize = null,
     last_side_by_side_row: ?SideBySideIndexedRow = null,
 
@@ -162,6 +163,7 @@ pub const BodyRowIterator = struct {
     }
 
     pub fn next(self: *BodyRowIterator) ?BodyRow {
+        self.last_metadata_index = null;
         self.last_unified_line_index = null;
         self.last_side_by_side_row = null;
         while (true) {
@@ -171,6 +173,7 @@ pub const BodyRowIterator = struct {
                         const line = self.file.metadata[self.metadata_index];
                         self.metadata_index += 1;
                         if (!isVisibleMetadataLine(line)) continue;
+                        self.last_metadata_index = self.metadata_index - 1;
                         return .{ .metadata = line };
                     }
                     self.phase = if (self.file.is_binary) .binary else .hunk_header;
@@ -234,6 +237,12 @@ pub const BodyRowIterator = struct {
             .hunk_header, .hunk_lines => if (self.hunk_index < self.file.hunks.len) self.hunk_index else null,
             else => null,
         };
+    }
+
+    /// Original `file.metadata` index of the most recent `.metadata` row
+    /// (hidden metadata lines keep their indices in that space).
+    pub fn currentMetadataIndex(self: BodyRowIterator) ?usize {
+        return self.last_metadata_index;
     }
 
     pub fn currentUnifiedLineIndex(self: BodyRowIterator) ?usize {
@@ -765,6 +774,23 @@ test "body line offsets account for metadata and side-by-side pairs" {
     try std.testing.expectEqual(@as(usize, 5), renderedBodyLineCount(file, .side_by_side));
     try std.testing.expectEqual(@as(usize, 4), hunkBodyLineOffset(file, .unified, 1));
     try std.testing.expectEqual(@as(usize, 6), renderedBodyLineCount(file, .unified));
+}
+
+test "BodyRowIterator tracks current metadata index across hidden lines" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{ "index 1..2", "old mode 100644", "--- a/a", "new mode 100755" },
+        .hunks = &.{},
+    };
+
+    var rows = BodyRowIterator.init(file, .unified);
+    try std.testing.expectEqual(@as(?usize, null), rows.currentMetadataIndex());
+    try std.testing.expect(rows.next().? == .metadata);
+    try std.testing.expectEqual(@as(?usize, 1), rows.currentMetadataIndex());
+    try std.testing.expect(rows.next().? == .metadata);
+    try std.testing.expectEqual(@as(?usize, 3), rows.currentMetadataIndex());
+    try std.testing.expect(rows.next() == null);
+    try std.testing.expectEqual(@as(?usize, null), rows.currentMetadataIndex());
 }
 
 test "BodyRowIterator tracks current unified hunk line index" {
