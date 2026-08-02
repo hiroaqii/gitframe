@@ -329,11 +329,26 @@ test "diffSurface adapter exposes shared field pointers without copying" {
     defer state.deinit(allocator);
 
     var surface = state.diffSurface(.unstaged, .{ .width = 80, .height = 24 });
+    try std.testing.expectEqual(&state.activation, surface.activation);
+    try std.testing.expectEqual(&state.status, surface.status);
+    try std.testing.expectEqual(&state.load, surface.load);
     try std.testing.expectEqual(&state.viewer, surface.viewer);
     try std.testing.expectEqual(&state.search, surface.search);
+    try std.testing.expectEqual(&state.file_search, surface.file_search);
+    try std.testing.expectEqual(&state.file_search_return_focus, surface.file_search_return_focus);
+    try std.testing.expectEqual(&state.accepted_sidebar_revision, surface.accepted_sidebar_revision);
+    try std.testing.expectEqual(&state.review_display, surface.review_display);
+    try std.testing.expectEqual(&state.reviewed_store, surface.reviewed_store);
+    try std.testing.expectEqual(&state.tree_order, surface.tree_order);
+    try std.testing.expectEqual(&state.tree_order_scope, surface.tree_order_scope);
+    try std.testing.expectEqual(&state.selection_owner, surface.selection_owner);
     try std.testing.expectEqual(&state.completed_selection, surface.completed_selection);
+    try std.testing.expectEqual(&state.source_session_revision, surface.source_session_revision);
+    try std.testing.expectEqual(&state.pending_initial_first_visible_selection, surface.pending_initial_first_visible_selection);
     try std.testing.expect(surface.reload_anchor == null);
     try std.testing.expect(!surface.live_drag_deferred_source);
+    try std.testing.expectEqual(diff_source.SourceMode.unstaged, surface.source);
+    try std.testing.expectEqual(diff_surface.Layout{ .width = 80, .height = 24 }, surface.layout);
 
     surface.viewer.diff_scroll = 7;
     try std.testing.expectEqual(@as(usize, 7), state.viewer.diff_scroll);

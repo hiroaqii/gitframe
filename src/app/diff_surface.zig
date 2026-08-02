@@ -23,6 +23,8 @@ const review_state = @import("../review/state.zig");
 
 pub const authority = @import("diff_surface/authority.zig");
 pub const file_search = @import("diff_surface/file_search.zig");
+pub const layout = @import("diff_surface/layout.zig");
+pub const navigation = @import("diff_surface/navigation.zig");
 pub const selection = @import("diff_surface/selection.zig");
 
 pub const Focus = enum {
@@ -153,12 +155,9 @@ pub const NormalLoadedDiffSelectionTarget = struct {
     identity: diff_selection.Identity,
 };
 
-pub const ParsedSelectionTarget = struct {
-    file: diff_parser.FileDiff,
-    line_index: diff_view_model.RenderedLineIndex,
-    folded_hunks: []const bool,
-    identity: diff_selection.Identity,
-};
+pub const ParsedSelectionTarget = navigation.ParsedSelectionTarget;
+pub const SelectionRegion = navigation.SelectionRegion;
+pub const ParsedMouseLine = navigation.ParsedMouseLine;
 
 pub const RawDiffPaneGeometry = struct { col: u16, width: u16 };
 
@@ -201,5 +200,7 @@ pub const DiffSurface = struct {
 test {
     _ = authority;
     _ = file_search;
+    _ = layout;
+    _ = navigation;
     _ = selection;
 }
