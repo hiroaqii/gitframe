@@ -1,0 +1,205 @@
+//! Page-independent read-only diff surface shared by Review and, from issue
+//! #34 on, the Compare page.
+//!
+//! This module owns the shared view-state vocabulary (viewer, search,
+//! file-search, selection, activation) and the `DiffSurface` pointer bundle
+//! that page adapters build per call. It must not import any page namespace
+//! (`pages/review*`, `pages/compare*`): pages depend on the surface, never the
+//! other way around.
+
+const std = @import("std");
+const load_state = @import("load_state.zig");
+const app_state = @import("state.zig");
+const prompt = @import("prompt.zig");
+const context = @import("../context.zig");
+const diff_render = @import("../diff/render.zig");
+const diff_search = @import("../diff/search.zig");
+const diff_selection = @import("../diff/selection.zig");
+const diff_source = @import("../diff/source.zig");
+const diff_parser = @import("../diff/parser.zig");
+const diff_view_model = @import("../diff/view_model.zig");
+const file_tree = @import("../file_tree.zig");
+const review_state = @import("../review/state.zig");
+
+pub const authority = @import("diff_surface/authority.zig");
+pub const file_search = @import("diff_surface/file_search.zig");
+pub const selection = @import("diff_surface/selection.zig");
+
+pub const Focus = enum {
+    sidebar,
+    diff,
+
+    pub fn toggled(self: Focus) Focus {
+        return switch (self) {
+            .sidebar => .diff,
+            .diff => .sidebar,
+        };
+    }
+};
+
+pub const ViewOptions = struct {
+    line_numbers: bool = true,
+
+    pub fn toggleLineNumbers(self: *ViewOptions) void {
+        self.line_numbers = !self.line_numbers;
+    }
+};
+
+pub const ViewerState = struct {
+    /// Sticky target shown in the diff pane or used by file actions.
+    ///
+    /// Directory sidebar rows can be selected without changing this value.
+    selected_target: ?context.SelectedTarget = .{ .diff_file = 0 },
+    /// Sidebar cursor. This may point at a directory, diff file, or later a
+    /// status-only row; it is not necessarily the action target.
+    selected_node: usize = 0,
+    focus: Focus = .sidebar,
+    sidebar_hidden: bool = false,
+    sidebar_width: ?u16 = null,
+    sidebar_horizontal_scroll: usize = 0,
+    diff_scroll: usize = 0,
+    diff_horizontal_scroll: usize = 0,
+    diff_cursor: diff_view_model.BodyCoordinate = .{ .metadata = 0 },
+    display_mode: diff_render.DisplayMode = .side_by_side,
+    view_options: ViewOptions = .{},
+};
+
+pub const DiffSearchState = struct {
+    mode: bool = false,
+    input: prompt.TextInput = .{},
+    query: prompt.TextInput = .{},
+    match: ?diff_search.Match = null,
+    /// Rendered body-line offset cache for match. Recomputed when display
+    /// mode, fold state, or selected file changes.
+    match_offset: ?usize = null,
+};
+
+pub const ReloadAnchor = struct {
+    /// Sticky main-pane file identity. A directory/root sidebar cursor does not
+    /// replace this target.
+    path_key: []u8,
+    /// Exact sidebar cursor identity, independently owned from `path_key`.
+    sidebar_identity: context.SidebarIdentity,
+    selected_target_tag: std.meta.Tag(context.SelectedTarget),
+    visible_sidebar_row: usize,
+    diff_cursor: diff_view_model.BodyCoordinate,
+    diff_cursor_offset: ?usize,
+    diff_scroll: usize,
+    diff_horizontal_scroll: usize,
+    sidebar_horizontal_scroll: usize,
+    search_coordinate: ?diff_view_model.BodyCoordinate,
+
+    pub fn deinit(self: *ReloadAnchor, allocator: std.mem.Allocator) void {
+        allocator.free(self.path_key);
+        switch (self.sidebar_identity) {
+            .repo_root => {},
+            inline .directory, .file => |path| allocator.free(path),
+        }
+        self.* = undefined;
+    }
+};
+
+/// Geometry after the shell frame has converted terminal coordinates into the
+/// active page content rectangle.
+pub const Layout = struct { width: u16, height: u16 };
+
+pub const DiagnosticSink = struct {
+    target: *app_state.StatusMessage,
+
+    pub fn set(self: DiagnosticSink, comptime fmt: []const u8, args: anytype) void {
+        self.target.set(fmt, args);
+    }
+};
+
+pub const MousePoint = struct { col: u16, row: u16 };
+
+pub const DiffMouseHit = struct {
+    identity: diff_selection.Identity,
+    side: diff_selection.Side,
+    mode: diff_selection.Mode,
+    point: diff_selection.Point,
+};
+
+pub const DiffHeaderTarget = struct {
+    identity: diff_selection.HeaderIdentity,
+    display_path: []const u8,
+};
+
+pub const DisplayNavigationSnapshot = struct {
+    selected_target: ?context.SelectedTarget,
+    selected_node: usize,
+    diff_cursor: diff_view_model.BodyCoordinate,
+    diff_scroll: usize,
+    diff_horizontal_scroll: usize,
+    sidebar_horizontal_scroll: usize,
+    search_coordinate: ?diff_view_model.BodyCoordinate,
+    search_match_offset: ?usize,
+    display_mode: diff_render.DisplayMode,
+};
+
+pub const invalid_utf8_body_message = "Text preview unavailable: diff content is not valid UTF-8";
+
+pub const HunkInteractionAvailability = enum {
+    available,
+    unavailable,
+    inert_invalid_utf8,
+};
+
+pub const NormalLoadedDiffSelectionTarget = struct {
+    file_index: usize,
+    file: diff_parser.FileDiff,
+    line_index: diff_view_model.RenderedLineIndex,
+    folded_hunks: []const bool,
+    identity: diff_selection.Identity,
+};
+
+pub const ParsedSelectionTarget = struct {
+    file: diff_parser.FileDiff,
+    line_index: diff_view_model.RenderedLineIndex,
+    folded_hunks: []const bool,
+    identity: diff_selection.Identity,
+};
+
+pub const RawDiffPaneGeometry = struct { col: u16, width: u16 };
+
+pub const SearchTarget = struct {
+    file: diff_parser.FileDiff,
+    line_index: diff_view_model.RenderedLineIndex,
+    folded_hunks: []const bool,
+};
+
+/// Borrowed, per-call view over one page's shared read-only diff state.
+///
+/// Pages own the fields; an adapter (`ReviewPageState.diffSurface`) builds this
+/// bundle on demand, so no field moves and no long-lived aliasing exists. The
+/// two partial-lift members are narrowed on purpose: the surface sees a reload
+/// anchor and whether a live-drag deferred source apply is held, never the
+/// page's rich reload/deferred owners (issue #34 design, field table).
+pub const DiffSurface = struct {
+    activation: *authority.Lifecycle,
+    status: *app_state.StatusMessage,
+    load: *load_state.LoadRuntimeState,
+    viewer: *ViewerState,
+    search: *DiffSearchState,
+    file_search: *file_search.State,
+    file_search_return_focus: *Focus,
+    accepted_sidebar_revision: *u64,
+    review_display: *app_state.ReviewDisplayState,
+    reviewed_store: *review_state.Store,
+    tree_order: *file_tree.StableOrder,
+    tree_order_scope: *?[]u8,
+    selection_owner: *diff_selection.Owner,
+    completed_selection: *?selection.CompletedSelection,
+    source_session_revision: *u64,
+    pending_initial_first_visible_selection: *bool,
+    reload_anchor: ?*const ReloadAnchor,
+    live_drag_deferred_source: bool,
+    source: diff_source.SourceMode,
+    layout: Layout,
+};
+
+test {
+    _ = authority;
+    _ = file_search;
+    _ = selection;
+}

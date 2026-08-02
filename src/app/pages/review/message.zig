@@ -4,7 +4,7 @@
 //! Shell/global commands are intentionally absent. A producer must pass shell
 //! precedence before it can create one of these page-local messages.
 
-pub const MousePoint = struct { col: u16, row: u16 };
+pub const MousePoint = @import("../../diff_surface.zig").MousePoint;
 
 pub const Msg = union(enum) {
     cancel_search,

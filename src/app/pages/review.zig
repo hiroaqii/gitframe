@@ -22,55 +22,13 @@ const file_tree = @import("../../file_tree.zig");
 const git_branch_status = @import("../../git/branch_status.zig");
 const git_status = @import("../../git/status.zig");
 const review_state = @import("../../review/state.zig");
+const diff_surface = @import("../diff_surface.zig");
 
-pub const Focus = enum {
-    sidebar,
-    diff,
-
-    pub fn toggled(self: Focus) Focus {
-        return switch (self) {
-            .sidebar => .diff,
-            .diff => .sidebar,
-        };
-    }
-};
-
-pub const ViewOptions = struct {
-    line_numbers: bool = true,
-
-    pub fn toggleLineNumbers(self: *ViewOptions) void {
-        self.line_numbers = !self.line_numbers;
-    }
-};
-
-pub const ViewerState = struct {
-    /// Sticky target shown in the diff pane or used by file actions.
-    ///
-    /// Directory sidebar rows can be selected without changing this value.
-    selected_target: ?context.SelectedTarget = .{ .diff_file = 0 },
-    /// Sidebar cursor. This may point at a directory, diff file, or later a
-    /// status-only row; it is not necessarily the action target.
-    selected_node: usize = 0,
-    focus: Focus = .sidebar,
-    sidebar_hidden: bool = false,
-    sidebar_width: ?u16 = null,
-    sidebar_horizontal_scroll: usize = 0,
-    diff_scroll: usize = 0,
-    diff_horizontal_scroll: usize = 0,
-    diff_cursor: diff_view_model.BodyCoordinate = .{ .metadata = 0 },
-    display_mode: diff_render.DisplayMode = .side_by_side,
-    view_options: ViewOptions = .{},
-};
-
-pub const DiffSearchState = struct {
-    mode: bool = false,
-    input: prompt.TextInput = .{},
-    query: prompt.TextInput = .{},
-    match: ?diff_search.Match = null,
-    /// Rendered body-line offset cache for match. Recomputed when display
-    /// mode, fold state, or selected file changes.
-    match_offset: ?usize = null,
-};
+pub const Focus = diff_surface.Focus;
+pub const ViewOptions = diff_surface.ViewOptions;
+pub const ViewerState = diff_surface.ViewerState;
+pub const DiffSearchState = diff_surface.DiffSearchState;
+pub const ReloadAnchor = diff_surface.ReloadAnchor;
 
 pub const ReloadKind = enum {
     initial,
@@ -78,31 +36,6 @@ pub const ReloadKind = enum {
     watch,
     action_result,
     repo_switch,
-};
-
-pub const ReloadAnchor = struct {
-    /// Sticky main-pane file identity. A directory/root sidebar cursor does not
-    /// replace this target.
-    path_key: []u8,
-    /// Exact sidebar cursor identity, independently owned from `path_key`.
-    sidebar_identity: context.SidebarIdentity,
-    selected_target_tag: std.meta.Tag(context.SelectedTarget),
-    visible_sidebar_row: usize,
-    diff_cursor: diff_view_model.BodyCoordinate,
-    diff_cursor_offset: ?usize,
-    diff_scroll: usize,
-    diff_horizontal_scroll: usize,
-    sidebar_horizontal_scroll: usize,
-    search_coordinate: ?diff_view_model.BodyCoordinate,
-
-    pub fn deinit(self: *ReloadAnchor, allocator: std.mem.Allocator) void {
-        allocator.free(self.path_key);
-        switch (self.sidebar_identity) {
-            .repo_root => {},
-            inline .directory, .file => |path| allocator.free(path),
-        }
-        self.* = undefined;
-    }
 };
 
 pub const PendingReload = struct {
@@ -353,7 +286,88 @@ pub const ReviewPageState = struct {
         if (self.pending_display_navigation_restore) |*restore| restore.deinit(allocator);
         self.* = .{};
     }
+
+    /// Builds the page-independent read-only surface view over this page's
+    /// shared fields. The bundle is a short-lived borrow for the current
+    /// update/render call; nothing may retain it across a state mutation.
+    pub fn diffSurface(
+        self: *ReviewPageState,
+        source: diff_source.SourceMode,
+        layout: diff_surface.Layout,
+    ) diff_surface.DiffSurface {
+        return .{
+            .activation = &self.activation,
+            .status = &self.status,
+            .load = &self.load,
+            .viewer = &self.viewer,
+            .search = &self.search,
+            .file_search = &self.file_search,
+            .file_search_return_focus = &self.file_search_return_focus,
+            .accepted_sidebar_revision = &self.accepted_sidebar_revision,
+            .review_display = &self.review_display,
+            .reviewed_store = &self.reviewed_store,
+            .tree_order = &self.tree_order,
+            .tree_order_scope = &self.tree_order_scope,
+            .selection_owner = &self.selection_owner,
+            .completed_selection = &self.completed_selection,
+            .source_session_revision = &self.source_session_revision,
+            .pending_initial_first_visible_selection = &self.pending_initial_first_visible_selection,
+            .reload_anchor = if (self.pending_reload) |*pending|
+                (if (pending.anchor) |*anchor| anchor else null)
+            else
+                null,
+            .live_drag_deferred_source = self.deferredSourceBlocksPageTransition(),
+            .source = source,
+            .layout = layout,
+        };
+    }
 };
+
+test "diffSurface adapter exposes shared field pointers without copying" {
+    const allocator = std.testing.allocator;
+    var state: ReviewPageState = .{};
+    defer state.deinit(allocator);
+
+    var surface = state.diffSurface(.unstaged, .{ .width = 80, .height = 24 });
+    try std.testing.expectEqual(&state.viewer, surface.viewer);
+    try std.testing.expectEqual(&state.search, surface.search);
+    try std.testing.expectEqual(&state.completed_selection, surface.completed_selection);
+    try std.testing.expect(surface.reload_anchor == null);
+    try std.testing.expect(!surface.live_drag_deferred_source);
+
+    surface.viewer.diff_scroll = 7;
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.diff_scroll);
+
+    state.pending_reload = .{
+        .generation = 1,
+        .kind = .manual,
+        .anchor = .{
+            .path_key = try allocator.dupe(u8, "src/main.zig"),
+            .sidebar_identity = .repo_root,
+            .selected_target_tag = .diff_file,
+            .visible_sidebar_row = 0,
+            .diff_cursor = .{ .metadata = 0 },
+            .diff_cursor_offset = null,
+            .diff_scroll = 0,
+            .diff_horizontal_scroll = 0,
+            .sidebar_horizontal_scroll = 0,
+            .search_coordinate = null,
+        },
+    };
+    state.deferred_source_apply = .{
+        .finished = .{
+            .identity = page.RequestIdentity.review(0, 1),
+            .generation = 2,
+            .result = .{ .failed_static = "surface test terminal" },
+        },
+        .cycle_id = 1,
+    };
+
+    const resolved = state.diffSurface(.unstaged, .{ .width = 80, .height = 24 });
+    try std.testing.expect(resolved.reload_anchor != null);
+    try std.testing.expectEqualStrings("src/main.zig", resolved.reload_anchor.?.path_key);
+    try std.testing.expect(resolved.live_drag_deferred_source);
+}
 
 test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
     const allocator = std.testing.allocator;

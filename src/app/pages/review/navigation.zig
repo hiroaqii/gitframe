@@ -49,43 +49,14 @@ const HorizontalDirection = app_direction.Horizontal;
 const SizeDirection = app_direction.Size;
 const VerticalDirection = app_direction.Vertical;
 
-/// Geometry after the shell frame has converted terminal coordinates into the
-/// active page content rectangle.
-pub const Layout = struct { width: u16, height: u16 };
+const diff_surface = @import("../../diff_surface.zig");
 
-pub const DiagnosticSink = struct {
-    target: *app_state.StatusMessage,
-
-    fn set(self: DiagnosticSink, comptime fmt: []const u8, args: anytype) void {
-        self.target.set(fmt, args);
-    }
-};
-
+pub const Layout = diff_surface.Layout;
+pub const DiagnosticSink = diff_surface.DiagnosticSink;
 pub const MousePoint = review_message.MousePoint;
-
-pub const DiffMouseHit = struct {
-    identity: diff_selection.Identity,
-    side: diff_selection.Side,
-    mode: diff_selection.Mode,
-    point: diff_selection.Point,
-};
-
-pub const DiffHeaderTarget = struct {
-    identity: diff_selection.HeaderIdentity,
-    display_path: []const u8,
-};
-
-pub const DisplayNavigationSnapshot = struct {
-    selected_target: ?context.SelectedTarget,
-    selected_node: usize,
-    diff_cursor: diff_view_model.BodyCoordinate,
-    diff_scroll: usize,
-    diff_horizontal_scroll: usize,
-    sidebar_horizontal_scroll: usize,
-    search_coordinate: ?diff_view_model.BodyCoordinate,
-    search_match_offset: ?usize,
-    display_mode: diff_render.DisplayMode,
-};
+pub const DiffMouseHit = diff_surface.DiffMouseHit;
+pub const DiffHeaderTarget = diff_surface.DiffHeaderTarget;
+pub const DisplayNavigationSnapshot = diff_surface.DisplayNavigationSnapshot;
 
 pub const ActiveDiffDisplay = union(enum) {
     loaded: struct {
@@ -153,13 +124,9 @@ pub fn projectedHunkStagePresentation(
     return .{ .per_hunk = presentation };
 }
 
-pub const invalid_utf8_body_message = "Text preview unavailable: diff content is not valid UTF-8";
+pub const invalid_utf8_body_message = diff_surface.invalid_utf8_body_message;
 
-pub const HunkInteractionAvailability = enum {
-    available,
-    unavailable,
-    inert_invalid_utf8,
-};
+pub const HunkInteractionAvailability = diff_surface.HunkInteractionAvailability;
 
 /// Borrowed reference to the fresh index authority paired with the current
 /// presentation. The explicit union keeps a real two-component mixed
@@ -253,28 +220,10 @@ pub const DisplayedReviewBody = union(enum) {
     pending,
 };
 
-pub const NormalLoadedDiffSelectionTarget = struct {
-    file_index: usize,
-    file: diff_parser.FileDiff,
-    line_index: diff_view_model.RenderedLineIndex,
-    folded_hunks: []const bool,
-    identity: diff_selection.Identity,
-};
-
-pub const ParsedSelectionTarget = struct {
-    file: diff_parser.FileDiff,
-    line_index: diff_view_model.RenderedLineIndex,
-    folded_hunks: []const bool,
-    identity: diff_selection.Identity,
-};
-
-pub const RawDiffPaneGeometry = struct { col: u16, width: u16 };
-
-pub const SearchTarget = struct {
-    file: diff_parser.FileDiff,
-    line_index: diff_view_model.RenderedLineIndex,
-    folded_hunks: []const bool,
-};
+pub const NormalLoadedDiffSelectionTarget = diff_surface.NormalLoadedDiffSelectionTarget;
+pub const ParsedSelectionTarget = diff_surface.ParsedSelectionTarget;
+pub const RawDiffPaneGeometry = diff_surface.RawDiffPaneGeometry;
+pub const SearchTarget = diff_surface.SearchTarget;
 
 pub const View = struct {
     page: *const review_page.ReviewPageState,
