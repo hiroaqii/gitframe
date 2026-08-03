@@ -7,6 +7,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const keymap = @import("keymap");
+const diff_surface_input = @import("../../diff_surface/input.zig");
 const key_input = @import("../../key_input.zig");
 const review_page = @import("../review.zig");
 const review_message = @import("message.zig");
@@ -21,39 +22,24 @@ pub const Context = struct {
     sidebar_hidden: bool = false,
     review_mode: bool = false,
     keymap: keymap.Effective = .{},
+
+    fn shared(self: Context) diff_surface_input.Context {
+        return .{
+            .search_mode = self.search_mode,
+            .file_search_mode = self.file_search_mode,
+        };
+    }
 };
 
 pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
-    if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
-    if (context.search_mode) return .{ .search_paste = text };
-    if (context.file_search_mode) return .{ .file_search_paste = text };
-    return null;
+    return review_message.fromShared(diff_surface_input.pasteToMsg(context.shared(), text) orelse return null);
 }
 
 pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
-    if (context.search_mode) return searchKeyToMsg(key);
-    if (context.file_search_mode) return fileSearchKeyToMsg(key);
+    if (context.search_mode or context.file_search_mode) {
+        return review_message.fromShared(diff_surface_input.keyToMsg(context.shared(), key) orelse return null);
+    }
     return normalKeyToMsg(context, key);
-}
-
-fn searchKeyToMsg(key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{})) return .cancel_search;
-    if (key.matches(chasen.Key.enter, .{})) return .submit_search;
-    if (key.matches(chasen.Key.backspace, .{})) return .search_backspace;
-    if (key.matches(chasen.Key.left, .{})) return .search_move_left;
-    if (key.matches(chasen.Key.right, .{})) return .search_move_right;
-    if (key_input.textInputCodepoint(key)) |codepoint| return .{ .search_insert = codepoint };
-    return null;
-}
-
-fn fileSearchKeyToMsg(key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{})) return .cancel_file_search;
-    if (key.matches(chasen.Key.enter, .{})) return .submit_file_search;
-    if (key.matches(chasen.Key.backspace, .{})) return .file_search_backspace;
-    if (key.matches(chasen.Key.up, .{})) return .file_search_previous;
-    if (key.matches(chasen.Key.down, .{})) return .file_search_next;
-    if (key_input.textInputCodepoint(key)) |codepoint| return .{ .file_search_insert = codepoint };
-    return null;
 }
 
 fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {

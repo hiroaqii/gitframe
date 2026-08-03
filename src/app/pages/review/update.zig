@@ -72,8 +72,8 @@ pub const Controller = struct {
     pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: message.Msg) !ReviewUpdate {
         var result: ReviewUpdate = .{};
         var adapter = self.navigation.updateAdapter();
-        if (try adapter.shared().apply(allocator, msg)) |handled| {
-            var shared_update = handled;
+        if (msg.shared()) |shared_msg| {
+            var shared_update = try adapter.shared().apply(allocator, shared_msg);
             defer shared_update.deinit(allocator);
             if (shared_update.takeEffect()) |effect| result.command = commandFromEffect(effect);
 

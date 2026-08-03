@@ -4,6 +4,8 @@
 //! Shell/global commands are intentionally absent. A producer must pass shell
 //! precedence before it can create one of these page-local messages.
 
+const shared_message = @import("../../diff_surface/message.zig");
+
 pub const MousePoint = @import("../../diff_surface.zig").MousePoint;
 
 pub const Msg = union(enum) {
@@ -82,4 +84,77 @@ pub const Msg = union(enum) {
     finish_review_approved,
     finish_review_needs_changes,
     finish_review_canceled,
+
+    /// Narrows the flat Review-compatible vocabulary to shared read-only
+    /// authority. Page-only commands return null.
+    pub fn shared(self: Msg) ?shared_message.Msg {
+        return switch (self) {
+            inline .cancel_search,
+            .submit_search,
+            .search_backspace,
+            .search_move_left,
+            .search_move_right,
+            .search_insert,
+            .search_paste,
+            .cancel_file_search,
+            .submit_file_search,
+            .file_search_previous,
+            .file_search_next,
+            .file_search_backspace,
+            .file_search_insert,
+            .file_search_paste,
+            .focus_sidebar,
+            .focus_diff,
+            .sidebar_click_node,
+            .mouse_sidebar_wheel_up,
+            .mouse_sidebar_wheel_down,
+            .mouse_diff_wheel_up,
+            .mouse_diff_wheel_down,
+            .mouse_diff_wheel_left,
+            .mouse_diff_wheel_right,
+            .mouse_diff_press,
+            .mouse_diff_drag,
+            .mouse_diff_release,
+            .toggle_focus,
+            .page_diff_up,
+            .page_diff_down,
+            .select_first_file,
+            .select_last_file,
+            .clear_search,
+            .toggle_directory,
+            .toggle_hunk_fold,
+            .expand_directory,
+            .collapse_or_parent_directory,
+            .scroll_diff_right,
+            .scroll_diff_left,
+            .scroll_sidebar_right,
+            .scroll_sidebar_left,
+            .scroll_diff_up,
+            .select_previous_file,
+            .scroll_diff_down,
+            .select_next_file,
+            .enter_search,
+            .select_next_search_match,
+            .select_next_hunk,
+            .select_previous_search_match,
+            .select_previous_hunk,
+            .enter_file_search,
+            .cycle_changed_file_filter,
+            .toggle_reviewed_file,
+            .toggle_hide_reviewed_files,
+            .toggle_sidebar_visibility,
+            .decrease_sidebar_width,
+            .increase_sidebar_width,
+            .toggle_display_mode,
+            .toggle_line_numbers,
+            => |payload, tag| @unionInit(shared_message.Msg, @tagName(tag), payload),
+            else => null,
+        };
+    }
 };
+
+pub fn fromShared(msg: shared_message.Msg) Msg {
+    return switch (msg) {
+        inline else => |payload, tag| @unionInit(Msg, @tagName(tag), payload),
+    };
+}

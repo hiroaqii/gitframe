@@ -1,12 +1,10 @@
 //! Page-independent semantic updates for a diff surface.
 //!
-//! Until S2c3 introduces the shared message vocabulary, `apply` accepts the
-//! page message structurally and returns `null` for page-only extensions.
-
 const std = @import("std");
 const context = @import("../../context.zig");
 const diff_selection = @import("../../diff/selection.zig");
 const navigation = @import("navigation.zig");
+const message = @import("message.zig");
 const selection = @import("selection.zig");
 
 /// Owned output which a page adapter translates into its physical effect.
@@ -57,8 +55,7 @@ pub const Controller = struct {
     /// can use the shared body operation directly.
     toggle_hunk_fold: ?Hook = null,
 
-    /// Returns null only when `msg` is a page extension.
-    pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: anytype) !?Update {
+    pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: message.Msg) !Update {
         const tracks_navigation = tracksDisplayNavigation(msg);
         const before = if (tracks_navigation) self.navigation.view().view.displayNavigationSnapshot() else undefined;
         const tracks_sidebar_selection = tracksExplicitSidebarSelection(msg);
@@ -193,7 +190,6 @@ pub const Controller = struct {
             .toggle_reviewed_file => try self.navigation.toggleReviewedFile(allocator orelse return error.MissingAllocator),
             .toggle_hide_reviewed_files => try self.navigation.toggleHideReviewedFiles(allocator orelse return error.MissingAllocator),
             .cycle_changed_file_filter => try self.navigation.cycleChangedFileFilter(allocator orelse return error.MissingAllocator),
-            else => return null,
         }
 
         if (tracks_sidebar_selection) {
@@ -265,7 +261,7 @@ fn sidebarSelectionSnapshot(controller: navigation.BodyController) SidebarSelect
     };
 }
 
-fn tracksExplicitSidebarSelection(msg: anytype) bool {
+fn tracksExplicitSidebarSelection(msg: message.Msg) bool {
     return switch (msg) {
         .select_previous_file,
         .select_next_file,
@@ -283,7 +279,7 @@ fn tracksExplicitSidebarSelection(msg: anytype) bool {
     };
 }
 
-fn tracksDisplayNavigation(msg: anytype) bool {
+fn tracksDisplayNavigation(msg: message.Msg) bool {
     return switch (msg) {
         .select_previous_file,
         .select_next_file,

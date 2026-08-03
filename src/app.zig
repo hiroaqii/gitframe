@@ -132,6 +132,16 @@ const MousePane = enum {
     diff,
 };
 
+const ActiveDiffSelectionOwner = union(enum) {
+    review: *const diff_selection.Owner,
+
+    fn active(self: ActiveDiffSelectionOwner) bool {
+        return switch (self) {
+            .review => |owner| owner.activeMouseSelection(),
+        };
+    }
+};
+
 const MousePoint = review_navigation.MousePoint;
 
 const LoadFinishedMsg = app_load.ReadFinished;
@@ -1139,12 +1149,14 @@ pub const App = struct {
     }
 
     fn mouseToMsg(self: *const App, mouse: anytype) ?Msg {
-        if (self.pages.review.selection_owner.activeMouseSelection()) {
-            switch (mouse.type) {
-                .drag => return .{ .review = .{ .mouse_diff_drag = self.bodyMousePoint(mouse) } },
-                .release => return .{ .review = .{ .mouse_diff_release = self.bodyMousePoint(mouse) } },
-                else => {},
-            }
+        if (self.activeDiffSelectionOwner()) |selection| {
+            if (selection.active()) switch (selection) {
+                .review => switch (mouse.type) {
+                    .drag => return .{ .review = .{ .mouse_diff_drag = self.bodyMousePoint(mouse) } },
+                    .release => return .{ .review = .{ .mouse_diff_release = self.bodyMousePoint(mouse) } },
+                    else => {},
+                },
+            };
         }
         if (self.pages.repository.activeMouseOwner()) {
             const body_point: ?repository_page.BodyPoint = if (self.bodyMousePoint(mouse)) |point|
@@ -1245,6 +1257,13 @@ pub const App = struct {
                 .diff => .{ .review = .mouse_diff_wheel_right },
             },
             else => null,
+        };
+    }
+
+    fn activeDiffSelectionOwner(self: *const App) ?ActiveDiffSelectionOwner {
+        return switch (self.active_page) {
+            .review => .{ .review = &self.pages.review.selection_owner },
+            .repository, .history, .config => null,
         };
     }
 
@@ -7964,6 +7983,25 @@ test "display mode toggle keeps nearby vertical scroll position" {
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.reviewNavigationView().effectiveDisplayMode());
     try std.testing.expect(app.pages.review.viewer.diff_scroll > 0);
     try std.testing.expect(app.pages.review.viewer.diff_scroll <= app.reviewNavigationView().selectedFileLineIndex(app.reviewNavigationView().effectiveDisplayMode()).lineCount());
+}
+
+test "diff mouse selection owner is resolved from the active page surface" {
+    var app: App = .{ .terminal_size = .{ .width = 80, .height = 20 } };
+    app.pages.review.selection_owner = .{ .diff_header = .{
+        .identity = .{ .kind = .loaded_file, .path_key = "a" },
+    } };
+
+    const drag = app.handleEvent(app_test_support.mouseEventTyped(4, 4, .left, .drag)) orelse return error.ExpectedDiffSelectionOwner;
+    switch (drag) {
+        .review => |review_msg| switch (review_msg) {
+            .mouse_diff_drag => {},
+            else => return error.ExpectedReviewDiffDrag,
+        },
+        else => return error.ExpectedReviewDiffDrag,
+    }
+
+    app.active_page = .repository;
+    try std.testing.expect(app.handleEvent(app_test_support.mouseEventTyped(4, 4, .left, .drag)) == null);
 }
 
 test "display mode toggle brings cursor back into view after wheel scroll" {
