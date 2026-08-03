@@ -19118,7 +19118,7 @@ test "hunk stage presentation keeps fresh staged authority without clearing acti
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.pages.review.git_status.replace("/repo", &staged_bundle);
-    const presentation = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    const presentation = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(presentation == .all_staged);
 
     switch (app.reviewOperations().selectedHunkUnstageTarget(std.testing.allocator)) {

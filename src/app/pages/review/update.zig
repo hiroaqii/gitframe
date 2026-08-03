@@ -283,9 +283,9 @@ pub const Controller = struct {
                 break :blk try review_selection.buildParsed(allocator, token, target.file, selection);
             },
             .generated_file => |generated| blk: {
-                const bundle = self.navigation.view().activeGeneratedFileProjection() orelse return error.StaleSelection;
-                if (!std.mem.eql(u8, generated.path_key, bundle.path)) return error.StaleSelection;
-                break :blk try review_selection.buildGenerated(allocator, token, bundle.path, &bundle.source, selection);
+                const body = self.navigation.view().generatedBody() orelse return error.StaleSelection;
+                if (!std.mem.eql(u8, generated.path_key, body.path)) return error.StaleSelection;
+                break :blk try review_selection.buildGenerated(allocator, token, body.path, body.source, selection);
             },
         };
     }

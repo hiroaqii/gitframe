@@ -418,8 +418,8 @@ pub const View = struct {
         const selection = self.page.selection_owner.activeDiff() orelse return null;
         switch (selection.identity) {
             .generated_file => |generated| {
-                const bundle = self.activeGeneratedFileProjection() orelse return null;
-                if (!std.mem.eql(u8, generated.path_key, bundle.path)) return null;
+                const body = self.generatedBody() orelse return null;
+                if (!std.mem.eql(u8, generated.path_key, body.path)) return null;
             },
             .loaded_file, .projection_file => _ = self.parsedSelectionTarget(selection.identity) orelse return null,
         }
@@ -579,8 +579,8 @@ pub const View = struct {
 
     pub fn displayedDiffHeaderLayout(self: View, content_width: u16, display_path: []const u8) ?diff_render.HeaderLayout {
         const mode_width = diff_render.bodyWidth(content_width);
-        if (self.activeGeneratedFileProjection()) |bundle| {
-            return diff_render.generatedHeaderLayout(content_width, display_path, bundle.source.contentLineCount(), self.page.viewer.display_mode, mode_width);
+        if (self.generatedBody()) |body| {
+            return diff_render.generatedHeaderLayout(content_width, display_path, body.source.contentLineCount(), self.page.viewer.display_mode, mode_width);
         }
         const file = self.displayedDiffFile() orelse return null;
         return diff_render.fileHeaderLayout(content_width, display_path, file, self.page.viewer.display_mode, mode_width);
@@ -628,7 +628,7 @@ pub const View = struct {
             };
         }
 
-        const generated = self.activeGeneratedFileProjection() orelse return null;
+        const generated = self.generatedBody() orelse return null;
         const line = generated.source.lineBody(offset) orelse return null;
         const region = selectionRegionForGenerated(body_col, body_width, display_mode, self.page.viewer.view_options.line_numbers, locked) orelse return null;
         const model_mode = if (locked) |selection| selection.mode else region.mode;
@@ -661,32 +661,28 @@ pub const View = struct {
         if (visible_rows == 0) return 0;
 
         const pane_width = self.diffPaneWidth();
-        switch (self.displayedReviewBody()) {
-            .generated => |bundle| {
-                const row_count = bundle.source.rowCount();
-                const first_row = @min(self.page.viewer.diff_scroll, row_count);
-                const end_row = @min(first_row +| visible_rows, row_count);
-                var max_scroll: usize = 0;
-                for (first_row..end_row) |row_index| {
-                    const line: diff_parser.DiffLine = .{
-                        .kind = .added,
-                        .text = bundle.source.lineBody(row_index) orelse continue,
-                        .new_line = @intCast(row_index + 1),
-                    };
-                    const body_row: diff_view_model.BodyRow = switch (mode) {
-                        .unified => .{ .unified_line = line },
-                        .side_by_side => .{ .side_by_side = .{ .paired = .{ .added = line } } },
-                    };
-                    max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(
-                        body_row,
-                        pane_width,
-                        self.page.viewer.view_options.line_numbers,
-                    ));
-                }
-                return max_scroll;
-            },
-            .primary, .cached, .combined, .retained_staged_only => {},
-            .none, .inert_invalid_utf8, .status, .pending => return 0,
+        if (self.generatedBody()) |body| {
+            const row_count = body.source.rowCount();
+            const first_row = @min(self.page.viewer.diff_scroll, row_count);
+            const end_row = @min(first_row +| visible_rows, row_count);
+            var max_scroll: usize = 0;
+            for (first_row..end_row) |row_index| {
+                const line: diff_parser.DiffLine = .{
+                    .kind = .added,
+                    .text = body.source.lineBody(row_index) orelse continue,
+                    .new_line = @intCast(row_index + 1),
+                };
+                const body_row: diff_view_model.BodyRow = switch (mode) {
+                    .unified => .{ .unified_line = line },
+                    .side_by_side => .{ .side_by_side = .{ .paired = .{ .added = line } } },
+                };
+                max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(
+                    body_row,
+                    pane_width,
+                    self.page.viewer.view_options.line_numbers,
+                ));
+            }
+            return max_scroll;
         }
 
         const file = self.displayedDiffFile() orelse return 0;
@@ -1034,7 +1030,7 @@ pub const View = struct {
             .hunk_stages = if (selected.hunk_authority) |authority|
                 try projectedHunkStagePresentation(allocator, authority.hunkStageStates())
             else
-                try self.hunkStagePresentationForFile(allocator, file),
+                try self.hunkStagePresentationForFileDirect(allocator, file),
             .syntax = .initDirect(&loaded.syntax_spans, file_index),
         } };
     }
@@ -1141,7 +1137,7 @@ pub const View = struct {
     }
 
     pub fn selectedFileLineIndex(self: View, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {
-        if (self.displayedReviewBody() == .inert_invalid_utf8) return .{ .mode = mode };
+        if (self.resolvedTarget().kind == .inert) return .{ .mode = mode };
         if (self.displayedDiffLineIndex(mode)) |index| return index;
         const loaded = self.activeLoadedDiffConst() orelse return .{ .mode = mode };
         const file_index = self.selectedFileIndex(loaded) orelse return .{ .mode = mode };
@@ -1154,7 +1150,7 @@ pub const View = struct {
     }
 
     fn displayedDiffLineCountDirect(self: View) usize {
-        if (self.displayedGeneratedLineCount()) |line_count| return line_count;
+        if (self.generatedBodyDirect()) |body| return body.source.rowCount();
         return self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
     }
 
@@ -1187,13 +1183,18 @@ pub const View = struct {
                     break :blk projectedHunkStagePresentation(allocator, authority.hunkStageStates());
                 }
                 if (file_index >= primary.loaded.document.files.len) break :blk .all_unstaged;
-                break :blk self.hunkStagePresentationForFile(allocator, primary.loaded.document.files[file_index]);
+                break :blk self.hunkStagePresentationForFileDirect(allocator, primary.loaded.document.files[file_index]);
             },
             .none, .generated, .inert_invalid_utf8, .status, .pending => .all_unstaged,
         };
     }
 
-    pub fn hunkStagePresentationForFile(self: View, allocator: std.mem.Allocator, file: diff_parser.FileDiff) !diff_render.HunkStagePresentation {
+    pub fn hunkStagePresentation(self: View, allocator: std.mem.Allocator, file_index: usize) !diff_render.HunkStagePresentation {
+        var adapter = self.bodyResolverAdapter();
+        return adapter.interface().hunkStagePresentation(allocator, file_index);
+    }
+
+    fn hunkStagePresentationForFileDirect(self: View, allocator: std.mem.Allocator, file: diff_parser.FileDiff) !diff_render.HunkStagePresentation {
         switch (self.source) {
             .cached => return .all_staged,
             .unstaged => {},
@@ -1204,7 +1205,7 @@ pub const View = struct {
         const path = diff_file.canonicalPathKey(file) orelse return .all_unstaged;
         if (self.isFreshStagedOnlyPath(repo_root, path)) return .all_staged;
         if (self.page.staged_hunks.items.items.len == 0) return .all_unstaged;
-        const content = self.currentContentToken() orelse return .all_unstaged;
+        const content = self.currentContentTokenDirect() orelse return .all_unstaged;
 
         var marked_count: usize = 0;
         for (0..file.hunks.len) |hunk_index| {
@@ -5795,15 +5796,15 @@ test "hunk stage presentation classifies direct source authority" {
         .repo_root = "/repo",
     };
 
-    const unstaged = try app.reviewNavigationView().hunkStagePresentationForFile(std.testing.allocator, app_test_support.file_with_hunks);
+    const unstaged = try app.reviewNavigationView().hunkStagePresentation(std.testing.allocator, 0);
     try std.testing.expect(unstaged == .all_unstaged);
 
     app.source = .cached;
-    const cached = try app.reviewNavigationView().hunkStagePresentationForFile(std.testing.allocator, app_test_support.file_with_hunks);
+    const cached = try app.reviewNavigationView().hunkStagePresentation(std.testing.allocator, 0);
     try std.testing.expect(cached == .all_staged);
 
     app.source = .{ .range = "HEAD~1..HEAD" };
-    const historical = try app.reviewNavigationView().hunkStagePresentationForFile(std.testing.allocator, app_test_support.file_with_hunks);
+    const historical = try app.reviewNavigationView().hunkStagePresentation(std.testing.allocator, 0);
     try std.testing.expect(historical == .all_unstaged);
 }
 
@@ -5829,7 +5830,7 @@ test "hunk stage presentation keeps partial session marks" {
     };
     try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", mark_key);
 
-    const presentation = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    const presentation = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(presentation == .per_hunk);
     try std.testing.expectEqual(diff_render.HunkStageState.staged, presentation.stateForHunk(0));
     try std.testing.expectEqual(diff_render.HunkStageState.unstaged, presentation.stateForHunk(1));
@@ -5851,7 +5852,7 @@ test "hunk stage presentation uses all-staged only for fresh staged-only status"
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.pages.review.git_status.replace("/repo", &staged_bundle);
-    const staged = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    const staged = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(staged == .all_staged);
 
     const content = app.reviewNavigationView().currentContentToken() orelse return error.ExpectedReviewContentToken;
@@ -5863,18 +5864,18 @@ test "hunk stage presentation uses all-staged only for fresh staged-only status"
         .content = content,
         .display_hunk_index = 1,
     });
-    const hunk_by_hunk = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    const hunk_by_hunk = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(hunk_by_hunk == .all_staged);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
     try app.pages.review.git_status.replace("/repo", &mixed_bundle);
-    const mixed = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    const mixed = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(mixed == .per_hunk);
     try std.testing.expectEqual(diff_render.HunkStageState.staged, mixed.stateForHunk(0));
     try std.testing.expectEqual(diff_render.HunkStageState.staged, mixed.stateForHunk(1));
 
     app.pages.review.status_load.pending = .{ .generation = 1 };
-    const stale = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    const stale = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(stale == .per_hunk);
     try std.testing.expectEqual(diff_render.HunkStageState.staged, stale.stateForHunk(0));
     try std.testing.expectEqual(diff_render.HunkStageState.staged, stale.stateForHunk(1));
@@ -5882,7 +5883,7 @@ test "hunk stage presentation uses all-staged only for fresh staged-only status"
     app.pages.review.status_load.pending = null;
     var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
     try app.pages.review.git_status.replace("/other", &other_repo_bundle);
-    const other_repo = try app.reviewNavigationView().hunkStagePresentationForFile(arena.allocator(), app_test_support.file_with_hunks);
+    const other_repo = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(other_repo == .per_hunk);
     try std.testing.expectEqual(diff_render.HunkStageState.staged, other_repo.stateForHunk(0));
     try std.testing.expectEqual(diff_render.HunkStageState.staged, other_repo.stateForHunk(1));
