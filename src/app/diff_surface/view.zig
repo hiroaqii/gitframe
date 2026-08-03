@@ -6,11 +6,15 @@
 
 const std = @import("std");
 const chasen = @import("chasen");
+const ui = @import("chasen_ui");
+const draw = @import("draw");
 const theme = @import("theme");
 const diff_surface = @import("../diff_surface.zig");
 const app_load_state = @import("../load_state.zig");
 const app_state = @import("../state.zig");
+const view_primitives = @import("../view_primitives.zig");
 const diff_source = @import("../../diff/source.zig");
+const file_search = @import("file_search.zig");
 
 /// Normalized presentation capabilities for an empty diff surface.
 ///
@@ -251,4 +255,71 @@ pub fn stateHintStyle(palette: theme.Palette) chasen.TextStyle {
 pub fn firstLine(text: []const u8) []const u8 {
     if (std.mem.indexOfAny(u8, text, "\r\n")) |end| return text[0..end];
     return text;
+}
+
+/// Draw a bounded file-search projection in the diff-pane position.
+pub fn drawFileSearch(surface: *chasen.Surface, state: *const file_search.State, palette: theme.Palette) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    const label_col: u16 = 1;
+    const prompt_style = palette.boldStyle(.prompt);
+    draw.copyClippedTextAt(surface, label_col, 0, file_search_label, prompt_style) catch {};
+    const label_width = chasen.text.displayWidth(file_search_label);
+    if (size.width > label_col + label_width) {
+        const input_col = label_col + label_width;
+        try drawFileSearchInput(surface, input_col, 0, state.input.slice(), state.input.cursor, prompt_style);
+        view_primitives.showInputCursor(surface, input_col, 0, state.input.slice(), state.input.cursor);
+    }
+
+    if (size.height > 1) {
+        const status = if (state.truncated)
+            "512+ matches; refine search"
+        else if (!state.projection_available)
+            "File list unavailable; wait or press Esc"
+        else if (state.no_match)
+            "No matching files"
+        else
+            "Enter: open  Esc: cancel";
+        const role: theme.Role = if (state.no_match or !state.projection_available) .warning else .muted;
+        draw.copyClippedTextAt(surface, 1, 1, status, palette.style(role)) catch {};
+    }
+
+    if (!state.projection_available) return;
+    const visible_rows: usize = size.height -| 2;
+    const focused = state.filter.list.focusedIndex();
+    const range = ui.ListViewport.visibleRange(state.filter.labels.len, focused, visible_rows);
+    var result_index = range.start;
+    while (result_index < range.end) : (result_index += 1) {
+        const candidate = state.candidateAt(result_index) orelse continue;
+
+        const row: u16 = @intCast(2 + result_index - range.start);
+        const style = if (result_index == focused) palette.boldStyle(.prompt) else palette.style(.muted);
+        try draw.copyTailClippedTextAt(surface, 1, row, candidate.path_key, style);
+    }
+}
+
+pub const file_search_label = "Find file: ";
+// Keep enough room for the fixed label and a short visible input tail. Below
+// this width the sidebar is less useful than the active prompt, so search uses
+// the full body until normal pane geometry becomes usable again.
+pub const file_search_min_pane_width: u16 = 1 + file_search_label.len + 4;
+
+fn drawFileSearchInput(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, cursor: usize, style: chasen.TextStyle) !void {
+    const size = surface.size();
+    if (col >= size.width or row >= size.height) return;
+    const width = size.width - col;
+    try draw.copyClippedTextAt(surface, col, row, text[view_primitives.inputVisibleStart(text, cursor, width)..], style);
+}
+
+pub fn drawEmptySidebarTitle(surface: *chasen.Surface, palette: theme.Palette) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height <= 2) return;
+
+    const title = " Files";
+    _ = surface.borrowTextAt(0, 2, title, palette.boldStyle(.accent));
+    const stats_col = chasen.text.displayWidth(title) + 1;
+    if (stats_col < size.width) {
+        _ = try surface.printAt(stats_col, 2, palette.style(.muted), "0 files / 0 hunks", .{});
+    }
 }

@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const chasen = @import("chasen");
-const ui = @import("chasen_ui");
 const draw = @import("draw");
 const branch_chrome = @import("../../branch_chrome.zig");
 const app_page = @import("../../page.zig");
@@ -208,15 +207,7 @@ fn viewEmptySidebarChrome(app: Context, surface: *chasen.Surface) !void {
     if (size.width == 0 or size.height == 0) return;
 
     try drawSidebarDetailRow(app, surface, 0);
-
-    if (size.height <= 2) return;
-    const title = " Files";
-    _ = surface.borrowTextAt(0, 2, title, sidebarTitleStyle(app.theme));
-    const title_width = chasen.text.displayWidth(title);
-    const stats_col = title_width + 1;
-    if (stats_col < size.width) {
-        _ = try surface.printAt(stats_col, 2, app.theme.style(.muted), "0 files / 0 hunks", .{});
-    }
+    try diff_surface_view.drawEmptySidebarTitle(surface, app.theme);
 }
 
 fn viewLoadedDiff(app: Context, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
@@ -275,58 +266,8 @@ fn viewLoadedDiff(app: Context, surface: *chasen.Surface, loaded: loaded_diff.Lo
     try viewDiffPane(app, &diff_pane, loaded);
 }
 
-/// Draw Review's bounded file-search projection in the diff-pane position.
-///
-/// Search intentionally replaces the diff body while the sidebar remains as
-/// stable context. Each visible label is validated through the typed candidate
-/// mapping before it is drawn, so rendering cannot expose a stale path borrow
-/// which a later submit would reject.
-fn drawFileSearch(surface: *chasen.Surface, state: *const review_file_search.State, palette: theme.Palette) !void {
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0) return;
-
-    const label_col: u16 = 1;
-    const prompt_style = palette.boldStyle(.prompt);
-    draw.copyClippedTextAt(surface, label_col, 0, file_search_label, prompt_style) catch {};
-    const label_width = chasen.text.displayWidth(file_search_label);
-    if (size.width > label_col + label_width) {
-        const input_col = label_col + label_width;
-        try drawInputLine(surface, input_col, 0, state.input.slice(), state.input.cursor, prompt_style);
-        view_primitives.showInputCursor(surface, input_col, 0, state.input.slice(), state.input.cursor);
-    }
-
-    if (size.height > 1) {
-        const status = if (state.truncated)
-            "512+ matches; refine search"
-        else if (!state.projection_available)
-            "File list unavailable; wait or press Esc"
-        else if (state.no_match)
-            "No matching files"
-        else
-            "Enter: open  Esc: cancel";
-        const role: theme.Role = if (state.no_match or !state.projection_available) .warning else .muted;
-        draw.copyClippedTextAt(surface, 1, 1, status, palette.style(role)) catch {};
-    }
-
-    if (!state.projection_available) return;
-    const visible_rows: usize = size.height -| 2;
-    const focused = state.filter.list.focusedIndex();
-    const range = ui.ListViewport.visibleRange(state.filter.labels.len, focused, visible_rows);
-    var result_index = range.start;
-    while (result_index < range.end) : (result_index += 1) {
-        const candidate = state.candidateAt(result_index) orelse continue;
-
-        const row: u16 = @intCast(2 + result_index - range.start);
-        const style = if (result_index == focused) palette.boldStyle(.prompt) else palette.style(.muted);
-        try draw.copyTailClippedTextAt(surface, 1, row, candidate.path_key, style);
-    }
-}
-
-const file_search_label = "Find file: ";
-// Keep enough room for the fixed label and a short visible input tail. Below
-// this width the sidebar is less useful than the active prompt, so search uses
-// the full body until normal pane geometry becomes usable again.
-const file_search_min_pane_width: u16 = 1 + file_search_label.len + 4;
+const drawFileSearch = diff_surface_view.drawFileSearch;
+const file_search_min_pane_width = diff_surface_view.file_search_min_pane_width;
 
 /// Draw the file tree side pane from the materialized sidebar view-model.
 pub fn viewSidebar(app: Context, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
