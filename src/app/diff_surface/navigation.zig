@@ -6,7 +6,9 @@
 
 const std = @import("std");
 const layout = @import("layout.zig");
+const diff_surface = @import("../diff_surface.zig");
 const context = @import("../../context.zig");
+const diff_file = @import("../../diff/file.zig");
 const diff_hunk_projection = @import("../../diff/hunk_projection.zig");
 const diff_parser = @import("../../diff/parser.zig");
 const diff_render = @import("../../diff/render.zig");
@@ -14,6 +16,7 @@ const diff_selection = @import("../../diff/selection.zig");
 const diff_view_model = @import("../../diff/view_model.zig");
 const file_tree = @import("../../file_tree.zig");
 const loaded_diff = @import("../../loaded_diff.zig");
+const sidebar_view_model = @import("../../sidebar/view_model.zig");
 const text_projection = @import("../../text/projection.zig");
 
 const LoadedDiff = loaded_diff.LoadedDiff;
@@ -37,6 +40,172 @@ pub const ParsedMouseLine = struct {
     line_index: usize,
     line: diff_parser.DiffLine,
     region: SelectionRegion,
+};
+
+/// Short-lived read-only facade over one page's shared diff surface.
+///
+/// The pointer bundle remains owned by the page and is rebuilt for every
+/// delegated call. Methods in this view must not mutate the pointed-to state.
+pub const View = struct {
+    surface: diff_surface.ReadSurface,
+    repo_root: ?[]const u8,
+
+    pub fn displayNavigationSnapshot(self: View) diff_surface.DisplayNavigationSnapshot {
+        return .{
+            .selected_target = self.surface.viewer.selected_target,
+            .selected_node = self.surface.viewer.selected_node,
+            .diff_cursor = self.surface.viewer.diff_cursor,
+            .diff_scroll = self.surface.viewer.diff_scroll,
+            .diff_horizontal_scroll = self.surface.viewer.diff_horizontal_scroll,
+            .sidebar_horizontal_scroll = self.surface.viewer.sidebar_horizontal_scroll,
+            .search_coordinate = if (self.surface.search.match) |match| match.coordinate else null,
+            .search_match_offset = self.surface.search.match_offset,
+            .display_mode = self.surface.viewer.display_mode,
+        };
+    }
+
+    pub fn rawDiffPaneGeometry(self: View) ?diff_surface.RawDiffPaneGeometry {
+        const size = self.surface.layout;
+        if (size.width == 0) return null;
+        if (self.surface.viewer.sidebar_hidden) return .{ .col = 0, .width = size.width };
+
+        const sidebar_width = sidebarWidth(size.width, self.surface.viewer.sidebar_width);
+        if (size.width <= sidebar_width + 1) return null;
+        return .{
+            .col = sidebar_width + 1,
+            .width = size.width - sidebar_width - 1,
+        };
+    }
+
+    pub fn fileTreeRootOptions(self: View) ?file_tree.RootOptions {
+        const root = self.repo_root orelse return null;
+        const base = std.fs.path.basename(root);
+        return .{ .name = if (base.len == 0) root else base };
+    }
+
+    pub fn visibleSidebarMaxHorizontalScroll(self: View) usize {
+        const loaded = self.activeLoadedDiffConst() orelse return 0;
+        const width = sidebarWidth(self.surface.layout.width, self.surface.viewer.sidebar_width);
+        const source = sidebar_view_model.Source{
+            .tree = loaded.tree,
+            .collapsed = &loaded.collapsed_dirs,
+            .reviewed_files = loaded.reviewed_files,
+            .visible_nodes = loaded.materializedVisibleNodes(),
+        };
+
+        var max_scroll: usize = 0;
+        var visible_index: usize = 0;
+        while (visible_index < loaded.visibleNodeCount()) : (visible_index += 1) {
+            const row = sidebar_view_model.rowAt(source, visible_index, self.surface.viewer.selected_node) orelse continue;
+            max_scroll = @max(max_scroll, sidebar_view_model.maxHorizontalScroll(row, width));
+        }
+        return max_scroll;
+    }
+
+    pub fn currentSearchMatchInHunkBody(self: View, hunk_index: usize) bool {
+        const match = self.surface.search.match orelse return false;
+        return switch (match.coordinate) {
+            .hunk_line => |line| line.hunk_index == hunk_index,
+            else => false,
+        };
+    }
+
+    pub fn selectedSidebarIdentity(self: View) ?context.SidebarIdentity {
+        const loaded = self.activeLoadedDiffConst() orelse return null;
+        if (self.surface.viewer.selected_node >= loaded.tree.nodes.len) return null;
+        const node = loaded.tree.nodes[self.surface.viewer.selected_node];
+        return switch (node.kind) {
+            .repo_root => .repo_root,
+            .directory => .{ .directory = node.path },
+            .file => .{ .file = if (node.path_key.len > 0) node.path_key else node.path },
+        };
+    }
+
+    pub fn diffFileSelection(self: View, loaded: *const LoadedDiff, file_index: usize) ?context.Selection {
+        if (file_index >= loaded.document.files.len) return null;
+        const file = loaded.document.files[file_index];
+        return .{ .diff_file = .{
+            .file_index = file_index,
+            .display_path = diff_file.displayPath(file),
+            .path_key = diff_file.canonicalPathKey(file),
+            .hunk_index = if (self.rawSelectedHunkIndex()) |hunk_index|
+                if (hunk_index < file.hunks.len) hunk_index else null
+            else
+                null,
+        } };
+    }
+
+    pub fn treeOrderScopeText(self: View, allocator: std.mem.Allocator) ![]u8 {
+        const repo_root = self.repo_root orelse "";
+        return switch (self.surface.source) {
+            .unstaged => std.fmt.allocPrint(allocator, "{s}\x1funstaged", .{repo_root}),
+            .cached => std.fmt.allocPrint(allocator, "{s}\x1fcached", .{repo_root}),
+            .range => |range| std.fmt.allocPrint(allocator, "{s}\x1frange\x1f{s}", .{ repo_root, range }),
+            .patch_file => |path| std.fmt.allocPrint(allocator, "{s}\x1fpatch\x1f{s}", .{ repo_root, path }),
+            .stdin => std.fmt.allocPrint(allocator, "{s}\x1fstdin", .{repo_root}),
+            .pager => std.fmt.allocPrint(allocator, "{s}\x1fpager", .{repo_root}),
+            .no_index => |paths| std.fmt.allocPrint(allocator, "{s}\x1fno-index\x1f{s}\x1f{s}", .{ repo_root, paths.left, paths.right }),
+        };
+    }
+
+    pub fn selectedFile(self: View) ?diff_parser.FileDiff {
+        const loaded = self.activeLoadedDiffConst() orelse return null;
+        const file_index = self.selectedFileIndex(loaded) orelse return null;
+        return loaded.document.files[file_index];
+    }
+
+    pub fn selectedFileCachedLineIndex(self: View, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
+        const loaded = self.activeLoadedDiffConst() orelse return null;
+        const file_index = self.selectedFileIndex(loaded) orelse return null;
+        return loaded.cachedRenderedLineIndex(file_index, mode);
+    }
+
+    pub fn rawSelectedHunkIndex(self: View) ?usize {
+        return switch (self.surface.viewer.diff_cursor) {
+            .hunk_header => |hunk_index| hunk_index,
+            .hunk_line => |line| line.hunk_index,
+            .metadata, .binary_marker => null,
+        };
+    }
+
+    pub fn loadedFileCount(self: View) ?usize {
+        const loaded = self.activeLoadedDiffConst() orelse return null;
+        return loaded.document.files.len;
+    }
+
+    pub fn effectiveDisplayMode(self: View) diff_render.DisplayMode {
+        return diff_render.effectiveMode(diff_render.bodyWidth(self.diffPaneWidth()), self.surface.viewer.display_mode);
+    }
+
+    pub fn diffVisibleRows(self: View) usize {
+        return diff_render.visibleBodyRows(self.surface.layout.height);
+    }
+
+    pub fn diffPaneWidth(self: View) u16 {
+        const width = self.surface.layout.width;
+        if (self.surface.viewer.sidebar_hidden) return contentWidth(width);
+        const sidebar_width = sidebarWidth(width, self.surface.viewer.sidebar_width);
+        if (width <= sidebar_width + 1) return 0;
+        return contentWidth(width - sidebar_width - 1);
+    }
+
+    pub fn selectedFileIndex(self: View, loaded: *const LoadedDiff) ?usize {
+        if (loaded.document.files.len == 0) return null;
+        const file_index = self.selectedDiffFileTarget() orelse return null;
+        return @min(file_index, loaded.document.files.len - 1);
+    }
+
+    pub fn selectedDiffFileTarget(self: View) ?usize {
+        const target = self.surface.viewer.selected_target orelse return null;
+        return target.diffFileIndex();
+    }
+
+    pub fn activeLoadedDiffConst(self: View) ?*const LoadedDiff {
+        return switch (self.surface.load.state) {
+            .loaded => |*session| &session.loaded,
+            else => null,
+        };
+    }
 };
 
 /// Converts projection-owned index membership into the renderer's explicit

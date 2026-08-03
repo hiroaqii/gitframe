@@ -167,13 +167,41 @@ pub const SearchTarget = struct {
     folded_hunks: []const bool,
 };
 
-/// Borrowed, per-call view over one page's shared read-only diff state.
+/// Const-qualified projection of the shared surface for rendering and other
+/// read-only consumers. It mirrors `DiffSurface` exactly, but the 16 shared
+/// state pointers cannot be used to acquire write authority.
+pub const ReadSurface = struct {
+    activation: *const authority.Lifecycle,
+    status: *const app_state.StatusMessage,
+    load: *const load_state.LoadRuntimeState,
+    viewer: *const ViewerState,
+    search: *const DiffSearchState,
+    file_search: *const file_search.State,
+    file_search_return_focus: *const Focus,
+    accepted_sidebar_revision: *const u64,
+    review_display: *const app_state.ReviewDisplayState,
+    reviewed_store: *const review_state.Store,
+    tree_order: *const file_tree.StableOrder,
+    tree_order_scope: *const ?[]u8,
+    selection_owner: *const diff_selection.Owner,
+    completed_selection: *const ?selection.CompletedSelection,
+    source_session_revision: *const u64,
+    pending_initial_first_visible_selection: *const bool,
+    reload_anchor: ?*const ReloadAnchor,
+    live_drag_deferred_source: bool,
+    source: diff_source.SourceMode,
+    layout: Layout,
+};
+
+/// Borrowed, per-call capability over one page's shared diff state.
 ///
 /// Pages own the fields; an adapter (`ReviewPageState.diffSurface`) builds this
 /// bundle on demand, so no field moves and no long-lived aliasing exists. The
 /// two partial-lift members are narrowed on purpose: the surface sees a reload
 /// anchor and whether a live-drag deferred source apply is held, never the
 /// page's rich reload/deferred owners (issue #34 design, field table).
+/// Read-only consumers must narrow it with `readOnly` or construct a
+/// `ReadSurface` directly from a const page borrow.
 pub const DiffSurface = struct {
     activation: *authority.Lifecycle,
     status: *app_state.StatusMessage,
@@ -195,6 +223,32 @@ pub const DiffSurface = struct {
     live_drag_deferred_source: bool,
     source: diff_source.SourceMode,
     layout: Layout,
+
+    /// Drops write capability while preserving the exact borrowed field set.
+    pub fn readOnly(self: DiffSurface) ReadSurface {
+        return .{
+            .activation = self.activation,
+            .status = self.status,
+            .load = self.load,
+            .viewer = self.viewer,
+            .search = self.search,
+            .file_search = self.file_search,
+            .file_search_return_focus = self.file_search_return_focus,
+            .accepted_sidebar_revision = self.accepted_sidebar_revision,
+            .review_display = self.review_display,
+            .reviewed_store = self.reviewed_store,
+            .tree_order = self.tree_order,
+            .tree_order_scope = self.tree_order_scope,
+            .selection_owner = self.selection_owner,
+            .completed_selection = self.completed_selection,
+            .source_session_revision = self.source_session_revision,
+            .pending_initial_first_visible_selection = self.pending_initial_first_visible_selection,
+            .reload_anchor = self.reload_anchor,
+            .live_drag_deferred_source = self.live_drag_deferred_source,
+            .source = self.source,
+            .layout = self.layout,
+        };
+    }
 };
 
 test {
@@ -203,4 +257,20 @@ test {
     _ = layout;
     _ = navigation;
     _ = selection;
+
+    const mutable_fields = std.meta.fields(DiffSurface);
+    const read_fields = std.meta.fields(ReadSurface);
+    try std.testing.expectEqual(mutable_fields.len, read_fields.len);
+    inline for (mutable_fields, read_fields, 0..) |mutable_field, read_field, index| {
+        try std.testing.expectEqualStrings(mutable_field.name, read_field.name);
+        if (index < 16) {
+            const mutable_pointer = @typeInfo(mutable_field.type).pointer;
+            const read_pointer = @typeInfo(read_field.type).pointer;
+            try std.testing.expect(!mutable_pointer.is_const);
+            try std.testing.expect(read_pointer.is_const);
+            try std.testing.expect(mutable_pointer.child == read_pointer.child);
+        } else {
+            try std.testing.expect(mutable_field.type == read_field.type);
+        }
+    }
 }

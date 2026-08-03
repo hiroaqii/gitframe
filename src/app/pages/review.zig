@@ -321,6 +321,39 @@ pub const ReviewPageState = struct {
             .layout = layout,
         };
     }
+
+    /// Builds the const-qualified projection used by shared read-only views.
+    pub fn readSurface(
+        self: *const ReviewPageState,
+        source: diff_source.SourceMode,
+        layout: diff_surface.Layout,
+    ) diff_surface.ReadSurface {
+        return .{
+            .activation = &self.activation,
+            .status = &self.status,
+            .load = &self.load,
+            .viewer = &self.viewer,
+            .search = &self.search,
+            .file_search = &self.file_search,
+            .file_search_return_focus = &self.file_search_return_focus,
+            .accepted_sidebar_revision = &self.accepted_sidebar_revision,
+            .review_display = &self.review_display,
+            .reviewed_store = &self.reviewed_store,
+            .tree_order = &self.tree_order,
+            .tree_order_scope = &self.tree_order_scope,
+            .selection_owner = &self.selection_owner,
+            .completed_selection = &self.completed_selection,
+            .source_session_revision = &self.source_session_revision,
+            .pending_initial_first_visible_selection = &self.pending_initial_first_visible_selection,
+            .reload_anchor = if (self.pending_reload) |*pending|
+                (if (pending.anchor) |*anchor| anchor else null)
+            else
+                null,
+            .live_drag_deferred_source = self.deferredSourceBlocksPageTransition(),
+            .source = source,
+            .layout = layout,
+        };
+    }
 };
 
 test "diffSurface adapter exposes shared field pointers without copying" {
@@ -349,6 +382,29 @@ test "diffSurface adapter exposes shared field pointers without copying" {
     try std.testing.expect(!surface.live_drag_deferred_source);
     try std.testing.expectEqual(diff_source.SourceMode.unstaged, surface.source);
     try std.testing.expectEqual(diff_surface.Layout{ .width = 80, .height = 24 }, surface.layout);
+
+    const const_state: *const ReviewPageState = &state;
+    const read_surface = const_state.readSurface(.cached, .{ .width = 96, .height = 31 });
+    try std.testing.expectEqual(&state.activation, read_surface.activation);
+    try std.testing.expectEqual(&state.status, read_surface.status);
+    try std.testing.expectEqual(&state.load, read_surface.load);
+    try std.testing.expectEqual(&state.viewer, read_surface.viewer);
+    try std.testing.expectEqual(&state.search, read_surface.search);
+    try std.testing.expectEqual(&state.file_search, read_surface.file_search);
+    try std.testing.expectEqual(&state.file_search_return_focus, read_surface.file_search_return_focus);
+    try std.testing.expectEqual(&state.accepted_sidebar_revision, read_surface.accepted_sidebar_revision);
+    try std.testing.expectEqual(&state.review_display, read_surface.review_display);
+    try std.testing.expectEqual(&state.reviewed_store, read_surface.reviewed_store);
+    try std.testing.expectEqual(&state.tree_order, read_surface.tree_order);
+    try std.testing.expectEqual(&state.tree_order_scope, read_surface.tree_order_scope);
+    try std.testing.expectEqual(&state.selection_owner, read_surface.selection_owner);
+    try std.testing.expectEqual(&state.completed_selection, read_surface.completed_selection);
+    try std.testing.expectEqual(&state.source_session_revision, read_surface.source_session_revision);
+    try std.testing.expectEqual(&state.pending_initial_first_visible_selection, read_surface.pending_initial_first_visible_selection);
+    try std.testing.expect(read_surface.reload_anchor == null);
+    try std.testing.expect(!read_surface.live_drag_deferred_source);
+    try std.testing.expectEqual(diff_source.SourceMode.cached, read_surface.source);
+    try std.testing.expectEqual(diff_surface.Layout{ .width = 96, .height = 31 }, read_surface.layout);
 
     surface.viewer.diff_scroll = 7;
     try std.testing.expectEqual(@as(usize, 7), state.viewer.diff_scroll);
