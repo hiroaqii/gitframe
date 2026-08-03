@@ -39,6 +39,7 @@ const loaded_diff = @import("../../../loaded_diff.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 const app_test_support = test_support;
+const review_body_render = @import("body_render.zig");
 
 const LoadedDiff = loaded_diff.LoadedDiff;
 const ChangedFileFilter = loaded_diff.ChangedFileFilter;
@@ -217,6 +218,78 @@ pub const ParsedSelectionTarget = diff_surface.ParsedSelectionTarget;
 pub const RawDiffPaneGeometry = diff_surface.RawDiffPaneGeometry;
 pub const SearchTarget = diff_surface.SearchTarget;
 
+/// Short-lived Review-owned implementation of the page-independent body
+/// resolver contract. Callers construct it on the stack for one resolver call;
+/// returned borrows point into `page`, never into this adapter.
+const ReviewBodyResolver = struct {
+    view: View,
+
+    fn interface(self: *ReviewBodyResolver) diff_surface.BodyResolver {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    fn fromContext(ctx: *anyopaque) *ReviewBodyResolver {
+        return @ptrCast(@alignCast(ctx));
+    }
+    const vtable: diff_surface.BodyResolver.VTable = .{
+        .resolvedTarget = resolvedTarget,
+        .hunkStagePresentation = hunkStagePresentation,
+        .contentToken = contentToken,
+        .renderProjectedBody = renderProjectedBody,
+        .parsedSelectionTarget = parsedSelectionTarget,
+        .displayedDiffFile = displayedDiffFile,
+        .displayedSearchTarget = displayedSearchTarget,
+        .displayedDiffLineIndex = displayedDiffLineIndex,
+        .displayedDiffLineCount = displayedDiffLineCount,
+        .generatedBody = generatedBody,
+        .displayedDiffHeaderTarget = displayedDiffHeaderTarget,
+    };
+
+    fn resolvedTarget(ctx: *anyopaque) diff_surface.ResolvedTarget {
+        return fromContext(ctx).view.resolvedTargetDirect();
+    }
+
+    fn hunkStagePresentation(ctx: *anyopaque, allocator: std.mem.Allocator, file_index: usize) !diff_render.HunkStagePresentation {
+        return fromContext(ctx).view.hunkStagePresentationDirect(allocator, file_index);
+    }
+
+    fn contentToken(ctx: *anyopaque) ?diff_surface.ContentToken {
+        return fromContext(ctx).view.currentContentTokenDirect();
+    }
+
+    fn renderProjectedBody(ctx: *anyopaque, args: diff_surface.RenderProjectedBodyArgs) !void {
+        return fromContext(ctx).view.renderProjectedBodyDirect(args);
+    }
+
+    fn parsedSelectionTarget(ctx: *anyopaque, expected: ?diff_selection.Identity) ?ParsedSelectionTarget {
+        return fromContext(ctx).view.parsedSelectionTargetDirect(expected);
+    }
+
+    fn displayedDiffFile(ctx: *anyopaque) ?diff_parser.FileDiff {
+        return fromContext(ctx).view.displayedDiffFileDirect();
+    }
+
+    fn displayedSearchTarget(ctx: *anyopaque, mode: diff_render.DisplayMode) ?SearchTarget {
+        return fromContext(ctx).view.displayedSearchTargetDirect(mode);
+    }
+
+    fn displayedDiffLineIndex(ctx: *anyopaque, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
+        return fromContext(ctx).view.displayedDiffLineIndexDirect(mode);
+    }
+
+    fn displayedDiffLineCount(ctx: *anyopaque) usize {
+        return fromContext(ctx).view.displayedDiffLineCountDirect();
+    }
+
+    fn generatedBody(ctx: *anyopaque) ?diff_surface.GeneratedBody {
+        return fromContext(ctx).view.generatedBodyDirect();
+    }
+
+    fn displayedDiffHeaderTarget(ctx: *anyopaque, expected: ?diff_selection.HeaderIdentity) ?DiffHeaderTarget {
+        return fromContext(ctx).view.displayedDiffHeaderTargetDirect(expected);
+    }
+};
+
 pub const View = struct {
     page: *const review_page.ReviewPageState,
     repo_root: ?[]const u8,
@@ -233,6 +306,20 @@ pub const View = struct {
             .surface = self.page.readSurface(self.source, self.layout),
             .repo_root = self.repo_root,
         };
+    }
+
+    fn bodyResolverAdapter(self: View) ReviewBodyResolver {
+        return .{ .view = self };
+    }
+
+    pub fn resolvedTarget(self: View) diff_surface.ResolvedTarget {
+        var adapter = self.bodyResolverAdapter();
+        return adapter.interface().resolvedTarget();
+    }
+
+    pub fn renderProjectedBody(self: View, args: diff_surface.RenderProjectedBodyArgs) !void {
+        var adapter = self.bodyResolverAdapter();
+        return adapter.interface().renderProjectedBody(args);
     }
 
     pub fn displayedReviewBody(self: View) DisplayedReviewBody {
@@ -280,6 +367,11 @@ pub const View = struct {
     /// Selection release, hunk action resolution, and session-mark rendering
     /// share this builder so they cannot disagree about presentation lineage.
     pub fn currentContentToken(self: View) ?review_selection.ReviewContentToken {
+        var adapter = self.bodyResolverAdapter();
+        return adapter.interface().contentToken();
+    }
+
+    fn currentContentTokenDirect(self: View) ?review_selection.ReviewContentToken {
         const display: review_selection.DisplayBasis = switch (self.displayedReviewBody()) {
             .primary => |primary| .{ .loaded = .init(primary.loaded.text) },
             .cached => |bundle| .{ .cached_projection = .{
@@ -345,34 +437,26 @@ pub const View = struct {
     }
 
     pub fn normalLoadedDiffSelectionTarget(self: View, identity: ?diff_selection.Identity) ?NormalLoadedDiffSelectionTarget {
-        const primary = switch (self.displayedReviewBody()) {
-            .primary => |primary| primary,
-            else => return null,
+        const target = self.parsedSelectionTarget(identity) orelse return null;
+        const loaded_identity = switch (target.identity) {
+            .loaded_file => |loaded| loaded,
+            .projection_file, .generated_file => return null,
         };
-        const loaded = primary.loaded;
-        const file_index = primary.file_index;
-        const file = loaded.document.files[file_index];
-        const path_key = diff_file.canonicalPathKey(file) orelse return null;
-        const current_identity: diff_selection.Identity = .{ .loaded_file = .{
-            .file_index = file_index,
-            .path_key = path_key,
-        } };
-        if (identity) |expected| {
-            if (!expected.eql(current_identity)) return null;
-            if (!expected.matchesLoadedFile(file_index, file)) return null;
-        }
-
-        const mode = self.effectiveDisplayMode();
         return .{
-            .file_index = file_index,
-            .file = file,
-            .line_index = loaded.cachedRenderedLineIndex(file_index, mode) orelse loaded.renderedLineIndex(file_index, mode),
-            .folded_hunks = loaded.foldedHunksForFile(file_index),
-            .identity = current_identity,
+            .file_index = loaded_identity.file_index,
+            .file = target.file,
+            .line_index = target.line_index,
+            .folded_hunks = target.folded_hunks,
+            .identity = target.identity,
         };
     }
 
     pub fn parsedSelectionTarget(self: View, expected: ?diff_selection.Identity) ?ParsedSelectionTarget {
+        var adapter = self.bodyResolverAdapter();
+        return adapter.interface().parsedSelectionTarget(expected);
+    }
+
+    fn parsedSelectionTargetDirect(self: View, expected: ?diff_selection.Identity) ?ParsedSelectionTarget {
         const target: ParsedSelectionTarget = switch (self.displayedReviewBody()) {
             .primary => |primary| blk: {
                 const file = primary.loaded.document.files[primary.file_index];
@@ -421,6 +505,11 @@ pub const View = struct {
     }
 
     pub fn displayedDiffHeaderTarget(self: View, expected: ?diff_selection.HeaderIdentity) ?DiffHeaderTarget {
+        var adapter = self.bodyResolverAdapter();
+        return adapter.interface().displayedDiffHeaderTarget(expected);
+    }
+
+    fn displayedDiffHeaderTargetDirect(self: View, expected: ?diff_selection.HeaderIdentity) ?DiffHeaderTarget {
         const target: DiffHeaderTarget = blk: {
             if (self.activeGeneratedFileProjection()) |bundle| {
                 break :blk .{
@@ -622,6 +711,10 @@ pub const View = struct {
     }
 
     pub fn selectedProjectionLineCount(self: View) usize {
+        return self.resolvedTarget().line_count;
+    }
+
+    fn selectedProjectionLineCountDirect(self: View) usize {
         if (self.selectedStatusEntry() == null) return 0;
         return switch (self.page.review_projection.displayed) {
             .ready => |ready| switch (ready.value) {
@@ -678,19 +771,24 @@ pub const View = struct {
     }
 
     pub fn unsupportedSearchMessage(self: View) ?[]const u8 {
+        const reason = self.resolvedTarget().search_unavailable orelse return null;
+        return reason.message();
+    }
+
+    fn searchUnavailableReasonDirect(self: View) ?diff_surface.SearchUnavailableReason {
         if (self.displayedReviewBody() == .inert_invalid_utf8) {
-            return "search is unavailable because diff content is not valid UTF-8";
+            return .invalid_utf8;
         }
         if (self.activeCombinedProjection() != null) {
-            return "search is unavailable for mixed staged/unstaged view";
+            return .mixed_stage_view;
         }
         if (self.activeGeneratedFileProjection() != null) {
-            return "search is unavailable for generated file preview";
+            return .generated_preview;
         }
         if (self.activeCachedDiffProjection() != null) {
             if (self.selectedStatusEntry()) |entry| {
                 if (entry.index == .added and !entry.isUnstaged()) {
-                    return "search is unavailable for staged new file preview";
+                    return .staged_new_preview;
                 }
             }
         }
@@ -791,6 +889,11 @@ pub const View = struct {
     }
 
     pub fn displayedDiffFile(self: View) ?diff_parser.FileDiff {
+        var adapter = self.bodyResolverAdapter();
+        return adapter.interface().displayedDiffFile();
+    }
+
+    fn displayedDiffFileDirect(self: View) ?diff_parser.FileDiff {
         return switch (self.displayedReviewBody()) {
             .primary => |primary| primary.loaded.document.files[primary.file_index],
             .cached => |bundle| bundle.loaded.document.files[0],
@@ -801,6 +904,11 @@ pub const View = struct {
     }
 
     pub fn displayedSearchTarget(self: View, mode: diff_render.DisplayMode) ?SearchTarget {
+        var adapter = self.bodyResolverAdapter();
+        return adapter.interface().displayedSearchTarget(mode);
+    }
+
+    fn displayedSearchTargetDirect(self: View, mode: diff_render.DisplayMode) ?SearchTarget {
         return switch (self.displayedReviewBody()) {
             .cached => |bundle| .{
                 .file = bundle.loaded.document.files[0],
@@ -822,11 +930,16 @@ pub const View = struct {
     }
 
     pub fn displayedGeneratedLineCount(self: View) ?usize {
-        const bundle = self.activeGeneratedFileProjection() orelse return null;
-        return bundle.source.rowCount();
+        const generated = self.generatedBody() orelse return null;
+        return generated.source.rowCount();
     }
 
     pub fn displayedDiffLineIndex(self: View, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
+        var adapter = self.bodyResolverAdapter();
+        return adapter.interface().displayedDiffLineIndex(mode);
+    }
+
+    fn displayedDiffLineIndexDirect(self: View, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
         return switch (self.displayedReviewBody()) {
             .primary => |primary| primary.loaded.cachedRenderedLineIndex(primary.file_index, mode),
             .cached => |bundle| bundle.loaded.cachedRenderedLineIndex(0, mode),
@@ -836,7 +949,50 @@ pub const View = struct {
         };
     }
 
+    fn resolvedTargetDirect(self: View) diff_surface.ResolvedTarget {
+        const body = self.displayedReviewBody();
+        return .{
+            .kind = switch (body) {
+                .none => .none,
+                .primary => .primary,
+                .inert_invalid_utf8 => .inert,
+                .cached, .combined, .retained_staged_only, .generated, .status, .pending => .projected,
+            },
+            .line_count = self.selectedProjectionLineCountDirect(),
+            .hunk_interaction = switch (body) {
+                .primary, .cached, .combined, .retained_staged_only => .available,
+                .inert_invalid_utf8 => .inert_invalid_utf8,
+                .none, .generated, .status, .pending => .unavailable,
+            },
+            .status_rows = self.page.git_status.document.entries.len,
+            .search_unavailable = self.searchUnavailableReasonDirect(),
+            .search_unfold_policy = switch (body) {
+                .primary => .unfold_displayed,
+                .retained_staged_only => .unfold_underlying,
+                .none, .cached, .combined, .generated, .inert_invalid_utf8, .status, .pending => .suppressed,
+            },
+            .folded_hunks_source = switch (body) {
+                .cached, .combined, .retained_staged_only => .empty,
+                .none, .primary, .generated, .inert_invalid_utf8, .status, .pending => .underlying_load,
+            },
+        };
+    }
+
+    pub fn generatedBody(self: View) ?diff_surface.GeneratedBody {
+        var adapter = self.bodyResolverAdapter();
+        return adapter.interface().generatedBody();
+    }
+
+    fn generatedBodyDirect(self: View) ?diff_surface.GeneratedBody {
+        const bundle = self.activeGeneratedFileProjection() orelse return null;
+        return .{ .path = bundle.path, .source = &bundle.source };
+    }
+
     pub fn activeDiffDisplay(self: View, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?ActiveDiffDisplay {
+        return self.activeDiffDisplayDirect(allocator, mode);
+    }
+
+    fn activeDiffDisplayDirect(self: View, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?ActiveDiffDisplay {
         const selected: PrimaryReviewBody = switch (self.displayedReviewBody()) {
             .combined => |bundle| {
                 return .{ .combined_projection = .{
@@ -860,7 +1016,7 @@ pub const View = struct {
                 return .{ .loaded = .{
                     .file = loaded.document.files[0],
                     .line_index = loaded.cachedRenderedLineIndex(0, mode),
-                    .folded_hunks = loaded.foldedHunksForFile(0),
+                    .folded_hunks = &.{},
                     .hunk_stages = .all_staged,
                     .syntax = .initDirect(&loaded.syntax_spans, 0),
                 } };
@@ -881,6 +1037,42 @@ pub const View = struct {
                 try self.hunkStagePresentationForFile(allocator, file),
             .syntax = .initDirect(&loaded.syntax_spans, file_index),
         } };
+    }
+
+    fn renderProjectedBodyDirect(self: View, args: diff_surface.RenderProjectedBodyArgs) !void {
+        const body = self.displayedReviewBody();
+        switch (body) {
+            .generated => |bundle| {
+                try review_body_render.renderGenerated(bundle, args);
+                return;
+            },
+            .inert_invalid_utf8 => |inert| {
+                try review_body_render.renderStatus(inert.display_path, invalid_utf8_body_message, self.selectedStatusLineStats(), args);
+                return;
+            },
+            .status => |status| {
+                try review_body_render.renderStatus(status.path, status.message, self.selectedStatusLineStats(), args);
+                return;
+            },
+            .pending => {
+                const entry = self.selectedStatusEntry() orelse return;
+                const path = entry.canonicalPathKey() orelse entry.path;
+                try review_body_render.renderStatus(path, "Loading review projection...", self.selectedStatusLineStats(), args);
+                return;
+            },
+            .none, .primary => return,
+            .cached, .combined, .retained_staged_only => {},
+        }
+
+        const mode = diff_render.effectiveMode(diff_render.bodyWidth(args.surface.size().width), args.requested_mode);
+        const display = (try self.activeDiffDisplayDirect(args.surface.frameAllocator(), mode)) orelse return;
+        try review_body_render.renderParsed(.{
+            .file = display.file(),
+            .line_index = display.lineIndex(),
+            .folded_hunks = display.foldedHunks(),
+            .hunk_stages = display.hunkStagePresentation(),
+            .syntax = display.syntaxView(),
+        }, args);
     }
 
     pub fn activeGeneratedFileProjection(self: View) ?*const review_projection.GeneratedFileBundle {
@@ -934,11 +1126,7 @@ pub const View = struct {
     }
 
     pub fn hunkInteractionAvailability(self: View) HunkInteractionAvailability {
-        return switch (self.displayedReviewBody()) {
-            .primary, .cached, .combined, .retained_staged_only => .available,
-            .inert_invalid_utf8 => .inert_invalid_utf8,
-            .none, .generated, .status, .pending => .unavailable,
-        };
+        return self.resolvedTarget().hunk_interaction;
     }
 
     pub fn displayedProjectionRequestIsActive(self: View, request: review_projection.Request) bool {
@@ -961,6 +1149,11 @@ pub const View = struct {
     }
 
     pub fn displayedDiffLineCount(self: View) usize {
+        var adapter = self.bodyResolverAdapter();
+        return adapter.interface().displayedDiffLineCount();
+    }
+
+    fn displayedDiffLineCountDirect(self: View) usize {
         if (self.displayedGeneratedLineCount()) |line_count| return line_count;
         return self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
     }
@@ -970,9 +1163,7 @@ pub const View = struct {
     }
 
     pub fn selectedFoldedHunks(self: View) []const bool {
-        if (self.activeCombinedProjection() != null or
-            self.activeRetainedStagedOnlyProjection() != null or
-            self.activeCachedDiffProjection() != null) return &.{};
+        if (self.resolvedTarget().folded_hunks_source == .empty) return &.{};
         const loaded = self.activeLoadedDiffConst() orelse return &.{};
         const file_index = self.selectedFileIndex(loaded) orelse return &.{};
         return loaded.foldedHunksForFile(file_index);
@@ -985,6 +1176,21 @@ pub const View = struct {
 
     fn rawSelectedHunkIndex(self: View) ?usize {
         return self.sharedView().rawSelectedHunkIndex();
+    }
+
+    fn hunkStagePresentationDirect(self: View, allocator: std.mem.Allocator, file_index: usize) !diff_render.HunkStagePresentation {
+        return switch (self.displayedReviewBody()) {
+            .combined => |bundle| projectedHunkStagePresentation(allocator, bundle.hunkStageStates()),
+            .retained_staged_only, .cached => .all_staged,
+            .primary => |primary| blk: {
+                if (primary.hunk_authority) |authority| {
+                    break :blk projectedHunkStagePresentation(allocator, authority.hunkStageStates());
+                }
+                if (file_index >= primary.loaded.document.files.len) break :blk .all_unstaged;
+                break :blk self.hunkStagePresentationForFile(allocator, primary.loaded.document.files[file_index]);
+            },
+            .none, .generated, .inert_invalid_utf8, .status, .pending => .all_unstaged,
+        };
     }
 
     pub fn hunkStagePresentationForFile(self: View, allocator: std.mem.Allocator, file: diff_parser.FileDiff) !diff_render.HunkStagePresentation {
@@ -1425,7 +1631,7 @@ pub const Controller = struct {
     }
 
     pub fn clampDiffNavigation(self: Controller) void {
-        if (self.view().displayedReviewBody() == .inert_invalid_utf8) {
+        if (self.view().resolvedTarget().kind == .inert) {
             self.page.viewer.diff_cursor = .{ .metadata = 0 };
             self.page.viewer.diff_scroll = 0;
             self.page.viewer.diff_horizontal_scroll = 0;
@@ -1721,9 +1927,7 @@ pub const Controller = struct {
     }
 
     pub fn unfoldSearchMatchIfNeeded(self: Controller, match: diff_search.Match) void {
-        if (self.view().activeCombinedProjection() != null or
-            self.view().activeCachedDiffProjection() != null or
-            self.view().activeGeneratedFileProjection() != null) return;
+        if (self.view().resolvedTarget().search_unfold_policy == .suppressed) return;
 
         const hunk_index = switch (match.coordinate) {
             .hunk_line => |line| line.hunk_index,
@@ -2082,7 +2286,7 @@ pub const Controller = struct {
                 .diff_file => |file_index| if (file_index >= file_count) {
                     self.setSelectedDiffFile(file_count - 1);
                 },
-                .status_only => |status_index| if (status_index >= self.page.git_status.document.entries.len) {
+                .status_only => |status_index| if (status_index >= self.view().resolvedTarget().status_rows) {
                     self.setSelectedDiffFile(file_count - 1);
                 },
             }
@@ -2497,6 +2701,46 @@ fn prepareStatusOnlyHorizontalScrollHarness(
     _ = harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, status_text);
     try harness.pages.review.git_status.replace("/repo", &status_bundle);
+}
+
+fn expectResolverRenderContains(harness: *TestHarness, needle: []const u8) !void {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 12);
+    defer ts.deinit();
+    try harness.view().renderProjectedBody(.{
+        .surface = &ts.surface,
+        .requested_mode = harness.pages.review.viewer.display_mode,
+        .scroll = harness.pages.review.viewer.diff_scroll,
+        .horizontal_scroll = harness.pages.review.viewer.diff_horizontal_scroll,
+        .pane_active = true,
+        .line_numbers = harness.pages.review.viewer.view_options.line_numbers,
+        .highlighted_hunk = harness.view().selectedHunkIndex(),
+        .cursor_offset = harness.view().visibleDiffCursorOffset(),
+        .palette = .default(),
+        .selection = harness.view().diffSelectionView(),
+        .header_selection = harness.view().diffHeaderSelectionActive(),
+    });
+    try test_support.expectSnapshotContains(&ts, needle);
+}
+
+fn expectResolverRenderOmits(harness: *TestHarness, needle: []const u8) !void {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 12);
+    defer ts.deinit();
+    try harness.view().renderProjectedBody(.{
+        .surface = &ts.surface,
+        .requested_mode = harness.pages.review.viewer.display_mode,
+        .scroll = harness.pages.review.viewer.diff_scroll,
+        .horizontal_scroll = harness.pages.review.viewer.diff_horizontal_scroll,
+        .pane_active = true,
+        .line_numbers = harness.pages.review.viewer.view_options.line_numbers,
+        .highlighted_hunk = harness.view().selectedHunkIndex(),
+        .cursor_offset = harness.view().visibleDiffCursorOffset(),
+        .palette = .default(),
+        .selection = harness.view().diffSelectionView(),
+        .header_selection = harness.view().diffHeaderSelectionActive(),
+    });
+    try test_support.expectSnapshotNotContains(&ts, needle);
 }
 
 fn installCombinedHorizontalScrollProjection(
@@ -2971,6 +3215,15 @@ test "invalid primary file is inert while its valid sibling remains selectable" 
 
     harness.controller().selectFileAbsolute(0);
     try std.testing.expect(harness.view().displayedReviewBody() == .primary);
+    try std.testing.expectEqualDeep(diff_surface.ResolvedTarget{
+        .kind = .primary,
+        .line_count = 0,
+        .hunk_interaction = .available,
+        .status_rows = 0,
+        .search_unavailable = null,
+        .search_unfold_policy = .unfold_displayed,
+        .folded_hunks_source = .underlying_load,
+    }, harness.view().resolvedTarget());
     try std.testing.expect(harness.view().bodyAllowsHunkInteraction());
     harness.controller().pressDiffMouse(.{ .col = 12, .row = diff_render.body_start_row + 1 });
     try std.testing.expect(harness.pages.review.selection_owner.activeDiff() != null);
@@ -3399,6 +3652,7 @@ test "displayed body horizontal scroll preserves primary behavior without a cach
     }, .{ .width = 80, .height = 12 });
 
     try std.testing.expect(harness.view().displayedReviewBody() == .primary);
+    try expectResolverRenderOmits(&harness, "hunks");
     try std.testing.expect(harness.view().displayedDiffLineIndex(.unified) == null);
     const with_line_numbers = harness.view().visibleBodyTextMaxHorizontalScroll();
     try std.testing.expect(with_line_numbers >= 8);
@@ -3423,6 +3677,12 @@ test "displayed body horizontal scroll uses cached combined retained and generat
         },
     }, .{ .width = 140, .height = 16 });
     try prepareStatusOnlyHorizontalScrollHarness(&cached, allocator, "M  a\x00");
+    var cached_bundle = try app_load.buildLoadedBundle(
+        allocator,
+        displayed_body_horizontal_scroll_cached_patch,
+    );
+    try std.testing.expect(cached_bundle.loaded.collapsed_hunks.len > 0);
+    cached_bundle.loaded.collapsed_hunks[0] = true;
     cached.pages.review.review_projection.installReady(.{
         .request = try review_projection.testing.cloneRequest(
             allocator,
@@ -3435,13 +3695,20 @@ test "displayed body horizontal scroll uses cached combined retained and generat
             cached.pages.review.source_session_revision,
             cached.pages.review.status_snapshot_revision,
         ),
-        .value = .{ .cached_diff = try app_load.buildLoadedBundle(
-            allocator,
-            displayed_body_horizontal_scroll_cached_patch,
-        ) },
+        .value = .{ .cached_diff = cached_bundle },
     });
     defer cached.pages.review.deinit(allocator);
     try std.testing.expect(cached.view().displayedReviewBody() == .cached);
+    const cached_target = cached.view().resolvedTarget();
+    try std.testing.expectEqual(diff_surface.ReducedBodyKind.projected, cached_target.kind);
+    try std.testing.expect(cached_target.line_count > 0);
+    try std.testing.expectEqual(HunkInteractionAvailability.available, cached_target.hunk_interaction);
+    try std.testing.expectEqual(@as(usize, 1), cached_target.status_rows);
+    try std.testing.expectEqual(@as(?diff_surface.SearchUnavailableReason, null), cached_target.search_unavailable);
+    try std.testing.expectEqual(diff_surface.SearchUnfoldPolicy.suppressed, cached_target.search_unfold_policy);
+    try std.testing.expectEqual(diff_surface.FoldedHunksSource.empty, cached_target.folded_hunks_source);
+    try expectResolverRenderContains(&cached, "hunks");
+    try expectResolverRenderContains(&cached, "wide-0123456789");
     try expectDisplayedBodyHorizontalScrollGeometry(&cached);
 
     var combined = TestHarness.init(.{
@@ -3456,6 +3723,14 @@ test "displayed body horizontal scroll uses cached combined retained and generat
     try installCombinedHorizontalScrollProjection(&combined, allocator);
     defer combined.pages.review.deinit(allocator);
     try std.testing.expect(combined.view().displayedReviewBody() == .combined);
+    const combined_target = combined.view().resolvedTarget();
+    try std.testing.expectEqual(diff_surface.ReducedBodyKind.projected, combined_target.kind);
+    try std.testing.expectEqual(@as(usize, 0), combined_target.line_count);
+    try std.testing.expectEqual(HunkInteractionAvailability.available, combined_target.hunk_interaction);
+    try std.testing.expectEqual(@as(?diff_surface.SearchUnavailableReason, .mixed_stage_view), combined_target.search_unavailable);
+    try std.testing.expectEqual(diff_surface.SearchUnfoldPolicy.suppressed, combined_target.search_unfold_policy);
+    try std.testing.expectEqual(diff_surface.FoldedHunksSource.empty, combined_target.folded_hunks_source);
+    try expectResolverRenderContains(&combined, "hunks");
     try expectDisplayedBodyHorizontalScrollGeometry(&combined);
 
     var retained = TestHarness.init(.{
@@ -3473,6 +3748,14 @@ test "displayed body horizontal scroll uses cached combined retained and generat
     try retainCombinedHorizontalScrollProjection(&retained, allocator);
     defer retained.pages.review.deinit(allocator);
     try std.testing.expect(retained.view().displayedReviewBody() == .retained_staged_only);
+    const retained_target = retained.view().resolvedTarget();
+    try std.testing.expectEqual(diff_surface.ReducedBodyKind.projected, retained_target.kind);
+    try std.testing.expectEqual(@as(usize, 0), retained_target.line_count);
+    try std.testing.expectEqual(HunkInteractionAvailability.available, retained_target.hunk_interaction);
+    try std.testing.expectEqual(@as(?diff_surface.SearchUnavailableReason, null), retained_target.search_unavailable);
+    try std.testing.expectEqual(diff_surface.SearchUnfoldPolicy.unfold_underlying, retained_target.search_unfold_policy);
+    try std.testing.expectEqual(diff_surface.FoldedHunksSource.empty, retained_target.folded_hunks_source);
+    try expectResolverRenderContains(&retained, "hunks");
     try expectDisplayedBodyHorizontalScrollGeometry(&retained);
 
     var generated = TestHarness.init(.{
@@ -3504,6 +3787,14 @@ test "displayed body horizontal scroll uses cached combined retained and generat
     });
     defer generated.pages.review.deinit(allocator);
     try std.testing.expect(generated.view().displayedReviewBody() == .generated);
+    const generated_target = generated.view().resolvedTarget();
+    try std.testing.expectEqual(diff_surface.ReducedBodyKind.projected, generated_target.kind);
+    try std.testing.expect(generated_target.line_count > 0);
+    try std.testing.expectEqual(HunkInteractionAvailability.unavailable, generated_target.hunk_interaction);
+    try std.testing.expectEqual(@as(?diff_surface.SearchUnavailableReason, .generated_preview), generated_target.search_unavailable);
+    try std.testing.expectEqual(diff_surface.SearchUnfoldPolicy.suppressed, generated_target.search_unfold_policy);
+    try std.testing.expectEqual(diff_surface.FoldedHunksSource.underlying_load, generated_target.folded_hunks_source);
+    try expectResolverRenderContains(&generated, "generated");
     try expectDisplayedBodyHorizontalScrollGeometry(&generated);
 }
 
@@ -3575,6 +3866,16 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
     try prepareStatusOnlyHorizontalScrollHarness(&none, allocator, "M  a\x00");
     defer none.pages.review.deinit(allocator);
     try std.testing.expect(none.view().displayedReviewBody() == .none);
+    try std.testing.expectEqualDeep(diff_surface.ResolvedTarget{
+        .kind = .none,
+        .line_count = 0,
+        .hunk_interaction = .unavailable,
+        .status_rows = 1,
+        .search_unavailable = null,
+        .search_unfold_policy = .suppressed,
+        .folded_hunks_source = .underlying_load,
+    }, none.view().resolvedTarget());
+    try expectResolverRenderOmits(&none, "status:");
     none.pages.review.viewer.diff_horizontal_scroll = 99;
     none.controller().clampDiffHorizontalScrollToVisibleRows();
     try std.testing.expectEqual(@as(usize, 0), none.pages.review.viewer.diff_horizontal_scroll);
@@ -3597,6 +3898,16 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
     );
     defer pending.pages.review.deinit(allocator);
     try std.testing.expect(pending.view().displayedReviewBody() == .pending);
+    try std.testing.expectEqualDeep(diff_surface.ResolvedTarget{
+        .kind = .projected,
+        .line_count = 0,
+        .hunk_interaction = .unavailable,
+        .status_rows = 1,
+        .search_unavailable = null,
+        .search_unfold_policy = .suppressed,
+        .folded_hunks_source = .underlying_load,
+    }, pending.view().resolvedTarget());
+    try expectResolverRenderContains(&pending, "Loading review projection...");
     try std.testing.expectEqual(@as(usize, 0), pending.view().visibleBodyTextMaxHorizontalScroll());
 
     var status = TestHarness.init(.{
@@ -3625,6 +3936,16 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
     });
     defer status.pages.review.deinit(allocator);
     try std.testing.expect(status.view().displayedReviewBody() == .status);
+    try std.testing.expectEqualDeep(diff_surface.ResolvedTarget{
+        .kind = .projected,
+        .line_count = 1,
+        .hunk_interaction = .unavailable,
+        .status_rows = 1,
+        .search_unavailable = null,
+        .search_unfold_policy = .suppressed,
+        .folded_hunks_source = .underlying_load,
+    }, status.view().resolvedTarget());
+    try expectResolverRenderContains(&status, "No staged diff.");
     try std.testing.expectEqual(@as(usize, 0), status.view().visibleBodyTextMaxHorizontalScroll());
 
     const invalid_patch =
@@ -3655,7 +3976,49 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
     });
     defer inert.pages.review.deinit(allocator);
     try std.testing.expect(inert.view().displayedReviewBody() == .inert_invalid_utf8);
+    try std.testing.expectEqualDeep(diff_surface.ResolvedTarget{
+        .kind = .inert,
+        .line_count = 1,
+        .hunk_interaction = .inert_invalid_utf8,
+        .status_rows = 1,
+        .search_unavailable = .invalid_utf8,
+        .search_unfold_policy = .suppressed,
+        .folded_hunks_source = .underlying_load,
+    }, inert.view().resolvedTarget());
+    try expectResolverRenderContains(&inert, "Text preview unavailable");
     try std.testing.expectEqual(@as(usize, 0), inert.view().visibleBodyTextMaxHorizontalScroll());
+}
+
+test "none body preserves underlying folded hunks through resolver seam" {
+    const allocator = std.testing.allocator;
+    var collapsed = [_]bool{ true, false };
+    var loaded = test_support.loadedDiffOne();
+    loaded.collapsed_hunks = &collapsed;
+    var harness = TestHarness.init(.{
+        .load = test_support.loadState(loaded),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    }, .{ .width = 80, .height = 12 });
+    harness.repo_root = "/repo";
+    _ = harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    harness.pages.review.review_projection.installReady(.{
+        .request = try review_projection.testing.cloneRequest(
+            allocator,
+            harness.pages.review.activation.currentIdentity().?,
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            harness.pages.review.source_session_revision,
+            harness.pages.review.status_snapshot_revision,
+        ),
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, "") },
+    });
+    defer harness.pages.review.deinit(allocator);
+
+    try std.testing.expect(harness.view().displayedReviewBody() == .none);
+    try std.testing.expectEqual(diff_surface.FoldedHunksSource.underlying_load, harness.view().resolvedTarget().folded_hunks_source);
+    try std.testing.expectEqualSlices(bool, &collapsed, harness.view().selectedFoldedHunks());
 }
 
 test "layout changes reset horizontal scroll only when diff pane width changes" {
@@ -4018,6 +4381,40 @@ test "search unfolds folded hunk body matches before setting offset" {
     try std.testing.expect(!active.isHunkFolded(0, 0));
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
     try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
+}
+
+test "retained staged-only search unfolds the underlying primary hunk" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    var loaded = app_test_support.loadedDiffOne();
+    loaded.collapsed_hunks = try arena.allocator().alloc(bool, loaded.document.totalHunks());
+    @memset(loaded.collapsed_hunks, false);
+    loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena.allocator(), loaded.document);
+
+    var app = TestHarness.init(.{
+        .load = app_test_support.loadStateWithArena(arena, loaded),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+    }, .{ .width = 100, .height = 12 });
+    try prepareStatusOnlyHorizontalScrollHarness(&app, allocator, "MM a\x00");
+    try installCombinedHorizontalScrollProjection(&app, allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try app.pages.review.git_status.replace("/repo", &staged_status);
+    try retainCombinedHorizontalScrollProjection(&app, allocator);
+    defer app.pages.review.deinit(allocator);
+
+    const active = app.controller().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
+    active.setHunkFolded(0, 0, true);
+    try std.testing.expect(active.isHunkFolded(0, 0));
+    try std.testing.expectEqual(
+        diff_surface.SearchUnfoldPolicy.unfold_underlying,
+        app.view().resolvedTarget().search_unfold_policy,
+    );
+
+    app.controller().unfoldSearchMatchIfNeeded(.{ .coordinate = .{ .hunk_line = .{
+        .hunk_index = 0,
+        .line_index = 0,
+    } } });
+    try std.testing.expect(!active.isHunkFolded(0, 0));
 }
 
 test "manual fold keeps hunk open when it contains active search match" {
@@ -5333,6 +5730,10 @@ test "staged new file preview blocks diff search" {
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
+    try std.testing.expectEqual(
+        @as(?diff_surface.SearchUnavailableReason, .staged_new_preview),
+        app.reviewNavigationView().resolvedTarget().search_unavailable,
+    );
 
     app.reviewNavigation().enterSearchMode();
     try std.testing.expect(!app.pages.review.search.mode);
