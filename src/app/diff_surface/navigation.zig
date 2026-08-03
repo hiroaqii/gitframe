@@ -664,6 +664,14 @@ pub const Controller = struct {
         return if (basis.valid()) basis else null;
     }
 
+    pub fn advanceAcceptedSidebarRevision(self: Controller, allocator: ?std.mem.Allocator) void {
+        file_search.advanceAcceptedSidebarRevision(
+            self.surface.file_search,
+            self.surface.accepted_sidebar_revision,
+            allocator,
+        );
+    }
+
     pub fn clearSearchMatch(self: Controller) void {
         self.surface.search.match = null;
         self.surface.search.match_offset = null;
@@ -758,6 +766,163 @@ pub const BodyController = struct {
             .view = self.controller.view(),
             .resolver = self.resolver,
         };
+    }
+
+    pub fn toggleReviewedFile(self: BodyController, allocator: std.mem.Allocator) !void {
+        const loaded = self.controller.activeLoadedDiff() orelse return;
+        if (self.controller.surface.viewer.selected_node >= loaded.tree.nodes.len) return;
+
+        const file_index = self.controller.view().selectedFileIndex(loaded) orelse return;
+        if (file_index >= loaded.reviewed_files.len) return;
+        const file = loaded.document.files[file_index];
+        if (self.controller.repo_root != null and diff_file.canonicalPathKey(file) == null) return;
+
+        const reviewed = !loaded.reviewed_files[file_index];
+        if (self.controller.surface.review_display.hide_reviewed_files) {
+            // Prepare the primary visible-tree replacement before changing
+            // reviewed authority. Once that primary operation can commit, the
+            // old search projection must be revoked before eligibility changes.
+            var prepared = try loaded.prepareVisibleNodeRebuild(self.controller.loadArenaAllocator() orelse unreachable);
+            try self.controller.surface.reviewed_store.set(allocator, self.controller.repo_root, file, reviewed);
+            self.controller.advanceAcceptedSidebarRevision(allocator);
+            loaded.reviewed_files[file_index] = reviewed;
+            prepared.commit(
+                self.controller.surface.review_display.hide_reviewed_files,
+                self.controller.surface.review_display.changed_file_filter,
+            );
+            self.reconcileSelectionAfterVisibleNodeChange(loaded);
+            self.controller.clampSidebarHorizontalScroll();
+            self.clampDiffNavigation();
+            self.controller.rebuildFileSearchProjection(allocator);
+            return;
+        }
+
+        try self.controller.surface.reviewed_store.set(allocator, self.controller.repo_root, file, reviewed);
+        loaded.reviewed_files[file_index] = reviewed;
+    }
+
+    pub fn toggleHideReviewedFiles(self: BodyController, allocator: std.mem.Allocator) !void {
+        try self.replaceFileVisibilityLens(
+            allocator,
+            self.controller.loadArenaAllocator() orelse allocator,
+            !self.controller.surface.review_display.hide_reviewed_files,
+            self.controller.surface.review_display.changed_file_filter,
+        );
+    }
+
+    pub fn cycleChangedFileFilter(self: BodyController, allocator: std.mem.Allocator) !void {
+        try self.replaceFileVisibilityLens(
+            allocator,
+            self.controller.loadArenaAllocator() orelse allocator,
+            self.controller.surface.review_display.hide_reviewed_files,
+            self.controller.surface.review_display.changed_file_filter.next(),
+        );
+    }
+
+    /// Replace the accepted file-visibility lens transactionally. Search
+    /// allocation follows the primary commit so its failure cannot reject a
+    /// valid lens change.
+    pub fn replaceFileVisibilityLens(
+        self: BodyController,
+        allocator: std.mem.Allocator,
+        visible_allocator: std.mem.Allocator,
+        hide_reviewed_files: bool,
+        changed_file_filter: loaded_diff.ChangedFileFilter,
+    ) !void {
+        if (self.controller.activeLoadedDiff()) |loaded| {
+            var prepared = try loaded.prepareVisibleNodeRebuild(visible_allocator);
+            self.controller.advanceAcceptedSidebarRevision(allocator);
+            self.controller.surface.review_display.hide_reviewed_files = hide_reviewed_files;
+            self.controller.surface.review_display.changed_file_filter = changed_file_filter;
+            prepared.commit(hide_reviewed_files, changed_file_filter);
+            self.reconcileSelectionAfterVisibleNodeChange(loaded);
+            self.controller.clampSidebarHorizontalScroll();
+            self.clampDiffNavigation();
+        } else {
+            // Lens state is retained across unloaded states. Revoke any
+            // projection defensively and give the next accepted sidebar a new
+            // namespace even though there is no visible tree to rebuild now.
+            self.controller.advanceAcceptedSidebarRevision(allocator);
+            self.controller.surface.review_display.hide_reviewed_files = hide_reviewed_files;
+            self.controller.surface.review_display.changed_file_filter = changed_file_filter;
+        }
+        self.controller.rebuildFileSearchProjection(allocator);
+    }
+
+    pub fn submitFileSearch(self: BodyController, allocator: std.mem.Allocator) void {
+        self.submitFileSearchWithVisibleAllocator(allocator, null);
+    }
+
+    pub fn submitFileSearchWithVisibleAllocator(
+        self: BodyController,
+        allocator: std.mem.Allocator,
+        visible_allocator_override: ?std.mem.Allocator,
+    ) void {
+        if (!self.controller.surface.file_search.projection_available) return;
+        const candidate = self.controller.surface.file_search.focusedCandidate() orelse {
+            if (self.controller.surface.file_search.filter.labels.len == 0) {
+                self.controller.surface.file_search.no_match = true;
+            } else {
+                self.controller.surface.file_search.markProjectionUnavailable(allocator);
+            }
+            return;
+        };
+        const loaded = self.controller.activeLoadedDiff() orelse {
+            self.controller.surface.file_search.markProjectionUnavailable(allocator);
+            return;
+        };
+        const basis = self.controller.currentFileSearchBasis() orelse {
+            self.controller.surface.file_search.markProjectionUnavailable(allocator);
+            return;
+        };
+        const node_index = candidate.node_index;
+        if (node_index >= loaded.tree.nodes.len or
+            !candidate.matchesNode(basis, node_index, loaded.tree.nodes[node_index]) or
+            !loaded.shouldIncludeFileNode(
+                node_index,
+                self.controller.surface.review_display.hide_reviewed_files,
+                self.controller.surface.review_display.changed_file_filter,
+            ))
+        {
+            self.controller.surface.file_search.markProjectionUnavailable(allocator);
+            return;
+        }
+
+        self.revealAndSelectExactNode(
+            loaded,
+            node_index,
+            visible_allocator_override orelse self.controller.loadArenaAllocator(),
+        ) catch {
+            self.controller.setStatus("Could not reveal file search result", .{});
+            return;
+        };
+        self.controller.surface.file_search.deinit(allocator);
+        self.controller.surface.viewer.focus = .diff;
+    }
+
+    /// Commit one already validated exact file node through the shared
+    /// ancestor-reveal and navigation transaction.
+    pub fn revealAndSelectExactNode(
+        self: BodyController,
+        loaded: *LoadedDiff,
+        node_index: usize,
+        visible_allocator: ?std.mem.Allocator,
+    ) !void {
+        std.debug.assert(node_index < loaded.tree.nodes.len);
+        std.debug.assert(loaded.tree.nodes[node_index].kind == .file);
+        if (loaded.visibleRowOfNode(node_index) == null) {
+            const allocator = visible_allocator orelse return error.MissingVisibleNodeAllocator;
+            var prepared = try loaded.prepareVisibleNodeRebuild(allocator);
+            file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
+            prepared.commit(
+                self.controller.surface.review_display.hide_reviewed_files,
+                self.controller.surface.review_display.changed_file_filter,
+            );
+        }
+
+        self.selectSidebarNode(loaded, node_index);
+        self.clampSelection(loaded.document.files.len);
+        self.clampDiffNavigation();
     }
 
     pub fn pressDiffMouse(self: BodyController, point: diff_surface.MousePoint) void {

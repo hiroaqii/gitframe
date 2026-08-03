@@ -13,6 +13,7 @@ pub const BuildOptions = shared.BuildOptions;
 pub const buildProjection = shared.buildProjection;
 pub const State = shared.State;
 pub const nextAcceptedSidebarRevision = shared.nextAcceptedSidebarRevision;
+pub const advanceAcceptedSidebarRevision = shared.advanceAcceptedSidebarRevision;
 
 test {
     _ = shared;

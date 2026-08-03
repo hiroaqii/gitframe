@@ -1341,54 +1341,18 @@ pub const Controller = struct {
     }
 
     pub fn toggleReviewedFile(self: Controller, allocator: std.mem.Allocator) !void {
-        const loaded = self.activeLoadedDiff() orelse return;
-        if (self.page.viewer.selected_node >= loaded.tree.nodes.len) return;
-
-        const file_index = self.view().selectedFileIndex(loaded) orelse return;
-        if (file_index >= loaded.reviewed_files.len) return;
-        const file = loaded.document.files[file_index];
-        if (self.repo_root != null and diff_file.canonicalPathKey(file) == null) return;
-
-        const reviewed = !loaded.reviewed_files[file_index];
-        if (self.page.review_display.hide_reviewed_files) {
-            // Prepare the primary visible-tree replacement before changing
-            // reviewed authority. Once that primary operation can commit, the
-            // old search projection must be revoked before eligibility changes.
-            var prepared = try loaded.prepareVisibleNodeRebuild(self.loadArenaAllocator() orelse unreachable);
-            try self.page.reviewed_store.set(allocator, self.repo_root, file, reviewed);
-            self.page.advanceAcceptedSidebarRevision(allocator);
-            loaded.reviewed_files[file_index] = reviewed;
-            prepared.commit(
-                self.page.review_display.hide_reviewed_files,
-                self.page.review_display.changed_file_filter,
-            );
-            self.reconcileSelectionAfterVisibleNodeChange(loaded);
-            self.clampSidebarHorizontalScroll();
-            self.clampDiffNavigation();
-            self.rebuildFileSearchProjection(allocator);
-            return;
-        }
-
-        try self.page.reviewed_store.set(allocator, self.repo_root, file, reviewed);
-        loaded.reviewed_files[file_index] = reviewed;
+        var adapter = self.bodyResolverAdapter();
+        try self.sharedBodyController(&adapter).toggleReviewedFile(allocator);
     }
 
     pub fn toggleHideReviewedFiles(self: Controller, allocator: std.mem.Allocator) !void {
-        try self.replaceFileVisibilityLens(
-            allocator,
-            self.loadArenaAllocator() orelse allocator,
-            !self.page.review_display.hide_reviewed_files,
-            self.page.review_display.changed_file_filter,
-        );
+        var adapter = self.bodyResolverAdapter();
+        try self.sharedBodyController(&adapter).toggleHideReviewedFiles(allocator);
     }
 
     pub fn cycleChangedFileFilter(self: Controller, allocator: std.mem.Allocator) !void {
-        try self.replaceFileVisibilityLens(
-            allocator,
-            self.loadArenaAllocator() orelse allocator,
-            self.page.review_display.hide_reviewed_files,
-            self.page.review_display.changed_file_filter.next(),
-        );
+        var adapter = self.bodyResolverAdapter();
+        try self.sharedBodyController(&adapter).cycleChangedFileFilter(allocator);
     }
 
     /// Replace the accepted Review file-visibility lens transactionally.
@@ -1401,31 +1365,18 @@ pub const Controller = struct {
         hide_reviewed_files: bool,
         changed_file_filter: ChangedFileFilter,
     ) !void {
-        if (self.activeLoadedDiff()) |loaded| {
-            var prepared = try loaded.prepareVisibleNodeRebuild(visible_allocator);
-            self.page.advanceAcceptedSidebarRevision(allocator);
-            self.page.review_display.hide_reviewed_files = hide_reviewed_files;
-            self.page.review_display.changed_file_filter = changed_file_filter;
-            prepared.commit(
-                hide_reviewed_files,
-                changed_file_filter,
-            );
-            self.reconcileSelectionAfterVisibleNodeChange(loaded);
-            self.clampSidebarHorizontalScroll();
-            self.clampDiffNavigation();
-        } else {
-            // Lens state is retained across unloaded states. Revoke any
-            // projection defensively and give the next accepted sidebar a new
-            // namespace even though there is no visible tree to rebuild now.
-            self.page.advanceAcceptedSidebarRevision(allocator);
-            self.page.review_display.hide_reviewed_files = hide_reviewed_files;
-            self.page.review_display.changed_file_filter = changed_file_filter;
-        }
-        self.rebuildFileSearchProjection(allocator);
+        var adapter = self.bodyResolverAdapter();
+        try self.sharedBodyController(&adapter).replaceFileVisibilityLens(
+            allocator,
+            visible_allocator,
+            hide_reviewed_files,
+            changed_file_filter,
+        );
     }
 
     pub fn submitFileSearch(self: Controller, allocator: std.mem.Allocator) void {
-        self.submitFileSearchWithVisibleAllocator(allocator, null);
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).submitFileSearch(allocator);
     }
 
     fn submitFileSearchWithVisibleAllocator(
@@ -1433,46 +1384,11 @@ pub const Controller = struct {
         allocator: std.mem.Allocator,
         visible_allocator_override: ?std.mem.Allocator,
     ) void {
-        if (!self.page.file_search.projection_available) return;
-        const candidate = self.page.file_search.focusedCandidate() orelse {
-            if (self.page.file_search.filter.labels.len == 0) {
-                self.page.file_search.no_match = true;
-            } else {
-                self.page.file_search.markProjectionUnavailable(allocator);
-            }
-            return;
-        };
-        const loaded = self.activeLoadedDiff() orelse {
-            self.page.file_search.markProjectionUnavailable(allocator);
-            return;
-        };
-        const basis = self.currentFileSearchBasis() orelse {
-            self.page.file_search.markProjectionUnavailable(allocator);
-            return;
-        };
-        const node_index = candidate.node_index;
-        if (node_index >= loaded.tree.nodes.len or
-            !candidate.matchesNode(basis, node_index, loaded.tree.nodes[node_index]) or
-            !loaded.shouldIncludeFileNode(
-                node_index,
-                self.page.review_display.hide_reviewed_files,
-                self.page.review_display.changed_file_filter,
-            ))
-        {
-            self.page.file_search.markProjectionUnavailable(allocator);
-            return;
-        }
-
-        self.revealAndSelectExactNode(
-            loaded,
-            node_index,
-            visible_allocator_override orelse self.loadArenaAllocator(),
-        ) catch {
-            self.setStatus("Could not reveal file search result", .{});
-            return;
-        };
-        self.page.file_search.deinit(allocator);
-        self.page.viewer.focus = .diff;
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).submitFileSearchWithVisibleAllocator(
+            allocator,
+            visible_allocator_override,
+        );
     }
 
     pub fn submitSearch(self: Controller) void {
@@ -1906,21 +1822,12 @@ pub const Controller = struct {
         node_index: usize,
         visible_allocator: ?std.mem.Allocator,
     ) !void {
-        std.debug.assert(node_index < loaded.tree.nodes.len);
-        std.debug.assert(loaded.tree.nodes[node_index].kind == .file);
-        if (loaded.visibleRowOfNode(node_index) == null) {
-            const allocator = visible_allocator orelse return error.MissingVisibleNodeAllocator;
-            var prepared = try loaded.prepareVisibleNodeRebuild(allocator);
-            file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[node_index].path);
-            prepared.commit(
-                self.page.review_display.hide_reviewed_files,
-                self.page.review_display.changed_file_filter,
-            );
-        }
-
-        self.selectSidebarNode(loaded, node_index);
-        self.clampSelection(loaded.document.files.len);
-        self.clampDiffNavigation();
+        var adapter = self.bodyResolverAdapter();
+        try self.sharedBodyController(&adapter).revealAndSelectExactNode(
+            loaded,
+            node_index,
+            visible_allocator,
+        );
     }
 
     pub fn loadArenaAllocator(self: Controller) ?std.mem.Allocator {

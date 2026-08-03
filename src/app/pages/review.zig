@@ -253,15 +253,11 @@ pub const ReviewPageState = struct {
     /// Prompt mode and input intentionally survive so the replacement path can
     /// rebuild the same query after its primary model has committed.
     pub fn advanceAcceptedSidebarRevision(self: *ReviewPageState, allocator: ?std.mem.Allocator) void {
-        if (allocator) |owner| {
-            self.file_search.markProjectionUnavailable(owner);
-        } else {
-            std.debug.assert(!self.file_search.projection_available);
-            std.debug.assert(self.file_search.candidates.len == 0);
-            std.debug.assert(self.file_search.basis == null);
-            std.debug.assert(self.file_search.filter.labels.len == 0);
-        }
-        self.accepted_sidebar_revision = file_search.nextAcceptedSidebarRevision(self.accepted_sidebar_revision);
+        file_search.advanceAcceptedSidebarRevision(
+            &self.file_search,
+            &self.accepted_sidebar_revision,
+            allocator,
+        );
     }
 
     pub fn deinit(self: *ReviewPageState, allocator: std.mem.Allocator) void {

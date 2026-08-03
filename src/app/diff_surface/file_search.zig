@@ -239,6 +239,26 @@ pub fn nextAcceptedSidebarRevision(current: u64) u64 {
     return if (next == 0) 1 else next;
 }
 
+/// Revoke every candidate borrow before replacing the accepted sidebar, then
+/// advance the namespace used by later projections. Prompt mode and input are
+/// intentionally retained so callers can rebuild the same query after the
+/// primary model commits.
+pub fn advanceAcceptedSidebarRevision(
+    state: *State,
+    revision: *u64,
+    allocator: ?std.mem.Allocator,
+) void {
+    if (allocator) |owner| {
+        state.markProjectionUnavailable(owner);
+    } else {
+        std.debug.assert(!state.projection_available);
+        std.debug.assert(state.candidates.len == 0);
+        std.debug.assert(state.basis == null);
+        std.debug.assert(state.filter.labels.len == 0);
+    }
+    revision.* = nextAcceptedSidebarRevision(revision.*);
+}
+
 test "review file search basis requires a nonzero accepted sidebar revision" {
     const invalid: Basis = .{ .repo_epoch = 4, .source_session_revision = 9, .accepted_sidebar_revision = 0 };
     const valid: Basis = .{ .repo_epoch = 4, .source_session_revision = 9, .accepted_sidebar_revision = 1 };
