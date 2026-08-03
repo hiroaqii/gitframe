@@ -319,6 +319,16 @@ pub const View = struct {
         return .{ .view = self };
     }
 
+    /// Builds the Review body resolver only for the duration of one shared
+    /// selected-content query. Returned borrows always point into page state.
+    pub fn contentView(self: View, adapter: *ReviewBodyResolver) diff_surface.content.View {
+        return .{ .navigation = self.sharedBodyView(adapter) };
+    }
+
+    pub fn contentResolverAdapter(self: View) ReviewBodyResolver {
+        return self.bodyResolverAdapter();
+    }
+
     pub fn resolvedTarget(self: View) diff_surface.ResolvedTarget {
         var adapter = self.bodyResolverAdapter();
         return self.sharedBodyView(&adapter).resolvedTarget();

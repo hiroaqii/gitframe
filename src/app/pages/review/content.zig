@@ -10,6 +10,7 @@ const app_page = if (builtin.is_test) @import("../../page.zig") else struct {};
 const app_state = if (builtin.is_test) @import("../../state.zig") else struct {};
 const page_link = @import("../../page_link.zig");
 const review_projection = if (builtin.is_test) @import("../../review_projection.zig") else struct {};
+const diff_surface = @import("../../diff_surface.zig");
 const review_page = @import("../review.zig");
 const navigation = @import("navigation.zig");
 const review_reload = @import("reload.zig");
@@ -37,16 +38,7 @@ pub const EditorTargetResult = union(enum) {
     stale_source,
 };
 
-pub const HunkCopyResult = union(enum) {
-    ready: []u8,
-    no_hunk,
-    no_new_side,
-
-    pub fn deinit(self: *HunkCopyResult, allocator: std.mem.Allocator) void {
-        if (self.* == .ready) allocator.free(self.ready);
-        self.* = undefined;
-    }
-};
+pub const HunkCopyResult = diff_surface.content.HunkCopyResult;
 
 pub const View = struct {
     page: *const review_page.ReviewPageState,
@@ -144,34 +136,13 @@ pub const View = struct {
     }
 
     pub fn currentLineCopyText(self: View) ?[]const u8 {
-        if (!self.navigation.bodyAllowsHunkInteraction()) return null;
-        const coordinate = switch (self.page.viewer.diff_cursor) {
-            .hunk_line => |line| line,
-            .metadata, .binary_marker, .hunk_header => return null,
-        };
-        const file = self.navigation.displayedDiffFile() orelse return null;
-        if (coordinate.hunk_index >= file.hunks.len) return null;
-        const hunk = file.hunks[coordinate.hunk_index];
-        if (coordinate.line_index >= hunk.lines.len) return null;
-
-        return switch (self.navigation.effectiveDisplayMode()) {
-            .unified => hunk.lines[coordinate.line_index].text,
-            .side_by_side => sideBySideLineCopyText(hunk, coordinate.line_index),
-        };
+        var adapter = self.navigation.contentResolverAdapter();
+        return self.navigation.contentView(&adapter).currentLineCopyText();
     }
 
     pub fn selectedHunkCopyText(self: View, allocator: std.mem.Allocator) !HunkCopyResult {
-        if (!self.navigation.bodyAllowsHunkInteraction()) return .no_hunk;
-        const hunk_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
-        const file = self.navigation.displayedDiffFile() orelse return .no_hunk;
-        if (hunk_index >= file.hunks.len) return .no_hunk;
-
-        const text = try newSideHunkCopyText(allocator, file.hunks[hunk_index]);
-        if (text.len == 0) {
-            allocator.free(text);
-            return .no_new_side;
-        }
-        return .{ .ready = text };
+        var adapter = self.navigation.contentResolverAdapter();
+        return self.navigation.contentView(&adapter).selectedHunkCopyText(allocator);
     }
 
     pub fn diffSelectionCopyText(
@@ -179,16 +150,16 @@ pub const View = struct {
         allocator: std.mem.Allocator,
         selection: diff_selection.DragSelection,
     ) !?[]u8 {
-        const target = self.navigation.normalLoadedDiffSelectionTarget(selection.identity) orelse return null;
-        return try diff_selection.copyText(allocator, target.file, selection);
+        var adapter = self.navigation.contentResolverAdapter();
+        return self.navigation.contentView(&adapter).diffSelectionCopyText(allocator, selection);
     }
 
     pub fn diffHeaderPath(
         self: View,
         selection: diff_selection.HeaderPathSelection,
     ) ?[]const u8 {
-        const target = self.navigation.displayedDiffHeaderTarget(selection.identity) orelse return null;
-        return target.display_path;
+        var adapter = self.navigation.contentResolverAdapter();
+        return self.navigation.contentView(&adapter).diffHeaderPath(selection);
     }
 
     fn editorTargetIsDeleted(self: View, repo_root: []const u8, path_key: []const u8) bool {
@@ -359,39 +330,6 @@ fn selectedSidebarTarget(view: navigation.View) ?SidebarTarget {
     };
 }
 
-fn sideBySideLineCopyText(hunk: diff_parser.Hunk, line_index: usize) ?[]const u8 {
-    var rows = diff_view_model.SideBySideIndexedIterator.init(hunk.lines);
-    while (rows.next()) |row| {
-        switch (row) {
-            .single => |line| if (line.line_index == line_index) return line.line.text,
-            .paired => |pair| {
-                const matches_removed = if (pair.removed) |removed| removed.line_index == line_index else false;
-                const matches_added = if (pair.added) |added| added.line_index == line_index else false;
-                if (!matches_removed and !matches_added) continue;
-                if (pair.added) |added| return added.line.text;
-                if (pair.removed) |removed| return removed.line.text;
-            },
-        }
-    }
-    return null;
-}
-
-fn newSideHunkCopyText(allocator: std.mem.Allocator, hunk: diff_parser.Hunk) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-
-    for (hunk.lines) |line| {
-        switch (line.kind) {
-            .context, .added => {
-                try out.writer.writeAll(line.text);
-                try out.writer.writeByte('\n');
-            },
-            .removed, .metadata => {},
-        }
-    }
-    return try out.toOwnedSlice();
-}
-
 fn worktreeLineForHunkLine(file: diff_parser.FileDiff, hunk_index: usize, line_index: usize) ?u32 {
     if (hunk_index >= file.hunks.len) return null;
     const lines = file.hunks[hunk_index].lines;
@@ -411,51 +349,6 @@ fn worktreeLineForHunkLine(file: diff_parser.FileDiff, hunk_index: usize, line_i
         index -= 1;
     }
     return null;
-}
-
-test "side-by-side copy prefers paired new side" {
-    const hunk: diff_parser.Hunk = .{
-        .old_start = 1,
-        .old_count = 1,
-        .new_start = 1,
-        .new_count = 1,
-        .section = "",
-        .lines = &.{
-            .{ .kind = .removed, .text = "old", .old_line = 1 },
-            .{ .kind = .added, .text = "new", .new_line = 1 },
-        },
-    };
-    try std.testing.expectEqualStrings("new", sideBySideLineCopyText(hunk, 0).?);
-}
-
-test "side-by-side copy falls back to removed side" {
-    const hunk: diff_parser.Hunk = .{
-        .old_start = 1,
-        .old_count = 1,
-        .new_start = 1,
-        .new_count = 0,
-        .section = "",
-        .lines = &.{.{ .kind = .removed, .text = "deleted", .old_line = 1 }},
-    };
-    try std.testing.expectEqualStrings("deleted", sideBySideLineCopyText(hunk, 0).?);
-}
-
-test "new-side hunk copy is undecorated and keeps trailing newline" {
-    const hunk: diff_parser.Hunk = .{
-        .old_start = 1,
-        .old_count = 2,
-        .new_start = 1,
-        .new_count = 2,
-        .section = "",
-        .lines = &.{
-            .{ .kind = .context, .text = "one", .old_line = 1, .new_line = 1 },
-            .{ .kind = .removed, .text = "old", .old_line = 2 },
-            .{ .kind = .added, .text = "new", .new_line = 2 },
-        },
-    };
-    const text = try newSideHunkCopyText(std.testing.allocator, hunk);
-    defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings("one\nnew\n", text);
 }
 
 test "worktree editor line falls forward then backward across removed lines" {

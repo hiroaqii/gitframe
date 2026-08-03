@@ -23,6 +23,7 @@ const review_state = @import("../review/state.zig");
 
 pub const authority = @import("diff_surface/authority.zig");
 pub const body_resolver = @import("diff_surface/body_resolver.zig");
+pub const content = @import("diff_surface/content.zig");
 pub const file_search = @import("diff_surface/file_search.zig");
 pub const layout = @import("diff_surface/layout.zig");
 pub const navigation = @import("diff_surface/navigation.zig");
@@ -253,6 +254,7 @@ pub const DiffSurface = struct {
 test {
     _ = authority;
     _ = body_resolver;
+    _ = content;
     _ = file_search;
     _ = layout;
     _ = navigation;
