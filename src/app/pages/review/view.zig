@@ -10,6 +10,7 @@ const review_projection = @import("../../review_projection.zig");
 const view_primitives = @import("../../view_primitives.zig");
 const review_page = @import("../review.zig");
 const review_file_search = @import("file_search.zig");
+const review_body_render = @import("body_render.zig");
 const review_layout = @import("layout.zig");
 const review_navigation = @import("navigation.zig");
 const diff_render = @import("../../../diff/render.zig");
@@ -592,7 +593,12 @@ pub fn viewDiffPane(app: Context, surface: *chasen.Surface, loaded: loaded_diff.
     const active = app.page.viewer.sidebar_hidden or app.page.viewer.focus == .diff;
     if (app.displayedReviewBody() == .inert_invalid_utf8) {
         const inert = app.displayedReviewBody().inert_invalid_utf8;
-        try drawStatusBody(&diff_content, inert.display_path, review_navigation.invalid_utf8_body_message, null, active, app.theme);
+        try review_body_render.renderStatus(
+            inert.display_path,
+            review_navigation.invalid_utf8_body_message,
+            null,
+            projectedBodyRenderArgs(app, &diff_content, active),
+        );
         drawPaneHeaderRule(surface, active, app.theme);
         return;
     }
@@ -664,114 +670,78 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
 
     switch (app.displayedReviewBody()) {
         .cached => |bundle| {
-            try diff_render.renderFile(&content, bundle.loaded.document.files[0], .{
-                .requested_mode = app.page.viewer.display_mode,
-                .scroll = app.page.viewer.diff_scroll,
-                .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
-                .pane_active = active,
-                .line_numbers = app.page.viewer.view_options.line_numbers,
-                .highlighted_hunk = app.selectedHunkIndex(),
-                .cursor_offset = app.visibleDiffCursorOffset(),
-                .hunk_stages = .all_staged,
+            try review_body_render.renderParsed(.{
+                .file = bundle.loaded.document.files[0],
                 .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
-                .palette = app.theme,
+                .folded_hunks = &.{},
+                .hunk_stages = .all_staged,
                 .syntax = .initDirect(&bundle.loaded.syntax_spans, 0),
-                .selection = app.diffSelectionView(),
-                .header_selection = app.diffHeaderSelectionActive(),
-            });
+            }, projectedBodyRenderArgs(app, &content, active));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .combined => |bundle| {
-            try diff_render.renderFile(&content, bundle.displayFile(), .{
-                .requested_mode = app.page.viewer.display_mode,
-                .scroll = app.page.viewer.diff_scroll,
-                .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
-                .pane_active = active,
-                .line_numbers = app.page.viewer.view_options.line_numbers,
-                .highlighted_hunk = app.selectedHunkIndex(),
-                .cursor_offset = app.visibleDiffCursorOffset(),
+            try review_body_render.renderParsed(.{
+                .file = bundle.displayFile(),
                 .line_index = bundle.displayLineIndex(diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
+                .folded_hunks = &.{},
                 .hunk_stages = try review_navigation.projectedHunkStagePresentation(surface.frameAllocator(), bundle.hunkStageStates()),
-                .palette = app.theme,
                 .syntax = bundle.syntaxView(),
-                .selection = app.diffSelectionView(),
-                .header_selection = app.diffHeaderSelectionActive(),
-            });
+            }, projectedBodyRenderArgs(app, &content, active));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .retained_staged_only => |bundle| {
-            try diff_render.renderFile(&content, bundle.displayFile(), .{
-                .requested_mode = app.page.viewer.display_mode,
-                .scroll = app.page.viewer.diff_scroll,
-                .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
-                .pane_active = active,
-                .line_numbers = app.page.viewer.view_options.line_numbers,
-                .highlighted_hunk = app.selectedHunkIndex(),
-                .cursor_offset = app.visibleDiffCursorOffset(),
+            try review_body_render.renderParsed(.{
+                .file = bundle.displayFile(),
                 .line_index = bundle.displayLineIndex(diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
+                .folded_hunks = &.{},
                 .hunk_stages = .all_staged,
-                .palette = app.theme,
                 .syntax = bundle.syntaxView(),
-                .selection = app.diffSelectionView(),
-                .header_selection = app.diffHeaderSelectionActive(),
-            });
+            }, projectedBodyRenderArgs(app, &content, active));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .generated => |bundle| {
-            try diff_render.renderGeneratedAddedFile(&content, bundle.path, &bundle.source, .{
-                .requested_mode = app.page.viewer.display_mode,
-                .scroll = app.page.viewer.diff_scroll,
-                .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
-                .pane_active = active,
-                .line_numbers = app.page.viewer.view_options.line_numbers,
-                .cursor_offset = app.visibleDiffCursorOffset(),
-                .hunk_stages = .all_unstaged,
-                .palette = app.theme,
-                .header_selection = app.diffHeaderSelectionActive(),
-                .source_syntax_spans = switch (bundle.decoration) {
-                    .decorated => |decorated| decorated.spans,
-                    .eligible, .terminal_plain => .empty(),
-                },
-                .source_has_visible_syntax = bundle.decoration.hasVisibleSyntax(),
-                .selection = app.diffSelectionView(),
-            });
+            try review_body_render.renderGenerated(bundle, projectedBodyRenderArgs(app, &content, active));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .inert_invalid_utf8 => |inert| {
-            try drawStatusBody(&content, inert.display_path, review_navigation.invalid_utf8_body_message, app.selectedStatusLineStats(), active, app.theme);
+            try review_body_render.renderStatus(inert.display_path, review_navigation.invalid_utf8_body_message, app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .status => |status| {
-            try drawStatusBody(&content, status.path, status.message, app.selectedStatusLineStats(), active, app.theme);
+            try review_body_render.renderStatus(status.path, status.message, app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .pending => {
-            try drawStatusBody(&content, path, "Loading review projection...", app.selectedStatusLineStats(), active, app.theme);
+            try review_body_render.renderStatus(path, "Loading review projection...", app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .none, .primary => {},
     }
 
-    try drawTitlePath(&content, path, app.selectedStatusLineStats(), paneTitleStyle(app.theme), app.theme);
-    const status_text = try std.fmt.allocPrint(surface.frameAllocator(), "status: {s}{s}", .{ statusName(entry.index), statusSuffix(entry) });
-    try draw.copyClippedTextAt(&content, 0, 2, status_text, .{ .fg = app.theme.color(.muted), .dim = !active });
-    switch (file_tree.stagePresenceFromEntry(entry)) {
-        .staged_only => {
-            try draw.copyClippedTextAt(&content, 0, 4, "This file is staged.", .{ .fg = app.theme.color(.muted), .dim = !active });
-            try draw.copyClippedTextAt(&content, 0, 5, "Loading staged diff preview.", .{ .fg = app.theme.color(.muted), .dim = !active });
-        },
-        else => {
-            try draw.copyClippedTextAt(&content, 0, 4, "No diff is available for this file yet.", .{ .fg = app.theme.color(.muted), .dim = !active });
-            try draw.copyClippedTextAt(&content, 0, 5, "Loading generated review preview if available.", .{ .fg = app.theme.color(.muted), .dim = !active });
-        },
-    }
+    try review_body_render.renderStatusOnlyFallback(&content, entry, app.selectedStatusLineStats(), active, app.theme);
+}
+
+fn projectedBodyRenderArgs(app: Context, surface: *chasen.Surface, active: bool) @import("../../diff_surface.zig").RenderProjectedBodyArgs {
+    return .{
+        .surface = surface,
+        .requested_mode = app.page.viewer.display_mode,
+        .scroll = app.page.viewer.diff_scroll,
+        .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
+        .pane_active = active,
+        .line_numbers = app.page.viewer.view_options.line_numbers,
+        .highlighted_hunk = app.selectedHunkIndex(),
+        .cursor_offset = app.visibleDiffCursorOffset(),
+        .palette = app.theme,
+        .selection = app.diffSelectionView(),
+        .header_selection = app.diffHeaderSelectionActive(),
+    };
 }
 
 fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool, palette: theme.Palette) void {
@@ -784,62 +754,19 @@ fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool, palette: theme.Pal
 }
 
 fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u8, stats: ?file_tree.Stats, active: bool, palette: theme.Palette) !void {
-    try drawTitlePath(surface, path, stats, paneTitleStyle(palette), palette);
-    try draw.copyClippedTextAt(surface, 0, 2, message, .{ .fg = palette.color(.muted), .dim = !active });
-}
-
-fn drawTitlePath(surface: *chasen.Surface, path: []const u8, stats: ?file_tree.Stats, style: chasen.TextStyle, palette: theme.Palette) !void {
-    if (stats) |line_stats| {
-        if (line_stats.added != 0 or line_stats.removed != 0) {
-            const suffix = try std.fmt.allocPrint(surface.frameAllocator(), " +{d} -{d}", .{ line_stats.added, line_stats.removed });
-            const suffix_width = chasen.text.displayWidth(suffix);
-            const path_width = surface.size().width -| @as(u16, @intCast(@min(suffix_width, std.math.maxInt(u16))));
-            if (path_width > 8) {
-                var path_surface = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
-                try draw.copyTailClippedTextAt(&path_surface, 0, 0, path, style);
-                const suffix_col: u16 = @intCast(path_width);
-                try drawStatusLineStats(surface, suffix_col, line_stats, palette);
-                return;
-            }
-        }
-    }
-    try draw.copyTailClippedTextAt(surface, 0, 0, path, style);
-}
-
-fn drawStatusLineStats(surface: *chasen.Surface, col: u16, stats: file_tree.Stats, palette: theme.Palette) !void {
-    var cursor = col;
-    const metadata_style = palette.style(.muted);
-    try draw.copyClippedTextAt(surface, cursor, 0, " ", metadata_style);
-    cursor +|= 1;
-    const added = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added});
-    try draw.copyClippedTextAt(surface, cursor, 0, added, .{ .fg = palette.color(.success), .bold = true });
-    cursor +|= @intCast(chasen.text.displayWidth(added));
-    if (cursor < surface.size().width) {
-        try draw.copyClippedTextAt(surface, cursor, 0, " ", metadata_style);
-        cursor +|= 1;
-    }
-    const removed = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed});
-    try draw.copyClippedTextAt(surface, cursor, 0, removed, .{ .fg = palette.color(.danger), .bold = true });
-}
-
-fn statusName(status: git_status.StatusCode) []const u8 {
-    return switch (status) {
-        .unmodified => "unmodified",
-        .modified => "modified",
-        .added => "added",
-        .deleted => "deleted",
-        .renamed => "renamed",
-        .copied => "copied",
-        .untracked => "untracked",
-        .ignored => "ignored",
-        .unmerged => "unmerged",
-        .unknown => "unknown",
-    };
-}
-
-fn statusSuffix(entry: git_status.StatusEntry) []const u8 {
-    if (entry.isConflict()) return " (conflict)";
-    return "";
+    try review_body_render.renderStatus(path, message, stats, .{
+        .surface = surface,
+        .requested_mode = .unified,
+        .scroll = 0,
+        .horizontal_scroll = 0,
+        .pane_active = active,
+        .line_numbers = true,
+        .highlighted_hunk = null,
+        .cursor_offset = null,
+        .palette = palette,
+        .selection = null,
+        .header_selection = false,
+    });
 }
 
 fn viewLoadState(app: Context, col: *chasen.Column) void {
@@ -1502,7 +1429,7 @@ fn sidebarBranchHintStyle(palette: theme.Palette) chasen.TextStyle {
 /// Selected-file identity is stable chrome rather than a pane-focus signal.
 /// Focus remains visible through the row-1 rule and diff body cursor.
 fn paneTitleStyle(palette: theme.Palette) chasen.TextStyle {
-    return palette.boldStyle(.accent);
+    return review_body_render.paneTitleStyle(palette);
 }
 
 fn paneSearchStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
@@ -2117,6 +2044,22 @@ test "status-only header keeps semantic statistics and metadata when inactive" {
     const inactive_body = inactive.surface.readCell(0, 2) orelse return error.ExpectedInactiveStatusBodyCell;
     try std.testing.expect(!active_body.style.dim);
     try std.testing.expect(inactive_body.style.dim);
+}
+
+test "status-only fallback preserves conflict suffix outside resolver rendering" {
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .selected_target = .{ .status_only = 0 } },
+    };
+    defer page.deinit(std.testing.allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "UU a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 8);
+    defer ts.deinit();
+    try viewDiffPane(testContext(&page, .default(), 80, 9), &ts.surface, page.load.state.loaded.loaded);
+    try test_support.expectSnapshotContains(&ts, "status: unmerged (conflict)");
 }
 
 test "inactive status-only pending and inert diff path headers keep semantic intensity" {

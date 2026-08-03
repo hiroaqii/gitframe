@@ -316,3 +316,108 @@ test "body resolver forwards value allocation and borrow entries through vtable"
     try std.testing.expect(resolver.generatedBody() == null);
     try std.testing.expect(resolver.displayedDiffHeaderTarget(null) == null);
 }
+
+test "body resolver forwards render arguments and propagates renderer errors" {
+    const Fake = struct {
+        expected_surface: *chasen.Surface,
+        called: bool = false,
+
+        fn from(ctx: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx));
+        }
+
+        fn renderProjectedBody(ctx: *anyopaque, args: RenderProjectedBodyArgs) anyerror!void {
+            const self = from(ctx);
+            self.called = true;
+            if (args.surface != self.expected_surface) return error.SurfaceNotForwarded;
+            if (args.requested_mode != .side_by_side) return error.ModeNotForwarded;
+            if (args.scroll != 7 or args.horizontal_scroll != 11) return error.ScrollNotForwarded;
+            if (args.pane_active or args.line_numbers) return error.FlagsNotForwarded;
+            if (args.highlighted_hunk != 13 or args.cursor_offset != 17) return error.CursorNotForwarded;
+            if (!args.header_selection) return error.HeaderSelectionNotForwarded;
+            return error.InjectedRendererFailure;
+        }
+    };
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(20, 4);
+    defer ts.deinit();
+    var fake: Fake = .{ .expected_surface = &ts.surface };
+    const vtable = BodyResolver.VTable{
+        .resolvedTarget = struct {
+            fn callback(_: *anyopaque) ResolvedTarget {
+                return .{
+                    .kind = .none,
+                    .line_count = 0,
+                    .hunk_interaction = .unavailable,
+                    .status_rows = 0,
+                    .search_unavailable = null,
+                    .search_unfold_policy = .suppressed,
+                    .folded_hunks_source = .underlying_load,
+                };
+            }
+        }.callback,
+        .hunkStagePresentation = struct {
+            fn callback(_: *anyopaque, _: std.mem.Allocator, _: usize) anyerror!diff_render.HunkStagePresentation {
+                return .all_unstaged;
+            }
+        }.callback,
+        .contentToken = struct {
+            fn callback(_: *anyopaque) ?ContentToken {
+                return null;
+            }
+        }.callback,
+        .renderProjectedBody = Fake.renderProjectedBody,
+        .parsedSelectionTarget = struct {
+            fn callback(_: *anyopaque, _: ?diff_selection.Identity) ?ParsedSelectionTarget {
+                return null;
+            }
+        }.callback,
+        .displayedDiffFile = struct {
+            fn callback(_: *anyopaque) ?diff_parser.FileDiff {
+                return null;
+            }
+        }.callback,
+        .displayedSearchTarget = struct {
+            fn callback(_: *anyopaque, _: diff_render.DisplayMode) ?SearchTarget {
+                return null;
+            }
+        }.callback,
+        .displayedDiffLineIndex = struct {
+            fn callback(_: *anyopaque, _: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
+                return null;
+            }
+        }.callback,
+        .displayedDiffLineCount = struct {
+            fn callback(_: *anyopaque) usize {
+                return 0;
+            }
+        }.callback,
+        .generatedBody = struct {
+            fn callback(_: *anyopaque) ?GeneratedBody {
+                return null;
+            }
+        }.callback,
+        .displayedDiffHeaderTarget = struct {
+            fn callback(_: *anyopaque, _: ?diff_selection.HeaderIdentity) ?DiffHeaderTarget {
+                return null;
+            }
+        }.callback,
+    };
+    const resolver: BodyResolver = .{ .ctx = &fake, .vtable = &vtable };
+
+    try std.testing.expectError(error.InjectedRendererFailure, resolver.renderProjectedBody(.{
+        .surface = &ts.surface,
+        .requested_mode = .side_by_side,
+        .scroll = 7,
+        .horizontal_scroll = 11,
+        .pane_active = false,
+        .line_numbers = false,
+        .highlighted_hunk = 13,
+        .cursor_offset = 17,
+        .palette = .default(),
+        .selection = null,
+        .header_selection = true,
+    }));
+    try std.testing.expect(fake.called);
+}
