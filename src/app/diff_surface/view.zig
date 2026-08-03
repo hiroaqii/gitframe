@@ -14,7 +14,11 @@ const app_load_state = @import("../load_state.zig");
 const app_state = @import("../state.zig");
 const view_primitives = @import("../view_primitives.zig");
 const diff_source = @import("../../diff/source.zig");
+const file_tree = @import("../../file_tree.zig");
 const file_search = @import("file_search.zig");
+const layout = @import("layout.zig");
+const loaded_diff = @import("../../loaded_diff.zig");
+const sidebar_view_model = @import("../../sidebar/view_model.zig");
 
 /// Normalized presentation capabilities for an empty diff surface.
 ///
@@ -322,4 +326,246 @@ pub fn drawEmptySidebarTitle(surface: *chasen.Surface, palette: theme.Palette) !
     if (stats_col < size.width) {
         _ = try surface.printAt(stats_col, 2, palette.style(.muted), "0 files / 0 hunks", .{});
     }
+}
+
+/// Fully normalized page-owned branch chrome. The shared renderer owns only
+/// placement and style; pages remain responsible for branch status, action
+/// reachability, effective key labels, clipping, and hint composition.
+pub const SidebarBranchPresentation = struct {
+    text: []const u8,
+    hint: ?Hint = null,
+
+    pub const Hint = struct {
+        text: []const u8,
+        col: u16,
+    };
+};
+
+/// Whether the detail row can show page-owned branch presentation. Filter
+/// chrome has precedence and is rendered entirely from shared surface state.
+pub fn sidebarDetailNeedsBranch(display: *const app_state.ReviewDisplayState) bool {
+    return !display.hide_reviewed_files and display.changed_file_filter == .all;
+}
+
+/// Draw the loaded file sidebar from shared state plus normalized page chrome.
+pub fn viewSidebar(
+    surface: *chasen.Surface,
+    state: diff_surface.ReadSurface,
+    loaded: loaded_diff.LoadedDiff,
+    palette: theme.Palette,
+    branch: ?SidebarBranchPresentation,
+) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    try drawSidebarDetailRow(surface, 0, state, palette, branch);
+
+    if (size.height <= 2) return;
+    const title = " Files";
+    _ = surface.borrowTextAt(0, 2, title, palette.boldStyle(.accent));
+    const title_width = chasen.text.displayWidth(title);
+    const stats_col = title_width + 1;
+    if (stats_col < size.width) {
+        _ = try surface.printAt(stats_col, 2, palette.style(.muted), "{d} files / {d} hunks", .{
+            loaded.document.files.len,
+            loaded.document.totalHunks(),
+        });
+    }
+
+    if (size.height <= layout.sidebar_header_rows) return;
+
+    const visible_rows: usize = size.height - layout.sidebar_header_rows;
+    // Sidebar has no independent scroll state; derive the visible window
+    // from the selected row each frame.
+    const range = loaded.sidebarVisibleRange(state.viewer.selected_node, visible_rows);
+    var row: u16 = layout.sidebar_header_rows;
+    var visible_index: usize = range.start;
+    while (visible_index < range.end) : ({
+        visible_index += 1;
+        row += 1;
+    }) {
+        const row_model = sidebar_view_model.rowAt(.{
+            .tree = loaded.tree,
+            .collapsed = &loaded.collapsed_dirs,
+            .reviewed_files = loaded.reviewed_files,
+            .visible_nodes = loaded.materializedVisibleNodes(),
+        }, visible_index, state.viewer.selected_node) orelse continue;
+        const cursor_active = state.viewer.focus == .sidebar and !state.file_search.mode;
+        try drawSidebarRow(surface, row, row_model, cursor_active, state.viewer.sidebar_horizontal_scroll, palette);
+    }
+}
+
+pub fn drawSidebarDetailRow(
+    surface: *chasen.Surface,
+    row: u16,
+    state: diff_surface.ReadSurface,
+    palette: theme.Palette,
+    branch: ?SidebarBranchPresentation,
+) !void {
+    const size = surface.size();
+    if (size.width <= 2 or row >= size.height) return;
+
+    if (state.review_display.hide_reviewed_files and state.review_display.changed_file_filter != .all) {
+        const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{state.review_display.changed_file_filter.label()});
+        try draw.copyClippedTextAt(surface, 1, row, text, palette.style(.prompt));
+        return;
+    }
+    if (state.review_display.hide_reviewed_files) {
+        try draw.copyClippedTextAt(surface, 1, row, "hiding reviewed", palette.style(.prompt));
+        return;
+    }
+    if (state.review_display.changed_file_filter != .all) {
+        try draw.copyClippedTextAt(surface, 1, row, state.review_display.changed_file_filter.label(), palette.style(.prompt));
+        return;
+    }
+
+    if (branch) |presentation| {
+        try draw.copyClippedTextAt(surface, 1, row, presentation.text, palette.style(.info));
+        if (presentation.hint) |hint| {
+            try draw.copyClippedTextAt(surface, hint.col, row, hint.text, sidebarBranchHintStyle(palette));
+        }
+    }
+}
+
+pub fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_model.Row, cursor_active: bool, horizontal_scroll: usize, palette: theme.Palette) !void {
+    const width = surface.size().width;
+    const row_layout = sidebar_view_model.layout(row_model, width);
+    const cursor_bg: ?chasen.Color = if (cursor_active and row_model.selected) palette.color(.pane_cursor_bg) else null;
+    const style = withCursorBackground(sidebarRowStyle(row_model, palette), cursor_bg);
+
+    // Cursor chrome is a row-level concern, separate from path/badge Git
+    // semantics. Fill first so trailing cells share the same signal, then
+    // compose the same background into every semantic cell written below.
+    if (cursor_bg != null) fillSidebarCursorRow(surface, row, style);
+
+    if (row_model.status) |status| {
+        if (row_layout.badge_col) |badge_col| {
+            if (width > badge_col) {
+                _ = surface.borrowTextAt(badge_col, row, status.badge(), statusStyle(row_model, status, palette, cursor_bg));
+            }
+        }
+    }
+
+    if (row_layout.mode_col) |mode_col| {
+        if (width > mode_col) {
+            _ = surface.borrowTextAt(mode_col, row, "m", modeBadgeStyle(palette, cursor_bg));
+        }
+    }
+
+    if (row_layout.reviewed_col) |reviewed_col| {
+        if (width > reviewed_col) {
+            _ = surface.borrowTextAt(reviewed_col, row, "✓", reviewedStyle(palette, cursor_bg));
+        }
+    }
+
+    if (row_layout.tree_content_width > 0) {
+        var path_area = surface.child(.{
+            .col = row_layout.tree_content_col,
+            .row = row,
+            .width = row_layout.tree_content_width,
+            .height = 1,
+        });
+        const content = try sidebarTreeContent(surface.frameAllocator(), row_model);
+        const effective_scroll = @min(horizontal_scroll, sidebar_view_model.maxHorizontalScroll(row_model, width));
+        const visible = chasen.text.dropToWidth(content, view_primitives.scrollCells(effective_scroll));
+        try draw.copyClippedTextAt(&path_area, 0, 0, visible, style);
+    }
+
+    if (row_layout.stats_col) |stats_col| {
+        var stats_area = surface.child(.{
+            .col = stats_col,
+            .row = row,
+            .width = row_layout.stats_width,
+            .height = 1,
+        });
+        try drawSidebarStats(&stats_area, row_model, palette, cursor_bg);
+    }
+}
+
+fn fillSidebarCursorRow(surface: *chasen.Surface, row: u16, style: chasen.TextStyle) void {
+    for (0..surface.size().width) |col| {
+        _ = surface.borrowTextAt(@intCast(col), row, " ", style);
+    }
+}
+
+fn drawSidebarStats(surface: *chasen.Surface, row: sidebar_view_model.Row, palette: theme.Palette, cursor_bg: ?chasen.Color) !void {
+    const added_text = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{row.stats.added});
+    const removed_text = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{row.stats.removed});
+    const added_style = sidebarStatStyle(palette.color(.success), cursor_bg);
+    const removed_style = sidebarStatStyle(palette.color(.danger), cursor_bg);
+
+    try draw.copyClippedTextAt(surface, 0, 0, added_text, added_style);
+    const removed_col = chasen.text.displayWidth(added_text) + 1;
+    if (removed_col < surface.size().width) {
+        try draw.copyClippedTextAt(surface, removed_col, 0, removed_text, removed_style);
+    }
+}
+
+fn sidebarStatStyle(fg: chasen.Color, cursor_bg: ?chasen.Color) chasen.TextStyle {
+    return withCursorBackground(.{
+        .fg = fg,
+        .bold = true,
+    }, cursor_bg);
+}
+
+fn sidebarTreeContent(allocator: std.mem.Allocator, row: sidebar_view_model.Row) ![]const u8 {
+    const indent = @as(usize, row.depth) * 2;
+    const fold_marker = switch (row.fold) {
+        .none => "",
+        .expanded => "▾ ",
+        .collapsed => "▸ ",
+    };
+    const len = indent + fold_marker.len + row.name.len;
+    const buf = try allocator.alloc(u8, len);
+    @memset(buf[0..indent], ' ');
+    @memcpy(buf[indent..][0..fold_marker.len], fold_marker);
+    @memcpy(buf[indent + fold_marker.len ..][0..row.name.len], row.name);
+    return buf;
+}
+
+pub fn sidebarRowStyle(row: sidebar_view_model.Row, palette: theme.Palette) chasen.TextStyle {
+    var style: chasen.TextStyle = if (row.kind == .directory or row.kind == .repo_root)
+        .{ .bold = true }
+    else switch (row.stage_presence) {
+        .staged_only => .{ .fg = palette.color(.staged) },
+        .mixed => .{ .fg = palette.color(.prompt) },
+        .conflict => .{ .fg = palette.color(.danger), .bold = true },
+        else => .{},
+    };
+    if (row.selected) style.bold = true;
+    return style;
+}
+
+pub fn withCursorBackground(style: chasen.TextStyle, cursor_bg: ?chasen.Color) chasen.TextStyle {
+    var composed = style;
+    if (cursor_bg) |background| composed.bg = background;
+    return composed;
+}
+
+pub fn statusStyle(row: sidebar_view_model.Row, status: file_tree.Status, palette: theme.Palette, cursor_bg: ?chasen.Color) chasen.TextStyle {
+    const fg: chasen.Color = switch (row.stage_presence) {
+        .staged_only => palette.color(.staged),
+        .mixed => palette.color(.prompt),
+        .conflict => palette.color(.danger),
+        else => switch (status) {
+            .modified => palette.color(.prompt),
+            .added => palette.color(.success),
+            .deleted => palette.color(.danger),
+            .renamed => palette.color(.accent),
+            .binary => palette.color(.binary),
+        },
+    };
+    return withCursorBackground(.{ .fg = fg, .bold = true }, cursor_bg);
+}
+
+fn reviewedStyle(palette: theme.Palette, cursor_bg: ?chasen.Color) chasen.TextStyle {
+    return withCursorBackground(.{ .fg = palette.color(.success), .bold = true }, cursor_bg);
+}
+
+fn modeBadgeStyle(palette: theme.Palette, cursor_bg: ?chasen.Color) chasen.TextStyle {
+    return withCursorBackground(.{ .fg = palette.color(.info), .bold = true }, cursor_bg);
+}
+
+fn sidebarBranchHintStyle(palette: theme.Palette) chasen.TextStyle {
+    return palette.style(.muted);
 }
