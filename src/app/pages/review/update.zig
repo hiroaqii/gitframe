@@ -7,11 +7,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const diff_surface_update = @import("../../diff_surface/update.zig");
 const message = @import("message.zig");
 const navigation = @import("navigation.zig");
 const context = @import("../../../context.zig");
 const review_page = @import("../review.zig");
-const review_selection = @import("selection.zig");
 const diff_selection = @import("../../../diff/selection.zig");
 const file_tree = if (builtin.is_test) @import("../../../file_tree.zig") else struct {};
 const review_session = @import("../../../review/session.zig");
@@ -70,16 +70,25 @@ pub const Controller = struct {
     /// return an owned command. Runtime App initialization always supplies one;
     /// the optional form keeps pure page transitions independent of Chasen Ctx.
     pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: message.Msg) !ReviewUpdate {
-        const tracks_navigation = tracksDisplayNavigation(msg);
-        const before = if (tracks_navigation) self.navigation.view().displayNavigationSnapshot() else undefined;
-        const tracks_sidebar_selection = tracksExplicitSidebarSelection(msg);
-        const sidebar_before = if (tracks_sidebar_selection) sidebarSelectionSnapshot(self.navigation) else undefined;
-
         var result: ReviewUpdate = .{};
         var adapter = self.navigation.updateAdapter();
-        if (try adapter.shared().apply(allocator, msg) == null) {
+        if (try adapter.shared().apply(allocator, msg)) |handled| {
+            var shared_update = handled;
+            defer shared_update.deinit(allocator);
+            if (shared_update.takeEffect()) |effect| result.command = commandFromEffect(effect);
+
+            // This boundary sees semantic Review input after it has either
+            // changed the sidebar/file intent or proved to be a no-op. Internal
+            // tree rebuild/remap helpers cannot revoke restoration authority.
+            if (shared_update.explicit_sidebar_selection_changed) {
+                _ = self.navigation.page.action_cursor.supersedeRestore();
+            }
+            if (shared_update.display_navigation_changed) {
+                self.navigation.page.display_navigation_input_revision +%= 1;
+                result.capture_display_override = self.navigation.page.pending_display_navigation_restore != null;
+            }
+        } else {
             switch (msg) {
-                .mouse_diff_release => result.command = try self.releaseDiffMouse(allocator orelse return error.MissingAllocator),
                 .enter_commit_panel => result.command = .enter_commit_panel,
                 .enter_amend_panel => result.command = .enter_amend_panel,
                 .toggle_selected_file => result.command = .toggle_selected_file,
@@ -98,148 +107,15 @@ pub const Controller = struct {
                 else => unreachable,
             }
         }
-
-        // This boundary sees semantic Review input after it has either changed
-        // the sidebar/file intent or proved to be a no-op. Internal tree
-        // rebuild/remap helpers never pass through here, so they cannot revoke
-        // an action's restoration authority accidentally.
-        if (tracks_sidebar_selection) {
-            const sidebar_after = sidebarSelectionSnapshot(self.navigation);
-            if (!std.meta.eql(sidebar_before, sidebar_after)) {
-                _ = self.navigation.page.action_cursor.supersedeRestore();
-            }
-        }
-
-        if (tracks_navigation) {
-            const after = self.navigation.view().displayNavigationSnapshot();
-            if (!std.meta.eql(before, after)) {
-                self.navigation.page.display_navigation_input_revision +%= 1;
-                result.capture_display_override = self.navigation.page.pending_display_navigation_restore != null;
-            }
-        }
         return result;
     }
-
-    fn releaseDiffMouse(self: Controller, allocator: std.mem.Allocator) !?Command {
-        const owner = self.navigation.page.selection_owner;
-        return switch (owner) {
-            .none => null,
-            .diff => |selection| blk: {
-                if (!selection.moved) {
-                    self.navigation.clearDiffSelection();
-                    break :blk null;
-                }
-
-                var candidate = self.buildCompletedSelection(allocator, selection) catch {
-                    if (self.navigation.page.completed_selection) |*prior| prior.deinit(allocator);
-                    self.navigation.page.completed_selection = null;
-                    self.navigation.clearDiffSelection();
-                    break :blk null;
-                };
-                if (self.navigation.page.completed_selection) |*prior| prior.deinit(allocator);
-                self.navigation.page.completed_selection = candidate;
-                candidate = undefined;
-                self.navigation.clearDiffSelection();
-
-                const clipboard = self.navigation.page.completed_selection.?.clipboardText(allocator) catch break :blk null;
-                break :blk .{ .copy_diff_selection = clipboard };
-            },
-            .diff_header => |selection| blk: {
-                const command: Command = .{ .copy_diff_header_path = try cloneHeaderSelection(allocator, selection) };
-                self.navigation.clearDiffSelection();
-                break :blk command;
-            },
-        };
-    }
-
-    fn buildCompletedSelection(self: Controller, allocator: std.mem.Allocator, selection: diff_selection.DragSelection) !review_selection.CompletedSelection {
-        const token = self.navigation.view().currentContentToken() orelse return error.StaleSelection;
-        return switch (selection.identity) {
-            .loaded_file, .projection_file => blk: {
-                const target = self.navigation.view().parsedSelectionTarget(selection.identity) orelse return error.StaleSelection;
-                break :blk try review_selection.buildParsed(allocator, token, target.file, selection);
-            },
-            .generated_file => |generated| blk: {
-                const body = self.navigation.view().generatedBody() orelse return error.StaleSelection;
-                if (!std.mem.eql(u8, generated.path_key, body.path)) return error.StaleSelection;
-                break :blk try review_selection.buildGenerated(allocator, token, body.path, body.source, selection);
-            },
-        };
-    }
 };
 
-const SidebarSelectionSnapshot = struct {
-    selected_target: ?context.SelectedTarget,
-    selected_node: usize,
-};
-
-fn sidebarSelectionSnapshot(controller: navigation.Controller) SidebarSelectionSnapshot {
-    return .{
-        .selected_target = controller.page.viewer.selected_target,
-        .selected_node = controller.page.viewer.selected_node,
+fn commandFromEffect(effect: diff_surface_update.Effect) Command {
+    return switch (effect) {
+        .copy_diff_selection => |text| .{ .copy_diff_selection = text },
+        .copy_diff_header_path => |header| .{ .copy_diff_header_path = header },
     };
-}
-
-fn tracksExplicitSidebarSelection(msg: message.Msg) bool {
-    return switch (msg) {
-        .select_previous_file,
-        .select_next_file,
-        .select_first_file,
-        .select_last_file,
-        .toggle_directory,
-        .expand_directory,
-        .collapse_or_parent_directory,
-        .sidebar_click_node,
-        .mouse_sidebar_wheel_up,
-        .mouse_sidebar_wheel_down,
-        .submit_file_search,
-        => true,
-        else => false,
-    };
-}
-
-fn tracksDisplayNavigation(msg: message.Msg) bool {
-    return switch (msg) {
-        .select_previous_file,
-        .select_next_file,
-        .toggle_directory,
-        .expand_directory,
-        .collapse_or_parent_directory,
-        .scroll_diff_up,
-        .scroll_diff_down,
-        .scroll_diff_left,
-        .scroll_diff_right,
-        .scroll_sidebar_left,
-        .scroll_sidebar_right,
-        .page_diff_up,
-        .page_diff_down,
-        .select_previous_hunk,
-        .select_next_hunk,
-        .toggle_hunk_fold,
-        .select_first_file,
-        .select_last_file,
-        .sidebar_click_node,
-        .mouse_sidebar_wheel_up,
-        .mouse_sidebar_wheel_down,
-        .mouse_diff_wheel_up,
-        .mouse_diff_wheel_down,
-        .mouse_diff_wheel_left,
-        .mouse_diff_wheel_right,
-        .toggle_display_mode,
-        .clear_search,
-        .submit_search,
-        .select_next_search_match,
-        .select_previous_search_match,
-        .submit_file_search,
-        => true,
-        else => false,
-    };
-}
-
-fn cloneHeaderSelection(allocator: std.mem.Allocator, selection: diff_selection.HeaderPathSelection) !diff_selection.HeaderPathSelection {
-    var cloned = selection;
-    cloned.identity.path_key = try allocator.dupe(u8, selection.identity.path_key);
-    return cloned;
 }
 
 test "review update owns state transition and shell intent" {
@@ -649,6 +525,70 @@ test "review mouse release returns one owned copy command" {
     try std.testing.expect(page.selection_owner == .none);
     try std.testing.expect(page.completed_selection != null);
     try std.testing.expect(page.completed_selection.?.token.eql(retained_token));
+}
+
+test "review header release returns an independent owned path command" {
+    const borrowed_path = "src/app.zig";
+    var page: review_page.ReviewPageState = .{
+        .selection_owner = .{ .diff_header = .{
+            .identity = .{ .kind = .loaded_file, .path_key = borrowed_path },
+            .moved = true,
+        } },
+    };
+    defer page.deinit(std.testing.allocator);
+    const controller: Controller = .{ .navigation = .{
+        .page = &page,
+        .repo_root = null,
+        .source = .unstaged,
+        .layout = .{ .width = 80, .height = 20 },
+        .diagnostics = .{ .target = &page.status },
+    } };
+
+    var update = try controller.apply(std.testing.allocator, .{ .mouse_diff_release = null });
+    defer update.deinit(std.testing.allocator);
+    try std.testing.expect(page.selection_owner == .none);
+
+    var command = update.takeCommand() orelse return error.ExpectedCopyCommand;
+    defer command.deinit(std.testing.allocator);
+    switch (command) {
+        .copy_diff_header_path => |header| {
+            try std.testing.expectEqualStrings(borrowed_path, header.identity.path_key);
+            try std.testing.expect(header.identity.path_key.ptr != borrowed_path.ptr);
+            try std.testing.expect(header.moved);
+        },
+        else => return error.ExpectedCopyCommand,
+    }
+}
+
+test "review header release allocation failure retains active selection" {
+    const borrowed_path = "src/app.zig";
+    var page: review_page.ReviewPageState = .{
+        .selection_owner = .{ .diff_header = .{
+            .identity = .{ .kind = .loaded_file, .path_key = borrowed_path },
+            .moved = true,
+        } },
+    };
+    defer page.deinit(std.testing.allocator);
+    const controller: Controller = .{ .navigation = .{
+        .page = &page,
+        .repo_root = null,
+        .source = .unstaged,
+        .layout = .{ .width = 80, .height = 20 },
+        .diagnostics = .{ .target = &page.status },
+    } };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        controller.apply(failing.allocator(), .{ .mouse_diff_release = null }),
+    );
+    const retained = switch (page.selection_owner) {
+        .diff_header => |header| header,
+        else => return error.ExpectedHeaderSelection,
+    };
+    try std.testing.expectEqualStrings(borrowed_path, retained.identity.path_key);
+    try std.testing.expectEqual(borrowed_path.ptr, retained.identity.path_key.ptr);
+    try std.testing.expect(retained.moved);
 }
 
 test "failed moved release clears prior candidate without emitting clipboard work" {

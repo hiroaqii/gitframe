@@ -4,11 +4,43 @@
 //! page message structurally and returns `null` for page-only extensions.
 
 const std = @import("std");
+const context = @import("../../context.zig");
+const diff_selection = @import("../../diff/selection.zig");
 const navigation = @import("navigation.zig");
+const selection = @import("selection.zig");
 
-/// Distinguishes one handled shared transition from a page-only message. S2b4b2
-/// adds owned effects and value-only epilogue classification to this type.
-pub const Update = struct {};
+/// Owned output which a page adapter translates into its physical effect.
+pub const Effect = union(enum) {
+    copy_diff_selection: []u8,
+    copy_diff_header_path: diff_selection.HeaderPathSelection,
+
+    pub fn deinit(self: *Effect, allocator: ?std.mem.Allocator) void {
+        switch (self.*) {
+            .copy_diff_selection => |text| (allocator orelse unreachable).free(text),
+            .copy_diff_header_path => |*header| (allocator orelse unreachable).free(header.identity.path_key),
+        }
+        self.* = undefined;
+    }
+};
+
+/// One handled shared transition and the value-only facts needed by page-local
+/// epilogues. The effect remains owned here until a page adapter takes it.
+pub const Update = struct {
+    effect: ?Effect = null,
+    explicit_sidebar_selection_changed: bool = false,
+    display_navigation_changed: bool = false,
+
+    pub fn deinit(self: *Update, allocator: ?std.mem.Allocator) void {
+        if (self.effect) |*effect| effect.deinit(allocator);
+        self.* = .{};
+    }
+
+    pub fn takeEffect(self: *Update) ?Effect {
+        const effect = self.effect;
+        self.effect = null;
+        return effect;
+    }
+};
 
 pub const Hook = struct {
     ctx: *anyopaque,
@@ -25,9 +57,14 @@ pub const Controller = struct {
     /// can use the shared body operation directly.
     toggle_hunk_fold: ?Hook = null,
 
-    /// Returns null only when `msg` is a page extension or the selection-release
-    /// effect retained by the page adapter until S2b4b2.
+    /// Returns null only when `msg` is a page extension.
     pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: anytype) !?Update {
+        const tracks_navigation = tracksDisplayNavigation(msg);
+        const before = if (tracks_navigation) self.navigation.view().view.displayNavigationSnapshot() else undefined;
+        const tracks_sidebar_selection = tracksExplicitSidebarSelection(msg);
+        const sidebar_before = if (tracks_sidebar_selection) sidebarSelectionSnapshot(self.navigation) else undefined;
+
+        var result: Update = .{};
         switch (msg) {
             .select_previous_file => self.navigation.selectFileDelta(-1),
             .select_next_file => self.navigation.selectFileDelta(1),
@@ -86,6 +123,7 @@ pub const Controller = struct {
             },
             .mouse_diff_press => |point| self.navigation.pressDiffMouse(point),
             .mouse_diff_drag => |point| self.navigation.dragDiffMouse(point),
+            .mouse_diff_release => result.effect = try self.releaseDiffMouse(allocator orelse return error.MissingAllocator),
             .toggle_display_mode => {
                 self.navigation.controller.clearDiffSelection();
                 const old_mode = self.navigation.controller.view().effectiveDisplayMode();
@@ -157,6 +195,168 @@ pub const Controller = struct {
             .cycle_changed_file_filter => try self.navigation.cycleChangedFileFilter(allocator orelse return error.MissingAllocator),
             else => return null,
         }
-        return .{};
+
+        if (tracks_sidebar_selection) {
+            result.explicit_sidebar_selection_changed = !std.meta.eql(sidebar_before, sidebarSelectionSnapshot(self.navigation));
+        }
+        if (tracks_navigation) {
+            result.display_navigation_changed = !std.meta.eql(before, self.navigation.view().view.displayNavigationSnapshot());
+        }
+        return result;
+    }
+
+    fn releaseDiffMouse(self: Controller, allocator: std.mem.Allocator) !?Effect {
+        const owner = self.navigation.controller.surface.selection_owner.*;
+        return switch (owner) {
+            .none => null,
+            .diff => |drag| blk: {
+                if (!drag.moved) {
+                    self.navigation.controller.clearDiffSelection();
+                    break :blk null;
+                }
+
+                var candidate = self.buildCompletedSelection(allocator, drag) catch {
+                    if (self.navigation.controller.surface.completed_selection.*) |*prior| prior.deinit(allocator);
+                    self.navigation.controller.surface.completed_selection.* = null;
+                    self.navigation.controller.clearDiffSelection();
+                    break :blk null;
+                };
+                if (self.navigation.controller.surface.completed_selection.*) |*prior| prior.deinit(allocator);
+                self.navigation.controller.surface.completed_selection.* = candidate;
+                candidate = undefined;
+                self.navigation.controller.clearDiffSelection();
+
+                const clipboard = self.navigation.controller.surface.completed_selection.*.?.clipboardText(allocator) catch break :blk null;
+                break :blk .{ .copy_diff_selection = clipboard };
+            },
+            .diff_header => |header| blk: {
+                const effect: Effect = .{ .copy_diff_header_path = try cloneHeaderSelection(allocator, header) };
+                self.navigation.controller.clearDiffSelection();
+                break :blk effect;
+            },
+        };
+    }
+
+    fn buildCompletedSelection(self: Controller, allocator: std.mem.Allocator, drag: diff_selection.DragSelection) !selection.CompletedSelection {
+        const token = self.navigation.view().currentContentToken() orelse return error.StaleSelection;
+        return switch (drag.identity) {
+            .loaded_file, .projection_file => blk: {
+                const target = self.navigation.view().parsedSelectionTarget(drag.identity) orelse return error.StaleSelection;
+                break :blk try selection.buildParsed(allocator, token, target.file, drag);
+            },
+            .generated_file => |generated| blk: {
+                const body = self.navigation.view().generatedBody() orelse return error.StaleSelection;
+                if (!std.mem.eql(u8, generated.path_key, body.path)) return error.StaleSelection;
+                break :blk try selection.buildGenerated(allocator, token, body.path, body.source, drag);
+            },
+        };
     }
 };
+
+const SidebarSelectionSnapshot = struct {
+    selected_target: ?context.SelectedTarget,
+    selected_node: usize,
+};
+
+fn sidebarSelectionSnapshot(controller: navigation.BodyController) SidebarSelectionSnapshot {
+    return .{
+        .selected_target = controller.controller.surface.viewer.selected_target,
+        .selected_node = controller.controller.surface.viewer.selected_node,
+    };
+}
+
+fn tracksExplicitSidebarSelection(msg: anytype) bool {
+    return switch (msg) {
+        .select_previous_file,
+        .select_next_file,
+        .select_first_file,
+        .select_last_file,
+        .toggle_directory,
+        .expand_directory,
+        .collapse_or_parent_directory,
+        .sidebar_click_node,
+        .mouse_sidebar_wheel_up,
+        .mouse_sidebar_wheel_down,
+        .submit_file_search,
+        => true,
+        else => false,
+    };
+}
+
+fn tracksDisplayNavigation(msg: anytype) bool {
+    return switch (msg) {
+        .select_previous_file,
+        .select_next_file,
+        .toggle_directory,
+        .expand_directory,
+        .collapse_or_parent_directory,
+        .scroll_diff_up,
+        .scroll_diff_down,
+        .scroll_diff_left,
+        .scroll_diff_right,
+        .scroll_sidebar_left,
+        .scroll_sidebar_right,
+        .page_diff_up,
+        .page_diff_down,
+        .select_previous_hunk,
+        .select_next_hunk,
+        .toggle_hunk_fold,
+        .select_first_file,
+        .select_last_file,
+        .sidebar_click_node,
+        .mouse_sidebar_wheel_up,
+        .mouse_sidebar_wheel_down,
+        .mouse_diff_wheel_up,
+        .mouse_diff_wheel_down,
+        .mouse_diff_wheel_left,
+        .mouse_diff_wheel_right,
+        .toggle_display_mode,
+        .clear_search,
+        .submit_search,
+        .select_next_search_match,
+        .select_previous_search_match,
+        .submit_file_search,
+        => true,
+        else => false,
+    };
+}
+
+fn cloneHeaderSelection(allocator: std.mem.Allocator, header: diff_selection.HeaderPathSelection) !diff_selection.HeaderPathSelection {
+    var cloned = header;
+    cloned.identity.path_key = try allocator.dupe(u8, header.identity.path_key);
+    return cloned;
+}
+
+test "update deinit releases untaken selection text effect" {
+    var update: Update = .{ .effect = .{
+        .copy_diff_selection = try std.testing.allocator.dupe(u8, "selected text"),
+    } };
+    update.deinit(std.testing.allocator);
+    try std.testing.expect(update.effect == null);
+}
+
+test "update deinit releases untaken header path effect" {
+    var update: Update = .{ .effect = .{ .copy_diff_header_path = .{
+        .identity = .{
+            .kind = .loaded_file,
+            .path_key = try std.testing.allocator.dupe(u8, "src/app.zig"),
+        },
+        .moved = true,
+    } } };
+    update.deinit(std.testing.allocator);
+    try std.testing.expect(update.effect == null);
+}
+
+test "takeEffect transfers the sole payload owner" {
+    var update: Update = .{ .effect = .{
+        .copy_diff_selection = try std.testing.allocator.dupe(u8, "transferred text"),
+    } };
+    var effect = update.takeEffect() orelse return error.ExpectedEffect;
+    defer effect.deinit(std.testing.allocator);
+
+    update.deinit(std.testing.allocator);
+    switch (effect) {
+        .copy_diff_selection => |text| try std.testing.expectEqualStrings("transferred text", text),
+        .copy_diff_header_path => return error.ExpectedSelectionEffect,
+    }
+}
