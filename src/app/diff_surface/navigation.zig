@@ -760,6 +760,176 @@ pub const BodyController = struct {
         };
     }
 
+    pub fn pressDiffMouse(self: BodyController, point: diff_surface.MousePoint) void {
+        self.controller.surface.viewer.focus = .diff;
+        if (self.view().diffHeaderMouseHit(point)) |hit| {
+            self.controller.surface.selection_owner.* = .{ .diff_header = .{ .identity = hit.identity } };
+            return;
+        }
+        const hit = self.view().diffMouseHit(point) orelse {
+            self.controller.clearDiffSelection();
+            return;
+        };
+        self.controller.surface.selection_owner.* = .{ .diff = diff_selection.DragSelection.initAtCell(
+            hit.identity,
+            hit.side,
+            hit.mode,
+            hit.point,
+            .{ .col = point.col, .row = point.row },
+        ) };
+    }
+
+    pub fn dragDiffMouse(self: BodyController, point_opt: ?diff_surface.MousePoint) void {
+        const point = point_opt orelse return;
+        switch (self.controller.surface.selection_owner.*) {
+            .none => return,
+            .diff_header => |*selection| selection.update(),
+            .diff => |*selection| {
+                const hit = self.view().diffMouseDragHit(point, selection.*) orelse return;
+                if (!selection.identity.eql(hit.identity)) return;
+                selection.updateAtCell(hit.point, .{ .col = point.col, .row = point.row });
+            },
+        }
+    }
+
+    pub fn selectFileDelta(self: BodyController, delta: i2) void {
+        const loaded = self.controller.activeLoadedDiff() orelse return;
+        if (loaded.tree.nodes.len == 0 or loaded.visibleNodeCount() == 0) return;
+
+        if (delta < 0) {
+            if (loaded.previousVisibleNodeIndex(self.controller.surface.viewer.selected_node)) |previous| {
+                self.selectSidebarNode(loaded, previous);
+            }
+        } else if (loaded.nextVisibleNodeIndex(self.controller.surface.viewer.selected_node)) |next| {
+            self.selectSidebarNode(loaded, next);
+        }
+        self.clampSelection(loaded.document.files.len);
+        self.clampDiffNavigation();
+    }
+
+    pub fn selectFileAbsolute(self: BodyController, index: usize) void {
+        const file_count = self.controller.view().loadedFileCount() orelse return;
+        if (file_count == 0) return;
+        const target = @min(index, file_count - 1);
+        if (self.controller.view().selectedDiffFileTarget() == target) {
+            if (self.controller.activeLoadedDiff()) |loaded| {
+                self.controller.syncSidebarNodeToSelectedFile(loaded);
+            }
+            self.clampSelection(file_count);
+            return;
+        }
+        self.controller.setSelectedDiffFile(target);
+        if (self.controller.activeLoadedDiff()) |loaded| {
+            self.controller.syncSidebarNodeToSelectedFile(loaded);
+        }
+        self.resetDiffPosition();
+        self.refreshSearchForSelectedFile();
+        self.clampSelection(file_count);
+        self.clampDiffNavigation();
+    }
+
+    pub fn selectLastFile(self: BodyController) void {
+        const file_count = self.controller.view().loadedFileCount() orelse return;
+        if (file_count == 0) return;
+        self.selectFileAbsolute(file_count - 1);
+    }
+
+    pub fn selectSidebarNode(self: BodyController, loaded: *LoadedDiff, node_index: usize) void {
+        if (node_index >= loaded.tree.nodes.len) return;
+        const previous_file = self.controller.view().selectedDiffFileTarget();
+        self.controller.surface.viewer.selected_node = node_index;
+        // File rows change the active diff pane file. Directory rows only move
+        // the sidebar cursor and keep the previous selected target visible.
+        switch (loaded.tree.nodes[node_index].target) {
+            .diff_file => |file_index| {
+                self.controller.setSelectedDiffFile(file_index);
+                if (previous_file == null or file_index != previous_file.?) {
+                    self.resetDiffPosition();
+                    self.refreshSearchForSelectedFile();
+                }
+            },
+            .status_entry => |status_index| {
+                self.controller.clearDiffSelection();
+                self.controller.surface.viewer.selected_target = .{ .status_only = status_index };
+                self.resetDiffPosition();
+                self.controller.clearSearchMatch();
+            },
+            .repo_root, .directory => {},
+        }
+    }
+
+    pub fn toggleSelectedDirectory(self: BodyController) !void {
+        const loaded = self.controller.activeLoadedDiff() orelse return;
+        if (self.controller.surface.viewer.selected_node >= loaded.tree.nodes.len) return;
+        const node = loaded.tree.nodes[self.controller.surface.viewer.selected_node];
+        if (node.kind != .directory) return;
+        const allocator = self.controller.loadArenaAllocator() orelse return;
+        var prepared = try loaded.prepareVisibleNodeRebuild(allocator);
+        try file_tree.toggle(allocator, &loaded.collapsed_dirs, node.path);
+        prepared.commit(
+            self.controller.surface.review_display.hide_reviewed_files,
+            self.controller.surface.review_display.changed_file_filter,
+        );
+        self.clampSelection(loaded.document.files.len);
+        self.controller.clampSidebarHorizontalScroll();
+    }
+
+    pub fn clickSidebarNode(self: BodyController, node_index: usize) !void {
+        if (self.controller.surface.viewer.sidebar_hidden) return;
+        const loaded = self.controller.activeLoadedDiff() orelse return;
+        if (node_index >= loaded.tree.nodes.len) return;
+
+        self.controller.surface.viewer.focus = .sidebar;
+        self.selectSidebarNode(loaded, node_index);
+
+        const node = loaded.tree.nodes[node_index];
+        if (node.kind == .directory) try self.toggleSelectedDirectory();
+
+        self.clampSelection(loaded.document.files.len);
+        self.clampDiffNavigation();
+    }
+
+    pub fn expandSelectedDirectory(self: BodyController) !void {
+        const loaded = self.controller.activeLoadedDiff() orelse return;
+        if (self.controller.surface.viewer.selected_node >= loaded.tree.nodes.len) return;
+        const node = loaded.tree.nodes[self.controller.surface.viewer.selected_node];
+        switch (node.kind) {
+            .directory => if (!file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) return,
+            .repo_root, .file => return,
+        }
+        const allocator = self.controller.loadArenaAllocator() orelse return;
+        var prepared = try loaded.prepareVisibleNodeRebuild(allocator);
+        file_tree.expand(&loaded.collapsed_dirs, node.path);
+        prepared.commit(
+            self.controller.surface.review_display.hide_reviewed_files,
+            self.controller.surface.review_display.changed_file_filter,
+        );
+        self.clampSelection(loaded.document.files.len);
+        self.controller.clampSidebarHorizontalScroll();
+    }
+
+    pub fn collapseOrSelectParentDirectory(self: BodyController) !void {
+        const loaded = self.controller.activeLoadedDiff() orelse return;
+        if (self.controller.surface.viewer.selected_node >= loaded.tree.nodes.len) return;
+        const node = loaded.tree.nodes[self.controller.surface.viewer.selected_node];
+        if (node.kind == .directory and !file_tree.isCollapsed(&loaded.collapsed_dirs, node.path)) {
+            const allocator = self.controller.loadArenaAllocator() orelse return;
+            var prepared = try loaded.prepareVisibleNodeRebuild(allocator);
+            try file_tree.collapse(allocator, &loaded.collapsed_dirs, node.path);
+            prepared.commit(
+                self.controller.surface.review_display.hide_reviewed_files,
+                self.controller.surface.review_display.changed_file_filter,
+            );
+            self.clampSelection(loaded.document.files.len);
+            self.controller.clampSidebarHorizontalScroll();
+            return;
+        }
+        if (loaded.tree.parentDirectoryNodeIndex(self.controller.surface.viewer.selected_node)) |parent| {
+            self.controller.surface.viewer.selected_node = parent;
+            self.clampSelection(loaded.document.files.len);
+        }
+    }
+
     pub fn scrollDiff(self: BodyController, direction: VerticalDirection) void {
         const old_scroll = self.controller.surface.viewer.diff_scroll;
         const old_cursor_offset = self.view().selectedDiffCursorOffset();
@@ -1013,6 +1183,77 @@ pub const BodyController = struct {
             self.controller.surface.viewer.diff_scroll = offset + 1 - visible_rows;
         }
         self.clampDiffNavigation();
+    }
+
+    pub fn clampSelection(self: BodyController, file_count: usize) void {
+        if (file_count == 0) {
+            if (self.controller.activeLoadedDiff()) |loaded| {
+                if (loaded.tree.nodes.len > 0) {
+                    self.controller.surface.viewer.selected_node = @min(self.controller.surface.viewer.selected_node, loaded.tree.nodes.len - 1);
+                    const node = loaded.tree.nodes[self.controller.surface.viewer.selected_node];
+                    self.controller.surface.viewer.selected_target = switch (node.target) {
+                        .status_entry => |status_index| .{ .status_only = status_index },
+                        .diff_file => |file_index| .{ .diff_file = file_index },
+                        .repo_root, .directory => self.controller.surface.viewer.selected_target,
+                    };
+                    return;
+                }
+            }
+            self.controller.surface.viewer.selected_target = null;
+            self.controller.surface.viewer.selected_node = 0;
+            return;
+        }
+        if (self.controller.surface.viewer.selected_target) |target| {
+            switch (target) {
+                .diff_file => |file_index| if (file_index >= file_count) {
+                    self.controller.setSelectedDiffFile(file_count - 1);
+                },
+                .status_only => |status_index| if (status_index >= self.view().resolvedTarget().status_rows) {
+                    self.controller.setSelectedDiffFile(file_count - 1);
+                },
+            }
+        } else {
+            self.controller.setSelectedDiffFile(file_count - 1);
+        }
+        if (self.controller.activeLoadedDiff()) |loaded| {
+            if (self.controller.surface.viewer.selected_node >= loaded.tree.nodes.len) {
+                self.controller.syncSidebarNodeToSelectedFile(loaded);
+            }
+            if (loaded.visibleAncestorOrSelf(self.controller.surface.viewer.selected_node)) |visible_node| {
+                self.controller.surface.viewer.selected_node = visible_node;
+            } else if (self.controller.view().selectedFileIndex(loaded)) |file_index| {
+                if (loaded.tree.selectedNodeIndex(file_index)) |file_node| {
+                    self.controller.surface.viewer.selected_node = file_node;
+                }
+            }
+        }
+    }
+
+    pub fn reconcileSelectionAfterVisibleNodeChange(self: BodyController, loaded: *LoadedDiff) void {
+        if (loaded.visibleRowOfNode(self.controller.surface.viewer.selected_node) != null) return;
+
+        if (loaded.firstVisibleFileNode()) |file_node| {
+            self.selectSidebarNode(loaded, file_node);
+            return;
+        }
+
+        if (loaded.visibleAncestorOrSelf(self.controller.surface.viewer.selected_node)) |visible_node| {
+            self.selectSidebarNode(loaded, visible_node);
+            return;
+        }
+
+        if (loaded.visibleNodeAt(0)) |node_index| {
+            self.controller.surface.viewer.selected_node = node_index;
+        }
+    }
+
+    pub fn selectFirstVisibleFile(self: BodyController, loaded: *LoadedDiff) void {
+        if (loaded.firstVisibleFileNode()) |node_index| {
+            self.selectSidebarNode(loaded, node_index);
+            return;
+        }
+        // Empty or fully filtered trees keep the existing fallback selection.
+        self.controller.syncSidebarNodeToSelectedFile(loaded);
     }
 
     pub fn initializeDiffCursorForSelectedFile(self: BodyController) void {
