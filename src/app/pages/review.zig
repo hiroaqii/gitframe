@@ -406,6 +406,28 @@ test "diffSurface adapter exposes shared field pointers without copying" {
     try std.testing.expectEqual(diff_source.SourceMode.cached, read_surface.source);
     try std.testing.expectEqual(diff_surface.Layout{ .width = 96, .height = 31 }, read_surface.layout);
 
+    const narrowed = surface.readOnly();
+    try std.testing.expectEqual(surface.activation, narrowed.activation);
+    try std.testing.expectEqual(surface.status, narrowed.status);
+    try std.testing.expectEqual(surface.load, narrowed.load);
+    try std.testing.expectEqual(surface.viewer, narrowed.viewer);
+    try std.testing.expectEqual(surface.search, narrowed.search);
+    try std.testing.expectEqual(surface.file_search, narrowed.file_search);
+    try std.testing.expectEqual(surface.file_search_return_focus, narrowed.file_search_return_focus);
+    try std.testing.expectEqual(surface.accepted_sidebar_revision, narrowed.accepted_sidebar_revision);
+    try std.testing.expectEqual(surface.review_display, narrowed.review_display);
+    try std.testing.expectEqual(surface.reviewed_store, narrowed.reviewed_store);
+    try std.testing.expectEqual(surface.tree_order, narrowed.tree_order);
+    try std.testing.expectEqual(surface.tree_order_scope, narrowed.tree_order_scope);
+    try std.testing.expectEqual(surface.selection_owner, narrowed.selection_owner);
+    try std.testing.expectEqual(surface.completed_selection, narrowed.completed_selection);
+    try std.testing.expectEqual(surface.source_session_revision, narrowed.source_session_revision);
+    try std.testing.expectEqual(surface.pending_initial_first_visible_selection, narrowed.pending_initial_first_visible_selection);
+    try std.testing.expectEqual(surface.reload_anchor, narrowed.reload_anchor);
+    try std.testing.expectEqual(surface.live_drag_deferred_source, narrowed.live_drag_deferred_source);
+    try std.testing.expectEqual(surface.source, narrowed.source);
+    try std.testing.expectEqual(surface.layout, narrowed.layout);
+
     surface.viewer.diff_scroll = 7;
     try std.testing.expectEqual(@as(usize, 7), state.viewer.diff_scroll);
 

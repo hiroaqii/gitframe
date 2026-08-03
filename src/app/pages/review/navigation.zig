@@ -1096,6 +1096,15 @@ pub const Controller = struct {
     layout: Layout,
     diagnostics: DiagnosticSink,
 
+    fn sharedController(self: Controller) diff_surface.navigation.Controller {
+        return .{
+            .surface = self.page.diffSurface(self.source, self.layout),
+            .repo_root = self.repo_root,
+            .repo_epoch = self.repo_epoch,
+            .diagnostics = self.diagnostics,
+        };
+    }
+
     pub fn view(self: Controller) View {
         return .{
             .page = self.page,
@@ -1108,22 +1117,15 @@ pub const Controller = struct {
     }
 
     fn setStatus(self: Controller, comptime fmt: []const u8, args: anytype) void {
-        self.diagnostics.set(fmt, args);
+        self.sharedController().setStatus(fmt, args);
     }
 
     pub fn stableOrderOptions(self: Controller, allocator: std.mem.Allocator) file_tree.StableOrderOptions {
-        return .{
-            .allocator = allocator,
-            .order = &self.page.tree_order,
-        };
+        return self.sharedController().stableOrderOptions(allocator);
     }
 
     fn rebuildVisibleNodes(self: Controller, loaded: *LoadedDiff, allocator: std.mem.Allocator) !void {
-        try loaded.rebuildVisibleNodes(
-            allocator,
-            self.page.review_display.hide_reviewed_files,
-            self.page.review_display.changed_file_filter,
-        );
+        try self.sharedController().rebuildVisibleNodes(loaded, allocator);
     }
 
     pub fn pressDiffMouse(self: Controller, point: MousePoint) void {
@@ -1159,7 +1161,7 @@ pub const Controller = struct {
     }
 
     pub fn clearDiffSelection(self: Controller) void {
-        self.page.selection_owner = .none;
+        self.sharedController().clearDiffSelection();
     }
 
     pub fn selectFileDelta(self: Controller, delta: i2) void {
@@ -1321,21 +1323,11 @@ pub const Controller = struct {
     }
 
     pub fn scrollSidebarHorizontal(self: Controller, direction: HorizontalDirection) void {
-        const step: usize = 4;
-        switch (direction) {
-            .left => self.page.viewer.sidebar_horizontal_scroll -|= step,
-            .right => {
-                self.page.viewer.sidebar_horizontal_scroll += step;
-                self.clampSidebarHorizontalScroll();
-            },
-        }
+        self.sharedController().scrollSidebarHorizontal(direction);
     }
 
     pub fn clampSidebarHorizontalScroll(self: Controller) void {
-        const max_scroll = self.view().visibleSidebarMaxHorizontalScroll();
-        if (self.page.viewer.sidebar_horizontal_scroll > max_scroll) {
-            self.page.viewer.sidebar_horizontal_scroll = max_scroll;
-        }
+        self.sharedController().clampSidebarHorizontalScroll();
     }
 
     pub fn clampDiffHorizontalScrollToVisibleRows(self: Controller) void {
@@ -1478,41 +1470,25 @@ pub const Controller = struct {
     }
 
     pub fn cancelSearchMode(self: Controller) void {
-        self.page.search.input = self.page.search.query;
-        self.page.search.mode = false;
+        self.sharedController().cancelSearchMode();
     }
 
     pub fn clearSearch(self: Controller) void {
-        self.page.search.mode = false;
-        self.page.search.input = .{};
-        self.page.search.query = .{};
-        self.clearSearchMatch();
+        self.sharedController().clearSearch();
     }
 
     /// Resets only Review-local navigation after the shell commits a different
     /// repository identity. Repository selection and reload remain shell-owned.
     pub fn resetAfterRepositorySwitch(self: Controller) void {
-        self.setSelectedDiffFile(0);
-        self.page.viewer.selected_node = 0;
-        self.clearSearch();
+        self.sharedController().resetAfterRepositorySwitch();
     }
 
     pub fn enterFileSearchMode(self: Controller, allocator: std.mem.Allocator) void {
-        self.clearDiffSelection();
-        self.page.file_search_return_focus = if (self.page.viewer.sidebar_hidden) .diff else self.page.viewer.focus;
-        if (!self.page.viewer.sidebar_hidden) self.page.viewer.focus = .sidebar;
-        self.page.file_search.mode = true;
-        self.page.file_search.input = .{};
-        self.page.file_search.resetNoMatch();
-        // Empty input is an authoritative all-eligible-files projection, not
-        // a sentinel state. This also establishes the unavailable terminal
-        // immediately when no accepted sidebar can supply candidates.
-        self.rebuildFileSearchProjection(allocator);
+        self.sharedController().enterFileSearchMode(allocator);
     }
 
     pub fn cancelFileSearchMode(self: Controller, allocator: std.mem.Allocator) void {
-        self.page.file_search.deinit(allocator);
-        self.page.viewer.focus = if (self.page.viewer.sidebar_hidden) .diff else self.page.file_search_return_focus;
+        self.sharedController().cancelFileSearchMode(allocator);
     }
 
     /// Rebuild the candidate projection from the current accepted sidebar
@@ -1520,38 +1496,11 @@ pub const Controller = struct {
     /// failed rebuild keeps the prompt/input alive but publishes no candidate,
     /// so render and submit cannot observe a stale path borrow.
     pub fn rebuildFileSearchProjection(self: Controller, allocator: std.mem.Allocator) void {
-        if (!self.page.file_search.mode) {
-            self.page.file_search.markProjectionUnavailable(allocator);
-            return;
-        }
-        const loaded = self.activeLoadedDiff() orelse {
-            self.page.file_search.markProjectionUnavailable(allocator);
-            return;
-        };
-        const basis = self.currentFileSearchBasis() orelse {
-            self.page.file_search.markProjectionUnavailable(allocator);
-            return;
-        };
-        const query = std.mem.trim(u8, self.page.file_search.input.slice(), " \t\r\n");
-        var projection = file_search.buildProjection(allocator, loaded, query, .{
-            .basis = basis,
-            .hide_reviewed_files = self.page.review_display.hide_reviewed_files,
-            .changed_file_filter = self.page.review_display.changed_file_filter,
-        }) catch {
-            self.page.file_search.markProjectionUnavailable(allocator);
-            return;
-        };
-        self.page.file_search.publish(allocator, &projection);
+        self.sharedController().rebuildFileSearchProjection(allocator);
     }
 
     fn currentFileSearchBasis(self: Controller) ?file_search.Basis {
-        _ = self.view().activeLoadedDiffConst() orelse return null;
-        const basis: file_search.Basis = .{
-            .repo_epoch = self.repo_epoch,
-            .source_session_revision = self.page.source_session_revision,
-            .accepted_sidebar_revision = self.page.accepted_sidebar_revision,
-        };
-        return if (basis.valid()) basis else null;
+        return self.sharedController().currentFileSearchBasis();
     }
 
     pub fn toggleReviewedFile(self: Controller, allocator: std.mem.Allocator) !void {
@@ -1735,8 +1684,7 @@ pub const Controller = struct {
     }
 
     pub fn clearSearchMatch(self: Controller) void {
-        self.page.search.match = null;
-        self.page.search.match_offset = null;
+        self.sharedController().clearSearchMatch();
     }
 
     pub fn setSearchMatch(self: Controller, match: diff_search.Match) void {
@@ -1788,13 +1736,7 @@ pub const Controller = struct {
     }
 
     pub fn scrollSearchMatchIntoView(self: Controller) void {
-        const offset = self.page.search.match_offset orelse return;
-        const visible_rows = self.view().diffVisibleRows();
-        if (offset < self.page.viewer.diff_scroll) {
-            self.page.viewer.diff_scroll = offset;
-        } else if (visible_rows > 0 and offset >= self.page.viewer.diff_scroll + visible_rows) {
-            self.page.viewer.diff_scroll = offset + 1 - visible_rows;
-        }
+        self.sharedController().scrollSearchMatchIntoView();
     }
 
     pub fn prepareActionCursor(
@@ -2018,17 +1960,7 @@ pub const Controller = struct {
     }
 
     pub fn ensureTreeOrderScope(self: Controller, allocator: std.mem.Allocator) !void {
-        const scope = try self.view().treeOrderScopeText(allocator);
-        defer allocator.free(scope);
-
-        if (self.page.tree_order_scope) |current| {
-            if (std.mem.eql(u8, current, scope)) return;
-            allocator.free(current);
-            self.page.tree_order_scope = null;
-            self.page.tree_order.reset(allocator);
-        }
-
-        self.page.tree_order_scope = try allocator.dupe(u8, scope);
+        try self.sharedController().ensureTreeOrderScope(allocator);
     }
 
     pub fn initializeDiffCursorForSelectedFile(self: Controller) void {
@@ -2120,11 +2052,11 @@ pub const Controller = struct {
     }
 
     pub fn resetDiffHorizontalScroll(self: Controller) void {
-        self.page.viewer.diff_horizontal_scroll = 0;
+        self.sharedController().resetDiffHorizontalScroll();
     }
 
     pub fn resetDiffHorizontalScrollIfPaneWidthChanged(self: Controller, previous_width: u16) void {
-        if (self.view().diffPaneWidth() != previous_width) self.resetDiffHorizontalScroll();
+        self.sharedController().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
     }
 
     pub fn clampSelection(self: Controller, file_count: usize) void {
@@ -2192,20 +2124,11 @@ pub const Controller = struct {
     }
 
     pub fn setSelectedDiffFile(self: Controller, file_index: usize) void {
-        const same_target = if (self.page.viewer.selected_target) |target|
-            if (target.diffFileIndex()) |current| current == file_index else false
-        else
-            false;
-        if (!same_target) self.clearDiffSelection();
-        self.page.viewer.selected_target = .{ .diff_file = file_index };
+        self.sharedController().setSelectedDiffFile(file_index);
     }
 
     pub fn syncSidebarNodeToSelectedFile(self: Controller, loaded: *const LoadedDiff) void {
-        const file_index = self.view().selectedFileIndex(loaded) orelse {
-            self.page.viewer.selected_node = 0;
-            return;
-        };
-        self.page.viewer.selected_node = loaded.tree.selectedNodeIndex(file_index) orelse 0;
+        self.sharedController().syncSidebarNodeToSelectedFile(loaded);
     }
 
     pub fn selectFirstVisibleFile(self: Controller, loaded: *LoadedDiff) void {
@@ -2218,20 +2141,11 @@ pub const Controller = struct {
     }
 
     pub fn materializeReviewedFiles(self: Controller, allocator: std.mem.Allocator, loaded: *LoadedDiff) !void {
-        const reviewed_files = try allocator.alloc(bool, loaded.document.files.len);
-        errdefer allocator.free(reviewed_files);
-
-        for (loaded.document.files, 0..) |file, index| {
-            reviewed_files[index] = try self.page.reviewed_store.containsFile(allocator, self.repo_root, file);
-        }
-        loaded.reviewed_files = reviewed_files;
+        try self.sharedController().materializeReviewedFiles(allocator, loaded);
     }
 
     pub fn activeLoadedDiff(self: Controller) ?*LoadedDiff {
-        return switch (self.page.load.state) {
-            .loaded => |*session| &session.loaded,
-            else => null,
-        };
+        return self.sharedController().activeLoadedDiff();
     }
 
     pub const ExactPathTarget = union(enum) {
@@ -2334,11 +2248,7 @@ pub const Controller = struct {
     }
 
     pub fn loadArenaAllocator(self: Controller) ?std.mem.Allocator {
-        return switch (self.page.load.state) {
-            .loaded => |*session| session.arena.allocator(),
-            .failed => |*failed| failed.arena.allocator(),
-            else => null,
-        };
+        return self.sharedController().loadArenaAllocator();
     }
 };
 

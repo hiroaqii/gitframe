@@ -7,6 +7,8 @@
 const std = @import("std");
 const layout = @import("layout.zig");
 const diff_surface = @import("../diff_surface.zig");
+const app_direction = @import("../direction.zig");
+const file_search = diff_surface.file_search;
 const context = @import("../../context.zig");
 const diff_file = @import("../../diff/file.zig");
 const diff_hunk_projection = @import("../../diff/hunk_projection.zig");
@@ -20,6 +22,7 @@ const sidebar_view_model = @import("../../sidebar/view_model.zig");
 const text_projection = @import("../../text/projection.zig");
 
 const LoadedDiff = loaded_diff.LoadedDiff;
+const HorizontalDirection = app_direction.Horizontal;
 
 pub const ParsedSelectionTarget = struct {
     file: diff_parser.FileDiff,
@@ -203,6 +206,215 @@ pub const View = struct {
     pub fn activeLoadedDiffConst(self: View) ?*const LoadedDiff {
         return switch (self.surface.load.state) {
             .loaded => |*session| &session.loaded,
+            else => null,
+        };
+    }
+};
+
+/// Short-lived mutable facade for page-independent model operations.
+///
+/// Views created from this controller receive only the const-qualified
+/// projection. The mutable capability remains private to controller methods.
+pub const Controller = struct {
+    surface: diff_surface.DiffSurface,
+    repo_root: ?[]const u8,
+    repo_epoch: u64 = 0,
+    diagnostics: diff_surface.DiagnosticSink,
+
+    pub fn view(self: Controller) View {
+        return .{
+            .surface = self.surface.readOnly(),
+            .repo_root = self.repo_root,
+        };
+    }
+
+    pub fn setStatus(self: Controller, comptime fmt: []const u8, args: anytype) void {
+        self.diagnostics.set(fmt, args);
+    }
+
+    pub fn stableOrderOptions(self: Controller, allocator: std.mem.Allocator) file_tree.StableOrderOptions {
+        return .{
+            .allocator = allocator,
+            .order = self.surface.tree_order,
+        };
+    }
+
+    pub fn rebuildVisibleNodes(self: Controller, loaded: *LoadedDiff, allocator: std.mem.Allocator) !void {
+        try loaded.rebuildVisibleNodes(
+            allocator,
+            self.surface.review_display.hide_reviewed_files,
+            self.surface.review_display.changed_file_filter,
+        );
+    }
+
+    pub fn clearDiffSelection(self: Controller) void {
+        self.surface.selection_owner.* = .none;
+    }
+
+    pub fn scrollSidebarHorizontal(self: Controller, direction: HorizontalDirection) void {
+        const step: usize = 4;
+        switch (direction) {
+            .left => self.surface.viewer.sidebar_horizontal_scroll -|= step,
+            .right => {
+                self.surface.viewer.sidebar_horizontal_scroll += step;
+                self.clampSidebarHorizontalScroll();
+            },
+        }
+    }
+
+    pub fn clampSidebarHorizontalScroll(self: Controller) void {
+        const max_scroll = self.view().visibleSidebarMaxHorizontalScroll();
+        if (self.surface.viewer.sidebar_horizontal_scroll > max_scroll) {
+            self.surface.viewer.sidebar_horizontal_scroll = max_scroll;
+        }
+    }
+
+    pub fn cancelSearchMode(self: Controller) void {
+        self.surface.search.input = self.surface.search.query;
+        self.surface.search.mode = false;
+    }
+
+    pub fn clearSearch(self: Controller) void {
+        self.surface.search.mode = false;
+        self.surface.search.input = .{};
+        self.surface.search.query = .{};
+        self.clearSearchMatch();
+    }
+
+    pub fn resetAfterRepositorySwitch(self: Controller) void {
+        self.setSelectedDiffFile(0);
+        self.surface.viewer.selected_node = 0;
+        self.clearSearch();
+    }
+
+    pub fn enterFileSearchMode(self: Controller, allocator: std.mem.Allocator) void {
+        self.clearDiffSelection();
+        self.surface.file_search_return_focus.* = if (self.surface.viewer.sidebar_hidden) .diff else self.surface.viewer.focus;
+        if (!self.surface.viewer.sidebar_hidden) self.surface.viewer.focus = .sidebar;
+        self.surface.file_search.mode = true;
+        self.surface.file_search.input = .{};
+        self.surface.file_search.resetNoMatch();
+        // Empty input is an authoritative all-eligible-files projection, not
+        // a sentinel state. This also establishes the unavailable terminal
+        // immediately when no accepted sidebar can supply candidates.
+        self.rebuildFileSearchProjection(allocator);
+    }
+
+    pub fn cancelFileSearchMode(self: Controller, allocator: std.mem.Allocator) void {
+        self.surface.file_search.deinit(allocator);
+        self.surface.viewer.focus = if (self.surface.viewer.sidebar_hidden) .diff else self.surface.file_search_return_focus.*;
+    }
+
+    pub fn rebuildFileSearchProjection(self: Controller, allocator: std.mem.Allocator) void {
+        if (!self.surface.file_search.mode) {
+            self.surface.file_search.markProjectionUnavailable(allocator);
+            return;
+        }
+        const loaded = self.activeLoadedDiff() orelse {
+            self.surface.file_search.markProjectionUnavailable(allocator);
+            return;
+        };
+        const basis = self.currentFileSearchBasis() orelse {
+            self.surface.file_search.markProjectionUnavailable(allocator);
+            return;
+        };
+        const query = std.mem.trim(u8, self.surface.file_search.input.slice(), " \t\r\n");
+        var projection = file_search.buildProjection(allocator, loaded, query, .{
+            .basis = basis,
+            .hide_reviewed_files = self.surface.review_display.hide_reviewed_files,
+            .changed_file_filter = self.surface.review_display.changed_file_filter,
+        }) catch {
+            self.surface.file_search.markProjectionUnavailable(allocator);
+            return;
+        };
+        self.surface.file_search.publish(allocator, &projection);
+    }
+
+    pub fn currentFileSearchBasis(self: Controller) ?file_search.Basis {
+        _ = self.view().activeLoadedDiffConst() orelse return null;
+        const basis: file_search.Basis = .{
+            .repo_epoch = self.repo_epoch,
+            .source_session_revision = self.surface.source_session_revision.*,
+            .accepted_sidebar_revision = self.surface.accepted_sidebar_revision.*,
+        };
+        return if (basis.valid()) basis else null;
+    }
+
+    pub fn clearSearchMatch(self: Controller) void {
+        self.surface.search.match = null;
+        self.surface.search.match_offset = null;
+    }
+
+    pub fn scrollSearchMatchIntoView(self: Controller) void {
+        const offset = self.surface.search.match_offset orelse return;
+        const visible_rows = self.view().diffVisibleRows();
+        if (offset < self.surface.viewer.diff_scroll) {
+            self.surface.viewer.diff_scroll = offset;
+        } else if (visible_rows > 0 and offset >= self.surface.viewer.diff_scroll + visible_rows) {
+            self.surface.viewer.diff_scroll = offset + 1 - visible_rows;
+        }
+    }
+
+    pub fn ensureTreeOrderScope(self: Controller, allocator: std.mem.Allocator) !void {
+        const scope = try self.view().treeOrderScopeText(allocator);
+        defer allocator.free(scope);
+
+        if (self.surface.tree_order_scope.*) |current| {
+            if (std.mem.eql(u8, current, scope)) return;
+            allocator.free(current);
+            self.surface.tree_order_scope.* = null;
+            self.surface.tree_order.reset(allocator);
+        }
+
+        self.surface.tree_order_scope.* = try allocator.dupe(u8, scope);
+    }
+
+    pub fn resetDiffHorizontalScroll(self: Controller) void {
+        self.surface.viewer.diff_horizontal_scroll = 0;
+    }
+
+    pub fn resetDiffHorizontalScrollIfPaneWidthChanged(self: Controller, previous_width: u16) void {
+        if (self.view().diffPaneWidth() != previous_width) self.resetDiffHorizontalScroll();
+    }
+
+    pub fn setSelectedDiffFile(self: Controller, file_index: usize) void {
+        const same_target = if (self.surface.viewer.selected_target) |target|
+            if (target.diffFileIndex()) |current| current == file_index else false
+        else
+            false;
+        if (!same_target) self.clearDiffSelection();
+        self.surface.viewer.selected_target = .{ .diff_file = file_index };
+    }
+
+    pub fn syncSidebarNodeToSelectedFile(self: Controller, loaded: *const LoadedDiff) void {
+        const file_index = self.view().selectedFileIndex(loaded) orelse {
+            self.surface.viewer.selected_node = 0;
+            return;
+        };
+        self.surface.viewer.selected_node = loaded.tree.selectedNodeIndex(file_index) orelse 0;
+    }
+
+    pub fn materializeReviewedFiles(self: Controller, allocator: std.mem.Allocator, loaded: *LoadedDiff) !void {
+        const reviewed_files = try allocator.alloc(bool, loaded.document.files.len);
+        errdefer allocator.free(reviewed_files);
+
+        for (loaded.document.files, 0..) |file, index| {
+            reviewed_files[index] = try self.surface.reviewed_store.containsFile(allocator, self.repo_root, file);
+        }
+        loaded.reviewed_files = reviewed_files;
+    }
+
+    pub fn activeLoadedDiff(self: Controller) ?*LoadedDiff {
+        return switch (self.surface.load.state) {
+            .loaded => |*session| &session.loaded,
+            else => null,
+        };
+    }
+
+    pub fn loadArenaAllocator(self: Controller) ?std.mem.Allocator {
+        return switch (self.surface.load.state) {
+            .loaded => |*session| session.arena.allocator(),
+            .failed => |*failed| failed.arena.allocator(),
             else => null,
         };
     }
