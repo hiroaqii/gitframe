@@ -206,6 +206,152 @@ pub const View = struct {
     }
 };
 
+/// Read-only diff view whose body-dependent operations require a resolver at
+/// construction time. The resolver context is valid only for the synchronous
+/// delegated call that owns this value.
+pub const BodyView = struct {
+    view: View,
+    resolver: diff_surface.BodyResolver,
+
+    pub fn parsedSelectionTarget(self: BodyView, expected: ?diff_selection.Identity) ?diff_surface.ParsedSelectionTarget {
+        return self.resolver.parsedSelectionTarget(expected);
+    }
+
+    pub fn displayedDiffHeaderTarget(self: BodyView, expected: ?diff_selection.HeaderIdentity) ?diff_surface.DiffHeaderTarget {
+        return self.resolver.displayedDiffHeaderTarget(expected);
+    }
+
+    pub fn displayedDiffFile(self: BodyView) ?diff_parser.FileDiff {
+        return self.resolver.displayedDiffFile();
+    }
+
+    pub fn generatedBody(self: BodyView) ?diff_surface.GeneratedBody {
+        return self.resolver.generatedBody();
+    }
+
+    pub fn displayedDiffLineIndex(self: BodyView, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
+        return self.resolver.displayedDiffLineIndex(mode);
+    }
+
+    pub fn diffSelectionView(self: BodyView) ?diff_selection.View {
+        const drag = self.view.surface.selection_owner.activeDiff() orelse return null;
+        switch (drag.identity) {
+            .generated_file => |generated| {
+                const body = self.generatedBody() orelse return null;
+                if (!std.mem.eql(u8, generated.path_key, body.path)) return null;
+            },
+            .loaded_file, .projection_file => _ = self.parsedSelectionTarget(drag.identity) orelse return null,
+        }
+        return drag.view();
+    }
+
+    pub fn diffHeaderSelectionActive(self: BodyView) bool {
+        const header = self.view.surface.selection_owner.activeHeader() orelse return false;
+        _ = self.displayedDiffHeaderTarget(header.identity) orelse return false;
+        return true;
+    }
+
+    pub fn normalLoadedDiffSelectionTarget(self: BodyView, identity: ?diff_selection.Identity) ?diff_surface.NormalLoadedDiffSelectionTarget {
+        const target = self.parsedSelectionTarget(identity) orelse return null;
+        const loaded_identity = switch (target.identity) {
+            .loaded_file => |loaded| loaded,
+            .projection_file, .generated_file => return null,
+        };
+        return .{
+            .file_index = loaded_identity.file_index,
+            .file = target.file,
+            .line_index = target.line_index,
+            .folded_hunks = target.folded_hunks,
+            .identity = target.identity,
+        };
+    }
+
+    pub fn diffHeaderMouseHit(self: BodyView, point: diff_surface.MousePoint) ?diff_surface.DiffHeaderTarget {
+        const target = self.displayedDiffHeaderTarget(null) orelse return null;
+        const raw_diff = self.view.rawDiffPaneGeometry() orelse return null;
+        if (point.col < raw_diff.col or point.col >= raw_diff.col + raw_diff.width) return null;
+        if (point.row != 0) return null;
+
+        const local_col = point.col - raw_diff.col;
+        const content_width = contentWidth(raw_diff.width);
+        const content_gutter = raw_diff.width - content_width;
+        if (local_col < content_gutter) return null;
+        const render_col = local_col - content_gutter;
+        if (render_col >= content_width) return null;
+
+        const header_layout = self.displayedDiffHeaderLayout(content_width, target.display_path) orelse return null;
+        const path_target = header_layout.path_target orelse return null;
+        if (!path_target.contains(render_col)) return null;
+        return target;
+    }
+
+    pub fn displayedDiffHeaderLayout(self: BodyView, content_width: u16, display_path: []const u8) ?diff_render.HeaderLayout {
+        const mode_width = diff_render.bodyWidth(content_width);
+        if (self.generatedBody()) |body| {
+            return diff_render.generatedHeaderLayout(content_width, display_path, body.source.contentLineCount(), self.view.surface.viewer.display_mode, mode_width);
+        }
+        const file = self.displayedDiffFile() orelse return null;
+        return diff_render.fileHeaderLayout(content_width, display_path, file, self.view.surface.viewer.display_mode, mode_width);
+    }
+
+    pub fn diffMouseHit(self: BodyView, point: diff_surface.MousePoint) ?diff_surface.DiffMouseHit {
+        return self.diffMouseHitLocked(point, null);
+    }
+
+    pub fn diffMouseDragHit(self: BodyView, point: diff_surface.MousePoint, drag: diff_selection.DragSelection) ?diff_surface.DiffMouseHit {
+        return self.diffMouseHitLocked(point, drag);
+    }
+
+    fn diffMouseHitLocked(self: BodyView, point: diff_surface.MousePoint, locked: ?diff_selection.DragSelection) ?diff_surface.DiffMouseHit {
+        const raw_diff = self.view.rawDiffPaneGeometry() orelse return null;
+        if (point.col < raw_diff.col or point.col >= raw_diff.col + raw_diff.width) return null;
+        if (point.row < diff_render.body_start_row) return null;
+
+        const local_col = point.col - raw_diff.col;
+        const content_width = contentWidth(raw_diff.width);
+        const content_gutter = raw_diff.width - content_width;
+        if (local_col < content_gutter) return null;
+        const render_col = local_col - content_gutter;
+        if (render_col >= content_width or render_col < diff_render.cursor_gutter_width) return null;
+
+        const body_col = render_col - diff_render.cursor_gutter_width;
+        const visible_body_row: usize = point.row - diff_render.body_start_row;
+        if (visible_body_row >= self.view.diffVisibleRows()) return null;
+        const offset = self.view.surface.viewer.diff_scroll + visible_body_row;
+        const body_width = diff_render.bodyWidth(content_width);
+        const display_mode = diff_render.effectiveMode(body_width, self.view.surface.viewer.display_mode);
+
+        if (self.parsedSelectionTarget(if (locked) |selection_value| selection_value.identity else null)) |target| {
+            const hit = parsedMouseLine(target, body_col, body_width, display_mode, offset, self.view.surface.viewer.view_options.line_numbers, locked) orelse return null;
+            const model_mode = if (locked) |selection_value| selection_value.mode else hit.region.mode;
+            const point_value = if (hit.region.leading_boundary)
+                diff_selection.pointFromBoundary(hit.hunk_index, hit.line_index, 0)
+            else
+                pointForTextCell(hit.hunk_index, hit.line_index, hit.line.text, model_mode, hit.region.text_cell +| self.view.surface.viewer.diff_horizontal_scroll) orelse return null;
+            return .{
+                .identity = target.identity,
+                .side = hit.region.side,
+                .mode = model_mode,
+                .point = point_value,
+            };
+        }
+
+        const generated = self.generatedBody() orelse return null;
+        const line = generated.source.lineBody(offset) orelse return null;
+        const region = selectionRegionForGenerated(body_col, body_width, display_mode, self.view.surface.viewer.view_options.line_numbers, locked) orelse return null;
+        const model_mode = if (locked) |selection_value| selection_value.mode else region.mode;
+        return .{
+            .identity = .{ .generated_file = .{ .path_key = generated.path } },
+            .side = .new,
+            .mode = model_mode,
+            .point = if (region.leading_boundary)
+                diff_selection.pointFromBoundary(0, offset, 0)
+            else
+                pointForTextCell(0, offset, line, model_mode, region.text_cell +| self.view.surface.viewer.diff_horizontal_scroll) orelse return null,
+        };
+    }
+};
+
 /// Short-lived mutable facade for page-independent model operations.
 ///
 /// Views created from this controller receive only the const-qualified
