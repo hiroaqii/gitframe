@@ -24,6 +24,7 @@ const text_projection = @import("../../text/projection.zig");
 
 const LoadedDiff = loaded_diff.LoadedDiff;
 const HorizontalDirection = app_direction.Horizontal;
+const SizeDirection = app_direction.Size;
 const VerticalDirection = app_direction.Vertical;
 
 pub const ParsedSelectionTarget = diff_surface.body_resolver.ParsedSelectionTarget;
@@ -922,6 +923,126 @@ pub const BodyController = struct {
 
         self.selectSidebarNode(loaded, node_index);
         self.clampSelection(loaded.document.files.len);
+        self.clampDiffNavigation();
+    }
+
+    pub fn restoreReloadAnchor(
+        self: BodyController,
+        loaded: *LoadedDiff,
+        anchor: *const diff_surface.ReloadAnchor,
+    ) bool {
+        const selected_same_path = if (findFileNodeByPathKey(loaded, anchor.path_key)) |node_index| blk: {
+            self.selectSidebarNode(loaded, node_index);
+            break :blk true;
+        } else blk: {
+            if (loaded.visibleNodeCount() == 0) {
+                self.controller.surface.viewer.selected_target = null;
+                self.controller.surface.viewer.selected_node = 0;
+                self.resetDiffPosition();
+                self.controller.clearSearchMatch();
+                return true;
+            }
+            const row = @min(anchor.visible_sidebar_row, loaded.visibleNodeCount() - 1);
+            if (nearestVisibleFileNode(loaded, row)) |node_index| {
+                self.selectSidebarNode(loaded, node_index);
+                break :blk false;
+            }
+            return false;
+        };
+
+        // Directory/root selection is independent from the sticky diff body.
+        // Restore it only after rebinding the body file so selecting a
+        // directory cannot accidentally replace the displayed target.
+        _ = self.restoreSidebarIdentity(loaded, anchor.sidebar_identity);
+
+        self.controller.surface.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
+        self.controller.surface.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
+
+        if (selected_same_path and std.meta.activeTag(self.controller.surface.viewer.selected_target.?) == anchor.selected_target_tag) {
+            self.controller.surface.viewer.diff_cursor = anchor.diff_cursor;
+            if (self.view().selectedDiffCursorOffset() == null) {
+                if (anchor.diff_cursor_offset) |offset| {
+                    self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(offset) orelse self.controller.surface.viewer.diff_cursor;
+                }
+            }
+        } else if (anchor.diff_cursor_offset) |offset| {
+            self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(offset) orelse self.controller.surface.viewer.diff_cursor;
+        }
+
+        if (self.view().selectedDiffCursorOffset() == null) {
+            self.initializeDiffCursorForSelectedFile();
+        }
+
+        self.controller.surface.viewer.diff_scroll = anchor.diff_scroll;
+        self.clampDiffNavigation();
+        self.keepDiffCursorVisible();
+        self.restoreSearchFromReloadAnchor(anchor);
+        self.controller.clampSidebarHorizontalScroll();
+        self.clampDiffHorizontalScrollToVisibleRows();
+        // Anchors address the complete tree, while root/directory disclosure
+        // controls its materialized rows. Preserve the restored diff target,
+        // but never leave the sidebar cursor on a hidden descendant.
+        self.reconcileSelectionAfterVisibleNodeChange(loaded);
+        return true;
+    }
+
+    pub fn restoreSidebarIdentity(
+        self: BodyController,
+        loaded: *LoadedDiff,
+        identity: context.SidebarIdentity,
+    ) bool {
+        const node_index = findNodeBySidebarIdentity(loaded, identity) orelse return false;
+        self.selectSidebarNode(loaded, node_index);
+        return true;
+    }
+
+    pub fn restoreSearchFromReloadAnchor(
+        self: BodyController,
+        anchor: *const diff_surface.ReloadAnchor,
+    ) void {
+        self.controller.clearSearchMatch();
+        if (self.controller.surface.search.query.len == 0) return;
+
+        if (anchor.search_coordinate) |coordinate| {
+            self.controller.surface.search.match = .{ .coordinate = coordinate };
+            self.updateSearchMatchOffset();
+            if (self.controller.surface.search.match != null) return;
+        }
+
+        self.refreshSearchForSelectedFile();
+    }
+
+    pub fn toggleSidebarVisibility(self: BodyController) void {
+        const previous_width = self.controller.view().diffPaneWidth();
+        const previous_mode = self.controller.view().effectiveDisplayMode();
+        self.controller.surface.viewer.sidebar_hidden = !self.controller.surface.viewer.sidebar_hidden;
+        if (self.controller.surface.viewer.sidebar_hidden) self.controller.surface.viewer.focus = .diff;
+        self.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
+        if (previous_mode != self.controller.view().effectiveDisplayMode()) self.controller.clearDiffSelection();
+        self.clampDiffNavigationKeepingHunkVisible();
+        self.updateSearchMatchOffset();
+        self.controller.scrollSearchMatchIntoView();
+        self.clampDiffNavigation();
+    }
+
+    pub fn adjustSidebarWidth(self: BodyController, direction: SizeDirection) void {
+        const total_width = self.controller.surface.layout.width;
+        const previous_width = self.controller.view().diffPaneWidth();
+        const previous_mode = self.controller.view().effectiveDisplayMode();
+        const current = sidebarWidth(total_width, self.controller.surface.viewer.sidebar_width);
+        const step: u16 = 4;
+        const next = switch (direction) {
+            .shrink => if (current > step) current - step else 0,
+            .grow => current +| step,
+        };
+
+        self.controller.surface.viewer.sidebar_width = sidebarWidth(total_width, next);
+        self.controller.clampSidebarHorizontalScroll();
+        self.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
+        if (previous_mode != self.controller.view().effectiveDisplayMode()) self.controller.clearDiffSelection();
+        self.clampDiffNavigationKeepingHunkVisible();
+        self.updateSearchMatchOffset();
+        self.controller.scrollSearchMatchIntoView();
         self.clampDiffNavigation();
     }
 

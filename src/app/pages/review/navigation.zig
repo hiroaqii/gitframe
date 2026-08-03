@@ -1565,59 +1565,8 @@ pub const Controller = struct {
     }
 
     pub fn restoreReloadAnchor(self: Controller, loaded: *LoadedDiff, anchor: *const review_page.ReloadAnchor) bool {
-        const selected_same_path = if (findFileNodeByPathKey(loaded, anchor.path_key)) |node_index| blk: {
-            self.selectSidebarNode(loaded, node_index);
-            break :blk true;
-        } else blk: {
-            if (loaded.visibleNodeCount() == 0) {
-                self.page.viewer.selected_target = null;
-                self.page.viewer.selected_node = 0;
-                self.resetDiffPosition();
-                self.clearSearchMatch();
-                return true;
-            }
-            const row = @min(anchor.visible_sidebar_row, loaded.visibleNodeCount() - 1);
-            if (nearestVisibleFileNode(loaded, row)) |node_index| {
-                self.selectSidebarNode(loaded, node_index);
-                break :blk false;
-            }
-            return false;
-        };
-
-        // Directory/root selection is independent from the sticky diff body.
-        // Restore it only after rebinding the body file so selecting a
-        // directory cannot accidentally replace the displayed target.
-        _ = self.restoreSidebarIdentity(loaded, anchor.sidebar_identity);
-
-        self.page.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
-        self.page.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
-
-        if (selected_same_path and std.meta.activeTag(self.page.viewer.selected_target.?) == anchor.selected_target_tag) {
-            self.page.viewer.diff_cursor = anchor.diff_cursor;
-            if (self.view().selectedDiffCursorOffset() == null) {
-                if (anchor.diff_cursor_offset) |offset| {
-                    self.page.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(offset) orelse self.page.viewer.diff_cursor;
-                }
-            }
-        } else if (anchor.diff_cursor_offset) |offset| {
-            self.page.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(offset) orelse self.page.viewer.diff_cursor;
-        }
-
-        if (self.view().selectedDiffCursorOffset() == null) {
-            self.initializeDiffCursorForSelectedFile();
-        }
-
-        self.page.viewer.diff_scroll = anchor.diff_scroll;
-        self.clampDiffNavigation();
-        self.keepDiffCursorVisible();
-        self.restoreSearchFromReloadAnchor(anchor);
-        self.clampSidebarHorizontalScroll();
-        self.clampDiffHorizontalScrollToVisibleRows();
-        // Anchors address the complete tree, while root/directory disclosure
-        // controls its materialized rows. Preserve the restored diff target,
-        // but never leave the sidebar cursor on a hidden descendant.
-        self.reconcileSelectionAfterVisibleNodeChange(loaded);
-        return true;
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyController(&adapter).restoreReloadAnchor(loaded, anchor);
     }
 
     pub fn restoreSidebarIdentity(
@@ -1625,9 +1574,8 @@ pub const Controller = struct {
         loaded: *LoadedDiff,
         identity: context.SidebarIdentity,
     ) bool {
-        const node_index = findNodeBySidebarIdentity(loaded, identity) orelse return false;
-        self.selectSidebarNode(loaded, node_index);
-        return true;
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyController(&adapter).restoreSidebarIdentity(loaded, identity);
     }
 
     pub fn keepDiffCursorVisible(self: Controller) void {
@@ -1636,16 +1584,8 @@ pub const Controller = struct {
     }
 
     pub fn restoreSearchFromReloadAnchor(self: Controller, anchor: *const review_page.ReloadAnchor) void {
-        self.clearSearchMatch();
-        if (self.page.search.query.len == 0) return;
-
-        if (anchor.search_coordinate) |coordinate| {
-            self.page.search.match = .{ .coordinate = coordinate };
-            self.updateSearchMatchOffset();
-            if (self.page.search.match != null) return;
-        }
-
-        self.refreshSearchForSelectedFile();
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).restoreSearchFromReloadAnchor(anchor);
     }
 
     pub fn ensureTreeOrderScope(self: Controller, allocator: std.mem.Allocator) !void {
@@ -1668,37 +1608,13 @@ pub const Controller = struct {
     }
 
     pub fn toggleSidebarVisibility(self: Controller) void {
-        const previous_width = self.view().diffPaneWidth();
-        const previous_mode = self.view().effectiveDisplayMode();
-        self.page.viewer.sidebar_hidden = !self.page.viewer.sidebar_hidden;
-        if (self.page.viewer.sidebar_hidden) self.page.viewer.focus = .diff;
-        self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
-        if (previous_mode != self.view().effectiveDisplayMode()) self.clearDiffSelection();
-        self.clampDiffNavigationKeepingHunkVisible();
-        self.updateSearchMatchOffset();
-        self.scrollSearchMatchIntoView();
-        self.clampDiffNavigation();
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).toggleSidebarVisibility();
     }
 
     pub fn adjustSidebarWidth(self: Controller, direction: SizeDirection) void {
-        const total_width = self.layout.width;
-        const previous_width = self.view().diffPaneWidth();
-        const previous_mode = self.view().effectiveDisplayMode();
-        const current = sidebarWidth(total_width, self.page.viewer.sidebar_width);
-        const step: u16 = 4;
-        const next = switch (direction) {
-            .shrink => if (current > step) current - step else 0,
-            .grow => current +| step,
-        };
-
-        self.page.viewer.sidebar_width = sidebarWidth(total_width, next);
-        self.clampSidebarHorizontalScroll();
-        self.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
-        if (previous_mode != self.view().effectiveDisplayMode()) self.clearDiffSelection();
-        self.clampDiffNavigationKeepingHunkVisible();
-        self.updateSearchMatchOffset();
-        self.scrollSearchMatchIntoView();
-        self.clampDiffNavigation();
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).adjustSidebarWidth(direction);
     }
 
     pub fn resetDiffHorizontalScroll(self: Controller) void {
