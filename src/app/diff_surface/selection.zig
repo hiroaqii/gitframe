@@ -70,14 +70,14 @@ pub const DisplayBasis = union(enum) {
     }
 };
 
-pub const ReviewContentToken = struct {
+pub const ContentToken = struct {
     repo_epoch: u64,
     root_identity: ?root_capability.Identity,
     source: SourceBasis,
     source_session_revision: u64,
     display: DisplayBasis,
 
-    pub fn eql(self: ReviewContentToken, other: ReviewContentToken) bool {
+    pub fn eql(self: ContentToken, other: ContentToken) bool {
         return self.repo_epoch == other.repo_epoch and
             optionalRootIdentityEql(self.root_identity, other.root_identity) and
             self.source.eql(other.source) and
@@ -85,6 +85,10 @@ pub const ReviewContentToken = struct {
             self.display.eql(other.display);
     }
 };
+
+/// Compatibility alias while Review-local callers migrate to the shared
+/// diff-surface vocabulary.
+pub const ReviewContentToken = ContentToken;
 
 pub const Parsed = struct {
     canonical_path: []u8,

@@ -6,6 +6,7 @@ const shared = @import("../../diff_surface/selection.zig");
 
 pub const SourceBasis = shared.SourceBasis;
 pub const DisplayBasis = shared.DisplayBasis;
+pub const ContentToken = shared.ContentToken;
 pub const ReviewContentToken = shared.ReviewContentToken;
 pub const Parsed = shared.Parsed;
 pub const GeneratedFragment = shared.GeneratedFragment;

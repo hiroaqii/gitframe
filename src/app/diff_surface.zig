@@ -22,6 +22,7 @@ const file_tree = @import("../file_tree.zig");
 const review_state = @import("../review/state.zig");
 
 pub const authority = @import("diff_surface/authority.zig");
+pub const body_resolver = @import("diff_surface/body_resolver.zig");
 pub const file_search = @import("diff_surface/file_search.zig");
 pub const layout = @import("diff_surface/layout.zig");
 pub const navigation = @import("diff_surface/navigation.zig");
@@ -122,10 +123,16 @@ pub const DiffMouseHit = struct {
     point: diff_selection.Point,
 };
 
-pub const DiffHeaderTarget = struct {
-    identity: diff_selection.HeaderIdentity,
-    display_path: []const u8,
-};
+pub const BodyResolver = body_resolver.BodyResolver;
+pub const ContentToken = body_resolver.ContentToken;
+pub const DiffHeaderTarget = body_resolver.DiffHeaderTarget;
+pub const FoldedHunksSource = body_resolver.FoldedHunksSource;
+pub const GeneratedBody = body_resolver.GeneratedBody;
+pub const ReducedBodyKind = body_resolver.ReducedBodyKind;
+pub const RenderProjectedBodyArgs = body_resolver.RenderProjectedBodyArgs;
+pub const ResolvedTarget = body_resolver.ResolvedTarget;
+pub const SearchUnavailableReason = body_resolver.SearchUnavailableReason;
+pub const SearchUnfoldPolicy = body_resolver.SearchUnfoldPolicy;
 
 pub const DisplayNavigationSnapshot = struct {
     selected_target: ?context.SelectedTarget,
@@ -141,11 +148,7 @@ pub const DisplayNavigationSnapshot = struct {
 
 pub const invalid_utf8_body_message = "Text preview unavailable: diff content is not valid UTF-8";
 
-pub const HunkInteractionAvailability = enum {
-    available,
-    unavailable,
-    inert_invalid_utf8,
-};
+pub const HunkInteractionAvailability = body_resolver.HunkInteractionAvailability;
 
 pub const NormalLoadedDiffSelectionTarget = struct {
     file_index: usize,
@@ -155,17 +158,13 @@ pub const NormalLoadedDiffSelectionTarget = struct {
     identity: diff_selection.Identity,
 };
 
-pub const ParsedSelectionTarget = navigation.ParsedSelectionTarget;
+pub const ParsedSelectionTarget = body_resolver.ParsedSelectionTarget;
 pub const SelectionRegion = navigation.SelectionRegion;
 pub const ParsedMouseLine = navigation.ParsedMouseLine;
 
 pub const RawDiffPaneGeometry = struct { col: u16, width: u16 };
 
-pub const SearchTarget = struct {
-    file: diff_parser.FileDiff,
-    line_index: diff_view_model.RenderedLineIndex,
-    folded_hunks: []const bool,
-};
+pub const SearchTarget = body_resolver.SearchTarget;
 
 /// Const-qualified projection of the shared surface for rendering and other
 /// read-only consumers. It mirrors `DiffSurface` exactly, but the 16 shared
@@ -253,6 +252,7 @@ pub const DiffSurface = struct {
 
 test {
     _ = authority;
+    _ = body_resolver;
     _ = file_search;
     _ = layout;
     _ = navigation;

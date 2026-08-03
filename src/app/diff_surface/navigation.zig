@@ -24,12 +24,7 @@ const text_projection = @import("../../text/projection.zig");
 const LoadedDiff = loaded_diff.LoadedDiff;
 const HorizontalDirection = app_direction.Horizontal;
 
-pub const ParsedSelectionTarget = struct {
-    file: diff_parser.FileDiff,
-    line_index: diff_view_model.RenderedLineIndex,
-    folded_hunks: []const bool,
-    identity: diff_selection.Identity,
-};
+pub const ParsedSelectionTarget = diff_surface.body_resolver.ParsedSelectionTarget;
 
 pub const SelectionRegion = struct {
     side: diff_selection.Side,
