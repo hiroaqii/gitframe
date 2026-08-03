@@ -127,147 +127,60 @@ test "reloadable activation reports validating and stale while one-shot input st
     try std.testing.expect(activationPresentation(&review, .{ .pager = "" }) == null);
 }
 
-const StateMessage = diff_surface_view.StateMessage;
-
 pub fn view(app: Context, surface: *chasen.Surface) !void {
-    switch (app.page.load.state) {
-        .loaded => |session| return viewLoadedDiff(app, surface, session.loaded),
-        else => {},
-    }
-
-    // Without an accepted load there is no sidebar owner from which search
-    // candidates may borrow paths. Keep the prompt usable, but render the
-    // explicit unavailable terminal instead of leaving the old page body
-    // visible behind a footer-only input.
-    if (app.page.file_search.mode) {
-        try drawFileSearch(surface, &app.page.file_search, app.theme);
-        return;
-    }
-
-    switch (app.page.load.state) {
-        .empty => |reason| if (reason == .no_changes) return viewNoChanges(app, surface),
-        else => {},
-    }
-
-    const size = surface.size();
-    const title = "GitFrame";
-    const subtitle = "Read-only diff viewer shell";
-
-    var panel = surface.child(.{
-        .col = if (size.width > 60) (size.width - 60) / 2 else 0,
-        .row = if (size.height > 10) (size.height - 10) / 2 else 0,
-        .width = @min(size.width, 60),
-        .height = if (size.height > 10) 10 else size.height,
+    var diff_pane_adapter: ReviewDiffPaneRenderer = .{ .app = app };
+    var branch_scratch: SidebarBranchScratch = undefined;
+    var fetch_key_buffer: [16]u8 = undefined;
+    return diff_surface_view.view(surface, .{
+        .state = app.page.readSurface(app.source, app.navigation.layout),
+        .palette = app.theme,
+        .source_label = app.source_label,
+        .no_changes_actions = viewNoChangesActionPresentation(app, fetch_key_buffer[0..]),
+        .branch = viewBranchRowPresentation(app, surface, &branch_scratch),
+        .diff_pane = diff_pane_adapter.interface(),
     });
-    var col = panel.column(.{ .gap = 1 });
-    col.borrowText(title, app.theme.boldStyle(.accent));
-    col.borrowText(subtitle, app.theme.style(.muted));
-    try col.print("Source: {s}", .{app.source_label});
-    viewLoadState(app, &col);
 }
 
-fn viewNoChanges(app: Context, surface: *chasen.Surface) !void {
-    const message = noChangesMessage(app, surface.frameAllocator());
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0) return;
+const ReviewDiffPaneRenderer = struct {
+    app: Context,
 
-    if (app.page.viewer.sidebar_hidden) {
-        drawStateMessage(surface, message, app.theme);
-        return;
+    fn interface(self: *ReviewDiffPaneRenderer) diff_surface_view.DiffPaneRenderer {
+        return .{ .ctx = self, .render_fn = render };
     }
+
+    fn render(ctx: *anyopaque, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
+        const self: *ReviewDiffPaneRenderer = @ptrCast(@alignCast(ctx));
+        return viewDiffPane(self.app, surface, loaded);
+    }
+};
+
+fn viewNoChangesActionPresentation(app: Context, fetch_key_buffer: []u8) diff_surface_view.NoChangesActionPresentation {
+    if (app.page.file_search.mode) return .{};
+    switch (app.page.load.state) {
+        .empty => |reason| if (reason != .no_changes) return .{},
+        else => return .{},
+    }
+    const fetch_key = app.keymap.display(.fetch, fetch_key_buffer);
+    return noChangesActionPresentation(app.empty_remote_hints, fetch_key);
+}
+
+fn viewBranchRowPresentation(app: Context, surface: *chasen.Surface, scratch: *SidebarBranchScratch) ?diff_surface_view.SidebarBranchPresentation {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0 or app.page.viewer.sidebar_hidden) return null;
 
     const sidebar_width = review_layout.sidebarWidth(size.width, app.page.viewer.sidebar_width);
-    var sidebar = surface.child(.{
-        .col = 0,
-        .row = 0,
-        .width = sidebar_width,
-        .height = size.height,
-    });
-    try viewEmptySidebarChrome(app, &sidebar);
-
-    if (size.width > sidebar_width) {
-        var row: u16 = 0;
-        while (row < size.height) : (row += 1) {
-            _ = surface.borrowTextAt(sidebar_width, row, "│", shellSeparatorStyle());
-        }
+    switch (app.page.load.state) {
+        .loaded => {
+            const search_pane_width = size.width -| (sidebar_width +| 1);
+            if (app.page.file_search.mode and search_pane_width < diff_surface_view.file_search_min_pane_width) return null;
+        },
+        .empty => |reason| if (reason != .no_changes or app.page.file_search.mode) return null,
+        else => return null,
     }
 
-    if (size.width <= sidebar_width + 1) return;
-    var diff_pane = surface.child(.{
-        .col = sidebar_width + 1,
-        .row = 0,
-        .width = size.width - sidebar_width - 1,
-        .height = size.height,
-    });
-    drawStateMessage(&diff_pane, message, app.theme);
+    var sidebar = surface.child(.{ .col = 0, .row = 0, .width = sidebar_width, .height = size.height });
+    return sidebarBranchRowPresentation(app, &sidebar, scratch);
 }
-
-fn viewEmptySidebarChrome(app: Context, surface: *chasen.Surface) !void {
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0) return;
-
-    try drawSidebarDetailRow(app, surface, 0);
-    try diff_surface_view.drawEmptySidebarTitle(surface, app.theme);
-}
-
-fn viewLoadedDiff(app: Context, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0) return;
-
-    if (app.page.viewer.sidebar_hidden) {
-        if (app.page.file_search.mode) {
-            try drawFileSearch(surface, &app.page.file_search, app.theme);
-            return;
-        }
-        if (loaded.visibleNodeCount() == 0) {
-            drawStateMessage(surface, filterEmptyMessage(app), app.theme);
-            return;
-        }
-        try viewDiffPane(app, surface, loaded);
-        return;
-    }
-
-    const sidebar_width = review_layout.sidebarWidth(size.width, app.page.viewer.sidebar_width);
-    const search_pane_width = size.width -| (sidebar_width +| 1);
-    if (app.page.file_search.mode and search_pane_width < file_search_min_pane_width) {
-        try drawFileSearch(surface, &app.page.file_search, app.theme);
-        return;
-    }
-    var sidebar = surface.child(.{
-        .col = 0,
-        .row = 0,
-        .width = sidebar_width,
-        .height = size.height,
-    });
-    try viewSidebar(app, &sidebar, loaded);
-
-    if (size.width > sidebar_width) {
-        var row: u16 = 0;
-        while (row < size.height) : (row += 1) {
-            _ = surface.borrowTextAt(sidebar_width, row, "│", shellSeparatorStyle());
-        }
-    }
-
-    if (size.width <= sidebar_width + 1) return;
-    var diff_pane = surface.child(.{
-        .col = sidebar_width + 1,
-        .row = 0,
-        .width = size.width - sidebar_width - 1,
-        .height = size.height,
-    });
-    if (app.page.file_search.mode) {
-        try drawFileSearch(&diff_pane, &app.page.file_search, app.theme);
-        return;
-    }
-    if (loaded.visibleNodeCount() == 0) {
-        drawStateMessage(&diff_pane, filterEmptyMessage(app), app.theme);
-        return;
-    }
-    try viewDiffPane(app, &diff_pane, loaded);
-}
-
-const drawFileSearch = diff_surface_view.drawFileSearch;
-const file_search_min_pane_width = diff_surface_view.file_search_min_pane_width;
 
 /// Draw the file tree side pane from the materialized sidebar view-model.
 pub fn viewSidebar(app: Context, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
@@ -524,17 +437,6 @@ fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u
     });
 }
 
-fn viewLoadState(app: Context, col: *chasen.Column) void {
-    diff_surface_view.viewLoadState(&app.page.load, col, app.theme);
-}
-
-fn noChangesMessage(app: Context, allocator: std.mem.Allocator) StateMessage {
-    var fetch_key_buffer: [16]u8 = undefined;
-    const hints = app.empty_remote_hints;
-    const fetch_key = app.keymap.display(.fetch, fetch_key_buffer[0..]);
-    return diff_surface_view.noChangesMessage(allocator, noChangesActionPresentation(hints, fetch_key));
-}
-
 fn noChangesActionPresentation(hints: EmptyRemoteActionHints, fetch_key: ?[]const u8) diff_surface_view.NoChangesActionPresentation {
     return .{
         .show_repo_picker = hints.show_repo_picker,
@@ -543,11 +445,7 @@ fn noChangesActionPresentation(hints: EmptyRemoteActionHints, fetch_key: ?[]cons
     };
 }
 
-fn filterEmptyMessage(app: Context) StateMessage {
-    return diff_surface_view.filterEmptyMessage(app.page.review_display);
-}
-
-const drawStateMessage = diff_surface_view.drawStateMessage;
+const drawFileSearch = diff_surface_view.drawFileSearch;
 
 test "review no-changes adapter normalizes fetch capability and key" {
     const denied = noChangesActionPresentation(.{ .show_fetch = false }, "Ctrl+f");
@@ -1054,10 +952,6 @@ fn paneHeaderRuleStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
         .{ .dim = true }
     else
         .{ .fg = palette.color(.muted), .dim = true };
-}
-
-fn shellSeparatorStyle() chasen.TextStyle {
-    return .{ .dim = true };
 }
 
 fn testContext(page: *const review_page.ReviewPageState, palette: theme.Palette, width: u16, height: u16) Context {

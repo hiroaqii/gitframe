@@ -261,6 +261,166 @@ pub fn firstLine(text: []const u8) []const u8 {
     return text;
 }
 
+/// Synchronous page adapter for the diff-pane body. S2c2a lifts the outer
+/// shell first; S2c2b supplies the shared pane renderer behind this boundary.
+pub const DiffPaneRenderer = struct {
+    ctx: *anyopaque,
+    render_fn: *const fn (ctx: *anyopaque, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) anyerror!void,
+
+    pub fn render(self: DiffPaneRenderer, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
+        return self.render_fn(self.ctx, surface, loaded);
+    }
+};
+
+pub const ViewArgs = struct {
+    state: diff_surface.ReadSurface,
+    palette: theme.Palette,
+    source_label: []const u8,
+    no_changes_actions: NoChangesActionPresentation,
+    branch: ?SidebarBranchPresentation,
+    diff_pane: DiffPaneRenderer,
+};
+
+/// Draw the full diff-surface shell from shared state and normalized
+/// page-owned presentation capabilities.
+pub fn view(surface: *chasen.Surface, args: ViewArgs) !void {
+    switch (args.state.load.state) {
+        .loaded => |session| return viewLoadedDiff(surface, args, session.loaded),
+        else => {},
+    }
+
+    // Without an accepted load there is no sidebar owner from which search
+    // candidates may borrow paths. Keep the prompt usable, but render the
+    // explicit unavailable terminal instead of leaving the old page body
+    // visible behind a footer-only input.
+    if (args.state.file_search.mode) {
+        try drawFileSearch(surface, args.state.file_search, args.palette);
+        return;
+    }
+
+    switch (args.state.load.state) {
+        .empty => |reason| if (reason == .no_changes) return viewNoChanges(surface, args),
+        else => {},
+    }
+
+    const size = surface.size();
+    const title = "GitFrame";
+    const subtitle = "Read-only diff viewer shell";
+
+    var panel = surface.child(.{
+        .col = if (size.width > 60) (size.width - 60) / 2 else 0,
+        .row = if (size.height > 10) (size.height - 10) / 2 else 0,
+        .width = @min(size.width, 60),
+        .height = if (size.height > 10) 10 else size.height,
+    });
+    var col = panel.column(.{ .gap = 1 });
+    col.borrowText(title, args.palette.boldStyle(.accent));
+    col.borrowText(subtitle, args.palette.style(.muted));
+    try col.print("Source: {s}", .{args.source_label});
+    viewLoadState(args.state.load, &col, args.palette);
+}
+
+fn viewNoChanges(surface: *chasen.Surface, args: ViewArgs) !void {
+    const message = noChangesMessage(surface.frameAllocator(), args.no_changes_actions);
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    if (args.state.viewer.sidebar_hidden) {
+        drawStateMessage(surface, message, args.palette);
+        return;
+    }
+
+    const sidebar_width = layout.sidebarWidth(size.width, args.state.viewer.sidebar_width);
+    var sidebar = surface.child(.{
+        .col = 0,
+        .row = 0,
+        .width = sidebar_width,
+        .height = size.height,
+    });
+    try viewEmptySidebarChrome(&sidebar, args);
+    drawSidebarSeparator(surface, sidebar_width, args.palette);
+
+    if (size.width <= sidebar_width + 1) return;
+    var diff_pane = surface.child(.{
+        .col = sidebar_width + 1,
+        .row = 0,
+        .width = size.width - sidebar_width - 1,
+        .height = size.height,
+    });
+    drawStateMessage(&diff_pane, message, args.palette);
+}
+
+fn viewEmptySidebarChrome(surface: *chasen.Surface, args: ViewArgs) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    try drawSidebarDetailRow(surface, 0, args.state, args.palette, args.branch);
+    try drawEmptySidebarTitle(surface, args.palette);
+}
+
+fn viewLoadedDiff(surface: *chasen.Surface, args: ViewArgs, loaded: loaded_diff.LoadedDiff) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    if (args.state.viewer.sidebar_hidden) {
+        if (args.state.file_search.mode) {
+            try drawFileSearch(surface, args.state.file_search, args.palette);
+            return;
+        }
+        if (loaded.visibleNodeCount() == 0) {
+            drawStateMessage(surface, filterEmptyMessage(args.state.review_display.*), args.palette);
+            return;
+        }
+        try args.diff_pane.render(surface, loaded);
+        return;
+    }
+
+    const sidebar_width = layout.sidebarWidth(size.width, args.state.viewer.sidebar_width);
+    const search_pane_width = size.width -| (sidebar_width +| 1);
+    if (args.state.file_search.mode and search_pane_width < file_search_min_pane_width) {
+        try drawFileSearch(surface, args.state.file_search, args.palette);
+        return;
+    }
+    var sidebar = surface.child(.{
+        .col = 0,
+        .row = 0,
+        .width = sidebar_width,
+        .height = size.height,
+    });
+    try viewSidebar(&sidebar, args.state, loaded, args.palette, args.branch);
+    drawSidebarSeparator(surface, sidebar_width, args.palette);
+
+    if (size.width <= sidebar_width + 1) return;
+    var diff_pane = surface.child(.{
+        .col = sidebar_width + 1,
+        .row = 0,
+        .width = size.width - sidebar_width - 1,
+        .height = size.height,
+    });
+    if (args.state.file_search.mode) {
+        try drawFileSearch(&diff_pane, args.state.file_search, args.palette);
+        return;
+    }
+    if (loaded.visibleNodeCount() == 0) {
+        drawStateMessage(&diff_pane, filterEmptyMessage(args.state.review_display.*), args.palette);
+        return;
+    }
+    try args.diff_pane.render(&diff_pane, loaded);
+}
+
+fn drawSidebarSeparator(surface: *chasen.Surface, sidebar_width: u16, palette: theme.Palette) void {
+    const size = surface.size();
+    if (size.width <= sidebar_width) return;
+    var row: u16 = 0;
+    while (row < size.height) : (row += 1) {
+        _ = surface.borrowTextAt(sidebar_width, row, "│", shellSeparatorStyle(palette));
+    }
+}
+
+fn shellSeparatorStyle(_: theme.Palette) chasen.TextStyle {
+    return .{ .dim = true };
+}
+
 /// Draw a bounded file-search projection in the diff-pane position.
 pub fn drawFileSearch(surface: *chasen.Surface, state: *const file_search.State, palette: theme.Palette) !void {
     const size = surface.size();
