@@ -4,9 +4,9 @@ const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const draw = @import("draw");
 const branch_chrome = @import("../../branch_chrome.zig");
-const app_load_state = @import("../../load_state.zig");
 const app_page = @import("../../page.zig");
 const review_projection = @import("../../review_projection.zig");
+const diff_surface_view = @import("../../diff_surface/view.zig");
 const view_primitives = @import("../../view_primitives.zig");
 const review_page = @import("../review.zig");
 const review_file_search = @import("file_search.zig");
@@ -29,21 +29,8 @@ pub const EmptyRemoteActionHints = struct {
     show_pull: bool = false,
     show_fetch: bool = false,
 };
-
-pub const FooterView = struct {
-    /// Page-local text input consumes printable keys before shell actions.
-    /// Suppress ordinary shell hints while those actions are unreachable.
-    normal_action_hints_enabled: bool,
-    sidebar_hidden: bool,
-    auto_reload_enabled: bool,
-    source_label: ?[]const u8,
-    activation: ?ActivationPresentation,
-};
-
-pub const ActivationPresentation = enum {
-    validating,
-    stale,
-};
+pub const FooterView = diff_surface_view.FooterView;
+pub const ActivationPresentation = diff_surface_view.ActivationPresentation;
 
 pub const Context = struct {
     page: *const review_page.ReviewPageState,
@@ -78,13 +65,10 @@ pub const Context = struct {
     }
 
     pub fn footer(self: Context) FooterView {
-        return .{
-            .normal_action_hints_enabled = !self.page.file_search.mode,
-            .sidebar_hidden = self.page.viewer.sidebar_hidden,
+        return diff_surface_view.footer(.{
+            .surface = self.page.readSurface(self.source, self.navigation.layout),
             .auto_reload_enabled = self.page.auto_reload.enabled(),
-            .source_label = sourceFooterLabel(self.source),
-            .activation = activationPresentation(self.page, self.source),
-        };
+        });
     }
 
     pub fn selectedStatusEntry(self: Context) ?git_status.StatusEntry {
@@ -129,34 +113,7 @@ pub const Context = struct {
 };
 
 fn activationPresentation(review: *const review_page.ReviewPageState, source: diff_source.SourceMode) ?ActivationPresentation {
-    // Accepted one-shot input is immutable on re-entry and must never pretend
-    // that stdin/pager is being read a second time.
-    if (diff_source.sourceIsOneShotInput(source)) return null;
-    return switch (review.activation.state) {
-        .inactive => null,
-        .active => |active| blk: {
-            const members = active.members;
-            if (members.source == .pending or members.status == .pending or members.branch == .pending) {
-                break :blk .validating;
-            }
-            if (members.source == .failed or members.status == .failed or members.branch == .failed) {
-                break :blk .stale;
-            }
-            break :blk null;
-        },
-    };
-}
-
-fn sourceFooterLabel(source: diff_source.SourceMode) ?[]const u8 {
-    return switch (source) {
-        .unstaged => null,
-        .cached => "staged",
-        .stdin => "stdin",
-        .pager => "pager",
-        .patch_file => "patch",
-        .range => "range",
-        .no_index => "difftool",
-    };
+    return diff_surface_view.activationPresentation(&review.activation, source);
 }
 
 test "reloadable activation reports validating and stale while one-shot input stays immutable" {
@@ -171,19 +128,7 @@ test "reloadable activation reports validating and stale while one-shot input st
     try std.testing.expect(activationPresentation(&review, .{ .pager = "" }) == null);
 }
 
-const StateTone = enum {
-    muted,
-    loading,
-    warning,
-    failure,
-};
-
-const StateMessage = struct {
-    title: []const u8,
-    body: []const u8 = "",
-    hint: []const u8 = "",
-    tone: StateTone = .muted,
-};
+const StateMessage = diff_surface_view.StateMessage;
 
 pub fn view(app: Context, surface: *chasen.Surface) !void {
     switch (app.page.load.state) {
@@ -770,150 +715,36 @@ fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u
 }
 
 fn viewLoadState(app: Context, col: *chasen.Column) void {
-    switch (app.page.load.state) {
-        .idle => drawStateMessageColumn(col, .{
-            .title = "Waiting to load diff",
-            .body = "GitFrame is waiting for a load request.",
-            .hint = "Press q to quit.",
-        }, app.theme),
-        .loading => drawStateMessageColumn(col, .{
-            .title = "Loading diff",
-            .body = "Reading and parsing the current source.",
-            .hint = "Press q to quit.",
-            .tone = .loading,
-        }, app.theme),
-        .empty => |reason| drawStateMessageColumn(col, emptyLoadMessage(reason), app.theme),
-        .failed => |failed| drawStateMessageColumn(col, .{
-            .title = "Could not load diff",
-            .body = firstLine(failed.message),
-            .hint = "Press r to retry or q to quit.",
-            .tone = .failure,
-        }, app.theme),
-        .loaded => {},
-    }
-}
-
-fn emptyLoadMessage(reason: app_load_state.EmptyReason) StateMessage {
-    return switch (reason) {
-        .no_changes => .{
-            // Normal no-changes rendering is intercepted by `viewNoChanges` so
-            // clean repos can keep branch chrome. Keep this fallback for any
-            // future generic empty-state path.
-            .title = "No changes",
-            .body = "Working tree has no diff for the current source.",
-            .hint = "Press r to reload or q to quit.",
-        },
-        .no_repository => .{
-            .title = "No Git repository",
-            .body = "Run GitFrame inside a repository or a workspace containing direct child repositories.",
-            .hint = "Press q to quit.",
-            .tone = .warning,
-        },
-    };
+    diff_surface_view.viewLoadState(&app.page.load, col, app.theme);
 }
 
 fn noChangesMessage(app: Context, allocator: std.mem.Allocator) StateMessage {
-    return .{
-        .title = "No changes",
-        .body = "Working tree has no diff for the current source.",
-        .hint = noChangesHint(app, allocator),
-    };
-}
-
-fn noChangesHint(app: Context, allocator: std.mem.Allocator) []const u8 {
     var fetch_key_buffer: [16]u8 = undefined;
     const hints = app.empty_remote_hints;
-    const fetch_key = if (hints.show_fetch) app.keymap.display(.fetch, fetch_key_buffer[0..]) else null;
+    const fetch_key = app.keymap.display(.fetch, fetch_key_buffer[0..]);
+    return diff_surface_view.noChangesMessage(allocator, noChangesActionPresentation(hints, fetch_key));
+}
 
-    // The hint is capability-oriented: `U` refreshes first and may legitimately
-    // finish as "nothing to pull", so the text advertises the workflow rather
-    // than predicting remote state from a possibly stale ahead/behind count.
-    if (hints.show_repo_picker and hints.show_pull and fetch_key != null) {
-        return std.fmt.allocPrint(allocator, "Press R to switch repository, U to fetch + fast-forward, {s} to fetch, r to reload, or q to quit.", .{fetch_key.?}) catch "Press R to switch repository, U to fetch + fast-forward, r to reload, or q to quit.";
-    }
-    if (hints.show_repo_picker and hints.show_pull) {
-        return "Press R to switch repository, U to fetch + fast-forward, r to reload, or q to quit.";
-    }
-    if (hints.show_repo_picker and fetch_key != null) {
-        return std.fmt.allocPrint(allocator, "Press R to switch repository, {s} to fetch, r to reload, or q to quit.", .{fetch_key.?}) catch "Press R to switch repository, r to reload, or q to quit.";
-    }
-    if (hints.show_repo_picker) {
-        return "Press R to switch repository, r to reload, or q to quit.";
-    }
-    if (hints.show_pull and fetch_key != null) {
-        return std.fmt.allocPrint(allocator, "Press U to fetch + fast-forward, {s} to fetch, r to reload, or q to quit.", .{fetch_key.?}) catch "Press U to fetch + fast-forward, r to reload, or q to quit.";
-    }
-    if (hints.show_pull) {
-        return "Press U to fetch + fast-forward, r to reload, or q to quit.";
-    }
-    if (fetch_key != null) {
-        return std.fmt.allocPrint(allocator, "Press {s} to fetch, r to reload, or q to quit.", .{fetch_key.?}) catch "Press r to reload or q to quit.";
-    }
-    return "Press r to reload or q to quit.";
+fn noChangesActionPresentation(hints: EmptyRemoteActionHints, fetch_key: ?[]const u8) diff_surface_view.NoChangesActionPresentation {
+    return .{
+        .show_repo_picker = hints.show_repo_picker,
+        .show_pull = hints.show_pull,
+        .fetch_key = if (hints.show_fetch) fetch_key else null,
+    };
 }
 
 fn filterEmptyMessage(app: Context) StateMessage {
-    const hint = if (app.page.review_display.hide_reviewed_files and app.page.review_display.changed_file_filter != .all)
-        "Press F to change filter, H to show reviewed files, or r to reload."
-    else if (app.page.review_display.hide_reviewed_files)
-        "Press H to show reviewed files or r to reload."
-    else if (app.page.review_display.changed_file_filter != .all)
-        "Press F to change filter or r to reload."
-    else
-        "Press r to reload.";
-
-    return .{
-        .title = "No files match current filters",
-        .body = "The diff is loaded, but the current sidebar filters hide every file.",
-        .hint = hint,
-    };
+    return diff_surface_view.filterEmptyMessage(app.page.review_display);
 }
 
-fn drawStateMessage(surface: *chasen.Surface, message: StateMessage, palette: theme.Palette) void {
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0) return;
+const drawStateMessage = diff_surface_view.drawStateMessage;
 
-    const width = @min(size.width, 64);
-    const height: u16 = @min(size.height, 6);
-    var panel = surface.child(.{
-        .col = if (size.width > width) (size.width - width) / 2 else 0,
-        .row = if (size.height > height) (size.height - height) / 2 else 0,
-        .width = width,
-        .height = height,
-    });
-    var col = panel.column(.{ .gap = 1 });
-    drawStateMessageColumn(&col, message, palette);
-}
+test "review no-changes adapter normalizes fetch capability and key" {
+    const denied = noChangesActionPresentation(.{ .show_fetch = false }, "Ctrl+f");
+    try std.testing.expect(denied.fetch_key == null);
 
-fn drawStateMessageColumn(col: *chasen.Column, message: StateMessage, palette: theme.Palette) void {
-    col.borrowText(message.title, stateTitleStyle(message.tone, palette));
-    if (message.body.len > 0) col.borrowText(message.body, stateBodyStyle(message.tone, palette));
-    if (message.hint.len > 0) col.borrowText(message.hint, stateHintStyle(palette));
-}
-
-fn stateTitleStyle(tone: StateTone, palette: theme.Palette) chasen.TextStyle {
-    return switch (tone) {
-        .muted => palette.boldStyle(.muted),
-        .loading => palette.boldStyle(.prompt),
-        .warning => palette.boldStyle(.warning),
-        .failure => palette.boldStyle(.danger),
-    };
-}
-
-fn stateBodyStyle(tone: StateTone, palette: theme.Palette) chasen.TextStyle {
-    return switch (tone) {
-        .failure => palette.style(.danger),
-        else => palette.style(.muted),
-    };
-}
-
-fn stateHintStyle(palette: theme.Palette) chasen.TextStyle {
-    return .{ .fg = palette.color(.muted), .dim = true };
-}
-
-fn firstLine(text: []const u8) []const u8 {
-    if (std.mem.indexOfAny(u8, text, "\r\n")) |end| return text[0..end];
-    return text;
+    const allowed = noChangesActionPresentation(.{ .show_fetch = true }, "Ctrl+f");
+    try std.testing.expectEqualStrings("Ctrl+f", allowed.fetch_key.?);
 }
 
 const SidebarBranchPresentation = struct {
