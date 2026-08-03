@@ -14,6 +14,7 @@ const diff_file = @import("../../diff/file.zig");
 const diff_hunk_projection = @import("../../diff/hunk_projection.zig");
 const diff_parser = @import("../../diff/parser.zig");
 const diff_render = @import("../../diff/render.zig");
+const diff_search = @import("../../diff/search.zig");
 const diff_selection = @import("../../diff/selection.zig");
 const diff_view_model = @import("../../diff/view_model.zig");
 const file_tree = @import("../../file_tree.zig");
@@ -839,6 +840,36 @@ pub const BodyController = struct {
         self.applyDiffCursorScrolloff();
     }
 
+    pub fn toggleSelectedHunkFold(self: BodyController) void {
+        if (!self.view().bodyAllowsHunkInteraction()) return;
+        const loaded = self.controller.activeLoadedDiff() orelse return;
+        const file_index = self.controller.view().selectedFileIndex(loaded) orelse return;
+        if (file_index >= loaded.document.files.len) return;
+        const file = loaded.document.files[file_index];
+        const hunk_index = self.view().selectedHunkIndex() orelse return;
+        if (hunk_index >= file.hunks.len) return;
+
+        if (!loaded.isHunkFolded(file_index, hunk_index) and
+            self.controller.view().currentSearchMatchInHunkBody(hunk_index))
+        {
+            return;
+        }
+
+        const folding = !loaded.isHunkFolded(file_index, hunk_index);
+        loaded.toggleHunkFold(file_index, hunk_index);
+        if (folding) {
+            switch (self.controller.surface.viewer.diff_cursor) {
+                .hunk_line => |line| if (line.hunk_index == hunk_index) {
+                    self.controller.surface.viewer.diff_cursor = .{ .hunk_header = hunk_index };
+                },
+                else => {},
+            }
+        }
+        self.updateSearchMatchOffset();
+        self.applyDiffCursorScrolloff();
+        self.clampDiffNavigation();
+    }
+
     pub fn clampDiffNavigation(self: BodyController) void {
         if (self.view().resolvedTarget().kind == .inert) {
             self.controller.surface.viewer.diff_cursor = .{ .metadata = 0 };
@@ -875,6 +906,102 @@ pub const BodyController = struct {
         self.controller.surface.viewer.diff_scroll = 0;
         self.initializeDiffCursorForSelectedFile();
         self.controller.clearSearchMatch();
+    }
+
+    pub fn enterSearchMode(self: BodyController) void {
+        if (self.blockUnsupportedSearchTarget()) return;
+        self.controller.clearDiffSelection();
+        self.controller.surface.search.input = self.controller.surface.search.query;
+        self.controller.surface.search.mode = true;
+    }
+
+    pub fn submitSearch(self: BodyController) void {
+        self.controller.surface.search.mode = false;
+        if (self.blockUnsupportedSearchTarget()) return;
+        self.controller.surface.search.query = self.controller.surface.search.input;
+        self.controller.clearSearchMatch();
+        if (self.controller.surface.search.query.len == 0) return;
+        self.selectSearchMatch(.forward);
+    }
+
+    pub fn selectSearchMatch(self: BodyController, direction: diff_search.Direction) void {
+        if (self.blockUnsupportedSearchTarget()) return;
+        const mode = self.controller.view().effectiveDisplayMode();
+        const target = self.view().displayedSearchTarget(mode) orelse return;
+        if (self.controller.surface.search.query.len == 0) return;
+
+        const line_count = target.line_index.lineCount();
+        if (line_count == 0) return;
+        const base = if (self.controller.surface.search.match) |match| match.coordinate else null;
+        const next = diff_search.findMatch(target.file, mode, self.controller.surface.search.query.slice(), base, direction) orelse {
+            self.controller.clearSearchMatch();
+            return;
+        };
+        self.unfoldSearchMatchIfNeeded(next);
+        self.setSearchMatch(next);
+        self.controller.surface.viewer.diff_cursor = next.coordinate;
+        self.controller.resetDiffHorizontalScroll();
+        self.applyDiffCursorScrolloff();
+        self.clampDiffNavigation();
+    }
+
+    pub fn refreshSearchForSelectedFile(self: BodyController) void {
+        self.controller.clearSearchMatch();
+        if (self.controller.surface.search.query.len == 0) return;
+        if (self.view().unsupportedSearchMessage() != null) return;
+        const mode = self.controller.view().effectiveDisplayMode();
+        const target = self.view().displayedSearchTarget(mode) orelse return;
+        const next = diff_search.findMatch(target.file, mode, self.controller.surface.search.query.slice(), null, .forward) orelse return;
+        self.unfoldSearchMatchIfNeeded(next);
+        self.setSearchMatch(next);
+        self.controller.surface.viewer.diff_cursor = next.coordinate;
+        self.applyDiffCursorScrolloff();
+    }
+
+    pub fn setSearchMatch(self: BodyController, match: diff_search.Match) void {
+        self.controller.surface.search.match = match;
+        self.updateSearchMatchOffset();
+    }
+
+    pub fn updateSearchMatchOffset(self: BodyController) void {
+        self.controller.surface.search.match_offset = null;
+        if (self.view().unsupportedSearchMessage() != null) {
+            self.controller.clearSearchMatch();
+            return;
+        }
+        const match = self.controller.surface.search.match orelse return;
+        const mode = self.controller.view().effectiveDisplayMode();
+        const target = self.view().displayedSearchTarget(mode) orelse {
+            self.controller.clearSearchMatch();
+            return;
+        };
+        const offset = diff_view_model.renderedOffsetForCoordinate(target.file, mode, match.coordinate, target.line_index) orelse {
+            self.controller.clearSearchMatch();
+            return;
+        };
+        self.controller.surface.search.match_offset = offset;
+    }
+
+    pub fn blockUnsupportedSearchTarget(self: BodyController) bool {
+        if (self.view().unsupportedSearchMessage()) |message| {
+            self.controller.clearSearchMatch();
+            self.controller.setStatus("{s}", .{message});
+            return true;
+        }
+        return false;
+    }
+
+    pub fn unfoldSearchMatchIfNeeded(self: BodyController, match: diff_search.Match) void {
+        if (self.view().resolvedTarget().search_unfold_policy == .suppressed) return;
+
+        const hunk_index = switch (match.coordinate) {
+            .hunk_line => |line| line.hunk_index,
+            else => return,
+        };
+        const loaded = self.controller.activeLoadedDiff() orelse return;
+        const file_index = self.controller.view().selectedFileIndex(loaded) orelse return;
+        if (!loaded.isHunkFolded(file_index, hunk_index)) return;
+        loaded.setHunkFolded(file_index, hunk_index, false);
     }
 
     pub fn keepDiffCursorVisible(self: BodyController) void {
