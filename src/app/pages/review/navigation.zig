@@ -1150,6 +1150,17 @@ pub const Controller = struct {
         };
     }
 
+    fn sharedBodyController(self: Controller, adapter: *ReviewBodyResolver) diff_surface.navigation.BodyController {
+        return .{
+            .controller = self.sharedController(),
+            .resolver = adapter.interface(),
+        };
+    }
+
+    fn bodyResolverAdapter(self: Controller) ReviewBodyResolver {
+        return .{ .view = self.view() };
+    }
+
     pub fn view(self: Controller) View {
         return .{
             .page = self.page,
@@ -1348,23 +1359,13 @@ pub const Controller = struct {
     }
 
     pub fn scrollDiff(self: Controller, direction: VerticalDirection) void {
-        const old_scroll = self.page.viewer.diff_scroll;
-        const old_cursor_offset = self.view().selectedDiffCursorOffset();
-        switch (direction) {
-            .up => self.page.viewer.diff_scroll -|= 1,
-            .down => self.page.viewer.diff_scroll += 1,
-        }
-        self.clampDiffNavigation();
-        self.syncDiffCursorAfterViewportScroll(direction, old_scroll, old_cursor_offset);
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).scrollDiff(direction);
     }
 
     pub fn scrollDiffHorizontal(self: Controller, direction: HorizontalDirection) void {
-        const step: usize = 8;
-        switch (direction) {
-            .left => self.page.viewer.diff_horizontal_scroll -|= step,
-            .right => self.page.viewer.diff_horizontal_scroll += step,
-        }
-        self.clampDiffHorizontalScrollToVisibleRows();
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).scrollDiffHorizontal(direction);
     }
 
     pub fn scrollSidebarHorizontal(self: Controller, direction: HorizontalDirection) void {
@@ -1376,63 +1377,23 @@ pub const Controller = struct {
     }
 
     pub fn clampDiffHorizontalScrollToVisibleRows(self: Controller) void {
-        const max_scroll = self.view().visibleBodyTextMaxHorizontalScroll();
-        if (self.page.viewer.diff_horizontal_scroll > max_scroll) {
-            self.page.viewer.diff_horizontal_scroll = max_scroll;
-        }
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).clampDiffHorizontalScrollToVisibleRows();
     }
 
     pub fn moveDiffCursorRows(self: Controller, direction: VerticalDirection) void {
-        const current = self.view().selectedDiffCursorOffset() orelse {
-            self.initializeDiffCursorForSelectedFile();
-            self.applyDiffCursorScrolloff();
-            return;
-        };
-        const line_count = self.view().displayedDiffLineCount();
-        if (line_count == 0) return;
-        const target = switch (direction) {
-            .up => current -| 1,
-            .down => @min(current + 1, line_count - 1),
-        };
-        self.page.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(target) orelse self.page.viewer.diff_cursor;
-        self.applyDiffCursorScrolloff();
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).moveDiffCursorRows(direction);
     }
 
     pub fn moveDiffCursorPage(self: Controller, direction: VerticalDirection) void {
-        const current = self.view().selectedDiffCursorOffset() orelse {
-            self.initializeDiffCursorForSelectedFile();
-            self.applyDiffCursorScrolloff();
-            return;
-        };
-        const line_count = self.view().displayedDiffLineCount();
-        if (line_count == 0) return;
-        const step = @max(self.view().diffVisibleRows(), 1);
-        const target = switch (direction) {
-            .up => current -| step,
-            .down => @min(current + step, line_count - 1),
-        };
-        self.page.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(target) orelse self.page.viewer.diff_cursor;
-        self.applyDiffCursorScrolloff();
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).moveDiffCursorPage(direction);
     }
 
     pub fn selectHunkDelta(self: Controller, delta: i2) void {
-        if (!self.view().bodyAllowsHunkInteraction()) return;
-        const file = self.view().displayedDiffFile() orelse return;
-        if (file.hunks.len == 0) return;
-
-        const current = self.view().selectedHunkIndex();
-        const target = if (delta < 0) blk: {
-            if (current) |hunk_index| {
-                if (self.page.viewer.diff_cursor == .hunk_line) break :blk hunk_index;
-                break :blk hunk_index -| 1;
-            }
-            break :blk 0;
-        } else blk: {
-            if (current) |hunk_index| break :blk @min(hunk_index + 1, file.hunks.len - 1);
-            break :blk 0;
-        };
-        self.page.viewer.diff_cursor = .{ .hunk_header = target };
-        self.applyDiffCursorScrolloff();
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).selectHunkDelta(delta);
     }
 
     pub fn toggleSelectedHunkFold(self: Controller) void {
@@ -1470,41 +1431,18 @@ pub const Controller = struct {
     }
 
     pub fn clampDiffNavigation(self: Controller) void {
-        if (self.view().resolvedTarget().kind == .inert) {
-            self.page.viewer.diff_cursor = .{ .metadata = 0 };
-            self.page.viewer.diff_scroll = 0;
-            self.page.viewer.diff_horizontal_scroll = 0;
-            return;
-        }
-        if (self.view().selectedFile() == null) {
-            const line_count = self.view().selectedProjectionLineCount();
-            const visible_rows = self.view().diffVisibleRows();
-            const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
-            if (self.page.viewer.diff_scroll > max_scroll) self.page.viewer.diff_scroll = max_scroll;
-            return;
-        }
-
-        if (self.view().selectedDiffCursorOffset() == null) {
-            self.initializeDiffCursorForSelectedFile();
-        }
-
-        const mode = self.view().effectiveDisplayMode();
-        const line_count = self.view().selectedFileLineIndex(mode).lineCount();
-        const visible_rows = self.view().diffVisibleRows();
-        const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
-        if (self.page.viewer.diff_scroll > max_scroll) self.page.viewer.diff_scroll = max_scroll;
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).clampDiffNavigation();
     }
 
     pub fn clampDiffNavigationKeepingHunkVisible(self: Controller) void {
-        self.clampDiffNavigation();
-        self.applyDiffCursorScrolloff();
-        self.clampDiffNavigation();
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).clampDiffNavigationKeepingHunkVisible();
     }
 
     pub fn resetDiffPosition(self: Controller) void {
-        self.page.viewer.diff_scroll = 0;
-        self.initializeDiffCursorForSelectedFile();
-        self.clearSearchMatch();
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).resetDiffPosition();
     }
 
     pub fn enterSearchMode(self: Controller) void {
@@ -1979,14 +1917,8 @@ pub const Controller = struct {
     }
 
     pub fn keepDiffCursorVisible(self: Controller) void {
-        const offset = self.view().selectedDiffCursorOffset() orelse return;
-        const visible_rows = self.view().diffVisibleRows();
-        if (offset < self.page.viewer.diff_scroll) {
-            self.page.viewer.diff_scroll = offset;
-        } else if (visible_rows > 0 and offset >= self.page.viewer.diff_scroll + visible_rows) {
-            self.page.viewer.diff_scroll = offset + 1 - visible_rows;
-        }
-        self.clampDiffNavigation();
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).keepDiffCursorVisible();
     }
 
     pub fn restoreSearchFromReloadAnchor(self: Controller, anchor: *const review_page.ReloadAnchor) void {
@@ -2007,57 +1939,18 @@ pub const Controller = struct {
     }
 
     pub fn initializeDiffCursorForSelectedFile(self: Controller) void {
-        self.page.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(0) orelse .{ .metadata = 0 };
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).initializeDiffCursorForSelectedFile();
     }
 
     pub fn applyDiffCursorScrolloff(self: Controller) void {
-        const cursor_offset = self.view().selectedDiffCursorOffset() orelse {
-            self.clampDiffNavigation();
-            return;
-        };
-        const visible_rows = self.view().diffVisibleRows();
-        if (visible_rows == 0) {
-            self.clampDiffNavigation();
-            return;
-        }
-        const margin = @min(@as(usize, 8), visible_rows / 3);
-        if (cursor_offset < self.page.viewer.diff_scroll + margin) {
-            self.page.viewer.diff_scroll = cursor_offset -| margin;
-        } else {
-            const lower_edge = self.page.viewer.diff_scroll + visible_rows -| margin;
-            if (cursor_offset >= lower_edge) {
-                self.page.viewer.diff_scroll = cursor_offset + margin + 1 - visible_rows;
-            }
-        }
-        self.clampDiffNavigation();
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).applyDiffCursorScrolloff();
     }
 
     pub fn syncDiffCursorAfterViewportScroll(self: Controller, direction: VerticalDirection, old_scroll: usize, old_cursor_offset: ?usize) void {
-        const line_count = self.view().selectedFileLineIndex(self.view().effectiveDisplayMode()).lineCount();
-        if (line_count == 0) return;
-        const visible_rows = self.view().diffVisibleRows();
-        if (visible_rows == 0) return;
-
-        // Mouse-wheel scrolling is viewport-first, but hunk actions still use
-        // the diff cursor. Keep the cursor near the user's visible scroll
-        // position without letting normal scrolloff pull the viewport back.
-        const margin = @min(@as(usize, 8), visible_rows / 3);
-        const target = if (old_cursor_offset) |offset| blk: {
-            if (offset >= old_scroll and offset < old_scroll + visible_rows) {
-                break :blk self.page.viewer.diff_scroll + (offset - old_scroll);
-            }
-            break :blk switch (direction) {
-                .up => self.page.viewer.diff_scroll + margin,
-                .down => self.page.viewer.diff_scroll + visible_rows - 1 -| margin,
-            };
-        } else blk: {
-            break :blk switch (direction) {
-                .up => self.page.viewer.diff_scroll + margin,
-                .down => self.page.viewer.diff_scroll + visible_rows - 1 -| margin,
-            };
-        };
-
-        self.page.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(@min(target, line_count - 1)) orelse self.page.viewer.diff_cursor;
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).syncDiffCursorAfterViewportScroll(direction, old_scroll, old_cursor_offset);
     }
 
     pub fn toggleSidebarVisibility(self: Controller) void {
