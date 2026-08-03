@@ -256,6 +256,10 @@ pub const BodyView = struct {
         return self.resolver.hunkStagePresentation(allocator, file_index);
     }
 
+    pub fn renderProjectedBody(self: BodyView, args: diff_surface.RenderProjectedBodyArgs) !void {
+        return self.resolver.renderProjectedBody(args);
+    }
+
     pub fn diffSelectionView(self: BodyView) ?diff_selection.View {
         const drag = self.view.surface.selection_owner.activeDiff() orelse return null;
         switch (drag.identity) {

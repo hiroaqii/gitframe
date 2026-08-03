@@ -6,7 +6,6 @@ const branch_chrome = @import("../../branch_chrome.zig");
 const app_page = @import("../../page.zig");
 const review_projection = @import("../../review_projection.zig");
 const diff_surface_view = @import("../../diff_surface/view.zig");
-const view_primitives = @import("../../view_primitives.zig");
 const review_page = @import("../review.zig");
 const review_file_search = @import("file_search.zig");
 const review_body_render = @import("body_render.zig");
@@ -78,20 +77,8 @@ pub const Context = struct {
         return self.navigation.selectedStatusLineStats();
     }
 
-    pub fn activeDiffDisplay(self: Context, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?review_navigation.ActiveDiffDisplay {
-        return self.navigation.activeDiffDisplay(allocator, mode);
-    }
-
     pub fn displayedReviewBody(self: Context) review_navigation.DisplayedReviewBody {
         return self.navigation.displayedReviewBody();
-    }
-
-    pub fn activeGeneratedFileProjection(self: Context) ?*const @import("../../review_projection.zig").GeneratedFileBundle {
-        return self.navigation.activeGeneratedFileProjection();
-    }
-
-    pub fn activeCachedDiffProjection(self: Context) ?*const @import("../../load.zig").LoadedDiffBundle {
-        return self.navigation.activeCachedDiffProjection();
     }
 
     pub fn selectedHunkIndex(self: Context) ?usize {
@@ -246,89 +233,34 @@ pub fn viewDiffPane(app: Context, surface: *chasen.Surface, loaded: loaded_diff.
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    if (app.selectedStatusEntry()) |entry| {
-        try viewStatusOnlyPane(app, surface, entry);
-        return;
-    }
-
-    if (loaded.document.files.len == 0) {
-        _ = surface.borrowTextAt(0, 0, "No parsed files.", app.theme.style(.muted));
-        return;
-    }
-
-    var diff_content = diffContentSurface(surface);
-    const mode = diff_render.effectiveMode(diff_render.bodyWidth(diff_content.size().width), app.page.viewer.display_mode);
-    const active = app.page.viewer.sidebar_hidden or app.page.viewer.focus == .diff;
-    if (app.displayedReviewBody() == .inert_invalid_utf8) {
-        const inert = app.displayedReviewBody().inert_invalid_utf8;
-        try review_body_render.renderStatus(
-            inert.display_path,
-            review_navigation.invalid_utf8_body_message,
-            null,
-            projectedBodyRenderArgs(app, &diff_content, active),
-        );
-        drawPaneHeaderRule(surface, active, app.theme);
-        return;
-    }
-    const display = (try app.activeDiffDisplay(surface.frameAllocator(), mode)) orelse return;
-    const display_file = display.file();
-    try diff_render.renderFile(&diff_content, display_file, .{
-        .requested_mode = app.page.viewer.display_mode,
-        .scroll = app.page.viewer.diff_scroll,
-        .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
-        .pane_active = active,
-        .line_numbers = app.page.viewer.view_options.line_numbers,
-        .highlighted_hunk = app.selectedHunkIndex(),
-        .cursor_offset = app.visibleDiffCursorOffset(),
-        .hunk_stages = display.hunkStagePresentation(),
-        .line_index = display.lineIndex(),
-        .folded_hunks = display.foldedHunks(),
-        .palette = app.theme,
-        .syntax = display.syntaxView(),
-        .selection = app.diffSelectionView(),
-        .header_selection = app.diffHeaderSelectionActive(),
-    });
-    drawDiffHeaderDetailRow(app, surface, active);
-    drawSearchMatchMarker(app, surface);
+    var resolver_adapter = app.navigation.contentResolverAdapter();
+    var status_adapter: ReviewStatusOnlyRenderer = undefined;
+    const status_renderer: ?diff_surface_view.StatusOnlyRenderer = if (app.selectedStatusEntry()) |entry| blk: {
+        status_adapter = .{ .app = app, .entry = entry };
+        break :blk status_adapter.interface();
+    } else null;
+    return diff_surface_view.viewDiffPane(
+        surface,
+        app.navigation.diffSurfaceBodyView(&resolver_adapter),
+        loaded,
+        app.theme,
+        status_renderer,
+    );
 }
 
-fn drawDiffHeaderDetailRow(app: Context, surface: *chasen.Surface, active: bool) void {
-    const size = surface.size();
-    if (size.width == 0 or size.height <= 1) return;
+const ReviewStatusOnlyRenderer = struct {
+    app: Context,
+    entry: git_status.StatusEntry,
 
-    surface.clear(.{ .col = 0, .row = 1, .width = size.width, .height = 1 });
-    if (!app.page.search.mode and app.page.search.query.len > 0) {
-        const label_col: u16 = 1;
-        const match_text = if (app.page.search.match_offset) |offset|
-            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ app.page.search.query.slice(), offset + 1 }) catch "search"
-        else
-            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{app.page.search.query.slice()}) catch "search";
-        draw.copyClippedTextAt(surface, label_col, 1, match_text, paneSearchStyle(active, app.theme)) catch {};
-        return;
+    fn interface(self: *ReviewStatusOnlyRenderer) diff_surface_view.StatusOnlyRenderer {
+        return .{ .ctx = self, .render_fn = render };
     }
 
-    if (app.page.search.mode) {
-        const label = "search: ";
-        const label_col: u16 = 1;
-        const style = paneSearchStyle(active, app.theme);
-        draw.copyClippedTextAt(surface, label_col, 1, label, style) catch {};
-        if (size.width > label_col + label.len) {
-            const input_col: u16 = label_col + @as(u16, @intCast(label.len));
-            drawInputLine(surface, input_col, 1, app.page.search.input.slice(), app.page.search.input.cursor, style) catch {};
-            view_primitives.showInputCursor(surface, input_col, 1, app.page.search.input.slice(), app.page.search.input.cursor);
-        }
-        return;
+    fn render(ctx: *anyopaque, surface: *chasen.Surface) !void {
+        const self: *ReviewStatusOnlyRenderer = @ptrCast(@alignCast(ctx));
+        return viewStatusOnlyPane(self.app, surface, self.entry);
     }
-
-    drawPaneHeaderRule(surface, active, app.theme);
-}
-
-fn drawInputLine(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, cursor: usize, style: chasen.TextStyle) !void {
-    const size = surface.size();
-    if (col >= size.width or row >= size.height) return;
-    const width = size.width - col;
-    try draw.copyClippedTextAt(surface, col, row, text[view_primitives.inputVisibleStart(text, cursor, width)..], style);
-}
+};
 
 fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.StatusEntry) !void {
     const active = app.page.viewer.sidebar_hidden or app.page.viewer.focus == .diff;
@@ -412,14 +344,7 @@ fn projectedBodyRenderArgs(app: Context, surface: *chasen.Surface, active: bool)
     };
 }
 
-fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool, palette: theme.Palette) void {
-    const size = surface.size();
-    if (size.width == 0 or size.height <= 1) return;
-
-    for (0..size.width) |col| {
-        _ = surface.borrowTextAt(@intCast(col), 1, "─", paneHeaderRuleStyle(active, palette));
-    }
-}
+const drawPaneHeaderRule = diff_surface_view.drawPaneHeaderRule;
 
 fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u8, stats: ?file_tree.Stats, active: bool, palette: theme.Palette) !void {
     try review_body_render.renderStatus(path, message, stats, .{
@@ -899,29 +824,14 @@ test "review filter summary owns sidebar detail row over branch action hint" {
 }
 
 pub fn drawSearchMatchMarker(app: Context, surface: *chasen.Surface) void {
-    const match_offset = app.page.search.match_offset orelse return;
-    if (match_offset < app.page.viewer.diff_scroll) return;
-
-    const visible_offset = match_offset - app.page.viewer.diff_scroll;
-    const body_rows = diff_render.visibleBodyRows(surface.size().height);
-    if (visible_offset >= body_rows) return;
-
-    const row: u16 = @intCast(review_layout.diff_body_start_row + visible_offset);
-    _ = surface.borrowTextAt(0, row, "»", .{ .bold = true, .reverse = true, .fg = app.theme.color(.prompt) });
+    return diff_surface_view.drawSearchMatchMarker(
+        surface,
+        app.page.readSurface(app.source, app.navigation.layout),
+        app.theme,
+    );
 }
 
-fn diffContentSurface(surface: *chasen.Surface) chasen.Surface {
-    const size = surface.size();
-    if (size.width <= review_layout.search_marker_gutter_width) {
-        return surface.child(.{ .col = 0, .row = 0, .width = size.width, .height = size.height });
-    }
-    return surface.child(.{
-        .col = review_layout.search_marker_gutter_width,
-        .row = 0,
-        .width = size.width - review_layout.search_marker_gutter_width,
-        .height = size.height,
-    });
-}
+const diffContentSurface = diff_surface_view.diffContentSurface;
 
 const withCursorBackground = diff_surface_view.withCursorBackground;
 const statusStyle = diff_surface_view.statusStyle;
@@ -940,19 +850,8 @@ fn paneTitleStyle(palette: theme.Palette) chasen.TextStyle {
     return review_body_render.paneTitleStyle(palette);
 }
 
-fn paneSearchStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
-    return if (active)
-        palette.boldStyle(.prompt)
-    else
-        palette.style(.prompt);
-}
-
-fn paneHeaderRuleStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
-    return if (active)
-        .{ .dim = true }
-    else
-        .{ .fg = palette.color(.muted), .dim = true };
-}
+const paneSearchStyle = diff_surface_view.paneSearchStyle;
+const paneHeaderRuleStyle = diff_surface_view.paneHeaderRuleStyle;
 
 fn testContext(page: *const review_page.ReviewPageState, palette: theme.Palette, width: u16, height: u16) Context {
     const navigation: review_navigation.View = .{

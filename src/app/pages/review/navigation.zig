@@ -329,6 +329,11 @@ pub const View = struct {
         return self.bodyResolverAdapter();
     }
 
+    /// Builds the shared body view for one synchronous render adapter call.
+    pub fn diffSurfaceBodyView(self: View, adapter: *ReviewBodyResolver) diff_surface.navigation.BodyView {
+        return self.sharedBodyView(adapter);
+    }
+
     pub fn resolvedTarget(self: View) diff_surface.ResolvedTarget {
         var adapter = self.bodyResolverAdapter();
         return self.sharedBodyView(&adapter).resolvedTarget();

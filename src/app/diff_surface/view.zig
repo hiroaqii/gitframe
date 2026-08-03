@@ -13,6 +13,7 @@ const diff_surface = @import("../diff_surface.zig");
 const app_load_state = @import("../load_state.zig");
 const app_state = @import("../state.zig");
 const view_primitives = @import("../view_primitives.zig");
+const diff_render = @import("../../diff/render.zig");
 const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
 const file_search = @import("file_search.zig");
@@ -419,6 +420,333 @@ fn drawSidebarSeparator(surface: *chasen.Surface, sidebar_width: u16, palette: t
 
 fn shellSeparatorStyle(_: theme.Palette) chasen.TextStyle {
     return .{ .dim = true };
+}
+
+/// Synchronous page renderer for Review-only status rows. Compare passes null;
+/// the shared pane owns primary and resolver-projected diff bodies.
+pub const StatusOnlyRenderer = struct {
+    ctx: *anyopaque,
+    render_fn: *const fn (ctx: *anyopaque, surface: *chasen.Surface) anyerror!void,
+
+    pub fn render(self: StatusOnlyRenderer, surface: *chasen.Surface) !void {
+        return self.render_fn(self.ctx, surface);
+    }
+};
+
+/// Draw the selected shared diff body, delegating resolver-projected content
+/// and an optional page-only status row through synchronous capabilities.
+pub fn viewDiffPane(
+    surface: *chasen.Surface,
+    body: diff_surface.navigation.BodyView,
+    loaded: loaded_diff.LoadedDiff,
+    palette: theme.Palette,
+    status_only: ?StatusOnlyRenderer,
+) !void {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return;
+
+    if (status_only) |renderer| {
+        try renderer.render(surface);
+        return;
+    }
+
+    if (loaded.document.files.len == 0) {
+        _ = surface.borrowTextAt(0, 0, "No parsed files.", palette.style(.muted));
+        return;
+    }
+
+    const state = body.view.surface;
+    var diff_content = diffContentSurface(surface);
+    const active = state.viewer.sidebar_hidden or state.viewer.focus == .diff;
+    switch (body.resolvedTarget().kind) {
+        .none => return,
+        .inert => {
+            try body.renderProjectedBody(projectedBodyRenderArgs(&diff_content, body, palette, active));
+            drawPaneHeaderRule(surface, active, palette);
+            return;
+        },
+        .projected => try body.renderProjectedBody(projectedBodyRenderArgs(&diff_content, body, palette, active)),
+        .primary => {
+            const file_index = body.view.selectedFileIndex(&loaded) orelse return;
+            const file = loaded.document.files[file_index];
+            const mode = diff_render.effectiveMode(diff_render.bodyWidth(diff_content.size().width), state.viewer.display_mode);
+            try diff_render.renderFile(&diff_content, file, .{
+                .requested_mode = state.viewer.display_mode,
+                .scroll = state.viewer.diff_scroll,
+                .horizontal_scroll = state.viewer.diff_horizontal_scroll,
+                .pane_active = active,
+                .line_numbers = state.viewer.view_options.line_numbers,
+                .highlighted_hunk = body.selectedHunkIndex(),
+                .cursor_offset = body.visibleDiffCursorOffset(),
+                .hunk_stages = try body.hunkStagePresentation(surface.frameAllocator(), file_index),
+                .line_index = loaded.cachedRenderedLineIndex(file_index, mode),
+                .folded_hunks = loaded.foldedHunksForFile(file_index),
+                .palette = palette,
+                .syntax = .initDirect(&loaded.syntax_spans, file_index),
+                .selection = body.diffSelectionView(),
+                .header_selection = body.diffHeaderSelectionActive(),
+            });
+        },
+    }
+    drawDiffHeaderDetailRow(surface, state, active, palette);
+    drawSearchMatchMarker(surface, state, palette);
+}
+
+fn projectedBodyRenderArgs(surface: *chasen.Surface, body: diff_surface.navigation.BodyView, palette: theme.Palette, active: bool) diff_surface.RenderProjectedBodyArgs {
+    const state = body.view.surface;
+    return .{
+        .surface = surface,
+        .requested_mode = state.viewer.display_mode,
+        .scroll = state.viewer.diff_scroll,
+        .horizontal_scroll = state.viewer.diff_horizontal_scroll,
+        .pane_active = active,
+        .line_numbers = state.viewer.view_options.line_numbers,
+        .highlighted_hunk = body.selectedHunkIndex(),
+        .cursor_offset = body.visibleDiffCursorOffset(),
+        .palette = palette,
+        .selection = body.diffSelectionView(),
+        .header_selection = body.diffHeaderSelectionActive(),
+    };
+}
+
+test "diff pane evaluates resolver entries only for its selected body terminal" {
+    const test_support = @import("../test_support.zig");
+    const diff_selection = @import("../../diff/selection.zig");
+    const diff_parser = @import("../../diff/parser.zig");
+    const diff_view_model = @import("../../diff/view_model.zig");
+    const review_state = @import("../../review/state.zig");
+    const Fake = struct {
+        kind: diff_surface.ReducedBodyKind,
+        loaded: *const loaded_diff.LoadedDiff,
+        resolved: usize = 0,
+        hunk_stage: usize = 0,
+        generated: usize = 0,
+        displayed_file: usize = 0,
+        line_index: usize = 0,
+        unexpected: usize = 0,
+
+        fn from(ctx: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx));
+        }
+        fn resolvedTarget(ctx: *anyopaque) diff_surface.ResolvedTarget {
+            const self = from(ctx);
+            self.resolved += 1;
+            return .{
+                .kind = self.kind,
+                .line_count = 1,
+                .hunk_interaction = .unavailable,
+                .status_rows = 0,
+                .search_unavailable = null,
+                .search_unfold_policy = .suppressed,
+                .folded_hunks_source = .underlying_load,
+            };
+        }
+        fn hunkStagePresentation(ctx: *anyopaque, _: std.mem.Allocator, _: usize) anyerror!diff_render.HunkStagePresentation {
+            const self = from(ctx);
+            self.hunk_stage += 1;
+            return .all_unstaged;
+        }
+        fn contentToken(ctx: *anyopaque) ?diff_surface.ContentToken {
+            from(ctx).unexpected += 1;
+            return null;
+        }
+        fn renderProjectedBody(ctx: *anyopaque, _: diff_surface.RenderProjectedBodyArgs) anyerror!void {
+            from(ctx).unexpected += 1;
+        }
+        fn parsedSelectionTarget(ctx: *anyopaque, _: ?diff_selection.Identity) ?diff_surface.ParsedSelectionTarget {
+            from(ctx).unexpected += 1;
+            return null;
+        }
+        fn displayedDiffFile(ctx: *anyopaque) ?diff_parser.FileDiff {
+            const self = from(ctx);
+            self.displayed_file += 1;
+            return self.loaded.document.files[0];
+        }
+        fn displayedSearchTarget(ctx: *anyopaque, _: diff_render.DisplayMode) ?diff_surface.SearchTarget {
+            from(ctx).unexpected += 1;
+            return null;
+        }
+        fn displayedDiffLineIndex(ctx: *anyopaque, _: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
+            const self = from(ctx);
+            self.line_index += 1;
+            return null;
+        }
+        fn displayedDiffLineCount(ctx: *anyopaque) usize {
+            from(ctx).unexpected += 1;
+            return 0;
+        }
+        fn generatedBody(ctx: *anyopaque) ?diff_surface.GeneratedBody {
+            const self = from(ctx);
+            self.generated += 1;
+            return null;
+        }
+        fn displayedDiffHeaderTarget(ctx: *anyopaque, _: ?diff_selection.HeaderIdentity) ?diff_surface.DiffHeaderTarget {
+            from(ctx).unexpected += 1;
+            return null;
+        }
+
+        const vtable: diff_surface.BodyResolver.VTable = .{
+            .resolvedTarget = resolvedTarget,
+            .hunkStagePresentation = hunkStagePresentation,
+            .contentToken = contentToken,
+            .renderProjectedBody = renderProjectedBody,
+            .parsedSelectionTarget = parsedSelectionTarget,
+            .displayedDiffFile = displayedDiffFile,
+            .displayedSearchTarget = displayedSearchTarget,
+            .displayedDiffLineIndex = displayedDiffLineIndex,
+            .displayedDiffLineCount = displayedDiffLineCount,
+            .generatedBody = generatedBody,
+            .displayedDiffHeaderTarget = displayedDiffHeaderTarget,
+        };
+    };
+
+    const loaded = test_support.loadedDiffOne();
+    var activation: diff_surface.authority.Lifecycle = .{};
+    var status: app_state.StatusMessage = .{};
+    var load = test_support.loadState(loaded);
+    defer load.clearCurrent(null);
+    var viewer: diff_surface.ViewerState = .{};
+    var search: diff_surface.DiffSearchState = .{};
+    var search_state: file_search.State = .{};
+    var search_focus: diff_surface.Focus = .sidebar;
+    var revision: u64 = 0;
+    var display: app_state.ReviewDisplayState = .{};
+    var reviewed: review_state.Store = .{};
+    var order: file_tree.StableOrder = .{};
+    var order_scope: ?[]u8 = null;
+    var selection_owner: diff_selection.Owner = .none;
+    var completed: ?diff_surface.selection.CompletedSelection = null;
+    var source_revision: u64 = 0;
+    var pending_initial_selection = false;
+    const state: diff_surface.ReadSurface = .{
+        .activation = &activation,
+        .status = &status,
+        .load = &load,
+        .viewer = &viewer,
+        .search = &search,
+        .file_search = &search_state,
+        .file_search_return_focus = &search_focus,
+        .accepted_sidebar_revision = &revision,
+        .review_display = &display,
+        .reviewed_store = &reviewed,
+        .tree_order = &order,
+        .tree_order_scope = &order_scope,
+        .selection_owner = &selection_owner,
+        .completed_selection = &completed,
+        .source_session_revision = &source_revision,
+        .pending_initial_first_visible_selection = &pending_initial_selection,
+        .reload_anchor = null,
+        .live_drag_deferred_source = false,
+        .source = .unstaged,
+        .layout = .{ .width = 80, .height = 10 },
+    };
+    var fake: Fake = .{ .kind = .none, .loaded = &loaded };
+    const body: diff_surface.navigation.BodyView = .{
+        .view = .{ .surface = state, .repo_root = null },
+        .resolver = .{ .ctx = &fake, .vtable = &Fake.vtable },
+    };
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 10);
+    defer ts.deinit();
+
+    try viewDiffPane(&ts.surface, body, loaded, .default(), null);
+    try std.testing.expectEqual(@as(usize, 1), fake.resolved);
+    try std.testing.expectEqual(@as(usize, 0), fake.hunk_stage + fake.generated + fake.displayed_file + fake.line_index + fake.unexpected);
+
+    fake = .{ .kind = .primary, .loaded = &loaded };
+    try viewDiffPane(&ts.surface, body, loaded, .default(), null);
+    try std.testing.expectEqual(@as(usize, 2), fake.resolved);
+    try std.testing.expectEqual(@as(usize, 1), fake.hunk_stage);
+    try std.testing.expectEqual(@as(usize, 1), fake.generated);
+    try std.testing.expectEqual(@as(usize, 1), fake.displayed_file);
+    try std.testing.expectEqual(@as(usize, 1), fake.line_index);
+    try std.testing.expectEqual(@as(usize, 0), fake.unexpected);
+}
+
+fn drawDiffHeaderDetailRow(surface: *chasen.Surface, state: diff_surface.ReadSurface, active: bool, palette: theme.Palette) void {
+    const size = surface.size();
+    if (size.width == 0 or size.height <= 1) return;
+
+    surface.clear(.{ .col = 0, .row = 1, .width = size.width, .height = 1 });
+    if (!state.search.mode and state.search.query.len > 0) {
+        const label_col: u16 = 1;
+        const match_text = if (state.search.match_offset) |offset|
+            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ state.search.query.slice(), offset + 1 }) catch "search"
+        else
+            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{state.search.query.slice()}) catch "search";
+        draw.copyClippedTextAt(surface, label_col, 1, match_text, paneSearchStyle(active, palette)) catch {};
+        return;
+    }
+
+    if (state.search.mode) {
+        const label = "search: ";
+        const label_col: u16 = 1;
+        const style = paneSearchStyle(active, palette);
+        draw.copyClippedTextAt(surface, label_col, 1, label, style) catch {};
+        if (size.width > label_col + label.len) {
+            const input_col: u16 = label_col + @as(u16, @intCast(label.len));
+            drawInputLine(surface, input_col, 1, state.search.input.slice(), state.search.input.cursor, style) catch {};
+            view_primitives.showInputCursor(surface, input_col, 1, state.search.input.slice(), state.search.input.cursor);
+        }
+        return;
+    }
+
+    drawPaneHeaderRule(surface, active, palette);
+}
+
+pub fn drawInputLine(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, cursor: usize, style: chasen.TextStyle) !void {
+    const size = surface.size();
+    if (col >= size.width or row >= size.height) return;
+    const width = size.width - col;
+    try draw.copyClippedTextAt(surface, col, row, text[view_primitives.inputVisibleStart(text, cursor, width)..], style);
+}
+
+pub fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool, palette: theme.Palette) void {
+    const size = surface.size();
+    if (size.width == 0 or size.height <= 1) return;
+
+    for (0..size.width) |col| {
+        _ = surface.borrowTextAt(@intCast(col), 1, "─", paneHeaderRuleStyle(active, palette));
+    }
+}
+
+pub fn drawSearchMatchMarker(surface: *chasen.Surface, state: diff_surface.ReadSurface, palette: theme.Palette) void {
+    const match_offset = state.search.match_offset orelse return;
+    if (match_offset < state.viewer.diff_scroll) return;
+
+    const visible_offset = match_offset - state.viewer.diff_scroll;
+    const body_rows = diff_render.visibleBodyRows(surface.size().height);
+    if (visible_offset >= body_rows) return;
+
+    const row: u16 = @intCast(layout.diff_body_start_row + visible_offset);
+    _ = surface.borrowTextAt(0, row, "»", .{ .bold = true, .reverse = true, .fg = palette.color(.prompt) });
+}
+
+pub fn diffContentSurface(surface: *chasen.Surface) chasen.Surface {
+    const size = surface.size();
+    if (size.width <= layout.search_marker_gutter_width) {
+        return surface.child(.{ .col = 0, .row = 0, .width = size.width, .height = size.height });
+    }
+    return surface.child(.{
+        .col = layout.search_marker_gutter_width,
+        .row = 0,
+        .width = size.width - layout.search_marker_gutter_width,
+        .height = size.height,
+    });
+}
+
+pub fn paneSearchStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
+    return if (active)
+        palette.boldStyle(.prompt)
+    else
+        palette.style(.prompt);
+}
+
+pub fn paneHeaderRuleStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
+    return if (active)
+        .{ .dim = true }
+    else
+        .{ .fg = palette.color(.muted), .dim = true };
 }
 
 /// Draw a bounded file-search projection in the diff-pane position.
