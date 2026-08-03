@@ -1171,6 +1171,30 @@ pub const Controller = struct {
         return .{ .view = self.view() };
     }
 
+    pub const UpdateAdapter = struct {
+        navigation: Controller,
+        resolver: ReviewBodyResolver,
+
+        pub fn shared(self: *UpdateAdapter) diff_surface.update.Controller {
+            return .{
+                .navigation = self.navigation.sharedBodyController(&self.resolver),
+                .toggle_hunk_fold = .{ .ctx = self, .callback = toggleHunkFold },
+            };
+        }
+
+        fn toggleHunkFold(ctx: *anyopaque) void {
+            const self: *UpdateAdapter = @ptrCast(@alignCast(ctx));
+            self.navigation.toggleSelectedHunkFold();
+        }
+    };
+
+    pub fn updateAdapter(self: Controller) UpdateAdapter {
+        return .{
+            .navigation = self,
+            .resolver = self.bodyResolverAdapter(),
+        };
+    }
+
     pub fn view(self: Controller) View {
         return .{
             .page = self.page,

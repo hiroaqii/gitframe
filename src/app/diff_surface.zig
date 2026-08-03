@@ -28,6 +28,7 @@ pub const file_search = @import("diff_surface/file_search.zig");
 pub const layout = @import("diff_surface/layout.zig");
 pub const navigation = @import("diff_surface/navigation.zig");
 pub const selection = @import("diff_surface/selection.zig");
+pub const update = @import("diff_surface/update.zig");
 
 pub const Focus = enum {
     sidebar,
@@ -259,6 +260,7 @@ test {
     _ = layout;
     _ = navigation;
     _ = selection;
+    _ = update;
 
     const mutable_fields = std.meta.fields(DiffSurface);
     const read_fields = std.meta.fields(ReadSurface);
