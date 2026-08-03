@@ -233,6 +233,26 @@ pub const BodyView = struct {
         return self.resolver.displayedDiffLineIndex(mode);
     }
 
+    pub fn resolvedTarget(self: BodyView) diff_surface.ResolvedTarget {
+        return self.resolver.resolvedTarget();
+    }
+
+    pub fn currentContentToken(self: BodyView) ?diff_surface.ContentToken {
+        return self.resolver.contentToken();
+    }
+
+    pub fn displayedSearchTarget(self: BodyView, mode: diff_render.DisplayMode) ?diff_surface.SearchTarget {
+        return self.resolver.displayedSearchTarget(mode);
+    }
+
+    pub fn displayedDiffLineCount(self: BodyView) usize {
+        return self.resolver.displayedDiffLineCount();
+    }
+
+    pub fn hunkStagePresentation(self: BodyView, allocator: std.mem.Allocator, file_index: usize) !diff_render.HunkStagePresentation {
+        return self.resolver.hunkStagePresentation(allocator, file_index);
+    }
+
     pub fn diffSelectionView(self: BodyView) ?diff_selection.View {
         const drag = self.view.surface.selection_owner.activeDiff() orelse return null;
         switch (drag.identity) {
@@ -349,6 +369,167 @@ pub const BodyView = struct {
             else
                 pointForTextCell(0, offset, line, model_mode, region.text_cell +| self.view.surface.viewer.diff_horizontal_scroll) orelse return null,
         };
+    }
+
+    pub fn displayedGeneratedLineCount(self: BodyView) ?usize {
+        const generated = self.generatedBody() orelse return null;
+        return generated.source.rowCount();
+    }
+
+    pub fn visibleBodyTextMaxHorizontalScroll(self: BodyView) usize {
+        const mode = self.view.effectiveDisplayMode();
+        const visible_rows = self.view.diffVisibleRows();
+        if (visible_rows == 0) return 0;
+
+        const pane_width = self.view.diffPaneWidth();
+        if (self.generatedBody()) |body| {
+            const row_count = body.source.rowCount();
+            const first_row = @min(self.view.surface.viewer.diff_scroll, row_count);
+            const end_row = @min(first_row +| visible_rows, row_count);
+            var max_scroll: usize = 0;
+            for (first_row..end_row) |row_index| {
+                const line: diff_parser.DiffLine = .{
+                    .kind = .added,
+                    .text = body.source.lineBody(row_index) orelse continue,
+                    .new_line = @intCast(row_index + 1),
+                };
+                const body_row: diff_view_model.BodyRow = switch (mode) {
+                    .unified => .{ .unified_line = line },
+                    .side_by_side => .{ .side_by_side = .{ .paired = .{ .added = line } } },
+                };
+                max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(
+                    body_row,
+                    pane_width,
+                    self.view.surface.viewer.view_options.line_numbers,
+                ));
+            }
+            return max_scroll;
+        }
+
+        const file = self.displayedDiffFile() orelse return 0;
+        const line_index = self.displayedDiffLineIndex(mode);
+        var max_scroll: usize = 0;
+        var rows = if (line_index) |index|
+            diff_view_model.BodyRowIterator.initAtWithFolded(file, mode, index, self.view.surface.viewer.diff_scroll, self.selectedFoldedHunks())
+        else
+            diff_view_model.BodyRowIterator.initWithFolded(file, mode, self.selectedFoldedHunks());
+        var skipped: usize = if (line_index != null) self.view.surface.viewer.diff_scroll else 0;
+        var visible: usize = 0;
+        while (rows.next()) |body_row| {
+            if (skipped < self.view.surface.viewer.diff_scroll) {
+                skipped += 1;
+                continue;
+            }
+            if (visible >= visible_rows) break;
+            visible += 1;
+            max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(body_row, pane_width, self.view.surface.viewer.view_options.line_numbers));
+        }
+        return max_scroll;
+    }
+
+    pub fn selectedProjectionLineCount(self: BodyView) usize {
+        return self.resolvedTarget().line_count;
+    }
+
+    pub fn remapDiffScrollForModeChange(
+        self: BodyView,
+        old_mode: diff_render.DisplayMode,
+        new_mode: diff_render.DisplayMode,
+        old_scroll: usize,
+    ) usize {
+        if (old_mode == new_mode) return old_scroll;
+
+        const old_index = self.selectedFileLineIndex(old_mode);
+        const new_index = self.selectedFileLineIndex(new_mode);
+        if (old_index.lineCount() == 0 or new_index.lineCount() == 0) return 0;
+
+        const hunk_index = old_index.hunkIndexAtOffset(old_scroll) orelse {
+            return @min(old_scroll, new_index.lineCount() - 1);
+        };
+
+        const old_hunk_offset = old_index.hunkOffset(hunk_index);
+        const old_hunk_rows = old_index.hunkLineCount(hunk_index);
+        const new_hunk_offset = new_index.hunkOffset(hunk_index);
+        const new_hunk_rows = new_index.hunkLineCount(hunk_index);
+        if (old_hunk_rows == 0 or new_hunk_rows == 0) return @min(new_hunk_offset, new_index.lineCount() - 1);
+
+        const old_local = @min(old_scroll - old_hunk_offset, old_hunk_rows - 1);
+        const new_local = if (old_hunk_rows <= 1)
+            0
+        else
+            old_local * (new_hunk_rows - 1) / (old_hunk_rows - 1);
+        return @min(new_hunk_offset + new_local, new_index.lineCount() - 1);
+    }
+
+    pub fn unsupportedSearchMessage(self: BodyView) ?[]const u8 {
+        const reason = self.resolvedTarget().search_unavailable orelse return null;
+        return reason.message();
+    }
+
+    pub fn bodyAllowsHunkInteraction(self: BodyView) bool {
+        return self.hunkInteractionAvailability() == .available;
+    }
+
+    pub fn hunkInteractionAvailability(self: BodyView) diff_surface.HunkInteractionAvailability {
+        return self.resolvedTarget().hunk_interaction;
+    }
+
+    pub fn selectedFileLineIndex(self: BodyView, mode: diff_render.DisplayMode) diff_view_model.RenderedLineIndex {
+        if (self.resolvedTarget().kind == .inert) return .{ .mode = mode };
+        if (self.displayedDiffLineIndex(mode)) |index| return index;
+        const loaded = self.view.activeLoadedDiffConst() orelse return .{ .mode = mode };
+        const file_index = self.view.selectedFileIndex(loaded) orelse return .{ .mode = mode };
+        return loaded.renderedLineIndex(file_index, mode);
+    }
+
+    pub fn selectedFoldedHunks(self: BodyView) []const bool {
+        if (self.resolvedTarget().folded_hunks_source == .empty) return &.{};
+        const loaded = self.view.activeLoadedDiffConst() orelse return &.{};
+        const file_index = self.view.selectedFileIndex(loaded) orelse return &.{};
+        return loaded.foldedHunksForFile(file_index);
+    }
+
+    pub fn selectedHunkIndex(self: BodyView) ?usize {
+        if (!self.bodyAllowsHunkInteraction()) return null;
+        return self.view.rawSelectedHunkIndex();
+    }
+
+    pub fn selectedDiffCursorOffset(self: BodyView) ?usize {
+        if (self.displayedGeneratedLineCount()) |line_count| {
+            return switch (self.view.surface.viewer.diff_cursor) {
+                .metadata => |offset| if (offset < line_count) offset else null,
+                else => null,
+            };
+        }
+
+        const mode = self.view.effectiveDisplayMode();
+        const file = self.displayedDiffFile() orelse return null;
+        const index = self.displayedDiffLineIndex(mode) orelse self.view.selectedFileCachedLineIndex(mode);
+        return diff_view_model.renderedOffsetForCoordinate(file, mode, self.view.surface.viewer.diff_cursor, index);
+    }
+
+    pub fn selectedCoordinateAtOffset(self: BodyView, offset: usize) ?diff_view_model.BodyCoordinate {
+        if (self.displayedGeneratedLineCount()) |line_count| {
+            if (offset >= line_count) return null;
+            return .{ .metadata = offset };
+        }
+
+        const mode = self.view.effectiveDisplayMode();
+        const file = self.displayedDiffFile() orelse return null;
+        const index = self.displayedDiffLineIndex(mode) orelse self.view.selectedFileCachedLineIndex(mode);
+        return diff_view_model.coordinateAtOffset(file, mode, offset, self.selectedFoldedHunks(), index);
+    }
+
+    pub fn visibleDiffCursorOffset(self: BodyView) ?usize {
+        const offset = self.selectedDiffCursorOffset() orelse return null;
+        const visible_rows = self.view.diffVisibleRows();
+        if (offset < self.view.surface.viewer.diff_scroll) return null;
+        if (visible_rows == 0 or offset >= self.view.surface.viewer.diff_scroll + visible_rows) return null;
+        return offset;
+    }
+
+    pub fn diffCursorIsVisible(self: BodyView) bool {
+        return self.visibleDiffCursorOffset() != null;
     }
 };
 
