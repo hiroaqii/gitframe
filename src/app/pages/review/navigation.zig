@@ -996,6 +996,11 @@ pub const View = struct {
         return self.sharedBodyView(&adapter).bodyAllowsHunkInteraction();
     }
 
+    pub fn bodyAllowsHunkFold(self: View) bool {
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyView(&adapter).bodyAllowsHunkFold();
+    }
+
     pub fn hunkInteractionAvailability(self: View) HunkInteractionAvailability {
         var adapter = self.bodyResolverAdapter();
         return self.sharedBodyView(&adapter).hunkInteractionAvailability();
@@ -1316,9 +1321,10 @@ pub const Controller = struct {
     }
 
     pub fn toggleSelectedHunkFold(self: Controller) void {
-        if (!self.view().bodyAllowsHunkInteraction()) return;
-        if (self.view().activeCombinedProjection() != null) {
-            self.setStatus("hunk fold is unavailable for mixed staged/unstaged view", .{});
+        const target = self.view().resolvedTarget();
+        if (target.hunk_interaction != .available) return;
+        if (!diff_surface.navigation.resolvedTargetAllowsHunkFold(target)) {
+            self.setStatus("hunk fold is unavailable for projected view", .{});
             return;
         }
         var adapter = self.bodyResolverAdapter();
@@ -2035,6 +2041,108 @@ fn prepareStatusOnlyHorizontalScrollHarness(
     _ = harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, status_text);
     try harness.pages.review.git_status.replace("/repo", &status_bundle);
+}
+
+fn initProjectionHunkFoldHarness(allocator: std.mem.Allocator) !TestHarness {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer arena.deinit();
+    var loaded = app_test_support.loadedDiffOne();
+    loaded.collapsed_hunks = try arena.allocator().alloc(bool, loaded.document.totalHunks());
+    @memset(loaded.collapsed_hunks, false);
+    loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(arena.allocator(), loaded.document);
+
+    return TestHarness.init(.{
+        .load = app_test_support.loadStateWithArena(arena, loaded),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .diff_cursor = .{ .hunk_header = 0 },
+            .diff_scroll = 2,
+            .diff_horizontal_scroll = 3,
+        },
+        .search = .{
+            .match = .{ .coordinate = .{ .metadata = 0 } },
+            .match_offset = 0,
+        },
+    }, .{ .width = 100, .height = 12 });
+}
+
+fn installCachedHunkFoldProjection(
+    harness: *TestHarness,
+    allocator: std.mem.Allocator,
+) !void {
+    var cached_bundle = try app_load.buildLoadedBundle(
+        allocator,
+        displayed_body_horizontal_scroll_cached_patch,
+    );
+    errdefer cached_bundle.deinit();
+    var request = try review_projection.testing.cloneRequest(
+        allocator,
+        harness.pages.review.activation.currentIdentity().?,
+        1,
+        "/repo",
+        "a",
+        .cached_diff,
+        .unstaged,
+        harness.pages.review.source_session_revision,
+        harness.pages.review.status_snapshot_revision,
+    );
+    errdefer request.deinit(allocator);
+    harness.pages.review.review_projection.installReady(.{
+        .request = request,
+        .value = .{ .cached_diff = cached_bundle },
+    });
+}
+
+fn expectProjectionHunkFoldDenied(
+    harness: *TestHarness,
+    allocator: std.mem.Allocator,
+) !void {
+    const active = harness.controller().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
+    const folded_before = active.isHunkFolded(0, 0);
+    const unified_lines_before = active.renderedLineIndex(0, .unified).lineCount();
+    const unified_hunk_lines_before = active.renderedLineIndex(0, .unified).hunkLineCount(0);
+    const side_by_side_lines_before = active.renderedLineIndex(0, .side_by_side).lineCount();
+    const cursor_before = harness.pages.review.viewer.diff_cursor;
+    const scroll_before = harness.pages.review.viewer.diff_scroll;
+    const horizontal_scroll_before = harness.pages.review.viewer.diff_horizontal_scroll;
+    const search_before = harness.pages.review.search;
+
+    try std.testing.expectEqual(HunkInteractionAvailability.available, harness.view().hunkInteractionAvailability());
+    try std.testing.expect(harness.view().selectedHunkIndex() != null);
+    try std.testing.expect(!harness.view().bodyAllowsHunkFold());
+    try std.testing.expectEqual(@as(usize, 0), harness.view().selectedFoldedHunks().len);
+    var display_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer display_arena.deinit();
+    const display = (try harness.view().activeDiffDisplay(display_arena.allocator(), .unified)) orelse
+        return error.ExpectedActiveDiffDisplay;
+    try std.testing.expectEqual(@as(usize, 0), display.foldedHunks().len);
+
+    var controller = harness.controller();
+    var resolver = controller.bodyResolverAdapter();
+    controller.sharedBodyController(&resolver).toggleSelectedHunkFold();
+    try std.testing.expectEqual(folded_before, active.isHunkFolded(0, 0));
+    try std.testing.expectEqual(unified_lines_before, active.renderedLineIndex(0, .unified).lineCount());
+    try std.testing.expectEqual(unified_hunk_lines_before, active.renderedLineIndex(0, .unified).hunkLineCount(0));
+    try std.testing.expectEqual(side_by_side_lines_before, active.renderedLineIndex(0, .side_by_side).lineCount());
+    try std.testing.expectEqualDeep(cursor_before, harness.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(scroll_before, harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(horizontal_scroll_before, harness.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqualDeep(search_before, harness.pages.review.search);
+    try std.testing.expectEqualStrings("", harness.status.text());
+
+    harness.controller().toggleSelectedHunkFold();
+    try std.testing.expectEqual(folded_before, active.isHunkFolded(0, 0));
+    try std.testing.expectEqual(unified_lines_before, active.renderedLineIndex(0, .unified).lineCount());
+    try std.testing.expectEqual(unified_hunk_lines_before, active.renderedLineIndex(0, .unified).hunkLineCount(0));
+    try std.testing.expectEqual(side_by_side_lines_before, active.renderedLineIndex(0, .side_by_side).lineCount());
+    try std.testing.expectEqualDeep(cursor_before, harness.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(scroll_before, harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(horizontal_scroll_before, harness.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqualDeep(search_before, harness.pages.review.search);
+    try std.testing.expectEqualStrings(
+        "hunk fold is unavailable for projected view",
+        harness.status.text(),
+    );
 }
 
 fn expectResolverRenderContains(harness: *TestHarness, needle: []const u8) !void {
@@ -3663,7 +3771,43 @@ test "mode change keeps search near later matches" {
     try std.testing.expectEqual(@as(?usize, 7), app.pages.review.search.match_offset);
 }
 
-test "toggle selected hunk fold updates active rendered line cache" {
+test "projection hunk fold authority denies cached projection mutation" {
+    const allocator = std.testing.allocator;
+    var app = try initProjectionHunkFoldHarness(allocator);
+    try prepareStatusOnlyHorizontalScrollHarness(&app, allocator, "M  a\x00");
+    try installCachedHunkFoldProjection(&app, allocator);
+    defer app.pages.review.deinit(allocator);
+
+    try std.testing.expect(app.view().displayedReviewBody() == .cached);
+    try expectProjectionHunkFoldDenied(&app, allocator);
+}
+
+test "projection hunk fold authority denies combined projection mutation" {
+    const allocator = std.testing.allocator;
+    var app = try initProjectionHunkFoldHarness(allocator);
+    try prepareStatusOnlyHorizontalScrollHarness(&app, allocator, "MM a\x00");
+    try installCombinedHorizontalScrollProjection(&app, allocator);
+    defer app.pages.review.deinit(allocator);
+
+    try std.testing.expect(app.view().displayedReviewBody() == .combined);
+    try expectProjectionHunkFoldDenied(&app, allocator);
+}
+
+test "projection hunk fold authority denies retained staged-only projection mutation" {
+    const allocator = std.testing.allocator;
+    var app = try initProjectionHunkFoldHarness(allocator);
+    try prepareStatusOnlyHorizontalScrollHarness(&app, allocator, "MM a\x00");
+    try installCombinedHorizontalScrollProjection(&app, allocator);
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try app.pages.review.git_status.replace("/repo", &staged_status);
+    try retainCombinedHorizontalScrollProjection(&app, allocator);
+    defer app.pages.review.deinit(allocator);
+
+    try std.testing.expect(app.view().displayedReviewBody() == .retained_staged_only);
+    try expectProjectionHunkFoldDenied(&app, allocator);
+}
+
+test "projection hunk fold authority preserves primary fold behavior" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     const allocator = arena.allocator();
     var loaded = app_test_support.loadedDiffOne();
@@ -3674,21 +3818,39 @@ test "toggle selected hunk fold updates active rendered line cache" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
-            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
+            .viewer = .{ .diff_cursor = .{ .hunk_line = .{
+                .hunk_index = 0,
+                .line_index = 3,
+            } } },
         } },
         .terminal_size = .{ .width = 100, .height = 12 },
     };
     defer app.clearLoadedDiff();
 
+    try std.testing.expect(app.reviewNavigationView().bodyAllowsHunkFold());
     try std.testing.expectEqual(@as(usize, 10), app.reviewNavigationView().selectedFileLineIndex(.unified).lineCount());
-    app.reviewNavigation().toggleSelectedHunkFold();
+    var controller = app.controller();
+    var resolver = controller.bodyResolverAdapter();
+    controller.sharedBodyController(&resolver).toggleSelectedHunkFold();
 
     const active = app.reviewNavigation().activeLoadedDiff().?;
     try std.testing.expect(active.isHunkFolded(0, 0));
+    try std.testing.expectEqualDeep(
+        diff_view_model.BodyCoordinate{ .hunk_header = 0 },
+        app.pages.review.viewer.diff_cursor,
+    );
     try std.testing.expectEqual(@as(usize, 5), app.reviewNavigationView().selectedFileLineIndex(.unified).lineCount());
     try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .unified).hunkLineCount(0));
     try std.testing.expectEqual(@as(usize, 4), app.reviewNavigationView().selectedFileLineIndex(.side_by_side).lineCount());
     try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .side_by_side).hunkLineCount(0));
+
+    app.reviewNavigation().toggleSelectedHunkFold();
+    try std.testing.expect(!active.isHunkFolded(0, 0));
+    try std.testing.expectEqual(@as(usize, 10), app.reviewNavigationView().selectedFileLineIndex(.unified).lineCount());
+    try std.testing.expectEqual(@as(usize, 6), active.renderedLineIndex(0, .unified).hunkLineCount(0));
+    try std.testing.expectEqual(@as(usize, 8), app.reviewNavigationView().selectedFileLineIndex(.side_by_side).lineCount());
+    try std.testing.expectEqual(@as(usize, 5), active.renderedLineIndex(0, .side_by_side).hunkLineCount(0));
+    try std.testing.expectEqualStrings("", app.status.text());
 }
 
 test "search unfolds folded hunk body matches before setting offset" {
@@ -3717,7 +3879,7 @@ test "search unfolds folded hunk body matches before setting offset" {
     try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
 }
 
-test "retained staged-only search unfolds the underlying primary hunk" {
+test "projection hunk fold authority preserves retained staged-only search unfold" {
     const allocator = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(allocator);
     var loaded = app_test_support.loadedDiffOne();

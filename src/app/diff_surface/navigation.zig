@@ -29,6 +29,11 @@ const VerticalDirection = app_direction.Vertical;
 
 pub const ParsedSelectionTarget = diff_surface.body_resolver.ParsedSelectionTarget;
 
+pub fn resolvedTargetAllowsHunkFold(target: diff_surface.ResolvedTarget) bool {
+    return target.hunk_interaction == .available and
+        target.folded_hunks_source == .underlying_load;
+}
+
 pub const SelectionRegion = struct {
     side: diff_selection.Side,
     mode: diff_selection.Mode,
@@ -475,6 +480,11 @@ pub const BodyView = struct {
 
     pub fn bodyAllowsHunkInteraction(self: BodyView) bool {
         return self.hunkInteractionAvailability() == .available;
+    }
+
+    pub fn bodyAllowsHunkFold(self: BodyView) bool {
+        const target = self.resolvedTarget();
+        return resolvedTargetAllowsHunkFold(target);
     }
 
     pub fn hunkInteractionAvailability(self: BodyView) diff_surface.HunkInteractionAvailability {
@@ -1301,7 +1311,7 @@ pub const BodyController = struct {
     }
 
     pub fn toggleSelectedHunkFold(self: BodyController) void {
-        if (!self.view().bodyAllowsHunkInteraction()) return;
+        if (!self.view().bodyAllowsHunkFold()) return;
         const loaded = self.controller.activeLoadedDiff() orelse return;
         const file_index = self.controller.view().selectedFileIndex(loaded) orelse return;
         if (file_index >= loaded.document.files.len) return;
