@@ -30,11 +30,10 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
     const navigation_context = navigationView(app);
     var pane_adapter = DiffPaneAdapter{ .context = navigation_context, .palette = app.palette };
     const branch = try branchPresentation(app, surface.frameAllocator());
-    const empty_message: ?diff_surface.view.StateMessage = if (app.page.basis) |basis| .{
-        .title = try std.fmt.allocPrint(surface.frameAllocator(), "Up to date with {s}", .{basis.base.display_name}),
-        .body = try std.fmt.allocPrint(surface.frameAllocator(), "No commits are ahead of {s}.", .{basis.base.display_name}),
-        .hint = "Press m to choose another base or r to refresh.",
-    } else null;
+    const empty_message: ?diff_surface.view.StateMessage = if (app.page.basis) |basis|
+        try emptyStateMessage(surface.frameAllocator(), basis.base.display_name, basis.ahead_count)
+    else
+        null;
 
     if (!app.page.hasAcceptedDisplay() and (app.page.basis_failure != null or app.page.load_failure != null)) {
         return viewInitialFailure(app, surface);
@@ -207,9 +206,57 @@ fn firstLine(text: []const u8) []const u8 {
     return text;
 }
 
+fn emptyStateMessage(
+    allocator: std.mem.Allocator,
+    base_display_name: []const u8,
+    ahead_count: usize,
+) !diff_surface.view.StateMessage {
+    if (ahead_count == 0) return .{
+        .title = try std.fmt.allocPrint(allocator, "Up to date with {s}", .{base_display_name}),
+        .body = try std.fmt.allocPrint(allocator, "No commits are ahead of {s}.", .{base_display_name}),
+        .hint = "Press m to choose another base or r to refresh.",
+    };
+
+    return .{
+        .title = try std.fmt.allocPrint(allocator, "No file changes against {s}", .{base_display_name}),
+        .body = if (ahead_count == 1)
+            try std.fmt.allocPrint(allocator, "1 commit is ahead of {s}, but its net file diff is empty.", .{base_display_name})
+        else
+            try std.fmt.allocPrint(allocator, "{d} commits are ahead of {s}, but their net file diff is empty.", .{ ahead_count, base_display_name }),
+        .hint = "Press m to choose another base or r to refresh.",
+    };
+}
+
 fn listWindowStart(selected: usize, len: usize, rows: u16) usize {
     if (rows == 0 or len == 0) return 0;
     const visible: usize = @intCast(rows);
     if (len <= visible) return 0;
     return @min(selected -| (visible / 2), len - visible);
+}
+
+test "empty Compare state distinguishes zero ahead commits from an empty net file diff" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const message = try emptyStateMessage(arena.allocator(), "main", 0);
+    try std.testing.expectEqualStrings("Up to date with main", message.title);
+    try std.testing.expectEqualStrings("No commits are ahead of main.", message.body);
+}
+
+test "empty Compare state describes one ahead commit accurately" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const message = try emptyStateMessage(arena.allocator(), "main", 1);
+    try std.testing.expectEqualStrings("No file changes against main", message.title);
+    try std.testing.expectEqualStrings("1 commit is ahead of main, but its net file diff is empty.", message.body);
+}
+
+test "empty Compare state describes multiple ahead commits accurately" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const message = try emptyStateMessage(arena.allocator(), "origin/main", 3);
+    try std.testing.expectEqualStrings("No file changes against origin/main", message.title);
+    try std.testing.expectEqualStrings("3 commits are ahead of origin/main, but their net file diff is empty.", message.body);
 }
