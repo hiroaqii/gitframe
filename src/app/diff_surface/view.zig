@@ -601,7 +601,7 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
     };
 
     const loaded = test_support.loadedDiffOne();
-    var activation: diff_surface.authority.Lifecycle = .{};
+    var activation = diff_surface.authority.Lifecycle.init(.review);
     var status: app_state.StatusMessage = .{};
     var load = test_support.loadState(loaded);
     defer load.clearCurrent(null);

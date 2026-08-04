@@ -3,14 +3,14 @@ const std = @import("std");
 pub const Id = enum {
     review,
     repository,
-    history,
+    compare,
     config,
 
     pub fn label(self: Id) []const u8 {
         return switch (self) {
             .review => "Review",
             .repository => "Repository",
-            .history => "History",
+            .compare => "Compare",
             .config => "Config",
         };
     }
@@ -19,13 +19,13 @@ pub const Id = enum {
         return switch (self) {
             .review => "Working-tree review",
             .repository => "Repository browser is not initialized",
-            .history => "History browser is not initialized",
+            .compare => "Compare: not loaded",
             .config => "Configuration viewer is not initialized",
         };
     }
 };
 
-pub const all = [_]Id{ .review, .repository, .history, .config };
+pub const all = [_]Id{ .review, .repository, .compare, .config };
 
 /// Scheduling identity shared by every page-owned asynchronous read.
 ///
@@ -42,6 +42,15 @@ pub const RequestIdentity = struct {
         std.debug.assert(activation_id != 0);
         return .{
             .origin = .review,
+            .repo_epoch = repo_epoch,
+            .activation_id = activation_id,
+        };
+    }
+
+    pub fn compare(repo_epoch: u64, activation_id: u64) RequestIdentity {
+        std.debug.assert(activation_id != 0);
+        return .{
+            .origin = .compare,
             .repo_epoch = repo_epoch,
             .activation_id = activation_id,
         };
@@ -91,8 +100,16 @@ pub const LazyPlaceholder = struct {
 test "page vocabulary has stable visible order" {
     try std.testing.expectEqualStrings("Review", all[0].label());
     try std.testing.expectEqualStrings("Repository", all[1].label());
-    try std.testing.expectEqualStrings("History", all[2].label());
+    try std.testing.expectEqualStrings("Compare", all[2].label());
     try std.testing.expectEqualStrings("Config", all[3].label());
+}
+
+test "Compare request identity is distinct from Review" {
+    const review = RequestIdentity.review(3, 7);
+    const compare = RequestIdentity.compare(3, 7);
+    try std.testing.expectEqual(Id.review, review.origin);
+    try std.testing.expectEqual(Id.compare, compare.origin);
+    try std.testing.expect(review.origin != compare.origin);
 }
 
 test "placeholder is lazy" {

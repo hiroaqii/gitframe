@@ -121,7 +121,7 @@ test "transition policy is conservative and leaves same-page requests unchanged"
     try std.testing.expectEqual(Disposition.unchanged, disposition(.review, .review, .{ .git_action = true }));
     try std.testing.expectEqual(
         Disposition{ .blocked = .git_action },
-        disposition(.review, .history, .{ .git_action = true, .review_search = true }),
+        disposition(.review, .compare, .{ .git_action = true, .review_search = true }),
     );
     try std.testing.expectEqual(
         Disposition{ .blocked = .review_mouse_selection },
@@ -136,7 +136,7 @@ test "repository prompt modes block mouse initiated page transitions" {
     );
     try std.testing.expectEqual(
         Disposition{ .blocked = .repository_file_search },
-        disposition(.repository, .history, .{ .repository_file_search = true }),
+        disposition(.repository, .compare, .{ .repository_file_search = true }),
     );
 }
 

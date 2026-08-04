@@ -1003,6 +1003,21 @@ test "loadConfig accepts keymap overrides" {
     try std.testing.expect(loaded.value.keymap.get(.repo_picker).?.eql(.{ .shifted_ascii = .{ .lower = 'o', .upper = 'O' } }));
 }
 
+test "keymap rejects removed page_history and accepts page_compare" {
+    try std.testing.expectError(error.UnknownKey, parseConfigToml(
+        \\schema_version = 1
+        \\[keymap]
+        \\page_history = "3"
+    ));
+
+    const parsed = try parseConfigToml(
+        \\schema_version = 1
+        \\[keymap]
+        \\page_compare = "3"
+    );
+    try std.testing.expect(parsed.keymap.get(.page_compare).?.eql(.{ .plain_codepoint = '3' }));
+}
+
 test "loadConfig accepts external action definitions" {
     const allocator = std.testing.allocator;
     const path = "zig-cache/tmp/gitframe-actions-config.toml";

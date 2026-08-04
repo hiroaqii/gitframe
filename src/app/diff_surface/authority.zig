@@ -1,4 +1,4 @@
-//! Review action authority vocabulary introduced by Phase 9 A3.
+//! Shared diff-page action authority vocabulary introduced by Phase 9 A3.
 //!
 //! A3 derives this vector from the currently reachable Review state so existing
 //! action behavior remains unchanged. Phase 9 C will make activation identity and
@@ -107,17 +107,45 @@ pub const Member = enum {
     branch,
 };
 
-/// Persistent Review activation owner.
+/// The diff pages which may own this lifecycle.
+///
+/// Keeping this narrower than `page.Id` prevents Repository or Config request
+/// identities from being admitted accidentally.
+pub const Owner = enum {
+    review,
+    compare,
+
+    fn identity(self: Owner, repo_epoch: u64, activation_id: u64) page.RequestIdentity {
+        return switch (self) {
+            .review => page.RequestIdentity.review(repo_epoch, activation_id),
+            .compare => page.RequestIdentity.compare(repo_epoch, activation_id),
+        };
+    }
+
+    fn matches(self: Owner, origin: page.Id) bool {
+        return switch (self) {
+            .review => origin == .review,
+            .compare => origin == .compare,
+        };
+    }
+};
+
+/// Persistent Review or Compare activation owner.
 ///
 /// Retained documents and reload fingerprints live outside this value. Leaving
-/// Review therefore revokes action authority without destroying last-good
+/// the owning page therefore revokes action authority without destroying last-good
 /// display state. A completion may mutate a member only when both its repo
-/// epoch and activation id still identify the current visible activation.
+/// epoch, activation id, and page origin identify the current visible activation.
 pub const Lifecycle = struct {
+    owner: Owner,
     state: ActivationState = .inactive,
     next_activation_id: u64 = 0,
     revalidation_requested: ?u64 = null,
     action_terminal_revalidation_requested: ?u64 = null,
+
+    pub fn init(owner: Owner) Lifecycle {
+        return .{ .owner = owner };
+    }
 
     pub fn activate(
         self: *Lifecycle,
@@ -148,7 +176,7 @@ pub const Lifecycle = struct {
     pub fn currentIdentity(self: Lifecycle) ?page.RequestIdentity {
         return switch (self.state) {
             .inactive => null,
-            .active => |active| page.RequestIdentity.review(active.repo_epoch, active.activation_id),
+            .active => |active| self.owner.identity(active.repo_epoch, active.activation_id),
         };
     }
 
@@ -215,7 +243,7 @@ pub const Lifecycle = struct {
         member: Member,
         freshness: MemberFreshness,
     ) bool {
-        if (identity.origin != .review) return false;
+        if (!self.owner.matches(identity.origin)) return false;
         switch (self.state) {
             .inactive => return false,
             .active => |*active| {
@@ -226,8 +254,8 @@ pub const Lifecycle = struct {
         }
     }
 
-    pub fn acceptsRepoEpoch(_: Lifecycle, identity: page.RequestIdentity, repo_epoch: u64) bool {
-        return identity.origin == .review and identity.repo_epoch == repo_epoch;
+    pub fn acceptsRepoEpoch(self: Lifecycle, identity: page.RequestIdentity, repo_epoch: u64) bool {
+        return self.owner.matches(identity.origin) and identity.repo_epoch == repo_epoch;
     }
 
     fn memberPtr(vector: *MemberVector, member: Member) *MemberFreshness {
@@ -285,7 +313,7 @@ test "action requirements do not globally couple auxiliary members" {
 }
 
 test "lifecycle rejects completion from an older activation" {
-    var lifecycle: Lifecycle = .{};
+    var lifecycle = Lifecycle.init(.review);
     const first = lifecycle.activate(4, .pending, .pending, .pending);
     lifecycle.deactivate();
     const second = lifecycle.activate(4, .pending, .pending, .pending);
@@ -295,8 +323,30 @@ test "lifecycle rejects completion from an older activation" {
     try std.testing.expect(lifecycle.state.satisfiesAction(.read_diff));
 }
 
+test "lifecycle identity authority is isolated by diff page owner" {
+    var review = Lifecycle.init(.review);
+    const review_activation = review.activate(4, .pending, .pending, .pending);
+    const review_identity = review.currentIdentity().?;
+    const compare_for_review = page.RequestIdentity.compare(4, review_activation);
+    try std.testing.expectEqual(page.Id.review, review_identity.origin);
+    try std.testing.expect(review.finishMember(review_identity, .source, .fresh));
+    try std.testing.expect(!review.finishMember(compare_for_review, .source, .failed));
+    try std.testing.expect(review.acceptsRepoEpoch(review_identity, 4));
+    try std.testing.expect(!review.acceptsRepoEpoch(compare_for_review, 4));
+
+    var compare = Lifecycle.init(.compare);
+    const compare_activation = compare.activate(4, .pending, .unavailable, .unavailable);
+    const compare_identity = compare.currentIdentity().?;
+    const review_for_compare = page.RequestIdentity.review(4, compare_activation);
+    try std.testing.expectEqual(page.Id.compare, compare_identity.origin);
+    try std.testing.expect(compare.finishMember(compare_identity, .source, .immutable));
+    try std.testing.expect(!compare.finishMember(review_for_compare, .source, .failed));
+    try std.testing.expect(compare.acceptsRepoEpoch(compare_identity, 4));
+    try std.testing.expect(!compare.acceptsRepoEpoch(review_for_compare, 4));
+}
+
 test "queued revalidation belongs to the current activation" {
-    var lifecycle: Lifecycle = .{};
+    var lifecycle = Lifecycle.init(.review);
     _ = lifecycle.activate(2, .pending, .pending, .pending);
     lifecycle.queueRevalidation();
     try std.testing.expect(lifecycle.hasQueuedFullRevalidation());
@@ -313,7 +363,7 @@ test "queued revalidation belongs to the current activation" {
 }
 
 test "full and terminal revalidation consumption remain distinct" {
-    var lifecycle: Lifecycle = .{};
+    var lifecycle = Lifecycle.init(.review);
     const activation_id = lifecycle.activate(3, .fresh, .fresh, .fresh);
     lifecycle.queueRevalidation();
     lifecycle.queueActionTerminalRevalidation();

@@ -171,7 +171,7 @@ fn viewBody(app: Context, surface: *chasen.Surface) !void {
     return switch (app.active_page) {
         .review => review_view.view(app.review, surface),
         .repository => repository_page.view(app.repository, surface),
-        .history, .config => viewPlaceholderPage(app.active_page, app.repo_state.activeRoot() != null, app.theme, surface),
+        .compare, .config => viewPlaceholderPage(app.active_page, app.repo_state.activeRoot() != null, app.theme, surface),
     };
 }
 
@@ -210,7 +210,7 @@ fn viewPlaceholderPage(id: page.Id, has_repository: bool, palette: theme.Palette
     if (size.width == 0 or size.height == 0) return;
     const row = size.height / 2;
     draw.copyClippedTextAt(surface, 1, row, id.label(), palette.boldStyle(.accent)) catch {};
-    const description = if (!has_repository and (id == .repository or id == .history))
+    const description = if (!has_repository and (id == .repository or id == .compare))
         "Repository required"
     else
         id.placeholderDescription();
@@ -1213,7 +1213,7 @@ fn footerItems(app: Context, storage: *[8]ui.key_hint.Item, key_buffers: *[8][16
     if (app.active_page != .review) {
         appendFooterItem(app, storage, key_buffers, &len, .page_review, "review");
         appendFooterItem(app, storage, key_buffers, &len, .page_repository, "repo");
-        appendFooterItem(app, storage, key_buffers, &len, .page_history, "history");
+        appendFooterItem(app, storage, key_buffers, &len, .page_compare, "compare");
         appendFooterItem(app, storage, key_buffers, &len, .page_config, "config");
         appendFooterItem(app, storage, key_buffers, &len, .repo_picker, "repository");
         appendFooterItem(app, storage, key_buffers, &len, .reload, "reload");
@@ -1672,6 +1672,17 @@ test "page bar dispatch shows repository requirement for unavailable placeholder
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository required") != null);
 }
 
+test "Compare placeholder names its unloaded state when a repository is active" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(40, 7);
+    defer ts.deinit();
+
+    viewPlaceholderPage(.compare, true, .default(), &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Compare: not loaded") != null);
+}
+
 test "page bar renders labels above a full muted rule" {
     const palette = theme.Palette.default();
     var ts: chasen.testing.TestSurface = undefined;
@@ -1708,18 +1719,18 @@ test "compact page bar keeps only the active label and draws a rule when availab
     try two_rows.init(30, shell_layout.page_bar_rows);
     defer two_rows.deinit();
 
-    viewPageBar(.history, true, .default(), &two_rows.surface);
+    viewPageBar(.compare, true, .default(), &two_rows.surface);
     const snapshot = try two_rows.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, " History ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Compare ") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") == null);
     try two_rows.expectCellText(0, shell_layout.page_bar_rule_row, "─");
 
     var one_row: chasen.testing.TestSurface = undefined;
     try one_row.init(30, 1);
     defer one_row.deinit();
-    viewPageBar(.history, true, .default(), &one_row.surface);
-    try one_row.expectCellText(2, shell_layout.page_bar_label_row, "H");
+    viewPageBar(.compare, true, .default(), &one_row.surface);
+    try one_row.expectCellText(2, shell_layout.page_bar_label_row, "C");
     try std.testing.expect(one_row.surface.readCell(0, shell_layout.page_bar_rule_row) == null);
 }
 
@@ -1902,7 +1913,7 @@ const HelpSection = struct {
 const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .page_review }, .description = "Review page" },
     .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
-    .{ .key = .{ .action = .page_history }, .description = "History page" },
+    .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
     .{ .key = .{ .action = .page_config }, .description = "Config page" },
     .{ .key = .{ .text = "Tab" }, .description = "focus sidebar / diff" },
     .{ .key = .{ .action = .help }, .description = "open / close help" },
@@ -1924,7 +1935,7 @@ const help_global_items = [_]HelpItem{
 const help_placeholder_items = [_]HelpItem{
     .{ .key = .{ .action = .page_review }, .description = "Review page" },
     .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
-    .{ .key = .{ .action = .page_history }, .description = "History page" },
+    .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
     .{ .key = .{ .action = .page_config }, .description = "Config page" },
     .{ .key = .{ .action = .repo_picker }, .description = "switch repository" },
     .{ .key = .{ .action = .reload }, .description = "reload (not available on this page yet)" },

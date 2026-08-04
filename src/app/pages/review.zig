@@ -193,7 +193,7 @@ pub const DeferredProjectionApply = struct {
 };
 
 pub const ReviewPageState = struct {
-    activation: authority.Lifecycle = .{},
+    activation: authority.Lifecycle = .init(.review),
     repository_read_authority: repository_read_authority.ReviewRepositoryReadAuthority = .{},
     status: app_state.StatusMessage = .{},
     load: load_state.LoadRuntimeState = .{},

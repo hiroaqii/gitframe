@@ -12,6 +12,7 @@ const page = @import("app/page.zig");
 const page_link = @import("app/page_link.zig");
 const page_transition = @import("app/page_transition.zig");
 const app_shell_layout = @import("app/shell_layout.zig");
+const compare_page = @import("app/pages/compare.zig");
 const review_page = @import("app/pages/review.zig");
 const review_content = @import("app/pages/review/content.zig");
 const review_layout = @import("app/pages/review/layout.zig");
@@ -237,7 +238,7 @@ const RepoCommitOrigin = enum {
 const PageStates = struct {
     review: review_page.ReviewPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
-    history: page.LazyPlaceholder = .{},
+    compare: compare_page.ComparePageState = .{},
     config: page.LazyPlaceholder = .{},
 };
 
@@ -467,6 +468,7 @@ pub const App = struct {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.pages.review.deinit(deinit_ctx.allocator);
         self.pages.repository.deinit(deinit_ctx.allocator);
+        self.pages.compare.deinit(deinit_ctx.allocator);
         self.repo_state.deinit(deinit_ctx.allocator);
         self.commit_panel.deinit();
         self.repo_picker.deinit(deinit_ctx.allocator);
@@ -688,13 +690,15 @@ pub const App = struct {
                     }
                 },
                 .repository => self.pages.repository.requestReload(self.activeRepoRoot() != null),
-                .history, .config => self.status.set("reload is not available on this page yet", .{}),
+                .compare => self.pages.compare.status.set("Compare: not loaded", .{}),
+                .config => self.status.set("reload is not available on this page yet", .{}),
             },
             .auto_reload_tick => try self.autoReloadTick(ctx),
             .focus_lost => switch (self.active_page) {
                 .review => self.reviewNavigation().clearDiffSelection(),
                 .repository => self.pages.repository.cancelMouseOwner(),
-                .history, .config => {},
+                .compare => self.pages.compare.selection_owner = .none,
+                .config => {},
             },
             .git_action_spinner_tick => self.gitActionSpinnerTick(ctx),
             .quit => self.requestQuit(ctx),
@@ -1263,7 +1267,7 @@ pub const App = struct {
     fn activeDiffSelectionOwner(self: *const App) ?ActiveDiffSelectionOwner {
         return switch (self.active_page) {
             .review => .{ .review = &self.pages.review.selection_owner },
-            .repository, .history, .config => null,
+            .repository, .compare, .config => null,
         };
     }
 
@@ -1336,7 +1340,8 @@ pub const App = struct {
         return switch (self.active_page) {
             .review => &self.pages.review.status,
             .repository => &self.pages.repository.status,
-            .history, .config => null,
+            .compare => &self.pages.compare.status,
+            .config => null,
         };
     }
 
@@ -1513,6 +1518,7 @@ pub const App = struct {
             self.deactivateReviewForPageSwitch(self.allocator orelse ctx.allocator());
         }
         if (self.active_page == .repository) self.pages.repository.deactivate();
+        if (self.active_page == .compare) self.pages.compare.deactivate();
         self.active_page = target;
         switch (target) {
             .review => {
@@ -1520,7 +1526,7 @@ pub const App = struct {
                 try self.requestReviewRevalidation(ctx);
             },
             .repository => self.pages.repository.activate(self.repo_epoch, self.repo_state.activeIdentity()),
-            .history => self.pages.history.ensureInitialized(),
+            .compare => _ = self.pages.compare.activate(self.repo_epoch),
             .config => self.pages.config.ensureInitialized(),
         }
     }
@@ -4653,7 +4659,9 @@ pub const App = struct {
                     origin_page.activation_id == self.pages.review.activation.next_activation_id,
                 .repository => origin_page.repo_epoch == self.repo_epoch and
                     origin_page.activation_id == self.pages.repository.activation_id,
-                .history, .config => origin_page.repo_epoch == self.repo_epoch,
+                .compare => origin_page.repo_epoch == self.repo_epoch and
+                    origin_page.activation_id == self.pages.compare.activation.next_activation_id,
+                .config => origin_page.repo_epoch == self.repo_epoch,
             },
             .shell_surface => |origin_surface| switch (origin_surface.surface) {
                 .push_error => self.overlay.isPushError() and
@@ -4669,9 +4677,10 @@ pub const App = struct {
             .page => |origin_page| switch (origin_page.page_id) {
                 .review => self.setReviewStatus(fmt, args),
                 .repository => self.pages.repository.status.set(fmt, args),
-                // Later page owners replace these placeholders with their own
-                // diagnostic slots without changing the effect completion tag.
-                .history, .config => self.setStatus(fmt, args),
+                .compare => self.pages.compare.status.set(fmt, args),
+                // Config later replaces this placeholder with its own
+                // diagnostic slot without changing the effect completion tag.
+                .config => self.setStatus(fmt, args),
             },
             .shell_surface => self.setStatus(fmt, args),
         }
@@ -10369,7 +10378,7 @@ test "Repository branch App completion suppresses stale unchanged and inactive r
     var inactive_request = try app.pages.repository.prepareBranchRequest(allocator, root_path, &app.repo_state.root.?);
     defer inactive_request.deinit(allocator);
     app.pages.repository.deactivate();
-    app.active_page = .history;
+    app.active_page = .compare;
     app.redraw_plan = .{};
     try app.updateRepository(&ctx, .{ .branch_finished = .{
         .identity = inactive_request.identity,
@@ -11263,6 +11272,35 @@ test "keyboard and page bar mouse share the page switch transition" {
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
+test "page key 3 activates Compare without replacing retained Review state" {
+    var app: App = .{
+        .config = .{ .source = .stdin },
+        .pages = .{ .review = .{
+            .load = .{ .state = .{ .empty = .no_changes } },
+            .viewer = .{ .diff_scroll = 11 },
+        } },
+    };
+    _ = app.activateReview();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    const message = app.handleEvent(.{ .key_press = .{ .codepoint = '3' } }) orelse
+        return error.ExpectedComparePageSwitch;
+    try std.testing.expectEqual(App.Msg{ .switch_page = .compare }, message);
+    try app.update(message, &ctx);
+
+    try std.testing.expectEqual(page.Id.compare, app.active_page);
+    try std.testing.expect(app.pages.compare.activation.state == .active);
+    try std.testing.expectEqual(
+        page.Id.compare,
+        app.pages.compare.activation.currentIdentity().?.origin,
+    );
+    try std.testing.expect(app.pages.review.activation.state == .inactive);
+    try std.testing.expectEqual(@as(usize, 11), app.pages.review.viewer.diff_scroll);
+    try std.testing.expect(app.pages.review.load.state == .empty);
+    try std.testing.expect(!app.redraw_plan.resolvesToSkip());
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+}
+
 test "page bar rule is dead chrome in normal and compact layouts" {
     var app: App = .{ .terminal_size = .{ .width = 100, .height = 20 } };
     const normal = app.shellLayout();
@@ -11391,7 +11429,7 @@ test "repository selection slice B shell blocks transition and cancels on focus 
     try std.testing.expect(app.pages.repository.activeMouseOwner());
     try std.testing.expect(app.pages.repository.activeSourceRange());
 
-    try app.update(.{ .switch_page = .history }, &ctx);
+    try app.update(.{ .switch_page = .compare }, &ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.repository.activeSourceRange());
     try std.testing.expectEqualStrings("finish Repository mouse selection before switching pages", app.status.text());
@@ -11431,22 +11469,22 @@ test "repository source header SH5 page switch cancels header owner without weak
     try std.testing.expect(!app.pages.repository.activeSourceRange());
 
     app.overlay.openHelp();
-    try app.requestPageSwitch(&ctx, .history);
+    try app.requestPageSwitch(&ctx, .compare);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
     try std.testing.expectEqualStrings("close help before switching pages", app.status.text());
     app.overlay.close();
 
     app.pages.repository.selection_owner = .{ .source_header = repositoryHeaderSelectionForTest() };
-    try app.requestPageSwitch(&ctx, .history);
-    try std.testing.expectEqual(page.Id.history, app.active_page);
+    try app.requestPageSwitch(&ctx, .compare);
+    try std.testing.expectEqual(page.Id.compare, app.active_page);
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
 
     app.active_page = .repository;
     app.pages.repository.active = true;
     app.pages.repository.selection_owner = .{ .source = repositoryLiveSelectionForTest() };
     app.status.clear();
-    try app.requestPageSwitch(&ctx, .history);
+    try app.requestPageSwitch(&ctx, .compare);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.repository.activeSourceRange());
     try std.testing.expectEqualStrings("finish Repository mouse selection before switching pages", app.status.text());
@@ -11561,13 +11599,13 @@ test "page transition blocker leaves page and Review state unchanged" {
     const activation_id = app.activateReview();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app.update(.{ .switch_page = .history }, &ctx);
+    try app.update(.{ .switch_page = .compare }, &ctx);
 
     try std.testing.expectEqual(page.Id.review, app.active_page);
     try std.testing.expect(app.pages.review.search.mode);
     try std.testing.expectEqual(activation_id, app.pages.review.activation.state.active.activation_id);
     try std.testing.expectEqualStrings("finish search before switching pages", app.status.text());
-    try std.testing.expect(!app.pages.history.initialized);
+    try std.testing.expect(app.pages.compare.activation.state == .inactive);
 }
 
 test "review repository transition E2a commit selects exact retained Review path" {
@@ -12186,7 +12224,7 @@ test "review repository transition E3b2 inactive Repository retains contextual s
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    try app.requestPageSwitch(&ctx, .history);
+    try app.requestPageSwitch(&ctx, .compare);
     try std.testing.expect(!app.pages.repository.active);
     try std.testing.expectEqualStrings("b", app.pages.repository.selected_path.?);
 
@@ -16224,7 +16262,7 @@ fn canonicalPageTransitionMessage(
             .codepoint = switch (target) {
                 .review => '1',
                 .repository => '2',
-                .history => '3',
+                .compare => '3',
                 .config => '4',
             },
         } }),
@@ -16577,7 +16615,7 @@ test "Review canonical publication page transition retires generic page exits" {
     var roots = try TestRepoPair.init();
     defer roots.deinit();
 
-    for ([_]page.Id{ .history, .config }, 0..) |target, index| {
+    for ([_]page.Id{ .compare, .config }, 0..) |target, index| {
         var app = try canonicalPublicationTestApp(allocator, roots.a);
         defer app.pages.review.deinit(allocator);
         defer app.pages.repository.deinit(allocator);

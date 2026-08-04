@@ -158,7 +158,7 @@ fn pageForKey(effective: keymap.Effective, key: chasen.Key) ?page.Id {
     const bindings = [_]struct { action: keymap.PublicAction, id: page.Id }{
         .{ .action = .page_review, .id = .review },
         .{ .action = .page_repository, .id = .repository },
-        .{ .action = .page_history, .id = .history },
+        .{ .action = .page_compare, .id = .compare },
         .{ .action = .page_config, .id = .config },
     };
     for (bindings) |binding| {

@@ -81,7 +81,7 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
 
 fn publicActionToMsg(action: keymap.PublicAction) ?Msg {
     return switch (action) {
-        .page_review, .page_repository, .page_history, .page_config => null,
+        .page_review, .page_repository, .page_compare, .page_config => null,
         .help, .reload => null,
         .search => .enter_search,
         .file_search => .enter_file_search,
