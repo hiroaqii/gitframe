@@ -13,6 +13,10 @@ const page_link = @import("app/page_link.zig");
 const page_transition = @import("app/page_transition.zig");
 const app_shell_layout = @import("app/shell_layout.zig");
 const compare_page = @import("app/pages/compare.zig");
+const compare_input = @import("app/pages/compare/input.zig");
+const compare_navigation = @import("app/pages/compare/navigation.zig");
+const diff_surface = @import("app/diff_surface.zig");
+const diff_basis = @import("app/diff_basis.zig");
 const review_page = @import("app/pages/review.zig");
 const review_content = @import("app/pages/review/content.zig");
 const review_layout = @import("app/pages/review/layout.zig");
@@ -106,6 +110,7 @@ const BranchListLoadTask = app_load.BranchListLoadTask(App.Msg);
 const CompareLoadFinished = app_load.CompareLoadFinished;
 const CompareLoadTask = app_load.CompareLoadTask(App.Msg);
 const CompareBranchListFinished = app_load.CompareBranchListFinished;
+const CompareBranchListLoadTask = app_load.CompareBranchListLoadTask(App.Msg);
 const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
 const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
@@ -138,15 +143,16 @@ const MousePane = enum {
 
 const ActiveDiffSelectionOwner = union(enum) {
     review: *const diff_selection.Owner,
+    compare: *const diff_selection.Owner,
 
     fn active(self: ActiveDiffSelectionOwner) bool {
         return switch (self) {
-            .review => |owner| owner.activeMouseSelection(),
+            inline .review, .compare => |owner| owner.activeMouseSelection(),
         };
     }
 };
 
-const MousePoint = review_navigation.MousePoint;
+const MousePoint = diff_surface.MousePoint;
 
 const LoadFinishedMsg = app_load.ReadFinished;
 
@@ -349,6 +355,7 @@ pub const App = struct {
         push_inspection_finished: app_push_retry.Finished,
         clipboard_copy_finished: ClipboardCopyFinished,
         review: review_message.Msg,
+        compare: compare_input.Msg,
         repository: repository_page.Msg,
         cancel_commit_panel,
         submit_commit_panel,
@@ -575,9 +582,15 @@ pub const App = struct {
                 // borrow before changing layout, then drain deferred owners at
                 // the common post-update boundary below.
                 self.reviewNavigation().clearDiffSelection();
+                self.pages.compare.selection_owner = .none;
                 self.pages.repository.cancelMouseOwner();
                 const previous_width = self.reviewNavigationView().diffPaneWidth();
                 const previous_mode = self.reviewNavigationView().effectiveDisplayMode();
+                const previous_compare_view = self.compareNavigationView();
+                var previous_compare_adapter = previous_compare_view.resolver();
+                const previous_compare_body = previous_compare_view.bodyView(&previous_compare_adapter);
+                const previous_compare_width = previous_compare_body.view.diffPaneWidth();
+                const previous_compare_mode = previous_compare_body.view.effectiveDisplayMode();
                 self.terminal_size = size;
                 self.reviewNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
                 if (previous_mode != self.reviewNavigationView().effectiveDisplayMode()) self.reviewNavigation().clearDiffSelection();
@@ -586,6 +599,18 @@ pub const App = struct {
                 self.reviewNavigation().updateSearchMatchOffset();
                 self.reviewNavigation().scrollSearchMatchIntoView();
                 self.reviewNavigation().clampDiffNavigation();
+                const compare_controller = self.compareNavigation();
+                var compare_adapter = compare_controller.updateAdapter();
+                var compare_body = compare_adapter.bodyController();
+                compare_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_compare_width);
+                if (previous_compare_mode != compare_body.controller.view().effectiveDisplayMode()) {
+                    compare_body.controller.clearDiffSelection();
+                }
+                compare_body.controller.clampSidebarHorizontalScroll();
+                compare_body.clampDiffNavigationKeepingHunkVisible();
+                compare_body.updateSearchMatchOffset();
+                compare_body.controller.scrollSearchMatchIntoView();
+                compare_body.clampDiffNavigation();
                 self.pages.repository.clampForBodySize(self.shellLayout().bodySize());
                 self.clampHelpScroll();
                 self.clampPushErrorScroll();
@@ -595,6 +620,7 @@ pub const App = struct {
             .push_inspection_finished => |finished| try self.finishPushInspection(ctx, finished),
             .clipboard_copy_finished => |finished| self.finishClipboardCopy(ctx, finished),
             .review => |review_msg| try self.updateReview(ctx, review_msg),
+            .compare => |compare_msg| try self.updateCompare(ctx, compare_msg),
             .repository => |repository_msg| try self.updateRepository(ctx, repository_msg),
             .cancel_commit_panel => self.closeCommitPanel(),
             .submit_commit_panel => try self.submitCommitPanel(ctx),
@@ -635,6 +661,7 @@ pub const App = struct {
             .repo_picker_move_right => self.moveRepoPickerCursorRight(),
             .open_help => {
                 if (self.active_page == .review) self.reviewNavigation().clearDiffSelection();
+                if (self.active_page == .compare) self.pages.compare.selection_owner = .none;
                 if (self.active_page == .repository) self.pages.repository.cancelMouseOwner();
                 self.overlay.openHelpForPage(self.active_page);
             },
@@ -693,7 +720,7 @@ pub const App = struct {
                     }
                 },
                 .repository => self.pages.repository.requestReload(self.activeRepoRoot() != null),
-                .compare => self.pages.compare.status.set("Compare: not loaded", .{}),
+                .compare => try self.startCompareRefresh(ctx),
                 .config => self.status.set("reload is not available on this page yet", .{}),
             },
             .auto_reload_tick => try self.autoReloadTick(ctx),
@@ -714,6 +741,11 @@ pub const App = struct {
         }
         if (!self.pages.review.selection_owner.activeMouseSelection() and self.pages.review.deferred_projection_apply != null) {
             if (try self.reviewReload().applyDeferredProjection(ctx.allocator())) self.redraw_plan.requireFrame();
+        }
+        if (!self.pages.compare.selection_owner.activeMouseSelection() and self.pages.compare.deferred_load_apply != null) {
+            const deferred = self.pages.compare.deferred_load_apply.?;
+            self.pages.compare.deferred_load_apply = null;
+            try self.finishCompareLoad(ctx, deferred.finished);
         }
         try self.maybeStartQueuedReviewRevalidation(ctx);
         try self.maybeStartRepositoryManifest(ctx);
@@ -776,6 +808,163 @@ pub const App = struct {
             .copy_diff_header_path => |selection| self.copyDiffHeaderPath(ctx, selection),
             .finish_review => |decision| try self.finishReview(ctx, decision),
         }
+    }
+
+    fn compareNavigation(self: *App) compare_navigation.Controller {
+        const body_size = self.shellLayout().bodySize();
+        return .{
+            .page = &self.pages.compare,
+            .repo_root = self.activeRepoRoot(),
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.repo_state.activeIdentity(),
+            .layout = .{ .width = body_size.width, .height = body_size.height },
+        };
+    }
+
+    fn compareNavigationView(self: *const App) compare_navigation.View {
+        const body_size = self.shellLayout().bodySize();
+        return .{
+            .page = &self.pages.compare,
+            .repo_root = self.activeRepoRoot(),
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.repo_state.activeIdentity(),
+            .layout = .{ .width = body_size.width, .height = body_size.height },
+        };
+    }
+
+    fn updateCompare(self: *App, ctx: *chasen.Ctx(Msg), msg: compare_input.Msg) !void {
+        switch (msg) {
+            .shared => |shared_msg| {
+                const navigation_controller = self.compareNavigation();
+                var update_adapter = navigation_controller.updateAdapter();
+                var page_update = try update_adapter.shared().apply(ctx.allocator(), shared_msg);
+                defer page_update.deinit(ctx.allocator());
+                if (page_update.takeEffect()) |taken| {
+                    var effect = taken;
+                    defer effect.deinit(ctx.allocator());
+                    switch (effect) {
+                        .copy_diff_selection => |text| self.queueClipboardCopy(ctx, .{
+                            .origin = .{ .page = self.comparePageEffectOrigin() },
+                            .label = "diff selection",
+                            .text = text,
+                        }),
+                        .copy_diff_header_path => |selection| {
+                            const navigation_view = navigation_controller.view();
+                            var content_adapter = navigation_view.resolver();
+                            const path = navigation_view.contentView(&content_adapter).diffHeaderPath(selection) orelse return;
+                            self.queueClipboardCopy(ctx, .{
+                                .origin = .{ .page = self.comparePageEffectOrigin() },
+                                .label = "file path",
+                                .text = path,
+                            });
+                        },
+                    }
+                }
+            },
+            .open_base_picker => try self.startCompareBasePicker(ctx),
+            .close_base_picker => self.pages.compare.closeBasePicker(ctx.allocator()),
+            .base_picker_previous => self.pages.compare.base_picker.moveSelection(-1),
+            .base_picker_next => self.pages.compare.base_picker.moveSelection(1),
+            .choose_base => {
+                if (try self.pages.compare.chooseBasePickerTarget(ctx.allocator())) {
+                    try self.startCompareRefresh(ctx);
+                }
+            },
+            .copy_current_line => self.copyCompareCurrentLine(ctx),
+            .copy_current_hunk => try self.copyCompareCurrentHunk(ctx),
+            .branch_switch_unavailable => self.pages.compare.status.set("branch switching is not available in Compare", .{}),
+        }
+    }
+
+    fn copyCompareCurrentLine(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        const navigation_view = self.compareNavigationView();
+        var adapter = navigation_view.resolver();
+        const text = navigation_view.contentView(&adapter).currentLineCopyText() orelse {
+            self.pages.compare.status.set("no diff line selected", .{});
+            return;
+        };
+        self.queueClipboardCopy(ctx, .{
+            .origin = .{ .page = self.comparePageEffectOrigin() },
+            .label = "current line",
+            .text = text,
+        });
+    }
+
+    fn copyCompareCurrentHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const navigation_view = self.compareNavigationView();
+        var adapter = navigation_view.resolver();
+        var content = try navigation_view.contentView(&adapter).selectedHunkCopyText(ctx.allocator());
+        defer content.deinit(ctx.allocator());
+        switch (content) {
+            .ready => |text| self.queueClipboardCopy(ctx, .{
+                .origin = .{ .page = self.comparePageEffectOrigin() },
+                .label = "current hunk",
+                .text = text,
+            }),
+            .no_hunk => self.pages.compare.status.set("no hunk selected", .{}),
+            .no_new_side => self.pages.compare.status.set("no new-side text in selected hunk", .{}),
+        }
+    }
+
+    fn startCompareRefresh(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const capability = self.repo_state.activeCapability() orelse {
+            self.pages.compare.markNoRepository(ctx.allocator());
+            return;
+        };
+        const navigation_view = self.compareNavigationView();
+        const anchor = try navigation_view.captureAnchor(ctx.allocator());
+        self.pages.compare.replaceRefreshAnchor(ctx.allocator(), anchor);
+        self.pages.compare.clearRefreshFailure(ctx.allocator());
+
+        const request = self.pages.compare.beginRefresh() orelse return;
+        const task = ctx.allocator().create(CompareLoadTask) catch |err| {
+            self.pages.compare.failRefresh(ctx.allocator(), request, self.repo_epoch, "Could not allocate Compare load task");
+            return err;
+        };
+        task.* = CompareLoadTask.init(
+            request.identity,
+            request.generation,
+            capability.*,
+            self.pages.compare.base_target,
+            self.env_map,
+            ctx.allocator(),
+        ) catch |err| {
+            ctx.allocator().destroy(task);
+            self.pages.compare.failRefresh(ctx.allocator(), request, self.repo_epoch, "Could not prepare Compare load task");
+            return err;
+        };
+        ctx.task().spawnWith(.{ .ctx = task, .run = CompareLoadTask.run, .failed = CompareLoadTask.failed }) catch |err| {
+            task.destroy(ctx.allocator());
+            self.pages.compare.failRefresh(ctx.allocator(), request, self.repo_epoch, "Could not start Compare load task");
+            return err;
+        };
+    }
+
+    fn startCompareBasePicker(self: *App, ctx: *chasen.Ctx(Msg)) !void {
+        const request = self.pages.compare.beginBasePicker(ctx.allocator()) orelse return;
+        const capability = self.repo_state.activeCapability() orelse {
+            self.pages.compare.base_picker.markFailure(ctx.allocator(), "Compare base picker requires a repository");
+            return;
+        };
+        const task = ctx.allocator().create(CompareBranchListLoadTask) catch |err| {
+            self.pages.compare.base_picker.markFailure(ctx.allocator(), "Could not allocate Compare base list task");
+            return err;
+        };
+        task.* = CompareBranchListLoadTask.init(
+            request.identity,
+            request.generation,
+            capability.*,
+            self.env_map,
+        ) catch |err| {
+            ctx.allocator().destroy(task);
+            self.pages.compare.base_picker.markFailure(ctx.allocator(), "Could not prepare Compare base list task");
+            return err;
+        };
+        ctx.task().spawnWith(.{ .ctx = task, .run = CompareBranchListLoadTask.run, .failed = CompareBranchListLoadTask.failed }) catch |err| {
+            task.destroy(ctx.allocator());
+            self.pages.compare.base_picker.markFailure(ctx.allocator(), "Could not start Compare base list task");
+            return err;
+        };
     }
 
     fn updateRepository(self: *App, ctx: *chasen.Ctx(Msg), msg: repository_page.Msg) !void {
@@ -1013,12 +1202,61 @@ pub const App = struct {
     fn finishCompareLoad(self: *App, ctx: *chasen.Ctx(Msg), result: CompareLoadFinished) !void {
         var finished = result;
         defer finished.deinit(ctx.allocator());
-        _ = try self.pages.compare.applyLoadFinished(
+        if (self.pages.compare.selection_owner.activeMouseSelection() and
+            self.pages.compare.acceptsFinished(self.repo_epoch, finished))
+        {
+            self.pages.compare.replaceDeferredLoad(ctx.allocator(), finished);
+            finished.result = .empty;
+            return;
+        }
+
+        const outcome = self.pages.compare.applyLoadFinished(
             ctx.allocator(),
             self.repo_epoch,
             self.activeRepoRoot(),
             &finished,
-        );
+        ) catch |err| {
+            self.pages.compare.failRefresh(ctx.allocator(), .{
+                .identity = finished.identity,
+                .generation = finished.generation,
+            }, self.repo_epoch, "Could not apply Compare load");
+            if (self.pages.compare.takeRefreshAnchor()) |anchor_value| {
+                var anchor = anchor_value;
+                anchor.deinit(ctx.allocator());
+            }
+            return err;
+        };
+        if (outcome == .stale) {
+            self.redraw_plan.requestSkip();
+            return;
+        }
+        if (outcome != .loaded) {
+            if (self.pages.compare.takeRefreshAnchor()) |anchor_value| {
+                var anchor = anchor_value;
+                anchor.deinit(ctx.allocator());
+            }
+            return;
+        }
+
+        const navigation_controller = self.compareNavigation();
+        var update_adapter = navigation_controller.updateAdapter();
+        var body = update_adapter.bodyController();
+        if (body.controller.activeLoadedDiff()) |loaded| {
+            if (self.pages.compare.takeRefreshAnchor()) |anchor_value| {
+                var anchor = anchor_value;
+                defer anchor.deinit(ctx.allocator());
+                _ = body.restoreReloadAnchor(loaded, &anchor);
+            } else {
+                body.controller.syncSidebarNodeToSelectedFile(loaded);
+                body.initializeDiffCursorForSelectedFile();
+                body.clampDiffNavigation();
+                body.refreshSearchForSelectedFile();
+            }
+            body.controller.rebuildFileSearchProjection(ctx.allocator());
+        } else if (self.pages.compare.takeRefreshAnchor()) |anchor_value| {
+            var anchor = anchor_value;
+            anchor.deinit(ctx.allocator());
+        }
     }
 
     fn finishCompareBranchList(self: *App, ctx: *chasen.Ctx(Msg), result: CompareBranchListFinished) void {
@@ -1055,6 +1293,7 @@ pub const App = struct {
         if (msgKeepsEphemeralStatus(msg)) return;
         self.status.clearIfEphemeral();
         if (self.active_page == .review) self.pages.review.status.clearIfEphemeral();
+        if (self.active_page == .compare) self.pages.compare.status.clearIfEphemeral();
         if (self.active_page == .repository) self.pages.repository.status.clearIfEphemeral();
     }
 
@@ -1198,6 +1437,11 @@ pub const App = struct {
                     .release => return .{ .review = .{ .mouse_diff_release = self.bodyMousePoint(mouse) } },
                     else => {},
                 },
+                .compare => switch (mouse.type) {
+                    .drag => return .{ .compare = .{ .shared = .{ .mouse_diff_drag = self.bodyMousePoint(mouse) } } },
+                    .release => return .{ .compare = .{ .shared = .{ .mouse_diff_release = self.bodyMousePoint(mouse) } } },
+                    else => {},
+                },
             };
         }
         if (self.pages.repository.activeMouseOwner()) {
@@ -1219,6 +1463,7 @@ pub const App = struct {
         }
 
         if ((self.active_page == .review and (self.pages.review.search.mode or self.pages.review.file_search.mode)) or
+            (self.active_page == .compare and (self.pages.compare.search.mode or self.pages.compare.file_search.mode or self.pages.compare.base_picker.open)) or
             (self.active_page == .repository and (self.pages.repository.source_search.mode or self.pages.repository.file_search.mode)) or
             self.commit_panel.is_open or self.repo_picker.mode) return null;
         if (mouse.type != .press) return null;
@@ -1274,6 +1519,20 @@ pub const App = struct {
             ) orelse return null;
             return .{ .repository = repository_msg };
         }
+        if (self.active_page == .compare) {
+            const pane = self.compareMousePane(mouse) orelse return null;
+            return switch (mouse.button) {
+                .left => switch (pane) {
+                    .sidebar => .{ .compare = .{ .shared = self.compareSidebarClickToMsg(mouse) } },
+                    .diff => .{ .compare = .{ .shared = .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null } } },
+                },
+                .wheel_up => .{ .compare = .{ .shared = if (pane == .sidebar) .mouse_sidebar_wheel_up else .mouse_diff_wheel_up } },
+                .wheel_down => .{ .compare = .{ .shared = if (pane == .sidebar) .mouse_sidebar_wheel_down else .mouse_diff_wheel_down } },
+                .wheel_left => if (pane == .diff) .{ .compare = .{ .shared = .mouse_diff_wheel_left } } else null,
+                .wheel_right => if (pane == .diff) .{ .compare = .{ .shared = .mouse_diff_wheel_right } } else null,
+                else => null,
+            };
+        }
         if (self.active_page != .review) return null;
 
         const pane = self.mousePane(mouse) orelse return null;
@@ -1305,8 +1564,42 @@ pub const App = struct {
     fn activeDiffSelectionOwner(self: *const App) ?ActiveDiffSelectionOwner {
         return switch (self.active_page) {
             .review => .{ .review = &self.pages.review.selection_owner },
-            .repository, .compare, .config => null,
+            .compare => .{ .compare = &self.pages.compare.selection_owner },
+            .repository, .config => null,
         };
+    }
+
+    fn compareMousePane(self: *const App, mouse: anytype) ?MousePane {
+        const body_size = self.shellLayout().bodySize();
+        const navigation_view: compare_navigation.View = .{
+            .page = &self.pages.compare,
+            .repo_root = self.activeRepoRoot(),
+            .repo_epoch = self.repo_epoch,
+            .root_identity = self.repo_state.activeIdentity(),
+            .layout = .{ .width = body_size.width, .height = body_size.height },
+        };
+        _ = navigation_view.view().activeLoadedDiffConst() orelse return null;
+        const point = self.bodyMousePoint(mouse) orelse return null;
+        const size = self.layoutSize();
+        if (self.pages.compare.viewer.sidebar_hidden) return .diff;
+        const sidebar_width = sidebarWidth(size.width, self.pages.compare.viewer.sidebar_width);
+        if (point.col < sidebar_width) return .sidebar;
+        if (point.col == sidebar_width) return null;
+        return .diff;
+    }
+
+    fn compareSidebarClickToMsg(self: *const App, mouse: anytype) diff_surface.message.Msg {
+        const point = self.bodyMousePoint(mouse) orelse return .focus_sidebar;
+        const body_height = self.shellLayout().body.height;
+        if (point.row < sidebar_header_rows or body_height <= sidebar_header_rows) return .focus_sidebar;
+        const loaded = switch (self.pages.compare.load.state) {
+            .loaded => |session| &session.loaded,
+            else => return .focus_sidebar,
+        };
+        const visible_rows: usize = body_height - sidebar_header_rows;
+        const body_row: usize = point.row - sidebar_header_rows;
+        const node_index = loaded.sidebarNodeAtBodyRow(self.pages.compare.viewer.selected_node, visible_rows, body_row) orelse return .focus_sidebar;
+        return .{ .sidebar_click_node = node_index };
     }
 
     fn mousePane(self: *const App, mouse: anytype) ?MousePane {
@@ -1352,6 +1645,15 @@ pub const App = struct {
                 .focus = self.pages.review.viewer.focus,
                 .sidebar_hidden = self.pages.review.viewer.sidebar_hidden,
                 .review_mode = self.config.review_mode,
+                .keymap = self.keymap,
+            },
+            .compare = .{
+                .search_mode = self.pages.compare.search.mode,
+                .file_search_mode = self.pages.compare.file_search.mode,
+                .search_query_len = self.pages.compare.search.query.len,
+                .focus = self.pages.compare.viewer.focus,
+                .sidebar_hidden = self.pages.compare.viewer.sidebar_hidden,
+                .base_picker_open = self.pages.compare.base_picker.open,
                 .keymap = self.keymap,
             },
             .repository = self.pages.repository.inputContext(self.keymap),
@@ -1404,10 +1706,14 @@ pub const App = struct {
     fn pageTransitionSnapshot(self: *const App) page_transition.Snapshot {
         return .{
             .review_mouse_selection = self.pages.review.selection_owner.activeMouseSelection(),
+            .compare_mouse_selection = self.pages.compare.selection_owner.activeMouseSelection(),
             .repository_mouse_selection = self.pages.repository.activeSourceRange(),
             .review_deferred_apply = self.pages.review.deferredSourceBlocksPageTransition(),
+            .compare_deferred_apply = self.pages.compare.deferred_load_apply != null,
             .review_search = self.pages.review.search.mode,
             .review_file_search = self.pages.review.file_search.mode,
+            .compare_search = self.pages.compare.search.mode,
+            .compare_file_search = self.pages.compare.file_search.mode,
             .repository_source_search = self.pages.repository.source_search.mode,
             .repository_file_search = self.pages.repository.file_search.mode,
             .repo_picker = self.repo_picker.mode,
@@ -1417,6 +1723,7 @@ pub const App = struct {
                 self.overlay.isPushBranch() or self.overlay.isPullBranch(),
             .credential_input = self.overlay.isPushCredentials(),
             .branch_switch = self.overlay.isSwitchBranch(),
+            .compare_base_picker = self.pages.compare.base_picker.open,
             .push_error = self.overlay.isPushError(),
             .git_action = app_git_requests.hasPendingAction(self.actions),
             .foreground_command = self.push_retry.state.hasForeground() or self.editor_foreground_request != null,
@@ -1564,7 +1871,10 @@ pub const App = struct {
                 try self.requestReviewRevalidation(ctx);
             },
             .repository => self.pages.repository.activate(self.repo_epoch, self.repo_state.activeIdentity()),
-            .compare => _ = self.pages.compare.activate(self.repo_epoch),
+            .compare => {
+                _ = self.pages.compare.activate(self.repo_epoch);
+                try self.startCompareRefresh(ctx);
+            },
             .config => self.pages.config.ensureInitialized(),
         }
     }
@@ -4744,6 +5054,15 @@ pub const App = struct {
         };
     }
 
+    fn comparePageEffectOrigin(self: *const App) PageEffectOrigin {
+        const identity = self.pages.compare.activation.currentIdentity();
+        return .{
+            .page_id = .compare,
+            .repo_epoch = if (identity) |value| value.repo_epoch else self.repo_epoch,
+            .activation_id = if (identity) |value| value.activation_id else self.pages.compare.activation.next_activation_id,
+        };
+    }
+
     fn persistRecentRepositories(self: *App, ctx: *chasen.Ctx(Msg)) void {
         const path = self.state_path orelse return;
         saveRecentRepositoriesState(ctx.io(), path, &self.recent_repos) catch {
@@ -5065,14 +5384,19 @@ pub const App = struct {
 
     /// Applies only the shell effects authorized by a completed repository
     /// commitment. A rejected capability open must not reload or reset the
-    /// still-authoritative Review page.
+    /// still-authoritative Review or Compare page.
     fn finishRepoPickerCommit(self: *App, ctx: *chasen.Ctx(Msg), outcome: RepoCommitOutcome) !void {
         switch (outcome) {
             .changed => {
                 // The identity is already committed. Page-local reset must not
                 // depend on allocation or task-spawn success for its first load.
                 self.reviewNavigation().resetAfterRepositorySwitch();
+                self.pages.compare.deinit(ctx.allocator());
                 if (self.active_page == .review) try self.startDiffLoad(ctx, .repo_switch);
+                if (self.active_page == .compare) {
+                    _ = self.pages.compare.activate(self.repo_epoch);
+                    try self.startCompareRefresh(ctx);
+                }
             },
             .unchanged => {},
             .rejected => self.setStatus("Repository root could not be opened safely", .{}),
@@ -8151,10 +8475,12 @@ test "terminal resize cancels live drag before geometry and retains completed se
     }, app_test_support.loadedDiffOne().document.files[0], selection);
     const retained_token = app.pages.review.completed_selection.?.token;
     app.pages.review.selection_owner = .{ .diff = selection };
+    app.pages.compare.selection_owner = .{ .diff = selection };
 
     try app.update(.{ .terminal_resized = .{ .width = 120, .height = 30 } }, undefined);
 
     try std.testing.expect(app.pages.review.selection_owner == .none);
+    try std.testing.expect(app.pages.compare.selection_owner == .none);
     try std.testing.expect(app.pages.review.completed_selection != null);
     try std.testing.expect(app.pages.review.completed_selection.?.token.eql(retained_token));
     try std.testing.expectEqual(chasen.Size{ .width = 120, .height = 30 }, app.terminal_size);
@@ -8362,6 +8688,443 @@ test "undelivered remaining read routes release owned payloads" {
         } },
     } } });
     compare_msg.deinitUndelivered(allocator);
+}
+
+const compare_app_test_diff =
+    "diff --git a/src/compare.zig b/src/compare.zig\n" ++
+    "--- a/src/compare.zig\n" ++
+    "+++ b/src/compare.zig\n" ++
+    "@@ -1 +1 @@\n" ++
+    "-old\n" ++
+    "+new\n";
+
+fn compareAppTestOid(byte: u8) diff_basis.Oid {
+    var oid: diff_basis.Oid = .{ .len = 40 };
+    @memset(oid.bytes[0..40], byte);
+    return oid;
+}
+
+fn compareAppLoadedFinished(
+    allocator: std.mem.Allocator,
+    identity: page.RequestIdentity,
+    generation: u64,
+    base_byte: u8,
+    head_byte: u8,
+) !CompareLoadFinished {
+    const full_ref = try allocator.dupe(u8, "refs/heads/main");
+    errdefer allocator.free(full_ref);
+    const display_name = try allocator.dupe(u8, "main");
+    errdefer allocator.free(display_name);
+    const head_display = try allocator.dupe(u8, "feature");
+    errdefer allocator.free(head_display);
+    return .{
+        .identity = identity,
+        .generation = generation,
+        .result = .{ .loaded = .{
+            .basis = .{
+                .base = .{
+                    .full_ref = full_ref,
+                    .display_name = display_name,
+                    .kind = .local,
+                    .oid = compareAppTestOid(base_byte),
+                },
+                .head_display = head_display,
+                .merge_base_oid = compareAppTestOid(base_byte),
+                .head_oid = compareAppTestOid(head_byte),
+                .ahead_count = 1,
+            },
+            .diff = .{ .loaded = try app_load.buildLoadedBundle(allocator, compare_app_test_diff) },
+        } },
+    };
+}
+
+fn compareAppBasisFailureFinished(
+    allocator: std.mem.Allocator,
+    identity: page.RequestIdentity,
+    generation: u64,
+    name: []const u8,
+) !CompareLoadFinished {
+    const full_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name});
+    errdefer allocator.free(full_ref);
+    return .{
+        .identity = identity,
+        .generation = generation,
+        .result = .{ .basis_failed = .{
+            .kind = .missing_base_ref,
+            .attempted = .{
+                .full_ref = full_ref,
+                .display_name = try allocator.dupe(u8, name),
+                .kind = .local,
+            },
+        } },
+    };
+}
+
+test "Compare entry resolves default and picker selection queues its full ref" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .stdin },
+        .pages = .{ .review = .{ .viewer = .{ .diff_scroll = 17 } } },
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    defer app.pages.compare.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    _ = app.activateReview();
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+
+    try app.update(.{ .switch_page = .compare }, &ctx);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    const entry_task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    try std.testing.expect(entry_task.target == null);
+    const entry_identity = entry_task.identity;
+    const entry_generation = entry_task.generation;
+    try abandonSingleQueuedTask(&ctx, allocator);
+
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+        allocator,
+        entry_identity,
+        entry_generation,
+        'a',
+        'b',
+    ) } } }, &ctx);
+    try std.testing.expectEqualStrings("main", app.pages.compare.basis.?.base.display_name);
+    try std.testing.expect(app.pages.compare.load.state == .loaded);
+    try std.testing.expectEqual(@as(usize, 17), app.pages.review.viewer.diff_scroll);
+
+    // The production shared-input route must consume the same-owner bound
+    // UpdateAdapter rather than reintroducing a raw controller/resolver pair.
+    try std.testing.expectEqual(diff_surface.Focus.sidebar, app.pages.compare.viewer.focus);
+    try app.update(.{ .compare = .{ .shared = .toggle_focus } }, &ctx);
+    try std.testing.expectEqual(diff_surface.Focus.diff, app.pages.compare.viewer.focus);
+
+    const picker_message = app.handleEvent(.{ .key_press = .{ .codepoint = 'm' } }) orelse
+        return error.ExpectedCompareBasePicker;
+    try std.testing.expectEqual(App.Msg{ .compare = .open_base_picker }, picker_message);
+    try app.update(picker_message, &ctx);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    const picker_task: *CompareBranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    const picker_identity = picker_task.identity;
+    const picker_generation = picker_task.generation;
+    try abandonSingleQueuedTask(&ctx, allocator);
+
+    try app.update(.{ .load_finished = .{ .compare = .{ .branch_list = .{
+        .identity = picker_identity,
+        .generation = picker_generation,
+        .result = try branchListForTest(allocator, &.{.{
+            .name = "topic",
+            .oid = "1111111111111111111111111111111111111111",
+        }}),
+    } } } }, &ctx);
+    try app.update(.{ .compare = .choose_base }, &ctx);
+    try std.testing.expect(!app.pages.compare.base_picker.open);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    const selected_task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    try std.testing.expectEqualStrings("refs/heads/topic", selected_task.target.?.full_ref);
+    try std.testing.expectEqualStrings("topic", app.pages.compare.base_target.?.display_name);
+}
+
+test "Compare reload retries user intent and preserves accepted display on failure" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .compare,
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    defer app.pages.compare.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    _ = app.pages.compare.activate(app.repo_epoch);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+
+    const initial = app.pages.compare.beginRefresh().?;
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+        allocator,
+        initial.identity,
+        initial.generation,
+        'a',
+        'b',
+    ) } } }, &ctx);
+    if (app.pages.compare.base_target) |*target| target.deinit(allocator);
+    app.pages.compare.base_target = .{
+        .full_ref = try allocator.dupe(u8, "refs/heads/topic"),
+        .display_name = try allocator.dupe(u8, "topic"),
+        .kind = .local,
+    };
+
+    try app.update(.reload, &ctx);
+    const failed_task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    try std.testing.expectEqualStrings("refs/heads/topic", failed_task.target.?.full_ref);
+    const failed_identity = failed_task.identity;
+    const failed_generation = failed_task.generation;
+    try abandonSingleQueuedTask(&ctx, allocator);
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppBasisFailureFinished(
+        allocator,
+        failed_identity,
+        failed_generation,
+        "topic",
+    ) } } }, &ctx);
+
+    try std.testing.expectEqualStrings("main", app.pages.compare.basis.?.base.display_name);
+    try std.testing.expect(app.pages.compare.load.state == .loaded);
+    try std.testing.expectEqualStrings("topic", app.pages.compare.basis_failure.?.attempted.display_name);
+    try std.testing.expectEqualStrings("topic", app.pages.compare.base_target.?.display_name);
+
+    try app.update(.reload, &ctx);
+    const retry_task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    try std.testing.expectEqualStrings("refs/heads/topic", retry_task.target.?.full_ref);
+    try std.testing.expect(app.pages.compare.basis_failure == null);
+    try std.testing.expectEqualStrings("main", app.pages.compare.basis.?.base.display_name);
+}
+
+test "Compare refresh restores its anchor after atomic replacement" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .compare,
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    defer app.pages.compare.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    _ = app.pages.compare.activate(app.repo_epoch);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+
+    const initial = app.pages.compare.beginRefresh().?;
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+        allocator,
+        initial.identity,
+        initial.generation,
+        'a',
+        'b',
+    ) } } }, &ctx);
+    app.pages.compare.viewer.diff_cursor = .{ .hunk_header = 0 };
+    const selected_before = app.pages.compare.viewer.selected_target.?;
+
+    try app.update(.reload, &ctx);
+    try std.testing.expect(app.pages.compare.refresh_anchor != null);
+    const stale_task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    const stale_identity = stale_task.identity;
+    const stale_generation = stale_task.generation;
+    try app.update(.reload, &ctx);
+    const current_task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[1].ctx));
+    const identity = current_task.identity;
+    const generation = current_task.generation;
+    try std.testing.expectEqual(@as(usize, 2), abandonQueuedTasks(&ctx, allocator));
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+        allocator,
+        stale_identity,
+        stale_generation,
+        'a',
+        'b',
+    ) } } }, &ctx);
+    try std.testing.expect(app.pages.compare.refresh_anchor != null);
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+        allocator,
+        identity,
+        generation,
+        'a',
+        'b',
+    ) } } }, &ctx);
+
+    try std.testing.expect(app.pages.compare.refresh_anchor == null);
+    try std.testing.expectEqual(selected_before, app.pages.compare.viewer.selected_target.?);
+    try std.testing.expectEqual(
+        diff_view_model.BodyCoordinate{ .hunk_header = 0 },
+        app.pages.compare.viewer.diff_cursor,
+    );
+}
+
+test "Compare completion defers as one bundle during drag and applies afterward" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator, .active_page = .compare };
+    defer app.pages.compare.deinit(allocator);
+    _ = app.pages.compare.activate(app.repo_epoch);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    const initial = app.pages.compare.beginRefresh().?;
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+        allocator,
+        initial.identity,
+        initial.generation,
+        'a',
+        'b',
+    ) } } }, &ctx);
+    app.pages.compare.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "b/src/compare.zig" } },
+        .side = .new,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 1 },
+        .moved = true,
+    } };
+    const replacement = app.pages.compare.beginRefresh().?;
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+        allocator,
+        replacement.identity,
+        replacement.generation,
+        'd',
+        'e',
+    ) } } }, &ctx);
+
+    try std.testing.expect(app.pages.compare.deferred_load_apply != null);
+    try std.testing.expectEqualStrings(compareAppTestOid('b').slice(), app.pages.compare.basis.?.head_oid.slice());
+    app.pages.compare.selection_owner = .none;
+    try app.update(.focus_lost, &ctx);
+    try std.testing.expect(app.pages.compare.deferred_load_apply == null);
+    try std.testing.expectEqualStrings(compareAppTestOid('e').slice(), app.pages.compare.basis.?.head_oid.slice());
+}
+
+test "Compare app route retains viewed marks only for an unchanged oid pair" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { base: u8, head: u8, retained: bool }{
+        .{ .base = 'a', .head = 'b', .retained = true },
+        .{ .base = 'd', .head = 'b', .retained = false },
+        .{ .base = 'a', .head = 'e', .retained = false },
+    };
+    for (cases) |case| {
+        var app: App = .{
+            .allocator = allocator,
+            .active_page = .compare,
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, "/repo") },
+        };
+        defer app.pages.compare.deinit(allocator);
+        defer app.repo_state.deinit(allocator);
+        _ = app.pages.compare.activate(app.repo_epoch);
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+        const initial = app.pages.compare.beginRefresh().?;
+        try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+            allocator,
+            initial.identity,
+            initial.generation,
+            'a',
+            'b',
+        ) } } }, &ctx);
+        const first_loaded = switch (app.pages.compare.load.state) {
+            .loaded => |*session| &session.loaded,
+            else => return error.ExpectedLoadedCompare,
+        };
+        try app.pages.compare.reviewed_store.set(allocator, "/repo", first_loaded.document.files[0], true);
+        first_loaded.reviewed_files[0] = true;
+
+        const replacement = app.pages.compare.beginRefresh().?;
+        try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+            allocator,
+            replacement.identity,
+            replacement.generation,
+            case.base,
+            case.head,
+        ) } } }, &ctx);
+        const second_loaded = switch (app.pages.compare.load.state) {
+            .loaded => |*session| &session.loaded,
+            else => return error.ExpectedLoadedCompare,
+        };
+        try std.testing.expectEqual(case.retained, second_loaded.reviewed_files[0]);
+    }
+}
+
+test "Compare picker rejects replaced and closed generations through the App route" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .compare,
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    defer app.pages.compare.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    _ = app.pages.compare.activate(app.repo_epoch);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+
+    try app.update(.{ .compare = .open_base_picker }, &ctx);
+    const first: *CompareBranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    const first_identity = first.identity;
+    const first_generation = first.generation;
+    try app.update(.{ .compare = .open_base_picker }, &ctx);
+    const second: *CompareBranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[1].ctx));
+    const second_identity = second.identity;
+    const second_generation = second.generation;
+    try std.testing.expect(second_generation > first_generation);
+
+    try app.update(.{ .load_finished = .{ .compare = .{ .branch_list = .{
+        .identity = first_identity,
+        .generation = first_generation,
+        .result = try branchListForTest(allocator, &.{.{ .name = "stale", .oid = "1111111111111111111111111111111111111111" }}),
+    } } } }, &ctx);
+    try std.testing.expect(app.pages.compare.base_picker.accepted == null);
+    try app.update(.{ .load_finished = .{ .compare = .{ .branch_list = .{
+        .identity = second_identity,
+        .generation = second_generation,
+        .result = try branchListForTest(allocator, &.{.{ .name = "accepted", .oid = "2222222222222222222222222222222222222222" }}),
+    } } } }, &ctx);
+    try std.testing.expectEqualStrings("accepted", app.pages.compare.base_picker.accepted.?.branches[0].name);
+
+    try app.update(.{ .compare = .close_base_picker }, &ctx);
+    try std.testing.expect(app.pages.compare.base_picker.accepted == null);
+    try app.update(.{ .load_finished = .{ .compare = .{ .branch_list = .{
+        .identity = second_identity,
+        .generation = second_generation,
+        .result = try branchListForTest(allocator, &.{.{ .name = "closed", .oid = "3333333333333333333333333333333333333333" }}),
+    } } } }, &ctx);
+    try std.testing.expect(app.pages.compare.base_picker.accepted == null);
+}
+
+test "repository commitment resets Compare and refreshes the new physical root" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .compare,
+        .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+    };
+    defer app.pages.compare.deinit(allocator);
+    defer app.repo_state.deinit(allocator);
+    app.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    _ = app.pages.compare.activate(app.repo_epoch);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+
+    const initial = app.pages.compare.beginRefresh().?;
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+        allocator,
+        initial.identity,
+        initial.generation,
+        'a',
+        'b',
+    ) } } }, &ctx);
+    try std.testing.expect(app.pages.compare.basis != null);
+
+    const outcome = app.commitRepoDiscovery(
+        allocator,
+        try testSingleRepoDiscovery(allocator, roots.b),
+        0,
+        .external_selection,
+    );
+    try std.testing.expectEqual(RepoCommitOutcome.changed, outcome);
+    try app.finishRepoPickerCommit(&ctx, outcome);
+
+    try std.testing.expectEqualStrings(roots.b, app.activeRepoRoot().?);
+    try std.testing.expect(app.pages.compare.basis == null);
+    try std.testing.expect(app.pages.compare.base_target == null);
+    try std.testing.expect(app.pages.compare.activation.state == .active);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    const task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    try std.testing.expect(task.root.identity.eql(app.repo_state.activeIdentity().?));
 }
 
 test "Compare load route admits failure intent through the Compare owner" {
@@ -11692,6 +12455,38 @@ test "page transition blocker leaves page and Review state unchanged" {
     try std.testing.expect(app.pages.compare.activation.state == .inactive);
 }
 
+test "Compare mouse selection and base picker block App page transitions" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator, .active_page = .compare };
+    defer app.pages.compare.deinit(allocator);
+    _ = app.pages.compare.activate(app.repo_epoch);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    app.pages.compare.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "b/src/compare.zig" } },
+        .side = .new,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 1 },
+        .moved = true,
+    } };
+    try app.requestPageSwitch(&ctx, .config);
+    try std.testing.expectEqual(page.Id.compare, app.active_page);
+    try std.testing.expectEqualStrings("finish Compare mouse selection before switching pages", app.status.text());
+
+    app.pages.compare.selection_owner = .none;
+    _ = app.pages.compare.beginBasePicker(allocator).?;
+    try app.requestPageSwitch(&ctx, .config);
+    try std.testing.expectEqual(page.Id.compare, app.active_page);
+    try std.testing.expectEqualStrings("close Compare base picker before switching pages", app.status.text());
+
+    app.pages.compare.closeBasePicker(allocator);
+    app.pages.compare.search.mode = true;
+    try app.requestPageSwitch(&ctx, .config);
+    try std.testing.expectEqual(page.Id.compare, app.active_page);
+    try std.testing.expectEqualStrings("finish Compare search before switching pages", app.status.text());
+}
+
 test "review repository transition E2a commit selects exact retained Review path" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
@@ -12322,7 +13117,9 @@ test "review repository transition E3b2 inactive Repository retains contextual s
     try std.testing.expectEqualStrings("b", app.pages.repository.selected_path.?);
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
+    // Re-entering Review queues its three reads; Compare entry also retains
+    // the independent snapshot task it started before the page switch.
+    try std.testing.expectEqual(@as(u8, 4), ctx._pending_tasks_with_len);
 }
 
 test "review repository transition E3b3 active repository replacement rejects old owner and result" {
@@ -16705,6 +17502,7 @@ test "Review canonical publication page transition retires generic page exits" {
         defer app.pages.repository.deinit(allocator);
         defer app.repo_state.deinit(allocator);
         var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        defer clearPendingRepositoryTasks(&ctx, allocator);
         _ = try startCanonicalPublicationWatch(&app, &ctx, allocator);
 
         try requestCanonicalPageTransition(
@@ -22653,21 +23451,9 @@ fn clearPendingBranchListTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.All
 }
 
 fn clearPendingStatusAndDiffTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
-    const entries = ctx.takePendingTasksWith();
-    if (entries.len >= 1) {
-        const task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
-        allocator.free(task.repo_root);
-        allocator.destroy(task);
-    }
-    if (entries.len >= 2) {
-        const task: *BranchStatusLoadTask = @ptrCast(@alignCast(entries[1].ctx));
-        allocator.free(task.repo_root);
-        allocator.destroy(task);
-    }
-    if (entries.len >= 3) {
-        const task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
-        diff_source.freeLoadRequest(allocator, task.request);
-        allocator.destroy(task);
+    for (ctx.takePendingTasksWith()) |entry| {
+        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
+        message.deinitUndelivered(allocator);
     }
 }
 

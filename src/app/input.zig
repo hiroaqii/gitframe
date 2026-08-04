@@ -5,6 +5,7 @@ const key_input = @import("key_input.zig");
 const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
 const review_input = @import("pages/review/input.zig");
+const compare_input = @import("pages/compare/input.zig");
 const repository_page = @import("pages/repository.zig");
 
 /// Minimal snapshot needed to translate a terminal key into an App message.
@@ -12,6 +13,7 @@ const repository_page = @import("pages/repository.zig");
 pub const KeyContext = struct {
     active_page: page.Id = .review,
     review: review_input.Context = .{},
+    compare: compare_input.Context = .{},
     repository: repository_page.InputContext = .{},
     commit_panel_mode: bool = false,
     repo_picker_mode: bool = false,
@@ -106,6 +108,10 @@ fn pasteToMsg(comptime Msg: type, context: KeyContext, text: []const u8) ?Msg {
         const repository_msg = repository_page.pasteToMsg(context.repository, text) orelse return null;
         return payloadMsg(Msg, "repository", repository_msg);
     }
+    if (context.active_page == .compare and (context.compare.search_mode or context.compare.file_search_mode)) {
+        const compare_msg = compare_input.pasteToMsg(context.compare, text) orelse return null;
+        return payloadMsg(Msg, "compare", compare_msg);
+    }
     if (context.repo_picker_mode) return payloadMsg(Msg, "repo_picker_paste", text);
     if (context.push_credential_mode) return payloadMsg(Msg, "push_credential_paste", text);
     if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
@@ -125,6 +131,12 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.active_page == .repository and (context.repository.source_search_mode or context.repository.file_search_mode)) {
         const repository_msg = repository_page.keyToMsg(context.repository, key) orelse return null;
         return payloadMsg(Msg, "repository", repository_msg);
+    }
+    if (context.active_page == .compare and
+        (context.compare.search_mode or context.compare.file_search_mode or context.compare.base_picker_open))
+    {
+        const compare_msg = compare_input.keyToMsg(context.compare, key) orelse return null;
+        return payloadMsg(Msg, "compare", compare_msg);
     }
     if (context.repo_picker_mode) return repoPickerKeyToMsg(Msg, context, key);
     if (context.help_mode) return helpKeyToMsg(Msg, context, key);
@@ -148,6 +160,11 @@ pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
     if (context.active_page == .repository) {
         if (repository_page.keyToMsg(context.repository, key)) |repository_msg| {
             return payloadMsg(Msg, "repository", repository_msg);
+        }
+    }
+    if (context.active_page == .compare) {
+        if (compare_input.keyToMsg(context.compare, key)) |compare_msg| {
+            return payloadMsg(Msg, "compare", compare_msg);
         }
     }
     if (key.codepoint == 'q' and !key_input.hasCommandModifier(key)) return voidMsg(Msg, "quit");
@@ -402,6 +419,7 @@ const TestMsg = union(enum) {
     terminal_resized: chasen.Size,
     switch_page: page.Id,
     review: review_input.Msg,
+    compare: compare_input.Msg,
     repository: repository_page.Msg,
     cancel_commit_panel,
     submit_commit_panel,
