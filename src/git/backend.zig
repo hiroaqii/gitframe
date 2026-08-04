@@ -1,4 +1,5 @@
 const std = @import("std");
+const git_ref = @import("ref.zig");
 const git_branch_status = @import("branch_status.zig");
 const git_push = @import("push.zig");
 const process_runner = @import("../process/runner.zig");
@@ -118,8 +119,14 @@ pub const BranchStatusLoadResult = union(enum) {
     }
 };
 
+pub const BranchKind = git_ref.BranchKind;
+
 pub const BranchListItem = struct {
+    /// Full Git ref used as operation authority.
+    full_ref: []u8,
+    /// Short name used for display. This can collide across ref namespaces.
     name: []u8,
+    kind: BranchKind,
     oid: []u8,
     current: bool = false,
 };
@@ -131,6 +138,7 @@ pub const BranchList = struct {
     pub fn deinit(self: *BranchList, allocator: std.mem.Allocator) void {
         if (self.current) |current| allocator.free(current);
         for (self.branches) |item| {
+            allocator.free(item.full_ref);
             allocator.free(item.name);
             allocator.free(item.oid);
         }
@@ -261,8 +269,14 @@ pub const BranchStatusRequest = struct {
     parent_env: ?*const std.process.Environ.Map,
 };
 
+pub const BranchListScope = enum {
+    local,
+    local_and_remote,
+};
+
 pub const BranchListRequest = struct {
     repo_root: []const u8,
+    scope: BranchListScope,
 };
 
 pub const OperationKind = union(enum) {
@@ -372,7 +386,7 @@ pub const LocalCommandBackend = struct {
     }
 
     pub fn loadBranchList(allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
-        return loadGitBranchList(allocator, io, request.repo_root);
+        return loadGitBranchList(allocator, io, request);
     }
 
     pub fn runOperation(allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
@@ -1867,13 +1881,18 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: Branch
     return .{ .ok = builder.finish() };
 }
 
-fn loadGitBranchList(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!BranchListLoadResult {
+fn loadGitBranchList(allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
     const current_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
-    const current_result = try runGitBranchStatusCommand(allocator, io, repo_root, &current_argv);
+    const current_result = try runGitBranchStatusCommand(allocator, io, request.repo_root, &current_argv);
     defer current_result.deinit(allocator);
 
-    const list_argv = [_][]const u8{ "git", "for-each-ref", "--format=%(refname:short)%00%(objectname)%00", "refs/heads" };
-    const list_result = try runGitBranchStatusCommand(allocator, io, repo_root, &list_argv);
+    const format = "--format=%(refname)%00%(refname:short)%00%(objectname)%00%(symref)%00";
+    const local_argv = [_][]const u8{ "git", "for-each-ref", format, "refs/heads" };
+    const all_argv = [_][]const u8{ "git", "for-each-ref", format, "refs/heads", "refs/remotes" };
+    const list_result = switch (request.scope) {
+        .local => try runGitBranchStatusCommand(allocator, io, request.repo_root, &local_argv),
+        .local_and_remote => try runGitBranchStatusCommand(allocator, io, request.repo_root, &all_argv),
+    };
     defer list_result.deinit(allocator);
 
     return branchListResultFromCommandResults(allocator, current_result, list_result);
@@ -1906,6 +1925,7 @@ fn branchListResultFromCommandResults(
     var items: std.ArrayList(BranchListItem) = .empty;
     errdefer {
         for (items.items) |item| {
+            allocator.free(item.full_ref);
             allocator.free(item.name);
             allocator.free(item.oid);
         }
@@ -1916,24 +1936,41 @@ fn branchListResultFromCommandResults(
     while (index < list_result.stdout.len) {
         skipBranchListRecordSeparators(list_result.stdout, &index);
         if (index >= list_result.stdout.len) break;
+        const full_ref_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
+        const full_ref = list_result.stdout[index..full_ref_end];
+        index = full_ref_end + 1;
         const name_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
         const name = list_result.stdout[index..name_end];
         index = name_end + 1;
         const oid_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
         const oid = list_result.stdout[index..oid_end];
         index = oid_end + 1;
-        if (name.len == 0 or oid.len == 0) continue;
+        const symref_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
+        const symref = list_result.stdout[index..symref_end];
+        index = symref_end + 1;
+        if (full_ref.len == 0 or name.len == 0 or oid.len == 0) continue;
 
-        const owned_name = allocator.dupe(u8, name) catch return error.OutOfMemory;
+        const kind = branchKind(full_ref) orelse continue;
+        if (kind == .remote_tracking and symref.len != 0 and std.mem.endsWith(u8, full_ref, "/HEAD")) continue;
+
+        const owned_full_ref = allocator.dupe(u8, full_ref) catch return error.OutOfMemory;
+        const owned_name = allocator.dupe(u8, name) catch {
+            allocator.free(owned_full_ref);
+            return error.OutOfMemory;
+        };
         const owned_oid = allocator.dupe(u8, oid) catch {
+            allocator.free(owned_full_ref);
             allocator.free(owned_name);
             return error.OutOfMemory;
         };
         items.append(allocator, .{
+            .full_ref = owned_full_ref,
             .name = owned_name,
+            .kind = kind,
             .oid = owned_oid,
-            .current = current != null and std.mem.eql(u8, current.?, name),
+            .current = kind == .local and current != null and std.mem.eql(u8, current.?, name),
         }) catch {
+            allocator.free(owned_full_ref);
             allocator.free(owned_name);
             allocator.free(owned_oid);
             return error.OutOfMemory;
@@ -1949,6 +1986,12 @@ fn branchListResultFromCommandResults(
     } };
 }
 
+fn branchKind(full_ref: []const u8) ?BranchKind {
+    if (std.mem.startsWith(u8, full_ref, "refs/heads/")) return .local;
+    if (std.mem.startsWith(u8, full_ref, "refs/remotes/")) return .remote_tracking;
+    return null;
+}
+
 fn skipBranchListRecordSeparators(output: []const u8, index: *usize) void {
     // `git for-each-ref --format=...%00...%00` still writes its normal record
     // newline after each formatted ref. Branch names are NUL fields, so consume
@@ -1957,11 +2000,11 @@ fn skipBranchListRecordSeparators(output: []const u8, index: *usize) void {
 }
 
 test "skipBranchListRecordSeparators preserves branch name after for-each-ref newline" {
-    const output = "\nzig-port\x00abc\x00";
+    const output = "\nrefs/heads/zig-port\x00zig-port\x00abc\x00\x00";
     var index: usize = 0;
     skipBranchListRecordSeparators(output, &index);
     try std.testing.expectEqual(@as(usize, 1), index);
-    try std.testing.expectEqualStrings("zig-port", output[index .. index + "zig-port".len]);
+    try std.testing.expectEqualStrings("refs/heads/zig-port", output[index .. index + "refs/heads/zig-port".len]);
 }
 
 test "branch list non-zero result releases current and preserves stderr" {
@@ -2039,7 +2082,7 @@ test "branch list diagnostic allocation failure releases current" {
 
 test "branch list success transfers current ownership exactly once" {
     var current_stdout = "main\n".*;
-    var list_stdout = "main\x00abc\x00\nfeature/topic\x00def\x00".*;
+    var list_stdout = "refs/heads/main\x00main\x00abc\x00\x00\nrefs/heads/feature/topic\x00feature/topic\x00def\x00\x00".*;
     var empty: [0]u8 = .{};
     const result = try branchListResultFromCommandResults(
         std.testing.allocator,
@@ -2062,7 +2105,9 @@ test "branch list success transfers current ownership exactly once" {
     };
     try std.testing.expectEqualStrings("main", list.current.?);
     try std.testing.expectEqual(@as(usize, 2), list.branches.len);
+    try std.testing.expectEqualStrings("refs/heads/main", list.branches[0].full_ref);
     try std.testing.expectEqualStrings("main", list.branches[0].name);
+    try std.testing.expectEqual(BranchKind.local, list.branches[0].kind);
     try std.testing.expect(list.branches[0].current);
     try std.testing.expectEqualStrings("feature/topic", list.branches[1].name);
     try std.testing.expect(!list.branches[1].current);
@@ -3791,7 +3836,10 @@ test "LocalCommandBackend loads local branch list without record separator newli
     const fixture = try setupBranchSwitchFixture(io, &tmp);
     defer fixture.deinit();
 
-    const result = try LocalCommandBackend.loadBranchList(std.testing.allocator, io, .{ .repo_root = fixture.repo_root });
+    const result = try LocalCommandBackend.loadBranchList(std.testing.allocator, io, .{
+        .repo_root = fixture.repo_root,
+        .scope = .local,
+    });
     defer result.deinit(std.testing.allocator);
 
     const list = switch (result) {
@@ -3802,10 +3850,61 @@ test "LocalCommandBackend loads local branch list without record separator newli
     try expectBranchListed(list.branches, "main");
     try expectBranchListed(list.branches, "feature/topic");
     try expectBranchNotListed(list.branches, "origin/remote-only");
+    const main = branchByFullRef(list.branches, "refs/heads/main") orelse return error.ExpectedBranchListed;
+    try std.testing.expectEqual(BranchKind.local, main.kind);
+    try std.testing.expect(main.current);
     for (list.branches) |branch| {
         try std.testing.expect(std.mem.indexOfScalar(u8, branch.name, '\n') == null);
         try std.testing.expect(std.mem.indexOfScalar(u8, branch.name, '\r') == null);
     }
+}
+
+test "LocalCommandBackend loads distinct local and remote refs and excludes every remote HEAD symref" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupBranchSwitchFixture(io, &tmp);
+    defer fixture.deinit();
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+
+    try runTestGit(io, &.{ "git", "config", "core.warnAmbiguousRefs", "true" }, work);
+    try runTestGit(io, &.{ "git", "branch", "origin/main", "main" }, work);
+    try runTestGit(io, &.{ "git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main" }, work);
+    try runTestGit(io, &.{ "git", "update-ref", "refs/remotes/upstream/main", fixture.main_oid }, work);
+    try runTestGit(io, &.{ "git", "symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/main" }, work);
+
+    const result = try LocalCommandBackend.loadBranchList(std.testing.allocator, io, .{
+        .repo_root = fixture.repo_root,
+        .scope = .local_and_remote,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    const list = switch (result) {
+        .ok => |list| list,
+        .failed, .failed_static => return error.ExpectedBranchList,
+    };
+    const local_collision = branchByFullRef(list.branches, "refs/heads/origin/main") orelse
+        return error.ExpectedBranchListed;
+    const remote_collision = branchByFullRef(list.branches, "refs/remotes/origin/main") orelse
+        return error.ExpectedBranchListed;
+    const remote_only = branchByFullRef(list.branches, "refs/remotes/origin/remote-only") orelse
+        return error.ExpectedBranchListed;
+    const current = branchByFullRef(list.branches, "refs/heads/main") orelse
+        return error.ExpectedBranchListed;
+
+    try std.testing.expectEqualStrings("heads/origin/main", local_collision.name);
+    try std.testing.expectEqualStrings("remotes/origin/main", remote_collision.name);
+    try std.testing.expectEqual(BranchKind.local, local_collision.kind);
+    try std.testing.expectEqual(BranchKind.remote_tracking, remote_collision.kind);
+    try std.testing.expectEqual(BranchKind.remote_tracking, remote_only.kind);
+    try std.testing.expectEqualStrings(fixture.main_oid, local_collision.oid);
+    try std.testing.expectEqualStrings(fixture.main_oid, remote_collision.oid);
+    try std.testing.expect(current.current);
+    try std.testing.expect(!remote_collision.current);
+    try std.testing.expect(branchByFullRef(list.branches, "refs/remotes/origin/HEAD") == null);
+    try std.testing.expect(branchByFullRef(list.branches, "refs/remotes/upstream/HEAD") == null);
 }
 
 test "LocalCommandBackend switch branch succeeds between local branches" {
@@ -4311,6 +4410,13 @@ fn expectBranchNotListed(branches: []const BranchListItem, name: []const u8) !vo
     for (branches) |branch| {
         if (std.mem.eql(u8, branch.name, name)) return error.ExpectedBranchNotListed;
     }
+}
+
+fn branchByFullRef(branches: []const BranchListItem, full_ref: []const u8) ?*const BranchListItem {
+    for (branches) |*branch| {
+        if (std.mem.eql(u8, branch.full_ref, full_ref)) return branch;
+    }
+    return null;
 }
 
 const PullRefreshFixture = struct {

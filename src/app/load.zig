@@ -964,7 +964,10 @@ fn nextZField(text: []const u8, offset: *usize) ?[]const u8 {
 }
 
 pub fn runBranchListLoad(repo_root: []const u8, allocator: std.mem.Allocator, io: std.Io) BranchListLoadTaskResult {
-    const raw_result = git_backend.LocalCommandBackend.loadBranchList(allocator, io, .{ .repo_root = repo_root }) catch |err| {
+    const raw_result = git_backend.LocalCommandBackend.loadBranchList(allocator, io, .{
+        .repo_root = repo_root,
+        .scope = .local,
+    }) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, "Branch list load failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Branch list load failed: OutOfMemory" },

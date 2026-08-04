@@ -5,6 +5,7 @@
 //! changing consumers back to an untagged branch-only contract.
 
 const std = @import("std");
+const git_ref = @import("../git/ref.zig");
 
 /// Git object id storage for SHA-1 (40 hex) and SHA-256 (64 hex) repositories.
 pub const Oid = struct {
@@ -21,10 +22,7 @@ pub const Oid = struct {
     }
 };
 
-pub const BaseKind = enum {
-    local,
-    remote_tracking,
-};
+pub const BaseKind = git_ref.BranchKind;
 
 /// User intent: which full ref should be resolved by the next Compare load.
 pub const BaseTarget = struct {

@@ -22599,14 +22599,23 @@ fn branchListForTest(allocator: std.mem.Allocator, specs: []const BranchListItem
     var initialized: usize = 0;
     errdefer {
         for (items[0..initialized]) |item| {
+            allocator.free(item.full_ref);
             allocator.free(item.name);
             allocator.free(item.oid);
         }
     }
     for (specs, 0..) |spec, index| {
+        const full_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{spec.name});
+        errdefer allocator.free(full_ref);
+        const name = try allocator.dupe(u8, spec.name);
+        errdefer allocator.free(name);
+        const oid = try allocator.dupe(u8, spec.oid);
+        errdefer allocator.free(oid);
         items[index] = .{
-            .name = try allocator.dupe(u8, spec.name),
-            .oid = try allocator.dupe(u8, spec.oid),
+            .full_ref = full_ref,
+            .name = name,
+            .kind = .local,
+            .oid = oid,
             .current = spec.current,
         };
         initialized += 1;
