@@ -123,6 +123,7 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
         .palette = app.theme,
         .source_label = app.source_label,
         .no_changes_actions = viewNoChangesActionPresentation(app, fetch_key_buffer[0..]),
+        .empty_message = null,
         .branch = viewBranchRowPresentation(app, surface, &branch_scratch),
         .diff_pane = diff_pane_adapter.interface(),
     });
@@ -847,7 +848,7 @@ fn sidebarBranchStyle(palette: theme.Palette) chasen.TextStyle {
 /// Selected-file identity is stable chrome rather than a pane-focus signal.
 /// Focus remains visible through the row-1 rule and diff body cursor.
 fn paneTitleStyle(palette: theme.Palette) chasen.TextStyle {
-    return review_body_render.paneTitleStyle(palette);
+    return diff_surface_view.statusPaneTitleStyle(palette);
 }
 
 const paneSearchStyle = diff_surface_view.paneSearchStyle;

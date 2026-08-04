@@ -9,6 +9,7 @@ const app_state = @import("state.zig");
 const shell_layout = @import("shell_layout.zig");
 const view_primitives = @import("view_primitives.zig");
 const review_view = @import("pages/review/view.zig");
+const compare_view = @import("pages/compare/view.zig");
 const repository_page = @import("pages/repository.zig");
 const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
@@ -18,6 +19,7 @@ const repo_discovery = @import("../repo/discovery.zig");
 const repo_state = @import("../repo/state.zig");
 const theme = @import("theme");
 const review_page = if (builtin.is_test) @import("pages/review.zig") else struct {};
+const compare_page = if (builtin.is_test) @import("pages/compare.zig") else struct {};
 
 /// Rendering-only helpers for App.
 ///
@@ -60,6 +62,7 @@ const StateMessage = struct {
 
 pub const Context = struct {
     review: review_view.Context,
+    compare: compare_view.Context,
     repository: repository_page.ViewContext,
     active_page: page.Id,
     page_bar_visible: bool,
@@ -155,6 +158,9 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     if (app.overlay.isPushCredentials() and app.overlay.visibleOn(app.active_page)) {
         try viewPushCredentials(app, surface);
     }
+    if (app.active_page == .compare and app.compare.page.base_picker.open) {
+        try compare_view.viewBasePicker(app.compare, surface);
+    }
 }
 
 fn shellFrameOptions(palette: theme.Palette) ui.Panel.ViewOptions {
@@ -171,7 +177,8 @@ fn viewBody(app: Context, surface: *chasen.Surface) !void {
     return switch (app.active_page) {
         .review => review_view.view(app.review, surface),
         .repository => repository_page.view(app.repository, surface),
-        .compare, .config => viewPlaceholderPage(app.active_page, app.repo_state.activeRoot() != null, app.theme, surface),
+        .compare => compare_view.view(app.compare, surface),
+        .config => viewPlaceholderPage(app.active_page, app.repo_state.activeRoot() != null, app.theme, surface),
     };
 }
 
@@ -221,6 +228,7 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
     const width = surface.size().width;
     if (width == 0) return;
     const review_footer = app.review.footer();
+    const compare_footer = app.compare.footer();
 
     var footer_item_storage: [8]ui.key_hint.Item = undefined;
     var footer_key_buffers: [8][16]u8 = undefined;
@@ -254,6 +262,23 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
             .drop_priority = .auto,
         });
         if (review_footer.activation) |activation| footer_segments.append(.{
+            .text = switch (activation) {
+                .validating => "validating",
+                .stale => "stale",
+            },
+            .style = switch (activation) {
+                .validating => app.theme.style(.prompt),
+                .stale => app.theme.style(.danger),
+            },
+        });
+    }
+    if (app.active_page == .compare) {
+        if (compare_footer.source_label) |label| footer_segments.append(.{
+            .text = label,
+            .style = app.theme.style(.prompt),
+            .drop_priority = .source,
+        });
+        if (compare_footer.activation) |activation| footer_segments.append(.{
             .text = switch (activation) {
                 .validating => "validating",
                 .stale => "stale",
@@ -1210,6 +1235,23 @@ fn stagedSummaryText(allocator: std.mem.Allocator, summary: app_commit_panel.Sta
 
 fn footerItems(app: Context, storage: *[8]ui.key_hint.Item, key_buffers: *[8][16]u8) []const ui.key_hint.Item {
     var len: usize = 0;
+    if (app.active_page == .compare) {
+        const footer = app.compare.footer();
+        if (!footer.normal_action_hints_enabled or app.compare.page.base_picker.open) return storage[0..0];
+        if (footer.sidebar_hidden) {
+            appendFooterItem(app, storage, key_buffers, &len, .toggle_sidebar, "sidebar");
+        } else {
+            storage[len] = ui.key_hint.item("Tab", "focus");
+            len += 1;
+        }
+        storage[len] = ui.key_hint.item("m", "base");
+        len += 1;
+        appendFooterItem(app, storage, key_buffers, &len, .reload, "refresh");
+        appendFooterItem(app, storage, key_buffers, &len, .help, "help");
+        storage[len] = ui.key_hint.item("q", "quit");
+        len += 1;
+        return storage[0..len];
+    }
     if (app.active_page != .review) {
         appendFooterItem(app, storage, key_buffers, &len, .page_review, "review");
         appendFooterItem(app, storage, key_buffers, &len, .page_repository, "repo");
@@ -1261,6 +1303,16 @@ fn viewHelpPopup(app: Context, surface: *chasen.Surface) !void {
     _ = content.borrowTextAt(0, 0, "GitFrame shortcuts", .{ .bold = true });
     if (size.height <= 2) return;
 
+    if (app.active_page == .compare) {
+        var list = content.child(.{
+            .col = 0,
+            .row = help_header_rows,
+            .width = size.width,
+            .height = size.height - help_header_rows,
+        });
+        try drawHelpSections(app, &list, &help_compare_sections, 0);
+        return;
+    }
     if (app.active_page != .review) {
         var list = content.child(.{
             .col = 0,
@@ -1576,6 +1628,7 @@ test "review file search keeps footer status but suppresses unreachable action h
 
 const ShellViewTestHarness = struct {
     review: review_page.ReviewPageState = .{},
+    compare: compare_page.ComparePageState = .{},
     repository: repository_page.RepositoryPageState = .{},
     keymap: keymap.Effective = .{},
     theme: theme.Palette = .default(),
@@ -1602,6 +1655,14 @@ const ShellViewTestHarness = struct {
         const review = review_view.Context.init(&self.review, navigation, self.theme, self.keymap, "working tree", .unstaged, null, .{});
         return .{
             .review = review,
+            .compare = .{
+                .page = &self.compare,
+                .palette = self.theme,
+                .repo_root = self.repo_state.activeRoot(),
+                .repo_epoch = 0,
+                .root_identity = self.repo_state.activeIdentity(),
+                .layout = .{ .width = self.terminal_size.width, .height = self.terminal_size.height },
+            },
             .repository = .{
                 .page_state = &self.repository,
                 .palette = self.theme,
@@ -1945,6 +2006,22 @@ const help_placeholder_items = [_]HelpItem{
 
 const help_placeholder_sections = [_]HelpSection{
     .{ .title = "Global", .items = &help_placeholder_items },
+};
+
+const help_compare_items = [_]HelpItem{
+    .{ .key = .{ .text = "m" }, .description = "choose comparison base (user assignment wins)" },
+    .{ .key = .{ .action = .reload }, .description = "refresh comparison against selected base" },
+    .{ .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },
+    .{ .key = .{ .action = .search }, .description = "search diff" },
+    .{ .key = .{ .action = .file_search }, .description = "search files" },
+    .{ .key = .{ .action = .toggle_display_mode }, .description = "unified / side-by-side" },
+    .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },
+    .{ .key = .{ .text = "y / Y" }, .description = "copy current line / hunk" },
+    .{ .key = .{ .text = "s / P / U / b" }, .description = "write operations unavailable" },
+};
+
+const help_compare_sections = [_]HelpSection{
+    .{ .title = "Compare", .items = &help_compare_items },
 };
 
 const help_sidebar_items = [_]HelpItem{

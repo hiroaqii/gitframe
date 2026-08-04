@@ -15,6 +15,7 @@ const file_tree = @import("../../../file_tree.zig");
 const git_status = @import("../../../git/status.zig");
 const review_projection = @import("../../review_projection.zig");
 const diff_surface = @import("../../diff_surface.zig");
+const diff_surface_view = @import("../../diff_surface/view.zig");
 const theme = @import("theme");
 
 pub const ParsedBody = struct {
@@ -65,11 +66,7 @@ pub fn renderGenerated(bundle: *const review_projection.GeneratedFileBundle, arg
 }
 
 pub fn renderStatus(path: []const u8, message: []const u8, stats: ?file_tree.Stats, args: diff_surface.RenderProjectedBodyArgs) !void {
-    try drawTitlePath(args.surface, path, stats, args.palette);
-    try draw.copyClippedTextAt(args.surface, 0, 2, message, .{
-        .fg = args.palette.color(.muted),
-        .dim = !args.pane_active,
-    });
+    return diff_surface_view.renderStatusBody(path, message, stats, args);
 }
 
 /// Review-local status-only fallback. This is intentionally not part of the
@@ -82,7 +79,7 @@ pub fn renderStatusOnlyFallback(
     palette: theme.Palette,
 ) !void {
     const path = entry.canonicalPathKey() orelse entry.path;
-    try drawTitlePath(surface, path, stats, palette);
+    try diff_surface_view.drawStatusTitlePath(surface, path, stats, palette);
     const status_text = try std.fmt.allocPrint(
         surface.frameAllocator(),
         "status: {s}{s}",
@@ -102,43 +99,6 @@ pub fn renderStatusOnlyFallback(
             try draw.copyClippedTextAt(surface, 0, 5, "Loading generated review preview if available.", .{ .fg = palette.color(.muted), .dim = !active });
         },
     }
-}
-
-pub fn drawTitlePath(surface: *chasen.Surface, path: []const u8, stats: ?file_tree.Stats, palette: theme.Palette) !void {
-    if (stats) |line_stats| {
-        if (line_stats.added != 0 or line_stats.removed != 0) {
-            const suffix = try std.fmt.allocPrint(surface.frameAllocator(), " +{d} -{d}", .{ line_stats.added, line_stats.removed });
-            const suffix_width = chasen.text.displayWidth(suffix);
-            const path_width = surface.size().width -| @as(u16, @intCast(@min(suffix_width, std.math.maxInt(u16))));
-            if (path_width > 8) {
-                var path_surface = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
-                try draw.copyTailClippedTextAt(&path_surface, 0, 0, path, paneTitleStyle(palette));
-                try drawStatusLineStats(surface, @intCast(path_width), line_stats, palette);
-                return;
-            }
-        }
-    }
-    try draw.copyTailClippedTextAt(surface, 0, 0, path, paneTitleStyle(palette));
-}
-
-pub fn paneTitleStyle(palette: theme.Palette) chasen.TextStyle {
-    return palette.boldStyle(.accent);
-}
-
-fn drawStatusLineStats(surface: *chasen.Surface, col: u16, stats: file_tree.Stats, palette: theme.Palette) !void {
-    var cursor = col;
-    const metadata_style = palette.style(.muted);
-    try draw.copyClippedTextAt(surface, cursor, 0, " ", metadata_style);
-    cursor +|= 1;
-    const added = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added});
-    try draw.copyClippedTextAt(surface, cursor, 0, added, .{ .fg = palette.color(.success), .bold = true });
-    cursor +|= @intCast(chasen.text.displayWidth(added));
-    if (cursor < surface.size().width) {
-        try draw.copyClippedTextAt(surface, cursor, 0, " ", metadata_style);
-        cursor +|= 1;
-    }
-    const removed = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed});
-    try draw.copyClippedTextAt(surface, cursor, 0, removed, .{ .fg = palette.color(.danger), .bold = true });
 }
 
 fn statusName(status: git_status.StatusCode) []const u8 {

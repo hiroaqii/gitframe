@@ -1107,8 +1107,17 @@ pub const App = struct {
     }
 
     fn shellViewContext(self: *const App) app_view.Context {
+        const body_size = self.shellLayout().bodySize();
         return .{
             .review = self.reviewViewContext(),
+            .compare = .{
+                .page = &self.pages.compare,
+                .palette = self.theme,
+                .repo_root = self.activeRepoRoot(),
+                .repo_epoch = self.repo_epoch,
+                .root_identity = self.repo_state.activeIdentity(),
+                .layout = .{ .width = body_size.width, .height = body_size.height },
+            },
             .repository = .{
                 .page_state = &self.pages.repository,
                 .palette = self.theme,

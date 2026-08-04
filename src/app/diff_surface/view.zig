@@ -278,6 +278,7 @@ pub const ViewArgs = struct {
     palette: theme.Palette,
     source_label: []const u8,
     no_changes_actions: NoChangesActionPresentation,
+    empty_message: ?StateMessage = null,
     branch: ?SidebarBranchPresentation,
     diff_pane: DiffPaneRenderer,
 };
@@ -322,7 +323,7 @@ pub fn view(surface: *chasen.Surface, args: ViewArgs) !void {
 }
 
 fn viewNoChanges(surface: *chasen.Surface, args: ViewArgs) !void {
-    const message = noChangesMessage(surface.frameAllocator(), args.no_changes_actions);
+    const message = args.empty_message orelse noChangesMessage(surface.frameAllocator(), args.no_changes_actions);
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
@@ -490,6 +491,63 @@ pub fn viewDiffPane(
     }
     drawDiffHeaderDetailRow(surface, state, active, palette);
     drawSearchMatchMarker(surface, state, palette);
+}
+
+/// Shared projected-body presentation for inert/status content. Page adapters
+/// provide only the already-resolved path, message, and optional line stats.
+pub fn renderStatusBody(
+    path: []const u8,
+    message: []const u8,
+    stats: ?file_tree.Stats,
+    args: diff_surface.RenderProjectedBodyArgs,
+) !void {
+    try drawStatusTitlePath(args.surface, path, stats, args.palette);
+    try draw.copyClippedTextAt(args.surface, 0, 2, message, .{
+        .fg = args.palette.color(.muted),
+        .dim = !args.pane_active,
+    });
+}
+
+pub fn drawStatusTitlePath(
+    surface: *chasen.Surface,
+    path: []const u8,
+    stats: ?file_tree.Stats,
+    palette: theme.Palette,
+) !void {
+    if (stats) |line_stats| {
+        if (line_stats.added != 0 or line_stats.removed != 0) {
+            const suffix = try std.fmt.allocPrint(surface.frameAllocator(), " +{d} -{d}", .{ line_stats.added, line_stats.removed });
+            const suffix_width = chasen.text.displayWidth(suffix);
+            const path_width = surface.size().width -| @as(u16, @intCast(@min(suffix_width, std.math.maxInt(u16))));
+            if (path_width > 8) {
+                var path_surface = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
+                try draw.copyTailClippedTextAt(&path_surface, 0, 0, path, statusPaneTitleStyle(palette));
+                try drawStatusLineStats(surface, @intCast(path_width), line_stats, palette);
+                return;
+            }
+        }
+    }
+    try draw.copyTailClippedTextAt(surface, 0, 0, path, statusPaneTitleStyle(palette));
+}
+
+pub fn statusPaneTitleStyle(palette: theme.Palette) chasen.TextStyle {
+    return palette.boldStyle(.accent);
+}
+
+fn drawStatusLineStats(surface: *chasen.Surface, col: u16, stats: file_tree.Stats, palette: theme.Palette) !void {
+    var cursor = col;
+    const metadata_style = palette.style(.muted);
+    try draw.copyClippedTextAt(surface, cursor, 0, " ", metadata_style);
+    cursor +|= 1;
+    const added = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added});
+    try draw.copyClippedTextAt(surface, cursor, 0, added, .{ .fg = palette.color(.success), .bold = true });
+    cursor +|= @intCast(chasen.text.displayWidth(added));
+    if (cursor < surface.size().width) {
+        try draw.copyClippedTextAt(surface, cursor, 0, " ", metadata_style);
+        cursor +|= 1;
+    }
+    const removed = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed});
+    try draw.copyClippedTextAt(surface, cursor, 0, removed, .{ .fg = palette.color(.danger), .bold = true });
 }
 
 fn projectedBodyRenderArgs(surface: *chasen.Surface, body: diff_surface.navigation.BodyView, palette: theme.Palette, active: bool) diff_surface.RenderProjectedBodyArgs {
