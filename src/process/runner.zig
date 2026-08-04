@@ -4,7 +4,7 @@ pub const Error = error{
     EmptyArgv,
     StreamTooLong,
     WriteFailed,
-} || std.process.SpawnError || std.process.Child.WaitError || std.Io.File.MultiReader.UnendingError || std.Io.Timeout.Error || std.Io.File.Writer.Error;
+} || std.process.SpawnError || std.process.Child.WaitError || std.Io.ConcurrentError || std.Io.File.MultiReader.UnendingError || std.Io.Timeout.Error || std.Io.File.Writer.Error;
 
 pub const Options = struct {
     argv: []const []const u8,
@@ -43,6 +43,7 @@ pub const StdinFailure = struct {
 pub const Failure = union(enum) {
     empty_argv,
     spawn: anyerror,
+    stdin_start: std.Io.ConcurrentError,
     stdin: StdinFailure,
     capture: anyerror,
     wait: anyerror,
@@ -59,7 +60,7 @@ pub const Failure = union(enum) {
         return switch (self) {
             .empty_argv => "EmptyArgv",
             .stdin => |failure| @errorName(failure.err),
-            inline .spawn, .capture, .wait => |err| @errorName(err),
+            inline .spawn, .stdin_start, .capture, .wait => |err| @errorName(err),
         };
     }
 
@@ -67,7 +68,7 @@ pub const Failure = union(enum) {
         return switch (self) {
             .empty_argv => error.EmptyArgv,
             .stdin => |failure| @errorCast(failure.err),
-            inline .spawn, .capture, .wait => |err| @errorCast(err),
+            inline .spawn, .stdin_start, .capture, .wait => |err| @errorCast(err),
         };
     }
 };
@@ -161,10 +162,13 @@ pub fn runWithStdinDetailed(allocator: std.mem.Allocator, io: std.Io, options: O
     if (options.stdin.len == 0) {
         stdin_file.close(io);
     } else {
-        stdin_future = io.concurrent(pumpStdin, .{ stdin_file, io, options.stdin }) catch |err| start_failed: {
+        stdin_future = io.concurrent(pumpStdin, .{ stdin_file, io, options.stdin }) catch |err| {
+            // Keep stdin open until the child is reaped so admission failure
+            // cannot look like a normal EOF to the command.
+            child.kill(io);
+            child_waited = true;
             stdin_file.close(io);
-            stdin_error = err;
-            break :start_failed null;
+            return .{ .failed = .{ .stdin_start = err } };
         };
     }
 
@@ -367,12 +371,50 @@ test "concurrent stdin arbitration orders capture wait and writer failures" {
     );
     try std.testing.expectEqual(
         FailurePhase.capture,
-        primaryFailurePhase(error.StreamTooLong, null, error.ConcurrencyUnavailable).?,
+        primaryFailurePhase(error.StreamTooLong, null, error.WriteFailed).?,
     );
     try std.testing.expectEqual(
         FailurePhase.stdin,
-        primaryFailurePhase(null, null, error.ConcurrencyUnavailable).?,
+        primaryFailurePhase(null, null, error.WriteFailed).?,
     );
+}
+
+test "stdin admission runner kills child when concurrency start is unavailable" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "IFS= read -r _ || :; printf child-ran > child-ran",
+    };
+    var detailed = try runWithStdinDetailed(std.testing.allocator, io, .{
+        .argv = &argv,
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = "payload",
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(64),
+    });
+    defer detailed.deinit(std.testing.allocator);
+
+    switch (detailed) {
+        .failed => |failure| switch (failure) {
+            .stdin_start => |err| try std.testing.expectEqual(error.ConcurrencyUnavailable, err),
+            else => return error.ExpectedStdinStartFailure,
+        },
+        .ok => return error.ExpectedStdinStartFailure,
+    }
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "child-ran", .{}));
+}
+
+test "stdin admission compatibility wrapper propagates concurrency unavailable" {
+    try std.testing.expectError(error.ConcurrencyUnavailable, resultFromDetailed(std.testing.allocator, .{
+        .failed = .{ .stdin_start = error.ConcurrencyUnavailable },
+    }));
 }
 
 test "concurrent stdin compatibility wrapper releases failure evidence" {

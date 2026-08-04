@@ -627,17 +627,28 @@ fn operationResultFromGitStdinCommand(
             const error_name = failure.errorName();
             return switch (failure) {
                 .stdin => |*stdin_failure| {
-                    if (stdin_failure.result.stderr.len > 0) {
+                    const child_exited_zero = switch (stdin_failure.result.term) {
+                        .exited => |code| code == 0,
+                        else => false,
+                    };
+                    if (stdin_failure.result.stderr.len > 0 and !child_exited_zero) {
                         const result = stdin_failure.takeResult();
                         allocator.free(result.stdout);
                         return .{ .failed = result.stderr };
                     }
 
-                    const message = std.fmt.allocPrint(
-                        allocator,
-                        "{s} failed during stdin ({s}): {any}",
-                        .{ fallback_label, error_name, stdin_failure.result.term },
-                    ) catch return error.OutOfMemory;
+                    const message = if (stdin_failure.result.stderr.len > 0)
+                        std.fmt.allocPrint(
+                            allocator,
+                            "{s} failed during stdin ({s}): {any}\n{s}",
+                            .{ fallback_label, error_name, stdin_failure.result.term, stdin_failure.result.stderr },
+                        ) catch return error.OutOfMemory
+                    else
+                        std.fmt.allocPrint(
+                            allocator,
+                            "{s} failed during stdin ({s}): {any}",
+                            .{ fallback_label, error_name, stdin_failure.result.term },
+                        ) catch return error.OutOfMemory;
                     const result = stdin_failure.takeResult();
                     result.deinit(allocator);
                     return .{ .failed = message };
@@ -3763,6 +3774,80 @@ test "concurrent stdin Git apply preserves malformed large patch diagnostic" {
     switch (result) {
         .failed => |message| try std.testing.expect(std.mem.indexOf(u8, message, "corrupt patch") != null),
         else => return error.ExpectedGitDiagnosticFailure,
+    }
+}
+
+test "stdin admission Git mapping fails closed on concurrency start failure" {
+    try std.testing.expectError(error.SpawnFailed, operationResultFromGitStdinCommand(std.testing.allocator, .{
+        .failed = .{ .stdin_start = error.ConcurrencyUnavailable },
+    }, "git apply --cached"));
+}
+
+test "stdin admission Git mapping reaches writer failure with real early-discard child" {
+    const stdin = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(stdin);
+    @memset(stdin, 'i');
+
+    const argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "exec 0<&-; printf stdin-prong-diagnostic >&2; exit 7",
+    };
+    var detailed = try process_runner.runWithStdinDetailed(std.testing.allocator, std.testing.io, .{
+        .argv = &argv,
+        .stdin = stdin,
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(1024),
+    });
+    var detailed_owned = true;
+    defer if (detailed_owned) detailed.deinit(std.testing.allocator);
+
+    switch (detailed) {
+        .failed => |failure| switch (failure) {
+            .stdin => |stdin_failure| {
+                try std.testing.expectEqualStrings("stdin-prong-diagnostic", stdin_failure.result.stderr);
+                try std.testing.expectEqual(std.process.Child.Term{ .exited = 7 }, stdin_failure.result.term);
+            },
+            else => return error.ExpectedStdinFailure,
+        },
+        .ok => return error.ExpectedStdinFailure,
+    }
+
+    detailed_owned = false;
+    const result = try operationResultFromGitStdinCommand(std.testing.allocator, detailed, "git apply --cached");
+    defer result.deinit(std.testing.allocator);
+    switch (result) {
+        .failed => |message| try std.testing.expectEqualStrings("stdin-prong-diagnostic", message),
+        else => return error.ExpectedGitDiagnosticFailure,
+    }
+}
+
+test "stdin admission Git mapping keeps writer error with zero-exit warning" {
+    const stdout = try std.testing.allocator.dupe(u8, "ignored");
+    const stderr = std.testing.allocator.dupe(u8, "warning: partial input") catch |err| {
+        std.testing.allocator.free(stdout);
+        return err;
+    };
+
+    var result = try operationResultFromGitStdinCommand(std.testing.allocator, .{
+        .failed = .{ .stdin = .{
+            .err = error.WriteFailed,
+            .result = .{
+                .term = .{ .exited = 0 },
+                .stdout = stdout,
+                .stderr = stderr,
+            },
+        } },
+    }, "git apply --cached");
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .failed => |message| {
+            try std.testing.expect(std.mem.indexOf(u8, message, "WriteFailed") != null);
+            try std.testing.expect(std.mem.indexOf(u8, message, "exited = 0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, message, "warning: partial input") != null);
+        },
+        else => return error.ExpectedGitStdinFailure,
     }
 }
 

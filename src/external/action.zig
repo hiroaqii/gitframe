@@ -144,7 +144,7 @@ fn resultForRunFailure(allocator: std.mem.Allocator, failure_value: process_runn
     };
     return switch (failure) {
         .empty_argv, .spawn => .{ .spawn_failed = output },
-        .stdin, .capture, .wait => .{ .runner_failed = output },
+        .stdin_start, .stdin, .capture, .wait => .{ .runner_failed = output },
     };
 }
 
@@ -299,4 +299,17 @@ test "concurrent stdin ExternalAction releases evidence when message allocation 
             },
         },
     }));
+}
+
+test "stdin admission ExternalAction classifies concurrency start failure as runner failure" {
+    var result = try resultForRunFailure(std.testing.allocator, .{
+        .stdin_start = error.ConcurrencyUnavailable,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result == .runner_failed);
+    try std.testing.expectEqualStrings("", result.runner_failed.stdout);
+    try std.testing.expectEqualStrings("", result.runner_failed.stderr);
+    try std.testing.expect(result.runner_failed.term == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.runner_failed.message, "ConcurrencyUnavailable") != null);
 }
