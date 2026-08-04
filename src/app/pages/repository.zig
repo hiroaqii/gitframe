@@ -35,6 +35,11 @@ const repository_tree_projection = @import("repository/tree_projection.zig");
 const repository_view = @import("repository/view.zig");
 const text_projection = @import("../../text/projection.zig");
 
+const oversized_display_message = std.fmt.comptimePrint(
+    "File exceeds the {d} MiB display limit",
+    .{selected_document.max_text_mib},
+);
+
 pub const InputContext = repository_input.Context;
 
 pub const LoadState = enum { idle, no_repository, loading, loaded, empty, failed };
@@ -3575,13 +3580,17 @@ fn drawInertCheckpoint(value: selected_document.Value, surface: *chasen.Surface,
         .binary => "Binary file is not shown",
         .invalid_utf8 => "Non-UTF-8 file is not shown",
         .unsafe_control_text => "File contains unsupported control characters",
-        .oversized => "File exceeds the 1 MiB display limit",
+        .oversized => oversized_display_message,
         .directory_or_gitlink => "Submodule or directory is not shown",
         .named_pipe, .unix_socket, .block_device, .character_device, .unknown_special => "Special file is not shown",
         .missing_or_changed => "File changed or disappeared; press r to retry",
         .unreadable, .unsupported_platform => "Selected file could not be read",
     };
     draw.copyClippedTextAt(surface, 1, repository_source_geometry.source_body_first_row, label, palette.style(.muted)) catch {};
+}
+
+test "text limit contract repository oversized diagnostic" {
+    try std.testing.expectEqualStrings("File exceeds the 2 MiB display limit", oversized_display_message);
 }
 
 fn treeRowTextAlloc(

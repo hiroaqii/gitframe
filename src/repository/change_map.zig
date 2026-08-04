@@ -169,7 +169,7 @@ test "change map handles context deletion-only and deterministic overlapping sev
     try std.testing.expectEqual(Kind.none, map.row(2));
 }
 
-test "change map rejects multi-file and bounds retained rows" {
+test "text limit contract change map accepted row ceiling" {
     const patch =
         \\diff --git a/a b/a
         \\--- a/a

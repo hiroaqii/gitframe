@@ -283,7 +283,7 @@ test "repository source match window expands graphemes and preserves display col
     try std.testing.expectEqualStrings("x", after_wide.text);
 }
 
-test "repository source model enforces one MiB and newline dense bounds" {
+test "text limit contract repository source dense and long lines" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.alloc(u8, selected_document.max_text_bytes);
     @memset(bytes, '\n');
@@ -293,6 +293,13 @@ test "repository source model enforces one MiB and newline dense bounds" {
     try std.testing.expectEqual(selected_document.max_text_bytes, document.contentLineCount());
     try std.testing.expectEqual(@as(usize, 0), document.max_display_width);
     for (0..64) |_| try std.testing.expectEqual(@as(usize, 0), document.maxDisplayWidth());
+
+    const long_bytes = try allocator.alloc(u8, selected_document.max_text_bytes);
+    @memset(long_bytes, 'x');
+    var long_document = try Document.initOwned(allocator, long_bytes, content_fingerprint.Fingerprint.init(long_bytes));
+    defer long_document.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), long_document.rowCount());
+    try std.testing.expectEqual(selected_document.max_text_bytes, long_document.maxDisplayWidth());
 
     const oversized = try allocator.alloc(u8, selected_document.max_text_bytes + 1);
     defer allocator.free(oversized);

@@ -2,7 +2,7 @@
 //!
 //! Repository files may be newline-dense or capture-dense, so retaining one
 //! entry per source line or every raw provider capture would amplify a bounded
-//! 1 MiB source into unbounded page state. Only sanitized styled lines/spans
+//! source into unbounded page state. Only sanitized styled lines/spans
 //! survive here; task-local provider/query data is deliberately excluded.
 
 const std = @import("std");
@@ -240,8 +240,9 @@ test "source syntax is sparse and rejects non-grapheme token endpoints" {
     try std.testing.expectEqual(@as(usize, 0), spans.lineSpans(500_000).spans.len);
 }
 
-test "source syntax metadata limit fails atomically" {
+test "text limit contract source syntax metadata fallback" {
     const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), max_retained_bytes);
     const bytes = try allocator.dupe(u8, "a b c\n");
     var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
     defer document.deinit(allocator);

@@ -12,7 +12,8 @@ const content_fingerprint = @import("../content_fingerprint.zig");
 const root_capability = @import("../repo/root_capability.zig");
 const repository_path = @import("path.zig");
 
-pub const max_text_bytes: usize = 1024 * 1024;
+pub const max_text_mib: usize = 2;
+pub const max_text_bytes: usize = max_text_mib * 1024 * 1024;
 const max_symlink_target_bytes: usize = std.Io.Dir.max_path_bytes - 1;
 
 const MutationHook = struct {
@@ -664,7 +665,7 @@ test "repository document preserves negative proved timestamp as raw metadata" {
     try std.testing.expectEqual(@as(i96, -1), snapshot.metadata.?.modified_at.nanoseconds);
 }
 
-test "repository document enforces exact one MiB boundary" {
+test "text limit contract repository document exact boundary" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -694,32 +695,16 @@ test "repository document enforces exact one MiB boundary" {
     try std.testing.expect(over_snapshot.value == .oversized);
     const expected_over = try tmp.dir.statFile(io, "over.txt", .{});
     try std.testing.expectEqual(expected_over.mtime.nanoseconds, over_snapshot.metadata.?.modified_at.nanoseconds);
-}
 
-test "repository document oversized classification requires a stable second stat" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const over = try allocator.alloc(u8, max_text_bytes + 1);
-    defer allocator.free(over);
-    @memset(over, 'x');
-    try tmp.dir.writeFile(io, .{ .sub_path = "over.txt", .data = over });
-    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(root_path);
-    var root = try root_capability.RootCapability.openCanonical(root_path);
-    defer root.deinit();
     var mutation: RewriteAfterReadContext = .{};
-
-    var snapshot = loadWithHooks(root, "over.txt", allocator, io, .{ .before_regular_final_stat = .{
+    var changed_snapshot = loadWithHooks(root, "over.txt", allocator, io, .{ .before_regular_final_stat = .{
         .context = &mutation,
         .run = RewriteAfterReadContext.run,
     } });
-    defer snapshot.deinit(allocator);
+    defer changed_snapshot.deinit(allocator);
     try std.testing.expect(!mutation.failed);
-    try std.testing.expect(snapshot.value == .missing_or_changed);
-    try std.testing.expect(snapshot.metadata == null);
+    try std.testing.expect(changed_snapshot.value == .missing_or_changed);
+    try std.testing.expect(changed_snapshot.metadata == null);
 }
 
 test "repository document rejects intermediate symlink" {

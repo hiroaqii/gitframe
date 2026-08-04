@@ -16,7 +16,6 @@ const page = @import("page.zig");
 const projection_component = @import("projection_component.zig");
 const review_read_epoch = @import("review_read_epoch.zig");
 
-pub const max_generated_file_bytes = 1024 * 1024;
 pub const max_cached_entries = 4;
 pub const max_cached_retained_bytes = 32 * 1024 * 1024;
 

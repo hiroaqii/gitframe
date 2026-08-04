@@ -37,9 +37,13 @@ const LoadedDiff = loaded_diff.LoadedDiff;
 
 const status_line_stats_stdout_limit = 2 * 1024 * 1024;
 const status_line_stats_stderr_limit = 256 * 1024;
-const untracked_stats_per_file_bytes = review_projection.max_generated_file_bytes;
+const untracked_line_stats_per_file_bytes = 1024 * 1024;
 const untracked_stats_max_files = 256;
 const untracked_stats_total_bytes = 4 * 1024 * 1024;
+const generated_oversized_message = std.fmt.comptimePrint(
+    "File exceeds the {d} MiB preview limit.",
+    .{selected_document.max_text_mib},
+);
 
 /// Result payload sent from the asynchronous diff load task back to App.
 pub const DiffLoadFinished = struct {
@@ -1091,7 +1095,7 @@ fn collectUntrackedStatusLineStats(
     stats_map: *StatusStatsMap,
 ) !void {
     return collectUntrackedStatusLineStatsWithBudget(allocator, io, repo_root, document, stats_map, .{
-        .per_file_bytes = untracked_stats_per_file_bytes,
+        .per_file_bytes = untracked_line_stats_per_file_bytes,
         .max_files = untracked_stats_max_files,
         .total_bytes = untracked_stats_total_bytes,
     });
@@ -1890,7 +1894,7 @@ fn loadGeneratedAddedFile(
         .binary => return generatedStatusBody(allocator, request.path_key, "Binary file content is not shown."),
         .invalid_utf8 => return generatedStatusBody(allocator, request.path_key, "Invalid UTF-8 file content is not shown."),
         .unsafe_control_text => return generatedStatusBody(allocator, request.path_key, "Unsafe control characters are not shown."),
-        .oversized => return generatedStatusBody(allocator, request.path_key, "File exceeds the 1 MiB preview limit."),
+        .oversized => return generatedStatusBody(allocator, request.path_key, generated_oversized_message),
         .symlink => return generatedStatusBody(allocator, request.path_key, "Symbolic link content is not shown."),
         .directory_or_gitlink => return generatedStatusBody(allocator, request.path_key, "Directory content is not shown."),
         .named_pipe, .unix_socket, .block_device, .character_device, .unknown_special => return generatedStatusBody(allocator, request.path_key, "Special file content is not shown."),
@@ -2678,12 +2682,12 @@ test "stats-only repository read rejects stable symlink components" {
     const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo_root);
 
-    const content = try readRepoFileLimited(std.testing.allocator, io, repo_root, "inside.txt", review_projection.max_generated_file_bytes);
+    const content = try readRepoFileLimited(std.testing.allocator, io, repo_root, "inside.txt", untracked_line_stats_per_file_bytes);
     defer std.testing.allocator.free(content);
     try std.testing.expectEqualStrings("inside", content);
 
-    try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, repo_root, "linked.txt", review_projection.max_generated_file_bytes));
-    try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, repo_root, "linked-dir/inside.txt", review_projection.max_generated_file_bytes));
+    try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, repo_root, "linked.txt", untracked_line_stats_per_file_bytes));
+    try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, repo_root, "linked-dir/inside.txt", untracked_line_stats_per_file_bytes));
 }
 
 test "generated projection uses pinned safe source snapshot" {
@@ -2725,7 +2729,7 @@ test "generated projection uses pinned safe source snapshot" {
     }
 }
 
-test "generated projection keeps unsafe text inert and rejects another root identity" {
+test "text limit contract generated projection shared loader" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2769,6 +2773,67 @@ test "generated projection keeps unsafe text inert and rejects another root iden
         .failed_static => |message| std.mem.eql(u8, message, "Repository root changed"),
         else => false,
     });
+
+    const boundary_bytes = try allocator.alloc(u8, selected_document.max_text_bytes);
+    defer allocator.free(boundary_bytes);
+    @memset(boundary_bytes, 'x');
+    try first.dir.writeFile(io, .{ .sub_path = "boundary.zig", .data = boundary_bytes });
+    var boundary_request = try review_projection.testing.cloneRequestWithRootIdentity(
+        allocator,
+        page.RequestIdentity.review(1, 2),
+        4,
+        first_path,
+        "boundary.zig",
+        .generated_added_file,
+        .unstaged,
+        4,
+        5,
+        first_root.identity,
+    );
+    defer boundary_request.deinit(allocator);
+    var boundary = runReviewProjectionLoad(boundary_request, first_root, allocator, io);
+    defer boundary.deinit(allocator);
+    switch (boundary) {
+        .ready => |ready| switch (ready) {
+            .generated_added_file => |bundle| {
+                try std.testing.expectEqual(selected_document.max_text_bytes, bundle.source.bytes.len);
+                try std.testing.expectEqualSlices(u8, boundary_bytes, bundle.source.bytes);
+            },
+            else => return error.ExpectedGeneratedPreview,
+        },
+        else => return error.ExpectedGeneratedPreview,
+    }
+
+    const oversized_bytes = try allocator.alloc(u8, selected_document.max_text_bytes + 1);
+    defer allocator.free(oversized_bytes);
+    @memset(oversized_bytes, 'x');
+    try first.dir.writeFile(io, .{ .sub_path = "oversized.zig", .data = oversized_bytes });
+    var oversized_request = try review_projection.testing.cloneRequestWithRootIdentity(
+        allocator,
+        page.RequestIdentity.review(1, 2),
+        5,
+        first_path,
+        "oversized.zig",
+        .generated_added_file,
+        .unstaged,
+        4,
+        5,
+        first_root.identity,
+    );
+    defer oversized_request.deinit(allocator);
+    var oversized = runReviewProjectionLoad(oversized_request, first_root, allocator, io);
+    defer oversized.deinit(allocator);
+    switch (oversized) {
+        .ready => |ready| switch (ready) {
+            .status_body => |body| try std.testing.expectEqualStrings(generated_oversized_message, body.message),
+            else => return error.ExpectedOversizedPreview,
+        },
+        else => return error.ExpectedOversizedPreview,
+    }
+}
+
+test "text limit contract review generated oversized diagnostic" {
+    try std.testing.expectEqualStrings("File exceeds the 2 MiB preview limit.", generated_oversized_message);
 }
 
 test "addedFileLineCount uses diff stats semantics" {
@@ -2811,7 +2876,7 @@ test "collectUntrackedStatusLineStats skips binary and oversized files" {
     try tmp.dir.writeFile(io, .{ .sub_path = "one.txt", .data = "one\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "two.txt", .data = "two\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "binary.dat", .data = "a\x00b" });
-    const oversized = try std.testing.allocator.alloc(u8, untracked_stats_per_file_bytes + 1);
+    const oversized = try std.testing.allocator.alloc(u8, untracked_line_stats_per_file_bytes + 1);
     defer std.testing.allocator.free(oversized);
     @memset(oversized, 'x');
     try tmp.dir.writeFile(io, .{ .sub_path = "oversized.txt", .data = oversized });
@@ -2856,7 +2921,7 @@ test "collectUntrackedStatusLineStats consumes max-files budget for failed reads
     defer deinitStatusStatsMap(std.testing.allocator, &stats_map);
 
     try collectUntrackedStatusLineStatsWithBudget(std.testing.allocator, io, repo_root, document, &stats_map, .{
-        .per_file_bytes = untracked_stats_per_file_bytes,
+        .per_file_bytes = untracked_line_stats_per_file_bytes,
         .max_files = 2,
         .total_bytes = untracked_stats_total_bytes,
     });

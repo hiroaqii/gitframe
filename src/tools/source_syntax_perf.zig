@@ -10,10 +10,10 @@
 //!   zig build source-syntax-perf -Doptimize=ReleaseFast -- <file-a> <file-b> [iterations]
 
 const std = @import("std");
+const selected_document = @import("../repository/document.zig");
 const source_document = @import("../repository/source.zig");
 const source_adapter = @import("../syntax/source_flow_syntax.zig");
 
-const max_source_bytes = 1024 * 1024;
 const default_iterations = 7;
 const max_iterations = 31;
 
@@ -62,7 +62,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn readSource(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_source_bytes));
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(selected_document.max_text_bytes));
 }
 
 fn profileSource(
