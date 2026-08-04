@@ -103,6 +103,8 @@ const BranchStatusLoadFinished = app_load.BranchStatusLoadFinished;
 const BranchStatusLoadTask = app_load.BranchStatusLoadTask(App.Msg);
 const BranchListLoadFinished = app_load.BranchListLoadFinished;
 const BranchListLoadTask = app_load.BranchListLoadTask(App.Msg);
+const CompareLoadFinished = app_load.CompareLoadFinished;
+const CompareLoadTask = app_load.CompareLoadTask(App.Msg);
 const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
 const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
@@ -993,6 +995,9 @@ pub const App = struct {
                 .projection => |result| try self.finishReviewProjectionLoad(ctx, result),
                 .projection_syntax => |result| self.finishGeneratedProjectionSyntax(ctx, result),
             },
+            .compare => |compare_result| switch (compare_result) {
+                .source => |result| self.finishCompareLoad(ctx, result),
+            },
             .shell => |shell_result| switch (shell_result) {
                 .repo_path_discovery => |result| try self.finishRepoPathDiscovery(ctx, result),
                 .branch_list => |result| try self.finishBranchListLoad(ctx, result),
@@ -1001,6 +1006,16 @@ pub const App = struct {
                 .repo_discovery => |result| try self.finishRepoDiscovery(ctx, result),
             },
         }
+    }
+
+    fn finishCompareLoad(self: *App, ctx: *chasen.Ctx(Msg), result: CompareLoadFinished) void {
+        var finished = result;
+        defer finished.deinit(ctx.allocator());
+        _ = self.pages.compare.acceptLoadFinished(
+            ctx.allocator(),
+            self.repo_epoch,
+            &finished,
+        );
     }
 
     fn finishActionResult(self: *App, ctx: *chasen.Ctx(Msg), finished: ActionFinishedMsg) !void {
@@ -8303,6 +8318,52 @@ test "undelivered remaining read routes release owned payloads" {
         .result = .{ .failed = try allocator.dupe(u8, "branch list failed") },
     } } });
     branch_list_msg.deinitUndelivered(allocator);
+
+    var compare_msg = App.Msg.loadFinished(.{ .compare = .{ .source = .{
+        .identity = page.RequestIdentity.compare(3, 5),
+        .generation = 4,
+        .result = .{ .loaded = .{
+            .basis = .{
+                .base = .{
+                    .full_ref = try allocator.dupe(u8, "refs/heads/main"),
+                    .display_name = try allocator.dupe(u8, "main"),
+                    .kind = .local,
+                    .oid = .{},
+                },
+                .head_display = try allocator.dupe(u8, "feature"),
+                .merge_base_oid = .{},
+                .head_oid = .{},
+                .ahead_count = 1,
+            },
+            .diff = .empty,
+        } },
+    } } });
+    compare_msg.deinitUndelivered(allocator);
+}
+
+test "Compare load route admits failure intent through the Compare owner" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .repo_epoch = 12 };
+    defer app.pages.compare.deinit(allocator);
+    _ = app.pages.compare.activate(app.repo_epoch);
+    const request = app.pages.compare.beginRefresh().?;
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = .{
+        .identity = request.identity,
+        .generation = request.generation,
+        .result = .{ .basis_failed = .{
+            .kind = .missing_base_ref,
+            .attempted = .{
+                .full_ref = try allocator.dupe(u8, "refs/heads/gone"),
+                .display_name = try allocator.dupe(u8, "gone"),
+                .kind = .local,
+            },
+        } },
+    } } } }, &tc.ctx);
+
+    try std.testing.expectEqualStrings("gone", app.pages.compare.basis_failure.?.attempted.display_name);
 }
 
 test "undelivered plain root message is a no-op" {
