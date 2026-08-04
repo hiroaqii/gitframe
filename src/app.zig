@@ -105,6 +105,7 @@ const BranchListLoadFinished = app_load.BranchListLoadFinished;
 const BranchListLoadTask = app_load.BranchListLoadTask(App.Msg);
 const CompareLoadFinished = app_load.CompareLoadFinished;
 const CompareLoadTask = app_load.CompareLoadTask(App.Msg);
+const CompareBranchListFinished = app_load.CompareBranchListFinished;
 const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(App.Msg);
 const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
@@ -996,7 +997,8 @@ pub const App = struct {
                 .projection_syntax => |result| self.finishGeneratedProjectionSyntax(ctx, result),
             },
             .compare => |compare_result| switch (compare_result) {
-                .source => |result| self.finishCompareLoad(ctx, result),
+                .source => |result| try self.finishCompareLoad(ctx, result),
+                .branch_list => |result| self.finishCompareBranchList(ctx, result),
             },
             .shell => |shell_result| switch (shell_result) {
                 .repo_path_discovery => |result| try self.finishRepoPathDiscovery(ctx, result),
@@ -1008,14 +1010,26 @@ pub const App = struct {
         }
     }
 
-    fn finishCompareLoad(self: *App, ctx: *chasen.Ctx(Msg), result: CompareLoadFinished) void {
+    fn finishCompareLoad(self: *App, ctx: *chasen.Ctx(Msg), result: CompareLoadFinished) !void {
         var finished = result;
         defer finished.deinit(ctx.allocator());
-        _ = self.pages.compare.acceptLoadFinished(
+        _ = try self.pages.compare.applyLoadFinished(
             ctx.allocator(),
             self.repo_epoch,
+            self.activeRepoRoot(),
             &finished,
         );
+    }
+
+    fn finishCompareBranchList(self: *App, ctx: *chasen.Ctx(Msg), result: CompareBranchListFinished) void {
+        var finished = result;
+        defer finished.deinit(ctx.allocator());
+        if (!self.pages.compare.base_picker.acceptFinished(
+            ctx.allocator(),
+            self.repo_epoch,
+            &self.pages.compare.activation,
+            &finished,
+        )) self.redraw_plan.requestSkip();
     }
 
     fn finishActionResult(self: *App, ctx: *chasen.Ctx(Msg), finished: ActionFinishedMsg) !void {

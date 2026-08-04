@@ -1,8 +1,7 @@
 //! Retained state owner for the read-only Compare page.
 //!
-//! S3 installs the page identity and independent state skeleton. Loading,
-//! picker ownership, committed-diff rendering, and page-local input are wired
-//! by S4-S6; until then the shell renders the explicit not-loaded placeholder.
+//! The page owns an accepted basis and committed-diff body as one snapshot,
+//! plus independent navigation, picker, refresh, and deferred-apply state.
 
 const std = @import("std");
 const app_state = @import("../state.zig");
@@ -14,10 +13,125 @@ const page = @import("../page.zig");
 const diff_selection = @import("../../diff/selection.zig");
 const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
+const git_backend = @import("../../git/backend.zig");
 const review_state = @import("../../review/state.zig");
 
-/// S6 replaces this scaffold with the owned asynchronous picker state.
-pub const BasePickerState = struct {};
+pub const BasePickerRequest = struct {
+    identity: page.RequestIdentity,
+    generation: u64,
+};
+
+/// Page-owned modal list. Pending task ownership remains independent: closing
+/// advances the generation, while the eventual stale Finished owns cleanup.
+pub const BasePickerState = struct {
+    open: bool = false,
+    loading: bool = false,
+    generation: u64 = 0,
+    selected_index: usize = 0,
+    accepted: ?git_backend.BranchList = null,
+    failure: ?[]u8 = null,
+
+    pub fn begin(self: *BasePickerState, allocator: std.mem.Allocator, identity: page.RequestIdentity) BasePickerRequest {
+        self.clearAccepted(allocator);
+        self.clearFailure(allocator);
+        self.open = true;
+        self.loading = true;
+        self.selected_index = 0;
+        self.advanceGeneration();
+        return .{ .identity = identity, .generation = self.generation };
+    }
+
+    pub fn close(self: *BasePickerState, allocator: std.mem.Allocator) void {
+        self.clearAccepted(allocator);
+        self.clearFailure(allocator);
+        self.open = false;
+        self.loading = false;
+        self.selected_index = 0;
+        self.advanceGeneration();
+    }
+
+    pub fn moveSelection(self: *BasePickerState, delta: isize) void {
+        const list = self.accepted orelse return;
+        if (list.branches.len == 0) return;
+        if (delta < 0) {
+            self.selected_index = if (self.selected_index == 0) list.branches.len - 1 else self.selected_index - 1;
+        } else if (delta > 0) {
+            self.selected_index = (self.selected_index + 1) % list.branches.len;
+        }
+    }
+
+    pub fn markFailure(self: *BasePickerState, allocator: std.mem.Allocator, message: []const u8) void {
+        self.loading = false;
+        self.clearFailure(allocator);
+        self.failure = allocator.dupe(u8, message) catch null;
+    }
+
+    pub fn selectedTarget(self: *const BasePickerState, allocator: std.mem.Allocator) !?diff_basis.BaseTarget {
+        const list = self.accepted orelse return null;
+        if (self.selected_index >= list.branches.len) return null;
+        const item = list.branches[self.selected_index];
+        const full_ref = try allocator.dupe(u8, item.full_ref);
+        errdefer allocator.free(full_ref);
+        return .{
+            .full_ref = full_ref,
+            .display_name = try allocator.dupe(u8, item.name),
+            .kind = item.kind,
+        };
+    }
+
+    pub fn acceptFinished(
+        self: *BasePickerState,
+        allocator: std.mem.Allocator,
+        repo_epoch: u64,
+        activation: *const diff_surface.authority.Lifecycle,
+        finished: *app_load.CompareBranchListFinished,
+    ) bool {
+        if (!self.open or finished.generation != self.generation) return false;
+        if (!activation.acceptsRepoEpoch(finished.identity, repo_epoch)) return false;
+        const current = activation.currentIdentity() orelse return false;
+        if (!std.meta.eql(current, finished.identity)) return false;
+
+        self.loading = false;
+        self.clearFailure(allocator);
+        switch (finished.result) {
+            .loaded => |list| {
+                self.clearAccepted(allocator);
+                self.accepted = list;
+                finished.result = .empty;
+                const len = self.accepted.?.branches.len;
+                if (len == 0) self.selected_index = 0 else self.selected_index = @min(self.selected_index, len - 1);
+            },
+            .failed => |message| {
+                self.failure = message;
+                finished.result = .empty;
+            },
+            .failed_static => |message| self.failure = allocator.dupe(u8, message) catch null,
+            .empty => {},
+        }
+        return true;
+    }
+
+    pub fn deinit(self: *BasePickerState, allocator: std.mem.Allocator) void {
+        self.clearAccepted(allocator);
+        self.clearFailure(allocator);
+        self.* = .{};
+    }
+
+    fn clearAccepted(self: *BasePickerState, allocator: std.mem.Allocator) void {
+        if (self.accepted) |*list| list.deinit(allocator);
+        self.accepted = null;
+    }
+
+    fn clearFailure(self: *BasePickerState, allocator: std.mem.Allocator) void {
+        if (self.failure) |message| allocator.free(message);
+        self.failure = null;
+    }
+
+    fn advanceGeneration(self: *BasePickerState) void {
+        self.generation +%= 1;
+        if (self.generation == 0) self.generation = 1;
+    }
+};
 
 /// A live drag may defer an entire atomic Compare completion. This owner never
 /// splits basis from diff; replacement and page teardown release both through
@@ -76,6 +190,7 @@ pub const ComparePageState = struct {
     basis: ?diff_basis.BranchDiffBasis = null,
     base_target: ?diff_basis.BaseTarget = null,
     basis_failure: ?BasisFailureState = null,
+    load_failure: ?[]u8 = null,
     base_picker: BasePickerState = .{},
     refresh_generation: u64 = 0,
     deferred_load_apply: ?DeferredLoadApply = null,
@@ -94,23 +209,52 @@ pub const ComparePageState = struct {
         self.refresh_generation +%= 1;
         if (self.refresh_generation == 0) self.refresh_generation = 1;
         self.activation.markPending(.source);
+        if (!self.hasAcceptedDisplay()) {
+            self.load.clearCurrent(null);
+            self.load.state = .loading;
+        }
         return .{ .identity = identity, .generation = self.refresh_generation };
     }
 
-    /// Admission-only S5 handler. A loaded result deliberately stays in
-    /// `finished` so the shell's defer can release it immediately; S6 replaces
-    /// that terminal with the atomic page commit.
-    pub fn acceptLoadFinished(
+    /// A new request supersedes the previous terminal diagnostic while the
+    /// accepted basis and body remain visible as the refresh snapshot.
+    pub fn clearRefreshFailure(self: *ComparePageState, allocator: std.mem.Allocator) void {
+        self.clearBasisFailure(allocator);
+        self.clearLoadFailure(allocator);
+    }
+
+    pub fn beginBasePicker(self: *ComparePageState, allocator: std.mem.Allocator) ?BasePickerRequest {
+        const identity = self.activation.currentIdentity() orelse return null;
+        self.selection_owner = .none;
+        return self.base_picker.begin(allocator, identity);
+    }
+
+    pub fn closeBasePicker(self: *ComparePageState, allocator: std.mem.Allocator) void {
+        self.base_picker.close(allocator);
+    }
+
+    pub fn chooseBasePickerTarget(self: *ComparePageState, allocator: std.mem.Allocator) !bool {
+        var target = try self.base_picker.selectedTarget(allocator) orelse return false;
+        errdefer target.deinit(allocator);
+        self.base_picker.close(allocator);
+        if (self.base_target) |*old| old.deinit(allocator);
+        self.base_target = target;
+        return true;
+    }
+
+    pub fn applyLoadFinished(
         self: *ComparePageState,
         allocator: std.mem.Allocator,
         repo_epoch: u64,
+        repo_root: ?[]const u8,
         finished: *app_load.CompareLoadFinished,
-    ) LoadAcceptance {
+    ) !LoadAcceptance {
         if (!self.acceptsLoadFinished(repo_epoch, finished.*)) return .stale;
 
         return switch (finished.result) {
-            .loaded => result: {
-                self.clearBasisFailure(allocator);
+            .loaded => |*bundle| result: {
+                try self.commitLoaded(allocator, repo_root, bundle);
+                finished.result = .empty;
                 _ = self.activation.finishMember(finished.identity, .source, .fresh);
                 break :result .loaded;
             },
@@ -121,13 +265,47 @@ pub const ComparePageState = struct {
                     .attempted = failure.attempted,
                 };
                 finished.result = .empty;
+                self.clearLoadFailure(allocator);
                 _ = self.activation.finishMember(finished.identity, .source, .failed);
                 break :result .basis_failed;
             },
-            .failed, .failed_static, .empty => result: {
+            .failed => |message| result: {
+                self.replaceLoadFailure(allocator, message) catch {};
                 _ = self.activation.finishMember(finished.identity, .source, .failed);
                 break :result .failed;
             },
+            .failed_static => |message| result: {
+                self.replaceLoadFailure(allocator, message) catch {};
+                _ = self.activation.finishMember(finished.identity, .source, .failed);
+                break :result .failed;
+            },
+            .empty => result: {
+                _ = self.activation.finishMember(finished.identity, .source, .failed);
+                break :result .failed;
+            },
+        };
+    }
+
+    pub fn acceptsFinished(self: *const ComparePageState, repo_epoch: u64, finished: app_load.CompareLoadFinished) bool {
+        return self.acceptsLoadFinished(repo_epoch, finished);
+    }
+
+    pub fn takeRefreshAnchor(self: *ComparePageState) ?diff_surface.ReloadAnchor {
+        const anchor = self.refresh_anchor;
+        self.refresh_anchor = null;
+        return anchor;
+    }
+
+    pub fn replaceRefreshAnchor(self: *ComparePageState, allocator: std.mem.Allocator, anchor: ?diff_surface.ReloadAnchor) void {
+        if (self.refresh_anchor) |*old| old.deinit(allocator);
+        self.refresh_anchor = anchor;
+    }
+
+    pub fn hasAcceptedDisplay(self: *const ComparePageState) bool {
+        if (self.basis == null) return false;
+        return switch (self.load.state) {
+            .loaded, .empty => true,
+            .idle, .loading, .failed => false,
         };
     }
 
@@ -135,6 +313,28 @@ pub const ComparePageState = struct {
         if (request.generation != self.refresh_generation) return false;
         if (!self.activation.acceptsRepoEpoch(request.identity, repo_epoch)) return false;
         return self.activation.finishMember(request.identity, .source, .failed);
+    }
+
+    pub fn failRefresh(
+        self: *ComparePageState,
+        allocator: std.mem.Allocator,
+        request: RefreshRequest,
+        repo_epoch: u64,
+        message: []const u8,
+    ) void {
+        if (!self.rejectRefresh(request, repo_epoch)) return;
+        self.replaceLoadFailure(allocator, message) catch {};
+        if (self.refresh_anchor) |*anchor| anchor.deinit(allocator);
+        self.refresh_anchor = null;
+    }
+
+    pub fn markNoRepository(self: *ComparePageState, allocator: std.mem.Allocator) void {
+        self.load.replaceEmpty(allocator, .no_repository);
+        self.clearBasisFailure(allocator);
+        self.clearLoadFailure(allocator);
+        if (self.activation.currentIdentity()) |identity| {
+            _ = self.activation.finishMember(identity, .source, .failed);
+        }
     }
 
     pub fn replaceDeferredLoad(
@@ -162,6 +362,106 @@ pub const ComparePageState = struct {
         self.basis_failure = null;
     }
 
+    fn commitLoaded(
+        self: *ComparePageState,
+        allocator: std.mem.Allocator,
+        repo_root: ?[]const u8,
+        bundle: *app_load.CompareLoadedBundle,
+    ) !void {
+        const pair_changed = if (self.basis) |current|
+            !std.mem.eql(u8, current.merge_base_oid.slice(), bundle.basis.merge_base_oid.slice()) or
+                !std.mem.eql(u8, current.head_oid.slice(), bundle.basis.head_oid.slice())
+        else
+            true;
+
+        var default_target: ?diff_basis.BaseTarget = null;
+        errdefer if (default_target) |*target| target.deinit(allocator);
+        if (self.base_target == null) {
+            const full_ref = try allocator.dupe(u8, bundle.basis.base.full_ref);
+            const display_name = allocator.dupe(u8, bundle.basis.base.display_name) catch |err| {
+                allocator.free(full_ref);
+                return err;
+            };
+            default_target = .{
+                .full_ref = full_ref,
+                .display_name = display_name,
+                .kind = bundle.basis.base.kind,
+            };
+        }
+
+        var prepared_session: ?load_state.LoadedSession = null;
+        switch (bundle.diff) {
+            .empty => {},
+            .loaded => |*diff_bundle| {
+                const arena_allocator = diff_bundle.arena.?.allocator();
+                if (repo_root) |root| {
+                    diff_bundle.loaded.tree = try file_tree.buildWithOptions(
+                        arena_allocator,
+                        diff_bundle.loaded.document,
+                        null,
+                        .{ .root = .{ .name = std.fs.path.basename(root) } },
+                    );
+                }
+                const reviewed = try arena_allocator.alloc(bool, diff_bundle.loaded.document.files.len);
+                for (diff_bundle.loaded.document.files, 0..) |file, index| {
+                    reviewed[index] = if (pair_changed)
+                        false
+                    else
+                        try self.reviewed_store.containsFile(allocator, repo_root, file);
+                }
+                diff_bundle.loaded.reviewed_files = reviewed;
+                try diff_bundle.loaded.rebuildVisibleNodes(
+                    arena_allocator,
+                    self.review_display.hide_reviewed_files,
+                    self.review_display.changed_file_filter,
+                );
+                prepared_session = .{
+                    .arena = diff_bundle.takeArena(),
+                    .loaded = diff_bundle.loaded,
+                };
+            },
+        }
+        errdefer if (prepared_session) |*session| session.deinit(null);
+
+        self.file_search.deinit(allocator);
+        if (self.completed_selection) |*selection| selection.deinit(allocator);
+        self.completed_selection = null;
+        self.selection_owner = .none;
+        if (pair_changed) {
+            self.reviewed_store.deinit(allocator);
+            self.tree_order.reset(allocator);
+        }
+        if (self.basis) |*basis| basis.deinit(allocator);
+        self.basis = bundle.basis;
+        bundle.basis = undefined;
+
+        self.load.clearCurrent(allocator);
+        if (prepared_session) |session| {
+            self.load.state = .{ .loaded = session };
+            prepared_session = null;
+        } else {
+            self.load.state = .{ .empty = .no_changes };
+        }
+        if (default_target) |target| {
+            self.base_target = target;
+            default_target = null;
+        }
+        self.source_session_revision +%= 1;
+        self.clearBasisFailure(allocator);
+        self.clearLoadFailure(allocator);
+    }
+
+    fn replaceLoadFailure(self: *ComparePageState, allocator: std.mem.Allocator, message: []const u8) !void {
+        const copy = try allocator.dupe(u8, message);
+        self.clearLoadFailure(allocator);
+        self.load_failure = copy;
+    }
+
+    fn clearLoadFailure(self: *ComparePageState, allocator: std.mem.Allocator) void {
+        if (self.load_failure) |message| allocator.free(message);
+        self.load_failure = null;
+    }
+
     pub fn deinit(self: *ComparePageState, allocator: std.mem.Allocator) void {
         self.selection_owner = .none;
         if (self.completed_selection) |*selection| selection.deinit(allocator);
@@ -175,6 +475,8 @@ pub const ComparePageState = struct {
         if (self.basis) |*basis| basis.deinit(allocator);
         if (self.base_target) |*target| target.deinit(allocator);
         if (self.basis_failure) |*failure| failure.deinit(allocator);
+        if (self.load_failure) |message| allocator.free(message);
+        self.base_picker.deinit(allocator);
         if (self.deferred_load_apply) |*deferred| deferred.deinit(allocator);
         self.* = .{};
     }
@@ -338,7 +640,7 @@ test "Compare rejects a completion with stale repository epoch" {
     var finished = try failedFinished(allocator, page.RequestIdentity.compare(8, activation_id), request.generation, "old repo");
     defer finished.deinit(allocator);
 
-    try std.testing.expectEqual(LoadAcceptance.stale, state.acceptLoadFinished(allocator, 9, &finished));
+    try std.testing.expectEqual(LoadAcceptance.stale, try state.applyLoadFinished(allocator, 9, null, &finished));
 }
 
 test "Compare rejects a completion with stale activation" {
@@ -353,7 +655,7 @@ test "Compare rejects a completion with stale activation" {
     var finished = try failedFinished(allocator, page.RequestIdentity.compare(9, old_activation), current.generation, "old activation");
     defer finished.deinit(allocator);
 
-    try std.testing.expectEqual(LoadAcceptance.stale, state.acceptLoadFinished(allocator, 9, &finished));
+    try std.testing.expectEqual(LoadAcceptance.stale, try state.applyLoadFinished(allocator, 9, null, &finished));
 }
 
 test "Compare rejects a completion with stale generation" {
@@ -365,7 +667,7 @@ test "Compare rejects a completion with stale generation" {
     var finished = try failedFinished(allocator, request.identity, request.generation + 1, "old generation");
     defer finished.deinit(allocator);
 
-    try std.testing.expectEqual(LoadAcceptance.stale, state.acceptLoadFinished(allocator, 9, &finished));
+    try std.testing.expectEqual(LoadAcceptance.stale, try state.applyLoadFinished(allocator, 9, null, &finished));
 }
 
 test "Compare replacement makes the older pending completion stale" {
@@ -380,8 +682,8 @@ test "Compare replacement makes the older pending completion stale" {
     var current_finished = try failedFinished(allocator, replacement.identity, replacement.generation, "current");
     defer current_finished.deinit(allocator);
 
-    try std.testing.expectEqual(LoadAcceptance.stale, state.acceptLoadFinished(allocator, 4, &old_finished));
-    try std.testing.expectEqual(LoadAcceptance.failed, state.acceptLoadFinished(allocator, 4, &current_finished));
+    try std.testing.expectEqual(LoadAcceptance.stale, try state.applyLoadFinished(allocator, 4, null, &old_finished));
+    try std.testing.expectEqual(LoadAcceptance.failed, try state.applyLoadFinished(allocator, 4, null, &current_finished));
 }
 
 test "Compare moves attempted failure, replaces it, and clears it on success" {
@@ -393,24 +695,23 @@ test "Compare moves attempted failure, replaces it, and clears it on success" {
     const first = state.beginRefresh().?;
     var first_finished = try basisFailedFinished(allocator, first.identity, first.generation, "missing-a");
     defer first_finished.deinit(allocator);
-    try std.testing.expectEqual(LoadAcceptance.basis_failed, state.acceptLoadFinished(allocator, 6, &first_finished));
+    try std.testing.expectEqual(LoadAcceptance.basis_failed, try state.applyLoadFinished(allocator, 6, null, &first_finished));
     try std.testing.expect(first_finished.result == .empty);
     try std.testing.expectEqualStrings("missing-a", state.basis_failure.?.attempted.display_name);
 
     const second = state.beginRefresh().?;
     var second_finished = try basisFailedFinished(allocator, second.identity, second.generation, "missing-b");
     defer second_finished.deinit(allocator);
-    try std.testing.expectEqual(LoadAcceptance.basis_failed, state.acceptLoadFinished(allocator, 6, &second_finished));
+    try std.testing.expectEqual(LoadAcceptance.basis_failed, try state.applyLoadFinished(allocator, 6, null, &second_finished));
     try std.testing.expectEqualStrings("missing-b", state.basis_failure.?.attempted.display_name);
 
     const third = state.beginRefresh().?;
     var success = try loadedFinished(allocator, third.identity, third.generation);
     defer success.deinit(allocator);
-    try std.testing.expectEqual(LoadAcceptance.loaded, state.acceptLoadFinished(allocator, 6, &success));
+    try std.testing.expectEqual(LoadAcceptance.loaded, try state.applyLoadFinished(allocator, 6, null, &success));
     try std.testing.expect(state.basis_failure == null);
-    // S5 admission intentionally leaves the atomic loaded bundle in Finished;
-    // the defer above is its one terminal cleanup until S6 installs it.
-    try std.testing.expect(success.result == .loaded);
+    try std.testing.expect(success.result == .empty);
+    try std.testing.expect(state.basis != null);
 }
 
 test "Compare deferred completion replacement and page deinit release exactly once" {
@@ -421,4 +722,210 @@ test "Compare deferred completion replacement and page deinit release exactly on
     state.replaceDeferredLoad(allocator, try failedFinished(allocator, request.identity, request.generation, "first"));
     state.replaceDeferredLoad(allocator, try failedFinished(allocator, request.identity, request.generation, "second"));
     state.deinit(allocator);
+}
+
+const compare_test_diff =
+    "diff --git a/src/old.zig b/src/old.zig\n" ++
+    "--- a/src/old.zig\n" ++
+    "+++ b/src/old.zig\n" ++
+    "@@ -1 +1 @@\n" ++
+    "-old\n" ++
+    "+new\n";
+
+fn testOid(byte: u8) diff_basis.Oid {
+    var result: diff_basis.Oid = .{ .len = 40 };
+    @memset(result.bytes[0..40], byte);
+    return result;
+}
+
+fn loadedDiffFinished(
+    allocator: std.mem.Allocator,
+    identity: page.RequestIdentity,
+    generation: u64,
+    base_byte: u8,
+    head_byte: u8,
+    path_diff: []const u8,
+) !app_load.CompareLoadFinished {
+    const full_ref = try allocator.dupe(u8, "refs/heads/main");
+    errdefer allocator.free(full_ref);
+    const display_name = try allocator.dupe(u8, "main");
+    errdefer allocator.free(display_name);
+    const head_display = try allocator.dupe(u8, "feature");
+    errdefer allocator.free(head_display);
+    return .{
+        .identity = identity,
+        .generation = generation,
+        .result = .{ .loaded = .{
+            .basis = .{
+                .base = .{
+                    .full_ref = full_ref,
+                    .display_name = display_name,
+                    .kind = .local,
+                    .oid = testOid(base_byte),
+                },
+                .head_display = head_display,
+                .merge_base_oid = testOid(base_byte),
+                .head_oid = testOid(head_byte),
+                .ahead_count = 1,
+            },
+            .diff = .{ .loaded = try app_load.buildLoadedBundle(allocator, path_diff) },
+        } },
+    };
+}
+
+test "Compare loaded acceptance atomically installs matching basis and diff" {
+    const allocator = std.testing.allocator;
+    var state: ComparePageState = .{};
+    defer state.deinit(allocator);
+    _ = state.activate(5);
+    const request = state.beginRefresh().?;
+    var finished = try loadedDiffFinished(allocator, request.identity, request.generation, 'a', 'b', compare_test_diff);
+    defer finished.deinit(allocator);
+
+    try std.testing.expectEqual(LoadAcceptance.loaded, try state.applyLoadFinished(allocator, 5, "/work/gitframe", &finished));
+    try std.testing.expectEqualStrings("main", state.basis.?.base.display_name);
+    try std.testing.expectEqualStrings("refs/heads/main", state.base_target.?.full_ref);
+    const loaded = switch (state.load.state) {
+        .loaded => |session| session.loaded,
+        else => return error.ExpectedLoadedCompare,
+    };
+    try std.testing.expectEqual(@as(usize, 1), loaded.document.files.len);
+    try std.testing.expectEqualStrings("b/src/old.zig", loaded.document.files[0].new_path.?);
+    try std.testing.expectEqual(file_tree.Node.Kind.repo_root, loaded.tree.nodes[0].kind);
+    try std.testing.expectEqualStrings("gitframe", loaded.tree.nodes[0].name);
+    try std.testing.expect(finished.result == .empty);
+}
+
+test "Compare viewed store retains only for the same accepted oid pair" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { base: u8, head: u8, retained: bool }{
+        .{ .base = 'a', .head = 'b', .retained = true },
+        .{ .base = 'd', .head = 'b', .retained = false },
+        .{ .base = 'a', .head = 'e', .retained = false },
+    };
+
+    for (cases) |case| {
+        var state: ComparePageState = .{};
+        defer state.deinit(allocator);
+        _ = state.activate(7);
+        const first = state.beginRefresh().?;
+        var first_finished = try loadedDiffFinished(allocator, first.identity, first.generation, 'a', 'b', compare_test_diff);
+        defer first_finished.deinit(allocator);
+        _ = try state.applyLoadFinished(allocator, 7, "/repo", &first_finished);
+        const first_loaded = switch (state.load.state) {
+            .loaded => |*session| &session.loaded,
+            else => return error.ExpectedLoadedCompare,
+        };
+        try state.reviewed_store.set(allocator, "/repo", first_loaded.document.files[0], true);
+        first_loaded.reviewed_files[0] = true;
+
+        const second = state.beginRefresh().?;
+        var second_finished = try loadedDiffFinished(allocator, second.identity, second.generation, case.base, case.head, compare_test_diff);
+        defer second_finished.deinit(allocator);
+        _ = try state.applyLoadFinished(allocator, 7, "/repo", &second_finished);
+        const second_loaded = switch (state.load.state) {
+            .loaded => |*session| &session.loaded,
+            else => return error.ExpectedLoadedCompare,
+        };
+        try std.testing.expectEqual(case.retained, second_loaded.reviewed_files[0]);
+        try std.testing.expectEqual(
+            case.retained,
+            try state.reviewed_store.containsFile(allocator, "/repo", second_loaded.document.files[0]),
+        );
+    }
+}
+
+test "Compare failed replacement preserves accepted display and attempted intent" {
+    const allocator = std.testing.allocator;
+    var state: ComparePageState = .{};
+    defer state.deinit(allocator);
+    _ = state.activate(9);
+    const initial = state.beginRefresh().?;
+    var initial_finished = try loadedDiffFinished(allocator, initial.identity, initial.generation, 'a', 'b', compare_test_diff);
+    defer initial_finished.deinit(allocator);
+    _ = try state.applyLoadFinished(allocator, 9, "/repo", &initial_finished);
+
+    if (state.base_target) |*target| target.deinit(allocator);
+    state.base_target = .{
+        .full_ref = try allocator.dupe(u8, "refs/heads/topic"),
+        .display_name = try allocator.dupe(u8, "topic"),
+        .kind = .local,
+    };
+    const retry = state.beginRefresh().?;
+    var failure = try basisFailedFinished(allocator, retry.identity, retry.generation, "topic");
+    defer failure.deinit(allocator);
+    try std.testing.expectEqual(LoadAcceptance.basis_failed, try state.applyLoadFinished(allocator, 9, "/repo", &failure));
+
+    try std.testing.expectEqualStrings("main", state.basis.?.base.display_name);
+    try std.testing.expect(state.load.state == .loaded);
+    try std.testing.expectEqualStrings("topic", state.basis_failure.?.attempted.display_name);
+    try std.testing.expectEqualStrings("topic", state.base_target.?.display_name);
+}
+
+fn testBranchList(allocator: std.mem.Allocator, name: []const u8) !git_backend.BranchList {
+    const branches = try allocator.alloc(git_backend.BranchListItem, 1);
+    errdefer allocator.free(branches);
+    branches[0] = .{
+        .full_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name}),
+        .name = try allocator.dupe(u8, name),
+        .kind = .local,
+        .oid = try allocator.dupe(u8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .current = false,
+    };
+    return .{ .branches = branches };
+}
+
+test "Compare base picker replacement close and selection have one owner" {
+    const allocator = std.testing.allocator;
+    var state: ComparePageState = .{};
+    defer state.deinit(allocator);
+    _ = state.activate(11);
+
+    const first = state.beginBasePicker(allocator).?;
+    var first_finished: app_load.CompareBranchListFinished = .{
+        .identity = first.identity,
+        .generation = first.generation,
+        .result = .{ .loaded = try testBranchList(allocator, "main") },
+    };
+    defer first_finished.deinit(allocator);
+    try std.testing.expect(state.base_picker.acceptFinished(allocator, 11, &state.activation, &first_finished));
+    try std.testing.expect(first_finished.result == .empty);
+
+    const replacement = state.beginBasePicker(allocator).?;
+    try std.testing.expect(state.base_picker.accepted == null);
+    var stale: app_load.CompareBranchListFinished = .{
+        .identity = first.identity,
+        .generation = first.generation,
+        .result = .{ .loaded = try testBranchList(allocator, "stale") },
+    };
+    defer stale.deinit(allocator);
+    try std.testing.expect(!state.base_picker.acceptFinished(allocator, 11, &state.activation, &stale));
+
+    var wrong_epoch: app_load.CompareBranchListFinished = .{
+        .identity = replacement.identity,
+        .generation = replacement.generation,
+        .result = .{ .loaded = try testBranchList(allocator, "wrong-epoch") },
+    };
+    defer wrong_epoch.deinit(allocator);
+    try std.testing.expect(!state.base_picker.acceptFinished(allocator, 12, &state.activation, &wrong_epoch));
+
+    var wrong_activation: app_load.CompareBranchListFinished = .{
+        .identity = page.RequestIdentity.compare(11, replacement.identity.activation_id + 1),
+        .generation = replacement.generation,
+        .result = .{ .loaded = try testBranchList(allocator, "wrong-activation") },
+    };
+    defer wrong_activation.deinit(allocator);
+    try std.testing.expect(!state.base_picker.acceptFinished(allocator, 11, &state.activation, &wrong_activation));
+
+    var replacement_finished: app_load.CompareBranchListFinished = .{
+        .identity = replacement.identity,
+        .generation = replacement.generation,
+        .result = .{ .loaded = try testBranchList(allocator, "topic") },
+    };
+    defer replacement_finished.deinit(allocator);
+    try std.testing.expect(state.base_picker.acceptFinished(allocator, 11, &state.activation, &replacement_finished));
+    try std.testing.expect(try state.chooseBasePickerTarget(allocator));
+    try std.testing.expect(!state.base_picker.open);
+    try std.testing.expect(state.base_picker.accepted == null);
+    try std.testing.expectEqualStrings("refs/heads/topic", state.base_target.?.full_ref);
 }

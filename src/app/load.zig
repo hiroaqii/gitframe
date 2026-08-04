@@ -138,6 +138,17 @@ pub const CompareLoadFinished = struct {
     }
 };
 
+pub const CompareBranchListFinished = struct {
+    identity: page.RequestIdentity,
+    generation: u64,
+    result: BranchListLoadTaskResult,
+
+    pub fn deinit(self: *CompareBranchListFinished, allocator: std.mem.Allocator) void {
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const ReviewProjectionFinished = review_projection.Finished;
 
 /// Read results whose acceptance and retained state belong to the Review page.
@@ -161,6 +172,7 @@ pub const ReviewReadFinished = union(enum) {
 /// Read results whose acceptance and retained state belong to Compare.
 pub const CompareReadFinished = union(enum) {
     source: CompareLoadFinished,
+    branch_list: CompareBranchListFinished,
 
     pub fn deinit(self: *CompareReadFinished, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -739,6 +751,61 @@ pub fn CompareLoadTask(comptime Msg: type) type {
     };
 }
 
+/// Compare-owned asynchronous branch-list read. The task snapshots the
+/// physical repository descriptor before spawn and never reopens cwd text.
+pub fn CompareBranchListLoadTask(comptime Msg: type) type {
+    return struct {
+        identity: page.RequestIdentity,
+        generation: u64,
+        root: root_capability.RootCapability,
+        env_map: ?*const std.process.Environ.Map,
+
+        pub fn init(
+            identity: page.RequestIdentity,
+            generation: u64,
+            root: root_capability.RootCapability,
+            env_map: ?*const std.process.Environ.Map,
+        ) !@This() {
+            return .{
+                .identity = identity,
+                .generation = generation,
+                .root = try root.duplicate(),
+                .env_map = env_map,
+            };
+        }
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, runCompareBranchListLoad(
+                task.root.dir(),
+                task.env_map,
+                allocator,
+                io,
+            ));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
+
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: BranchListLoadTaskResult) Msg {
+            defer allocator.destroy(task);
+            task.root.deinit();
+            return Msg.loadFinished(.{ .compare = .{ .branch_list = .{
+                .identity = task.identity,
+                .generation = task.generation,
+                .result = result,
+            } } });
+        }
+    };
+}
+
 pub fn ReviewProjectionTask(comptime Msg: type) type {
     return struct {
         request: review_projection.Request,
@@ -1119,7 +1186,8 @@ fn nextZField(text: []const u8, offset: *usize) ?[]const u8 {
 
 pub fn runBranchListLoad(repo_root: []const u8, allocator: std.mem.Allocator, io: std.Io) BranchListLoadTaskResult {
     const raw_result = git_backend.LocalCommandBackend.loadBranchList(allocator, io, .{
-        .repo_root = repo_root,
+        .cwd = .{ .path = repo_root },
+        .environment = .inherited,
         .scope = .local,
     }) catch |err| {
         return .{
@@ -1133,6 +1201,30 @@ pub fn runBranchListLoad(repo_root: []const u8, allocator: std.mem.Allocator, io
         .failed => |message| return .{ .failed = message },
         .failed_static => |message| return .{ .failed_static = message },
     }
+}
+
+pub fn runCompareBranchListLoad(
+    cwd: std.Io.Dir,
+    env_map: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) BranchListLoadTaskResult {
+    const raw_result = git_backend.LocalCommandBackend.loadBranchList(allocator, io, .{
+        .cwd = .{ .dir = cwd },
+        .environment = .{ .controlled = env_map },
+        .scope = .local_and_remote,
+    }) catch |err| {
+        return .{
+            .failed = std.fmt.allocPrint(allocator, "Compare base list failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Compare base list failed: OutOfMemory" },
+        };
+    };
+
+    return switch (raw_result) {
+        .ok => |list| .{ .loaded = list },
+        .failed => |message| .{ .failed = message },
+        .failed_static => |message| .{ .failed_static = message },
+    };
 }
 
 /// Run the single structured Compare backend operation and translate its raw
@@ -2980,6 +3072,7 @@ test "CompareLoadTask owns cloned target and routes failed terminal to Compare" 
     var finished = switch (message.load) {
         .compare => |compare| switch (compare) {
             .source => |payload| payload,
+            .branch_list => return error.UnexpectedReadRoute,
         },
         else => return error.UnexpectedReadRoute,
     };
@@ -3020,6 +3113,105 @@ test "CompareLoadTask destroy releases cloned spawn payload" {
     const task = try allocator.create(Task);
     task.* = try Task.init(page.RequestIdentity.compare(1, 1), 1, root, target, null, allocator);
     Task.destroy(task, allocator);
+}
+
+test "CompareBranchListLoadTask routes its terminal and destroy closes descriptor ownership" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const TestMsg = union(enum) {
+        load: ReadFinished,
+
+        pub fn loadFinished(msg: ReadFinished) @This() {
+            return .{ .load = msg };
+        }
+    };
+    const Task = CompareBranchListLoadTask(TestMsg);
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    var root = try root_capability.RootCapability.openCanonical(root_path);
+    defer root.deinit();
+
+    const terminal_task = try allocator.create(Task);
+    terminal_task.* = try Task.init(page.RequestIdentity.compare(7, 8), 9, root, null);
+    const message = Task.failed(terminal_task, .{ .start_failed = "SystemResources" }, allocator);
+    var finished = switch (message.load) {
+        .compare => |compare| switch (compare) {
+            .branch_list => |payload| payload,
+            .source => return error.UnexpectedReadRoute,
+        },
+        else => return error.UnexpectedReadRoute,
+    };
+    defer finished.deinit(allocator);
+    try std.testing.expectEqual(page.RequestIdentity.compare(7, 8), finished.identity);
+    try std.testing.expectEqual(@as(u64, 9), finished.generation);
+    try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
+        .failed_static => |value| value,
+        else => return error.UnexpectedResult,
+    });
+
+    const destroyed_task = try allocator.create(Task);
+    destroyed_task.* = try Task.init(page.RequestIdentity.compare(1, 2), 3, root, null);
+    Task.destroy(destroyed_task, allocator);
+}
+
+test "CompareBranchListLoadTask keeps physical root and controlled environment after path replacement" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const TestMsg = union(enum) {
+        load: ReadFinished,
+
+        pub fn loadFinished(msg: ReadFinished) @This() {
+            return .{ .load = msg };
+        }
+    };
+    const Task = CompareBranchListLoadTask(TestMsg);
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "repo", .default_dir);
+    var repo = try tmp.dir.openDir(io, "repo", .{});
+    defer repo.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=pinned" }, repo);
+    try repo.writeFile(io, .{ .sub_path = "base.txt", .data = "base\n" });
+    try runTestGit(io, &.{ "git", "add", "base.txt" }, repo);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, repo);
+    const root_path = try repo.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    var root = try root_capability.RootCapability.openCanonical(root_path);
+    defer root.deinit();
+    var injected_env = std.process.Environ.Map.init(allocator);
+    defer injected_env.deinit();
+    try injected_env.put("GIT_DIR", "/definitely/not/the/pinned/repository");
+
+    const task = try allocator.create(Task);
+    task.* = try Task.init(page.RequestIdentity.compare(2, 3), 4, root, &injected_env);
+    try tmp.dir.rename("repo", tmp.dir, "pinned-repo", io);
+    try tmp.dir.createDir(io, "repo", .default_dir);
+    var replacement = try tmp.dir.openDir(io, "repo", .{});
+    defer replacement.close(io);
+    try replacement.writeFile(io, .{ .sub_path = ".git", .data = "invalid replacement gitfile\n" });
+
+    const message = Task.run(task, allocator, io);
+    var finished = switch (message.load) {
+        .compare => |compare| switch (compare) {
+            .branch_list => |payload| payload,
+            .source => return error.UnexpectedReadRoute,
+        },
+        else => return error.UnexpectedReadRoute,
+    };
+    defer finished.deinit(allocator);
+    const list = switch (finished.result) {
+        .loaded => |value| value,
+        else => return error.ExpectedBranchList,
+    };
+    var found_pinned = false;
+    for (list.branches) |branch| {
+        if (std.mem.eql(u8, branch.full_ref, "refs/heads/pinned")) found_pinned = true;
+    }
+    try std.testing.expect(found_pinned);
 }
 
 test "Compare task translation keeps basis failure kinds and attempted target" {
@@ -3106,6 +3298,7 @@ test "CompareLoadTask duplicate retains physical root after path replacement" {
     var finished = switch (message.load) {
         .compare => |compare| switch (compare) {
             .source => |payload| payload,
+            .branch_list => return error.UnexpectedReadRoute,
         },
         else => return error.UnexpectedReadRoute,
     };

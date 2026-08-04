@@ -8,6 +8,7 @@ const repository_change_map = @import("../repository/change_map.zig");
 pub const max_diff_bytes = 16 * 1024 * 1024;
 pub const max_status_bytes = 8 * 1024 * 1024;
 pub const max_repository_manifest_bytes = 16 * 1024 * 1024;
+pub const max_branch_list_bytes = 4 * 1024 * 1024;
 
 pub const LoadError = error{
     StreamTooLong,
@@ -274,8 +275,20 @@ pub const BranchListScope = enum {
     local_and_remote,
 };
 
+pub const BranchListEnvironment = union(enum) {
+    /// Legacy shell branch switching keeps the process environment unchanged.
+    inherited,
+    /// Repository-sensitive callers clone this parent and remove every GIT_*
+    /// override before invoking Git. Null means a deliberately empty parent.
+    controlled: ?*const std.process.Environ.Map,
+};
+
 pub const BranchListRequest = struct {
-    repo_root: []const u8,
+    /// Borrowed physical repository authority kept alive for this complete
+    /// synchronous snapshot. Path authority remains available for the legacy
+    /// shell branch-switch caller; Compare supplies a descriptor.
+    cwd: BranchStatusCwd,
+    environment: BranchListEnvironment,
     scope: BranchListScope,
 };
 
@@ -1914,7 +1927,7 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: Branch
     defer env.deinit();
 
     const head_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
-    const head_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &head_argv);
+    const head_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &head_argv, .limited(4 * 1024));
     defer head_result.deinit(allocator);
 
     switch (head_result.term) {
@@ -1927,7 +1940,7 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: Branch
     }
 
     const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
-    const oid_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &oid_argv);
+    const oid_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &oid_argv, .limited(4 * 1024));
     defer oid_result.deinit(allocator);
     switch (oid_result.term) {
         .exited => |code| if (code == 0) {
@@ -1937,7 +1950,7 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: Branch
     }
 
     const upstream_argv = [_][]const u8{ "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}" };
-    const upstream_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &upstream_argv);
+    const upstream_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &upstream_argv, .limited(4 * 1024));
     defer upstream_result.deinit(allocator);
     var has_upstream = false;
     switch (upstream_result.term) {
@@ -1953,7 +1966,7 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: Branch
 
     if (has_upstream) {
         const ab_argv = [_][]const u8{ "git", "rev-list", "--left-right", "--count", "HEAD...@{upstream}" };
-        const ab_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &ab_argv);
+        const ab_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &ab_argv, .limited(4 * 1024));
         defer ab_result.deinit(allocator);
         switch (ab_result.term) {
             .exited => |code| if (code == 0) {
@@ -1970,16 +1983,36 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: Branch
 }
 
 fn loadGitBranchList(allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
+    return loadGitBranchListWithLimit(allocator, io, request, .limited(max_branch_list_bytes));
+}
+
+fn loadGitBranchListWithLimit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: BranchListRequest,
+    list_stdout_limit: std.Io.Limit,
+) LoadError!BranchListLoadResult {
+    const cwd: std.process.Child.Cwd = switch (request.cwd) {
+        .path => |path| .{ .path = path },
+        .dir => |dir| .{ .dir = dir },
+    };
+    var controlled_env: ?std.process.Environ.Map = switch (request.environment) {
+        .inherited => null,
+        .controlled => |parent| try controlledGitEnvironment(allocator, parent),
+    };
+    defer if (controlled_env) |*env| env.deinit();
+    const env: ?*const std.process.Environ.Map = if (controlled_env) |*value| value else null;
+
     const current_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
-    const current_result = try runGitBranchStatusCommand(allocator, io, request.repo_root, &current_argv);
+    const current_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, env, &current_argv, .limited(4 * 1024));
     defer current_result.deinit(allocator);
 
     const format = "--format=%(refname)%00%(refname:short)%00%(objectname)%00%(symref)%00";
     const local_argv = [_][]const u8{ "git", "for-each-ref", format, "refs/heads" };
     const all_argv = [_][]const u8{ "git", "for-each-ref", format, "refs/heads", "refs/remotes" };
     const list_result = switch (request.scope) {
-        .local => try runGitBranchStatusCommand(allocator, io, request.repo_root, &local_argv),
-        .local_and_remote => try runGitBranchStatusCommand(allocator, io, request.repo_root, &all_argv),
+        .local => try runGitBranchStatusCommandInCwd(allocator, io, cwd, env, &local_argv, list_stdout_limit),
+        .local_and_remote => try runGitBranchStatusCommandInCwd(allocator, io, cwd, env, &all_argv, list_stdout_limit),
     };
     defer list_result.deinit(allocator);
 
@@ -2706,7 +2739,7 @@ fn branchListCommandFailure(allocator: std.mem.Allocator, result: process_runner
 }
 
 fn runGitBranchStatusCommand(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!process_runner.Result {
-    return runGitBranchStatusCommandInCwd(allocator, io, .{ .path = repo_root }, null, argv);
+    return runGitBranchStatusCommandInCwd(allocator, io, .{ .path = repo_root }, null, argv, .limited(4 * 1024));
 }
 
 fn runGitBranchStatusCommandInCwd(
@@ -2715,12 +2748,13 @@ fn runGitBranchStatusCommandInCwd(
     cwd: std.process.Child.Cwd,
     environ_map: ?*const std.process.Environ.Map,
     argv: []const []const u8,
+    stdout_limit: std.Io.Limit,
 ) LoadError!process_runner.Result {
     return process_runner.runCaptured(allocator, io, .{
         .argv = argv,
         .cwd = cwd,
         .environ_map = environ_map,
-        .stdout_limit = .limited(4 * 1024),
+        .stdout_limit = stdout_limit,
         .stderr_limit = .limited(16 * 1024),
     }) catch |err| return runnerErrorToLoadError(err);
 }
@@ -4425,7 +4459,8 @@ test "LocalCommandBackend loads local branch list without record separator newli
     defer fixture.deinit();
 
     const result = try LocalCommandBackend.loadBranchList(std.testing.allocator, io, .{
-        .repo_root = fixture.repo_root,
+        .cwd = .{ .path = fixture.repo_root },
+        .environment = .inherited,
         .scope = .local,
     });
     defer result.deinit(std.testing.allocator);
@@ -4464,7 +4499,8 @@ test "LocalCommandBackend loads distinct local and remote refs and excludes ever
     try runTestGit(io, &.{ "git", "symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/main" }, work);
 
     const result = try LocalCommandBackend.loadBranchList(std.testing.allocator, io, .{
-        .repo_root = fixture.repo_root,
+        .cwd = .{ .path = fixture.repo_root },
+        .environment = .inherited,
         .scope = .local_and_remote,
     });
     defer result.deinit(std.testing.allocator);
@@ -4493,6 +4529,73 @@ test "LocalCommandBackend loads distinct local and remote refs and excludes ever
     try std.testing.expect(!remote_collision.current);
     try std.testing.expect(branchByFullRef(list.branches, "refs/remotes/origin/HEAD") == null);
     try std.testing.expect(branchByFullRef(list.branches, "refs/remotes/upstream/HEAD") == null);
+}
+
+test "LocalCommandBackend loads a local and remote branch list larger than four KiB" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupBranchSwitchFixture(io, &tmp);
+    defer fixture.deinit();
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+
+    const remote_ref_count = 80;
+    var ref_buffer: [160]u8 = undefined;
+    for (0..remote_ref_count) |index| {
+        const full_ref = try std.fmt.bufPrint(
+            &ref_buffer,
+            "refs/remotes/origin/feature-{d}-with-a-realistic-name-for-compare-picker",
+            .{index},
+        );
+        try runTestGit(io, &.{ "git", "update-ref", full_ref, fixture.main_oid }, work);
+    }
+    try runTestGit(io, &.{ "git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main" }, work);
+
+    const result = try LocalCommandBackend.loadBranchList(std.testing.allocator, io, .{
+        .cwd = .{ .path = fixture.repo_root },
+        .environment = .inherited,
+        .scope = .local_and_remote,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    const list = switch (result) {
+        .ok => |value| value,
+        .failed, .failed_static => return error.ExpectedBranchList,
+    };
+    try std.testing.expect(list.branches.len >= remote_ref_count);
+    for (0..remote_ref_count) |index| {
+        const full_ref = try std.fmt.bufPrint(
+            &ref_buffer,
+            "refs/remotes/origin/feature-{d}-with-a-realistic-name-for-compare-picker",
+            .{index},
+        );
+        const branch = branchByFullRef(list.branches, full_ref) orelse return error.ExpectedBranchListed;
+        try std.testing.expectEqual(BranchKind.remote_tracking, branch.kind);
+        try std.testing.expectEqualStrings(fixture.main_oid, branch.oid);
+    }
+    try std.testing.expect(branchByFullRef(list.branches, "refs/remotes/origin/HEAD") == null);
+}
+
+test "branch list reports StreamTooLong at its explicit bounded capacity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.testing.io;
+    const fixture = try setupBranchSwitchFixture(io, &tmp);
+    defer fixture.deinit();
+
+    try std.testing.expectError(error.StreamTooLong, loadGitBranchListWithLimit(
+        std.testing.allocator,
+        io,
+        .{
+            .cwd = .{ .path = fixture.repo_root },
+            .environment = .inherited,
+            .scope = .local_and_remote,
+        },
+        .limited(1),
+    ));
 }
 
 const SwapCompareRefsHookContext = struct {
