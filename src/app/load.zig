@@ -1629,8 +1629,8 @@ fn buildCombinedHunkResult(
 
     // The parsed inputs become fresh patch authority. Reparse their already
     // owned bytes for the eager presentation so its decorated component
-    // storage can outlive replacement of that authority in P4. Parsing is
-    // This eager branch deliberately keeps presentation and authority in one
+    // storage can outlive replacement of that authority. This eager branch
+    // deliberately keeps presentation and authority in one
     // same-generation result even though their owners remain replaceable.
     var cached_presentation_component = projection_component.ParsedComponent.parse(allocator, cached_component.text) catch |err| {
         return projectionDecorationFailureResult(allocator, path_key, err);
@@ -2024,7 +2024,7 @@ fn decorateProjectionComponent(
 
 /// Build every presentation derivative from an already-owned parsed model.
 /// Both the ordinary load path and projection promotion use this one work
-/// order so P2 cannot silently diverge in syntax, tree, or rendered-row state.
+/// order so load paths cannot silently diverge in syntax, tree, or rendered-row state.
 fn decorateLoadedDiff(
     arena_allocator: std.mem.Allocator,
     io: std.Io,

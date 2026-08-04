@@ -1268,7 +1268,7 @@ pub const RepositoryPageState = struct {
     }
 
     /// Continue a newly committed owner only after `activate` establishes the
-    /// destination identity. Slice C calls this allocation-free operation
+    /// destination identity. The shell calls this allocation-free operation
     /// after its owner-move/deactivate/activate sequence; accepted async
     /// manifest completions use the same resolver while inactive or active.
     pub fn resolveIncomingAfterActivation(
@@ -2150,7 +2150,7 @@ pub const RepositoryPageState = struct {
             0;
 
         // A newly accepted manifest does not yet provide a complete selected
-        // source fingerprint. Slice C therefore cannot prove candidate identity.
+        // source fingerprint, so it cannot prove candidate identity.
         self.clearCompletedSelection(allocator);
         if (self.bundle) |*previous| previous.deinit(allocator);
         self.bundle = incoming.*;
@@ -3660,7 +3660,7 @@ test "repository page zero state deinitializes and activation is lazy" {
     try std.testing.expectEqual(@as(u64, 3), state.repo_epoch);
 }
 
-test "repository transition E1 exports only resolved exact Review context" {
+test "repository transition exports only resolved exact Review context" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 5, .inode = 8 };
     const exact_path = "src/\xff.zig";
@@ -3688,7 +3688,7 @@ test "repository transition E1 exports only resolved exact Review context" {
     try std.testing.expect(state.reviewTarget() == .no_context);
 }
 
-test "repository transition E1 pending and unavailable destinations suppress retained context" {
+test "repository transition pending and unavailable destinations suppress retained context" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 5, .inode = 8 };
     var state: RepositoryPageState = .{
@@ -4654,7 +4654,7 @@ fn applyBundleStatusForTest(bundle: *Bundle, bytes: []const u8) !void {
     bundle.status_available = true;
 }
 
-test "repository source header SH3 projects exact accepted source facts" {
+test "repository source header projects exact accepted source facts" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "first\nsecond\n");
     defer state.deinit(allocator);
@@ -4676,7 +4676,7 @@ test "repository source header SH3 projects exact accepted source facts" {
     try std.testing.expectEqualStrings("main.zig", presentation.raw_path);
 }
 
-test "repository source header SH3 projects empty accepted source as zero of zero" {
+test "repository source header projects empty accepted source as zero of zero" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("empty.zig\x00", "");
     defer state.deinit(allocator);
@@ -4691,7 +4691,7 @@ test "repository source header SH3 projects empty accepted source as zero of zer
     try std.testing.expectEqual(repository_source_header.GitState.clean, presentation.git_state);
 }
 
-test "repository source header SH3 keeps inert mtime and omits its line" {
+test "repository source header keeps inert mtime and omits its line" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest("binary.dat\x00"),
@@ -4716,7 +4716,7 @@ test "repository source header SH3 keeps inert mtime and omits its line" {
     try std.testing.expectEqual(modified_at.nanoseconds, presentation.modified_at.?.nanoseconds);
 }
 
-test "repository source header SH3 retained document cannot claim line or mtime" {
+test "repository source header retained document cannot claim line or mtime" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "first\nsecond\n");
     defer state.deinit(allocator);
@@ -4737,7 +4737,7 @@ test "repository source header SH3 retained document cannot claim line or mtime"
     try std.testing.expectEqual(repository_source_header.GitState.added, presentation.git_state);
 }
 
-test "repository source header SH3 status requires an exact usable manifest node" {
+test "repository source header status requires an exact usable manifest node" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest("main.zig\x00"),
@@ -4759,7 +4759,7 @@ test "repository source header SH3 status requires an exact usable manifest node
     try std.testing.expect(presentation.modified_at == null);
 }
 
-test "repository source header SH5 copies a loading byte-exact path and excludes chrome" {
+test "repository source header copies a loading byte-exact path and excludes chrome" {
     const allocator = std.testing.allocator;
     const raw_path = "src/\xff-main.zig";
     var state: RepositoryPageState = .{
@@ -4819,7 +4819,7 @@ test "repository source header SH5 copies a loading byte-exact path and excludes
     try std.testing.expect(state.completed_selection == null);
 }
 
-test "repository source header SH5 locks gesture kind and revalidates release identity" {
+test "repository source header locks gesture kind and revalidates release identity" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "first\nsecond\n");
     defer state.deinit(allocator);
@@ -4856,7 +4856,7 @@ test "repository source header SH5 locks gesture kind and revalidates release id
     try std.testing.expect(!state.activeMouseOwner());
 }
 
-test "repository source header SH5 bounds clone failure and retains exact unchanged manifest" {
+test "repository source header bounds clone failure and retains exact unchanged manifest" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
         .active = true,
@@ -6604,7 +6604,7 @@ test "repository page owns source focus navigation search and mouse geometry" {
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_horizontal_scroll);
 }
 
-test "repository selection slice B live gesture fixes mode and resumes after leaving the pane" {
+test "repository selection live gesture fixes mode and resumes after leaving the pane" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "ABCDEFG\nHIJKLMN\nthird\nfourth\n");
     defer state.deinit(allocator);
@@ -6664,7 +6664,7 @@ test "repository selection slice B live gesture fixes mode and resumes after lea
     state.cancelMouseOwner();
 }
 
-test "repository selection slice B hit testing applies scroll once and follows line number geometry" {
+test "repository selection hit testing applies scroll once and follows line number geometry" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "ABCDEFG\nHIJKLMN\nthird\nfourth\n");
     defer state.deinit(allocator);
@@ -6699,7 +6699,7 @@ test "repository selection slice B hit testing applies scroll once and follows l
     try std.testing.expectEqual(@as(usize, 0), state.selection_owner.activeSource().?.anchor.leading_byte);
 }
 
-test "repository selection slice B synthetic empty row rejects every gesture stage" {
+test "repository selection synthetic empty row rejects every gesture stage" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("empty.zig\x00", "");
     defer state.deinit(allocator);
@@ -6715,7 +6715,7 @@ test "repository selection slice B synthetic empty row rejects every gesture sta
     try std.testing.expect(!state.activeSourceRange());
 }
 
-test "repository selection slice B owner replacement cancels live borrowed selection first" {
+test "repository selection owner replacement cancels live borrowed selection first" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("a.zig\x00b.zig\x00", "first\nsecond\n");
     defer state.deinit(allocator);
@@ -6734,7 +6734,7 @@ test "repository selection slice B owner replacement cancels live borrowed selec
     try std.testing.expect(state.bundle == null);
 }
 
-test "repository selection slice B accepted manifest and document replacement cancel live borrow" {
+test "repository selection accepted manifest and document replacement cancel live borrow" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "old source\n");
     defer state.deinit(allocator);
@@ -6755,8 +6755,8 @@ test "repository selection slice B accepted manifest and document replacement ca
     try std.testing.expect(state.activeSourceRange());
     state.document_generation = 8;
     state.pending_document_generation = 8;
-    // Byte-identical content still arrives in separately owned storage; Slice
-    // B cancels before replacement rather than borrowing across that swap.
+    // Byte-identical content still arrives in separately owned storage. The
+    // active owner cancels before replacement rather than borrowing across that swap.
     const replacement_bytes = try allocator.dupe(u8, "old source\n");
     var replacement: DocumentFinished = .{
         .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
@@ -6772,7 +6772,7 @@ test "repository selection slice B accepted manifest and document replacement ca
     try std.testing.expectEqualStrings("old source", state.currentSource().?.lineBody(0).?);
 }
 
-test "repository selection slice C moved release installs candidate and independent copy command" {
+test "repository selection moved release installs candidate and independent copy command" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "ABCDEFG\nHIJKLMN\n");
     defer state.deinit(allocator);
@@ -6817,7 +6817,7 @@ test "repository selection slice C moved release installs candidate and independ
     try std.testing.expectEqualStrings("DEFG\nHIJKL", state.completed_selection.?.text);
 }
 
-test "repository selection slice C first token to gutter keeps the token" {
+test "repository selection first token to gutter keeps the token" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "ABC\n");
     defer state.deinit(allocator);
@@ -6843,7 +6843,7 @@ test "repository selection slice C first token to gutter keeps the token" {
     }
 }
 
-test "repository selection slice C candidate and clipboard allocation failures have separate terminals" {
+test "repository selection candidate and clipboard allocation failures have separate terminals" {
     const backing = std.testing.allocator;
     const size: chasen.Size = .{ .width = 60, .height = 6 };
 
@@ -6894,7 +6894,7 @@ test "repository selection slice C candidate and clipboard allocation failures h
     try std.testing.expect(observed_clipboard_failure);
 }
 
-test "repository selection slice C stale release clears prior candidate" {
+test "repository selection stale release clears prior candidate" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "ABC\n");
     defer state.deinit(allocator);
@@ -6916,7 +6916,7 @@ test "repository selection slice C stale release clears prior candidate" {
     try std.testing.expect(!state.activeSourceRange());
 }
 
-test "repository selection slice C real empty line keeps candidate without copy command" {
+test "repository selection real empty line keeps candidate without copy command" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "\nnext\n");
     defer state.deinit(allocator);
@@ -6936,7 +6936,7 @@ test "repository selection slice C real empty line keeps candidate without copy 
     try std.testing.expectEqualStrings("Selected source line is empty", state.status.text());
 }
 
-test "repository selection slice D reconciles accepted document and keeps other replacements fail closed" {
+test "repository selection reconciles accepted document and keeps other replacements fail closed" {
     const allocator = std.testing.allocator;
     const size: chasen.Size = .{ .width = 60, .height = 6 };
 
@@ -6975,7 +6975,7 @@ test "repository selection slice D reconciles accepted document and keeps other 
     try expectDocumentReplacementCandidateForTest(null, false);
 }
 
-test "repository selection slice D retains candidate across inactive page and presentation changes" {
+test "repository selection retains candidate across inactive page and presentation changes" {
     const allocator = std.testing.allocator;
     const size: chasen.Size = .{ .width = 60, .height = 6 };
     var state = try selectionStateForTest("main.zig\x00", "first\nneedle here\nthird\n");
@@ -7200,7 +7200,7 @@ test "repository minimum tree disclosure empty typed root stays open after mouse
     try width_two.expectCellText(1, 2, "i");
 }
 
-test "Repository branch C2 renders read-only facts without moving tree geometry" {
+test "Repository branch renders read-only facts without moving tree geometry" {
     const allocator = std.testing.allocator;
     var state = try repositoryBranchViewStateForTest();
     defer state.deinit(allocator);
@@ -7251,7 +7251,7 @@ test "Repository branch C2 renders read-only facts without moving tree geometry"
     try std.testing.expect(std.mem.indexOf(u8, no_upstream, "topic no upstream") != null);
 }
 
-test "Repository branch C2 retains last good facts and bounds stale chrome" {
+test "Repository branch retains last good facts and bounds stale chrome" {
     const allocator = std.testing.allocator;
     var state = try repositoryBranchViewStateForTest();
     defer state.deinit(allocator);
@@ -7313,7 +7313,7 @@ test "Repository branch C2 retains last good facts and bounds stale chrome" {
     try std.testing.expect(std.mem.indexOf(u8, unavailable, "main ↑0") == null);
 }
 
-test "Repository branch C2 yields row zero to full page owners" {
+test "Repository branch yields row zero to full page owners" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 5, .inode = 8 };
     var state: RepositoryPageState = .{
@@ -7369,7 +7369,7 @@ test "Repository branch C2 yields row zero to full page owners" {
     try std.testing.expect(std.mem.indexOf(u8, incoming_unavailable, "branch-first") == null);
 }
 
-test "Repository branch C2 keeps bundle search chrome and hides with the tree" {
+test "Repository branch keeps bundle search chrome and hides with the tree" {
     const allocator = std.testing.allocator;
     var state = try repositoryBranchViewStateForTest();
     defer state.deinit(allocator);
@@ -7410,7 +7410,7 @@ test "Repository branch C2 keeps bundle search chrome and hides with the tree" {
     try std.testing.expect(std.mem.indexOf(u8, mismatched, "branch unavailable") != null);
 }
 
-test "Repository branch C2 clips width one and two without moving Files" {
+test "Repository branch clips width one and two without moving Files" {
     const allocator = std.testing.allocator;
     var state = try repositoryBranchViewStateForTest();
     defer state.deinit(allocator);
@@ -7501,7 +7501,7 @@ test "repository minimum tree disclosure renders root entries and collapses open
     try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "Loading selected file") != null);
 }
 
-test "repository source header SH3 page view renders and withdraws exact document facts" {
+test "repository source header page view renders and withdraws exact document facts" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "first\nsecond\n");
     defer state.deinit(allocator);
@@ -7867,7 +7867,7 @@ test "repository tree width controls share rendering mouse and source geometry" 
     try std.testing.expectEqual(@as(?u16, 34), state.viewer.tree_width);
 }
 
-test "repository transition B1 incoming lifecycle keeps one destination owner" {
+test "repository transition incoming lifecycle keeps one destination owner" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var state: RepositoryPageState = .{
@@ -7931,7 +7931,7 @@ test "repository transition B1 incoming lifecycle keeps one destination owner" {
     try std.testing.expect(state.selected_path == null);
 }
 
-test "repository transition B1 direct unavailable renders byte-safe terminal" {
+test "repository transition direct unavailable renders byte-safe terminal" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var state: RepositoryPageState = .{
@@ -8234,7 +8234,7 @@ test "repository minimum tree disclosure Review incoming root file opens no dire
     try std.testing.expectEqualStrings("root-target.zig", pending.location.path);
 }
 
-test "repository transition B2a exact failures retain prior browser location" {
+test "repository transition exact failures retain prior browser location" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var state: RepositoryPageState = .{
@@ -8272,7 +8272,7 @@ test "repository transition B2a exact failures retain prior browser location" {
     try std.testing.expectEqualStrings("retained.zig", state.selected_path.?);
 }
 
-test "repository transition B2a first owner install waits for activation identity" {
+test "repository transition first owner install waits for activation identity" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var state: RepositoryPageState = .{
@@ -8301,7 +8301,7 @@ test "repository transition B2a first owner install waits for activation identit
     try std.testing.expectEqual(@as(?u32, 3), state.incoming.documentIntent().?.location.line);
 }
 
-test "repository transition B2a resolves or terminalizes matching manifest completion" {
+test "repository transition resolves or terminalizes matching manifest completion" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var state: RepositoryPageState = .{
@@ -8739,7 +8739,7 @@ test "repository capability terminal cannot promote retained source authority" {
     try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
 }
 
-test "repository transition B2b1 resolves an already accepted source without a task" {
+test "repository transition resolves an already accepted source without a task" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "one\ntwo\nthree\n");
     defer state.deinit(allocator);
@@ -8863,7 +8863,7 @@ fn expectReactivatedIncomingDocumentForTest(
     }
 }
 
-test "repository transition B2b1 reactivation waits for current source authority" {
+test "repository transition reactivation waits for current source authority" {
     try expectReactivatedIncomingDocumentForTest(2, "new one\nnew two\nnew three\n", 1);
     try expectReactivatedIncomingDocumentForTest(null, "new one\nnew two\nnew three\n", 0);
     try expectReactivatedIncomingDocumentForTest(2, null, null);
@@ -8927,7 +8927,7 @@ fn expectIncomingDocumentLineForTest(
     try std.testing.expectEqual(!inactive_completion, state.active);
 }
 
-test "repository transition B2b1 binds completion and clamps current source lines" {
+test "repository transition binds completion and clamps current source lines" {
     try expectIncomingDocumentLineForTest("one\ntwo\nthree\n", null, 0, false);
     try expectIncomingDocumentLineForTest("one\ntwo\nthree\n", 1, 0, false);
     try expectIncomingDocumentLineForTest("one\ntwo\nthree\n", 2, 1, false);
@@ -8935,7 +8935,7 @@ test "repository transition B2b1 binds completion and clamps current source line
     try expectIncomingDocumentLineForTest("", 99, 0, false);
 }
 
-test "repository transition B2b1 inert document moves request path to unavailable" {
+test "repository transition inert document moves request path to unavailable" {
     const allocator = std.testing.allocator;
     var root = try TestRoot.init();
     defer root.deinit();
@@ -8980,7 +8980,7 @@ test "repository transition B2b1 inert document moves request path to unavailabl
     try std.testing.expect(state.displayed_document.?.value == .inert);
 }
 
-test "repository transition B2b1 wrong root terminalizes the bound owner" {
+test "repository transition wrong root terminalizes the bound owner" {
     const allocator = std.testing.allocator;
     var root = try TestRoot.init();
     defer root.deinit();
@@ -9050,7 +9050,7 @@ fn expectIncomingRequestFailureForTest(state: *const RepositoryPageState, owned_
     try std.testing.expectEqual(owned_address, @intFromPtr(unavailable.path.ptr));
 }
 
-test "repository transition B2b2a manifest start failures close the owner" {
+test "repository transition manifest start failures close the owner" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
         .active = true,
@@ -9099,7 +9099,7 @@ test "repository transition B2b2a manifest start failures close the owner" {
     try std.testing.expectEqual(LoadState.no_repository, state.load_state);
 }
 
-test "repository transition B2b2a document start failures close the bound owner" {
+test "repository transition document start failures close the bound owner" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
         .active = true,
@@ -9138,7 +9138,7 @@ test "repository transition B2b2a document start failures close the bound owner"
     try std.testing.expect(!state.needs_document_revalidation);
 }
 
-test "repository transition B2b2b1 manual reload rebinds one destination through manifest" {
+test "repository transition manual reload rebinds one destination through manifest" {
     const allocator = std.testing.allocator;
     var root = try TestRoot.init();
     defer root.deinit();
@@ -9215,7 +9215,7 @@ test "repository transition B2b2b1 manual reload rebinds one destination through
     try std.testing.expectEqualStrings("new one\nnew two\nnew three\n", state.currentSource().?.bytes);
 }
 
-test "repository transition B2b2b1 reactivation rewinds or terminalizes document owner" {
+test "repository transition reactivation rewinds or terminalizes document owner" {
     const allocator = std.testing.allocator;
     var root = try TestRoot.init();
     defer root.deinit();
@@ -9288,7 +9288,7 @@ test "repository transition B2b2b1 reactivation rewinds or terminalizes document
     try std.testing.expectEqual(LoadState.no_repository, state.load_state);
 }
 
-test "repository transition B2b2b1 reactivation invalidates manifest predecessor" {
+test "repository transition reactivation invalidates manifest predecessor" {
     const allocator = std.testing.allocator;
     const identity = root_capability.Identity{ .device = 5, .inode = 8 };
     var state: RepositoryPageState = .{
@@ -9321,7 +9321,7 @@ test "repository transition B2b2b1 reactivation invalidates manifest predecessor
     try std.testing.expect(state.bundle == null);
 }
 
-test "repository transition B2b2b2a manifest mismatch keeps a current task successor" {
+test "repository transition manifest mismatch keeps a current task successor" {
     const allocator = std.testing.allocator;
     const identity = root_capability.Identity{ .device = 5, .inode = 8 };
     var state: RepositoryPageState = .{
@@ -9370,7 +9370,7 @@ test "repository transition B2b2b2a manifest mismatch keeps a current task succe
     try expectIncomingRequestFailureForTest(&state, owned_address);
 }
 
-test "repository transition B2b2b2a manifest mismatch keeps a scheduled successor" {
+test "repository transition manifest mismatch keeps a scheduled successor" {
     const allocator = std.testing.allocator;
     const identity = root_capability.Identity{ .device = 5, .inode = 8 };
     var state: RepositoryPageState = .{
@@ -9401,7 +9401,7 @@ test "repository transition B2b2b2a manifest mismatch keeps a scheduled successo
     try expectIncomingRequestFailureForTest(&state, owned_address);
 }
 
-test "repository transition B2b2b2a manifest mismatch keeps a dormant successor" {
+test "repository transition manifest mismatch keeps a dormant successor" {
     const allocator = std.testing.allocator;
     const identity = root_capability.Identity{ .device = 5, .inode = 8 };
     var state: RepositoryPageState = .{
@@ -9432,7 +9432,7 @@ test "repository transition B2b2b2a manifest mismatch keeps a dormant successor"
     try expectIncomingRequestFailureForTest(&state, owned_address);
 }
 
-test "repository transition B2b2b2a manifest mismatch without successor closes owner" {
+test "repository transition manifest mismatch without successor closes owner" {
     const allocator = std.testing.allocator;
     const identity = root_capability.Identity{ .device = 5, .inode = 8 };
     var state: RepositoryPageState = .{
@@ -9459,7 +9459,7 @@ test "repository transition B2b2b2a manifest mismatch without successor closes o
     try std.testing.expect(state.bundle == null);
 }
 
-test "repository transition B2b2b2b document mismatch keeps a current task successor" {
+test "repository transition document mismatch keeps a current task successor" {
     const allocator = std.testing.allocator;
     const identity = root_capability.Identity{ .device = 5, .inode = 8 };
     var state: RepositoryPageState = .{
@@ -9508,7 +9508,7 @@ test "repository transition B2b2b2b document mismatch keeps a current task succe
     try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
 }
 
-test "repository transition B2b2b2b document mismatch keeps a scheduled successor" {
+test "repository transition document mismatch keeps a scheduled successor" {
     const allocator = std.testing.allocator;
     var root = try TestRoot.init();
     defer root.deinit();
@@ -9562,7 +9562,7 @@ test "repository transition B2b2b2b document mismatch keeps a scheduled successo
     try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
 }
 
-test "repository transition B2b2b2b document mismatch keeps a dormant successor" {
+test "repository transition document mismatch keeps a dormant successor" {
     const allocator = std.testing.allocator;
     const identity = root_capability.Identity{ .device = 5, .inode = 8 };
     var state: RepositoryPageState = .{
@@ -9597,7 +9597,7 @@ test "repository transition B2b2b2b document mismatch keeps a dormant successor"
     try expectIncomingRequestFailureForTest(&state, owned_address);
 }
 
-test "repository transition B2b2b2b document mismatch without successor closes owner" {
+test "repository transition document mismatch without successor closes owner" {
     const allocator = std.testing.allocator;
     const identity = root_capability.Identity{ .device = 5, .inode = 8 };
     var state: RepositoryPageState = .{
@@ -9686,7 +9686,7 @@ test "repository transition B2b2b2b document mismatch without successor closes o
     try expectIncomingRequestFailureForTest(&state, manifest_address);
 }
 
-test "repository transition B2b2b2b accepted source closes inconsistent document owner" {
+test "repository transition accepted source closes inconsistent document owner" {
     const allocator = std.testing.allocator;
     const identity = root_capability.Identity{ .device = 5, .inode = 8 };
     var state: RepositoryPageState = .{

@@ -99,9 +99,9 @@ pub const BranchDiffBasis = struct {
     }
 };
 
-/// Phase 10 History will extend this payload into the reviewed lossless form
-/// (selected parent/root/merge policy and ordered parents). Compare v1 never
-/// constructs this minimal identity placeholder.
+/// Reserved for a future lossless History payload with selected parent/root,
+/// merge policy, and ordered parents. Compare never constructs this minimal
+/// identity placeholder.
 pub const CommitDiffBasis = struct {
     selected_commit_oid: Oid,
 };

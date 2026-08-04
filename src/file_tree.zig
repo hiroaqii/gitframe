@@ -104,8 +104,8 @@ pub const Node = struct {
     };
 
     /// Transitional compatibility for diff-only tree consumers.
-    /// TODO(phase8): switch callers to target-aware handling when status rows
-    /// are introduced.
+    /// TODO: switch remaining callers to target-aware handling, then remove
+    /// this accessor.
     pub fn diffFileIndex(self: Node) ?usize {
         return self.target.diffFileIndex();
     }

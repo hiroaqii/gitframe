@@ -1,7 +1,7 @@
 //! Review-local reload, projection identity, and navigation-restore ownership.
 //!
-//! Async task allocation/spawn remains a shell effect during Phase 9 A3. This
-//! module owns the page state transitions which prepare and reconcile those
+//! Async task allocation and spawning remain shell effects. This module owns
+//! the page state transitions which prepare and reconcile those
 //! effects; it deliberately has no `App`, `Ctx`, overlay, or process access.
 
 const std = @import("std");
@@ -180,17 +180,17 @@ const OwnedCombinedPresentationKind = enum {
     retained_staged_only,
 };
 
-/// Borrowed view of the self-owned A-to-C presentation which may survive an
-/// index-only authority transition. The tag keeps the same-kind P4 refresh
-/// distinct from P5c's staged-only-to-combined boundary even though both
-/// states intentionally share `CombinedPresentation` ownership.
+/// Borrowed view of the self-owned combined presentation which may survive an
+/// index-only authority transition. The tag keeps same-kind refresh distinct
+/// from the staged-only-to-combined boundary even though both states
+/// intentionally share `CombinedPresentation` ownership.
 const OwnedCombinedPresentation = struct {
     kind: OwnedCombinedPresentationKind,
     presentation: *const review_projection.CombinedPresentation,
     display_file: diff_parser.FileDiff,
 };
 
-/// Exact P5d handoff between the disappearing combined projection and the
+/// Exact handoff between the disappearing combined projection and the
 /// already-owned ordinary primary presentation. Both tokens are scalar: no
 /// pointer into either display owner survives projection teardown.
 const CombinedToOrdinaryOwner = enum {
@@ -413,7 +413,7 @@ pub const View = struct {
                 }
                 // A staged body can outlive its combined display kind: the
                 // final unstaged hunk leaves the watched primary file selected
-                // until a later source reload removes it (P5b), and the
+                // until a later source reload removes it, and the
                 // installed staged-only owner must keep deriving the same
                 // target afterwards or the next prepareProjection drops it.
                 // Ownership of the projection request, not the displayed body
@@ -864,10 +864,10 @@ pub const Controller = struct {
             .generated_added_file => return null,
         }
         if (self.ownedCombinedPresentation()) |live| {
-            // A retained staged-only body feeds only P5c's return to combined;
+            // A retained staged-only body feeds only the return to combined;
             // an unchanged staged-only refresh remains on the existing eager
-            // cached-diff path. The ordinary combined owner also serves P4's
-            // same-kind refresh and P5b's final-hunk stage boundary.
+            // cached-diff path. The ordinary combined owner also serves
+            // same-kind refresh and the final-hunk stage boundary.
             if (live.kind == .retained_staged_only and target.kind != .combined_hunks) return null;
             return .{
                 .owner = .combined_projection,
@@ -976,7 +976,8 @@ pub const Controller = struct {
 
         // Exact acceptance has proved one immutable presentation, but the
         // install operation must still consume the correct authority owner.
-        // Record the P5c boundary before moving either request or payload.
+        // Record the staged-only return boundary before moving either request
+        // or payload.
         const returns_from_staged_only = switch (result.request.expected_presentation.?.owner) {
             .combined_projection => self.ownedCombinedPresentation().?.kind == .retained_staged_only,
             .primary_loaded => switch (self.navigation.view().displayedReviewBody()) {
@@ -1017,7 +1018,8 @@ pub const Controller = struct {
         self.finishExactPresentationTransfer(allocator, outgoing_lineage);
         // Exact reuse retains the presentation, so navigation (cursor, scroll,
         // search match, selection) is reconciled in place rather than rebuilt.
-        // The previous installed-reconcile on this arm was the C4 drift.
+        // A previous installed-reconcile on this arm discarded retained
+        // navigation state.
         self.reconcileRetainedPresentationNavigation(allocator);
         return .{ .result_transferred = true };
     }
@@ -2273,8 +2275,8 @@ pub const Controller = struct {
                 }
             }
             if (self.boundaryInertRetention()) {
-                // B7/B10: the selection still points at the owner path but the
-                // fresh entry offers no projection target (the last staged
+                // The selection still points at the owner path but the fresh
+                // entry offers no projection target (the last staged
                 // hunk was unstaged, or the entry is in conflict). Dropping
                 // here would publish an empty body; instead keep the owned
                 // body visible as inert state — stale-status admission already
@@ -7956,9 +7958,9 @@ test "ordinary primary exact combined reuse retains active search match and curs
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(applied.result_transferred);
 
-    // BC4 regression: exact reuse reconciles retained navigation on the
-    // live-target route. The previous installed-reconcile on this arm was the
-    // C4 drift: it discarded the active match and moved the cursor to the
+    // Exact reuse reconciles retained navigation on the live-target route. A
+    // previous installed-reconcile on this arm discarded the active match and
+    // moved the cursor to the
     // first match even though the presentation bytes were unchanged.
     try std.testing.expect(std.meta.eql(search_before, page.search.match.?));
     try std.testing.expectEqual(search_offset_before, page.search.match_offset);
@@ -7999,7 +8001,7 @@ test "publication snapshot staged-only admission requires live presentation iden
     try std.testing.expect(controller.admitStagedOnlyReuse(request, &candidate, .live_target));
     try std.testing.expect(controller.admitStagedOnlyReuse(request, &candidate, .publication_snapshot));
 
-    // BC1 regression: the publication snapshot basis validates the live
+    // The publication snapshot basis validates the live
     // presentation identity, not just exact bytes. A stale content token must
     // reject the candidate even though the display file compares equal.
     var tampered = request;
@@ -8053,8 +8055,8 @@ test "publication snapshot combined reuse returns retained staged-only owner to 
         &finished.result.reuse_candidate,
         .publication_snapshot,
     ));
-    // BC2 regression: the publication route must route a P5c return through
-    // the retained staged-only install. The removed canonical install always
+    // The publication route must route a staged-only return through the
+    // retained staged-only install. The removed canonical install always
     // consumed the ordinary combined owner and reached unreachable here.
     const outgoing_lineage = controller.installCombinedReuseExact(allocator, &finished);
     controller.finishExactPresentationTransfer(allocator, outgoing_lineage);
@@ -8068,7 +8070,7 @@ test "publication snapshot combined reuse returns retained staged-only owner to 
     try std.testing.expectEqual(page.status_snapshot_revision, combined.authority.status_snapshot_revision);
 }
 
-test "ordinary primary staged-only status does not enter P5b boundary" {
+test "ordinary primary staged-only status does not enter final-hunk projection boundary" {
     const allocator = std.testing.allocator;
     var page: review_page.ReviewPageState = .{
         .load = try testPrimaryLoadState(allocator, test_support.diff_one),
@@ -8620,8 +8622,8 @@ test "unstaged-only boundary retains staged preview and queues repair" {
     try installTestCachedPreviewOwner(controller, allocator);
     const text_ptr = page.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr;
 
-    // B7: the only staged hunk gets unstaged and the entry turns
-    // unstaged-only; no target arm exists for the still-selected row.
+    // The only staged hunk gets unstaged and the entry turns unstaged-only; no
+    // target arm exists for the still-selected row.
     controller.advanceStatusSnapshotRevision(allocator);
     var unstaged_status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
     try page.git_status.replace("/repo", &unstaged_status);
@@ -8635,7 +8637,7 @@ test "unstaged-only boundary retains staged preview and queues repair" {
     try std.testing.expect(page.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr == text_ptr);
     try std.testing.expect(page.activation.hasQueuedFullRevalidation());
 
-    // B10: a conflict entry keeps the same inert retention.
+    // A conflict entry keeps the same inert retention.
     var conflict_status = try git_status.StatusBundle.parseOwned(allocator, "UU a\x00");
     try page.git_status.replace("/repo", &conflict_status);
     var second = try controller.prepareProjection(allocator);
@@ -8880,8 +8882,8 @@ test "one hunk unstage restores combined authority over retained owned presentat
     const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(original_clipboard);
     try page.search.query.insertSlice("gamma");
-    // Self-owned combined search remains unsupported. P5c must not convert the
-    // retained query into a new first match while authority changes underneath
+    // Self-owned combined search remains unsupported. The return to combined
+    // must not convert the retained query into a new first match while authority changes underneath
     // the same rendered coordinates.
     try std.testing.expect(page.search.match == null);
     page.viewer.diff_scroll = 5;

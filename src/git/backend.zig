@@ -3487,8 +3487,8 @@ fn explicitAheadBehind(allocator: std.mem.Allocator, io: std.Io, repo_root: []co
 }
 
 fn verifyCleanWorktree(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!bool {
-    // Include untracked files to match the first-slice "clean worktree only"
-    // contract. This is stricter than Git's overwrite protection, but avoids a
+    // Include untracked files to enforce the "clean worktree only" contract.
+    // This is stricter than Git's overwrite protection, but avoids a
     // review action starting from a workspace state GitFrame no longer shows.
     const status_argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
     const status_result = try runGitBranchStatusCommand(allocator, io, repo_root, &status_argv);

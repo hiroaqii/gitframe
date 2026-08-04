@@ -2,8 +2,8 @@
 //!
 //! Source pages derive borrowed targets from their accepted models. The shell
 //! converts a target into `RepositoryIncoming` before mutating page activation;
-//! after that fallible allocation, later slices can move the value into the
-//! Repository page without retaining pointers into Review-owned arenas.
+//! after that fallible allocation, the value can move into the Repository page
+//! without retaining pointers into Review-owned arenas.
 
 const std = @import("std");
 const root_capability = @import("../repo/root_capability.zig");
@@ -105,8 +105,8 @@ pub const RepositoryUnavailable = struct {
 
 /// Move-only shell handoff value.
 ///
-/// `initOwned` is the fallible prepare phase. Later page wiring must make
-/// owner installation allocation-free and infallible; a post-activation
+/// `initOwned` is the fallible prepare phase. Owner installation is
+/// allocation-free and infallible; a post-activation
 /// rollback is intentionally not part of this type's contract.
 pub const RepositoryIncoming = union(enum) {
     no_context,

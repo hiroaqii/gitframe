@@ -842,8 +842,8 @@ pub const State = struct {
         self.displayed.deinit(allocator);
     }
 
-    /// P5d terminal boundary: the accepted all-unstaged status makes the
-    /// independently owned primary load authoritative again. A self-owned
+    /// Accepted all-unstaged status makes the independently owned primary load
+    /// authoritative again. A self-owned
     /// combined value releases presentation plus authority; a primary-backed
     /// value releases only its authority overlay. The primary load itself is
     /// deliberately outside this state and is never moved or deinitialized.

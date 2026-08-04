@@ -487,7 +487,7 @@ test "repository source header renders path above a full fixed separator" {
     }
 }
 
-test "repository source header SH3 renders typed metadata focus-stably" {
+test "repository source header renders typed metadata focus-stably" {
     const HeaderPalette = struct {
         pub fn get(_: @This(), role: theme.Role) ?theme.ColorValue {
             return switch (role) {
@@ -548,7 +548,7 @@ test "repository source header SH3 renders typed metadata focus-stably" {
     }
 }
 
-test "repository source header SH5 highlights only the exact path target" {
+test "repository source header highlights only the exact path target" {
     const palette: theme.Palette = .default();
     const presentation = source_header.Presentation.init(
         "src/main.zig",
@@ -578,7 +578,7 @@ test "repository source header SH5 highlights only the exact path target" {
     try std.testing.expect(!metadata.style.bg.eql(palette.color(.diff_cursor)));
 }
 
-test "repository source header SH3 preserves semantic Git styles" {
+test "repository source header preserves semantic Git styles" {
     const palette: theme.Palette = .default();
     const cases = [_]struct { state: source_header.GitState, role: theme.Role }{
         .{ .state = .clean, .role = .muted },
@@ -600,7 +600,7 @@ test "repository source header SH3 preserves semantic Git styles" {
     }
 }
 
-test "repository source header SH3 renderer follows adaptive omission regions" {
+test "repository source header renderer follows adaptive omission regions" {
     const presentation = source_header.Presentation.init(
         "src/main.zig",
         .{ .current = 42, .total = 8713 },
@@ -996,7 +996,7 @@ test "repository source row style preserves intrinsic flags while gating cursor 
     try std.testing.expect(sourceRowStyle(intrinsic, true, false, palette).eql(intrinsic));
 }
 
-test "repository selection slice B background composes after cursor syntax and search styles" {
+test "repository selection background composes after cursor syntax and search styles" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "const value plain\n");
     var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
@@ -1047,7 +1047,7 @@ test "repository selection slice B background composes after cursor syntax and s
     try std.testing.expect(trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
 
-test "repository selection slice B whole-line style covers gutter numbers body and trailing cells" {
+test "repository selection whole-line style covers gutter numbers body and trailing cells" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "one\ntwo\n");
     var document = try source.Document.initOwned(allocator, bytes, .init(bytes));

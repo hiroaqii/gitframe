@@ -94,7 +94,7 @@ pub fn refreshFileSearch(
     state.no_match = state.len == 0;
 }
 
-test "repository selection slice B navigation clamps cursor scroll and horizontal cells" {
+test "repository selection navigation clamps cursor scroll and horizontal cells" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "one\ntwo\n0123456789\n");
     var document = try source.Document.initOwned(allocator, bytes, .init(bytes));

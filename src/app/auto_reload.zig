@@ -233,7 +233,7 @@ pub const State = struct {
 
     /// Foreground reads have no cycle and pass this half of admission. A
     /// background result must name the exact still-active open cycle; read
-    /// epoch/phase admission remains a separate P6b contract.
+    /// epoch/phase admission remains a separate contract.
     pub fn acceptsCycle(self: State, cycle_id: ?u64) bool {
         const id = cycle_id orelse return true;
         const cycle = self.background_cycle orelse return false;

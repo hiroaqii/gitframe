@@ -336,8 +336,8 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
                 if (!std.mem.eql(u8, key, "schema_version")) return error.UnknownKey;
                 config.schema_version = std.fmt.parseInt(u32, value, 10) catch return error.InvalidInteger;
             },
-            // Section names are reserved now so later settings can grow under a
-            // stable TOML shape. Empty sections are valid in the foundation slice.
+            // Section names are reserved so later settings can grow under a
+            // stable TOML shape. Empty sections remain valid.
             .editor => {
                 if (!std.mem.eql(u8, key, "argv")) return error.UnknownKey;
                 config.editor = try parseEditorArgv(value);

@@ -47,8 +47,8 @@ pub const SidebarTarget = union(enum) {
     status_entry: usize,
 
     /// Transitional compatibility for code that still consumes diff file rows.
-    /// TODO(phase8): remove once status-only sidebar rows have first-class
-    /// action handling and callers switch to target-specific accessors.
+    /// TODO: remove once status-only sidebar rows have first-class action
+    /// handling and callers switch to target-specific accessors.
     pub fn diffFileIndex(self: SidebarTarget) ?usize {
         return switch (self) {
             .diff_file => |index| index,
@@ -78,7 +78,7 @@ pub const SelectedTarget = union(enum) {
     status_only: usize,
 
     /// Transitional compatibility for diff-only panes.
-    /// TODO(phase8): remove when action handlers cover status-only targets.
+    /// TODO: remove when action handlers cover status-only targets.
     pub fn diffFileIndex(self: SelectedTarget) ?usize {
         return switch (self) {
             .diff_file => |index| index,

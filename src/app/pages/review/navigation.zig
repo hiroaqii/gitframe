@@ -1708,7 +1708,7 @@ pub const Controller = struct {
 
     /// Classify one Repository path against the accepted retained Review
     /// without changing folds, filters, selection, search, or diff position.
-    /// Slice D's mutation half consumes only the `ready` node synchronously;
+    /// The mutation half consumes only the `ready` node synchronously;
     /// an unavailable result is never retained for a future reload.
     pub fn exactPathTarget(self: Controller, intent: page_link.ReviewLocationIntent) ExactPathTarget {
         if (!diff_source.sourceAllowsRepositoryLink(self.source)) {
@@ -1729,8 +1729,8 @@ pub const Controller = struct {
         return .{ .ready = node_index };
     }
 
-    /// Reveal and select one D1-classified exact file without retaining the
-    /// borrowed request. Fallible visible-tree preparation completes before
+    /// Reveal and select one exact file without retaining the borrowed request.
+    /// Fallible visible-tree preparation completes before
     /// collapsed ancestors or Review navigation state can change.
     pub fn revealExactPath(self: Controller, intent: page_link.ReviewLocationIntent) !ExactPathRevealResult {
         return self.revealExactPathWithAllocator(intent, null);
@@ -4013,7 +4013,7 @@ test "review root expansion file search reveals only collapsed ancestors" {
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
 }
 
-test "review transition D1 exact lookup accepts diff status and collapsed raw paths" {
+test "review transition exact lookup accepts diff status and collapsed raw paths" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     {
         var app: TestHarness = .{
@@ -4072,7 +4072,7 @@ test "review transition D1 exact lookup accepts diff status and collapsed raw pa
     }
 }
 
-test "review transition D1 exact lookup rejects non-current repository sources" {
+test "review transition exact lookup rejects non-current repository sources" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var app: TestHarness = .{
         .pages = .{ .review = .{
@@ -4107,7 +4107,7 @@ test "review transition D1 exact lookup rejects non-current repository sources" 
     );
 }
 
-test "review transition D1 exact lookup skips colliding directories before files" {
+test "review transition exact lookup skips colliding directories before files" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     const replacement_diff =
         \\diff --git a/src/a b/src/a
@@ -4217,7 +4217,7 @@ test "review transition D1 exact lookup skips colliding directories before files
     );
 }
 
-test "review transition D1 exact lookup preserves reviewed and changed filters" {
+test "review transition exact lookup preserves reviewed and changed filters" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     {
         var reviewed = [_]bool{ true, false };
@@ -4274,7 +4274,7 @@ test "review transition D1 exact lookup preserves reviewed and changed filters" 
     }
 }
 
-test "review transition D1 exact lookup rejects identity absence and non-file paths" {
+test "review transition exact lookup rejects identity absence and non-file paths" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var app: TestHarness = .{
         .pages = .{ .review = .{
@@ -4318,7 +4318,7 @@ test "review transition D1 exact lookup rejects identity absence and non-file pa
     try expectExactPathUnavailable(app.reviewNavigation().exactPathTarget(explicit_intent), .repository_mismatch);
 }
 
-test "review transition D2b exact reveal expands only target ancestors and selects normally" {
+test "review transition exact reveal expands only target ancestors and selects normally" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var app: TestHarness = .{
         .pages = .{ .review = .{
@@ -4375,7 +4375,7 @@ test "review transition D2b exact reveal expands only target ancestors and selec
     try std.testing.expect(app.pages.review.selection_owner == .none);
 }
 
-test "review transition D2b exact reveal selects status-only and reports unchanged" {
+test "review transition exact reveal selects status-only and reports unchanged" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     const nodes = [_]file_tree.Node{
         .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
@@ -4423,7 +4423,7 @@ test "review transition D2b exact reveal selects status-only and reports unchang
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
-test "review transition D2b selected exact node still reveals collapsed ancestor" {
+test "review transition selected exact node still reveals collapsed ancestor" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var app: TestHarness = .{
         .pages = .{ .review = .{
@@ -4483,7 +4483,7 @@ test "review root expansion exact reveal expands only ordinary ancestors" {
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
 }
 
-test "review transition D2b unavailable result preserves navigation folds and filters" {
+test "review transition unavailable exact reveal preserves navigation folds and filters" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var reviewed = [_]bool{ true, false };
     var app: TestHarness = .{
@@ -4530,7 +4530,7 @@ test "review transition D2b unavailable result preserves navigation folds and fi
     ));
 }
 
-test "review transition D2b allocation failure rolls back before ancestor expansion" {
+test "review transition exact reveal allocation failure rolls back before ancestor expansion" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var app: TestHarness = .{
         .pages = .{ .review = .{

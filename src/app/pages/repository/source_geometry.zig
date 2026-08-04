@@ -89,7 +89,7 @@ fn decimalDigits(value: usize) usize {
     return digits;
 }
 
-test "repository selection slice B geometry shares narrow line number and body boundaries" {
+test "repository selection geometry shares narrow line number and body boundaries" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "\n\n\n\n\n\n\n\n\n\nx");
     var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
@@ -117,7 +117,7 @@ test "repository selection slice B geometry shares narrow line number and body b
     try std.testing.expectEqual(@as(usize, 1), narrow.navigationRows());
 }
 
-test "repository selection slice B geometry rejects the empty document synthetic row" {
+test "repository selection geometry rejects the empty document synthetic row" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "");
     var document = try source.Document.initOwned(allocator, bytes, .init(bytes));

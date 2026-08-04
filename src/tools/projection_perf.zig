@@ -259,7 +259,7 @@ fn profileComponentPairOnce(
     const arena_allocator = arena.allocator();
 
     // The retained presentation is setup rather than part of refresh timing.
-    // P0 measures the work performed after an index-only action against it.
+    // The benchmark measures work performed after an index-only action.
     const before_cached = try parseComponent(arena_allocator, input.before_cached);
     const before_unstaged = try parseComponent(arena_allocator, input.before_unstaged);
     const before_projection = try diff_hunk_projection.build(

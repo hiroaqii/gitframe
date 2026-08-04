@@ -1,6 +1,6 @@
 //! Import-path shim: the module body moved to `src/app/diff_surface/file_search.zig`
 //! so the shared diff surface can reference file-search state without importing
-//! Review page namespaces (issue #34 S1).
+//! Review page namespaces.
 
 const shared = @import("../../diff_surface/file_search.zig");
 

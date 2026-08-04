@@ -4619,8 +4619,8 @@ pub const App = struct {
                 return .unsupported;
             },
             .authority_closed => {
-                // BC3: the post-action revalidation intent is queued by the
-                // shared pre-check instead of being silently dropped by the
+                // The post-action revalidation intent is queued by the shared
+                // pre-check instead of being silently dropped by the
                 // inner read gate; the queued full revalidation fires once
                 // when the read authority reopens. The action pair is
                 // finished here because the queued revalidation runs as an
@@ -7987,7 +7987,7 @@ test "inactive Review clipboard completion retains diagnostic without redraw" {
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
-test "repository selection slice C copy uses Repository origin without opening AI UI" {
+test "repository selection copy uses Repository origin without opening AI UI" {
     var app: App = .{
         .active_page = .repository,
         .repo_epoch = 4,
@@ -8013,7 +8013,7 @@ test "repository selection slice C copy uses Repository origin without opening A
     try std.testing.expectEqual(app_state.OverlayKind.none, app.overlay.kind);
 }
 
-test "repository source header SH5 copy uses byte-exact Repository clipboard effect" {
+test "repository source header copy uses byte-exact Repository clipboard effect" {
     var app: App = .{
         .active_page = .repository,
         .repo_epoch = 4,
@@ -8041,7 +8041,7 @@ test "repository source header SH5 copy uses byte-exact Repository clipboard eff
     try std.testing.expectEqual(app_state.OverlayKind.none, app.overlay.kind);
 }
 
-test "repository selection slice C clipboard queue failure retains page candidate" {
+test "repository selection clipboard queue failure retains page candidate" {
     const allocator = std.testing.allocator;
     var app: App = .{
         .active_page = .repository,
@@ -8088,7 +8088,7 @@ test "repository selection slice C clipboard queue failure retains page candidat
     try std.testing.expectEqualStrings("clipboard copy already queued", app.pages.repository.status.text());
 }
 
-test "repository selection slice C late clipboard completion cannot target a new page instance" {
+test "repository selection late clipboard completion cannot target a new page instance" {
     var app: App = .{
         .active_page = .repository,
         .repo_epoch = 4,
@@ -8112,7 +8112,7 @@ test "repository selection slice C late clipboard completion cannot target a new
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
-test "repository selection slice C inactive page accepts same-instance clipboard completion" {
+test "repository selection inactive page accepts same-instance clipboard completion" {
     var app: App = .{
         .active_page = .repository,
         .repo_epoch = 4,
@@ -12204,7 +12204,7 @@ fn repositoryHeaderSelectionForTest() repository_selection.SourceHeaderPathSelec
     } };
 }
 
-test "repository selection slice B drag routes first and outside release terminates" {
+test "repository selection drag routes first and outside release terminates" {
     var app: App = .{
         .active_page = .repository,
         .terminal_size = .{ .width = 100, .height = 20 },
@@ -12265,7 +12265,7 @@ test "repository selection slice B drag routes first and outside release termina
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
 }
 
-test "repository selection slice B shell blocks transition and cancels on focus or resize" {
+test "repository selection shell blocks transition and cancels on focus or resize" {
     var app: App = .{
         .active_page = .repository,
         .terminal_size = .{ .width = 100, .height = 20 },
@@ -12303,7 +12303,7 @@ test "repository selection slice B shell blocks transition and cancels on focus 
     try std.testing.expectEqual(chasen.Size{ .width = 70, .height = 12 }, app.terminal_size);
 }
 
-test "repository source header SH5 page switch cancels header owner without weakening source blocker" {
+test "repository source header page switch cancels header owner without weakening source blocker" {
     var app: App = .{
         .active_page = .repository,
         .pages = .{ .repository = .{ .active = true } },
@@ -12376,7 +12376,7 @@ test "repository activation and manual reload route to page-owned manifest tasks
     try std.testing.expectEqual(second_branch.request.generation, app.pages.repository.branch.pending.?.generation);
 }
 
-test "repository transition B2b2a missing document capability closes incoming owner" {
+test "repository transition missing document capability closes incoming owner" {
     const allocator = std.testing.allocator;
     var app: App = .{
         .allocator = allocator,
@@ -12414,7 +12414,7 @@ test "repository transition B2b2a missing document capability closes incoming ow
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
-test "repository transition B2b2a ordinary document capability loss preserves retry" {
+test "repository transition ordinary document capability loss preserves retry" {
     const allocator = std.testing.allocator;
     var app: App = .{
         .allocator = allocator,
@@ -12487,7 +12487,7 @@ test "Compare mouse selection and base picker block App page transitions" {
     try std.testing.expectEqualStrings("finish Compare search before switching pages", app.status.text());
 }
 
-test "review repository transition E2a commit selects exact retained Review path" {
+test "review repository transition commit selects exact retained Review path" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -12529,7 +12529,7 @@ test "review repository transition E2a commit selects exact retained Review path
     try std.testing.expectEqual(@as(u64, 7), app.pages.review.activation.state.active.repo_epoch);
 }
 
-test "review repository transition E2a commit maps unchanged and unavailable outcomes" {
+test "review repository transition commit maps unchanged and unavailable outcomes" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -12581,7 +12581,7 @@ test "review repository transition E2a commit maps unchanged and unavailable out
     }
 }
 
-test "review repository transition E2a no context dismisses pending and unavailable owners" {
+test "review repository transition no context dismisses pending and unavailable owners" {
     const allocator = std.testing.allocator;
     const identity: repo_root_capability.Identity = .{ .device = 5, .inode = 8 };
     const cases = [_]enum { pending, unavailable }{ .pending, .unavailable };
@@ -12636,7 +12636,7 @@ test "review repository transition E2a no context dismisses pending and unavaila
     }
 }
 
-test "review repository transition E2b common switch commits exact path before revalidation" {
+test "review repository transition common switch commits exact path before revalidation" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -12692,7 +12692,7 @@ test "review repository transition E2b common switch commits exact path before r
     try std.testing.expect(diff_task.read_epoch.eql(.{ .value = 31 }));
 }
 
-test "review repository transition E2b blocker retains page owner and Review state" {
+test "review repository transition blocker retains page owner and Review state" {
     const allocator = std.testing.allocator;
     const identity: repo_root_capability.Identity = .{ .device = 5, .inode = 8 };
     var app: App = .{
@@ -12742,7 +12742,7 @@ test "review repository transition E2b blocker retains page owner and Review sta
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
-test "review repository transition E3a keyboard and page bar open the same exact Review path" {
+test "review repository transition keyboard and page bar open the same exact Review path" {
     const allocator = std.testing.allocator;
     const inputs = [_]enum { keyboard, page_bar }{ .keyboard, .page_bar };
 
@@ -12804,7 +12804,7 @@ test "review repository transition E3a keyboard and page bar open the same exact
     }
 }
 
-test "review repository transition E3a active Repository controls remain same-page no-ops" {
+test "review repository transition active Repository controls remain same-page no-ops" {
     const allocator = std.testing.allocator;
     const identity: repo_root_capability.Identity = .{ .device = 5, .inode = 8 };
     const inputs = [_]enum { keyboard, page_bar }{ .keyboard, .page_bar };
@@ -12859,7 +12859,7 @@ test "review repository transition E3a active Repository controls remain same-pa
     }
 }
 
-test "review repository transition E3b1 common switch maps retained-location outcomes" {
+test "review repository transition common switch maps retained-location outcomes" {
     const allocator = std.testing.allocator;
     const cases = [_]struct {
         path: ?[]const u8,
@@ -12937,7 +12937,7 @@ test "review repository transition E3b1 common switch maps retained-location out
     }
 }
 
-test "review repository transition E3b1 common switch consumes pending and unavailable no context" {
+test "review repository transition common switch consumes pending and unavailable no context" {
     const allocator = std.testing.allocator;
     const identity: repo_root_capability.Identity = .{ .device = 5, .inode = 8 };
     const cases = [_]enum { pending, unavailable }{ .pending, .unavailable };
@@ -12994,7 +12994,7 @@ test "review repository transition E3b1 common switch consumes pending and unava
     }
 }
 
-test "review repository transition E3b2 unavailable path is not replayed after reload" {
+test "review repository transition unavailable path is not replayed after reload" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -13070,7 +13070,7 @@ test "review repository transition E3b2 unavailable path is not replayed after r
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
-test "review repository transition E3b2 inactive Repository retains contextual selection" {
+test "review repository transition inactive Repository retains contextual selection" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -13122,7 +13122,7 @@ test "review repository transition E3b2 inactive Repository retains contextual s
     try std.testing.expectEqual(@as(u8, 4), ctx._pending_tasks_with_len);
 }
 
-test "review repository transition E3b3 active repository replacement rejects old owner and result" {
+test "review repository transition active repository replacement rejects old owner and result" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -13204,7 +13204,7 @@ test "review repository transition E3b3 active repository replacement rejects ol
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
-test "review repository transition C1 prepare failures leave both pages unchanged" {
+test "review repository transition prepare failures leave both pages unchanged" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -13254,7 +13254,7 @@ test "review repository transition C1 prepare failures leave both pages unchange
     ));
 }
 
-test "review repository transition C1 commit moves location and replaces old owner" {
+test "review repository transition commit moves location and replaces old owner" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -13311,7 +13311,7 @@ test "review repository transition C1 commit moves location and replaces old own
     ));
 }
 
-test "review repository transition C1 direct unavailable uses the same commit boundary" {
+test "review repository transition direct unavailable uses the same commit boundary" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -13362,7 +13362,7 @@ test "review repository transition C1 direct unavailable uses the same commit bo
     try std.testing.expectEqual(page.Id.repository, app.active_page);
 }
 
-test "review repository transition C1 no context bypasses identity and retains browser location" {
+test "review repository transition no context bypasses identity and retains browser location" {
     const allocator = std.testing.allocator;
     const repository_manifest = @import("repository/manifest.zig");
     const repository_tree = @import("repository/tree.zig");
@@ -13432,7 +13432,7 @@ test "review repository transition C1 no context bypasses identity and retains b
     try std.testing.expectEqual(@as(usize, 1), app.pages.repository.viewer.tree_cursor);
 }
 
-test "review repository transition C2 blocker precedes contextual handoff preparation" {
+test "review repository transition blocker precedes contextual handoff preparation" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -13465,7 +13465,7 @@ test "review repository transition C2 blocker precedes contextual handoff prepar
     try std.testing.expect(app.pages.repository.incoming == .none);
 }
 
-test "review repository transition C2 prepare failure stays on Review with bounded diagnostic" {
+test "review repository transition prepare failure stays on Review with bounded diagnostic" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -13499,7 +13499,7 @@ test "review repository transition C2 prepare failure stays on Review with bound
     try std.testing.expectEqualStrings("could not prepare page navigation", app.status.text());
 }
 
-test "review repository transition C2 post-commit manifest start failures stay on Repository" {
+test "review repository transition post-commit manifest start failures stay on Repository" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -13561,7 +13561,7 @@ test "review repository transition C2 post-commit manifest start failures stay o
     }
 }
 
-test "review repository transition C2 keyboard opens exact retained path with line owner" {
+test "review repository transition keyboard opens exact retained path with line owner" {
     const allocator = std.testing.allocator;
     const repository_manifest = @import("repository/manifest.zig");
     const repository_tree = @import("repository/tree.zig");
@@ -13624,7 +13624,7 @@ test "review repository transition C2 keyboard opens exact retained path with li
     try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
 }
 
-test "review repository transition C2 page bar exposes deleted target as unavailable" {
+test "review repository transition page bar exposes deleted target as unavailable" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -13975,8 +13975,8 @@ test "closed read authority queues action-terminal revalidation instead of dropp
     try std.testing.expect(app.pages.review.repository_read_authority.closeForMutation(owner));
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
-    // BC3 regression: the pre-check queues one coalesced revalidation where
-    // the old route reached the inner read gate and silently dropped the
+    // The pre-check queues one coalesced revalidation where the old route
+    // reached the inner read gate and silently dropped the
     // post-action refresh intent.
     const disposition = app.startActionResultRevalidation(&ctx, null, false);
 
@@ -18723,7 +18723,7 @@ test "Review canonical publication projection failure publishes failure body ato
     request = undefined;
     try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
 
-    // Audit regression (slice 5): the publication route's failure arm commits
+    // The publication route's failure arm commits
     // atomically — the gate is consumed, the accepted source and status are
     // published exactly once, and the preallocated failure body becomes the
     // displayed projection instead of leaving a stale retained body plus a
@@ -23678,7 +23678,7 @@ test "Review staged boundary result lands safely while canonical gate is open" {
     try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
 
     // A queued full revalidation is not blocked by the pending read: the next
-    // update tail starts it and the canonical gate opens with R1 in flight.
+    // update tail starts it while the canonical boundary read is in flight.
     app.pages.review.activation.queueRevalidation();
     try app.update(.git_action_spinner_tick, &ctx);
     try std.testing.expect(app.pages.review.auto_reload.background_cycle != null);

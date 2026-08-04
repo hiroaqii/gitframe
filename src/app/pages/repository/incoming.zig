@@ -52,7 +52,7 @@ pub const State = union(enum) {
     }
 
     /// Move an exact manifest match into the document stage without copying
-    /// its byte-exact path. A later slice binds the selected-file generation.
+    /// its byte-exact path. The document stage binds the selected-file generation.
     pub fn advanceToDocument(self: *State, manifest_revision: u64) bool {
         const location = switch (self.*) {
             .awaiting_manifest => |location| location,

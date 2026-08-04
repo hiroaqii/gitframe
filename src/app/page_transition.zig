@@ -2,8 +2,8 @@
 //!
 //! Keyboard, page-bar mouse input, and the future Session API all request a
 //! page change through the same pure disposition function. This module owns no
-//! App state; callers provide the small blocker snapshot required by the
-//! reviewed Phase 9 transition matrix.
+//! App state; callers provide the small blocker snapshot required by the page
+//! transition policy.
 
 const std = @import("std");
 const page = @import("page.zig");
@@ -160,7 +160,7 @@ test "repository prompt modes block mouse initiated page transitions" {
     );
 }
 
-test "repository selection slice B transition blocks every page switch" {
+test "repository selection transition blocks every page switch" {
     try std.testing.expectEqual(
         Disposition{ .blocked = .repository_mouse_selection },
         disposition(.repository, .review, .{ .repository_mouse_selection = true }),

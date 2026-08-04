@@ -23,8 +23,8 @@ pub const AheadBehind = struct {
 
 /// Minimal branch/upstream snapshot for remote workflow gates.
 ///
-/// This intentionally stays separate from porcelain file status so Phase 8.7
-/// can add push/pull preconditions without migrating the hot file-status parser.
+/// This intentionally stays separate from porcelain file status so push/pull
+/// preconditions do not migrate into the hot file-status parser.
 pub const BranchStatus = struct {
     oid: ?[]const u8 = null,
     head: Head = .unknown,

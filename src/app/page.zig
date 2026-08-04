@@ -87,8 +87,8 @@ pub fn tabAtColumn(bar_width: u16, col: u16) ?Id {
     return null;
 }
 
-/// A non-Review page slot remains allocation-free until its owning phase
-/// replaces this placeholder with a real state owner.
+/// A non-Review page slot remains allocation-free until its owner replaces
+/// this placeholder with real state.
 pub const LazyPlaceholder = struct {
     initialized: bool = false,
 

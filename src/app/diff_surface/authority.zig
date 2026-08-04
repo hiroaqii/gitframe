@@ -1,8 +1,7 @@
-//! Shared diff-page action authority vocabulary introduced by Phase 9 A3.
+//! Shared diff-page action authority vocabulary.
 //!
-//! A3 derives this vector from the currently reachable Review state so existing
-//! action behavior remains unchanged. Phase 9 C will make activation identity and
-//! deactivation/re-entry transitions persistent runtime state.
+//! Requirements are evaluated against the current page activation and member
+//! freshness vector. Review and Compare retain independent lifecycle state.
 
 const std = @import("std");
 const auto_reload = @import("../auto_reload.zig");

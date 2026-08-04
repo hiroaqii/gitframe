@@ -4,8 +4,8 @@ const text_edit = @import("text_edit.zig");
 /// App-local UTF-8 text storage for editable fields.
 ///
 /// Cursor positions are byte offsets into `bytes.items`. Movement helpers keep
-/// those offsets on UTF-8 codepoint boundaries; grapheme-level movement is
-/// intentionally left for a later input-polish slice.
+/// those offsets on UTF-8 codepoint boundaries. Grapheme-level movement is not
+/// implemented.
 pub const TextBuffer = struct {
     pub const InsertError = error{OutOfMemory};
 

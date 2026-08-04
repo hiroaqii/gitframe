@@ -343,7 +343,7 @@ fn selectedBytesForLine(line: []const u8, mode: Mode, range: Range, line_index: 
 
 /// Every retained byte in a character point is a strict boundary, including
 /// the side not used directly for first/last-line extraction. The completed
-/// range may later feed rendering or a Phase 11 snapshot, so validation cannot
+/// range may later feed rendering or a durable snapshot, so validation cannot
 /// be deferred to whichever endpoint the current assembler happens to slice.
 fn validCharacterPoint(document: *const source.Document, point: Point) bool {
     const line = document.lineBody(point.line_index) orelse return false;
@@ -371,7 +371,7 @@ fn testToken(path: []const u8, bytes: []const u8) RepositoryContentToken {
     };
 }
 
-test "repository selection owner SH4 keeps pointer and source-range predicates explicit" {
+test "repository selection owner keeps pointer and source-range predicates explicit" {
     var owner: Owner = .none;
     try std.testing.expect(!owner.activeMouseOwner());
     try std.testing.expect(!owner.activeSourceRange());

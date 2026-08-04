@@ -507,7 +507,7 @@ fn directoryStageTarget(repo_root: []const u8, directory: []const u8, status: St
         if (!file_tree.isPathDescendantOfDirectory(key, directory)) continue;
 
         // Git operates on the whole directory path. Reject conflicts here so
-        // first-slice directory actions cannot resolve them implicitly.
+        // directory actions cannot resolve them implicitly.
         if (entry.isConflict()) return .{ .conflict_unsupported = directory };
 
         switch (file_tree.stagePresenceFromEntry(entry)) {

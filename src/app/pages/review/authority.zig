@@ -1,6 +1,6 @@
 //! Import-path shim: the module body moved to `src/app/diff_surface/authority.zig`
 //! so the shared diff surface can reference the activation lifecycle without
-//! importing Review page namespaces (issue #34 S1).
+//! importing Review page namespaces.
 
 const shared = @import("../../diff_surface/authority.zig");
 

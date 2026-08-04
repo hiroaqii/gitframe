@@ -262,8 +262,8 @@ pub fn firstLine(text: []const u8) []const u8 {
     return text;
 }
 
-/// Synchronous page adapter for the diff-pane body. S2c2a lifts the outer
-/// shell first; S2c2b supplies the shared pane renderer behind this boundary.
+/// Synchronous page adapter that keeps the outer shell separate from the
+/// shared diff-pane renderer behind this boundary.
 pub const DiffPaneRenderer = struct {
     ctx: *anyopaque,
     render_fn: *const fn (ctx: *anyopaque, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) anyerror!void,

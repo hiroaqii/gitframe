@@ -1,9 +1,9 @@
 //! Pure Repository source-header facts, formatting, and adaptive row layout.
 //!
 //! This module deliberately owns no page state and performs no filesystem,
-//! Git, rendering, or input work. SH3 may project exact accepted page facts
-//! into `Presentation`, while both rendering and SH5 hit testing consume the
-//! same `Layout` so terminal-cell geometry cannot diverge.
+//! Git, rendering, or input work. It projects exact accepted page facts into
+//! `Presentation`; rendering and hit testing consume the same `Layout` so
+//! terminal-cell geometry cannot diverge.
 
 const std = @import("std");
 const manifest = @import("../../../repository/manifest.zig");

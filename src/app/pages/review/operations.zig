@@ -206,8 +206,8 @@ pub const View = struct {
     repo_root: ?[]const u8,
     activation_state: authority.ActivationState,
 
-    /// Git operation authority is stricter than page activation lifetime.
-    /// P6b2d retains the old Review body and activation while a mutation runs,
+    /// Git operation authority is stricter than page activation lifetime. The
+    /// old Review body and activation remain visible while a mutation runs,
     /// but that visual owner must not resolve another file/hunk or remote
     /// action until exact-terminal reconciliation reopens repository reads.
     pub fn activation(self: View) authority.ActivationState {
