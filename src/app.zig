@@ -22,10 +22,10 @@ const review_content = @import("app/pages/review/content.zig");
 const review_layout = @import("app/pages/review/layout.zig");
 const review_message = @import("app/pages/review/message.zig");
 const review_navigation = @import("app/pages/review/navigation.zig");
-const review_authority = @import("app/pages/review/authority.zig");
+const review_authority = @import("app/diff_surface/authority.zig");
 const review_operations = @import("app/pages/review/operations.zig");
 const review_reload = @import("app/pages/review/reload.zig");
-const review_selection_model = @import("app/pages/review/selection.zig");
+const review_selection_model = @import("app/diff_surface/selection.zig");
 const review_page_update = @import("app/pages/review/update.zig");
 const review_view = @import("app/pages/review/view.zig");
 const repository_page = @import("app/pages/repository.zig");
@@ -8448,7 +8448,7 @@ test "diff mouse drag supports unified fallback and clears on invalidation" {
 
 test "terminal resize cancels live drag before geometry and retains completed selection" {
     const allocator = std.testing.allocator;
-    const review_selection = @import("app/pages/review/selection.zig");
+    const review_selection = @import("app/diff_surface/selection.zig");
     var app: App = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),

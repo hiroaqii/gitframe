@@ -4,7 +4,7 @@
 //! target/task/result. This module carries only scalar presentation lineage and
 //! the display hunk ordinal, so async ownership never duplicates path buffers.
 
-const review_selection = @import("selection.zig");
+const review_selection = @import("../../diff_surface/selection.zig");
 
 pub const Key = struct {
     content: review_selection.ReviewContentToken,

@@ -45,7 +45,7 @@ test {
     _ = @import("app/pages/review/layout.zig");
     _ = @import("app/pages/review/message.zig");
     _ = @import("app/pages/review/navigation.zig");
-    _ = @import("app/pages/review/authority.zig");
+    _ = @import("app/diff_surface/authority.zig");
     _ = @import("app/pages/review/repository_read_authority.zig");
     _ = @import("app/pages/review/operations.zig");
     _ = @import("app/pages/review/reload.zig");
