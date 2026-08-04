@@ -20,7 +20,7 @@ const Candidate = struct {
 /// one source of truth. The fold-free `init` is deliberate policy: lines
 /// inside folded hunks stay searchable — the viewer's fold state never
 /// narrows the search space — and offsets therefore live in the same
-/// fold-free space as `renderedOffsetForCoordinate(..., null)`.
+/// fold-free space as `renderedOffsetForCoordinate(..., &.{}, null)`.
 pub fn findMatch(
     file: diff_parser.FileDiff,
     mode: diff_view_model.DisplayMode,
@@ -31,7 +31,7 @@ pub fn findMatch(
     if (query.len == 0) return null;
 
     const base_offset = if (base) |coordinate|
-        diff_view_model.renderedOffsetForCoordinate(file, mode, coordinate, null)
+        diff_view_model.renderedOffsetForCoordinate(file, mode, coordinate, &.{}, null)
     else
         null;
 
@@ -335,7 +335,7 @@ fn expectRenderedOffset(
 ) !void {
     try std.testing.expectEqual(
         @as(?usize, expected),
-        diff_view_model.renderedOffsetForCoordinate(file, mode, coordinate, null),
+        diff_view_model.renderedOffsetForCoordinate(file, mode, coordinate, &.{}, null),
     );
 }
 

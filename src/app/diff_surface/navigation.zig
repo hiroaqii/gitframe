@@ -522,7 +522,7 @@ pub const BodyView = struct {
         const mode = self.view.effectiveDisplayMode();
         const file = self.displayedDiffFile() orelse return null;
         const index = self.displayedDiffLineIndex(mode) orelse self.view.selectedFileCachedLineIndex(mode);
-        return diff_view_model.renderedOffsetForCoordinate(file, mode, self.view.surface.viewer.diff_cursor, index);
+        return diff_view_model.renderedOffsetForCoordinate(file, mode, self.view.surface.viewer.diff_cursor, self.selectedFoldedHunks(), index);
     }
 
     pub fn selectedCoordinateAtOffset(self: BodyView, offset: usize) ?diff_view_model.BodyCoordinate {
@@ -1445,7 +1445,7 @@ pub const BodyController = struct {
             self.controller.clearSearchMatch();
             return;
         };
-        const offset = diff_view_model.renderedOffsetForCoordinate(target.file, mode, match.coordinate, target.line_index) orelse {
+        const offset = diff_view_model.renderedOffsetForCoordinate(target.file, mode, match.coordinate, target.folded_hunks, target.line_index) orelse {
             self.controller.clearSearchMatch();
             return;
         };

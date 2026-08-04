@@ -3807,6 +3807,44 @@ test "projection hunk fold authority denies retained staged-only projection muta
     try expectProjectionHunkFoldDenied(&app, allocator);
 }
 
+test "folded coordinate offset uses display folds without a cached index" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    const allocator = arena.allocator();
+    var loaded = app_test_support.loadedDiffOne();
+    loaded.collapsed_hunks = try allocator.alloc(bool, loaded.document.totalHunks());
+    @memset(loaded.collapsed_hunks, false);
+    loaded.collapsed_hunks[0] = true;
+
+    var app: TestHarness = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, loaded),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .diff_cursor = .{ .hunk_header = 1 },
+            },
+        } },
+        .terminal_size = .{ .width = 100, .height = 12 },
+    };
+    defer app.clearLoadedDiff();
+
+    try std.testing.expect(app.reviewNavigationView().displayedDiffLineIndex(.unified) == null);
+    try std.testing.expectEqual(
+        @as(?usize, diff_view_model.hunkBodyLineOffsetFolded(
+            app_test_support.file_with_hunks,
+            .unified,
+            1,
+            &.{ true, false },
+        )),
+        app.reviewNavigationView().selectedDiffCursorOffset(),
+    );
+
+    app.pages.review.viewer.diff_cursor = .{ .hunk_line = .{
+        .hunk_index = 0,
+        .line_index = 0,
+    } };
+    try std.testing.expect(app.reviewNavigationView().selectedDiffCursorOffset() == null);
+}
+
 test "projection hunk fold authority preserves primary fold behavior" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     const allocator = arena.allocator();

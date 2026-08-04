@@ -713,7 +713,7 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
 
     fake = .{ .kind = .primary, .loaded = &loaded };
     try viewDiffPane(&ts.surface, body, loaded, .default(), null);
-    try std.testing.expectEqual(@as(usize, 2), fake.resolved);
+    try std.testing.expectEqual(@as(usize, 3), fake.resolved);
     try std.testing.expectEqual(@as(usize, 1), fake.hunk_stage);
     try std.testing.expectEqual(@as(usize, 1), fake.generated);
     try std.testing.expectEqual(@as(usize, 1), fake.displayed_file);

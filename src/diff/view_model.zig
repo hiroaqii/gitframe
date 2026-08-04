@@ -287,6 +287,7 @@ pub fn renderedOffsetForCoordinate(
     file: diff_parser.FileDiff,
     mode: DisplayMode,
     coordinate: BodyCoordinate,
+    folded_hunks: []const bool,
     index_opt: ?RenderedLineIndex,
 ) ?usize {
     const index = if (index_opt) |index|
@@ -297,13 +298,14 @@ pub fn renderedOffsetForCoordinate(
     return switch (coordinate) {
         .metadata => |metadata_index| visibleMetadataOffset(file, metadata_index),
         .binary_marker => if (file.is_binary) visibleMetadataRowCount(file) else null,
-        .hunk_header => |hunk_index| hunkOffsetForCoordinate(file, mode, index, hunk_index),
+        .hunk_header => |hunk_index| hunkOffsetForCoordinate(file, mode, index, hunk_index, folded_hunks),
         .hunk_line => |line| blk: {
             if (line.hunk_index >= file.hunks.len) break :blk null;
             const hunk = file.hunks[line.hunk_index];
             if (line.line_index >= hunk.lines.len) break :blk null;
+            if (isFolded(folded_hunks, line.hunk_index)) break :blk null;
 
-            const hunk_offset = hunkOffsetForCoordinate(file, mode, index, line.hunk_index) orelse break :blk null;
+            const hunk_offset = hunkOffsetForCoordinate(file, mode, index, line.hunk_index, folded_hunks) orelse break :blk null;
             if (index) |line_index| {
                 if (line_index.hunkLineCount(line.hunk_index) <= 1) break :blk null;
             }
@@ -366,10 +368,16 @@ pub fn coordinateAtOffset(
     } };
 }
 
-fn hunkOffsetForCoordinate(file: diff_parser.FileDiff, mode: DisplayMode, index: ?RenderedLineIndex, hunk_index: usize) ?usize {
+fn hunkOffsetForCoordinate(
+    file: diff_parser.FileDiff,
+    mode: DisplayMode,
+    index: ?RenderedLineIndex,
+    hunk_index: usize,
+    folded_hunks: []const bool,
+) ?usize {
     if (hunk_index >= file.hunks.len) return null;
     if (index) |line_index| return line_index.hunkOffset(hunk_index);
-    return hunkBodyLineOffset(file, mode, hunk_index);
+    return hunkBodyLineOffsetFolded(file, mode, hunk_index, folded_hunks);
 }
 
 fn hunkIndexAtOffsetByWalk(file: diff_parser.FileDiff, mode: DisplayMode, offset: usize, folded_hunks: []const bool) ?usize {
@@ -924,7 +932,7 @@ test "rendered line index can fold hunk bodies in place" {
     try std.testing.expectEqual(@as(usize, 1), index.hunkOffset(1));
     try std.testing.expectEqual(@as(?usize, null), renderedOffsetForCoordinate(file, .unified, .{
         .hunk_line = .{ .hunk_index = 0, .line_index = 0 },
-    }, index));
+    }, &folded, index));
 
     var rows = BodyRowIterator.initAtWithFolded(file, .unified, index, index.hunkOffset(0), &folded);
     const header = rows.next().?.hunk_header;
@@ -937,7 +945,7 @@ test "rendered line index can fold hunk bodies in place" {
     try std.testing.expectEqual(@as(usize, 3), index.hunkLineCount(0));
     try std.testing.expectEqual(@as(?usize, index.hunkOffset(0) + 1), renderedOffsetForCoordinate(file, .unified, .{
         .hunk_line = .{ .hunk_index = 0, .line_index = 0 },
-    }, index));
+    }, &unfolded, index));
 }
 
 test "rendered line index counts binary file" {
@@ -1033,10 +1041,10 @@ test "rendered offset maps added side of paired rows to the paired row" {
 
     const removed_offset = renderedOffsetForCoordinate(file, .side_by_side, .{
         .hunk_line = .{ .hunk_index = 0, .line_index = 1 },
-    }, index);
+    }, &.{}, index);
     const added_offset = renderedOffsetForCoordinate(file, .side_by_side, .{
         .hunk_line = .{ .hunk_index = 0, .line_index = 3 },
-    }, index);
+    }, &.{}, index);
 
     try std.testing.expectEqual(removed_offset, added_offset);
     try std.testing.expectEqual(@as(?usize, index.hunkOffset(0) + 2), added_offset);
@@ -1078,7 +1086,7 @@ test "coordinateAtOffset maps rendered rows back to body coordinates" {
     try std.testing.expectEqual(BodyCoordinate{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } }, coordinateAtOffset(file, .side_by_side, side_by_side.hunkOffset(0) + 2, &.{}, side_by_side).?);
 }
 
-test "coordinateAtOffset fallback keeps folded hunk geometry" {
+test "folded coordinate offset round trips cached and fallback geometry" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
         .metadata = &.{},
@@ -1108,50 +1116,68 @@ test "coordinateAtOffset fallback keeps folded hunk geometry" {
             },
         },
     };
-    const folded = [_]bool{ true, false };
-    const unified_expected = [_]BodyCoordinate{
-        .{ .hunk_header = 0 },
-        .{ .hunk_header = 1 },
-        .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } },
-        .{ .hunk_line = .{ .hunk_index = 1, .line_index = 1 } },
-        .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } },
+    const fold_cases = [_][2]bool{
+        .{ false, false },
+        .{ true, false },
     };
-    const side_by_side_expected = [_]BodyCoordinate{
-        .{ .hunk_header = 0 },
-        .{ .hunk_header = 1 },
-        .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } },
-        .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } },
-    };
-    const cases = [_]struct {
-        mode: DisplayMode,
-        expected: []const BodyCoordinate,
-    }{
-        .{ .mode = .unified, .expected = &unified_expected },
-        .{ .mode = .side_by_side, .expected = &side_by_side_expected },
-    };
+    const modes = [_]DisplayMode{ .unified, .side_by_side };
 
-    for (cases) |case| {
-        var index = try RenderedLineIndex.buildFolded(std.testing.allocator, file, case.mode, &folded);
-        defer index.deinit(std.testing.allocator);
+    for (fold_cases) |folded| {
+        for (modes) |mode| {
+            var index = try RenderedLineIndex.buildFolded(std.testing.allocator, file, mode, &folded);
+            defer index.deinit(std.testing.allocator);
 
-        for (case.expected, 0..) |expected, offset| {
-            const fallback = coordinateAtOffset(file, case.mode, offset, &folded, null);
-            try std.testing.expect(fallback != null);
-            try std.testing.expectEqual(expected, fallback.?);
+            for (0..index.lineCount()) |offset| {
+                const cached_coordinate = coordinateAtOffset(file, mode, offset, &folded, index) orelse
+                    return error.ExpectedCachedCoordinate;
+                const fallback_coordinate = coordinateAtOffset(file, mode, offset, &folded, null) orelse
+                    return error.ExpectedFallbackCoordinate;
+                try std.testing.expectEqual(cached_coordinate, fallback_coordinate);
+                try std.testing.expectEqual(
+                    @as(?usize, offset),
+                    renderedOffsetForCoordinate(file, mode, cached_coordinate, &folded, index),
+                );
+                try std.testing.expectEqual(
+                    @as(?usize, offset),
+                    renderedOffsetForCoordinate(file, mode, fallback_coordinate, &folded, null),
+                );
+            }
 
-            const cached = coordinateAtOffset(file, case.mode, offset, &folded, index);
-            try std.testing.expect(cached != null);
-            try std.testing.expectEqual(expected, cached.?);
+            const expected_second_header: usize = if (folded[0])
+                1
+            else switch (mode) {
+                .unified => 3,
+                .side_by_side => 2,
+            };
+            const second_header: BodyCoordinate = .{ .hunk_header = 1 };
+            try std.testing.expectEqual(
+                @as(?usize, expected_second_header),
+                renderedOffsetForCoordinate(file, mode, second_header, &folded, null),
+            );
+
+            const rejected_index: RenderedLineIndex = .{ .mode = mode.toggled() };
+            try std.testing.expectEqual(
+                @as(?usize, expected_second_header),
+                renderedOffsetForCoordinate(file, mode, second_header, &folded, rejected_index),
+            );
+            try std.testing.expectEqual(
+                second_header,
+                coordinateAtOffset(file, mode, expected_second_header, &folded, rejected_index).?,
+            );
+
+            if (folded[0]) {
+                const hidden_body: BodyCoordinate = .{ .hunk_line = .{
+                    .hunk_index = 0,
+                    .line_index = 0,
+                } };
+                try std.testing.expect(renderedOffsetForCoordinate(file, mode, hidden_body, &folded, index) == null);
+                try std.testing.expect(renderedOffsetForCoordinate(file, mode, hidden_body, &folded, null) == null);
+                try std.testing.expect(renderedOffsetForCoordinate(file, mode, hidden_body, &folded, rejected_index) == null);
+            }
+
+            try std.testing.expect(coordinateAtOffset(file, mode, index.lineCount(), &folded, null) == null);
+            try std.testing.expect(coordinateAtOffset(file, mode, index.lineCount(), &folded, index) == null);
         }
-
-        try std.testing.expect(coordinateAtOffset(file, case.mode, index.lineCount(), &folded, null) == null);
-        try std.testing.expect(coordinateAtOffset(file, case.mode, index.lineCount(), &folded, index) == null);
-
-        const rejected_index: RenderedLineIndex = .{ .mode = case.mode.toggled() };
-        try std.testing.expectEqual(
-            BodyCoordinate{ .hunk_header = 1 },
-            coordinateAtOffset(file, case.mode, 1, &folded, rejected_index).?,
-        );
     }
 }
 
@@ -1180,11 +1206,11 @@ test "rendered offset rejects stale coordinates" {
         }},
     };
 
-    try std.testing.expect(renderedOffsetForCoordinate(file, .unified, .{ .metadata = 9 }, null) == null);
-    try std.testing.expect(renderedOffsetForCoordinate(file, .unified, .{ .hunk_header = 2 }, null) == null);
+    try std.testing.expect(renderedOffsetForCoordinate(file, .unified, .{ .metadata = 9 }, &.{}, null) == null);
+    try std.testing.expect(renderedOffsetForCoordinate(file, .unified, .{ .hunk_header = 2 }, &.{}, null) == null);
     try std.testing.expect(renderedOffsetForCoordinate(file, .unified, .{
         .hunk_line = .{ .hunk_index = 0, .line_index = 3 },
-    }, null) == null);
+    }, &.{}, null) == null);
 }
 
 test "side-by-side pairs removed and added runs by index" {
