@@ -1899,12 +1899,12 @@ fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
     return diff_surface.navigation.sidebarWidth(total_width, preferred_width);
 }
 
-fn maxHorizontalScrollForBodyRow(body_row: diff_view_model.BodyRow, pane_width: u16, line_numbers: bool) usize {
-    return diff_surface.navigation.maxHorizontalScrollForBodyRow(body_row, pane_width, line_numbers);
+fn maxHorizontalScrollForBodyRow(body_row: diff_view_model.BodyRow, body_width: u16, line_numbers: bool) usize {
+    return diff_surface.navigation.maxHorizontalScrollForBodyRow(body_row, body_width, line_numbers);
 }
 
-fn maxHorizontalScrollForSideBySideRow(side_row: diff_view_model.SideBySideRow, pane_width: u16, line_numbers: bool) usize {
-    return diff_surface.navigation.maxHorizontalScrollForSideBySideRow(side_row, pane_width, line_numbers);
+fn maxHorizontalScrollForSideBySideRow(side_row: diff_view_model.SideBySideRow, body_width: u16, line_numbers: bool) usize {
+    return diff_surface.navigation.maxHorizontalScrollForSideBySideRow(side_row, body_width, line_numbers);
 }
 
 fn visibleTextWidth(total_width: u16, text_col: u16) u16 {
@@ -2303,7 +2303,11 @@ fn expectDisplayedBodyHorizontalScrollGeometry(harness: *TestHarness) !void {
         harness.pages.review.viewer.display_mode = mode;
         harness.pages.review.viewer.view_options.line_numbers = true;
         const with_line_numbers = harness.view().visibleBodyTextMaxHorizontalScroll();
-        try std.testing.expect(with_line_numbers >= 8);
+        const expected_with_line_numbers: usize = switch (mode) {
+            .unified => 76,
+            .side_by_side => 139,
+        };
+        try std.testing.expectEqual(expected_with_line_numbers, with_line_numbers);
 
         harness.pages.review.viewer.diff_horizontal_scroll = 0;
         harness.controller().scrollDiffHorizontal(.right);
@@ -2311,7 +2315,11 @@ fn expectDisplayedBodyHorizontalScrollGeometry(harness: *TestHarness) !void {
 
         harness.pages.review.viewer.view_options.line_numbers = false;
         const without_line_numbers = harness.view().visibleBodyTextMaxHorizontalScroll();
-        try std.testing.expect(with_line_numbers > without_line_numbers);
+        const expected_without_line_numbers: usize = switch (mode) {
+            .unified => 66,
+            .side_by_side => 134,
+        };
+        try std.testing.expectEqual(expected_without_line_numbers, without_line_numbers);
     }
 
     harness.terminal_size = .{ .width = 60, .height = 16 };
@@ -3097,14 +3105,12 @@ test "displayed body horizontal scroll preserves primary behavior without a cach
     try expectResolverRenderOmits(&harness, "hunks");
     try std.testing.expect(harness.view().displayedDiffLineIndex(.unified) == null);
     const with_line_numbers = harness.view().visibleBodyTextMaxHorizontalScroll();
-    try std.testing.expect(with_line_numbers >= 8);
+    try std.testing.expectEqual(@as(usize, 35), with_line_numbers);
 
     harness.controller().scrollDiffHorizontal(.right);
     try std.testing.expectEqual(@as(usize, 8), harness.pages.review.viewer.diff_horizontal_scroll);
     harness.pages.review.viewer.view_options.line_numbers = false;
-    try std.testing.expect(
-        harness.view().visibleBodyTextMaxHorizontalScroll() < with_line_numbers,
-    );
+    try std.testing.expectEqual(@as(usize, 25), harness.view().visibleBodyTextMaxHorizontalScroll());
 }
 
 test "displayed body horizontal scroll uses cached combined retained and generated authority" {
@@ -6152,11 +6158,11 @@ test "side-by-side context horizontal clamp checks both columns" {
     };
 
     try std.testing.expectEqual(
-        @as(usize, 8),
-        maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, 80, true),
+        @as(usize, 9),
+        maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, diff_render.bodyWidth(80), true),
     );
     try std.testing.expect(
-        maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, 80, false) <
-            maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, 80, true),
+        maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, diff_render.bodyWidth(80), false) <
+            maxHorizontalScrollForBodyRow(.{ .side_by_side = .{ .single = line } }, diff_render.bodyWidth(80), true),
     );
 }

@@ -393,7 +393,7 @@ pub const BodyView = struct {
         const visible_rows = self.view.diffVisibleRows();
         if (visible_rows == 0) return 0;
 
-        const pane_width = self.view.diffPaneWidth();
+        const body_width = diff_render.bodyWidth(self.view.diffPaneWidth());
         if (self.generatedBody()) |body| {
             const row_count = body.source.rowCount();
             const first_row = @min(self.view.surface.viewer.diff_scroll, row_count);
@@ -411,7 +411,7 @@ pub const BodyView = struct {
                 };
                 max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(
                     body_row,
-                    pane_width,
+                    body_width,
                     self.view.surface.viewer.view_options.line_numbers,
                 ));
             }
@@ -434,7 +434,7 @@ pub const BodyView = struct {
             }
             if (visible >= visible_rows) break;
             visible += 1;
-            max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(body_row, pane_width, self.view.surface.viewer.view_options.line_numbers));
+            max_scroll = @max(max_scroll, maxHorizontalScrollForBodyRow(body_row, body_width, self.view.surface.viewer.view_options.line_numbers));
         }
         return max_scroll;
     }
@@ -1798,21 +1798,19 @@ pub fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
     return layout.sidebarWidth(total_width, preferred_width);
 }
 
-pub fn maxHorizontalScrollForBodyRow(body_row: diff_view_model.BodyRow, pane_width: u16, line_numbers: bool) usize {
+pub fn maxHorizontalScrollForBodyRow(body_row: diff_view_model.BodyRow, body_width: u16, line_numbers: bool) usize {
     return switch (body_row) {
-        .unified_line => |line| maxHorizontalScrollForText(line.text, visibleTextWidth(pane_width, diff_render.lineTextStart(line_numbers, .unified))),
-        .side_by_side => |side_row| maxHorizontalScrollForSideBySideRow(side_row, pane_width, line_numbers),
+        .unified_line => |line| maxHorizontalScrollForText(line.text, visibleTextWidth(body_width, diff_render.lineTextStart(line_numbers, .unified))),
+        .side_by_side => |side_row| maxHorizontalScrollForSideBySideRow(side_row, body_width, line_numbers),
         else => 0,
     };
 }
 
-pub fn maxHorizontalScrollForSideBySideRow(side_row: diff_view_model.SideBySideRow, pane_width: u16, line_numbers: bool) usize {
-    const gutter_col = pane_width / 2;
-    const new_col = gutter_col + 1;
+pub fn maxHorizontalScrollForSideBySideRow(side_row: diff_view_model.SideBySideRow, body_width: u16, line_numbers: bool) usize {
+    const geometry = diff_render.sideBySideGeometry(body_width);
     const text_col = diff_render.lineTextStart(line_numbers, .side_by_side);
-    const old_text_width: u16 = visibleTextWidth(gutter_col, text_col);
-    const new_width: u16 = if (pane_width > new_col) pane_width - new_col else 0;
-    const new_text_width: u16 = visibleTextWidth(new_width, text_col);
+    const old_text_width: u16 = visibleTextWidth(geometry.old.width, text_col);
+    const new_text_width: u16 = visibleTextWidth(geometry.new.width, text_col);
     var max_scroll: usize = 0;
     switch (side_row) {
         .single => |line| {
