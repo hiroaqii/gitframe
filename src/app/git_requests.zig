@@ -4,11 +4,9 @@
 //! payloads are consumed on every return path: success transfers ownership to
 //! the task, and failure frees the payload before returning.
 //!
-//! A successful launcher returns its exact `PendingAction` only after
-//! `spawnWith` accepts the task. This receipt lets the App distinguish
-//! preparation from a concrete launch without inferring success from mutable
-//! `ActionState` after the fact. The caller must pass that receipt through the
-//! App launch coordinator exactly once before any task completion is admitted.
+//! The action lifecycle prepares the exact `PendingAction` before entering a
+//! launcher. These functions either queue a task carrying that token or return
+//! an error; the caller then rejects or accepts the same token synchronously.
 
 const std = @import("std");
 const chasen = @import("chasen");
@@ -17,13 +15,8 @@ const actions = @import("actions.zig");
 const git_ops = @import("git_ops.zig");
 const app_state = @import("state.zig");
 
-pub fn hasPendingAction(action_state: actions.ActionState) bool {
-    return action_state.pending != null;
-}
-
-pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: git_ops.StageTarget) !actions.PendingAction {
-    const pending = action_state.begin(.stage_file);
-    errdefer _ = action_state.cancelPreparing(pending);
+pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: git_ops.StageTarget) !void {
+    requireKind(pending, .stage_file);
 
     const Task = actions.StageFileTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -41,12 +34,10 @@ pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *
     task.label = try ctx.allocator().dupe(u8, if (target.label.len > 0) target.label else target.path);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    return pending;
 }
 
-pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: git_ops.UnstageTarget) !actions.PendingAction {
-    const pending = action_state.begin(.unstage_file);
-    errdefer _ = action_state.cancelPreparing(pending);
+pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: git_ops.UnstageTarget) !void {
+    requireKind(pending, .unstage_file);
 
     const Task = actions.UnstageFileTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -64,14 +55,11 @@ pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
     task.label = try ctx.allocator().dupe(u8, if (target.label.len > 0) target.label else target.path);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    return pending;
 }
 
-pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: *git_ops.HunkStageTarget) !actions.PendingAction {
+pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: *git_ops.HunkStageTarget) !void {
     defer consumeHunkTarget(ctx.allocator(), target);
-
-    const pending = action_state.begin(.stage_hunk);
-    errdefer _ = action_state.cancelPreparing(pending);
+    requireKind(pending, .stage_hunk);
 
     const Task = actions.StageHunkTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -91,14 +79,11 @@ pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *
     target.patch = &.{};
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    return pending;
 }
 
-pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, target: *git_ops.HunkUnstageTarget) !actions.PendingAction {
+pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: *git_ops.HunkUnstageTarget) !void {
     defer consumeHunkTarget(ctx.allocator(), target);
-
-    const pending = action_state.begin(.unstage_hunk);
-    errdefer _ = action_state.cancelPreparing(pending);
+    requireKind(pending, .unstage_hunk);
 
     const Task = actions.UnstageHunkTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -119,12 +104,10 @@ pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
     target.patch = &.{};
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    return pending;
 }
 
-pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, repo_root: []const u8, path: []const u8) !actions.PendingAction {
-    const pending = action_state.begin(.discard_file);
-    errdefer _ = action_state.cancelPreparing(pending);
+pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, repo_root: []const u8, path: []const u8) !void {
+    requireKind(pending, .discard_file);
 
     const Task = actions.DiscardFileTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -139,7 +122,6 @@ pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state:
     task.path = try ctx.allocator().dupe(u8, path);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    return pending;
 }
 
 pub const CommitRequest = struct {
@@ -155,11 +137,9 @@ pub const CommitRequest = struct {
     }
 };
 
-pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, request: *CommitRequest) !actions.PendingAction {
+pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, request: *CommitRequest) !void {
     defer request.deinit(ctx.allocator());
-
-    const pending = action_state.begin(.commit);
-    errdefer _ = action_state.cancelPreparing(pending);
+    requireKind(pending, .commit);
 
     const Task = actions.CommitTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -173,7 +153,6 @@ pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *act
     errdefer destroyCommitTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    return pending;
 }
 
 pub const CommitMessageAssistRequest = struct {
@@ -193,11 +172,9 @@ pub const CommitMessageAssistRequest = struct {
     }
 };
 
-pub fn startCommitMessageAssist(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, request: *CommitMessageAssistRequest) !actions.PendingAction {
+pub fn startCommitMessageAssist(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, request: *CommitMessageAssistRequest) !void {
     defer request.deinit(ctx.allocator());
-
-    const pending = action_state.begin(.assist_commit_message);
-    errdefer _ = action_state.cancelPreparing(pending);
+    requireKind(pending, .assist_commit_message);
 
     const Task = actions.CommitMessageAssistTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -213,14 +190,11 @@ pub fn startCommitMessageAssist(comptime Msg: type, ctx: *chasen.Ctx(Msg), actio
     errdefer actions.destroyCommitMessageAssistTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    return pending;
 }
 
-pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *actions.ActionState, confirmation: *app_state.AmendConfirmation) !actions.PendingAction {
+pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, confirmation: *app_state.AmendConfirmation) !void {
     defer consumeAmendConfirmation(ctx.allocator(), confirmation);
-
-    const pending = action_state.begin(.amend);
-    errdefer _ = action_state.cancelPreparing(pending);
+    requireKind(pending, .amend);
 
     const Task = actions.AmendTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -234,20 +208,17 @@ pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), action_state: *acti
     errdefer destroyCommitTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    return pending;
 }
 
 pub fn startPush(
     comptime Msg: type,
     ctx: *chasen.Ctx(Msg),
-    action_state: *actions.ActionState,
+    pending: actions.PendingAction,
     env_map: ?*const std.process.Environ.Map,
     confirmation: *app_state.PushConfirmation,
-) !actions.PendingAction {
+) !void {
     defer consumePushConfirmation(ctx.allocator(), confirmation);
-
-    const pending = action_state.begin(.push);
-    errdefer _ = action_state.cancelPreparing(pending);
+    requireKind(pending, .push);
 
     const Task = actions.PushTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -273,20 +244,17 @@ pub fn startPush(
     errdefer destroyPushTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    return pending;
 }
 
 pub fn startPull(
     comptime Msg: type,
     ctx: *chasen.Ctx(Msg),
-    action_state: *actions.ActionState,
+    pending: actions.PendingAction,
     env_map: ?*const std.process.Environ.Map,
     confirmation: *app_state.PullConfirmation,
-) !actions.PendingAction {
+) !void {
     defer consumePullConfirmation(ctx.allocator(), confirmation);
-
-    const pending = action_state.begin(.pull);
-    errdefer _ = action_state.cancelPreparing(pending);
+    requireKind(pending, .pull);
 
     const Task = actions.PullTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -311,7 +279,6 @@ pub fn startPull(
     errdefer destroyPullTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    return pending;
 }
 
 pub const FetchRequest = struct {
@@ -326,14 +293,12 @@ pub const FetchRequest = struct {
 pub fn startFetch(
     comptime Msg: type,
     ctx: *chasen.Ctx(Msg),
-    action_state: *actions.ActionState,
+    pending: actions.PendingAction,
     env_map: ?*const std.process.Environ.Map,
     request: *FetchRequest,
-) !actions.PendingAction {
+) !void {
     defer consumeFetchRequest(ctx.allocator(), request);
-
-    const pending = action_state.begin(.fetch);
-    errdefer _ = action_state.cancelPreparing(pending);
+    requireKind(pending, .fetch);
 
     const Task = actions.FetchTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -347,7 +312,6 @@ pub fn startFetch(
     errdefer destroyFetchTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    return pending;
 }
 
 pub const SwitchBranchRequest = struct {
@@ -365,13 +329,11 @@ pub const SwitchBranchRequest = struct {
 pub fn startSwitchBranch(
     comptime Msg: type,
     ctx: *chasen.Ctx(Msg),
-    action_state: *actions.ActionState,
+    pending: actions.PendingAction,
     request: *SwitchBranchRequest,
-) !actions.PendingAction {
+) !void {
     defer consumeSwitchBranchRequest(ctx.allocator(), request);
-
-    const pending = action_state.begin(.switch_branch);
-    errdefer _ = action_state.cancelPreparing(pending);
+    requireKind(pending, .switch_branch);
 
     const Task = actions.SwitchBranchTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -393,24 +355,22 @@ pub fn startSwitchBranch(
     errdefer destroySwitchBranchTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    return pending;
 }
 
 pub fn startCredentialedPush(
     comptime Msg: type,
     ctx: *chasen.Ctx(Msg),
-    action_state: *actions.ActionState,
+    pending: actions.PendingAction,
     env_map: ?*const std.process.Environ.Map,
     target: *app_state.PushRetryTarget,
     credentials: *actions.PushCredentials,
-) !actions.PendingAction {
+) !void {
     // This function consumes credentials on every return path. Keeping cleanup
     // here prevents caller/task rollback paths from both freeing the same
     // secret buffers if spawning fails after task construction.
     defer credentials.deinit(ctx.allocator());
 
-    const pending = action_state.begin(.push);
-    errdefer _ = action_state.cancelPreparing(pending);
+    requireKind(pending, .push);
 
     const Task = actions.PushTask(Msg);
     const task = try ctx.allocator().create(Task);
@@ -451,7 +411,6 @@ pub fn startCredentialedPush(
         .mode = .upstream,
         .remote_url = null,
     };
-    return pending;
 }
 
 fn destroyFileTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
@@ -459,6 +418,10 @@ fn destroyFileTask(comptime Task: type, allocator: std.mem.Allocator, task: *Tas
     if (task.path.len > 0) allocator.free(task.path);
     if (@hasField(Task, "label") and task.label.len > 0) allocator.free(task.label);
     allocator.destroy(task);
+}
+
+fn requireKind(pending: actions.PendingAction, expected: actions.ActionKind) void {
+    if (pending.kind != expected) @panic("Git action launcher received the wrong action kind");
 }
 
 fn consumeHunkTarget(allocator: std.mem.Allocator, target: anytype) void {

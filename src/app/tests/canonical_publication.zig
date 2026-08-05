@@ -483,7 +483,7 @@ test "Review mutation read fence follows accepted action launch and exact termin
 
     const epoch_before_launch = app.pages.review.repository_read_authority.epoch;
     try app.update(.{ .review = .toggle_selected_file }, &ctx);
-    const pending = (app.actions.pending orelse return error.ExpectedPendingAction).token;
+    const pending = app_testing.actionView(&app).acceptedPending() orelse return error.ExpectedPendingAction;
     const action_tasks = ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), action_tasks.len);
 
@@ -501,7 +501,7 @@ test "Review mutation read fence follows accepted action launch and exact termin
         .path = try allocator.dupe(u8, "a"),
         .result = .{ .failed_static = "stale fixture" },
     } }), &ctx);
-    try std.testing.expect(app.actions.isAccepted(pending));
+    try std.testing.expect(app_testing.actionView(&app).isAccepted(pending));
     try std.testing.expect(app.pages.review.repository_read_authority.ownsMutation(pending));
 
     const exact = action_tasks[0].failed(
@@ -511,7 +511,7 @@ test "Review mutation read fence follows accepted action launch and exact termin
     );
     try app.update(exact, &ctx);
 
-    try std.testing.expect(!app.actions.isCurrent(pending));
+    try std.testing.expect(!app_testing.actionView(&app).isCurrent(pending));
     try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expect(app.pages.review.repository_read_authority.epoch.eql(epoch_before_launch.next()));
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
@@ -675,7 +675,7 @@ test "Review mutation read fence drains old production reads without publication
 
     try installPushCredentialPrompt(&app, allocator, roots.a);
     try app.update(.push_credential_submit, &task_ctx);
-    const pending = (app.actions.pending orelse return error.ExpectedPendingAction).token;
+    const pending = app_testing.actionView(&app).acceptedPending() orelse return error.ExpectedPendingAction;
     const action_tasks = task_ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), action_tasks.len);
     var action_terminal = action_tasks[0].failed(
@@ -759,7 +759,7 @@ test "Review mutation read fence drains old production reads without publication
         app.pages.review.branch_status_load.pending == null and
         app.pages.review.auto_reload.background_cycle == null;
     try app.update(action_terminal, &delivery_ctx);
-    const exact_terminal = !app.actions.isCurrent(pending);
+    const exact_terminal = !app_testing.actionView(&app).isCurrent(pending);
     const fence_reopened =
         app.pages.review.repository_read_authority.mayStartRepositoryRead();
 

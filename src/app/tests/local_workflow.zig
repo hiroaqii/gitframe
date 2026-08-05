@@ -1,0 +1,455 @@
+//! Root integration tests for local workflow outcomes and shell routing.
+
+const std = @import("std");
+const chasen = @import("chasen");
+
+const app_mod = @import("../../app.zig");
+const app_actions = @import("../actions.zig");
+const app_commit_panel = @import("../commit_panel.zig");
+const app_load = @import("../load.zig");
+const app_message = @import("../message.zig");
+const app_shell_layout = @import("../shell_layout.zig");
+const app_state = @import("../state.zig");
+const app_test_support = @import("../test_support.zig");
+const review_page = @import("../pages/review.zig");
+const review_navigation = @import("../pages/review/navigation.zig");
+const review_reload = @import("../pages/review/reload.zig");
+const review_authority = @import("../diff_surface/authority.zig");
+const content_fingerprint = @import("../../content_fingerprint.zig");
+const diff_source = @import("../../diff/source.zig");
+const git_ops = @import("../git_ops.zig");
+const git_status = @import("../../git/status.zig");
+const loaded_diff = @import("../../loaded_diff.zig");
+const repo_discovery = @import("../../repo/discovery.zig");
+const repo_root_capability = @import("../../repo/root_capability.zig");
+
+const App = app_mod.App;
+const app_testing = app_mod.testing;
+const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
+const StatusLoadTask = app_load.StatusLoadTask(app_message.Msg);
+const test_action_root_identity: repo_root_capability.Identity = .{ .device = 41, .inode = 73 };
+
+fn activateReview(app: *App) void {
+    _ = app.pages.review.activation.activate(
+        app.repo_session.view().epoch(),
+        .pending,
+        .pending,
+        .pending,
+    );
+}
+
+fn reviewNavigation(app: *App) review_navigation.Controller {
+    const body = app_shell_layout.compute(
+        app.terminal_size,
+        .{ .page_bar_visible = true },
+    ).bodySize();
+    return .{
+        .page = &app.pages.review,
+        .repo_root = app.repo_session.view().activeRoot(),
+        .repo_epoch = app.repo_session.view().epoch(),
+        .root_identity = app.repo_session.view().activeIdentity(),
+        .source = app.config.source,
+        .layout = .{ .width = body.width, .height = body.height },
+        .diagnostics = .{ .target = &app.pages.review.status },
+    };
+}
+
+fn reviewReload(app: *App) review_reload.Controller {
+    return .{
+        .page = &app.pages.review,
+        .navigation = reviewNavigation(app),
+        .source = app.config.source,
+        .repo_root = app.repo_session.view().activeRoot(),
+        .repo_epoch = app.repo_session.view().epoch(),
+        .root_identity = app.repo_session.view().activeIdentity(),
+    };
+}
+
+fn beginAcceptedTestAction(app: *App, kind: app_actions.ActionKind) app_actions.PendingAction {
+    if (app.allocator == null) app.allocator = std.testing.allocator;
+    return app_testing.installAcceptedActionFixture(app, kind);
+}
+
+fn installTestActionCursor(
+    app: *App,
+    allocator: std.mem.Allocator,
+    kind: review_page.action_cursor.TargetKind,
+    path_key: []const u8,
+    action_generation: u64,
+) !void {
+    const identity = app.repo_session.view().activeIdentity() orelse test_action_root_identity;
+    var prepared = try reviewNavigation(app).prepareActionCursor(
+        allocator,
+        app.repo_session.view().epoch(),
+        identity,
+        kind,
+        path_key,
+    );
+    reviewNavigation(app).installActionCursor(allocator, &prepared, action_generation);
+}
+
+fn finishStageFileForTest(
+    app: *App,
+    ctx: *chasen.Ctx(App.Msg),
+    finished: app_actions.StageFileFinished,
+) !void {
+    try app.update(.{ .action_finished = .{ .stage_file = finished } }, ctx);
+}
+
+fn finishStageHunkForTest(
+    app: *App,
+    ctx: *chasen.Ctx(App.Msg),
+    finished: app_actions.StageHunkFinished,
+) !void {
+    try app.update(.{ .action_finished = .{ .stage_hunk = finished } }, ctx);
+}
+
+fn finishUnstageHunkForTest(
+    app: *App,
+    ctx: *chasen.Ctx(App.Msg),
+    finished: app_actions.UnstageHunkFinished,
+) !void {
+    try app.update(.{ .action_finished = .{ .unstage_hunk = finished } }, ctx);
+}
+
+fn syncTestActivation(app: *App) void {
+    const source: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
+        .immutable
+    else if (app.pages.review.auto_reload.sourceIsActionable())
+        .fresh
+    else if (app.pages.review.load.hasPending())
+        .pending
+    else
+        .unavailable;
+    _ = app.pages.review.activation.activate(
+        app.repo_session.view().epoch(),
+        source,
+        review_authority.auxiliaryMember(app.pages.review.status_load),
+        review_authority.auxiliaryMember(app.pages.review.branch_status_load),
+    );
+}
+
+fn acceptTestSource(app: *App) void {
+    app.pages.review.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
+    syncTestActivation(app);
+}
+
+fn testSingleRepoDiscovery(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+) !repo_discovery.DiscoveryResult {
+    return .{ .single_repo = .{
+        .label = try allocator.dupe(u8, std.fs.path.basename(root)),
+        .display_path = try allocator.dupe(u8, root),
+        .canonical_root = try allocator.dupe(u8, root),
+    } };
+}
+
+const TestRepoPair = struct {
+    tmp: std.testing.TmpDir,
+    a: [:0]u8,
+    b: [:0]u8,
+
+    fn init() !TestRepoPair {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.createDir(std.testing.io, "a", .default_dir);
+        try tmp.dir.createDir(std.testing.io, "b", .default_dir);
+        const a = try tmp.dir.realPathFileAlloc(std.testing.io, "a", std.testing.allocator);
+        errdefer std.testing.allocator.free(a);
+        const b = try tmp.dir.realPathFileAlloc(std.testing.io, "b", std.testing.allocator);
+        return .{ .tmp = tmp, .a = a, .b = b };
+    }
+
+    fn deinit(self: *TestRepoPair) void {
+        std.testing.allocator.free(self.a);
+        std.testing.allocator.free(self.b);
+        self.tmp.cleanup();
+        self.* = undefined;
+    }
+};
+
+fn initStageHunkLaunchApp(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+) !App {
+    var root = try repo_root_capability.RootCapability.openCanonical(repo_root);
+    var root_owned = true;
+    errdefer if (root_owned) root.deinit();
+    var discovery = try testSingleRepoDiscovery(allocator, repo_root);
+    var discovery_owned = true;
+    errdefer if (discovery_owned) discovery.deinit(allocator);
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    var arena_owned = true;
+    errdefer if (arena_owned) arena.deinit();
+    var loaded = app_test_support.loadedDiffTwo();
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .repo_session = .{ .repo_state = .{
+            .discovery = discovery,
+            .root = root,
+        } },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadStateWithArena(arena, loaded),
+            .viewer = .{
+                .focus = .diff,
+                .selected_target = .{ .diff_file = 0 },
+                .selected_node = 0,
+                .diff_cursor = .{ .hunk_header = 0 },
+            },
+        } },
+        .terminal_size = .{ .width = 100, .height = 20 },
+    };
+    root_owned = false;
+    discovery_owned = false;
+    arena_owned = false;
+    errdefer {
+        app.pages.review.deinit(allocator);
+        app.repo_session.repo_state.deinit(allocator);
+    }
+    var status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00 M b\x00");
+    defer status.deinit();
+    try app.pages.review.git_status.replace(repo_root, &status);
+    acceptTestSource(&app);
+    return app;
+}
+
+fn clearPendingStatusTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
+    for (ctx.takePendingTasksWith()) |entry| {
+        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
+        message.deinitUndelivered(allocator);
+    }
+}
+
+fn clearPendingStatusAndDiffTasks(
+    ctx: *chasen.Ctx(App.Msg),
+    allocator: std.mem.Allocator,
+) void {
+    for (ctx.takePendingTasksWith()) |entry| {
+        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
+        message.deinitUndelivered(allocator);
+    }
+}
+
+test "successful file action binds the exact source and status generations started by its refresh" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .repo_session = .{
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+        },
+    };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(allocator);
+    defer reviewReload(&app).clearPendingReload(allocator);
+    defer reviewReload(&app).clearLoadedDiff(app.allocator);
+    defer app.pages.review.git_status.deinit();
+    defer reviewNavigation(&app).clearActionCursor(allocator);
+    _ = activateReview(&app);
+
+    const pending = beginAcceptedTestAction(&app, .stage_file);
+    try installTestActionCursor(&app, allocator, .directory, "src", pending.generation);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    try finishStageFileForTest(&app, &ctx, .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .path = try allocator.dupe(u8, "src"),
+        .result = .ok,
+    });
+
+    const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
+    const source_task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
+    const basis = app.pages.review.action_cursor.owner.?.phase.awaiting_action_refresh;
+    try std.testing.expectEqual(pending.generation, app.pages.review.action_cursor.actionGeneration().?);
+    try std.testing.expectEqual(status_task.generation, basis.memberState(.status).?.generation.?);
+    try std.testing.expectEqual(source_task.generation, basis.memberState(.source).?.generation.?);
+    try std.testing.expectEqual(review_page.action_cursor.Terminal.pending, basis.memberState(.status).?.terminal);
+    try std.testing.expectEqual(review_page.action_cursor.Terminal.pending, basis.memberState(.source).?.terminal);
+}
+
+test "successful hunk action binds an exact status-only refresh" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .repo_session = .{
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+        },
+    };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(allocator);
+    defer app.pages.review.git_status.deinit();
+    defer reviewNavigation(&app).clearActionCursor(allocator);
+    _ = activateReview(&app);
+
+    const pending = beginAcceptedTestAction(&app, .stage_hunk);
+    try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusTasks(&ctx, allocator);
+    try finishStageHunkForTest(&app, &ctx, .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .path = try allocator.dupe(u8, "a"),
+        .hunk_index = 1,
+        .session_mark_mutation = .none,
+        .result = .ok,
+    });
+
+    const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
+    const basis = app.pages.review.action_cursor.owner.?.phase.awaiting_action_refresh;
+    try std.testing.expectEqual(review_page.action_cursor.RefreshRequirement.status_only, std.meta.activeTag(basis));
+    try std.testing.expect(basis.memberState(.source) == null);
+    try std.testing.expectEqual(status_task.generation, basis.memberState(.status).?.generation.?);
+    try std.testing.expectEqual(review_page.action_cursor.Terminal.pending, basis.memberState(.status).?.terminal);
+}
+
+test "cached hunk unstage binds exact source and status refresh members" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try initStageHunkLaunchApp(allocator, roots.a);
+    defer app.repo_session.repo_state.deinit(allocator);
+    defer app.pages.review.deinit(allocator);
+
+    const pending = beginAcceptedTestAction(&app, .unstage_hunk);
+    try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    try finishUnstageHunkForTest(&app, &ctx, .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .path = try allocator.dupe(u8, "a"),
+        .hunk_index = 1,
+        .session_mark_mutation = .none,
+        .reload_after_success = true,
+        .result = .ok,
+    });
+
+    const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
+    const source_task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
+    const basis = app.pages.review.action_cursor.owner.?.phase.awaiting_action_refresh;
+    try std.testing.expectEqual(review_page.action_cursor.RefreshRequirement.source_and_status, std.meta.activeTag(basis));
+    try std.testing.expectEqual(status_task.generation, basis.memberState(.status).?.generation.?);
+    try std.testing.expectEqual(source_task.generation, basis.memberState(.source).?.generation.?);
+}
+
+test "status-only hunk refresh spawn rejection closes its exact owner" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try initStageHunkLaunchApp(allocator, roots.a);
+    defer app.repo_session.repo_state.deinit(allocator);
+    defer app.pages.review.deinit(allocator);
+
+    const pending = beginAcceptedTestAction(&app, .stage_hunk);
+    try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._pending_tasks_with_len = 16 };
+    try finishStageHunkForTest(&app, &ctx, .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .path = try allocator.dupe(u8, "a"),
+        .hunk_index = 1,
+        .session_mark_mutation = .none,
+        .result = .ok,
+    });
+    ctx._pending_tasks_with_len = 0;
+
+    try std.testing.expect(!app_testing.actionView(&app).hasPending());
+    try std.testing.expect(app.pages.review.status_load.pending == null);
+    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+}
+
+test "inert diff hunk command reports bounded encoding diagnostic" {
+    const eligibility = [_]loaded_diff.FileTextEligibility{.inert_invalid_utf8};
+    var loaded = app_test_support.loadedDiffOne();
+    loaded.file_text_eligibility = &eligibility;
+    var app: App = .{
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(loaded),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        } },
+        .allocator = std.testing.allocator,
+    };
+    defer reviewReload(&app).clearLoadedDiff(std.testing.allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.update(.{ .review = .toggle_selected_hunk }, &ctx);
+
+    try std.testing.expectEqualStrings(git_ops.inert_hunk_action_message, app.pages.review.status.text());
+    try std.testing.expect(std.mem.indexOfScalar(u8, app.pages.review.status.text(), 0xff) == null);
+}
+
+test "opening amend confirmation cancels active discard confirmation" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .local_workflow = .{ .commit_panel = app_commit_panel.State.init(allocator) },
+        .repo_session = .{ .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } } },
+    };
+    defer app.local_workflow.commit_panel.deinit();
+    defer {
+        if (app.local_workflow.amend_confirmation) |*confirmation| confirmation.deinit(allocator);
+        if (app.local_workflow.discard_confirmation) |*confirmation| confirmation.deinit(allocator);
+    }
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    app.local_workflow.discard_confirmation = .{
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .path = try allocator.dupe(u8, "src/app.zig"),
+    };
+    app.overlay.openDiscardFile();
+    app.local_workflow.commit_panel.open(.amend);
+    app.local_workflow.commit_panel.insert('x');
+
+    try app.update(.submit_commit_panel, &ctx);
+
+    try std.testing.expect(app.local_workflow.discard_confirmation == null);
+    try std.testing.expect(app.local_workflow.amend_confirmation != null);
+    try std.testing.expectEqual(app_state.OverlayKind.amend_commit, app.overlay.kind);
+}
+
+test "canceling amend confirmation keeps commit panel draft" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .allocator = allocator,
+        .local_workflow = .{ .commit_panel = app_commit_panel.State.init(allocator) },
+        .repo_session = .{ .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } } },
+    };
+    defer app.local_workflow.commit_panel.deinit();
+    defer if (app.local_workflow.amend_confirmation) |*confirmation| confirmation.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    app.local_workflow.commit_panel.open(.amend);
+    app.local_workflow.commit_panel.insert('x');
+    try app.update(.submit_commit_panel, &ctx);
+
+    try app.update(.cancel_amend, &ctx);
+
+    try std.testing.expect(app.local_workflow.amend_confirmation == null);
+    try std.testing.expectEqual(app_state.OverlayKind.none, app.overlay.kind);
+    try std.testing.expect(app.local_workflow.commit_panel.is_open);
+    try std.testing.expectEqual(app_commit_panel.Mode.amend, app.local_workflow.commit_panel.mode);
+    try std.testing.expectEqualStrings("x", app.local_workflow.commit_panel.subject.slice());
+}

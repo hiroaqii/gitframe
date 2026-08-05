@@ -5,6 +5,7 @@ const ui = @import("chasen_ui");
 const app_commit_panel = @import("commit_panel.zig");
 const app_repo_picker = @import("repo_picker.zig");
 const app_actions = @import("actions.zig");
+const action_lifecycle = @import("workflow/action_lifecycle.zig");
 const app_state = @import("state.zig");
 const shell_layout = @import("shell_layout.zig");
 const view_primitives = @import("view_primitives.zig");
@@ -68,7 +69,7 @@ pub const Context = struct {
     theme: theme.Palette,
     keymap: keymap.Effective,
     terminal_size: chasen.Size,
-    actions: *const app_actions.ActionState,
+    action: action_lifecycle.View,
     /// Shell notifications temporarily win over the active page diagnostic.
     status: *const app_state.StatusMessage,
     page_status: ?*const app_state.StatusMessage = null,
@@ -91,7 +92,6 @@ pub const Context = struct {
     push_retry_inspecting: bool,
     push_credential_prompt: ?*const app_state.PushCredentialPrompt,
     branch_switch: *const app_state.BranchSwitchState,
-    git_action_spinner_tick: u8,
     staged_summary: app_commit_panel.StagedSummary,
 };
 
@@ -393,13 +393,13 @@ const FooterSegments = struct {
 };
 
 fn gitActionSpinnerText(app: Context, allocator: std.mem.Allocator) ?[]const u8 {
-    const pending = app.actions.pending orelse return null;
+    const presentation = app.action.spinnerPresentation() orelse return null;
     const label = if (visibleStatus(app).len > 0)
         visibleStatus(app)
     else
-        pendingActionFallbackLabel(pending.token.kind);
+        pendingActionFallbackLabel(presentation.kind);
     const spinner = ui.Spinner.init(.{});
-    return std.fmt.allocPrint(allocator, "{s} {s}", .{ spinner.frameAt(app.git_action_spinner_tick), label }) catch label;
+    return std.fmt.allocPrint(allocator, "{s} {s}", .{ spinner.frameAt(presentation.tick), label }) catch label;
 }
 
 fn visibleStatus(app: Context) []const u8 {
@@ -1562,8 +1562,8 @@ test "footer segment fit includes left inset" {
 test "footer shows pending spinner with current status label" {
     var app: ShellViewTestHarness = .{};
     app.status.set("pushing: main -> origin/main", .{});
-    app.actions.pending = .{ .token = .{ .generation = 1, .kind = .push }, .launch = .accepted };
-    app.git_action_spinner_tick = 1;
+    action_lifecycle.testing.installAccepted(&app.action_runtime, .{ .generation = 1, .kind = .push });
+    action_lifecycle.testing.setSpinner(&app.action_runtime, 1, false);
 
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(96, 1);
@@ -1578,7 +1578,7 @@ test "footer shows pending spinner with current status label" {
 
 test "footer falls back to pending kind when status is empty" {
     var app: ShellViewTestHarness = .{};
-    app.actions.pending = .{ .token = .{ .generation = 1, .kind = .push }, .launch = .accepted };
+    action_lifecycle.testing.installAccepted(&app.action_runtime, .{ .generation = 1, .kind = .push });
 
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 1);
@@ -1640,7 +1640,7 @@ const ShellViewTestHarness = struct {
     theme: theme.Palette = .default(),
     terminal_size: chasen.Size = .{ .width = 80, .height = 24 },
     status: app_state.StatusMessage = .{},
-    actions: app_actions.ActionState = .{},
+    action_runtime: action_lifecycle.ActionRuntime = .{},
     commit_panel: app_commit_panel.State = .{},
     repo_picker: app_prompt.RepoPickerState = .{},
     repo_picker_items: app_repo_picker.ItemList = .empty,
@@ -1649,7 +1649,6 @@ const ShellViewTestHarness = struct {
     repo_state: repo_state.State = .{},
     branch_switch: app_state.BranchSwitchState = .{},
     push_confirmation: ?app_state.PushConfirmation = null,
-    git_action_spinner_tick: u8 = 0,
 
     fn context(self: *const ShellViewTestHarness) Context {
         const navigation: @import("pages/review/navigation.zig").View = .{
@@ -1680,7 +1679,7 @@ const ShellViewTestHarness = struct {
             .theme = self.theme,
             .keymap = self.keymap,
             .terminal_size = self.terminal_size,
-            .actions = &self.actions,
+            .action = self.action_runtime.view(),
             .status = &self.status,
             .page_status = &self.review.status,
             .commit_panel = &self.commit_panel,
@@ -1702,7 +1701,6 @@ const ShellViewTestHarness = struct {
             .push_retry_inspecting = false,
             .push_credential_prompt = null,
             .branch_switch = &self.branch_switch,
-            .git_action_spinner_tick = self.git_action_spinner_tick,
             .staged_summary = .unavailable,
         };
     }
