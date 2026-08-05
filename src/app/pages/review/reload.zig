@@ -8,8 +8,9 @@ const std = @import("std");
 const context = @import("../../../context.zig");
 const content_fingerprint = @import("../../../content_fingerprint.zig");
 const builtin = @import("builtin");
+const action_fence = if (builtin.is_test) @import("action_fence.zig") else struct {};
 const auto_reload = @import("../../auto_reload.zig");
-const app_actions = @import("../../actions.zig");
+const app_actions = if (builtin.is_test) @import("../../actions.zig") else struct {};
 const app_load = @import("../../load.zig");
 const app_page = @import("../../page.zig");
 const load_state = @import("../../load_state.zig");
@@ -518,47 +519,6 @@ pub const Controller = struct {
         if (!self.page.repository_read_authority.mayStartRepositoryRead()) {
             return error.RepositoryReadAuthorityClosed;
         }
-    }
-
-    /// Atomically closes Review repository-read authority for one accepted
-    /// mutating action and retires projection work derived before that action.
-    ///
-    /// The displayed body and cache remain owned so launch itself cannot blank
-    /// or flicker the UI. Their old epoch prevents promotion or write
-    /// authority. Source, status, and branch task owners also remain intact so
-    /// their terminals can perform exact tracker and background-cycle drain.
-    pub fn beginMutationReadFence(
-        self: Controller,
-        allocator: std.mem.Allocator,
-        pending: app_actions.PendingAction,
-    ) bool {
-        if (!self.page.repository_read_authority.closeForMutation(pending)) return false;
-
-        self.page.auto_reload.supersedeActiveCycleByMutation();
-        self.page.review_projection.clearPending(allocator);
-        self.page.review_projection.clearSyntaxPending(allocator);
-        if (self.page.deferred_projection_apply) |*deferred| deferred.deinit(allocator);
-        self.page.deferred_projection_apply = null;
-        return true;
-    }
-
-    /// Reopens the Review repository-read authority for its exact mutating
-    /// action terminal, then coalesces one foreground revalidation intent for
-    /// the activation which observed that terminal.
-    ///
-    /// Reopening must happen before queueing: the post-update scheduler may
-    /// consume this intent immediately, and every successor read must capture
-    /// the already-advanced open epoch. An inactive page still releases the
-    /// gate, but the activation-scoped terminal fallback deliberately does not
-    /// target a future activation. Stale, mismatched, and duplicate terminals
-    /// change neither owner.
-    pub fn finishMutationReadFence(
-        self: Controller,
-        pending: app_actions.PendingAction,
-    ) bool {
-        if (!self.page.repository_read_authority.reopenForMutation(pending)) return false;
-        self.page.activation.queueActionTerminalRevalidation();
-        return true;
     }
 
     /// The live drag is the only state which borrows displayed source or
@@ -4309,6 +4269,17 @@ fn testController(
     };
 }
 
+fn testActionFence(page: *review_page.ReviewPageState) action_fence.Controller {
+    return .{
+        .read_authority = &page.repository_read_authority,
+        .activation = &page.activation,
+        .action_cursor = &page.action_cursor,
+        .auto_reload = &page.auto_reload,
+        .review_projection = &page.review_projection,
+        .deferred_projection_apply = &page.deferred_projection_apply,
+    };
+}
+
 fn addTestSessionHunkMarks(
     page: *review_page.ReviewPageState,
     allocator: std.mem.Allocator,
@@ -5402,7 +5373,7 @@ test "mutation read fence closes one exact owner and preserves read drain owners
         .generation = 6,
         .kind = .assist_commit_message,
     };
-    try std.testing.expect(!controller.beginMutationReadFence(allocator, assistance));
+    try std.testing.expect(!testActionFence(&page).closeForAcceptedMutation(allocator, assistance));
     try std.testing.expect(page.repository_read_authority.epoch.eql(old_epoch));
     try std.testing.expect(page.review_projection.pending != null);
     try std.testing.expect(page.review_projection.syntax_pending != null);
@@ -5424,7 +5395,7 @@ test "mutation read fence closes one exact owner and preserves read drain owners
         .generation = 7,
         .kind = .stage_hunk,
     };
-    try std.testing.expect(controller.beginMutationReadFence(allocator, mutation));
+    try std.testing.expect(testActionFence(&page).closeForAcceptedMutation(allocator, mutation));
     const fenced_epoch = page.repository_read_authority.epoch;
     try std.testing.expect(fenced_epoch.eql(old_epoch.next()));
     try std.testing.expect(page.repository_read_authority.ownsMutation(mutation));
@@ -5454,7 +5425,7 @@ test "mutation read fence closes one exact owner and preserves read drain owners
         cache_retained_bytes,
     );
 
-    try std.testing.expect(!controller.beginMutationReadFence(allocator, mutation));
+    try std.testing.expect(!testActionFence(&page).closeForAcceptedMutation(allocator, mutation));
     try std.testing.expect(page.repository_read_authority.epoch.eql(fenced_epoch));
     try expectMutationFenceRetainedReadOwners(
         &page,
@@ -5587,7 +5558,7 @@ test "mutation read fence retains deferred source until production apply drains 
         .generation = 8,
         .kind = .unstage_hunk,
     };
-    try std.testing.expect(controller.beginMutationReadFence(allocator, mutation));
+    try std.testing.expect(testActionFence(&page).closeForAcceptedMutation(allocator, mutation));
     const retained = page.deferred_source_apply orelse return error.ExpectedDeferredSource;
     try std.testing.expectEqual(cycle_id, retained.cycle_id);
     try std.testing.expectEqual(command.generation, retained.finished.generation);
@@ -5619,32 +5590,30 @@ test "mutation read fence terminal reopens exact owner and queues active revalid
     var page: review_page.ReviewPageState = .{};
     defer page.deinit(allocator);
     const activation_id = page.activation.activate(13, .fresh, .fresh, .fresh);
-    var status_message = @import("../../state.zig").StatusMessage{};
-    const controller = testController(&page, &status_message, .unstaged);
     const old_epoch = page.repository_read_authority.epoch;
     const owner: app_actions.PendingAction = .{
         .generation = 21,
         .kind = .stage_hunk,
     };
 
-    try std.testing.expect(!controller.finishMutationReadFence(.{
+    try std.testing.expect(!testActionFence(&page).reopenForExactTerminal(.{
         .generation = 20,
         .kind = .assist_commit_message,
     }));
     try std.testing.expect(page.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expect(page.activation.revalidation_requested == null);
 
-    try std.testing.expect(controller.beginMutationReadFence(allocator, owner));
+    try std.testing.expect(testActionFence(&page).closeForAcceptedMutation(allocator, owner));
     const fenced_epoch = page.repository_read_authority.epoch;
     try std.testing.expect(fenced_epoch.eql(old_epoch.next()));
     try std.testing.expect(!page.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expect(page.activation.revalidation_requested == null);
 
-    try std.testing.expect(!controller.finishMutationReadFence(.{
+    try std.testing.expect(!testActionFence(&page).reopenForExactTerminal(.{
         .generation = 20,
         .kind = .stage_hunk,
     }));
-    try std.testing.expect(!controller.finishMutationReadFence(.{
+    try std.testing.expect(!testActionFence(&page).reopenForExactTerminal(.{
         .generation = owner.generation,
         .kind = .unstage_hunk,
     }));
@@ -5652,7 +5621,7 @@ test "mutation read fence terminal reopens exact owner and queues active revalid
     try std.testing.expect(page.repository_read_authority.epoch.eql(fenced_epoch));
     try std.testing.expect(page.activation.revalidation_requested == null);
 
-    try std.testing.expect(controller.finishMutationReadFence(owner));
+    try std.testing.expect(testActionFence(&page).reopenForExactTerminal(owner));
     try std.testing.expect(page.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expect(page.repository_read_authority.epoch.eql(fenced_epoch));
     try std.testing.expectEqual(
@@ -5667,7 +5636,7 @@ test "mutation read fence terminal reopens exact owner and queues active revalid
 
     const later_activation = page.activation.activate(13, .fresh, .fresh, .fresh);
     try std.testing.expect(later_activation != activation_id);
-    try std.testing.expect(!controller.finishMutationReadFence(owner));
+    try std.testing.expect(!testActionFence(&page).reopenForExactTerminal(owner));
     try std.testing.expect(page.activation.revalidation_requested == null);
     try std.testing.expect(page.activation.action_terminal_revalidation_requested == null);
 }
@@ -5677,8 +5646,6 @@ test "mutation read fence terminal coalesces current intent and never targets a 
     var page: review_page.ReviewPageState = .{};
     defer page.deinit(allocator);
     const activation_id = page.activation.activate(17, .fresh, .fresh, .fresh);
-    var status_message = @import("../../state.zig").StatusMessage{};
-    const controller = testController(&page, &status_message, .unstaged);
     const first: app_actions.PendingAction = .{
         .generation = 31,
         .kind = .unstage_hunk,
@@ -5689,8 +5656,8 @@ test "mutation read fence terminal coalesces current intent and never targets a 
         activation_id,
         page.activation.revalidation_requested orelse return error.ExpectedRevalidationIntent,
     );
-    try std.testing.expect(controller.beginMutationReadFence(allocator, first));
-    try std.testing.expect(controller.finishMutationReadFence(first));
+    try std.testing.expect(testActionFence(&page).closeForAcceptedMutation(allocator, first));
+    try std.testing.expect(testActionFence(&page).reopenForExactTerminal(first));
     try std.testing.expectEqual(
         activation_id,
         page.activation.revalidation_requested orelse return error.ExpectedRevalidationIntent,
@@ -5708,11 +5675,11 @@ test "mutation read fence terminal coalesces current intent and never targets a 
         .generation = 32,
         .kind = .stage_file,
     };
-    try std.testing.expect(controller.beginMutationReadFence(allocator, second));
+    try std.testing.expect(testActionFence(&page).closeForAcceptedMutation(allocator, second));
     const fenced_epoch = page.repository_read_authority.epoch;
     page.activation.deactivate();
 
-    try std.testing.expect(controller.finishMutationReadFence(second));
+    try std.testing.expect(testActionFence(&page).reopenForExactTerminal(second));
     try std.testing.expect(page.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expect(page.repository_read_authority.epoch.eql(fenced_epoch));
     try std.testing.expect(page.activation.revalidation_requested == null);
@@ -5720,7 +5687,7 @@ test "mutation read fence terminal coalesces current intent and never targets a 
 
     _ = page.activation.activate(17, .fresh, .fresh, .fresh);
     try std.testing.expect(page.activation.revalidation_requested == null);
-    try std.testing.expect(!controller.finishMutationReadFence(second));
+    try std.testing.expect(!testActionFence(&page).reopenForExactTerminal(second));
     try std.testing.expect(page.activation.revalidation_requested == null);
     try std.testing.expect(page.activation.action_terminal_revalidation_requested == null);
 }

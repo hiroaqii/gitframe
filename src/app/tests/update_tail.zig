@@ -3,10 +3,13 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const app_mod = @import("../../app.zig");
+const app_auto_reload = @import("../auto_reload.zig");
+const canonical = @import("canonical_publication.zig");
 const app_test_support = @import("../test_support.zig");
 const app_load = @import("../load.zig");
 const app_input = @import("../input.zig");
 const app_message = @import("../message.zig");
+const app_review_projection = @import("../review_projection.zig");
 const app_shell_layout = @import("../shell_layout.zig");
 const page = @import("../page.zig");
 const page_link = @import("../page_link.zig");
@@ -23,12 +26,14 @@ const diff_basis = @import("../diff_basis.zig");
 const diff_surface = @import("../diff_surface.zig");
 const diff_file = @import("../../diff/file.zig");
 const diff_parser = @import("../../diff/parser.zig");
+const diff_presentation_identity = @import("../../diff/presentation_identity.zig");
 const diff_selection = @import("../../diff/selection.zig");
 const diff_source = @import("../../diff/source.zig");
 const diff_view_model = @import("../../diff/view_model.zig");
 const file_tree = @import("../../file_tree.zig");
 const git_backend = @import("../../git/backend.zig");
 const git_branch_status = @import("../../git/branch_status.zig");
+const git_status = @import("../../git/status.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
 const repo_root_capability = @import("../../repo/root_capability.zig");
 const review_session = @import("../../review/session.zig");
@@ -50,6 +55,26 @@ const RepositoryBranchTask = repository_page.BranchTask(app_message.Msg);
 const RepositoryDocumentTask = repository_page.DocumentTask(app_message.Msg);
 const RepositorySyntaxTask = repository_page.SyntaxTask(app_message.Msg);
 const RepositoryChangeMapTask = repository_page.ChangeMapTask(app_message.Msg);
+
+const test_action_root_identity: repo_root_capability.Identity = .{ .device = 41, .inode = 73 };
+
+const canonicalPublicationTestApp = canonical.canonicalPublicationTestApp;
+const canonicalPublicationStagedOnlyReuseCandidate = canonical.canonicalPublicationStagedOnlyReuseCandidate;
+const takeCanonicalPublicationReads = canonical.takeCanonicalPublicationReads;
+const startCanonicalPublicationWatch = canonical.startCanonicalPublicationWatch;
+const finishCanonicalPublicationStatus = canonical.finishCanonicalPublicationStatus;
+const finishCanonicalPublicationBranch = canonical.finishCanonicalPublicationBranch;
+
+const cached_projection_b_diff =
+    \\diff --git a/b b/b
+    \\index 1..2 100644
+    \\--- a/b
+    \\+++ b/b
+    \\@@ -1 +1 @@
+    \\-old b
+    \\+new b
+    \\
+;
 
 fn activateReview(app: *App) u64 {
     const source_member: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
@@ -82,6 +107,22 @@ fn reviewNavigationView(app: *const App) review_navigation.View {
         .root_identity = app.repo_session.view().activeIdentity(),
         .source = app.config.source,
         .layout = .{ .width = body.width, .height = body.height },
+    };
+}
+
+fn reviewNavigation(app: *App) review_navigation.Controller {
+    const body = app_shell_layout.compute(
+        app.terminal_size,
+        .{ .page_bar_visible = true },
+    ).bodySize();
+    return .{
+        .page = &app.pages.review,
+        .repo_root = app.repo_session.view().activeRoot(),
+        .repo_epoch = app.repo_session.view().epoch(),
+        .root_identity = app.repo_session.view().activeIdentity(),
+        .source = app.config.source,
+        .layout = .{ .width = body.width, .height = body.height },
+        .diagnostics = .{ .target = &app.pages.review.status },
     };
 }
 
@@ -946,4 +987,585 @@ fn abandonQueuedTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) u
         abandoned.deinitUndelivered(allocator);
     }
     return queued.len;
+}
+
+fn deliverStagedBoundaryStatus(
+    app: *App,
+    ctx: *chasen.Ctx(App.Msg),
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+) !void {
+    const identity = app.pages.review.activation.currentIdentity() orelse
+        return error.ExpectedReviewActivation;
+    app.pages.review.status_load = .{ .generation = 6, .pending = .{ .generation = 6 } };
+    var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .status = .{
+        .identity = identity,
+        .generation = 6,
+        .repo_root = try allocator.dupe(u8, repo_root),
+        .result = .{ .loaded = staged_status },
+    } } }), ctx);
+    staged_status = undefined;
+}
+
+fn cloneBoundaryProjectionRequest(
+    app: *App,
+    allocator: std.mem.Allocator,
+) !app_review_projection.Request {
+    const pending = app.pages.review.review_projection.pending orelse
+        return error.ExpectedBoundaryProjection;
+    return app_review_projection.cloneRequestWithOptions(
+        allocator,
+        pending.identity,
+        pending.id,
+        pending.repo_root,
+        pending.path_key,
+        pending.kind,
+        pending.source_kind,
+        pending.source_session_revision,
+        pending.status_snapshot_revision,
+        .{
+            .read_epoch = pending.read_epoch,
+            .root_identity = pending.root_identity,
+            .expected_presentation = pending.expected_presentation,
+        },
+    );
+}
+
+fn expectRetainedStagedOnlyOwner(app: *App, prior_hunks: [*]const diff_parser.Hunk) !void {
+    try std.testing.expect(app.pages.review.review_projection.pending == null);
+    const ready = switch (app.pages.review.review_projection.displayed) {
+        .ready => |*ready| ready,
+        else => return error.ExpectedRetainedOwner,
+    };
+    try std.testing.expect(ready.value == .retained_staged_only);
+    try std.testing.expect(
+        ready.value.retained_staged_only.presentation.projection.file.hunks.ptr == prior_hunks,
+    );
+    const authority_view = reviewNavigationView(app).activeHunkAuthority() orelse
+        return error.ExpectedStagedOnlyAuthority;
+    try std.testing.expect(authority_view.authority == .staged_only);
+}
+
+fn installTestActionCursor(
+    app: *App,
+    allocator: std.mem.Allocator,
+    kind: review_page.action_cursor.TargetKind,
+    path_key: []const u8,
+    action_generation: u64,
+) !void {
+    const identity = app.repo_session.view().activeIdentity() orelse test_action_root_identity;
+    var prepared = try reviewNavigation(app).prepareActionCursor(
+        allocator,
+        app.repo_session.repo_epoch,
+        identity,
+        kind,
+        path_key,
+    );
+    reviewNavigation(app).installActionCursor(allocator, &prepared, action_generation);
+}
+
+fn promoteTestActionCursorWithRequirement(
+    app: *App,
+    action_generation: u64,
+    requirement: review_page.action_cursor.RefreshRequirement,
+) !void {
+    const owner = app.pages.review.action_cursor.owner orelse return error.ExpectedActionCursorOwner;
+    try std.testing.expect(app.pages.review.action_cursor.promote(
+        action_generation,
+        owner.repo_epoch,
+        owner.root_identity,
+        requirement,
+    ));
+}
+
+test "Review staged boundary keeps owner body through real update tail" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const prior = reviewNavigationView(&app).activeCombinedProjection() orelse
+        return error.ExpectedCombinedProjection;
+    const prior_hunks = prior.displayFile().hunks.ptr;
+    const revision_before = app.pages.review.status_snapshot_revision;
+
+    try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
+    try std.testing.expectEqual(revision_before + 1, app.pages.review.status_snapshot_revision);
+
+    const pending = app.pages.review.review_projection.pending orelse
+        return error.ExpectedBoundaryProjection;
+    try std.testing.expectEqual(app_review_projection.Kind.cached_diff, pending.kind);
+    try abandonSingleQueuedTask(&ctx, allocator);
+
+    const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
+    var candidate = try canonicalPublicationStagedOnlyReuseCandidate(
+        allocator,
+        app.pages.review.status_snapshot_revision,
+    );
+    const current = reviewNavigationView(&app).displayedDiffFile() orelse
+        return error.ExpectedDisplayedDiff;
+    try std.testing.expect(diff_presentation_identity.exactEqual(current, candidate.displayFile()));
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .projection = .{
+        .request = result_request,
+        .result = .{ .staged_only_reuse_candidate = candidate },
+    } } }), &ctx);
+    candidate = undefined;
+
+    try expectRetainedStagedOnlyOwner(&app, prior_hunks);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+}
+test "Review staged boundary with queued revalidation defers to canonical gate" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const prior = reviewNavigationView(&app).activeCombinedProjection() orelse
+        return error.ExpectedCombinedProjection;
+    const prior_hunks = prior.displayFile().hunks.ptr;
+
+    app.pages.review.activation.queueRevalidation();
+    try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
+
+    // The queued full revalidation starts in the same tail and its canonical
+    // authority takes over: no navigation-side projection request is issued
+    // and the owned combined body stays displayed.
+    try std.testing.expect(app.pages.review.review_projection.pending == null);
+    const still_combined = reviewNavigationView(&app).activeCombinedProjection() orelse
+        return error.ExpectedRetainedCombinedProjection;
+    try std.testing.expect(still_combined.displayFile().hunks.ptr == prior_hunks);
+    const reads = try takeCanonicalPublicationReads(&ctx, allocator);
+    _ = reads;
+}
+test "Review staged boundary result lands safely while canonical gate is open" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const prior = reviewNavigationView(&app).activeCombinedProjection() orelse
+        return error.ExpectedCombinedProjection;
+    const prior_hunks = prior.displayFile().hunks.ptr;
+
+    try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
+    try std.testing.expect(app.pages.review.review_projection.pending != null);
+    try abandonSingleQueuedTask(&ctx, allocator);
+    const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
+
+    // A watch tick cannot open the gate while the boundary read is pending.
+    try app.update(.auto_reload_tick, &ctx);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+
+    // A queued full revalidation is not blocked by the pending read: the next
+    // update tail starts it while the canonical boundary read is in flight.
+    app.pages.review.activation.queueRevalidation();
+    try app.update(.git_action_spinner_tick, &ctx);
+    try std.testing.expect(app.pages.review.auto_reload.background_cycle != null);
+    const reads = try takeCanonicalPublicationReads(&ctx, allocator);
+    _ = reads;
+
+    var candidate = try canonicalPublicationStagedOnlyReuseCandidate(
+        allocator,
+        app.pages.review.status_snapshot_revision,
+    );
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .projection = .{
+        .request = result_request,
+        .result = .{ .staged_only_reuse_candidate = candidate },
+    } } }), &ctx);
+    candidate = undefined;
+
+    // The gate's fresh cycle already retired the boundary read: the late
+    // result is ignored and the owned combined body stays displayed until the
+    // canonical publication commits. Nothing is dropped either way.
+    try std.testing.expect(app.pages.review.review_projection.pending == null);
+    const held = reviewNavigationView(&app).activeCombinedProjection() orelse
+        return error.ExpectedRetainedCombinedProjection;
+    try std.testing.expect(held.displayFile().hunks.ptr == prior_hunks);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+}
+test "Review watch cycle after staged boundary advances revisions monotonically" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const prior = reviewNavigationView(&app).activeCombinedProjection() orelse
+        return error.ExpectedCombinedProjection;
+    const prior_hunks = prior.displayFile().hunks.ptr;
+
+    try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
+    try abandonSingleQueuedTask(&ctx, allocator);
+    const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
+    var candidate = try canonicalPublicationStagedOnlyReuseCandidate(
+        allocator,
+        app.pages.review.status_snapshot_revision,
+    );
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .projection = .{
+        .request = result_request,
+        .result = .{ .staged_only_reuse_candidate = candidate },
+    } } }), &ctx);
+    candidate = undefined;
+    try expectRetainedStagedOnlyOwner(&app, prior_hunks);
+    const boundary_revision = app.pages.review.status_snapshot_revision;
+
+    // Watch repair cycle: the fully staged worktree reports an empty unstaged
+    // source and the same staged-only status. Revisions must only move
+    // forward and the owned body must stay visible at every acceptance.
+    try app.update(.auto_reload_tick, &ctx);
+    const reads = try takeCanonicalPublicationReads(&ctx, allocator);
+
+    var watch_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .status = .{
+        .identity = reads.status_identity,
+        .read_epoch = reads.status_read_epoch,
+        .generation = reads.status_generation,
+        .background_cycle_id = reads.status_cycle_id,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .result = .{ .loaded = watch_status },
+    } } }), &ctx);
+    watch_status = undefined;
+    try std.testing.expect(app.pages.review.status_snapshot_revision >= boundary_revision);
+    const status_revision = app.pages.review.status_snapshot_revision;
+    _ = abandonQueuedTasks(&ctx, allocator);
+    try std.testing.expect(reviewNavigationView(&app).displayedReviewBody() != .none);
+
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .branch_status = .{
+        .identity = reads.branch_identity,
+        .read_epoch = reads.branch_read_epoch,
+        .generation = reads.branch_generation,
+        .background_cycle_id = reads.branch_cycle_id,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .result = .empty,
+    } } }), &ctx);
+    _ = abandonQueuedTasks(&ctx, allocator);
+    try std.testing.expect(reviewNavigationView(&app).displayedReviewBody() != .none);
+
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .source = .{
+        .identity = reads.source_identity,
+        .read_epoch = reads.source_read_epoch,
+        .generation = reads.source_generation,
+        .background_cycle_id = reads.source_cycle_id,
+        .result = .empty,
+    } } }), &ctx);
+
+    try std.testing.expect(app.pages.review.status_snapshot_revision >= status_revision);
+    try std.testing.expect(reviewNavigationView(&app).displayedReviewBody() != .none);
+    try std.testing.expectEqualStrings("a", reviewNavigationView(&app).selectedStagePathKey().?);
+
+    // The committed publication resolves the staged-only row through a fresh
+    // canonical cached read; deliver it and land on the cached preview.
+    const canonical_request = try cloneBoundaryProjectionRequest(&app, allocator);
+    try abandonSingleQueuedTask(&ctx, allocator);
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .projection = .{
+        .request = canonical_request,
+        .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(
+            allocator,
+            app_test_support.diff_cached_projection,
+        ) } },
+    } } }), &ctx);
+
+    try std.testing.expect(app.pages.review.review_projection.pending == null);
+    try std.testing.expect(app.pages.review.review_projection.displayed == .ready);
+    try std.testing.expect(app.pages.review.review_projection.displayed.ready.value == .cached_diff);
+    try std.testing.expect(app.pages.review.status_snapshot_revision >= status_revision);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+}
+test "Review staged boundary result defers during drag and lands afterward" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const prior = reviewNavigationView(&app).activeCombinedProjection() orelse
+        return error.ExpectedCombinedProjection;
+    const prior_hunks = prior.displayFile().hunks.ptr;
+
+    try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
+    try abandonSingleQueuedTask(&ctx, allocator);
+    const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
+
+    app.pages.review.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 1 },
+        .moved = true,
+    } };
+
+    var candidate = try canonicalPublicationStagedOnlyReuseCandidate(
+        allocator,
+        app.pages.review.status_snapshot_revision,
+    );
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .projection = .{
+        .request = result_request,
+        .result = .{ .staged_only_reuse_candidate = candidate },
+    } } }), &ctx);
+    candidate = undefined;
+
+    // Drag holds the display mutation: the combined body stays visible and
+    // the result waits in the deferred slot.
+    try std.testing.expect(app.pages.review.deferred_projection_apply != null);
+    const held = reviewNavigationView(&app).activeCombinedProjection() orelse
+        return error.ExpectedHeldCombinedProjection;
+    try std.testing.expect(held.displayFile().hunks.ptr == prior_hunks);
+
+    app.pages.review.selection_owner = .none;
+    try app.update(.git_action_spinner_tick, &ctx);
+
+    try std.testing.expect(app.pages.review.deferred_projection_apply == null);
+    try expectRetainedStagedOnlyOwner(&app, prior_hunks);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+}
+test "Review deferred boundary publication forces frame past skip latch" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const prior = reviewNavigationView(&app).activeCombinedProjection() orelse
+        return error.ExpectedCombinedProjection;
+    const prior_hunks = prior.displayFile().hunks.ptr;
+
+    try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
+    try abandonSingleQueuedTask(&ctx, allocator);
+    const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
+
+    app.pages.review.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 1 },
+        .moved = true,
+    } };
+    var candidate = try canonicalPublicationStagedOnlyReuseCandidate(
+        allocator,
+        app.pages.review.status_snapshot_revision,
+    );
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .projection = .{
+        .request = result_request,
+        .result = .{ .staged_only_reuse_candidate = candidate },
+    } } }), &ctx);
+    candidate = undefined;
+    try std.testing.expect(app.pages.review.deferred_projection_apply != null);
+
+    // The drag ends on a message whose handler skips its redraw; the tail
+    // publishes the deferred owner and must still produce a frame.
+    app.pages.review.selection_owner = .none;
+    ctx.resetRedrawSuppressed();
+    try app.update(.git_action_spinner_tick, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try expectRetainedStagedOnlyOwner(&app, prior_hunks);
+
+    // An unchanged tail on the same steady state keeps the handler's skip.
+    ctx.resetRedrawSuppressed();
+    try app.update(.git_action_spinner_tick, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+}
+test "Review unchanged tail keeps handler redraw skip" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.git_action_spinner_tick, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+}
+test "canonical noop commit clearing failure banner forces frame" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
+    try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, "MM a\x00");
+    try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
+
+    // A previous watch failure left a banner; this cycle finds the same
+    // content again (noop commit) and recovers that failure.
+    const failure = app_auto_reload.FailureIdentity.init("watch failed");
+    app.pages.review.auto_reload.last_failure = failure;
+    app.pages.review.status.setSourceReloadFailure(
+        failure.digest,
+        "auto reload failed: {s}",
+        .{"boom"},
+    );
+
+    // The unchanged source terminal lands on a skip-latched cycle; the tail's
+    // noop commit clears the banner and must still produce a frame.
+    ctx.resetRedrawSuppressed();
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .source = .{
+        .identity = reads.source_identity,
+        .read_epoch = reads.source_read_epoch,
+        .generation = reads.source_generation,
+        .background_cycle_id = reads.source_cycle_id,
+        .result = .{ .unchanged = content_fingerprint.Fingerprint.init("test source") },
+    } } }), &ctx);
+
+    try std.testing.expect(app.pages.review.canonical_publication == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, app.pages.review.status.text(), "auto reload failed") == null,
+    );
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+}
+test "canonical noop commit without projection kind clears banner and forces frame" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try canonicalPublicationTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    // Baseline where the gate path resolves no canonical projection kind:
+    // the entry is unstaged-only, so the commit takes the kind-less noop
+    // branch instead of the displayed-match branch.
+    var unstaged_baseline = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try app.pages.review.git_status.replace(roots.a, &unstaged_baseline);
+
+    const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
+    try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, " M a\x00");
+    try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
+
+    const failure = app_auto_reload.FailureIdentity.init("watch failed");
+    app.pages.review.auto_reload.last_failure = failure;
+    app.pages.review.status.setSourceReloadFailure(
+        failure.digest,
+        "auto reload failed: {s}",
+        .{"boom"},
+    );
+
+    ctx.resetRedrawSuppressed();
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .source = .{
+        .identity = reads.source_identity,
+        .read_epoch = reads.source_read_epoch,
+        .generation = reads.source_generation,
+        .background_cycle_id = reads.source_cycle_id,
+        .result = .{ .unchanged = content_fingerprint.Fingerprint.init("test source") },
+    } } }), &ctx);
+
+    try std.testing.expect(app.pages.review.canonical_publication == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, app.pages.review.status.text(), "auto reload failed") == null,
+    );
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+}
+test "Review boundary repair revalidation starts in the same update cycle" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .review,
+        .config = .{ .source = .unstaged },
+        .repo_session = .{
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+        },
+        .pages = .{ .review = .{
+            .viewer = .{ .selected_target = .{ .status_only = 0 } },
+        } },
+        .terminal_size = .{ .width = 120, .height = 40 },
+    };
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+
+    var source = try app_load.buildLoadedBundle(allocator, cached_projection_b_diff);
+    app.pages.review.load.replaceLoaded(allocator, .{
+        .arena = source.takeArena(),
+        .loaded = source.loaded,
+        .reviewed_files_owned = false,
+    });
+    var status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
+    try app.pages.review.git_status.replace(roots.a, &status);
+    app.pages.review.status_load.markSuccess();
+    acceptTestSource(&app);
+    const identity = app.pages.review.activation.currentIdentity() orelse
+        return error.ExpectedReviewActivation;
+    app.pages.review.review_projection.displayed = .{ .ready = .{
+        .request = try app_review_projection.testing.cloneRequest(
+            allocator,
+            identity,
+            1,
+            roots.a,
+            "a",
+            .cached_diff,
+            .unstaged,
+            app.pages.review.source_session_revision,
+            app.pages.review.status_snapshot_revision,
+        ),
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(
+            allocator,
+            app_test_support.diff_cached_projection,
+        ) },
+    } };
+    const text_ptr =
+        app.pages.review.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr;
+
+    // Watch is off and no further input arrives after the status terminal:
+    // the repair reload must still start inside this same update cycle. The
+    // unstage action's cursor restores the path anchor exactly like the real
+    // hunk-unstage flow does.
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+    app.pages.review.status_load = .{ .generation = 6, .pending = .{ .generation = 6 } };
+    try installTestActionCursor(&app, allocator, .file, "a", 8);
+    try promoteTestActionCursorWithRequirement(&app, 8, .status_only);
+    try std.testing.expect(app.pages.review.action_cursor.startMember(8, .status, 6));
+    var unstaged_status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try app.update(App.Msg.loadFinished(.{ .review = .{ .status = .{
+        .identity = identity,
+        .generation = 6,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .result = .{ .loaded = unstaged_status },
+    } } }), &ctx);
+    unstaged_status = undefined;
+
+    try std.testing.expect(app.pages.review.review_projection.displayed == .ready);
+    try std.testing.expect(app.pages.review.review_projection.displayed.ready.value == .cached_diff);
+    try std.testing.expect(
+        app.pages.review.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr == text_ptr,
+    );
+    try std.testing.expect(!app.pages.review.activation.hasQueuedFullRevalidation());
+    const reads = try takeCanonicalPublicationReads(&ctx, allocator);
+    _ = reads;
 }

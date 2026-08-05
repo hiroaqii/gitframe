@@ -23,6 +23,7 @@ const diff_source = @import("../../../diff/source.zig");
 const auto_reload = @import("../../auto_reload.zig");
 const app_load = @import("../../load.zig");
 const app_page = @import("../../page.zig");
+const action_fence = @import("action_fence.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
 const ToggleHunkTargetResult = git_ops.ToggleHunkTargetResult;
@@ -154,11 +155,7 @@ pub const OwnedOperationProposal = union(enum) {
     }
 };
 
-pub const ReloadIntent = union(enum) {
-    none,
-    source_and_aux,
-    status: []const u8,
-};
+pub const ReloadIntent = action_fence.ReloadIntent;
 
 pub const AcceptedActionOutcome = union(enum) {
     stage_file,

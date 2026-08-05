@@ -10,6 +10,8 @@ pub fn include() void {
     _ = @import("page_coordinator_test.zig");
     _ = @import("pages/compare/coordinator_test.zig");
     _ = @import("pages/repository/coordinator_test.zig");
+    _ = @import("pages/review/read_coordinator_test.zig");
     _ = @import("tests/page_transition.zig");
+    _ = @import("tests/canonical_publication.zig");
     _ = @import("tests/update_tail.zig");
 }
