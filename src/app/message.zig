@@ -28,11 +28,10 @@ pub const ActionFinished = union(enum) {
     fetch: actions.FetchFinished,
     switch_branch: actions.SwitchBranchFinished,
     push_foreground: chasen.ForegroundCommandResult,
-    editor: chasen.ForegroundCommandResult,
 
     pub fn deinit(self: *ActionFinished, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .push_foreground, .editor => {},
+            .push_foreground => {},
             inline else => |*finished| finished.deinit(allocator),
         }
         self.* = undefined;
@@ -50,6 +49,11 @@ pub const ClipboardCopyFinished = struct {
     outcome: ClipboardCopyOutcome,
 };
 
+pub const ShellEffectFinished = union(enum) {
+    editor: chasen.ForegroundCommandResult,
+    clipboard: ClipboardCopyFinished,
+};
+
 pub const Msg = union(enum) {
     pub const undelivered_policy = .deinit;
 
@@ -58,7 +62,7 @@ pub const Msg = union(enum) {
     load_finished: LoadFinished,
     action_finished: ActionFinished,
     push_inspection_finished: push_retry.Finished,
-    clipboard_copy_finished: ClipboardCopyFinished,
+    shell_effect_finished: ShellEffectFinished,
     review: review_message.Msg,
     compare: compare_input.Msg,
     repository: repository_page.Msg,
@@ -145,7 +149,7 @@ pub const Msg = union(enum) {
     }
 
     pub fn editorFinished(result: chasen.ForegroundCommandResult) Msg {
-        return actionFinished(.{ .editor = result });
+        return .{ .shell_effect_finished = .{ .editor = result } };
     }
 
     pub fn pushForegroundFinished(result: chasen.ForegroundCommandResult) Msg {
@@ -153,14 +157,14 @@ pub const Msg = union(enum) {
     }
 
     pub fn clipboardFinished(result: chasen.ClipboardCopyResult) Msg {
-        return .{ .clipboard_copy_finished = .{
+        return .{ .shell_effect_finished = .{ .clipboard = .{
             .request_id = result.request_id,
             .outcome = switch (result.outcome) {
                 .sent => .sent,
                 .unsupported_runtime => .unsupported_runtime,
                 .write_failed => |err| .{ .write_failed = err },
             },
-        } };
+        } } };
     }
 
     /// Releases messages that the runtime cannot deliver during shutdown.
@@ -296,14 +300,16 @@ test "undelivered plain root message is a no-op" {
         .request_id = .{ .id = 17 },
         .outcome = .{ .exited = 0 },
     };
-    const editor = Msg.editorFinished(foreground);
-    try std.testing.expectEqual(@as(u64, 17), editor.action_finished.editor.request_id.id);
+    var editor = Msg.editorFinished(foreground);
+    try std.testing.expectEqual(@as(u64, 17), editor.shell_effect_finished.editor.request_id.id);
+    editor.deinitUndelivered(std.testing.allocator);
     const push = Msg.pushForegroundFinished(foreground);
     try std.testing.expectEqual(@as(u64, 17), push.action_finished.push_foreground.request_id.id);
-    const clipboard = Msg.clipboardFinished(.{
+    var clipboard = Msg.clipboardFinished(.{
         .request_id = .{ .id = 23 },
         .outcome = .unsupported_runtime,
     });
-    try std.testing.expectEqual(@as(u64, 23), clipboard.clipboard_copy_finished.request_id.id);
-    try std.testing.expect(clipboard.clipboard_copy_finished.outcome == .unsupported_runtime);
+    try std.testing.expectEqual(@as(u64, 23), clipboard.shell_effect_finished.clipboard.request_id.id);
+    try std.testing.expect(clipboard.shell_effect_finished.clipboard.outcome == .unsupported_runtime);
+    clipboard.deinitUndelivered(std.testing.allocator);
 }

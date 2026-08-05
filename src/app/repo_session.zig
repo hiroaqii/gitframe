@@ -12,7 +12,6 @@ const diff_source = @import("../diff/source.zig");
 const git_ops = @import("git_ops.zig");
 const load = @import("load.zig");
 const page = @import("page.zig");
-const push_retry = @import("push_retry.zig");
 const prompt = @import("prompt.zig");
 const repo_picker = @import("repo_picker.zig");
 const review_repository_session = @import("pages/review/repository_session.zig");
@@ -24,6 +23,7 @@ const repository_page = @import("pages/repository.zig");
 const discovery = @import("../repo/discovery.zig");
 const root_capability = @import("../repo/root_capability.zig");
 const repo_state = @import("../repo/state.zig");
+const remote_state = @import("workflow/remote_state.zig");
 
 const PendingRecentPathDiscovery = struct {
     kind: repo_state.RecentKind,
@@ -204,34 +204,6 @@ pub const CompareInvalidationPort = struct {
     }
 };
 
-/// Root-shell state whose lifetime is bounded by the committed repository.
-pub const ShellInvalidationPort = struct {
-    retry: *push_retry.Model,
-    push_error_message: *?[]u8,
-    overlay: *app_state.OverlayState,
-    branch_switch: *app_state.BranchSwitchState,
-    branch_switch_load_pending: *?u64,
-
-    fn clearBranchSwitch(self: ShellInvalidationPort, allocator: std.mem.Allocator) void {
-        if (self.branch_switch.hasState()) self.branch_switch.deinit(allocator);
-        self.branch_switch_load_pending.* = null;
-        if (self.overlay.isSwitchBranch()) self.overlay.close();
-    }
-
-    fn invalidateBeforeReplacement(self: ShellInvalidationPort, allocator: std.mem.Allocator) void {
-        if (self.push_error_message.*) |message| allocator.free(message);
-        self.push_error_message.* = null;
-        if (self.overlay.isPushError() or self.overlay.isPushCredentials()) self.overlay.close();
-        switch (self.retry.state) {
-            .available, .inspecting, .credential_prompt => {
-                self.retry.state.deinit(allocator);
-            },
-            .idle, .foreground => {},
-        }
-        self.clearBranchSwitch(allocator);
-    }
-};
-
 pub const Controller = struct {
     state: *State,
     status: *app_state.StatusMessage,
@@ -242,7 +214,7 @@ pub const Controller = struct {
     review: review_repository_session.Controller,
     repository: RepositoryInvalidationPort,
     compare: CompareInvalidationPort,
-    shell: ShellInvalidationPort,
+    shell: remote_state.RepositoryInvalidationPort,
 
     fn view(self: Controller) View {
         return self.state.view();
@@ -327,7 +299,7 @@ pub const Controller = struct {
         }
         if (changed) {
             const next_epoch = nextEpoch(self.state.repo_epoch);
-            self.shell.invalidateBeforeReplacement(allocator);
+            self.shell.invalidateBeforeRepositoryReplacement(allocator);
             self.review.invalidateBeforeReplacement(allocator);
             self.compare.invalidateBeforeReplacement(allocator);
             self.repository.invalidateBeforeReplacement(
@@ -409,7 +381,7 @@ pub const Controller = struct {
         }
         if (changed) {
             const next_epoch = nextEpoch(self.state.repo_epoch);
-            self.shell.invalidateBeforeReplacement(allocator);
+            self.shell.invalidateBeforeRepositoryReplacement(allocator);
             self.review.invalidateBeforeReplacement(allocator);
             self.compare.invalidateBeforeReplacement(allocator);
             self.repository.invalidateBeforeReplacement(allocator, next_epoch, prepared.candidate.?.identity);
@@ -949,11 +921,8 @@ const RepoSessionTestApp = struct {
     active_page: page.Id = .review,
     source: diff_source.SourceMode = .unstaged,
     pages: RepoSessionTestPages = .{},
-    push_retry: push_retry.Model = .{},
-    push_error_message: ?[]u8 = null,
+    remote: remote_state.State = .{},
     overlay: app_state.OverlayState = .{},
-    branch_switch: app_state.BranchSwitchState = .{},
-    branch_switch_load_pending: ?u64 = null,
 
     fn repoSessionView(self: *const RepoSessionTestApp) View {
         return self.repo_session.view();
@@ -1008,13 +977,7 @@ const RepoSessionTestApp = struct {
             },
             .repository = .{ .page = &self.pages.repository },
             .compare = .{ .page = &self.pages.compare },
-            .shell = .{
-                .retry = &self.push_retry,
-                .push_error_message = &self.push_error_message,
-                .overlay = &self.overlay,
-                .branch_switch = &self.branch_switch,
-                .branch_switch_load_pending = &self.branch_switch_load_pending,
-            },
+            .shell = self.remote.repositoryInvalidationPort(&self.overlay),
         };
     }
 };
@@ -1095,27 +1058,27 @@ test "workspace repository commitments advance one authoritative epoch" {
     app.repo_session.repo_state.root = try root_capability.RootCapability.openCanonical(roots.a);
     defer app.repo_session.deinit(allocator);
     defer app.pages.review.deinit(allocator);
-    defer if (app.branch_switch.hasState()) app.branch_switch.deinit(allocator);
+    defer app.remote.deinit(allocator);
     _ = app.activateReview();
 
     app.pages.review.pending_reload = .{ .generation = 17, .kind = .manual };
     try installRepoSessionTestActionCursor(&app, allocator, .file, "src/app.zig", 18);
-    app.branch_switch = .{
+    app.remote.branch_switch = .{
         .repo_root = try allocator.dupe(u8, roots.a),
         .generation = 19,
         .loading = true,
     };
-    app.branch_switch_load_pending = 19;
+    app.remote.branch_switch_load_pending = 19;
     app.overlay.openSwitchBranch();
     try std.testing.expectEqual(CommitOutcome.unchanged, app.repoSession().commitWorkspaceIndex(allocator, 0));
     try std.testing.expectEqual(@as(u64, 0), app.repoSessionView().epoch());
     try std.testing.expect(app.pages.review.pending_reload == null);
     try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
-    try std.testing.expect(!app.branch_switch.hasState());
-    try std.testing.expect(app.branch_switch_load_pending == null);
+    try std.testing.expect(!app.remote.branch_switch.hasState());
+    try std.testing.expect(app.remote.branch_switch_load_pending == null);
     try std.testing.expect(!app.overlay.isSwitchBranch());
 
-    app.push_error_message = try allocator.dupe(u8, "old repository push failure");
+    app.remote.push_error_message = try allocator.dupe(u8, "old repository push failure");
     app.overlay.openPushError();
     const deferred_identity = app.pages.review.activation.currentIdentity().?;
     app.pages.review.deferred_source_apply = .{
@@ -1143,7 +1106,7 @@ test "workspace repository commitments advance one authoritative epoch" {
     try std.testing.expectEqual(CommitOutcome.changed, app.repoSession().commitWorkspaceIndex(allocator, 1));
     try std.testing.expectEqual(@as(u64, 1), app.repoSessionView().epoch());
     try std.testing.expectEqualStrings(roots.b, app.repoSessionView().activeRoot().?);
-    try std.testing.expect(app.push_error_message == null);
+    try std.testing.expect(app.remote.push_error_message == null);
     try std.testing.expect(!app.overlay.isPushError());
     try std.testing.expect(app.pages.review.deferred_source_apply == null);
     try std.testing.expect(app.pages.review.deferred_projection_apply == null);

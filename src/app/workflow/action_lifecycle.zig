@@ -92,12 +92,14 @@ pub const TerminalTarget = enum {
     detached_review,
 };
 
+pub const AcceptedTerminal = struct {
+    pending: app_actions.PendingAction,
+    target: TerminalTarget,
+};
+
 pub const TerminalAdmission = union(enum) {
     rejected,
-    accepted: struct {
-        pending: app_actions.PendingAction,
-        target: TerminalTarget,
-    },
+    accepted: AcceptedTerminal,
 };
 
 pub const Controller = struct {

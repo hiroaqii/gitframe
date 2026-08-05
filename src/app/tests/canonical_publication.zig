@@ -443,7 +443,7 @@ fn installPushCredentialPrompt(
     target_owned = false;
     try prompt.username.insertSlice("alice");
     try prompt.password.insertSlice("secret-token");
-    app.push_retry.state = .{ .credential_prompt = prompt };
+    app.remote_workflow.push_retry.state = .{ .credential_prompt = prompt };
     prompt_owned = false;
 }
 
@@ -536,7 +536,7 @@ test "Review mutation read fence drains old production reads without publication
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.push_retry.deinit(allocator);
+    defer app.remote_workflow.push_retry.deinit(allocator);
 
     var old_status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
     try app.pages.review.git_status.replace(roots.a, &old_status);
@@ -1105,7 +1105,7 @@ test "repo picker capability rejection preserves Review navigation and does not 
     };
     defer app.repo_session.deinit(allocator);
     defer app.pages.review.deinit(allocator);
-    defer if (app.branch_switch.hasState()) app.branch_switch.deinit(allocator);
+    defer if (app.remote_workflow.branch_switch.hasState()) app.remote_workflow.branch_switch.deinit(allocator);
     try std.testing.expectEqual(repo_session.CommitOutcome.changed, try app_testing.commitDiscovery(
         &app,
         allocator,
@@ -1122,12 +1122,12 @@ test "repo picker capability rejection preserves Review navigation and does not 
     app.pages.repository.freshness = .fresh;
     try installTestActionCursor(&app, allocator, .file, "src/app.zig", 9);
     app.pages.review.pending_reload = .{ .generation = 31, .kind = .manual };
-    app.branch_switch = .{
+    app.remote_workflow.branch_switch = .{
         .repo_root = try allocator.dupe(u8, roots.a),
         .generation = 12,
         .loading = true,
     };
-    app.branch_switch_load_pending = 12;
+    app.remote_workflow.branch_switch_load_pending = 12;
     app.overlay.openSwitchBranch();
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer ctx.runtimeClearPendingEffectCopies();
@@ -1148,8 +1148,8 @@ test "repo picker capability rejection preserves Review navigation and does not 
     try std.testing.expect(app.pages.review.search.mode);
     try std.testing.expect(app.pages.review.action_cursor.hasOwner());
     try std.testing.expectEqual(@as(u64, 31), app.pages.review.pending_reload.?.generation);
-    try std.testing.expect(app.branch_switch.hasState());
-    try std.testing.expectEqual(@as(?u64, 12), app.branch_switch_load_pending);
+    try std.testing.expect(app.remote_workflow.branch_switch.hasState());
+    try std.testing.expectEqual(@as(?u64, 12), app.remote_workflow.branch_switch_load_pending);
     try std.testing.expect(app.overlay.isSwitchBranch());
     try std.testing.expect(app.pages.repository.load_state == .loaded);
     try std.testing.expect(app.pages.repository.freshness == .fresh);

@@ -175,6 +175,7 @@ pub const AcceptedActionOutcome = union(enum) {
         reload_after_success: bool,
     },
     commit: struct { repo_root: []const u8 },
+    switch_branch: struct { repo_root: []const u8 },
 };
 
 pub const OutcomeApply = struct {
@@ -779,6 +780,18 @@ pub const Controller = struct {
                 const clear_failed = if (self.page.reviewed_store.clearForRepo(allocator, value.repo_root)) |_| false else |_| true;
                 break :blk .{
                     .reload = if (active_repo_matches) .source_and_aux else .none,
+                    .local_effect_failure = if (clear_failed) .reviewed_mark_clear else null,
+                };
+            },
+            .switch_branch => |value| blk: {
+                const clear_failed = if (self.page.reviewed_store.clearForRepo(allocator, value.repo_root)) |_| false else |_| true;
+                self.page.staged_hunks.clearRepo(allocator, value.repo_root);
+                if (active_repo_matches) {
+                    self.navigation.clearActionCursor(allocator);
+                    self.navigation.clearSearch();
+                }
+                break :blk .{
+                    .reload = if (active_repo_matches) .source_and_aux_clear_visible else .none,
                     .local_effect_failure = if (clear_failed) .reviewed_mark_clear else null,
                 };
             },
