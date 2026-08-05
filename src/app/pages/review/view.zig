@@ -1181,7 +1181,7 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "very_long") != null);
 }
 
-test "review root expansion renderer keeps expanded root glyph and alignment" {
+test "review markerless root renderer keeps hierarchy stats and selection styling" {
     const nodes = [_]file_tree.Node{
         .{
             .kind = .repo_root,
@@ -1211,11 +1211,12 @@ test "review root expansion renderer keeps expanded root glyph and alignment" {
     try drawSidebarRow(&ts.surface, 0, root, true, 0, palette);
     try drawSidebarRow(&ts.surface, 1, directory, true, 0, palette);
 
-    try ts.expectCellText(0, 0, "▾");
-    try std.testing.expect(!ts.surface.readCell(0, 0).?.style.reverse);
+    try ts.expectCellText(0, 0, " ");
+    try ts.expectCellText(1, 0, "g");
+    try std.testing.expect(!ts.surface.readCell(1, 0).?.style.reverse);
     try std.testing.expect(ts.surface.readCell(0, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(ts.surface.readCell(1, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(ts.surface.readCell(39, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try ts.expectCellText(2, 0, "g");
     try ts.expectCellText(28, 0, "+");
     try ts.expectCellText(32, 0, "-");
     try std.testing.expect(ts.surface.readCell(28, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -1226,13 +1227,51 @@ test "review root expansion renderer keeps expanded root glyph and alignment" {
 
     ts.surface.clearAll();
     try drawSidebarRow(&ts.surface, 0, root, false, 0, palette);
-    const retained_root = ts.surface.readCell(0, 0) orelse return error.ExpectedRetainedRoot;
+    try ts.expectCellText(0, 0, " ");
+    const retained_root = ts.surface.readCell(1, 0) orelse return error.ExpectedRetainedRoot;
     const retained_trailing = ts.surface.readCell(39, 0) orelse return error.ExpectedRetainedRootTrailingCell;
     try std.testing.expect(retained_root.style.bold);
     try std.testing.expect(!retained_root.style.dim);
     try std.testing.expect(!retained_root.style.reverse);
     try std.testing.expect(!retained_root.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(!retained_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
+}
+
+test "review markerless root renderer has exact scroll and narrow clipping" {
+    const nodes = [_]file_tree.Node{.{
+        .kind = .repo_root,
+        .name = "0123456789abcdefghijklmnopqrstuv",
+        .path = "",
+        .depth = 0,
+        .stats = .{ .added = 68, .removed = 3 },
+        .target = .repo_root,
+    }};
+    const tree: file_tree.FileTree = .{ .nodes = &nodes };
+    const collapsed: file_tree.CollapsedSet = .empty;
+    const root = sidebar_view_model.rowForNode(tree, &collapsed, &.{}, 0, 0).?;
+    const palette: theme.Palette = .default();
+
+    var scrolled: chasen.testing.TestSurface = undefined;
+    try scrolled.init(40, 1);
+    defer scrolled.deinit();
+    try drawSidebarRow(&scrolled.surface, 0, root, true, 1, palette);
+    try scrolled.expectCellText(0, 0, " ");
+    try scrolled.expectCellText(1, 0, "1");
+    try scrolled.expectCellText(28, 0, "+");
+    try scrolled.expectCellText(32, 0, "-");
+
+    var narrow: chasen.testing.TestSurface = undefined;
+    try narrow.init(20, 1);
+    defer narrow.deinit();
+    try drawSidebarRow(&narrow.surface, 0, root, true, 0, palette);
+    try narrow.expectCellText(0, 0, " ");
+    try narrow.expectCellText(1, 0, "0");
+    try narrow.expectCellText(18, 0, "h");
+    try narrow.expectCellText(19, 0, "…");
+    const snapshot = try narrow.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "+68") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "-3") == null);
 }
 
 test "sidebar cursor background composes reviewed status mode and path semantics" {

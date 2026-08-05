@@ -3222,7 +3222,7 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             mode_header;
         // Copy frame-local text and let the surface clip its right edge without
         // adding a marker; the current mode therefore remains the leading fact.
-        if (size.height > 2) _ = left.copyTextAt(0, 2, tree_header, context.palette.boldStyle(.accent)) catch {};
+        if (size.height > 2) _ = left.copyTextAt(1, 2, tree_header, context.palette.boldStyle(.accent)) catch {};
         if (layout.tree_width < size.width) {
             var separator_style = context.palette.style(.muted);
             separator_style.dim = true;
@@ -3467,12 +3467,17 @@ fn drawTreeProjectionRow(
     const state = context.page_state;
     const target = state.tree_projection.targetAt(tree, visible_index) orelse return;
     const width = surface.size().width;
+    const content_col: u16 = switch (target) {
+        .repo_root => 1,
+        .manifest_node => 0,
+    };
+    const content_width = width -| content_col;
     const visible_text: []const u8 = switch (target) {
         .repo_root => try rootRowTextAlloc(
             surface.frameAllocator(),
             repositoryRootName(context.repo_root),
             state.viewer.tree_horizontal_scroll,
-            width,
+            content_width,
         ),
         .manifest_node => |node_index| try treeRowTextAlloc(
             surface.frameAllocator(),
@@ -3511,7 +3516,7 @@ fn drawTreeProjectionRow(
         style.bg = context.palette.color(.pane_cursor_bg);
         fillTreeSelectionRow(surface, screen_row, style);
     }
-    draw.copyClippedTextAt(surface, 0, screen_row, visible_text, style) catch {};
+    draw.copyClippedTextAt(surface, content_col, screen_row, visible_text, style) catch {};
 }
 
 /// Extend the selected row's composed semantic foreground and neutral cursor
@@ -3619,7 +3624,7 @@ fn rootRowTextAlloc(
     horizontal_scroll: usize,
     width: u16,
 ) ![]const u8 {
-    return treeItemTextAlloc(allocator, 0, "▾ ", name, horizontal_scroll, width);
+    return treeItemTextAlloc(allocator, 0, "", name, horizontal_scroll, width);
 }
 
 fn treeItemTextAlloc(
@@ -3729,7 +3734,7 @@ test "repository transition pending and unavailable destinations suppress retain
     }
 }
 
-test "repository minimum tree disclosure keyboard root collapse keeps sticky file selection" {
+test "repository root keyboard activation preserves expanded descendants and sticky selection" {
     var document = try manifest.parseOwned(std.testing.allocator, try std.testing.allocator.dupe(u8, "a/one.zig\x00b.zig\x00"));
     const tree = try repository_tree.Tree.build(std.testing.allocator, &document);
     var state: RepositoryPageState = .{ .bundle = .{ .document = document, .tree = tree }, .load_state = .loaded };
@@ -3743,19 +3748,19 @@ test "repository minimum tree disclosure keyboard root collapse keeps sticky fil
     state.viewer.tree_cursor = 0;
     _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 11 });
     try std.testing.expectEqualStrings("a/one.zig", state.selected_path.?);
-    try std.testing.expect(!state.bundle.?.tree.nodes[directory].expanded);
-    try std.testing.expectEqual(@as(usize, 3), state.tree_projection.visibleLen(&state.bundle.?.tree));
+    try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
+    try std.testing.expectEqual(@as(usize, 4), state.tree_projection.visibleLen(&state.bundle.?.tree));
     const first_child = state.tree_projection.targetAt(&state.bundle.?.tree, 1) orelse return error.ExpectedDirectory;
     switch (first_child) {
         .repo_root => return error.ExpectedDirectory,
         .manifest_node => |node_index| try std.testing.expectEqualStrings("a", state.bundle.?.tree.nodes[node_index].path),
     }
     _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 11 });
-    try std.testing.expect(!state.bundle.?.tree.nodes[directory].expanded);
+    try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
     try std.testing.expectEqualStrings("a/one.zig", state.selected_path.?);
 }
 
-test "repository minimum tree disclosure root collapse preserves source and closes hidden Changed directories" {
+test "repository root activation preserves source and expanded All and Changed directories" {
     const allocator = std.testing.allocator;
     const size: chasen.Size = .{ .width = 80, .height = 12 };
     var state = try selectionStateForTest(
@@ -3780,7 +3785,7 @@ test "repository minimum tree disclosure root collapse preserves source and clos
     state.viewer.tree_cursor = 0;
     _ = state.applyNavigation(allocator, .toggle_directory, size);
     for (state.bundle.?.tree.nodes) |node| {
-        if (node.kind == .directory) try std.testing.expect(!node.expanded);
+        if (node.kind == .directory) try std.testing.expect(node.expanded);
     }
     try std.testing.expectEqualStrings("changed/selected.zig", state.selected_path.?);
     try std.testing.expectEqualStrings("source\n", state.currentSource().?.bytes);
@@ -3797,15 +3802,15 @@ test "repository minimum tree disclosure root collapse preserves source and clos
     try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, root_click);
     _ = state.applyNavigation(allocator, root_click, size);
     for (state.bundle.?.tree.nodes) |node| {
-        if (node.kind == .directory) try std.testing.expect(!node.expanded);
+        if (node.kind == .directory) try std.testing.expect(node.expanded);
     }
 
     _ = state.applyNavigation(allocator, .toggle_changed_filter, size);
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
     const clean = state.bundle.?.tree.nodeIndexForPath("clean", .all) orelse return error.ExpectedCleanDirectory;
     const nested = state.bundle.?.tree.nodeIndexForPath("clean/nested", .all) orelse return error.ExpectedCleanDirectory;
-    try std.testing.expect(!state.bundle.?.tree.nodes[clean].expanded);
-    try std.testing.expect(!state.bundle.?.tree.nodes[nested].expanded);
+    try std.testing.expect(state.bundle.?.tree.nodes[clean].expanded);
+    try std.testing.expect(state.bundle.?.tree.nodes[nested].expanded);
     try std.testing.expectEqualStrings("changed/selected.zig", state.selected_path.?);
     try std.testing.expectEqualStrings("source\n", state.currentSource().?.bytes);
     try std.testing.expectEqual(DisplayedDocument.Authority.accepted, state.displayed_document.?.authority);
@@ -5586,10 +5591,11 @@ test "repository tree cursor background follows active focus and preserves seman
     try active_surface.init(size.width, size.height);
     defer active_surface.deinit();
     try view(.{ .page_state = &state, .palette = palette }, &active_surface.surface);
-    try active_surface.expectCellText(0, 2, "F");
-    try active_surface.expectCellText(1, 2, "i");
-    const active_header = active_surface.surface.readCell(0, 2) orelse return error.ExpectedTreeHeader;
-    const active_root = active_surface.surface.readCell(0, root_row) orelse return error.ExpectedRoot;
+    try active_surface.expectCellText(0, 2, " ");
+    try active_surface.expectCellText(1, 2, "F");
+    try active_surface.expectCellText(2, 2, "i");
+    const active_header = active_surface.surface.readCell(1, 2) orelse return error.ExpectedTreeHeader;
+    const active_root = active_surface.surface.readCell(1, root_row) orelse return error.ExpectedRoot;
     const active_directory = active_surface.surface.readCell(4, directory_row) orelse return error.ExpectedDirectory;
     const active_added = active_surface.surface.readCell(4, added_row) orelse return error.ExpectedAddedFile;
     const active_nested = active_surface.surface.readCell(6, nested_row) orelse return error.ExpectedNestedFile;
@@ -5629,12 +5635,14 @@ test "repository tree cursor background follows active focus and preserves seman
     state.viewer.tree_cursor = 0;
     active_surface.surface.clearAll();
     try view(.{ .page_state = &state, .palette = palette }, &active_surface.surface);
-    const selected_root = active_surface.surface.readCell(0, root_row) orelse return error.ExpectedRoot;
+    const selected_root_gutter = active_surface.surface.readCell(0, root_row) orelse return error.ExpectedRootGutter;
+    const selected_root = active_surface.surface.readCell(1, root_row) orelse return error.ExpectedRoot;
     const selected_root_trailing = active_surface.surface.readCell(layout.tree_width - 1, root_row) orelse return error.ExpectedRootTrailingCell;
     try std.testing.expect(selected_root.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(selected_root.style.bold);
     try std.testing.expect(!selected_root.style.reverse);
     try std.testing.expect(selected_root.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(selected_root_gutter.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(selected_root_trailing.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(selected_root_trailing.style.bold);
     try std.testing.expect(!selected_root_trailing.style.reverse);
@@ -5661,10 +5669,11 @@ test "repository tree cursor background follows active focus and preserves seman
     try inactive_surface.init(size.width, size.height);
     defer inactive_surface.deinit();
     try view(.{ .page_state = &state, .palette = palette }, &inactive_surface.surface);
-    try inactive_surface.expectCellText(0, 2, "F");
-    try inactive_surface.expectCellText(1, 2, "i");
-    const inactive_header = inactive_surface.surface.readCell(0, 2) orelse return error.ExpectedTreeHeader;
-    const inactive_root = inactive_surface.surface.readCell(0, root_row) orelse return error.ExpectedRoot;
+    try inactive_surface.expectCellText(0, 2, " ");
+    try inactive_surface.expectCellText(1, 2, "F");
+    try inactive_surface.expectCellText(2, 2, "i");
+    const inactive_header = inactive_surface.surface.readCell(1, 2) orelse return error.ExpectedTreeHeader;
+    const inactive_root = inactive_surface.surface.readCell(1, root_row) orelse return error.ExpectedRoot;
     const inactive_directory = inactive_surface.surface.readCell(4, directory_row) orelse return error.ExpectedDirectory;
     const inactive_added = inactive_surface.surface.readCell(4, added_row) orelse return error.ExpectedAddedFile;
     const inactive_nested = inactive_surface.surface.readCell(6, nested_row) orelse return error.ExpectedNestedFile;
@@ -7142,7 +7151,7 @@ test "repository manifest root liveness check rejects stable path replacement" {
     }
 }
 
-test "repository minimum tree disclosure empty typed root stays open after mouse activation" {
+test "repository empty root renders without disclosure and mouse activation is inert" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest(""),
@@ -7155,14 +7164,17 @@ test "repository minimum tree disclosure empty typed root stays open after mouse
     try expanded_surface.init(full_size.width, full_size.height);
     defer expanded_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &expanded_surface.surface);
-    try expanded_surface.expectCellText(0, 2, "F");
-    try expanded_surface.expectCellText(1, 2, "i");
-    try expanded_surface.expectCellText(0, 3, "▾");
+    try expanded_surface.expectCellText(0, 2, " ");
+    try expanded_surface.expectCellText(1, 2, "F");
+    try expanded_surface.expectCellText(2, 2, "i");
+    try expanded_surface.expectCellText(0, 3, " ");
+    try expanded_surface.expectCellText(1, 3, "e");
     try expanded_surface.expectCellText(0, 4, "R");
     const expanded_snapshot = try expanded_surface.snapshot(allocator);
     defer allocator.free(expanded_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "Files") != null);
-    try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "▾ empty-repo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "empty-repo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "▾ empty-repo") == null);
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "Repository has no") != null);
     const expanded_layout = bodyLayout(full_size, state.viewer.tree_width, state.viewer.tree_hidden);
     const no_file_cell = expanded_surface.surface.readCell(expanded_layout.source_col + 1, repository_source_geometry.source_path_row) orelse
@@ -7180,7 +7192,8 @@ test "repository minimum tree disclosure empty typed root stays open after mouse
     try after_click_surface.init(full_size.width, full_size.height);
     defer after_click_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &after_click_surface.surface);
-    try after_click_surface.expectCellText(0, 3, "▾");
+    try after_click_surface.expectCellText(0, 3, " ");
+    try after_click_surface.expectCellText(1, 3, "e");
     try after_click_surface.expectCellText(0, 4, "R");
 
     const compact_size = chasen.Size{ .width = 60, .height = 3 };
@@ -7188,8 +7201,9 @@ test "repository minimum tree disclosure empty typed root stays open after mouse
     try compact_surface.init(compact_size.width, compact_size.height);
     defer compact_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &compact_surface.surface);
-    try compact_surface.expectCellText(0, 2, "F");
-    try compact_surface.expectCellText(1, 2, "i");
+    try compact_surface.expectCellText(0, 2, " ");
+    try compact_surface.expectCellText(1, 2, "F");
+    try compact_surface.expectCellText(2, 2, "i");
     const compact_snapshot = try compact_surface.snapshot(allocator);
     defer allocator.free(compact_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "empty-repo") == null);
@@ -7199,14 +7213,14 @@ test "repository minimum tree disclosure empty typed root stays open after mouse
     try width_one.init(1, compact_size.height);
     defer width_one.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &width_one.surface);
-    try width_one.expectCellText(0, 2, "F");
+    try width_one.expectCellText(0, 2, " ");
 
     var width_two: chasen.testing.TestSurface = undefined;
     try width_two.init(2, compact_size.height);
     defer width_two.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &width_two.surface);
-    try width_two.expectCellText(0, 2, "F");
-    try width_two.expectCellText(1, 2, "i");
+    try width_two.expectCellText(0, 2, " ");
+    try width_two.expectCellText(1, 2, "F");
 }
 
 test "Repository branch renders read-only facts without moving tree geometry" {
@@ -7232,9 +7246,11 @@ test "Repository branch renders read-only facts without moving tree geometry" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "push") == null);
     try test_surface.expectCellText(1, 0, "m");
     try test_surface.expectCellText(0, 1, " ");
-    try test_surface.expectCellText(0, 2, "F");
-    try test_surface.expectCellText(1, 2, "i");
-    try test_surface.expectCellText(0, 3, "▾");
+    try test_surface.expectCellText(0, 2, " ");
+    try test_surface.expectCellText(1, 2, "F");
+    try test_surface.expectCellText(2, 2, "i");
+    try test_surface.expectCellText(0, 3, " ");
+    try test_surface.expectCellText(1, 3, "g");
     const branch_cell = test_surface.surface.readCell(1, 0) orelse return error.ExpectedRepositoryBranchCell;
     try std.testing.expect(branch_cell.style.fg.eql(palette.color(.info)));
     try std.testing.expect(!branch_cell.style.dim);
@@ -7435,7 +7451,7 @@ test "Repository branch clips width one and two without moving Files" {
     try view(.{ .page_state = &state, .palette = .default() }, &width_one.surface);
     try width_one.expectCellText(0, 0, " ");
     try width_one.expectCellText(0, 1, " ");
-    try width_one.expectCellText(0, 2, "F");
+    try width_one.expectCellText(0, 2, " ");
 
     var width_two: chasen.testing.TestSurface = undefined;
     try width_two.init(2, 3);
@@ -7444,11 +7460,11 @@ test "Repository branch clips width one and two without moving Files" {
     try width_two.expectCellText(0, 0, " ");
     try width_two.expectCellText(1, 0, "…");
     try width_two.expectCellText(0, 1, " ");
-    try width_two.expectCellText(0, 2, "F");
-    try width_two.expectCellText(1, 2, "i");
+    try width_two.expectCellText(0, 2, " ");
+    try width_two.expectCellText(1, 2, "F");
 }
 
-test "repository minimum tree disclosure renders root entries and collapses opened descendants" {
+test "repository root renders without disclosure and activation preserves opened descendants" {
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest("README.md\x00src/main.zig\x00"),
         .load_state = .loaded,
@@ -7463,11 +7479,22 @@ test "repository minimum tree disclosure renders root entries and collapses open
     const snapshot = try test_surface.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "▾ gitframe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "gitframe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "▾ gitframe") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "README.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "main.zig") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading selected file") != null);
+    try test_surface.expectCellText(0, 2, " ");
+    try test_surface.expectCellText(1, 2, "F");
+    try test_surface.expectCellText(0, 3, " ");
+    try test_surface.expectCellText(1, 3, "g");
+    state.viewer.tree_horizontal_scroll = 1;
+    test_surface.surface.clearAll();
+    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/gitframe" }, &test_surface.surface);
+    try test_surface.expectCellText(0, 3, " ");
+    try test_surface.expectCellText(1, 3, "i");
+    state.viewer.tree_horizontal_scroll = 0;
     const layout = bodyLayout(test_surface.surface.size(), state.viewer.tree_width, state.viewer.tree_hidden);
     try test_surface.expectCellText(
         layout.tree_width + 2,
@@ -7497,17 +7524,18 @@ test "repository minimum tree disclosure renders root entries and collapses open
     try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
     state.viewer.tree_cursor = 0;
     _ = state.applyNavigation(std.testing.allocator, .toggle_directory, .{ .width = 60, .height = 10 });
-    var collapsed_surface: chasen.testing.TestSurface = undefined;
-    try collapsed_surface.init(60, 10);
-    defer collapsed_surface.deinit();
-    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/gitframe" }, &collapsed_surface.surface);
-    const collapsed_snapshot = try collapsed_surface.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(collapsed_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "▾ gitframe") != null);
-    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "README.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "src") != null);
-    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "main.zig") == null);
-    try std.testing.expect(std.mem.indexOf(u8, collapsed_snapshot, "Loading selected file") != null);
+    var after_root_surface: chasen.testing.TestSurface = undefined;
+    try after_root_surface.init(60, 10);
+    defer after_root_surface.deinit();
+    try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/gitframe" }, &after_root_surface.surface);
+    const after_root_snapshot = try after_root_surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(after_root_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, after_root_snapshot, "gitframe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_root_snapshot, "▾ gitframe") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after_root_snapshot, "README.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_root_snapshot, "src") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_root_snapshot, "main.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_root_snapshot, "Loading selected file") != null);
 }
 
 test "repository source header page view renders and withdraws exact document facts" {
@@ -7617,8 +7645,8 @@ test "repository filter discoverability header follows effective keymap and clip
         try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
         const snapshot = try test_surface.snapshot(allocator);
         defer allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [changed]  (F: toggle)") != null);
-        try test_surface.expectCellText(27, 2, ")");
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [changed]  (F: toggle") != null);
+        try test_surface.expectCellText(27, 2, "e");
     }
 
     var config: keymap.Config = .{};
@@ -7671,7 +7699,7 @@ test "repository filter discoverability header follows effective keymap and clip
         try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
         const snapshot = try test_surface.snapshot(allocator);
         defer allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [chang") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [chan") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "…") == null);
         try std.testing.expectEqual(@as(u16, 12), bodyLayout(
             test_surface.surface.size(),
@@ -7715,8 +7743,9 @@ test "repository filter discoverability distinguishes loading unavailable and no
         defer test_surface.deinit();
         const palette: theme.Palette = .default();
         try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
-        try test_surface.expectCellText(0, 2, "F");
-        try test_surface.expectCellText(27, 2, ")");
+        try test_surface.expectCellText(0, 2, " ");
+        try test_surface.expectCellText(1, 2, "F");
+        try test_surface.expectCellText(28, 2, ")");
         const layout = bodyLayout(.{ .width = 120, .height = 8 }, state.viewer.tree_width, state.viewer.tree_hidden);
         const message_cell = test_surface.surface.readCell(0, layout.header_rows + 1) orelse
             return error.ExpectedChangedFilesMessage;
@@ -7829,10 +7858,10 @@ test "repository minimum tree disclosure page layout and mouse mapping share tre
     try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
     const root_toggle = state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, wide).?;
     _ = state.applyNavigation(std.testing.allocator, root_toggle, wide);
-    try std.testing.expect(!state.bundle.?.tree.nodes[directory].expanded);
-    try std.testing.expectEqual(@as(usize, 3), state.tree_projection.visibleLen(&state.bundle.?.tree));
+    try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
+    try std.testing.expectEqual(@as(usize, 4), state.tree_projection.visibleLen(&state.bundle.?.tree));
     _ = state.applyNavigation(std.testing.allocator, root_toggle, wide);
-    try std.testing.expect(!state.bundle.?.tree.nodes[directory].expanded);
+    try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
 
     const narrow = chasen.Size{ .width = 20, .height = 6 };
     try std.testing.expectEqual(narrow.width, bodyLayout(narrow, state.viewer.tree_width, state.viewer.tree_hidden).tree_width);
@@ -9764,12 +9793,12 @@ test "repository page row rendering is bounded for multiple maximum names" {
     }
 }
 
-test "repository root row renders fixed disclosure and byte-safe basename" {
+test "repository root row renders markerless byte-safe basename" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const expanded = try rootRowTextAlloc(arena.allocator(), "repo\xff\n", 0, 40);
-    try std.testing.expectEqualStrings("▾ repo\\xFF\\x0A", expanded);
-    const partial_glyph_scroll = try rootRowTextAlloc(arena.allocator(), "repo", 1, 40);
-    try std.testing.expectEqualStrings("repo", partial_glyph_scroll);
+    const visible = try rootRowTextAlloc(arena.allocator(), "repo\xff\n", 0, 40);
+    try std.testing.expectEqualStrings("repo\\xFF\\x0A", visible);
+    const scrolled = try rootRowTextAlloc(arena.allocator(), "repo", 1, 40);
+    try std.testing.expectEqualStrings("epo", scrolled);
 }

@@ -83,7 +83,7 @@ pub const State = struct {
         target: Target,
     ) bool {
         return switch (target) {
-            .repo_root => tree.collapseAllFor(visibility),
+            .repo_root => false,
             .manifest_node => |node_index| blk: {
                 const visible_index = underlyingVisibleIndex(tree, node_index) orelse break :blk false;
                 break :blk tree.toggleVisibleFor(visible_index, visibility);
@@ -170,7 +170,7 @@ fn treeForTest(bytes: []const u8) !struct {
     return .{ .document = document, .tree = tree };
 }
 
-test "repository minimum tree disclosure keeps typed root and collapses descendants" {
+test "repository typed root activation preserves expanded descendants" {
     var fixture = try treeForTest("README.md\x00src/main.zig\x00");
     defer fixture.tree.deinit(std.testing.allocator);
     defer fixture.document.deinit(std.testing.allocator);
@@ -185,11 +185,14 @@ test "repository minimum tree disclosure keeps typed root and collapses descenda
     const src_node = fixture.tree.nodeIndexForPath("src", .all) orelse return error.ExpectedDirectory;
     try std.testing.expect(projection.activateTarget(&fixture.tree, .all, .{ .manifest_node = src_node }));
     try std.testing.expect(fixture.tree.nodes[src_node].expanded);
-    try std.testing.expect(projection.activateTarget(&fixture.tree, .all, .repo_root));
-    try std.testing.expect(!fixture.tree.nodes[src_node].expanded);
+    try std.testing.expect(!projection.activateTarget(&fixture.tree, .all, .repo_root));
+    try std.testing.expect(fixture.tree.nodes[src_node].expanded);
     try std.testing.expectEqual(fixture.tree.visible_len + 1, projection.visibleLen(&fixture.tree));
     try std.testing.expectEqual(Target{ .manifest_node = src_node }, projection.targetAt(&fixture.tree, 1).?);
-    try std.testing.expect(!projection.activateTarget(&fixture.tree, .all, .repo_root));
+    try std.testing.expect(!projection.activateTarget(&fixture.tree, .changed, .repo_root));
+    try std.testing.expect(fixture.tree.nodes[src_node].expanded);
+    try std.testing.expect(projection.activateTarget(&fixture.tree, .all, .{ .manifest_node = src_node }));
+    try std.testing.expect(!fixture.tree.nodes[src_node].expanded);
 }
 
 test "Repository typed cursor restores exact identity then nearest visible ancestor" {

@@ -57,7 +57,7 @@ pub fn rowForNode(
 
     const node = tree.nodes[node_index];
     const fold: Row.Fold = switch (node.kind) {
-        .repo_root => .expanded,
+        .repo_root => .none,
         .directory => if (file_tree.isCollapsed(collapsed, node.path)) .collapsed else .expanded,
         .file => .none,
     };
@@ -104,16 +104,18 @@ fn visibleRowAt(
 
 pub fn layout(row: Row, width: u16) RowLayout {
     const indent: u16 = row.depth *| 2;
-    // Root and directory content starts at the tree's left edge. File-only
-    // reviewed/status/mode columns stay fixed so removing the old selection
-    // marker does not make semantic badges jump between rows.
+    // Root content follows the fixed one-cell sidebar gutter; directory
+    // content keeps its existing tree-edge origin. File-only reviewed/status/
+    // mode columns stay fixed so semantic badges do not jump between rows.
     const reviewed_col: ?u16 = if (row.kind == .file and row.reviewed) 1 else null;
     const badge_col: ?u16 = if (row.status != null) 2 else null;
     const mode_col: ?u16 = if (row.kind == .file and row.mode_changed)
         if (row.status != null) 4 else 2
     else
         null;
-    const tree_content_col: u16 = if (row.kind == .repo_root or row.kind == .directory)
+    const tree_content_col: u16 = if (row.kind == .repo_root)
+        1
+    else if (row.kind == .directory)
         0
     else if (row.mode_changed and row.status != null)
         6
@@ -122,7 +124,7 @@ pub fn layout(row: Row, width: u16) RowLayout {
     else
         2;
     const name_col: u16 = if (row.kind == .repo_root)
-        2 +| indent
+        1
     else if (row.kind == .directory)
         2 +| indent
     else if (row.mode_changed and row.status != null)
@@ -360,15 +362,15 @@ test "layout shows stats only for repository root rows" {
     const root_layout = layout(rowForNode(tree, &collapsed, &.{}, 0, 0).?, 40);
     const directory_layout = layout(rowForNode(tree, &collapsed, &.{}, 1, 0).?, 40);
 
-    try std.testing.expectEqual(@as(u16, 0), root_layout.tree_content_col);
-    try std.testing.expectEqual(@as(u16, 2), root_layout.name_col);
+    try std.testing.expectEqual(@as(u16, 1), root_layout.tree_content_col);
+    try std.testing.expectEqual(@as(u16, 1), root_layout.name_col);
     try std.testing.expectEqual(@as(?u16, 28), root_layout.stats_col);
     try std.testing.expectEqual(@as(u16, 0), directory_layout.tree_content_col);
     try std.testing.expectEqual(@as(u16, 4), directory_layout.name_col);
     try std.testing.expectEqual(@as(?u16, null), directory_layout.stats_col);
 }
 
-test "review root expansion always renders repository root as expanded" {
+test "review root row has no disclosure state" {
     const nodes = [_]file_tree.Node{.{
         .kind = .repo_root,
         .name = "repo",
@@ -381,6 +383,39 @@ test "review root expansion always renders repository root as expanded" {
 
     const root = rowForNode(tree, &collapsed, &.{}, 0, 0).?;
 
-    try std.testing.expectEqual(Row.Fold.expanded, root.fold);
+    try std.testing.expectEqual(Row.Fold.none, root.fold);
     try std.testing.expect(!file_tree.isCollapsed(&collapsed, ""));
+}
+
+test "review markerless root has exact stats and horizontal geometry" {
+    const root_name = "0123456789abcdefghijklmnopqrstuv";
+    try std.testing.expectEqual(@as(usize, 32), chasen.text.displayWidth(root_name));
+    const nodes = [_]file_tree.Node{.{
+        .kind = .repo_root,
+        .name = root_name,
+        .path = "",
+        .depth = 0,
+        .stats = .{ .added = 68, .removed = 3 },
+        .target = .repo_root,
+    }};
+    const tree: file_tree.FileTree = .{ .nodes = &nodes };
+    const collapsed: file_tree.CollapsedSet = .empty;
+    const root = rowForNode(tree, &collapsed, &.{}, 0, 0).?;
+
+    try std.testing.expectEqual(Row.Fold.none, root.fold);
+    try std.testing.expectEqual(@as(usize, 32), treeContentDisplayWidth(root));
+
+    const with_stats = layout(root, 40);
+    try std.testing.expectEqual(@as(u16, 1), with_stats.tree_content_col);
+    try std.testing.expectEqual(@as(u16, 1), with_stats.name_col);
+    try std.testing.expectEqual(@as(u16, 27), with_stats.tree_content_width);
+    try std.testing.expectEqual(@as(?u16, 28), with_stats.stats_col);
+    try std.testing.expectEqual(@as(usize, 5), maxHorizontalScroll(root, 40));
+
+    const narrow = layout(root, 20);
+    try std.testing.expectEqual(@as(u16, 1), narrow.tree_content_col);
+    try std.testing.expectEqual(@as(u16, 1), narrow.name_col);
+    try std.testing.expectEqual(@as(u16, 19), narrow.tree_content_width);
+    try std.testing.expectEqual(@as(?u16, null), narrow.stats_col);
+    try std.testing.expectEqual(@as(usize, 13), maxHorizontalScroll(root, 20));
 }

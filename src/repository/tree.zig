@@ -188,20 +188,6 @@ pub const Tree = struct {
         return true;
     }
 
-    /// Returns every directory to the minimum tree shape. Expansion is raw
-    /// tree state shared by All and Changed projections, so even directories
-    /// hidden from the current visibility must be closed.
-    pub fn collapseAllFor(self: *Tree, visibility: Visibility) bool {
-        var changed = false;
-        for (self.nodes) |*node| {
-            if (node.kind != .directory or !node.expanded) continue;
-            node.expanded = false;
-            changed = true;
-        }
-        if (changed) self.rebuildVisibleFor(visibility);
-        return changed;
-    }
-
     pub fn firstFilePath(self: *const Tree) ?[]const u8 {
         for (self.nodes) |node| if (node.kind == .file) return node.path;
         return null;
@@ -383,9 +369,8 @@ test "repository minimum tree disclosure builds only top-level entries and toggl
     try std.testing.expectEqual(@as(usize, 2), tree.visible_len);
     try std.testing.expect(tree.toggleVisibleFor(0, .all));
     try std.testing.expectEqual(@as(usize, 4), tree.visible_len);
-    try std.testing.expect(tree.collapseAllFor(.all));
+    try std.testing.expect(tree.toggleVisibleFor(0, .all));
     try std.testing.expectEqual(@as(usize, 2), tree.visible_len);
-    try std.testing.expect(!tree.collapseAllFor(.all));
 }
 
 test "repository minimum tree disclosure reveals a file below collapsed ancestors only" {
